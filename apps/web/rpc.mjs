@@ -68,11 +68,14 @@ export class CrewRpc extends EventEmitter {
   request(method, params, item) {
     if (this.socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Crew engine disconnected'));
     const id = ++this.nextId;
+    const startedAt = Date.now();
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         this.socket?.send(JSON.stringify({ id, cancel: true }));
-        reject(new Error('Crew request timed out'));
+        const elapsedMs = Date.now() - startedAt;
+        console.error('Crew RPC request timed out', { method, id, elapsedMs });
+        reject(new Error(`Crew request timed out: method=${method} id=${id} elapsed_ms=${elapsedMs}`));
       }, 30000);
       this.pending.set(id, { resolve, reject, timer, item });
       this.socket.send(JSON.stringify({ id, method, params }));

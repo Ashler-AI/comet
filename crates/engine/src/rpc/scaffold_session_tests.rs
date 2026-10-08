@@ -58,6 +58,707 @@ fn response(
         handoff_cwd: None,
     }
 }
+#[tokio::test]
+async fn explicit_scaffold_control_requires_existing_exact_deployment_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = crate::EngineCore::assemble_with_identity(
+        dir.path(),
+        std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+        HarnessId::Mock,
+        None,
+        "project-a",
+        "owner@example.com",
+        RuntimeProfile::Mock,
+    ).unwrap();
+    let mut auth_config = crate::AuthConfig::new("http://127.0.0.1:1", dir.path());
+    auth_config.project_scope = "project-a".into();
+    auth_config.dev_user_id = "owner@example.com".into();
+    core.set_auth(crate::Auth::new(auth_config));
+    let prepared = response(&params().scope, ScaffoldLifecycle::Ready);
+    let chat_id = prepared.environment.scope.session_id.clone().unwrap();
+    core.doc_host.open_projection(&chat_id, prepared.room_projection.as_ref()).unwrap();
+    let rpc = core.rpc_service();
+    rpc.install_scaffold_control_grant(&prepared).unwrap();
+    let command = SessionCommandPayload::Control {
+        session_id: chat_id.clone(),
+        owner_device_id: prepared.attached_device_id.clone().unwrap(),
+        actor_device_id: core.device_id.clone(),
+        actor_subject: "owner@example.com".into(),
+        grant_id: prepared.control_grant.as_ref().unwrap().id.clone(),
+        source: comet_proto::AgentSessionSource::Scaffold,
+        action: Box::new(comet_doc::SessionControlAction::Queue {
+            prompt: "queued instruction".into(), message_id: None,
+        }),
+    };
+    let request = serde_json::json!({
+        "chatId": chat_id, "commandId": "exact-deployment", "command": command,
+        "deploymentId": "deployment-a", "controlDeploymentId": "deployment-a",
+        "roomProjection": prepared.room_projection,
+        "targetDeviceId": prepared.attached_device_id,
+    });
+    let mut foreign = request.clone();
+    foreign["commandId"] = serde_json::json!("foreign-deployment");
+    foreign["deploymentId"] = serde_json::json!("deployment-b");
+    foreign["controlDeploymentId"] = serde_json::json!("deployment-b");
+    foreign["roomProjection"]["deploymentId"] = serde_json::json!("deployment-b");
+    assert!(rpc.handle(methods::QUEUE_COMMAND, foreign).await.is_err());
+    assert!(core.doc_host.command_entry(&chat_id, "foreign-deployment").unwrap().is_none());
+    let mut wrong_owner = request.clone();
+    wrong_owner["commandId"] = serde_json::json!("wrong-owner");
+    wrong_owner["targetDeviceId"] = serde_json::json!("comet-scaffold-other-sandbox-e2");
+    assert!(rpc.handle(methods::QUEUE_COMMAND, wrong_owner).await.is_err());
+    assert!(core.doc_host.command_entry(&chat_id, "wrong-owner").unwrap().is_none());
+    rpc.handle(methods::QUEUE_COMMAND, request).await.unwrap();
+    assert_eq!(core.doc_host.command_entry(&chat_id, "exact-deployment").unwrap().unwrap().payload, command);
+}
+
+
+fn recovery_core(path: &std::path::Path, origin: &str) -> crate::EngineCore {
+    let core = crate::EngineCore::assemble_with_identity(
+        path,
+        std::sync::Arc::new(crate::HarnessRegistry::new()),
+        HarnessId::Omp,
+        None,
+        "project-a",
+        "owner@example.com",
+        RuntimeProfile::LocalController,
+    )
+    .unwrap();
+    let mut auth = crate::AuthConfig::new(origin, path);
+    auth.project_scope = "project-a".into();
+    auth.dev_user_id = "owner@example.com".into();
+    core.set_auth(crate::Auth::new(auth));
+    core.set_scaffold_runtime(
+        crate::ScaffoldRuntime::new(
+            crate::ScaffoldClient::new(
+                origin,
+                "project-a",
+                std::sync::Arc::new(comet_rpc::StaticToken("test".into())),
+            )
+            .unwrap(),
+            origin,
+            std::sync::Arc::new(crate::UnavailableDeviceJoinGrantProvider),
+        )
+        .with_deployment_id("deployment-a".into()),
+    );
+    core.workspace
+        .create_space("source-space", &core.device_id, "/source", None, false)
+        .unwrap();
+    let source_id = "00000000-0000-4000-8000-000000000002";
+    core.workspace
+        .create_chat(
+            source_id,
+            "source-space",
+            Some(ChatConfig {
+                harness: HarnessId::Omp,
+                model: Some("openai-codex/gpt-6-astra".into()),
+                reasoning: None,
+                agent_account_id: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            }),
+            None,
+        )
+        .unwrap();
+    let mut source = core.workspace.doc().chat(source_id).unwrap().unwrap();
+    source.harness_session_id = Some("native-source".into());
+    source.harness_session_cwd = Some("/source".into());
+    core.workspace.doc().upsert_chat(&source).unwrap();
+    core
+}
+
+#[tokio::test]
+async fn scaffold_attach_verifies_authority_before_opening_a_legacy_cache() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let scope = params().scope;
+    let chat_id = scope.session_id.as_deref().unwrap();
+    let store = comet_sync::DocsStore::open(dir.path().join("projects")
+        .join(crate::sanitize_path_id("project-a"))
+        .join(crate::sanitize_path_id("owner@example.com"))).unwrap();
+    let legacy = comet_doc::SessionDoc::init(chat_id).unwrap();
+    legacy.push_message(&comet_doc::SessionMessageEntry {
+        id: "retained-output".into(), role: comet_doc::MessageRole::Assistant,
+        parts: vec![comet_doc::MessagePart::Text { id: "text".into(), text: "accepted output".into() }],
+        created_at: 1, device_id: "comet-scaffold-sandbox-a-e1".into(),
+        status: Some(comet_doc::MessageStatus::Complete), continuation_of: None, peer_message: None,
+    }).unwrap();
+    store.save_snapshot(chat_id, &legacy.export_snapshot().unwrap()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let core = recovery_core(dir.path(), &format!("http://{}", listener.local_addr().unwrap()));
+    let environment = serde_json::json!({"sandbox": {
+        "id": "sandbox-a", "lifecycleEpoch": 1, "status": "ready", "kind": "remote_code",
+        "runtimeProfile": "remote_code", "ownerEmail": "owner@example.com",
+        "createdAt": "2026-08-04T00:00:00Z", "updatedAt": "2026-08-04T00:00:00Z"
+    }}).to_string();
+    let authority = serde_json::json!({"ok": true, "exitCode": 0, "stdout": serde_json::json!({
+        "grantId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expiresAt": crate::now_ms() + 60_000,
+        "principalSubject": "owner@example.com", "scope": scope,
+        "sandboxId": "sandbox-a", "deviceId": "comet-scaffold-sandbox-a-e1", "lifecycleEpoch": 1,
+        "capabilities": ["session.read", "session.chat", "session.control", "session.annotate", "session.files", "session.environment"]
+    }).to_string()}).to_string();
+    let provider = tokio::spawn(async move {
+        for (method, body) in [("GET", environment), ("POST", authority)] {
+            let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+            let mut reader = BufReader::new(connection);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with(&format!("{method} /api/code-sandboxes/sandbox-a")));
+            let mut length = 0;
+            loop {
+                line.clear(); reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).await.unwrap();
+            if method == "POST" {
+                let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(request["argv"], serde_json::json!(["comet", "scaffold-authority"]));
+            }
+            reader.get_mut().write_all(format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        }
+    });
+    let cancellation = CancellationToken::new();
+    let operation_cancel = cancellation.clone();
+    let rpc = core.rpc_service();
+    let control = ScaffoldEnvironmentControl::Attach { sandbox_id: "sandbox-a".into(), scope: scope.clone() };
+    let operation = tokio::spawn(async move { rpc.control_scaffold_environment(control, &operation_cancel).await });
+    provider.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while store.document_scope(chat_id).unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.unwrap();
+    cancellation.cancel();
+    assert!(operation.await.unwrap().unwrap_err().to_string().contains("scaffold_request_cancelled"));
+    let handle = core.doc_host.open_projection(chat_id, Some(&SessionRoomProjection {
+        project_id: scope.project_id, deployment_id: scope.deployment_id.unwrap(), session_id: chat_id.into(),
+    })).unwrap();
+    assert_eq!(handle.doc().read_entries().unwrap(), legacy.read_entries().unwrap());
+    core.shutdown().await;
+}
+
+fn recovery_request() -> comet_rpc::RecoverSessionHandoffToScaffoldParams {
+    comet_rpc::RecoverSessionHandoffToScaffoldParams {
+        handoff: HandoffSessionToScaffoldParams {
+            source_chat_id: "00000000-0000-4000-8000-000000000002".into(),
+            prompt: "Continue remotely".into(),
+            database_environment: ScaffoldDatabaseEnvironment::Local,
+        },
+        recover_chat_id: params().scope.session_id.unwrap(),
+        recover_sandbox_id: "sandbox-a".into(),
+    }
+}
+
+async fn respond_to_route_receipt(connection: tokio::net::TcpStream, model: &str) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut reader = BufReader::new(connection);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let supported = line.trim() == "GET /api/code-sandboxes/sandbox-a HTTP/1.1";
+    loop {
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let body = serde_json::json!({ "ok": true, "sandbox": {
+        "id": "sandbox-a", "kind": "remote_code", "runtimeProfile": "comet_remote",
+        "status": "ready", "lifecycleEpoch": 1, "ownerEmail": "owner@example.com",
+        "databaseEnvironment": "local", "createdAt": "2026-08-10T00:00:00Z", "updatedAt": "2026-08-10T00:00:00Z",
+        "cometRuntimeProfile": { "version": "scaffold.comet-runtime.v1", "projectId": "project-a",
+            "deploymentId": "deployment-a", "sessionId": recovery_request().recover_chat_id, "sandboxId": "sandbox-a" },
+        "agentRoute": { "provider": "openai", "model": model, "fallback": "disabled", "routingMode": "automatic" }
+    }}).to_string();
+    let status = if supported { "200 OK" } else { "404 Not Found" };
+    reader.get_mut().write_all(format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_route_mismatch_never_attaches_imports_creates_or_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let core = recovery_core(
+        dir.path(),
+        &format!("http://{}", listener.local_addr().unwrap()),
+    );
+    core.workspace
+        .upsert_session_ref(
+            &recovery_request().recover_chat_id,
+            Some(response(&params().scope, ScaffoldLifecycle::Ready).environment),
+        )
+        .unwrap();
+    let rpc = core.rpc_service();
+    let (result, ()) = tokio::join!(
+        rpc.recover_session_handoff_to_scaffold(recovery_request()),
+        async {
+            let (connection, _) = listener.accept().await.unwrap();
+            respond_to_route_receipt(connection, "different-model").await;
+        }
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("agent route differs")
+    );
+    assert!(
+        !core
+            .doc_host
+            .chat_has_commands(&recovery_request().recover_chat_id)
+            .unwrap()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), listener.accept())
+            .await
+            .is_err()
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_reference_disappearing_or_changing_during_validation_never_creates() {
+    for remove in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let core = recovery_core(
+            dir.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let mut accepted = response(&params().scope, ScaffoldLifecycle::Ready).environment;
+        let id = recovery_request().recover_chat_id;
+        core.workspace
+            .upsert_session_ref(&id, Some(accepted.clone()))
+            .unwrap();
+        let rpc = core.rpc_service();
+        let first = tokio::spawn(async move {
+            rpc.recover_session_handoff_to_scaffold(recovery_request())
+                .await
+        });
+        let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        if remove {
+            core.workspace
+                .doc()
+                .remove_session_ref("owner@example.com", &id)
+                .unwrap();
+        } else {
+            accepted.database_environment = Some(ScaffoldDatabaseEnvironment::ProductionSnapshot);
+            core.workspace
+                .upsert_session_ref(&id, Some(accepted))
+                .unwrap();
+        }
+        respond_to_route_receipt(connection, "gpt-6-astra").await;
+        let error = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("recovery"));
+        assert!(!core.doc_host.chat_has_commands(&id).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn imported_context_without_command_admission_is_persisted_and_not_reimported() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let core = recovery_core(
+        dir.path(),
+        &format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let mut attached = response(&params().scope, ScaffoldLifecycle::Ready);
+    attached.handoff_native_session_id = Some("native-source".into());
+    attached.handoff_cwd = Some("/workspace/ashler-platform".into());
+    core.workspace
+        .upsert_session_ref(
+            &recovery_request().recover_chat_id,
+            Some(attached.environment.clone()),
+        )
+        .unwrap();
+    let source = core
+        .workspace
+        .doc()
+        .chat(&recovery_request().handoff.source_chat_id)
+        .unwrap()
+        .unwrap();
+    core.rpc_service()
+        .persist_handoff_context(
+            &source,
+            params().agent_route.omp_model(),
+            attached.attached_device_id.as_deref().unwrap(),
+            &attached,
+        )
+        .unwrap();
+    let error = core
+        .rpc_service()
+        .recover_session_handoff_to_scaffold(recovery_request())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("already imported native context")
+    );
+    assert!(
+        !core
+            .doc_host
+            .chat_has_commands(&recovery_request().recover_chat_id)
+            .unwrap()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), listener.accept())
+            .await
+            .is_err()
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn explicit_recovery_missing_mismatched_imported_or_admitted_target_never_creates_or_commands()
+ {
+    for case in [
+        "missing", "sandbox", "scope", "owner", "database", "active", "imported", "admitted",
+        "ledger",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let core = recovery_core(
+            dir.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let request = recovery_request();
+        let id = request.recover_chat_id.clone();
+        if case != "missing" {
+            let mut environment = response(&params().scope, ScaffoldLifecycle::Ready).environment;
+            match case {
+                "sandbox" => {
+                    if let SessionEnvironmentSource::Scaffold { sandbox_id, .. } =
+                        &mut environment.source
+                    {
+                        *sandbox_id = "other".into();
+                    }
+                }
+                "scope" => environment.scope.deployment_id = Some("other".into()),
+                "owner" => environment.owner_principal = "other@example.com".into(),
+                "database" => {
+                    environment.database_environment =
+                        Some(ScaffoldDatabaseEnvironment::StagingSnapshot)
+                }
+                "active" => {
+                    if let SessionEnvironmentSource::Scaffold { lifecycle, .. } =
+                        &mut environment.source
+                    {
+                        *lifecycle = ScaffoldLifecycle::AgentRunning;
+                    }
+                }
+                _ => {}
+            }
+            core.workspace
+                .upsert_session_ref(&id, Some(environment))
+                .unwrap();
+            if case == "imported" {
+                let mut chat = core
+                    .workspace
+                    .doc()
+                    .chat(&request.handoff.source_chat_id)
+                    .unwrap()
+                    .unwrap();
+                chat.id = id.clone();
+                core.workspace.doc().upsert_chat(&chat).unwrap();
+            }
+            if case == "admitted" {
+                core.workspace
+                    .update_session_startup(
+                        &id,
+                        None,
+                        comet_proto::SessionStartup {
+                            generation: "accepted".into(),
+                            status: comet_proto::SessionStartupStatus::Admitted,
+                            updated_at: chrono::Utc::now(),
+                            command_id: Some("command-a".into()),
+                        },
+                    )
+                    .unwrap();
+            }
+            if case == "ledger" {
+                core.doc_host
+                    .queue_command(
+                        &id,
+                        SessionCommandPayload::Run {
+                            request: RunRequest {
+                                prompt: "existing".into(),
+                                model: None,
+                                agent_account_id: None,
+                                reasoning: None,
+                                model_options: Default::default(),
+                                cwd: "/source".into(),
+                                sandbox: SandboxLevel::WorkspaceWrite,
+                                auto_approve: false,
+                                resume: None,
+                                attachments: Vec::new(),
+                            },
+                            message_id: crate::new_id(),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let before = core.doc_host.chat_has_commands(&id).unwrap();
+        let client = comet_rpc::memory_client(core.rpc_service());
+        let result = client
+            .call(
+                comet_rpc::methods::RECOVER_SESSION_HANDOFF_TO_SCAFFOLD,
+                serde_json::to_value(request).unwrap(),
+            )
+            .await;
+        assert!(
+            result.unwrap_err().to_string().contains("recovery"),
+            "{case}"
+        );
+        assert_eq!(
+            core.doc_host.chat_has_commands(&id).unwrap(),
+            before,
+            "{case}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err(),
+            "{case}"
+        );
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_recovery_rejects_same_target_before_transfer_and_admission() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let core = recovery_core(
+        dir.path(),
+        &format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let environment = response(&params().scope, ScaffoldLifecycle::Ready).environment;
+    core.workspace
+        .upsert_session_ref(&recovery_request().recover_chat_id, Some(environment))
+        .unwrap();
+    let rpc = core.rpc_service();
+    let first = tokio::spawn(async move {
+        rpc.recover_session_handoff_to_scaffold(recovery_request())
+            .await
+    });
+    let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let admission = |generation: Option<String>| {
+        client.call(comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": recovery_request().recover_chat_id,
+                "preparationGeneration": generation,
+                "command": SessionCommandPayload::Run {
+                    request: RunRequest { prompt: "Competing start".into(), model: None, agent_account_id: None,
+                        reasoning: None, model_options: Default::default(), cwd: "/source".into(),
+                        sandbox: SandboxLevel::WorkspaceWrite, auto_approve: false, resume: None, attachments: Vec::new() },
+                    message_id: crate::new_id(),
+                },
+            }))
+    };
+    assert!(
+        admission(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already in progress")
+    );
+    respond_to_route_receipt(connection, "gpt-6-astra").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if core
+                .workspace
+                .session_startup(&recovery_request().recover_chat_id)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The first operation is allowed to inspect its preserved sandbox while
+    // competitors remain fenced; no owner-room connection is a prerequisite.
+    let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+    let mut attachment = BufReader::new(connection);
+    let mut request = String::new();
+    attachment.read_line(&mut request).await.unwrap();
+    assert!(request.starts_with("GET /api/code-sandboxes/sandbox-a"), "{request:?}");
+    assert!(
+        !first.is_finished(),
+        "first recovery must retain its target gate while waiting for attachment"
+    );
+    assert!(
+        core.rpc_service()
+            .recover_session_handoff_to_scaffold(recovery_request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already in progress")
+    );
+    let generation = core
+        .workspace
+        .session_startup(&recovery_request().recover_chat_id)
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert!(
+        admission(Some(generation))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already in progress")
+    );
+    assert!(
+        !core
+            .doc_host
+            .chat_has_commands(&recovery_request().recover_chat_id)
+            .unwrap()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), listener.accept())
+            .await
+            .is_err()
+    );
+    first.abort();
+    let _ = first.await;
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_peer_diagnostic_does_not_duplicate_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = recovery_core(dir.path(), "http://127.0.0.1:1");
+    let mut parameters = params();
+    parameters.database_environment = ScaffoldDatabaseEnvironment::StagingSnapshot;
+    let scope = parameters.scope.clone();
+    let mut accepted = response(&scope, ScaffoldLifecycle::Ready).environment;
+    accepted.database_environment = Some(ScaffoldDatabaseEnvironment::StagingSnapshot);
+    core.workspace
+        .upsert_session_ref(scope.session_id.as_deref().unwrap(), Some(accepted.clone()))
+        .unwrap();
+    // This is an already accepted diagnostic in the scoped replica, not a new
+    // bare control admission inheriting deployment authority from its cache.
+    core.doc_host
+        .open_projection(scope.session_id.as_deref().unwrap(), response(&scope, ScaffoldLifecycle::Ready).room_projection.as_ref())
+        .unwrap().doc().queue_command(&comet_doc::SessionCommandEntry {
+            id:"diagnostic".into(), issued_by:core.device_id.clone(), issued_at:1,
+            based_on:None, expires_at:None, status:comet_doc::SessionCommandStatus::Applied, resolution:None,
+            payload:SessionCommandPayload::PeerMessage {
+                text:"Read-only diagnostic".into(), source_chat_id:recovery_request().handoff.source_chat_id,
+                source_deployment_id:None, source_device_id:None, thread_id:"diagnostic".into(),
+                reply_to:None, hop_count:0,
+            },
+        }).unwrap();
+    core.rpc_service()
+        .require_unadmitted_handoff(&recovery_request().recover_chat_id)
+        .unwrap();
+    let mut startup =
+        PreparationOutcome::begin(core.workspace.clone(), scope.session_id.as_deref().unwrap())
+            .unwrap();
+    let mut attached = prepare_scaffold_session_with(parameters, Some(accepted), |operation| {
+        let mut result = response(&scope, ScaffoldLifecycle::Ready);
+        result.environment.database_environment =
+            Some(ScaffoldDatabaseEnvironment::StagingSnapshot);
+        match operation {
+            ScaffoldEnvironmentControl::Attach {
+                sandbox_id,
+                scope: actual,
+            }
+            | ScaffoldEnvironmentControl::Inspect {
+                sandbox_id,
+                scope: actual,
+            } => {
+                assert_eq!(sandbox_id, "sandbox-a");
+                assert_eq!(actual, scope);
+            }
+            ScaffoldEnvironmentControl::HandoffOmpSession { sandbox_id, .. } => {
+                assert_eq!(sandbox_id, "sandbox-a");
+                result.handoff_native_session_id = Some("native-source".into());
+                result.handoff_cwd = Some("/workspace/ashler-platform".into());
+            }
+            _ => panic!("recovery must never create or update the database/route"),
+        }
+        std::future::ready(Ok(result))
+    })
+    .await
+    .unwrap();
+    startup.armed = false;
+    attached.preparation_generation = Some(startup.startup.generation.clone());
+    let source = core
+        .workspace
+        .doc()
+        .chat(&recovery_request().handoff.source_chat_id)
+        .unwrap()
+        .unwrap();
+    let receipt = core
+        .rpc_service()
+        .admit_scaffold_handoff(
+            source,
+            "Continue".into(),
+            params().agent_route.omp_model(),
+            "owner@example.com".into(),
+            attached,
+        )
+        .unwrap();
+    let mut replay = recovery_request();
+    replay.handoff.database_environment = ScaffoldDatabaseEnvironment::StagingSnapshot;
+    assert!(
+        core.rpc_service()
+            .recover_session_handoff_to_scaffold(replay)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("recovery")
+    );
+    assert_eq!(
+        core.doc_host
+            .open(&receipt.chat_id)
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        core.workspace
+            .session_startup(&receipt.chat_id)
+            .unwrap()
+            .unwrap()
+            .command_id
+            .as_deref(),
+        Some(receipt.command_id.as_str())
+    );
+    core.shutdown().await;
+}
 
 #[tokio::test]
 async fn native_handoff_bootstraps_before_readiness_and_never_recreates_on_attach_retry() {
@@ -591,15 +1292,29 @@ async fn concurrent_and_interrupted_preparation_never_duplicates_creation() {
         ref sandbox_id, lifecycle_epoch: None, ..
     } if sandbox_id == "sandbox-a")
     );
+    let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+    let mut initial_attach = BufReader::new(connection);
+    line.clear();
+    initial_attach.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("GET /api/code-sandboxes/sandbox-a"));
     first.abort();
     let _ = first.await;
     let retry_rpc = core.rpc_service();
     tokio::select! {
         result = retry_rpc.prepare_scaffold_session(params()) => {
-            panic!("recovery should await the same target's owner room: {result:?}");
+            panic!("recovery should inspect the same target before attachment: {result:?}");
         }
-        _ = listener.accept() => panic!("retry must not allocate another sandbox"),
-        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        accepted = async {
+            loop {
+                let mut retry_attach = BufReader::new(listener.accept().await.unwrap().0);
+                line.clear();
+                // Cancellation can leave an accepted TCP connection with no request.
+                if retry_attach.read_line(&mut line).await.unwrap() != 0 { break line.clone(); }
+            }
+        } => {
+            assert!(accepted.starts_with("GET /api/code-sandboxes/sandbox-a"), "{accepted:?}");
+        }
+        _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("retry did not inspect the preserved sandbox"),
     }
     core.shutdown().await;
 }
@@ -978,12 +1693,8 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
                 if let Some(session) = session
                     && session.status == status
                     && chat.last_message_at.is_some_and(|at| {
-                        at.timestamp_millis()
-                            >= match status {
-                                SessionStatus::Idle | SessionStatus::Errored => session.updated_at,
-                                _ => session.started_at.unwrap(),
-                            }
-                            .timestamp_millis()
+                        !matches!(status, SessionStatus::Idle | SessionStatus::Errored)
+                            || at.timestamp_millis() >= session.updated_at.timestamp_millis()
                     })
                 {
                     break;
@@ -1221,7 +1932,7 @@ async fn prepared_handoff_routes_peer_messages_and_interrupts_to_the_remote_nati
             working.updated_at
                 + chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS + 1)
         ),
-        comet_proto::view::Indicator::None
+        comet_proto::view::Indicator::Unreachable
     );
     // The persisted workspace alone retains completion and seen state; no
     // session document or scoped follower is needed after restart.

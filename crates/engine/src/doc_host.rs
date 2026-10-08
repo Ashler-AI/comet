@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
+use loro::ToJson;
 
 use comet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
@@ -31,6 +32,122 @@ use comet_sync::{DocsStore, RoomClient};
 use crate::sessions::{PeerReply, QueueOutcome, SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct CacheScope {
+    project: String,
+    principal: String,
+    deployment: Option<String>,
+    session: String,
+}
+impl CacheScope {
+    fn key(&self) -> Result<String, EngineError> { serde_json::to_string(self).map_err(|error| EngineError::Other(error.to_string())) }
+    fn projection(&self) -> Option<SessionRoomProjection> {
+        self.deployment.as_ref().map(|deployment| SessionRoomProjection {
+            project_id:self.project.clone(),deployment_id:deployment.clone(),session_id:self.session.clone(),
+        })
+    }
+}
+
+fn empty_session_cache(doc: &SessionDoc) -> bool {
+    let raw = doc.doc();
+    if raw.len_ops() > 3 { return false; }
+    let value = raw.get_deep_value().to_json_value();
+    value.as_object().is_some_and(|roots| roots.iter().all(|(name,value)| {
+        if name == "meta" { return value.as_object().is_some_and(|fields| fields.iter().all(|(name,value)| {
+            matches!(name.as_str(),"chatId"|"schemaVersion") || name == "directoryCompletedTurn" && value.as_str() == Some("")
+        })); }
+        value.as_array().is_some_and(Vec::is_empty) || value.as_object().is_some_and(serde_json::Map::is_empty)
+    }))
+}
+
+pub(crate) fn install_document_journal(
+    store: &Arc<DocsStore>, snapshot_id: &str, doc_id: &str, binding: &comet_doc::SharedDocument,
+    legacy_records: impl FnOnce() -> Result<Vec<comet_doc::PendingRecord>, EngineError>,
+    expected_chat: Option<&str>,
+) -> Result<(), EngineError> {
+    if !store.has_semantic_journal(doc_id)? {
+        let mut records = legacy_records()?;
+        // Pre-journal clients used the UUID cache namespace. Preserve their
+        // explicit pending records in the newly claimed physical scope.
+        if snapshot_id != doc_id { records.extend(store.load_pending_records(snapshot_id)?); }
+        // Keep the original cache as evidence when ownership or a field conflict
+        // prevents safe migration; recovery never deletes the user's only copy.
+        let original = binding.export(loro::ExportMode::Snapshot).map_err(|error| EngineError::Other(error.to_string()))?;
+        store.save_snapshot(&format!("recovery-original/{doc_id}"), &original)?;
+        store.migrate_pending_records(doc_id, &records)?;
+    }
+    if expected_chat.is_none() {
+        let evidence_id = format!("recovery-original/{doc_id}");
+        if store.load_snapshot(&evidence_id)?.is_none() {
+            let original = binding.export(loro::ExportMode::Snapshot).map_err(|error| EngineError::Other(error.to_string()))?;
+            store.save_snapshot(&evidence_id, &original)?;
+        }
+        store.normalize_workspace_records(doc_id, &binding.raw())?;
+    }
+    let pending = store.load_pending_records(doc_id)?;
+    let has_pending = !pending.is_empty();
+    let journal_store = store.clone();
+    let journal_id = doc_id.to_string();
+    let snapshot_id = snapshot_id.to_string();
+    binding.install_journal(pending, Arc::new(move |records, snapshot| {
+        journal_store.save_pending_records_for_snapshot(&journal_id, &snapshot_id, records.iter().map(Arc::as_ref), snapshot).map_err(|error| error.to_string())
+    }));
+    if has_pending || expected_chat.is_none() {
+        let snapshot = binding.export(loro::ExportMode::Snapshot).map_err(|error| EngineError::Other(error.to_string()))?;
+        binding.adopt_snapshot(&snapshot, expected_chat)?;
+    }
+    Ok(())
+}
+
+fn legacy_record(container: &str, key: String, value: serde_json::Value) -> comet_doc::PendingRecord {
+    comet_doc::PendingRecord { container: container.into(), key, before: None, value: Some(value), version: Vec::new(), acknowledged: false }
+}
+
+fn install_session_journal(store: &Arc<DocsStore>, chat_id: &str, scope_key: &str, doc: &SessionDoc, device: &str) -> Result<(), EngineError> {
+    install_document_journal(store, chat_id, scope_key, &doc.binding(), || {
+        let mut records = Vec::new();
+        for entry in doc.read_entries()?.into_iter().filter(|entry| entry.device_id == device) {
+            records.push(legacy_record("messages", entry.id.clone(), serde_json::to_value(entry).map_err(|error| EngineError::Other(error.to_string()))?));
+        }
+        for command in doc.read_commands()?.into_iter().filter(|entry| entry.issued_by == device || entry.status != SessionCommandStatus::Pending) {
+            records.push(legacy_record("commands", command.id.clone(), serde_json::to_value(command).map_err(|error| EngineError::Other(error.to_string()))?));
+        }
+        for publication in doc.read_publications()? {
+            let owned = match &publication.value {
+                PublicationValue::AgentSession(session) => session.owner_device_id == device,
+                PublicationValue::MessageProvenance(provenance) => provenance.owner_device_id == device,
+                PublicationValue::Audit(audit) => audit.actor_device_id == device,
+                _ => false,
+            };
+            if owned { records.push(legacy_record("publications", publication.id.clone(), serde_json::json!({"id":publication.id,"record":publication}))); }
+        }
+        Ok(records)
+    }, Some(chat_id))
+}
+
+pub(crate) fn install_workspace_journal(store: &Arc<DocsStore>, doc: &comet_doc::WorkspaceDoc, device: &str, project: &str, user: &str) -> Result<(), EngineError> {
+    let key = CacheScope { project:project.into(),principal:user.into(),deployment:None,session:format!("ws4/{project}") }.key()?;
+    store.claim_document_scope(crate::workspace_host::WORKSPACE_DOC_ID,&key,None)?;
+    install_document_journal(store, crate::workspace_host::WORKSPACE_DOC_ID, &key, &doc.binding(), || {
+        let raw = doc.doc().fork();
+        comet_doc::WorkspaceDoc::from_doc(raw.clone()).migrate_execution_rows()?;
+        let mut records = Vec::new();
+        let refs_prefix = format!("{}:{user}:", user.len());
+        for container in ["devices", "spaces", "chats", "sessions", "sessionRefs", "worktreeDeletions"] {
+            if let serde_json::Value::Object(rows) = raw.get_map(container).get_deep_value().to_json_value() {
+                for (key,value) in rows {
+                    let owned = if container == "devices" { key == device }
+                        else if container == "sessionRefs" { key.starts_with(&refs_prefix) }
+                        else if container == "worktreeDeletions" { value.get("ownerDeviceId").and_then(|value| value.as_str()) == Some(device) }
+                        else { value.get("deviceId").and_then(|value| value.as_str()) == Some(device) };
+                    if owned { records.push(legacy_record(container,key,value)); }
+                }
+            }
+        }
+        Ok(records)
+    }, None)
+}
 
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
@@ -175,7 +292,7 @@ impl comet_sync::UrlProvider for EdgeRoomUrl {
             let token = token.token().await.ok_or_else(|| {
                 comet_sync::SyncError::Auth("no access token (signed out)".into())
             })?;
-            let mut url = format!("{base}?token={token}");
+            let mut url = format!("{base}?token={token}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL);
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
             }
@@ -212,9 +329,11 @@ enum CommandNudgeRoute {
 struct DocHostInner {
     store: Arc<DocsStore>,
     config: DocHostConfig,
-    sessions: OnceLock<SessionsEngine>,
+    sessions: OnceLock<crate::sessions::WeakSessionsEngine>,
     workspace: OnceLock<WorkspaceHost>,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// Retry metadata only; never retains hydrated documents. Token changes are due immediately.
+    nudge_attempts: Mutex<HashMap<String, (String, i64)>>,
     /// Host-local authority populated only by authenticated relay frames or the
     /// authenticated local identity path. Never imported from Loro.
     trusted_grants: Mutex<HashMap<String, TrustedGrant>>,
@@ -371,6 +490,8 @@ pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
+    store: Arc<DocsStore>,
+    cache_scope: Mutex<CacheScope>,
     messages_tx: watch::Sender<Arc<SessionEntryWindow>>,
     /// True when the doc changed while nobody watched: the bounded tail mirror
     /// is rebuilt on the next `watch_messages` attach.
@@ -379,6 +500,13 @@ pub struct ChatDocHandle {
     last_access: AtomicI64,
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
+    /// Reused across all full checkpoints, not an immutable snapshot cache.
+    snapshot_buffer: Mutex<Vec<u8>>,
+    /// Full snapshots checkpoint the durable journal only after quiescence.
+    changes: watch::Receiver<u64>,
+    snapshot_epoch: Mutex<Option<u64>>,
+    /// Imports and edits outside the semantic journal retain periodic checkpoints.
+    unjournaled_changes: Arc<AtomicBool>,
     room_projection: Mutex<Option<SessionRoomProjection>>,
     room: Mutex<Option<RoomClient>>,
     room_join_task: Mutex<Option<tokio::task::AbortHandle>>,
@@ -389,7 +517,7 @@ pub struct ChatDocHandle {
     command_lock: Mutex<()>,
     room_join_started: AtomicBool,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
-    _sub: loro::Subscription,
+    _sub: comet_doc::DocumentSubscription,
 }
 
 impl Drop for ChatDocHandle {
@@ -412,6 +540,8 @@ impl ChatDocHandle {
     pub fn doc_arc(&self) -> Arc<SessionDoc> {
         self.doc.clone()
     }
+
+    pub fn recovery_error(&self) -> Option<String> { self.doc.binding().recovery_error() }
 
     /// Bounded joined transcript tail watch (`WatchDocMessages`).
     ///
@@ -441,44 +571,56 @@ impl ChatDocHandle {
         self.last_access.store(now_ms(), Ordering::Relaxed);
     }
 
-    /// Adopt the exact trusted Scaffold room for a handle that was opened
-    /// locally before attach completed. A handle may move from unprojected to
-    /// projected once. Projection-aware opens must keep matching exactly;
-    /// ordinary opens preserve an established trusted projection.
+    /// Retargeting is permitted only before any application record is accepted.
+    /// A nonempty cache and its durable journal never cross physical room scope.
     fn ensure_room_projection(
-        &self,
-        requested: Option<&SessionRoomProjection>,
+        &self, requested: Option<&SessionRoomProjection>, scope: &CacheScope,
     ) -> Result<(), EngineError> {
+        let _command = lock(&self.command_lock);
+        let binding = self.doc.binding();
+        let _operation = binding.operation();
+        let mut cached_scope = lock(&self.cache_scope);
+        if cached_scope.project != scope.project || cached_scope.principal != scope.principal || cached_scope.session != scope.session {
+            return Err(EngineError::Other("cached records belong to a different authenticated principal/project/session; original retained".into()));
+        }
         let mut current = lock(&self.room_projection);
-        match (current.as_ref(), requested) {
-            (_, None) => return Ok(()),
-            (Some(existing), Some(requested)) if existing == requested => return Ok(()),
-            (Some(_), Some(_)) => {
-                return Err(EngineError::Other(
-                    "chat is already open with a different session room projection".into(),
-                ));
+        if let (Some(existing),Some(requested)) = (current.as_ref(),requested) {
+            if existing != requested { return Err(EngineError::Other("chat is already open with a different session room projection".into())); }
+        }
+        if *cached_scope != *scope {
+            let old_key = cached_scope.key()?;
+            if requested.is_none() || !empty_session_cache(&self.doc) || !binding.pending_records().is_empty()
+                || self.store.has_semantic_records(&old_key)? {
+                return Err(EngineError::Other("nonempty cache cannot cross deployment scope; original snapshot and intents retained".into()));
             }
-            (None, Some(requested)) => {
-                *current = Some(requested.clone());
-            }
+            let new_key = scope.key()?;
+            self.store.claim_document_scope(&self.chat_id,&new_key,Some(&old_key))?;
+            self.store.migrate_pending_records(&new_key,&[])?;
+            let store = self.store.clone(); let snapshot_id = self.chat_id.clone();
+            binding.install_journal(Vec::new(),Arc::new(move |records,snapshot| {
+                store.save_pending_records_for_snapshot(&new_key,&snapshot_id,records.iter().map(Arc::as_ref),snapshot).map_err(|error| error.to_string())
+            }));
+            binding.invalidate_scope();
+            *cached_scope = scope.clone();
+        }
+        match (current.as_ref(),requested) {
+            (_,None) => return Ok(()),
+            (Some(_),Some(_)) => return Ok(()),
+            (None,Some(requested)) => *current = Some(requested.clone()),
         }
         drop(current);
-
-        // A join may already be connected or dialing the legacy room. Bump the
-        // generation before dropping the current client so an old dial cannot
-        // install itself after the new projected join starts.
+        // The scope token rejects even an old actor already blocked in import,
+        // while these aborts cancel sockets and pending connection descendants.
         let mut join_task = lock(&self.room_join_task);
-        self.room_generation.fetch_add(1, Ordering::AcqRel);
-        if let Some(task) = join_task.take() {
-            task.abort();
-        }
+        self.room_generation.fetch_add(1,Ordering::AcqRel);
+        if let Some(task) = join_task.take() { task.abort(); }
         drop(lock(&self.room).take());
-        self.room_join_started.store(false, Ordering::Release);
+        self.room_join_started.store(false,Ordering::Release);
         Ok(())
     }
 
     pub fn connected(&self) -> bool {
-        lock(&self.room).is_some()
+        lock(&self.room).as_ref().is_some_and(|room| room.stats().connected)
     }
 
     /// Write a complete user message, idempotent by durable message id. Returns whether
@@ -610,34 +752,50 @@ impl ChatDocHandle {
 impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
         let (authority_tx, _) = watch::channel(0);
-        Self {
+        let host = Self {
             inner: Arc::new(DocHostInner {
                 store,
                 config,
                 sessions: OnceLock::new(),
                 workspace: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
+                nudge_attempts: Mutex::new(HashMap::new()),
                 trusted_grants: Mutex::new(HashMap::new()),
                 edge_grants_ready: AtomicBool::new(false),
                 authority_tx,
             }),
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&host.inner);
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(EVICT_MIN_IDLE_MS as u64)).await;
+                    let Some(inner) = weak.upgrade() else { break; };
+                    let host = DocHost { inner };
+                    host.process_pending_nudges(None);
+                    host.evict_over_budget();
+                }
+            });
         }
+        host
     }
 
     /// Wire the sessions engine (engine assembly; see `SessionsEngine::set_doc_host`).
-    pub fn set_sessions(&self, sessions: SessionsEngine) {
-        let _ = self.inner.sessions.set(sessions);
+    pub fn set_sessions(&self, sessions: &SessionsEngine) {
+        let _ = self.inner.sessions.set(sessions.downgrade());
         // Commands may already be pending in warm-opened docs.
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             let host = self.clone();
             tokio::spawn(async move { host.drain_commands(&handle).await });
         }
+        self.process_pending_nudges(None);
     }
 
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
     pub fn set_workspace(&self, workspace: WorkspaceHost) {
         let _ = self.inner.workspace.set(workspace);
+        self.process_pending_nudges(None);
     }
 
     /// The workspace host, once wired (tests may assemble a DocHost without one).
@@ -728,20 +886,16 @@ impl DocHost {
             deployment_id: deployment_id.to_owned(),
             session_id: stream_session_id.to_owned(),
         };
-        self.open_projection(stream_session_id, Some(&projection))
-            .map_err(|_| "grant_room_projection_rejected")?;
-        {
+        // This verified envelope is scope evidence for legacy cache migration.
+        // Roll it back if the cache cannot be safely bound to that exact room.
+        let previous = lock(&self.inner.trusted_grants).insert(grant.id.clone(),TrustedGrant { grant:grant.clone(),edge_derived:true });
+        if self.open_projection(stream_session_id,Some(&projection)).is_err() {
             let mut grants = lock(&self.inner.trusted_grants);
-            grants.retain(|_, trusted| !trusted.edge_derived);
-            grants.insert(
-                grant.id.clone(),
-                TrustedGrant {
-                    grant: grant.clone(),
-                    edge_derived: true,
-                },
-            );
-            self.inner.edge_grants_ready.store(true, Ordering::Release);
+            if let Some(previous) = previous { grants.insert(grant.id.clone(),previous); } else { grants.remove(&grant.id); }
+            return Err("grant_room_projection_rejected");
         }
+        lock(&self.inner.trusted_grants).retain(|id,trusted| !trusted.edge_derived || id == &grant.id);
+        self.inner.edge_grants_ready.store(true,Ordering::Release);
         self.inner
             .authority_tx
             .send_modify(|version| *version = version.wrapping_add(1));
@@ -749,6 +903,8 @@ impl DocHost {
             grant.id.clone(),
             grant.expires_at.expect("validated expiry"),
         );
+        lock(&self.inner.nudge_attempts).remove(stream_session_id);
+        self.process_pending_nudges(Some(stream_session_id));
         Ok(())
     }
 
@@ -924,7 +1080,7 @@ impl DocHost {
     /// can never serve, so the join loop would retry a permanent 404 forever.
     /// Those docs stay local regardless of which controller they acquire.
     fn chat_allows_room_join(&self, chat_id: &str) -> bool {
-        !chat_id.starts_with("local-chat-")
+        uuid::Uuid::parse_str(chat_id).is_ok_and(|id| id.to_string() == chat_id)
     }
 
     fn start_room_join(&self, handle: Arc<ChatDocHandle>) {
@@ -950,9 +1106,10 @@ impl DocHost {
             format!("/session/{}/ws", handle.chat_id),
             projection.as_ref(),
         );
-        let room_doc = handle.doc.doc().clone();
+        let room_doc = handle.doc.binding();
         let chat = handle.chat_id.clone();
         let weak = Arc::downgrade(&handle);
+        let weak_host = Arc::downgrade(&self.inner);
         let task = tokio::spawn(async move {
             let mut wake = comet_sync::wake::subscribe();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
@@ -962,7 +1119,7 @@ impl DocHost {
                 }) {
                     return;
                 }
-                let cap = match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await
+                let cap = match RoomClient::connect_binding_via_tuned(url.clone(), &chat, room_doc.clone(), comet_sync::RoomTuning::default()).await
                 {
                     Ok(client) => {
                         let Some(handle) = weak.upgrade() else {
@@ -973,6 +1130,12 @@ impl DocHost {
                             return;
                         }
                         *room = Some(client);
+                        drop(room);
+                        if let Some(sessions) = weak_host.upgrade().and_then(|host| host.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade)) {
+                            if let Err(error) = sessions.recover_stale_in_room(&chat) {
+                                tracing::warn!(%chat, %error, "room-baseline recovery failed");
+                            }
+                        }
                         tracing::info!(chat = %chat, "session room joined");
                         return;
                     }
@@ -997,6 +1160,15 @@ impl DocHost {
             }
         });
         *join_task = Some(task.abort_handle());
+    }
+
+    pub(crate) fn recovery_is_online(&self) -> bool {
+        self.inner.config.edge.is_some()
+    }
+
+    pub(crate) fn recovery_baseline_ready(&self, handle: &ChatDocHandle) -> bool {
+        self.inner.config.edge.is_none() || !self.chat_allows_room_join(&handle.chat_id)
+            || lock(&handle.room).is_some()
     }
 
     /// Start room supervision for an already-open chat (e.g. once a native run
@@ -1028,7 +1200,185 @@ impl DocHost {
             self.start_room_join(handle.clone());
             return Ok(handle);
         }
+        if let Some((public_id, session_id)) = chat_id.split_once("::session::") {
+            if ![public_id, session_id].iter().all(|id| uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == *id)) {
+                return Err(EngineError::Other("invalid private execution identity".into()));
+            }
+            let sessions = self.inner.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade)
+                .ok_or_else(|| EngineError::Other("recovered execution authority is unavailable".into()))?;
+            if sessions.recovered_context_if_present(chat_id)?.is_none() {
+                return Err(EngineError::Other("execution alias has no authenticated durable context".into()));
+            }
+            let handle = self.open(public_id)?;
+            let workspace = self.workspace();
+            let owner = workspace.map_or(crate::workspace_host::DEFAULT_USER_ID, WorkspaceHost::owner_subject);
+            let snapshot = handle.doc.collaboration_snapshot()?;
+            let owned = snapshot.sessions.iter().any(|record| {
+                record.session_id == session_id && record.chat_id == public_id
+                    && record.owner_device_id == self.device_id() && record.owner_subject == owner
+            }) || (session_id == public_id && workspace.is_some_and(|workspace| {
+                workspace.doc().chat(public_id).ok().flatten()
+                    .is_some_and(|chat| chat.device_id == self.device_id())
+            })) || (session_id == public_id && workspace.is_none()
+                && !snapshot.sessions.iter().any(|record| record.session_id == public_id));
+            if !owned {
+                return Err(EngineError::Other("recovered execution has no matching owned public session".into()));
+            }
+            self.migrate_private_output(chat_id, session_id, &handle)?;
+            lock(&self.inner.handles).insert(chat_id.to_string(), handle.clone());
+            return Ok(handle);
+        }
         self.open(chat_id)
+    }
+
+    fn migrate_private_output(&self, execution_key: &str, session_id: &str, handle: &ChatDocHandle) -> Result<(), EngineError> {
+        let scope = lock(&handle.cache_scope).key()?;
+        let marker = format!("private-output/{scope}/{execution_key}");
+        if self.inner.store.is_local_migration_applied(&marker)? { return Ok(()) }
+        let Some(bytes) = self.inner.store.load_snapshot(execution_key)? else { return Ok(()) };
+        let raw = loro::LoroDoc::new();
+        let imported = raw.import(&bytes).map_err(|error| EngineError::Other(error.to_string()))?;
+        if imported.pending.as_ref().is_some_and(|pending| !pending.is_empty())
+            || raw.is_detached() || raw.state_vv() != raw.oplog_vv() {
+            return Err(EngineError::Other("private output snapshot is incomplete; original retained".into()));
+        }
+        let legacy = SessionDoc::from_doc(raw);
+        if !legacy.chat_id().is_some_and(|id| id == execution_key || id == handle.chat_id) {
+            return Err(EngineError::Other("legacy output has a different logical owner; original retained".into()));
+        }
+        let principal = self.workspace().map_or(crate::workspace_host::DEFAULT_USER_ID,WorkspaceHost::owner_subject);
+        let mut publications = legacy.read_publications()?;
+        // Validate every ownership claim before any recovered output becomes public.
+        for publication in &mut publications {
+            let PublicationValue::MessageProvenance(provenance) = &mut publication.value else { continue };
+            if publication.published_by != principal || provenance.author_subject != principal || provenance.owner_device_id != self.device_id() {
+                return Err(EngineError::Other("legacy provenance has a different owner; original retained".into()));
+            }
+            if provenance.session_id == execution_key { provenance.session_id = session_id.to_string(); }
+            if provenance.session_id.contains("::session::") { return Err(EngineError::Other("legacy provenance has an unresolved execution identity".into())); }
+            publication.id = publication.id.replace(execution_key,session_id);
+        }
+        let binding = handle.doc.binding();
+        let _operation = binding.operation();
+        let candidate_raw = loro::LoroDoc::new();
+        candidate_raw.import(&handle.doc.export_snapshot()?)
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let candidate = SessionDoc::from_doc(candidate_raw);
+        let mut recovered = legacy.read_entries()?;
+        for entry in &mut recovered {
+            if entry.role == MessageRole::Assistant && entry.device_id != self.device_id() {
+                return Err(EngineError::Other("private output belongs to another device; original retained".into()));
+            }
+            if let Some(peer) = &mut entry.peer_message { if peer.source_chat_id == execution_key { peer.source_chat_id = handle.chat_id.clone(); } }
+            // An accepted user message retains its original authoritative clock.
+            if let Some(current) = candidate.read_entry(&entry.id)?
+                && current.role == MessageRole::User && entry.role == MessageRole::User
+                && current.parts == entry.parts
+                && handle.doc.read_command(&entry.id)?.is_some_and(|command| command.status == SessionCommandStatus::Applied)
+            {
+                continue;
+            }
+            candidate.reconcile_message(entry)?;
+        }
+        for publication in &publications {
+            if !matches!(&publication.value,PublicationValue::MessageProvenance(_)) { continue }
+            candidate.append_publication(publication)?;
+        }
+        // Original snapshots and execution journals remain intact. In particular,
+        // commands are never copied or drained as part of output recovery.
+        drop(_operation);
+        // Publish validated typed records through the existing semantic journal,
+        // so later snapshot recovery cannot lose this migration's local intent.
+        for entry in recovered {
+            if let Some(current) = handle.doc.read_entry(&entry.id)?
+                && current.role == MessageRole::User && entry.role == MessageRole::User
+                && current.parts == entry.parts
+                && handle.doc.read_command(&entry.id)?.is_some_and(|command| command.status == SessionCommandStatus::Applied)
+            {
+                continue;
+            }
+            handle.doc.reconcile_message(&entry)?;
+        }
+        for publication in publications {
+            if matches!(&publication.value, PublicationValue::MessageProvenance(_)) {
+                handle.doc.append_publication(&publication)?;
+            }
+        }
+        self.inner.store.save_snapshot(&handle.chat_id, &handle.doc.export_snapshot()?)?;
+        self.inner.store.mark_local_migration_applied(&marker)?;
+        Ok(())
+    }
+
+    /// Durable acceptance is the ACK boundary, not opening a replaceable cache.
+    pub(crate) fn accept_nudge(&self, nudge: comet_rpc::Nudge) -> Result<(), EngineError> {
+        if let Some(nudge_id) = nudge.nudge_id {
+            self.inner.store.accept_nudge(&nudge.chat_id, &nudge_id)?;
+            self.process_pending_nudges(Some(&nudge.chat_id));
+        } else {
+            // Legacy frames remain readable but cannot receive durable ACKs.
+            self.open_for_nudge(&nudge.chat_id)?;
+        }
+        Ok(())
+    }
+
+    fn process_pending_nudges(&self, priority_chat: Option<&str>) {
+        if self.workspace().is_none() || self.inner.sessions.get().is_none() {
+            return;
+        }
+        let mut wakes = match self.inner.store.pending_nudges() {
+            Ok(wakes) => wakes,
+            Err(error) => {
+                tracing::warn!(%error, "durable wake restore failed");
+                return;
+            }
+        };
+        let retries = lock(&self.inner.nudge_attempts);
+        wakes.sort_unstable_by_key(|(chat, token, _)| {
+            let due = retries.get(chat).filter(|(attempted, _)| attempted == token).map_or(0, |(_, due)| *due);
+            (priority_chat != Some(chat.as_str()), due)
+        });
+        drop(retries);
+        let now = now_ms();
+        let mut attempts = 0;
+        for (chat_id, nudge_id, accepted_at) in wakes {
+            // No command id/frontier accompanies a wake: observing old commands
+            // cannot prove its work arrived. Admission TTL safely covers expiry.
+            if now.saturating_sub(accepted_at) >= COMMAND_DEFAULT_TTL_MS {
+                if let Err(error) = self.inner.store.complete_nudge(&chat_id, &nudge_id) {
+                    tracing::warn!(%chat_id, %error, "durable wake completion failed");
+                }
+                let mut retries = lock(&self.inner.nudge_attempts);
+                if retries.get(&chat_id).is_some_and(|(token, _)| token == &nudge_id) {
+                    retries.remove(&chat_id);
+                }
+                continue;
+            }
+            let mut retries = lock(&self.inner.nudge_attempts);
+            let same_token = retries.get(&chat_id).is_some_and(|(token, _)| token == &nudge_id);
+            if same_token && retries.get(&chat_id).is_some_and(|(_, due)| now < *due) {
+                continue;
+            }
+            // A healthy room (or its initial-join supervisor) already owes the
+            // work. Do not touch its LRU age or reopen it every janitor tick.
+            if same_token && lock(&self.inner.handles).get(&chat_id).is_some_and(|handle| {
+                handle.connected() || handle.room_join_started.load(Ordering::Acquire)
+            }) {
+                continue;
+            }
+            // ponytail: eight opens/pass; retry metadata stays cold, not 1600 hydrated docs.
+            if attempts == 8 { continue; }
+            attempts += 1;
+            retries.insert(chat_id.clone(), (nudge_id, now + REJECTED_RETRY_CAP.as_millis() as i64));
+            drop(retries);
+            match self.open_for_nudge(&chat_id) {
+                Ok(Some(handle)) => {
+                    let host = self.clone();
+                    tokio::spawn(async move { host.drain_commands(&handle).await });
+                }
+                Ok(None) => {} // Exact verified owner grant has not arrived.
+                Err(error) => tracing::warn!(%chat_id, %error, "durable wake deferred"),
+            }
+        }
     }
 
     /// Open a nudged chat without allowing a Scaffold host to join an
@@ -1037,13 +1387,10 @@ impl DocHost {
         &self,
         chat_id: &str,
     ) -> Result<Option<Arc<ChatDocHandle>>, EngineError> {
-        if let Some(handle) = lock(&self.inner.handles).get(chat_id).cloned() {
-            handle.touch();
+        if comet_proto::parse_scaffold_device_id(self.device_id()).is_none() {
+            let handle = self.open(chat_id)?;
             self.start_room_join(handle.clone());
             return Ok(Some(handle));
-        }
-        if comet_proto::parse_scaffold_device_id(self.device_id()).is_none() {
-            return self.open(chat_id).map(Some);
         }
 
         let now = now_ms();
@@ -1078,6 +1425,10 @@ impl DocHost {
         chat_id: &str,
         projection: Option<&SessionRoomProjection>,
     ) -> Result<Arc<ChatDocHandle>, EngineError> {
+        if chat_id.contains("::session::") {
+            return Err(EngineError::Other("private execution keys cannot open public documents".into()));
+        }
+        let mut cache_scope = self.cache_scope(chat_id, projection);
         if let Some(projection) = projection
             && (projection.project_id != self.workspace().map_or("", WorkspaceHost::project_scope)
                 || projection.session_id != chat_id
@@ -1087,11 +1438,13 @@ impl DocHost {
                 "session room projection does not match local project/chat".into(),
             ));
         }
-        if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
-            handle.ensure_room_projection(projection)?;
+        let existing_handle = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(handle) = existing_handle {
+            if projection.is_none() && cache_scope.deployment.is_none() { cache_scope.deployment = lock(&handle.cache_scope).deployment.clone(); }
+            handle.ensure_room_projection(projection,&cache_scope)?;
             handle.touch();
             self.start_room_join(handle.clone());
-            return Ok(handle.clone());
+            return Ok(handle);
         }
         let mut snapshot_len = 0usize;
         let doc = match self.inner.store.load_snapshot(chat_id)? {
@@ -1105,9 +1458,59 @@ impl DocHost {
             None => SessionDoc::init(chat_id)?,
         };
         let doc = Arc::new(doc);
+        if doc.chat_id().as_deref() != Some(chat_id) { return Err(EngineError::Other("cached document has a different public identity; original retained".into())); }
+        let persisted_scope = self.inner.store.document_scope(chat_id)?;
+        if let Some(scope) = &persisted_scope {
+            let persisted: CacheScope = serde_json::from_str(scope).map_err(|error| EngineError::Other(format!("invalid cached room scope: {error}")))?;
+            if cache_scope.deployment.is_none() && projection.is_none() { cache_scope.deployment = persisted.deployment.clone(); }
+            if cache_scope != persisted {
+                if cache_scope.project != persisted.project || cache_scope.principal != persisted.principal || cache_scope.session != persisted.session
+                    || !empty_session_cache(&doc) || self.inner.store.has_semantic_records(scope)? {
+                    return Err(EngineError::Other("cached snapshot and intent belong to a different authenticated room scope; original retained".into()));
+                }
+                self.inner.store.claim_document_scope(chat_id,&cache_scope.key()?,Some(scope))?;
+            }
+        } else if cache_scope.deployment.is_some() && (!empty_session_cache(&doc) || !self.inner.store.load_pending_records(chat_id)?.is_empty()) {
+            if !self.verified_cache_scope(&cache_scope,false,None) {
+                return Err(EngineError::Other("legacy scoped cache requires a verified exact attach/runtime grant; original snapshot and journal retained".into()));
+            }
+        }
+        if self.inner.config.edge.is_some() && uuid::Uuid::parse_str(chat_id).is_ok()
+            && comet_proto::parse_scaffold_device_id(self.device_id()).is_some() && cache_scope.deployment.is_none() {
+            return Err(EngineError::Other("scoped runtime must receive verified deployment identity before opening its room".into()));
+        }
+        let scope_key = cache_scope.key()?;
+        self.inner.store.claim_document_scope(chat_id,&scope_key,None)?;
+        let selected_projection = cache_scope.projection();
+        install_session_journal(&self.inner.store, chat_id, &scope_key, &doc, self.device_id())?;
+        self.recover_processed_outcomes(chat_id, &scope_key, &doc)?;
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
-        let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
+        let unjournaled_changes = Arc::new(AtomicBool::new(false));
+        let unjournaled = unjournaled_changes.clone();
+        let sub = doc.binding().subscribe_root(Arc::new(move |diff| {
+            if diff.triggered_by != loro::EventTriggerKind::Local || diff.events.iter().any(|event| {
+                let root = match event.target {
+                    loro::ContainerID::Root { .. } => Some(event.target),
+                    _ => event.path.first().map(|(id, _)| id),
+                };
+                match root {
+                    Some(loro::ContainerID::Root { name, .. }) => match name.as_str() {
+                        "messages" | "commands" | "publications" => {
+                            !matches!(event.path.get(1), Some((_, loro::Index::Seq(_))))
+                                && !matches!(&event.diff, loro::event::Diff::List(items)
+                                    if items.iter().all(|item| !matches!(item, loro::event::ListDiffItem::Delete { .. })))
+                        }
+                        "agentSessions" => false,
+                        "meta" => !matches!(&event.diff, loro::event::Diff::Map(map)
+                            if map.updated.keys().all(|key| *key == "directoryCompletedTurn")),
+                        _ => true,
+                    },
+                    _ => true,
+                }
+            }) {
+                unjournaled.store(true, Ordering::Relaxed);
+            }
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
         // The mirror starts dirty and empty: many opens never watch a
@@ -1120,11 +1523,17 @@ impl DocHost {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
             doc: doc.clone(),
+            store: self.inner.store.clone(),
+            cache_scope: Mutex::new(cache_scope.clone()),
             messages_tx,
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
-            room_projection: Mutex::new(projection.cloned()),
+            snapshot_buffer: Mutex::new(Vec::new()),
+            changes: changed_rx.clone(),
+            snapshot_epoch: Mutex::new(None),
+            unjournaled_changes,
+            room_projection: Mutex::new(selected_projection.clone()),
             room: Mutex::new(None),
             room_join_task: Mutex::new(None),
             room_generation: AtomicU64::new(0),
@@ -1135,7 +1544,7 @@ impl DocHost {
         let racing = {
             let mut handles = lock(&self.inner.handles);
             if let Some(existing) = handles.get(chat_id) {
-                existing.ensure_room_projection(projection)?;
+                // Waiting on command/scope gates must happen outside this map lock.
                 Some(existing.clone())
             } else {
                 handles.insert(chat_id.to_string(), handle.clone());
@@ -1143,13 +1552,14 @@ impl DocHost {
             }
         };
         if let Some(existing) = racing {
+            existing.ensure_room_projection(selected_projection.as_ref(),&cache_scope)?;
             self.start_room_join(existing.clone());
             return Ok(existing);
         }
 
         self.start_room_join(handle.clone());
 
-        tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
+        tokio::spawn(chat_task(Arc::downgrade(&self.inner), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
         Ok(handle)
     }
@@ -1157,10 +1567,24 @@ impl DocHost {
     /// Bind a per-agent-session execution key to the shared thread document. SessionsEngine
     /// remains keyed by its first argument, so distinct keys run concurrently while every
     /// writer receives the same `SessionDoc` and publications CRDT-merge in one room.
-    fn bind_session_execution_key(&self, handle: &Arc<ChatDocHandle>, session_id: &str) -> String {
+    fn bind_session_execution_key(&self, handle: &Arc<ChatDocHandle>, session_id: &str) -> Result<String, EngineError> {
         let key = format!("{}::session::{session_id}", handle.chat_id);
+        // Canonical controls must preserve both a live bare writer and its
+        // durable pending recovery before boot has reconstructed status.
+        if session_id == handle.chat_id
+            && let Some(sessions) = self.inner.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade)
+        {
+            let bare = sessions.session_status(&handle.chat_id);
+            if bare.as_ref().is_some_and(|status| matches!(status.status,
+                comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput))
+                || (sessions.session_status(&key).is_none() && !sessions.has_pending_recovery(&key)?
+                    && (bare.is_some() || sessions.has_pending_recovery(&handle.chat_id)?))
+            {
+                return Ok(handle.chat_id.clone());
+            }
+        }
         lock(&self.inner.handles).insert(key.clone(), handle.clone());
-        key
+        Ok(key)
     }
 
     /// A new sandbox epoch may continue a room without another Start command.
@@ -1209,6 +1633,11 @@ impl DocHost {
                 continue;
             }
             session.owner_device_id = self.device_id().to_string();
+            if let Some(environment) = &mut session.environment {
+                if let comet_proto::SessionEnvironmentSource::Scaffold { sandbox_id,lifecycle_epoch,.. } = &mut environment.source {
+                    *sandbox_id = sandbox.to_string(); *lifecycle_epoch = Some(epoch);
+                }
+            }
             session.status = Some(comet_proto::SessionStatus::Idle);
             session.updated_at = Some(now);
             handle.doc.append_publication(&PublicationRecord {
@@ -1223,7 +1652,7 @@ impl DocHost {
         Ok(())
     }
 
-    /// Mirror only an owned, bound agent execution into its shared session room.
+    /// Mirror an owned execution into its shared room, including legacy bare-chat runs.
     /// Called synchronously under the engine status lock to preserve turn order.
     pub(crate) fn record_agent_session(
         &self,
@@ -1232,26 +1661,73 @@ impl DocHost {
         let Some(handle) = lock(&self.inner.handles).get(&status.chat_id).cloned() else {
             return Ok(());
         };
-        let Some(session_id) = status
+        if status.device_id != self.device_id() {
+            return Ok(());
+        }
+        let bare = status.chat_id == handle.chat_id;
+        let session_id = if bare {
+            handle.chat_id.as_str()
+        } else if let Some(session_id) = status
             .chat_id
             .strip_prefix(handle.chat_id.as_str())
             .and_then(|suffix| suffix.strip_prefix("::session::"))
-        else {
+        {
+            session_id
+        } else {
             return Ok(());
         };
-        let Some(mut session) = handle
-            .doc
-            .collaboration_snapshot()?
-            .sessions
-            .into_iter()
-            .find(|session| {
-                session.session_id == session_id
-                    && session.owner_device_id == self.device_id()
-                    && session.owner_device_id == status.device_id
-            })
-        else {
-            return Ok(());
+        let snapshot = handle.doc.collaboration_snapshot()?;
+        let existing = snapshot.sessions.iter().find(|session| {
+            session.session_id == session_id && session.chat_id == handle.chat_id
+        }).cloned();
+        let mut session = match existing {
+            Some(session) if session.owner_device_id == self.device_id()
+                && self.workspace().is_none_or(|workspace| workspace.owner_subject() == session.owner_subject) => session,
+            Some(_) => return Ok(()),
+            None if bare || session_id == handle.chat_id => {
+                let Some(workspace) = self.workspace().filter(|ws| ws.is_host(&handle.chat_id)) else {
+                    return Ok(());
+                };
+                AgentSessionRecord {
+                    session_id: session_id.to_string(),
+                    chat_id: handle.chat_id.clone(),
+                    owner_subject: workspace.owner_subject().to_string(),
+                    owner_device_id: self.device_id().to_string(),
+                    source: if comet_proto::parse_scaffold_device_id(self.device_id()).is_some() {
+                        comet_proto::AgentSessionSource::Scaffold
+                    } else {
+                        comet_proto::AgentSessionSource::Local
+                    },
+                    environment: None,
+                    harness: Some(self.harness_for(&handle.chat_id)),
+                    model: workspace.chat_config(&handle.chat_id).and_then(|config| config.model),
+                    harness_session_id: None,
+                    status: None,
+                    started_at: None,
+                    updated_at: None,
+                    created_at: status.started_at.unwrap_or(status.updated_at).timestamp_millis(),
+                    unknown: Default::default(),
+                }
+            }
+            None => return Ok(()),
         };
+        if session_id != handle.chat_id && !snapshot.sessions.iter().any(|record| record.session_id == handle.chat_id)
+            && self.workspace().is_some_and(|workspace| workspace.is_host(&handle.chat_id))
+        {
+            // A thread can start with an explicitly addressed child rather than
+            // a bare-chat run. Anchor its existing host, never another runtime.
+            let mut owner = session.clone();
+            owner.session_id = handle.chat_id.clone();
+            owner.status = Some(comet_proto::SessionStatus::Idle);
+            owner.updated_at = Some(status.updated_at.timestamp_millis());
+            handle.doc.append_publication(&PublicationRecord {
+                id: format!("session/{}/owner/{}",handle.chat_id,self.device_id()),
+                schema_version: COLLABORATION_SCHEMA_VERSION,
+                published_at: status.updated_at.timestamp_millis(),
+                published_by: owner.owner_subject.clone(), value: PublicationValue::AgentSession(Box::new(owner)),
+                unknown: Default::default(),
+            })?;
+        }
         let updated_at = status.updated_at.timestamp_millis();
         let started_at = status.started_at.map(|at| at.timestamp_millis());
         if session.status == Some(status.status)
@@ -1260,12 +1736,11 @@ impl DocHost {
         {
             return Ok(());
         }
+        let phase_changed = session.status != Some(status.status);
         session.status = Some(status.status);
         session.updated_at = Some(updated_at);
         session.started_at = started_at;
-        // Publication ids are immutable replay keys, not upsert keys. The engine
-        // already throttles heartbeats; only changed owner snapshots append here.
-        handle.doc.append_publication(&PublicationRecord {
+        let publication = PublicationRecord {
             id: format!(
                 "session/{session_id}/status/{}/{:?}",
                 status.updated_at, status.status
@@ -1275,8 +1750,28 @@ impl DocHost {
             published_by: session.owner_subject.clone(),
             value: PublicationValue::AgentSession(Box::new(session)),
             unknown: Default::default(),
-        })?;
+        };
+        if phase_changed {
+            handle.doc.append_publication(&publication)?;
+        }
+        handle.doc.upsert_agent_session(&publication)?;
         Ok(())
+    }
+
+    /// Public activity belongs to the thread, not a private execution key. The
+    /// chosen writer's genuine heartbeat controls freshness, including stale work.
+    pub(crate) fn owner_thread_session(&self, status: &comet_proto::Session) -> Option<comet_proto::Session> {
+        let handle = lock(&self.inner.handles).get(&status.chat_id).cloned()?;
+        let workspace = self.workspace()?;
+        if status.device_id != self.device_id() { return None }
+        let snapshot = handle.doc.collaboration_snapshot().ok()?;
+        let owned = |session: &&AgentSessionRecord| session.chat_id == handle.chat_id
+            && session.owner_device_id == self.device_id() && session.owner_subject == workspace.owner_subject();
+        let canonical = snapshot.sessions.iter().filter(owned).find(|session| session.session_id == handle.chat_id)
+            .or_else(|| snapshot.sessions.iter().filter(owned).find(|session| {
+                status.chat_id == format!("{}::session::{}",handle.chat_id,session.session_id)
+            }))?;
+        crate::session_activity::aggregate_owner_thread(&snapshot.sessions,canonical,now_ms())
     }
 
     // A native handoff assigns the chat UUID as its agent session. Legacy
@@ -1291,18 +1786,41 @@ impl DocHost {
                 session.session_id == handle.chat_id && session.owner_device_id == self.device_id()
             })
         {
-            Ok(self.bind_session_execution_key(handle, &handle.chat_id))
+            self.bind_session_execution_key(handle, &handle.chat_id)
         } else {
             Ok(handle.chat_id.clone())
         }
     }
 
+    /// Bound child writers share thread activity, never its native continuation.
+    pub(crate) fn workspace_activity_id(&self, execution_key: &str) -> Option<String> {
+        let handle = lock(&self.inner.handles).get(execution_key).cloned()?;
+        if execution_key == handle.chat_id {
+            return Some(handle.chat_id.clone());
+        }
+        let session_id = execution_key.strip_prefix(handle.chat_id.as_str())?.strip_prefix("::session::")?;
+        let owner = self.workspace()?.owner_subject();
+        handle.doc.collaboration_snapshot().ok()?.sessions.iter().any(|session| {
+            session.session_id == session_id && session.chat_id == handle.chat_id
+                && session.owner_device_id == self.device_id() && session.owner_subject == owner
+        }).then(|| handle.chat_id.clone())
+    }
+
     pub(crate) fn workspace_continuation_id(&self, execution_key: &str) -> String {
+        if let Some(chat_id) = comet_doc::workspace::execution_chat_id(execution_key) {
+            return chat_id.to_string();
+        }
         let handles = lock(&self.inner.handles);
         if let Some(handle) = handles.get(execution_key)
             && execution_key == format!("{}::session::{}", handle.chat_id, handle.chat_id)
         {
             return handle.chat_id.clone();
+        }
+        if let Some((public, session)) = execution_key.split_once("::session::")
+            && public == session
+            && let Ok(id) = uuid::Uuid::parse_str(public)
+        {
+            return id.to_string();
         }
         execution_key.to_string()
     }
@@ -1358,9 +1876,8 @@ impl DocHost {
                 }
             };
             if let Some(handle) = evicted {
-                // Final flush outside the map lock; ≤1s of changes could be
-                // pending in the snapshot debounce.
-                self.save_snapshot(&handle);
+                // Final forced flush outside the map lock, including unjournaled edits.
+                self.save_snapshot(&handle, false);
                 tracing::debug!(chat = %handle.chat_id, "doc evicted (LRU)");
             }
         }
@@ -1422,6 +1939,10 @@ impl DocHost {
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
+    }
+
+    pub fn recovery_error(&self, chat_id: &str) -> Option<String> {
+        lock(&self.inner.handles).get(chat_id).and_then(|handle| handle.recovery_error())
     }
 
     /// Drop a chat's doc unconditionally and delete its local snapshot — the
@@ -1571,8 +2092,15 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
+        self.queue_command_at(chat_id, payload, None, None)
+    }
+
+    pub fn queue_command_at(
+        &self, chat_id: &str, payload: SessionCommandPayload,
+        issued_at: Option<i64>, expires_at: Option<i64>,
+    ) -> Result<String, EngineError> {
         let id = new_id();
-        self.queue_command_with_id(chat_id, &id, payload)?;
+        self.queue_command_with_id_at(chat_id, &id, payload, issued_at, expires_at)?;
         Ok(id)
     }
 
@@ -1584,6 +2112,21 @@ impl DocHost {
         command_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<SessionCommandEntry, EngineError> {
+        self.queue_command_with_id_at(chat_id, command_id, payload, None, None)
+    }
+
+    pub fn queue_command_with_id_at(
+        &self, chat_id: &str, command_id: &str, payload: SessionCommandPayload,
+        issued_at: Option<i64>, expires_at: Option<i64>,
+    ) -> Result<SessionCommandEntry, EngineError> {
+        if let Some(existing) = self.command_entry(chat_id, command_id)? {
+            if existing.payload != payload || issued_at.is_some_and(|value| value != existing.issued_at)
+                || expires_at.is_some_and(|value| Some(value) != existing.expires_at)
+            {
+                return Err(EngineError::Other("command id already names a different immutable intent".into()));
+            }
+            return Ok(existing);
+        }
         let existing = { lock(&self.inner.handles).get(chat_id).cloned() };
         let handle = match existing {
             Some(handle) => {
@@ -1599,9 +2142,31 @@ impl DocHost {
             .into_iter()
             .find(|entry| entry.id == command_id)
         {
+            if existing.payload != payload || issued_at.is_some_and(|value| value != existing.issued_at)
+                || expires_at.is_some_and(|value| Some(value) != existing.expires_at)
+            {
+                return Err(EngineError::Other("command id already names a different immutable intent".into()));
+            }
             return Ok(existing);
         }
+        let deployment = lock(&handle.cache_scope).deployment.clone();
+        if let Some(deployment) = deployment {
+            let authorized = if matches!(&payload,SessionCommandPayload::Control { .. }) {
+                self.control_projection_authorized(chat_id,&deployment,&payload)
+            } else if matches!(&payload,SessionCommandPayload::PeerMessage { .. } | SessionCommandPayload::Steer { .. } | SessionCommandPayload::Queue { .. }) {
+                self.verified_cache_scope(&lock(&handle.cache_scope),false,Some(comet_proto::CAPABILITY_SESSION_CHAT))
+            } else {
+                self.verified_cache_scope(&lock(&handle.cache_scope),true,None)
+            };
+            if !authorized { return Err(EngineError::Other("scoped command requires exact live deployment authority; bare control admission cannot be inherited".into())); }
+        }
         let now = now_ms();
+        let (issued_at, expires_at) = match (issued_at, expires_at) {
+            (None, None) => (now, now + COMMAND_DEFAULT_TTL_MS),
+            (Some(issued), Some(expires)) if issued <= now && now < expires
+                && expires.checked_sub(issued).is_some_and(|lifetime| lifetime > 0 && lifetime <= COMMAND_DEFAULT_TTL_MS) => (issued, expires),
+            _ => return Err(EngineError::Other("command lifetime is incomplete, expired, future, or exceeds admission policy".into())),
+        };
         let based_on = handle.doc.last_message_id().map(|id| CommandBasedOn {
             turn_id: Some(id),
             frontier: None,
@@ -1617,11 +2182,8 @@ impl DocHost {
                 expected_turn_id: Some(expected),
             } = action.as_ref()
         {
-            let execution_key = self.bind_session_execution_key(&handle, session_id);
-            let sessions = self
-                .inner
-                .sessions
-                .get()
+            let execution_key = self.bind_session_execution_key(&handle, session_id)?;
+            let sessions = self.inner.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade)
                 .ok_or_else(|| EngineError::Other("Stop target is no longer active".into()))?;
             sessions.require_turn(&execution_key, expected)?;
         }
@@ -1629,9 +2191,9 @@ impl DocHost {
             id: command_id.to_string(),
             payload,
             issued_by: self.inner.config.device_id.clone(),
-            issued_at: now,
+            issued_at,
             based_on,
-            expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
+            expires_at: Some(expires_at),
             status: SessionCommandStatus::Pending,
             resolution: None,
         };
@@ -1674,17 +2236,12 @@ impl DocHost {
             self.inner.store.trust_local_command(trust_key)?;
         }
         if let Err(err) = handle.doc.queue_command(&entry) {
-            if let Some(trust_key) = trust_key.as_deref() {
+            if let Some(trust_key) = trust_key.as_deref()
+                && matches!(handle.doc.read_command(command_id), Ok(None)) {
                 let _ = self.inner.store.forget_local_command(trust_key);
             }
             return Err(err.into());
         }
-        let explicit_host = match nudge_route {
-            CommandNudgeRoute::None => None,
-            CommandNudgeRoute::WorkspaceHost => None,
-            CommandNudgeRoute::ExactDevice(device_id) => Some(device_id),
-        };
-        self.nudge_remote_host(chat_id, explicit_host.as_deref());
         Ok(entry)
     }
 
@@ -1693,13 +2250,54 @@ impl DocHost {
         chat_id: &str,
         command_id: &str,
     ) -> Result<Option<SessionCommandEntry>, EngineError> {
-        let handle = self.open(chat_id)?;
+        self.command_entry_projection(chat_id, command_id, None)
+    }
+
+    /// Read durable admission evidence without opening or repairing its cache.
+    pub fn command_entry_projection(
+        &self,
+        chat_id: &str,
+        command_id: &str,
+        projection: Option<&SessionRoomProjection>,
+    ) -> Result<Option<SessionCommandEntry>, EngineError> {
+        if chat_id.contains("::session::") {
+            return Err(EngineError::Other("private execution keys cannot read public command outcomes".into()));
+        }
+        let mut scope = self.cache_scope(chat_id, projection);
+        if projection.is_some_and(|projection| projection.project_id != scope.project
+            || projection.session_id != chat_id || projection.deployment_id.trim().is_empty())
+        {
+            return Err(EngineError::Other("command outcome projection does not match local project/chat".into()));
+        }
+        let handle = lock(&self.inner.handles).get(chat_id).cloned();
+        if let Some(persisted) = self.inner.store.document_scope(chat_id)? {
+            let persisted: CacheScope = serde_json::from_str(&persisted)
+                .map_err(|error| EngineError::Other(format!("invalid command outcome scope: {error}")))?;
+            if projection.is_none() && scope.deployment.is_none() {
+                scope.deployment = persisted.deployment.clone();
+            }
+            if scope != persisted {
+                return Err(EngineError::Other("command outcome belongs to a different authenticated room scope".into()));
+            }
+        }
+        if let Some(handle) = &handle {
+            let cached = lock(&handle.cache_scope);
+            if projection.is_none() && scope.deployment.is_none() {
+                scope.deployment = cached.deployment.clone();
+            }
+            if scope != *cached {
+                return Err(EngineError::Other("live command outcome belongs to a different authenticated room scope".into()));
+            }
+        }
+        if let Some(entry) = self.inner.store.load_command_outcome(&scope.key()?, command_id)? {
+            if entry.id != command_id {
+                return Err(EngineError::Other("durable command outcome has a different identity".into()));
+            }
+            return Ok(Some(entry));
+        }
+        let Some(handle) = handle else { return Ok(None) };
         let _guard = lock(&handle.command_lock);
-        Ok(handle
-            .doc
-            .read_commands()?
-            .into_iter()
-            .find(|entry| entry.id == command_id))
+        Ok(handle.doc.read_commands()?.into_iter().find(|entry| entry.id == command_id))
     }
 
     pub fn chat_has_commands(&self, chat_id: &str) -> Result<bool, EngineError> {
@@ -1708,89 +2306,42 @@ impl DocHost {
         Ok(!handle.doc.read_commands()?.is_empty())
     }
 
-    /// POST `{edge}/device/{host}/nudge {chatId}`. Versioned control commands
-    /// carry the remote owner explicitly; legacy commands fall back to the
-    /// workspace chat row. Offline and edge-less engines skip silently.
-    fn nudge_remote_host(&self, chat_id: &str, explicit_host: Option<&str>) {
-        let Some(edge) = self.inner.config.edge.clone() else {
-            return;
-        };
-        let host_device = explicit_host
-            .filter(|device| !device.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                self.workspace()
-                    .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
-                    .map(|chat| chat.device_id)
-            });
-        let Some(host_device) = host_device else {
-            return;
-        };
-        if host_device == self.inner.config.device_id {
-            return;
+    /// Wake only after durable admission, awaited at the actual RPC boundary.
+    /// Failure leaves the immutable instruction and its outcome untouched.
+    pub(crate) async fn wake_queued_command(&self, chat_id: &str, command_id: &str) -> Result<(), EngineError> {
+        let handle = self.open(chat_id)?;
+        let entry = handle.doc.read_command(command_id)?
+            .ok_or_else(|| EngineError::Other("queued command missing".into()))?;
+        if entry.status != SessionCommandStatus::Pending || entry.expires_at.is_some_and(|expires| expires <= now_ms()) {
+            return Ok(());
         }
-        // Only meaningful inside a runtime (RPC handlers, executors); bare sync
-        // callers (unit tests) skip rather than panic.
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let url = format!(
-            "{}/device/{}/nudge",
-            edge.url.trim_end_matches('/'),
-            host_device
-        );
-        let chat = chat_id.to_string();
-        runtime.spawn(async move {
-            const RETRY_DELAYS_MS: [u64; 5] = [0, 250, 1_000, 3_000, 7_000];
-            let http = reqwest::Client::new();
-            for (attempt, delay_ms) in RETRY_DELAYS_MS.into_iter().enumerate() {
-                if delay_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
-                // Fresh bearer per attempt — never the boot-time snapshot.
-                let Some(bearer) = edge.bearer().await else {
-                    if attempt + 1 == RETRY_DELAYS_MS.len() {
-                        tracing::warn!(chat = %chat, "nudge skipped: signed out");
-                    }
-                    continue;
-                };
-                let send = http
-                    .post(&url)
-                    .bearer_auth(&bearer)
-                    .json(&serde_json::json!({ "chatId": chat }))
-                    .timeout(std::time::Duration::from_secs(10))
-                    .send()
-                    .await;
-                match send {
-                    Ok(response) if response.status().is_success() => {
-                        tracing::info!(
-                            chat = %chat,
-                            device = %host_device,
-                            attempts = attempt + 1,
-                            "host nudged"
-                        );
-                        return;
-                    }
-                    Ok(response) if attempt + 1 == RETRY_DELAYS_MS.len() => {
-                        tracing::warn!(
-                            chat = %chat,
-                            device = %host_device,
-                            status = response.status().as_u16(),
-                            "nudge rejected after retries"
-                        );
-                    }
-                    Err(err) if attempt + 1 == RETRY_DELAYS_MS.len() => {
-                        tracing::warn!(
-                            chat = %chat,
-                            device = %host_device,
-                            error = %err,
-                            "nudge failed after retries"
-                        );
-                    }
-                    _ => {}
-                }
-            }
+        let projection = lock(&handle.room_projection).clone();
+        match self.command_nudge_route(chat_id, projection.as_ref(), &entry) {
+            CommandNudgeRoute::None => Ok(()),
+            CommandNudgeRoute::WorkspaceHost => self.nudge_remote_host(chat_id, None).await,
+            CommandNudgeRoute::ExactDevice(device) => self.nudge_remote_host(chat_id, Some(&device)).await,
+        }
+    }
+
+    async fn nudge_remote_host(&self, chat_id: &str, explicit_host: Option<&str>) -> Result<(), EngineError> {
+        let Some(edge) = self.inner.config.edge.clone() else { return Ok(()); };
+        let host_device = explicit_host.map(str::to_string).or_else(|| {
+            self.workspace().and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten()).map(|chat| chat.device_id)
         });
+        let Some(host_device) = host_device else { return Ok(()); };
+        if host_device == self.device_id() { return Ok(()); }
+        let bearer = edge.bearer().await
+            .ok_or_else(|| EngineError::Other("nudge unavailable: signed out".into()))?;
+        let response = reqwest::Client::new()
+            .post(format!("{}/device/{}/nudge?syncProtocol={}", edge.url.trim_end_matches('/'), host_device, comet_proto::DURABLE_SYNC_PROTOCOL))
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({ "chatId": chat_id }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send().await.map_err(|error| EngineError::Other(format!("nudge failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(EngineError::Other(format!("nudge enqueue rejected: HTTP {}", response.status().as_u16())));
+        }
+        Ok(())
     }
 
     /// Legacy chat ownership for pre-v2 commands.
@@ -1817,6 +2368,85 @@ impl DocHost {
             .and_then(|ws| ws.chat_config(chat_id))
             .map(|config| config.harness)
             .unwrap_or(self.inner.config.default_harness)
+    }
+    fn cache_scope(&self, chat_id: &str, projection: Option<&SessionRoomProjection>) -> CacheScope {
+        CacheScope {
+            project:self.workspace().map_or(crate::workspace_host::DEFAULT_PROJECT_SCOPE, WorkspaceHost::project_scope).into(),
+            principal:self.workspace().map_or(crate::workspace_host::DEFAULT_USER_ID, WorkspaceHost::owner_subject).into(),
+            deployment:projection.map(|scope| scope.deployment_id.clone()).or_else(|| self.inner.config.edge.as_ref().map(|edge| edge.deployment_id.clone()).filter(|id| !id.is_empty())),
+            session:chat_id.into(),
+        }
+    }
+
+    fn verified_cache_scope(&self, scope: &CacheScope, runtime_owner: bool, required_capability: Option<&str>) -> bool {
+        let now = now_ms();
+        lock(&self.inner.trusted_grants).values().any(|trusted| {
+            let grant = &trusted.grant;
+            (trusted.edge_derived || grant.granted_by == "comet-edge-device-room" || grant.granted_by == "authenticated-local-identity")
+                && (!runtime_owner || grant.device_id.as_deref() == Some(self.device_id()))
+                && grant.principal_subject == scope.principal && grant.scope.project_id == scope.project
+                && grant.scope.deployment_id == scope.deployment && grant.scope.session_id.as_deref() == Some(scope.session.as_str())
+                && grant.granted_at <= now && grant.expires_at.is_some_and(|expires| now < expires) && grant.revoked_at.is_none()
+                && grant.capabilities.iter().any(|capability| required_capability.map_or(
+                    capability == comet_proto::CAPABILITY_SESSION_CHAT || capability == comet_proto::CAPABILITY_SESSION_CONTROL,
+                    |required| capability == required,
+                ))
+        })
+    }
+
+    pub(crate) fn has_scoped_route(&self, chat_id: &str) -> bool {
+        if self.inner.config.edge.as_ref().is_some_and(|edge| !edge.deployment_id.is_empty()) { return true }
+        if let Some(handle) = lock(&self.inner.handles).get(chat_id) { return lock(&handle.cache_scope).deployment.is_some() }
+        self.inner.store.document_scope(chat_id).ok().flatten().is_some_and(|scope| {
+            serde_json::from_str::<CacheScope>(&scope).is_ok_and(|scope| scope.deployment.is_some())
+        })
+    }
+
+    pub(crate) fn has_exact_projection(&self, chat_id: &str, deployment_id: &str) -> bool {
+        let Some(workspace) = self.workspace() else { return false };
+        let handles = lock(&self.inner.handles);
+        let Some(handle) = handles.get(chat_id) else { return false };
+        let scope = lock(&handle.cache_scope);
+        scope.session == chat_id && scope.project == workspace.project_scope()
+            && scope.principal == workspace.owner_subject() && scope.deployment.as_deref() == Some(deployment_id)
+    }
+
+    pub(crate) fn control_projection_authorized(&self, chat_id: &str, deployment_id: &str, command: &SessionCommandPayload) -> bool {
+        if !self.has_exact_projection(chat_id,deployment_id) { return false }
+        let Some(workspace) = self.workspace() else { return false };
+        let SessionCommandPayload::Control { grant_id,owner_device_id,session_id,source,action,.. } = command else { return false };
+        let now = now_ms();
+        lock(&self.inner.trusted_grants).get(grant_id).is_some_and(|trusted| {
+            let grant = &trusted.grant;
+            let trusted_source = match source {
+                comet_proto::AgentSessionSource::Scaffold => trusted.edge_derived || grant.granted_by == "comet-edge-device-room",
+                comet_proto::AgentSessionSource::Local => !trusted.edge_derived && grant.granted_by == "authenticated-local-identity",
+            };
+            trusted_source && session_id == chat_id && grant.scope.session_id.as_deref() == Some(chat_id)
+                && grant.scope.project_id == workspace.project_scope() && grant.scope.deployment_id.as_deref() == Some(deployment_id)
+                && grant.principal_subject == workspace.owner_subject() && grant.device_id.as_deref() == Some(owner_device_id.as_str())
+                && grant.granted_at <= now && grant.expires_at.is_some_and(|expires| now < expires) && grant.revoked_at.is_none()
+                && grant.capabilities.iter().any(|capability| capability == action.required_capability())
+        })
+    }
+
+    fn recover_processed_outcomes(&self, chat_id: &str, scope_key: &str, doc: &SessionDoc) -> Result<(), EngineError> {
+        for entry in doc.read_commands()? {
+            if entry.status != SessionCommandStatus::Pending || !self.owns_command(chat_id, &entry)
+                || !self.inner.store.is_processed(&entry.id)? { continue }
+            let stored = self.inner.store.load_command_outcome(scope_key,&entry.id)?;
+            if let Some(stored) = stored.filter(|stored| stored.status != SessionCommandStatus::Pending) {
+                if stored.payload != entry.payload || stored.issued_by != entry.issued_by
+                    || stored.issued_at != entry.issued_at || stored.expires_at != entry.expires_at || stored.based_on != entry.based_on {
+                    return Err(EngineError::Other("processed command identity conflicts with durable outcome; original retained".into()));
+                }
+                doc.set_command_status(&entry.id,stored.status,stored.resolution.as_deref())?;
+            } else {
+                doc.set_command_status(&entry.id,SessionCommandStatus::Rejected,
+                    Some("Execution was interrupted after admission; its outcome is unknown and the original instruction will not run again"))?;
+            }
+        }
+        Ok(())
     }
 
     fn owns_command(&self, chat_id: &str, entry: &SessionCommandEntry) -> bool {
@@ -1964,11 +2594,12 @@ impl DocHost {
     /// Drain only commands owned by this device. Other owners drain their own session
     /// commands from the same shared document concurrently.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
-        let Some(sessions) = self.inner.sessions.get() else {
+        let Some(sessions) = self.inner.sessions.get().and_then(crate::sessions::WeakSessionsEngine::upgrade) else {
             return;
         };
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
+            if handle.recovery_error().is_some() { return; }
             let commands = match handle.doc.read_commands() {
                 Ok(commands) => commands,
                 Err(err) => {
@@ -2012,10 +2643,14 @@ impl DocHost {
                 skipped.insert(entry.id.clone());
                 continue;
             }
-            if let Err(err) = self.inner.store.mark_processed(&entry.id) {
-                tracing::error!(chat = %handle.chat_id, error = %err,
-                    "processed-ledger write failed; halting drain");
-                return;
+            match self.inner.store.mark_processed(&entry.id) {
+                Ok(true) => {}
+                Ok(false) => continue, // another drain already owns the side effect
+                Err(err) => {
+                    tracing::error!(chat = %handle.chat_id, error = %err,
+                        "processed-ledger write failed; halting drain");
+                    return;
+                }
             }
             match disposition {
                 CommandDisposition::Skip => {
@@ -2034,7 +2669,7 @@ impl DocHost {
                             Some("verified capability grant does not authorize command".into()),
                         )
                     } else {
-                        match self.execute(sessions, handle, &entry).await {
+                        match self.execute(&sessions, handle, &entry).await {
                             Ok(outcome) => outcome,
                             Err(err) => {
                                 tracing::warn!(chat = %handle.chat_id, command = %entry.id, error = %err, "command execution rejected");
@@ -2162,16 +2797,16 @@ impl DocHost {
                 }
                 let harness = self.harness_for(chat_id);
                 sessions
-                    .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
+                    .dispatch(&self.chat_execution_key(handle)?, harness, request.clone(), Some(message_id.clone()))
                     .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
-                self.execute_steer(sessions, chat_id, chat_id, prompt, message_id)
+                self.execute_steer(sessions, &self.chat_execution_key(handle)?, chat_id, prompt, message_id)
                     .await
             }
             SessionCommandPayload::Queue { prompt, message_id } => {
-                self.execute_queue(sessions, chat_id, chat_id, prompt, message_id)
+                self.execute_queue(sessions, &self.chat_execution_key(handle)?, chat_id, prompt, message_id)
                     .await
             }
             SessionCommandPayload::PeerMessage {
@@ -2271,7 +2906,7 @@ impl DocHost {
                         Some("command addressed to another session owner".into()),
                     ));
                 }
-                let execution_key = self.bind_session_execution_key(handle, session_id);
+                let execution_key = self.bind_session_execution_key(handle, session_id)?;
                 match action.as_ref() {
                     SessionControlAction::Start {
                         request,
@@ -2779,18 +3414,34 @@ impl DocHost {
             .get(chat_id)
             .cloned()
             .ok_or_else(|| EngineError::Other("completed turn document unavailable".into()))?;
-        self.inner
-            .store
-            .save_completed_snapshot(chat_id, &handle.doc.export_snapshot()?)?;
+        let binding = handle.doc.binding();
+        let _operation = binding.operation();
+        let epoch = *handle.changes.borrow();
+        let mut bytes = lock(&handle.snapshot_buffer);
+        handle.doc.doc().inner().export_snapshot_into(&mut bytes)
+            .map_err(|error| DocError::Schema(error.to_string()))?;
+        self.inner.store.save_completed_snapshot(chat_id, &bytes)?;
+        handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+        *lock(&handle.snapshot_epoch) = Some(epoch);
+        handle.unjournaled_changes.store(false, Ordering::Relaxed);
         Ok(())
     }
 
-    fn save_snapshot(&self, handle: &ChatDocHandle) {
-        match handle.doc.export_snapshot() {
-            Ok(bytes) => {
+    fn save_snapshot(&self, handle: &ChatDocHandle, skip_checkpointed: bool) {
+        let binding = handle.doc.binding();
+        let _operation = binding.operation();
+        let epoch = *handle.changes.borrow();
+        if skip_checkpointed && *lock(&handle.snapshot_epoch) == Some(epoch) { return; }
+        let mut bytes = lock(&handle.snapshot_buffer);
+        match handle.doc.doc().inner().export_snapshot_into(&mut bytes)
+            .map_err(|error| DocError::Schema(error.to_string())) {
+            Ok(()) => {
                 handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
                 if let Err(err) = self.inner.store.save_snapshot(&handle.chat_id, &bytes) {
                     tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
+                } else {
+                    *lock(&handle.snapshot_epoch) = Some(epoch);
+                    handle.unjournaled_changes.store(false, Ordering::Relaxed);
                 }
             }
             Err(err) => {
@@ -2807,7 +3458,7 @@ impl DocHost {
             .map(|(_, handle)| handle.clone())
             .collect();
         for handle in handles {
-            self.save_snapshot(&handle);
+            self.save_snapshot(&handle, false);
         }
     }
 }
@@ -2855,13 +3506,18 @@ pub fn respond_input_prompt(
 
 /// Per-chat background task: reacts to doc and authority changes by re-publishing
 /// the transcript watch, draining commands, and debouncing snapshots. Holds only
-/// a weak handle so a dropped host tears the task down.
-async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
-    let mut authority_rx = host.watch_authority();
+/// weak references to both the host and handle; idle tasks cannot retain either.
+async fn chat_task(host: Weak<DocHostInner>, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
+    let mut authority_rx = {
+        let Some(inner) = host.upgrade() else { return; };
+        inner.authority_tx.subscribe()
+    };
     // Initial pass: the snapshot may already carry pending commands. The
     // mirror stays lazy — it materializes on the first watch attach.
     {
         let Some(handle) = weak.upgrade() else { return };
+        let Some(inner) = host.upgrade() else { return; };
+        let host = DocHost { inner };
         host.drain_commands(&handle).await;
     }
     let mut save_deadline: Option<tokio::time::Instant> = None;
@@ -2874,9 +3530,13 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                     break; // doc handle (and its change sender) is gone
                 }
                 let Some(handle) = weak.upgrade() else { break };
+                let Some(inner) = host.upgrade() else { break; };
+                let host = DocHost { inner };
                 handle.publish_messages_if_watched();
                 host.drain_commands(&handle).await;
-                if save_deadline.is_none() {
+                // Local semantic edits are durable per commit. Imports and other
+                // edits still need the original periodic checkpoint for durability.
+                if save_deadline.is_none() || !handle.unjournaled_changes.load(Ordering::Relaxed) {
                     save_deadline = Some(
                         tokio::time::Instant::now()
                             + std::time::Duration::from_millis(SNAPSHOT_DEBOUNCE_MS),
@@ -2888,12 +3548,16 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                     break;
                 }
                 let Some(handle) = weak.upgrade() else { break };
+                let Some(inner) = host.upgrade() else { break; };
+                let host = DocHost { inner };
                 host.drain_commands(&handle).await;
             }
             _ = tokio::time::sleep_until(sleep_until), if save_deadline.is_some() => {
                 save_deadline = None;
                 let Some(handle) = weak.upgrade() else { break };
-                host.save_snapshot(&handle);
+                let Some(inner) = host.upgrade() else { break; };
+                let host = DocHost { inner };
+                host.save_snapshot(&handle, true);
                 // Post-quiesce eviction pass: sizes just refreshed.
                 host.evict_over_budget();
             }
@@ -2906,6 +3570,312 @@ mod authority_tests {
     use super::*;
     use comet_proto::{AgentSessionSource, SessionStatus};
     use loro::LoroMap;
+
+
+    fn scoped_test_host(store: Arc<DocsStore>) -> DocHost {
+        let workspace = WorkspaceHost::open(store.clone(),crate::WorkspaceHostConfig {
+            device_id:"device-a".into(),device_name:"Test".into(),platform:"test".into(),
+            project_scope:"scope-project".into(),user_id:"owner".into(),edge:None,
+        }).unwrap();
+        let host = DocHost::new(store,DocHostConfig { device_id:"device-a".into(),default_harness:HarnessId::Mock,edge:None });
+        host.set_workspace(workspace); host
+    }
+
+    #[tokio::test]
+    async fn durable_wake_restores_on_startup_and_survives_cache_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(dir.path(),
+            Arc::new(crate::default_registry(crate::RuntimeProfile::Mock)), HarnessId::Mock,
+            None, "project-a", "owner-a", crate::RuntimeProfile::Mock).unwrap();
+        let store = Arc::new(DocsStore::open(dir.path().join("wake-docs")).unwrap());
+        let config = DocHostConfig { device_id: core.device_id.clone(), default_harness: HarnessId::Mock, edge: None };
+        let host = DocHost::new(store.clone(), config.clone());
+        let chat = "00000000-0000-4000-8000-000000000232";
+        host.accept_nudge(comet_rpc::Nudge { chat_id: chat.into(), nudge_id: Some("old-token".into()) }).unwrap();
+        assert!(!lock(&host.inner.handles).contains_key(chat));
+        drop(host);
+        let restarted = DocHost::new(store.clone(), config);
+        restarted.set_workspace(core.workspace.clone());
+        assert!(!lock(&restarted.inner.handles).contains_key(chat));
+        restarted.set_sessions(&core.sessions);
+        let handle = lock(&restarted.inner.handles).get(chat).cloned().expect("restored wake opens its chat after assembly");
+        handle.last_access.store(7, Ordering::Relaxed);
+        restarted.process_pending_nudges(None);
+        assert_eq!(handle.last_access.load(Ordering::Relaxed), 7, "duplicate wakes must not keep cold docs warm");
+        handle.write_user_message("offline-output", "accepted", 7).unwrap();
+        let replacement = SessionDoc::init(chat).unwrap();
+        handle.doc.binding().adopt_snapshot(&replacement.export_snapshot().unwrap(), Some(chat)).unwrap();
+        assert_eq!(handle.doc.read_entry("offline-output").unwrap().unwrap().parts,
+            vec![MessagePart::Text { id: "t0".into(), text: "accepted".into() }]);
+        assert_eq!(store.pending_nudges().unwrap()[0].1, "old-token");
+        restarted.accept_nudge(comet_rpc::Nudge { chat_id: chat.into(), nudge_id: Some("new-token".into()) }).unwrap();
+        assert!(!store.complete_nudge(chat, "old-token").unwrap());
+        assert_eq!(store.pending_nudges().unwrap()[0].1, "new-token");
+        for id in 1..=17 {
+            store.accept_nudge(&format!("00000000-0000-4000-8000-{id:012}"), "backlog-token").unwrap();
+        }
+        restarted.process_pending_nudges(None);
+        assert_eq!(lock(&restarted.inner.handles).len(), 9);
+        restarted.process_pending_nudges(None);
+        assert_eq!(lock(&restarted.inner.handles).len(), 17);
+        restarted.process_pending_nudges(None);
+        assert_eq!(lock(&restarted.inner.handles).len(), 18);
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scope_claim_preserves_pending_output_on_restart_and_denies_cross_deployment() {
+        let dir = tempfile::tempdir().unwrap(); let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = scoped_test_host(store.clone());
+        let chat = "00000000-0000-4000-8000-000000000211";
+        let projection = SessionRoomProjection { project_id:"scope-project".into(),deployment_id:"deployment-a".into(),session_id:chat.into() };
+        let empty = host.open(chat).unwrap(); let _watch = empty.watch_messages();
+        let bound = host.open_projection(chat,Some(&projection)).unwrap();
+        assert!(Arc::ptr_eq(&empty,&bound));
+        bound.write_user_message("accepted","accepted offline",7).unwrap();
+        let original_scope = store.document_scope(chat).unwrap().unwrap();
+        let mut foreign = projection.clone(); foreign.deployment_id="deployment-b".into();
+        assert!(host.open_projection(chat,Some(&foreign)).is_err());
+        assert_eq!(store.document_scope(chat).unwrap().as_deref(),Some(original_scope.as_str()));
+        assert_eq!(bound.doc.read_entry("accepted").unwrap().unwrap().parts,vec![MessagePart::Text { id:"t0".into(),text:"accepted offline".into() }]);
+        drop(host);
+        let restarted = scoped_test_host(store.clone());
+        let restored = restarted.open(chat).unwrap();
+        assert_eq!(lock(&restored.cache_scope).deployment.as_deref(),Some("deployment-a"));
+        assert_eq!(restored.doc.read_entries().unwrap().iter().filter(|entry| entry.id=="accepted").count(),1);
+        assert!(restarted.open_projection(chat,Some(&foreign)).is_err());
+    }
+
+    #[tokio::test]
+    async fn immutable_command_lifetime_and_terminal_outcome_survive_stale_cache_restart() {
+        let dir = tempfile::tempdir().unwrap(); let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(store.clone(),DocHostConfig { device_id:"device-a".into(),default_harness:HarnessId::Mock,edge:None });
+        let chat = "00000000-0000-4000-8000-000000000212"; let now=now_ms();
+        let entry = host.queue_command_with_id_at(chat,"command",SessionCommandPayload::Interrupt {},Some(now-1),Some(now+30_000)).unwrap();
+        let handle = host.open(chat).unwrap(); let stale = handle.doc.export_snapshot().unwrap();
+        assert!(store.mark_processed("command").unwrap());
+        handle.doc.set_command_status("command",SessionCommandStatus::Applied,Some("settled")).unwrap();
+        handle.doc.binding().acknowledge(&handle.doc.doc().oplog_vv()).unwrap();
+        store.save_snapshot(chat,&stale).unwrap(); drop(host);
+        let restarted = DocHost::new(store.clone(),DocHostConfig { device_id:"device-a".into(),default_harness:HarnessId::Mock,edge:None });
+        let outcome = restarted.queue_command_with_id_at(chat,"command",SessionCommandPayload::Interrupt {},Some(entry.issued_at),entry.expires_at).unwrap();
+        assert_eq!(outcome.status,SessionCommandStatus::Applied); assert_eq!(outcome.resolution.as_deref(),Some("settled"));
+        assert_eq!(outcome.issued_at,entry.issued_at); assert_eq!(outcome.expires_at,entry.expires_at);
+        assert!(restarted.queue_command_with_id_at(chat,"command",SessionCommandPayload::Interrupt {},Some(entry.issued_at),Some(entry.expires_at.unwrap()+1)).is_err());
+        assert_eq!(restarted.open(chat).unwrap().doc.read_commands().unwrap().len(),1);
+    }
+
+    #[tokio::test]
+    async fn durable_admission_readback_survives_unreadable_cache_without_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let config = DocHostConfig { device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None };
+        let host = DocHost::new(store.clone(), config.clone());
+        let chat = "00000000-0000-4000-8000-000000000215";
+        let now = now_ms();
+        let accepted = host.queue_command_with_id_at(chat, "retained-send", SessionCommandPayload::Interrupt {},
+            Some(now - 1), Some(now + 30_000)).unwrap();
+        drop(host);
+        let damaged = b"retained unreadable cache";
+        store.save_snapshot(chat, damaged).unwrap();
+        let restarted = DocHost::new(store.clone(), config);
+        assert_eq!(restarted.command_entry(chat, "retained-send").unwrap(), Some(accepted.clone()));
+        assert!(restarted.command_entry(chat, "absent-send").unwrap().is_none());
+        assert_eq!(restarted.queue_command_with_id_at(chat, "retained-send", accepted.payload.clone(),
+            Some(accepted.issued_at), accepted.expires_at).unwrap(), accepted);
+        assert!(restarted.queue_command_with_id_at(chat, "retained-send", SessionCommandPayload::Interrupt {},
+            Some(accepted.issued_at + 1), accepted.expires_at).is_err());
+        let foreign = SessionRoomProjection { project_id: "other-project".into(), deployment_id: "other-deployment".into(), session_id: chat.into() };
+        assert!(restarted.command_entry_projection(chat, "retained-send", Some(&foreign)).is_err());
+        assert_eq!(store.load_snapshot(chat).unwrap().as_deref(), Some(damaged.as_slice()));
+        let absent_chat = "00000000-0000-4000-8000-000000000216";
+        assert!(restarted.command_entry(absent_chat, "absent-send").unwrap().is_none());
+        assert!(store.load_snapshot(absent_chat).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_command_commit_keeps_authority_only_for_the_original_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = scoped_test_host(Arc::new(DocsStore::open(dir.path()).unwrap()));
+        let chat = "00000000-0000-4000-8000-000000000233";
+        let handle = host.open(chat).unwrap();
+        let binding = handle.doc.binding();
+        let replacement = handle.doc.export_snapshot().unwrap();
+        binding.install_journal(Vec::new(), Arc::new(|_, _| Err("disk unavailable".into())));
+        let now = now_ms();
+        assert!(host.queue_command_with_id_at(chat, "failed-commit", SessionCommandPayload::Interrupt {},
+            Some(now - 1), Some(now + 30_000)).is_err());
+        let retained = handle.doc.read_command("failed-commit").unwrap().unwrap();
+        assert_eq!(retained.status, SessionCommandStatus::Pending);
+        assert!(host.command_grant_authorized(&retained));
+        let mut forged = retained.clone();
+        forged.issued_at += 1;
+        assert!(!host.command_grant_authorized(&forged));
+        binding.install_journal(binding.pending_records(), Arc::new(|_, _| Ok(())));
+        binding.adopt_snapshot(&replacement, Some(chat)).unwrap();
+        assert_eq!(handle.doc.read_command("failed-commit").unwrap(), Some(retained));
+        assert!(handle.recovery_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn authenticated_cold_execution_alias_recovers_output_without_replaying_commands() {
+        let dir = tempfile::tempdir().unwrap(); let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let chat = "00000000-0000-4000-8000-000000000213"; let key=format!("{chat}::session::{chat}");
+        let private = SessionDoc::init(&key).unwrap();
+        private.push_message(&SessionMessageEntry { id:"finished-report".into(),role:MessageRole::Assistant,
+            parts:vec![MessagePart::Text { id:"text".into(),text:"already finished".into() }],created_at:1,device_id:"device-a".into(),
+            status:Some(MessageStatus::Complete),continuation_of:None,peer_message:None }).unwrap();
+        private.queue_command(&SessionCommandEntry { id:"never-replay".into(),payload:SessionCommandPayload::Interrupt {},issued_by:"device-a".into(),
+            issued_at:0,based_on:None,expires_at:Some(1),status:SessionCommandStatus::Pending,resolution:None }).unwrap();
+        store.save_snapshot(&key,&private.export_snapshot().unwrap()).unwrap();
+        let journal = Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap());
+        let request: comet_proto::RunRequest = serde_json::from_value(serde_json::json!({"prompt":"must not replay","cwd":"/tmp","sandbox":"workspace-write","autoApprove":true,"resume":"native"})).unwrap();
+        journal.save_context(&key,&(serde_json::json!("Unattached"),"device-a",HarnessId::Codex,&request)).unwrap();
+        let sessions = SessionsEngine::new("device-a".into(),journal,Arc::new(crate::HarnessRegistry::new()),27654);
+        let host = DocHost::new(store.clone(),DocHostConfig { device_id:"device-a".into(),default_harness:HarnessId::Mock,edge:None }); host.set_sessions(&sessions);
+        let recovered = host.open_existing_or_local(&key).unwrap();
+        assert_eq!(recovered.chat_id(),chat); assert_eq!(recovered.doc.chat_id().as_deref(),Some(chat));
+        assert_eq!(recovered.doc.read_entry("finished-report").unwrap().unwrap().status,Some(MessageStatus::Complete));
+        assert!(recovered.doc.read_commands().unwrap().is_empty()); assert!(sessions.session_status(&key).is_none());
+        assert_eq!(host.open_existing_or_local(&key).unwrap().doc.read_entries().unwrap().len(),1);
+        assert!(store.load_snapshot(&key).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn foreign_legacy_provenance_never_publishes_private_output() {
+        let dir = tempfile::tempdir().unwrap(); let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let chat = "00000000-0000-4000-8000-000000000214"; let key = format!("{chat}::session::{chat}");
+        let private = SessionDoc::init(&key).unwrap();
+        private.push_message(&SessionMessageEntry { id:"private-foreign-report".into(),role:MessageRole::Assistant,
+            parts:vec![MessagePart::Text { id:"text".into(),text:"private foreign transcript".into() }],created_at:1,
+            device_id:"other-device".into(),status:Some(MessageStatus::Complete),continuation_of:None,peer_message:None }).unwrap();
+        private.append_publication(&PublicationRecord { id:"foreign-provenance".into(),schema_version:COLLABORATION_SCHEMA_VERSION,
+            published_at:1,published_by:"other-owner".into(),value:PublicationValue::MessageProvenance(MessageProvenance {
+                message_id:"private-foreign-report".into(),session_id:key.clone(),author_subject:"other-owner".into(),
+                owner_device_id:"other-device".into(),model:None,source:AgentSessionSource::Local,unknown:Default::default(),
+            }),unknown:Default::default() }).unwrap();
+        let original = private.export_snapshot().unwrap(); store.save_snapshot(&key,&original).unwrap();
+        let journal = Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap());
+        let request: comet_proto::RunRequest = serde_json::from_value(serde_json::json!({"prompt":"must not replay","cwd":"/tmp",
+            "sandbox":"workspace-write","autoApprove":true,"resume":"native"})).unwrap();
+        journal.save_context(&key,&(serde_json::json!("Unattached"),"device-a",HarnessId::Omp,&request)).unwrap();
+        let sessions = SessionsEngine::new("device-a".into(),journal,Arc::new(crate::HarnessRegistry::new()),27654);
+        let host = DocHost::new(store.clone(),DocHostConfig { device_id:"device-a".into(),default_harness:HarnessId::Mock,edge:None });
+        host.set_sessions(&sessions);
+        assert!(host.open_existing_or_local(&key).is_err());
+        let public = host.open(chat).unwrap();
+        assert!(public.doc.read_entries().unwrap().is_empty());
+        assert!(public.doc.read_publications().unwrap().is_empty());
+        assert_eq!(store.load_snapshot(&key).unwrap(),Some(original));
+    }
+
+    #[tokio::test]
+    async fn reciprocal_engine_assembly_does_not_retain_retired_cores() {
+        let dir=tempfile::tempdir().unwrap();
+        let host=DocHost::new(Arc::new(DocsStore::open(dir.path()).unwrap()),DocHostConfig {device_id:"device-a".into(),default_harness:HarnessId::Mock,edge:None});
+        let sessions=SessionsEngine::new("device-a".into(),Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap()),Arc::new(crate::HarnessRegistry::new()),27654);
+        host.set_sessions(&sessions); sessions.set_doc_host(host.clone());
+        let weak_host=Arc::downgrade(&host.inner); let weak_sessions=sessions.downgrade();
+        drop(host); drop(sessions);
+        assert!(weak_host.upgrade().is_none()); assert!(weak_sessions.upgrade().is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn streaming_checkpoints_debounce_but_imports_and_shutdown_stay_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(store.clone(), DocHostConfig {
+            device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        let handle = host.open("chat-a").unwrap();
+        tokio::task::yield_now().await;
+        for index in 0..10 {
+            handle.write_user_message(&format!("local-{index}"), "accepted", index).unwrap();
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(150)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*lock(&handle.snapshot_epoch), None, "streaming must not repeatedly export full history");
+        assert_eq!(handle.doc.binding().pending_records().iter().filter(|r| r.container == "messages").count(), 10);
+
+        let remote = loro::LoroDoc::new();
+        remote.import(&handle.doc.export_snapshot().unwrap()).unwrap();
+        remote.get_map("foreign").insert("accepted", true).unwrap();
+        remote.commit();
+        handle.doc.binding().import(&remote.export(loro::ExportMode::updates(&handle.doc.doc().oplog_vv())).unwrap()).unwrap();
+        assert!(handle.unjournaled_changes.load(Ordering::Relaxed));
+        for index in 10..20 {
+            handle.write_user_message(&format!("local-{index}"), "accepted", index).unwrap();
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(150)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(lock(&handle.snapshot_epoch).is_some(), "imports must checkpoint even during local streaming");
+        let restored = loro::LoroDoc::new();
+        restored.import(&store.load_snapshot("chat-a").unwrap().unwrap()).unwrap();
+        assert!(matches!(restored.get_map("foreign").get("accepted"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::Bool(true)))));
+        handle.doc.doc().get_map("foreign").insert("local", true).unwrap();
+        handle.doc.doc().commit();
+        assert!(handle.unjournaled_changes.load(Ordering::Relaxed), "nonsemantic local edits must not defer forever");
+
+        host.persist_completed_turn("chat-a").unwrap();
+        assert_eq!(*lock(&handle.snapshot_epoch), Some(*handle.changes.borrow()));
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute("UPDATE snapshots SET saved_at = -1 WHERE doc_id = 'chat-a'", []).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(SNAPSHOT_DEBOUNCE_MS)).await;
+        tokio::task::yield_now().await;
+        let saved_at = || db.query_row("SELECT saved_at FROM snapshots WHERE doc_id = 'chat-a'", [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(saved_at(), -1, "completed epoch must not be exported again by the background task");
+        host.flush_all();
+        assert_ne!(saved_at(), -1, "shutdown must still force a full snapshot, including edits without events");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_chat_task_does_not_keep_host_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(Arc::new(DocsStore::open(dir.path()).unwrap()), DocHostConfig {
+            device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        let handle = host.open("chat-a").unwrap();
+        let weak_host = Arc::downgrade(&host.inner);
+        let (_changed, receiver) = watch::channel(0);
+        let task = chat_task(weak_host.clone(), Arc::downgrade(&handle), receiver);
+        tokio::pin!(task);
+        assert!(futures::poll!(&mut task).is_pending());
+        drop(host);
+        assert!(weak_host.upgrade().is_none(), "idle task retained DocHostInner");
+        assert!(futures::poll!(&mut task).is_ready(), "closed authority must stop the idle task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_eviction_retires_unobserved_docs_without_another_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(Arc::new(DocsStore::open(dir.path()).unwrap()), DocHostConfig {
+            device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        let mut retired = None;
+        let mut watched = None;
+        for index in 0..WARM_DOC_CAP + 2 {
+            let handle = host.open(&format!("chat-{index:02}")).unwrap();
+            if index == 0 { watched = Some(handle.watch_messages()); }
+            if index == 1 { retired = Some(Arc::downgrade(&handle)); }
+        }
+        // Tokio controls the eviction deadline; the LRU's wall-clock grace is
+        // stamped explicitly so this test needs neither sleeps nor clock mocks.
+        for handle in lock(&host.inner.handles).values() {
+            handle.last_access.store(now_ms() - EVICT_MIN_IDLE_MS - 1, Ordering::Relaxed);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(lock(&host.inner.handles).len(), WARM_DOC_CAP + 2);
+        tokio::time::advance(std::time::Duration::from_millis(EVICT_MIN_IDLE_MS as u64)).await;
+        tokio::task::yield_now().await;
+        assert!(lock(&host.inner.handles).len() <= WARM_DOC_CAP);
+        assert!(retired.unwrap().upgrade().is_none());
+        assert!(lock(&host.inner.handles).contains_key("chat-00"), "watched transcript was evicted");
+        assert_eq!(host.open("chat-01").unwrap().doc().chat_id().as_deref(), Some("chat-01"));
+        drop(watched);
+    }
 
     #[tokio::test]
     async fn transcript_watch_retains_bounded_snapshots_and_paging() {
@@ -2975,6 +3945,57 @@ mod authority_tests {
     }
 
     #[tokio::test]
+    async fn canonical_stop_retires_bare_recovery_before_status_is_rebuilt() {
+        for typed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(DocsStore::open(dir.path().join("docs")).unwrap());
+            let host = scoped_test_host(store);
+            host.workspace().unwrap().claim_chat("chat-a", Some("/tmp")).unwrap();
+            let handle = host.open("chat-a").unwrap();
+            handle.write_user_message("accepted", "original request", 1).unwrap();
+            host.record_agent_session(&comet_proto::Session {
+                chat_id: "chat-a".into(), device_id: "device-a".into(),
+                status: SessionStatus::Working, started_at: None, updated_at: chrono::Utc::now(),
+            }).unwrap();
+            let request: comet_proto::RunRequest = serde_json::from_value(serde_json::json!({
+                "prompt": "original request", "cwd": "/tmp", "sandbox": "workspace-write", "autoApprove": true,
+            })).unwrap();
+            let journal = Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap());
+            journal.save_recovery("chat-a", &serde_json::json!({
+                "identity": "Unattached", "device_id": "device-a", "harness": "mock",
+                "request": request, "user_message_id": "accepted", "blocked_session": null,
+                "updated_at": now_ms(), "journal_seq": 0,
+            })).unwrap();
+            let sessions = SessionsEngine::new("device-a".into(), journal.clone(),
+                Arc::new(crate::HarnessRegistry::new()), 27654);
+            sessions.set_doc_host(host.clone());
+            host.set_sessions(&sessions);
+            assert!(sessions.session_status("chat-a").is_none());
+            let payload = if typed {
+                SessionCommandPayload::Control {
+                    session_id: "chat-a".into(), owner_device_id: "device-a".into(),
+                    actor_device_id: "device-a".into(), actor_subject: "owner".into(),
+                    grant_id: "local-stop".into(), source: AgentSessionSource::Local,
+                    action: Box::new(SessionControlAction::Stop { expected_turn_id: None }),
+                }
+            } else { SessionCommandPayload::Interrupt {} };
+            let command = SessionCommandEntry {
+                id: "accepted-stop".into(), payload, issued_by: "device-a".into(),
+                issued_at: now_ms(), based_on: None, expires_at: None,
+                status: SessionCommandStatus::Pending, resolution: None,
+            };
+            assert_eq!(host.execute(&sessions, &handle, &command).await.unwrap().0, SessionCommandStatus::Applied);
+            assert!(journal.recovery_retired("chat-a").unwrap());
+            assert!(!sessions.has_pending_recovery("chat-a").unwrap());
+            assert_eq!(sessions.session_status("chat-a").unwrap().status, SessionStatus::Idle);
+            assert_eq!(handle.doc.collaboration_snapshot().unwrap().sessions[0].status, Some(SessionStatus::Idle));
+            assert_eq!(handle.doc.read_entries().unwrap().iter().filter(|row| row.id == "accepted").count(), 1);
+            assert_eq!(sessions.recover_stale_in_room("chat-a").unwrap(), 0);
+            sessions.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn owned_session_status_tracks_heartbeat_input_and_followup_turn() {
         let dir = tempfile::tempdir().unwrap();
         let host = DocHost::new(
@@ -2986,8 +4007,8 @@ mod authority_tests {
             },
         );
         let handle = host.open("chat-a").unwrap();
-        let execution_key = host.bind_session_execution_key(&handle, "chat-a");
-        let other_key = host.bind_session_execution_key(&handle, "agent-b");
+        let execution_key = host.bind_session_execution_key(&handle, "chat-a").unwrap();
+        let other_key = host.bind_session_execution_key(&handle, "agent-b").unwrap();
         for (session_id, owner_device_id) in [("chat-a", "device-a"), ("agent-b", "device-b")] {
             handle
                 .doc
@@ -3023,17 +4044,18 @@ mod authority_tests {
             started_at: None,
             updated_at: chrono::DateTime::from_timestamp_millis(1).unwrap(),
         };
-        for (status, at) in [
-            (SessionStatus::Working, 10_001),
-            (SessionStatus::Working, 20_001),
-            (SessionStatus::AwaitingInput, 20_002),
-            (SessionStatus::Working, 20_003),
-            (SessionStatus::Idle, 20_004),
-            (SessionStatus::Working, 20_005),
-            (SessionStatus::Errored, 20_006),
+        for (status, at, publication_count) in [
+            (SessionStatus::Working, 10_001, 2),
+            (SessionStatus::Working, 20_001, 2),
+            (SessionStatus::AwaitingInput, 20_002, 3),
+            (SessionStatus::Working, 20_003, 4),
+            (SessionStatus::Idle, 20_004, 5),
+            (SessionStatus::Idle, 20_005, 5),
+            (SessionStatus::Working, 20_006, 6),
+            (SessionStatus::Errored, 20_007, 7),
         ] {
             source.status = status;
-            if at == 10_001 || at == 20_005 {
+            if at == 10_001 || at == 20_006 {
                 source.started_at = chrono::DateTime::from_timestamp_millis(at);
             }
             source.updated_at = chrono::DateTime::from_timestamp_millis(at).unwrap();
@@ -3050,8 +4072,14 @@ mod authority_tests {
             );
             assert_eq!(
                 assigned.started_at,
-                Some(if at < 20_005 { 10_001 } else { 20_005 })
+                Some(if at < 20_006 { 10_001 } else { 20_006 })
             );
+            assert_eq!(snapshot.publications.len(), publication_count);
+            assert_eq!(handle.doc.doc().get_map("agentSessions").len(), 1);
+            assert_eq!(assigned.created_at, 1);
+            assert_eq!(assigned.owner_subject, "owner");
+            assert_eq!(assigned.owner_device_id, "device-a");
+            assert_eq!(assigned.source, AgentSessionSource::Scaffold);
             let other = snapshot
                 .sessions
                 .iter()
@@ -3062,7 +4090,7 @@ mod authority_tests {
                 (Some(SessionStatus::Working), Some(1))
             );
 
-            // Replay, a bare chat key, and another device's agent cannot append.
+            // Replay and another device's agent cannot append.
             host.record_agent_session(&source).unwrap();
             for chat_id in ["chat-a", other_key.as_str()] {
                 let unrelated = comet_proto::Session {
@@ -3089,12 +4117,13 @@ mod authority_tests {
                 edge: None,
             },
         );
-        host.set_sessions(SessionsEngine::new(
+        let sessions = SessionsEngine::new(
             "device-a".into(),
             Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap()),
             Arc::new(crate::HarnessRegistry::new()),
             27654,
-        ));
+        );
+        host.set_sessions(&sessions);
         let command = SessionCommandPayload::Control {
             session_id: "session-a".into(),
             owner_device_id: "device-a".into(),
@@ -3137,8 +4166,8 @@ mod authority_tests {
             },
         );
         let handle = host.open("shared-chat").unwrap();
-        host.bind_session_execution_key(&handle, "session-a");
-        host.bind_session_execution_key(&handle, "session-b");
+        host.bind_session_execution_key(&handle, "session-a").unwrap();
+        host.bind_session_execution_key(&handle, "session-b").unwrap();
         host.flush_all();
         assert_eq!(
             host.sync_statuses()
@@ -3231,13 +4260,11 @@ mod authority_tests {
                 .unwrap()
                 .unwrap();
             if change_projection {
-                handle
-                    .ensure_room_projection(Some(&SessionRoomProjection {
-                        project_id: "project-lifetime".into(),
-                        deployment_id: "deployment-lifetime".into(),
-                        session_id: chat_id.into(),
-                    }))
-                    .unwrap();
+                let projection = SessionRoomProjection {
+                    project_id: crate::workspace_host::DEFAULT_PROJECT_SCOPE.into(),
+                    deployment_id: "deployment-lifetime".into(), session_id: chat_id.into(),
+                };
+                handle.ensure_room_projection(Some(&projection),&host.cache_scope(chat_id,Some(&projection))).unwrap();
             } else {
                 host.purge_chat(chat_id);
             }
@@ -3486,7 +4513,7 @@ mod authority_tests {
             Arc::new(crate::HarnessRegistry::new()),
             27654,
         );
-        assert!(host.inner.sessions.set(sessions).is_ok());
+        assert!(host.inner.sessions.set(sessions.downgrade()).is_ok());
         host.drain_commands(&handle).await;
         assert!(!host.inner.store.is_processed(&edge_command.id).unwrap());
         assert_eq!(
@@ -3559,6 +4586,11 @@ mod authority_tests {
             target_session_id: "session-a".into(),
             unknown: Default::default(),
         };
+        host.accept_nudge(comet_rpc::Nudge {
+            chat_id: "session-a".into(), nudge_id: Some("accepted-before-grant".into()),
+        }).unwrap();
+        assert_eq!(host.inner.store.pending_nudges().unwrap()[0].1, "accepted-before-grant");
+        assert!(!lock(&host.inner.handles).contains_key("session-a"));
         assert!(
             host.open_for_nudge("session-a").unwrap().is_none(),
             "a Scaffold host must defer nudges until the verified room grant arrives"
@@ -3608,6 +4640,10 @@ mod authority_tests {
                 session_id: "session-a".into(),
             })
         );
+        host.reset_edge_grants();
+        assert!(host.open_for_nudge("session-a").unwrap().is_none(), "a cached handle cannot bypass grant refresh");
+        assert_eq!(host.inner.store.pending_nudges().unwrap()[0].1, "accepted-before-grant");
+        host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap()).unwrap();
         host.open_projection(
             "session-b",
             Some(&SessionRoomProjection {
@@ -3626,12 +4662,10 @@ mod authority_tests {
             source: AgentSessionSource::Scaffold,
             action: Box::new(SessionControlAction::Pause {}),
         };
-        let error = host.queue_command("session-b", mismatched).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not match its attached room")
-        );
+        let wrong_room = host.open("session-b").unwrap();
+        let before = wrong_room.doc.read_commands().unwrap();
+        assert!(host.queue_command("session-b", mismatched).is_err());
+        assert_eq!(wrong_room.doc.read_commands().unwrap(),before);
     }
 
     #[tokio::test]
@@ -3687,7 +4721,7 @@ mod authority_tests {
                 .contains("different session room projection")
         );
 
-        let execution_key = host.bind_session_execution_key(&room_handle, "agent-a");
+        let execution_key = host.bind_session_execution_key(&room_handle, "agent-a").unwrap();
         let execution_handle = host.open_existing_or_local(&execution_key).unwrap();
 
         assert!(Arc::ptr_eq(&room_handle, &execution_handle));
@@ -3695,6 +4729,101 @@ mod authority_tests {
             lock(&execution_handle.room_projection).as_ref(),
             Some(&projection)
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_execution_alias_restores_the_owned_canonical_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let public = uuid::Uuid::new_v4().to_string();
+        let execution = format!("{public}::session::{public}");
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: "device-a".into(), device_name: "test".into(), platform: "test".into(),
+                project_scope: "project-a".into(), user_id: "owner-a".into(), edge: None,
+            },
+        ).unwrap();
+        workspace.claim_chat(&public, Some("/workspace")).unwrap();
+        let canonical = SessionDoc::init(&public).unwrap();
+        canonical.push_message(&SessionMessageEntry {
+            id: "saved-output".into(), role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "text".into(), text: "Saved report output".into() }],
+            created_at: 100, device_id: "device-a".into(), status: Some(MessageStatus::Complete),
+            continuation_of: None, peer_message: None,
+        }).unwrap();
+        store.save_snapshot(&public, &canonical.export_snapshot().unwrap()).unwrap();
+        // Older flushes also cached a canonical document under its warm alias.
+        let private = SessionDoc::init(&public).unwrap();
+        let private_output = SessionMessageEntry {
+            id: "private-report-output".into(), role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "private-text".into(), text: "Completed report details".into() }],
+            created_at: 150, device_id: "device-a".into(), status: Some(MessageStatus::Complete),
+            continuation_of: None, peer_message: None,
+        };
+        private.push_message(&private_output).unwrap();
+        private.queue_command(&comet_doc::SessionCommandEntry {
+            id: "private-pending-command".into(), payload: SessionCommandPayload::Interrupt {},
+            issued_by: "device-a".into(), issued_at: 100, based_on: None, expires_at: None,
+            status: SessionCommandStatus::Pending, resolution: None,
+        }).unwrap();
+        let private_bytes = private.export_snapshot().unwrap();
+        store.save_snapshot(&execution, &private_bytes).unwrap();
+        let host = DocHost::new(store.clone(), DocHostConfig {
+            device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        host.set_workspace(workspace);
+        let journal = Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap());
+        let request: comet_proto::RunRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "completed output only", "cwd": "/workspace", "sandbox": "workspace-write", "autoApprove": true
+        })).unwrap();
+        journal.save_context(&execution, &(serde_json::json!("Unattached"), "device-a", HarnessId::Mock, &request)).unwrap();
+        let sessions = SessionsEngine::new("device-a".into(), journal, Arc::new(crate::HarnessRegistry::new()), 27654);
+        host.set_sessions(&sessions);
+        assert_eq!(host.workspace_continuation_id(&execution), public);
+        let recovered = host.open_existing_or_local(&execution).unwrap();
+        assert_eq!(recovered.chat_id(), public);
+        assert_eq!(recovered.doc().read_entry("saved-output").unwrap(), canonical.read_entry("saved-output").unwrap());
+        assert_eq!(recovered.doc().read_entry(&private_output.id).unwrap(), Some(private_output.clone()));
+        assert!(recovered.doc().read_command("private-pending-command").unwrap().is_none());
+        let observer = host.open(&public).unwrap();
+        let continued = SessionMessageEntry {
+            id: "continued-output".into(), role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text { id: "continued-text".into(), text: "New canonical output".into() }],
+            created_at: 200, device_id: "device-a".into(), status: Some(MessageStatus::Complete),
+            continuation_of: None, peer_message: None,
+        };
+        recovered.doc().push_message(&continued).unwrap();
+        assert_eq!(observer.doc().read_entry(&continued.id).unwrap(), Some(continued));
+        host.flush_all();
+        assert_eq!(store.load_snapshot(&execution).unwrap(), Some(private_bytes));
+        assert!(host.open(&execution).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovered_alias_cannot_claim_another_devices_public_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let public = uuid::Uuid::new_v4().to_string();
+        let workspace = WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
+            device_id: "device-b".into(), device_name: "test".into(), platform: "test".into(),
+            project_scope: "project-a".into(), user_id: "owner-a".into(), edge: None,
+        }).unwrap();
+        workspace.claim_chat(&public, Some("/workspace")).unwrap();
+        let host = DocHost::new(store.clone(), DocHostConfig {
+            device_id: "device-a".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        host.set_workspace(workspace);
+        let execution = format!("{public}::session::{public}");
+        let journal = Arc::new(crate::RunJournal::open(dir.path().join("journal")).unwrap());
+        let request: comet_proto::RunRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "completed output only", "cwd": "/workspace", "sandbox": "workspace-write", "autoApprove": true
+        })).unwrap();
+        journal.save_context(&execution, &(serde_json::json!("Unattached"), "device-a", HarnessId::Mock, &request)).unwrap();
+        let sessions = SessionsEngine::new("device-a".into(), journal, Arc::new(crate::HarnessRegistry::new()), 27654);
+        host.set_sessions(&sessions);
+        assert!(host.open_existing_or_local(&execution).is_err());
+        assert!(store.load_snapshot(&execution).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3724,8 +4853,23 @@ mod authority_tests {
         );
         host.set_workspace(workspace.clone());
         let handle = host.open("chat-a").unwrap();
-        let assigned = host.bind_session_execution_key(&handle, "chat-a");
-        let other = host.bind_session_execution_key(&handle, "agent-b");
+        let assigned = host.bind_session_execution_key(&handle, "chat-a").unwrap();
+        let other = host.bind_session_execution_key(&handle, "agent-b").unwrap();
+        handle.doc.append_publication(&PublicationRecord {
+            id: "child-start".into(), schema_version: COLLABORATION_SCHEMA_VERSION,
+            published_at: 1, published_by: "owner-a".into(),
+            value: PublicationValue::AgentSession(Box::new(AgentSessionRecord {
+                session_id: "agent-b".into(), chat_id: "chat-a".into(),
+                owner_subject: "owner-a".into(), owner_device_id: "device-a".into(),
+                source: AgentSessionSource::Local, environment: None,
+                harness: Some(HarnessId::Mock), model: None, harness_session_id: None,
+                started_at: None,
+                status: Some(SessionStatus::Idle), updated_at: Some(1), created_at: 1,
+                unknown: Default::default(),
+            })), unknown: Default::default(),
+        }).unwrap();
+        assert_eq!(host.workspace_activity_id(&other).as_deref(), Some("chat-a"));
+        assert!(host.workspace_activity_id("unbound::session::unbound").is_none());
         assert_eq!(host.workspace_continuation_id(&assigned), "chat-a");
         assert_eq!(host.workspace_continuation_id(&other), other);
         assert_eq!(
@@ -3774,12 +4918,15 @@ mod authority_tests {
                 27654,
             );
             sessions.set_doc_host(host.clone());
+            let before_activity = workspace.doc().chat("chat-a").unwrap().unwrap().last_message_at;
+            // Separate this turn from the preceding millisecond-granularity activity.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             sessions
                 .dispatch(
                     key,
                     HarnessId::Mock,
                     comet_proto::RunRequest {
-                        prompt: "continue".into(),
+                        prompt: if key == other { "child activity" } else { "continue" }.into(),
                         model: None,
                         agent_account_id: None,
                         reasoning: None,
@@ -3831,11 +4978,19 @@ mod authority_tests {
                 },
             );
             sessions.interrupt(key).await.unwrap();
+            if key == other {
+                let chat = workspace.doc().chat("chat-a").unwrap().unwrap();
+                assert_eq!(chat.last_message_preview.as_deref(), Some("child activity"));
+                assert!(chat.last_message_at > before_activity, "the child must advance public activity, not its parent's continuation");
+                assert_eq!(workspace.doc().read_chats().unwrap().len(), 1, "child output must not claim a private workspace chat");
+                assert_eq!(sessions.watch_sessions().borrow().iter().find(|row| row.chat_id == "chat-a").unwrap().status, SessionStatus::Idle);
+            }
         }
     }
 
     #[tokio::test]
     async fn resumed_epoch_adopts_prior_owner_and_publishes_status() {
+        const CHAT: &str = "00000000-0000-4000-8000-000000000004";
         for continuation in ["queue", "steer", "peer"] {
             let dir = tempfile::tempdir().unwrap();
             let store = Arc::new(DocsStore::open(dir.path()).unwrap());
@@ -3860,16 +5015,16 @@ mod authority_tests {
                 },
             );
             workspace
-                .claim_chat("session-a", Some("/workspace"))
+                .claim_chat(CHAT, Some("/workspace"))
                 .unwrap();
             host.set_workspace(workspace.clone());
             let projection = SessionRoomProjection {
                 project_id: "project-a".into(),
                 deployment_id: "deployment-a".into(),
-                session_id: "session-a".into(),
+                session_id: CHAT.into(),
             };
             let handle = host
-                .open_projection("session-a", Some(&projection))
+                .open_projection(CHAT, Some(&projection))
                 .unwrap();
             let registry = crate::HarnessRegistry::for_profile(comet_proto::RuntimeProfile::Mock);
             registry.register(Arc::new(comet_harness::mock::MockHarness {
@@ -3892,7 +5047,7 @@ mod authority_tests {
             let command = SessionCommandEntry {
                 id: "command-start".into(),
                 payload: SessionCommandPayload::Control {
-                    session_id: "session-a".into(),
+                    session_id: CHAT.into(),
                     owner_device_id: "comet-scaffold-smoke-001-e1".into(),
                     actor_device_id: "operator-device".into(),
                     actor_subject: "accounts.google.com:owner@example.com".into(),
@@ -3928,7 +5083,7 @@ mod authority_tests {
             );
             let running = workspace.doc().read_sessions().unwrap();
             assert_eq!(running.len(), 1);
-            assert_eq!(running[0].chat_id, "session-a");
+            assert_eq!(running[0].chat_id, CHAT);
             assert_eq!(running[0].status, SessionStatus::Working);
             assert_eq!(running[0].device_id, "comet-scaffold-smoke-001-e1");
             let published = handle.doc.collaboration_snapshot().unwrap().sessions;
@@ -3943,7 +5098,7 @@ mod authority_tests {
                         .unwrap()
                         .sessions
                         .into_iter()
-                        .find(|session| session.session_id == "session-a")
+                        .find(|session| session.session_id == CHAT)
                         .is_some_and(|session| session.status == Some(SessionStatus::Idle));
                     if completed {
                         break;
@@ -3960,9 +5115,22 @@ mod authority_tests {
 
             // Resume the persisted room on a new epoch, then Queue without Start.
             host.flush_all();
+            workspace.flush();
             drop(handle);
             drop(sessions);
             drop(host);
+            drop(workspace);
+            let workspace = WorkspaceHost::open(
+                store.clone(),
+                crate::workspace_host::WorkspaceHostConfig {
+                    device_id: "comet-scaffold-smoke-001-e3".into(),
+                    device_name: "test".into(),
+                    platform: "test".into(),
+                    project_scope: "project-a".into(),
+                    user_id: "accounts.google.com:owner@example.com".into(),
+                    edge: None,
+                },
+            ).unwrap();
             let host = DocHost::new(
                 store,
                 DocHostConfig {
@@ -3973,7 +5141,7 @@ mod authority_tests {
             );
             host.set_workspace(workspace.clone());
             let handle = host
-                .open_projection("session-a", Some(&projection))
+                .open_projection(CHAT, Some(&projection))
                 .unwrap();
             let sessions = SessionsEngine::new(
                 host.device_id().into(),
@@ -3993,7 +5161,7 @@ mod authority_tests {
                     scope: comet_proto::CollaborationScope {
                         project_id: "project-a".into(),
                         deployment_id: Some("deployment-a".into()),
-                        session_id: Some("session-a".into()),
+                        session_id: Some(CHAT.into()),
                         unknown: Default::default(),
                     },
                     capabilities: vec![comet_proto::CAPABILITY_SESSION_CHAT.into()],
@@ -4006,9 +5174,9 @@ mod authority_tests {
                     revoked_at: None,
                     unknown: Default::default(),
                 },
-                room_id: "s4/project-a/deployment-a/session-a".into(),
+                room_id: format!("s4/project-a/deployment-a/{CHAT}"),
                 target_device_id: host.device_id().into(),
-                target_session_id: "session-a".into(),
+                target_session_id: CHAT.into(),
                 unknown: Default::default(),
             };
             host.adopt_scaffold_session_owners(&handle).unwrap();
@@ -4019,7 +5187,7 @@ mod authority_tests {
             );
             let mut foreign_grant = envelope.clone();
             foreign_grant.grant.principal_subject = "accounts.google.com:other@example.com".into();
-            host.ingest_verified_grant("session-a", &serde_json::to_vec(&foreign_grant).unwrap())
+            host.ingest_verified_grant(CHAT, &serde_json::to_vec(&foreign_grant).unwrap())
                 .unwrap();
             host.adopt_scaffold_session_owners(&handle).unwrap();
             assert_eq!(
@@ -4027,7 +5195,7 @@ mod authority_tests {
                 "comet-scaffold-smoke-001-e1",
                 "a different principal cannot take ownership"
             );
-            host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap())
+            host.ingest_verified_grant(CHAT, &serde_json::to_vec(&envelope).unwrap())
                 .unwrap();
 
             // A follow-up Control command starts a new turn without another Start
@@ -4056,7 +5224,7 @@ mod authority_tests {
             if continuation == "peer" {
                 followup.payload = SessionCommandPayload::PeerMessage {
                     text: "continue".into(),
-                    source_chat_id: "source-chat".into(),
+                    source_chat_id: "00000000-0000-4000-8000-000000000005".into(),
                     source_deployment_id: None,
                     source_device_id: Some("source-device".into()),
                     thread_id: "thread".into(),
@@ -4072,7 +5240,7 @@ mod authority_tests {
             assert_eq!(published[0].status, Some(SessionStatus::Working));
             assert_eq!(published[0].owner_device_id, "comet-scaffold-smoke-001-e3");
             let running = workspace.doc().read_sessions().unwrap();
-            assert!(running.iter().any(|row| row.chat_id == "session-a"
+            assert!(running.iter().any(|row| row.chat_id == CHAT
                 && row.device_id == host.device_id()
                 && row.status == SessionStatus::Working));
             let mut rows = workspace.watch_session_rows();
@@ -4081,7 +5249,7 @@ mod authority_tests {
                     let finished = rows
                         .borrow_and_update()
                         .iter()
-                        .any(|row| row.chat_id == "session-a" && row.status == SessionStatus::Idle);
+                        .any(|row| row.chat_id == CHAT && row.status == SessionStatus::Idle);
                     if finished
                         && handle.doc.collaboration_snapshot().unwrap().sessions[0].status
                             == Some(SessionStatus::Idle)
@@ -4157,7 +5325,7 @@ mod authority_tests {
             )
             .unwrap();
         let first_handle = first_host.open("chat-a").unwrap();
-        first_host.save_snapshot(&first_handle);
+        first_host.save_snapshot(&first_handle, false);
 
         // A new host has no in-memory grant. It can authenticate only the exact
         // command fingerprint persisted by the original local RPC path.
@@ -4257,7 +5425,7 @@ mod authority_tests {
             Arc::new(crate::HarnessRegistry::new()),
             27654,
         );
-        assert!(restarted_host.inner.sessions.set(sessions).is_ok());
+        assert!(restarted_host.inner.sessions.set(sessions.downgrade()).is_ok());
         restarted_host.drain_commands(&restarted_handle).await;
         let resolved = restarted_handle
             .doc
@@ -4462,19 +5630,6 @@ mod authority_tests {
 #[cfg(test)]
 mod edge_url_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn deployment_scoped_room_url_carries_trusted_namespace() {
-        let edge = EdgeConfig::with_static_token("https://edge.example", "secret")
-            .with_device("device-a")
-            .with_deployment("deployment-a");
-        let provider = edge.room_url("/session/session-a/ws");
-        let url = provider.url().await.unwrap();
-        assert_eq!(
-            url,
-            "wss://edge.example/session/session-a/ws?token=secret&device=device-a&deploymentId=deployment-a"
-        );
-    }
 
     #[test]
     fn policy_rejections_throttle_while_transport_faults_stay_fast() {

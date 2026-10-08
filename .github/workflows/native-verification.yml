@@ -3,6 +3,12 @@ name: native-verification
 on:
   push:
     branches: ["verify/native-lifecycle-*", "verify/native-startup-*", "verify/native-recovery-*"]
+  workflow_dispatch:
+  workflow_call:
+defaults:
+  run:
+    shell: bash
+
 
 permissions:
   contents: read
@@ -21,7 +27,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +70,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo test --locked -p comet-doc -p comet-sync --lib 2>&1 | tee native-evidence/replica-recovery.log
+          cargo test --locked -p comet-engine --lib workspace_host:: 2>&1 | tee native-evidence/workspace.log
+          cargo test --locked -p comet-engine --lib session_activity:: 2>&1 | tee native-evidence/activity.log
           cargo test --locked -p comet-rpc --lib 2>&1 | tee native-evidence/rpc.log
           cargo test --locked -p comet-engine --lib rpc::scaffold_session::tests 2>&1 | tee native-evidence/handoff.log
           cargo test --locked -p comet-engine --lib scaffold::tests 2>&1 | tee native-evidence/scaffold.log
@@ -73,6 +82,13 @@ jobs:
           cargo test --locked -p comet-engine --test peer_messages --test restart_resume --test workspace_sync --test remote_sync 2>&1 | tee native-evidence/native-integration.log
           cargo test --locked -p comet-engine --test e2e queued_run_command_executes_end_to_end 2>&1 | tee native-evidence/queued-run.log
           cargo test --locked -p comet --bin comet session 2>&1 | tee native-evidence/cli.log
+      - name: Exercise paced large-tool memory bound
+        timeout-minutes: 10
+        env:
+          COMET_MOCK_DELAY_MS: "150"
+        run: |
+          set -euo pipefail
+          cargo run --locked -p comet-engine --example crew_tool_soak 2>&1 | tee native-evidence/large-tool-memory.log
       - name: Verify worker lifecycle and asynchronous admission
         if: startsWith(github.ref_name, 'verify/native-lifecycle-')
         timeout-minutes: 10
@@ -99,6 +115,42 @@ jobs:
       - name: Build exact source native executable
         timeout-minutes: 15
         run: cargo build --locked -p comet --bin comet
+      - name: Record tested native binary digest
+        run: |
+          node --input-type=module -e 'import {createReadStream} from "node:fs"; import {createHash} from "node:crypto"; const hash=createHash("sha256"); for await (const chunk of createReadStream("target/debug/comet")) hash.update(chunk); console.log(hash.digest("hex"));' | tee native-evidence/native-binary-sha256.txt
+      - name: Install locked edge smoke dependencies
+        if: runner.os == 'Linux'
+        working-directory: edge
+        run: npm ci
+      - name: Generate Worker binding types
+        if: runner.os == 'Linux'
+        working-directory: edge
+        run: npm run types
+      - name: Require current Worker binding declarations
+        if: runner.os == 'Linux'
+        run: git diff --exit-code -- edge/worker-configuration.d.ts
+      - name: Typecheck Worker
+        if: runner.os == 'Linux'
+        working-directory: edge
+        run: npm run typecheck
+      - name: Verify edge recovery and durable acknowledgements
+        if: runner.os == 'Linux'
+        working-directory: edge
+        run: npm test
+      - name: Exercise real Edge and native failure recovery
+        if: runner.os == 'Linux'
+        env:
+          COMET_BIN: ${{ github.workspace }}/target/debug/comet
+          COMET_SYNC_SOAK_TURNS: "24"
+        run: node scripts/headless-collaboration-smoke.mjs 2>&1 | tee native-evidence/sync-reliability.log
+      - name: Exercise durable owner register freshness
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        env:
+          COMET_BIN: ${{ github.workspace }}/target/debug/comet
+          COMET_SYNC_QUIET_OWNER: "1"
+          COMET_SYNC_SOAK_TURNS: "4"
+        run: node scripts/headless-collaboration-smoke.mjs 2>&1 | tee native-evidence/owner-register-freshness.log
       - name: Exercise native CLI against isolated headless engine
         timeout-minutes: 3
         shell: bash

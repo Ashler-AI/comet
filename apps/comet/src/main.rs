@@ -994,6 +994,7 @@ mod session_parser_tests {
                     chat_id,
                     prompt_file,
                     database_environment,
+                    ..
                 },
         }) = current.command
         else {
@@ -1033,6 +1034,46 @@ mod session_parser_tests {
             database_environment,
             comet_proto::ScaffoldDatabaseEnvironment::ProductionSnapshot
         );
+    }
+
+    #[test]
+    fn session_handoff_recovery_requires_both_target_ids() {
+        let base = [
+            "comet",
+            "session",
+            "handoff",
+            "source-chat",
+            "--prompt-file",
+            "task.txt",
+        ];
+        for flag in ["--recover-chat-id", "--recover-sandbox-id"] {
+            let mut args = base.to_vec();
+            args.extend([flag, "target"]);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let mut args = base.to_vec();
+        args.extend([
+            "--recover-chat-id",
+            "target-chat",
+            "--recover-sandbox-id",
+            "sandbox-a",
+        ]);
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Some(Command::Session {
+            command:
+                super::session_cli::SessionCommand::Handoff {
+                    chat_id,
+                    recover_chat_id,
+                    recover_sandbox_id,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected handoff recovery")
+        };
+        assert_eq!(chat_id.as_deref(), Some("source-chat"));
+        assert_eq!(recover_chat_id.as_deref(), Some("target-chat"));
+        assert_eq!(recover_sandbox_id.as_deref(), Some("sandbox-a"));
     }
 
     #[test]

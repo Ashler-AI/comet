@@ -8,9 +8,9 @@
 # Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
 
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Linux packaging requires a Linux runner" >&2
   exit 1
@@ -32,17 +32,18 @@ STAGE="$OUT_DIR/comet-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"
+BIN="$(mktemp)"
+trap 'rm -f "$BIN"' EXIT
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build --release -p comet
-  BIN="$ROOT/target/release/comet"
+  python3 scripts/local-cargo.py build --release -p comet --copy-binary release/comet "$BIN"
 else
-  cargo build -p comet
-  BIN="$ROOT/target/debug/comet"
+  python3 scripts/local-cargo.py build -p comet --copy-binary debug/comet "$BIN"
 fi
 
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/comet"
+rm -f "$BIN"
 install -m 644 "$ROOT/dist/comet.desktop" "$STAGE/comet.desktop"
 install -m 644 "$ROOT/assets/brand/png/crew-icon-1024.png" "$STAGE/comet.png"
 install -m 644 "$ROOT/assets/brand/crew-icon.svg" "$STAGE/comet.svg"

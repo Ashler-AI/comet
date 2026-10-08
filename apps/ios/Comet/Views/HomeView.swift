@@ -46,7 +46,12 @@ struct HomeView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     // In the bar, not the list: as a list row it appeared and
                     // vanished with the connection and shoved the content down.
-                    if !model.connected {
+                    if let failure = model.workspace?.recoveryFailure {
+                        Button { Task { await model.workspace?.retryRecovery() } } label: {
+                            Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+                        }
+                        .accessibilityLabel("Crew recovery blocked: \(failure). Retry recovery")
+                    } else if !model.connected {
                         ProgressView()
                             .controlSize(.mini)
                             .tint(Theme.textMuted)
@@ -288,7 +293,8 @@ struct ChatRow: View {
                                 .accessibilityLabel("Unread")
                         }
                         SessionStatusBadge(status: activity.status,
-                                           sending: model.hasPendingSend(chatId: chat.id))
+                                           sending: model.hasPendingSend(chatId: chat.id),
+                                           unreachable: activity.status == nil && (activity.row?.status == .working || activity.row?.status == .awaitingInput))
                         let updatedAt = max(chat.lastMessageAt ?? chat.createdAt, activity.row?.updatedAt ?? 0)
                         Text(relativeTime(updatedAt))
                             .font(Theme.sans(11))
@@ -379,7 +385,8 @@ struct SharedSessionRow: View {
                         .accessibilityLabel(sessionRef.startupLabel ?? "Last updated")
                 }
                 SessionStatusBadge(status: activity.status,
-                                   sending: model.hasPendingSend(chatId: sessionRef.chatId))
+                                   sending: model.hasPendingSend(chatId: sessionRef.chatId),
+                                   unreachable: activity.status == nil && (activity.row?.status == .working || activity.row?.status == .awaitingInput))
             }
         }
         .padding(.horizontal, 8)
@@ -393,10 +400,13 @@ struct SharedSessionRow: View {
 private struct SessionStatusBadge: View {
     let status: SessionStatus?
     var sending = false
+    var unreachable = false
 
     var body: some View {
         Group {
-            if sending || status == .working {
+            if unreachable {
+                Text("Unreachable").foregroundStyle(Theme.attention)
+            } else if sending || status == .working {
                 HStack(spacing: 4) {
                     ArcSpinner()
                     Text(sending ? "Sending" : "Running")

@@ -24,8 +24,10 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
-    #[error("This OMP session is already running. Stop it before resuming in Comet.")]
+    #[error("This OMP session is already running. Take over to resume it in Crew.")]
     SessionBusy { session_id: String },
+    #[error("The write-capable holder has no verified OMP owner")]
+    SessionOwnerUnverified,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -142,9 +144,17 @@ pub(crate) fn is_curated_comet_model(model_id: &str) -> bool {
         || matches!(
             model_id,
             "anthropic/claude-opus-5"
+                | "openai-codex/gpt-6-sol"
+                | "openai-codex/gpt-6.1-sol"
+                | "openai-codex/gpt-6-luna"
+                | "prime-inference/openai/gpt-6-sol"
+                | "prime-inference/openai/gpt-6.1-sol"
+                | "prime-inference/openai/gpt-6-luna"
+                | "anthropic/claude-opus-5-5"
                 | "anthropic/claude-sonnet-5"
                 | "anthropic/claude-fable-5"
                 | "prime-inference/anthropic/claude-opus-5"
+                | "prime-inference/anthropic/claude-opus-5-5"
                 | "prime-inference/anthropic/claude-sonnet-5"
                 | "prime-inference/anthropic/claude-fable-5"
                 | "prime-inference/moonshotai/kimi-k3"

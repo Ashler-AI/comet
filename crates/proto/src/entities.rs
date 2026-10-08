@@ -240,21 +240,22 @@ impl Chat {
     }
 }
 
-/// Display status for a chat row/tab: the four user-facing states plus a
-/// distinct Errored. Derived — never stored.
+/// Derived presentation status for a chat row/tab; never stored as owner state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatIndicator {
     Working,
     AwaitingInput,
     Errored,
+    /// The owner was active but is no longer publishing live status.
+    Unreachable,
     /// Finished running (or errored out) but not seen yet on any device.
     Completed,
     Idle,
 }
 
-/// Derive the display status. `live` must already be staleness-gated by the
-/// caller (the UI's 45s window) — pass `None` for a stale/absent session row.
+/// Derive the display status from a fresh owner row. Stale active rows must be
+/// handled as Unreachable by `view::display_status`, not passed here as absent.
 pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
     match live.map(|s| s.status) {
         Some(SessionStatus::Working) => ChatIndicator::Working,

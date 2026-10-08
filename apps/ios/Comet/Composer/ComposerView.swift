@@ -140,6 +140,22 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if !store.retainedDrafts.isEmpty || !store.retainedControls.isEmpty {
+                Menu("Retained Crew sends") {
+                    ForEach(store.retainedDrafts, id: \.id) { draft in
+                        Button(String(draft.prompt.prefix(80))) {
+                            store.selectRetainedDraft(draft.id)
+                            text = store.failedPrompt ?? ""
+                            images.images = store.failedImages
+                        }
+                    }
+                    ForEach(store.retainedControls, id: \.id) { instruction in
+                        Button("Retry \(instruction.prompt)") { store.retryControl(instruction.id) }
+                            .disabled(instruction.terminal || submitting || store.sending)
+                    }
+                }
+                .font(Theme.sans(12))
+            }
             if let previousFailure {
                 Button("Retry previous failed message") {
                     guard !submitting else { return }
@@ -168,8 +184,22 @@ struct ComposerView: View {
             }
         }
         .onChange(of: store.sendFailure) { _, _ in restoreFailure() }
-        .onAppear { restoreFailure() }
-        .onDisappear { images.cancelImport() }
+        .onChange(of: text) { _, value in store.retainComposer(text: value, images: images.images) }
+        .onChange(of: store.composerText) { old, value in
+            if text == old { text = value; if value.isEmpty { images.images = [] } }
+        }
+        .onChange(of: images.images.map(\.id)) { _, _ in store.retainComposer(text: text, images: images.images) }
+        .onAppear {
+            if text.isEmpty, images.images.isEmpty {
+                text = store.composerText; images.images = store.composerImages
+            }
+            restoreFailure()
+        }
+        .onDisappear {
+            store.retainComposer(text: text, images: images.images)
+            store.flushToDisk()
+            images.cancelImport()
+        }
     }
 
     private func restoreFailure() {

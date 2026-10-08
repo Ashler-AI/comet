@@ -277,7 +277,7 @@ impl EngineCore {
             &journal,
         )?;
         doc_host.set_workspace(workspace.clone());
-        doc_host.set_sessions(sessions.clone());
+        doc_host.set_sessions(&sessions);
         sessions.set_doc_host(doc_host.clone());
         match sessions.recover_stale() {
             Ok(0) => {}
@@ -425,18 +425,9 @@ impl EngineCore {
         let config =
             comet_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let nudge_host = self.doc_host.clone();
-        let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
-            // Scaffold hosts must not open the legacy unprojected room while
-            // the verified grant frame is still in flight.
-            match nudge_host.open_for_nudge(&chat_id) {
-                Ok(Some(_)) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
-                Ok(None) => {
-                    tracing::info!(chat = %chat_id, "nudge: waiting for verified room grant")
-                }
-                Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
-                }
-            }
+        let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |nudge| {
+            nudge_host.accept_nudge(nudge)
+                .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
         });
         let reset_host = self.doc_host.clone();
         let on_grant_reset: comet_rpc::GrantResetHandler =

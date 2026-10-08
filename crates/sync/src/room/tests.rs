@@ -28,6 +28,61 @@ fn fragment_headers_are_bounded_before_allocation() {
     ));
 }
 
+#[tokio::test]
+async fn socket_backfill_backpressure_does_not_block_uploads() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+    let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+    let (out_tx, out_rx) = mpsc::channel(1);
+    let (in_tx, mut in_rx) = mpsc::channel(1);
+    let task = tokio::spawn(pump(client, out_rx, in_tx, Arc::new(AtomicBool::new(false)), "duplex-test".into()));
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        // Fill the reader's queue, then leave another backfill frame waiting
+        // on the actor. The actor is concurrently uploading a large batch.
+        server.send(WsMessage::Binary(vec![1])).await.unwrap();
+        server.send(WsMessage::Binary(vec![2])).await.unwrap();
+        while in_rx.is_empty() { tokio::task::yield_now().await; }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        out_tx.send(vec![3]).await.unwrap();
+        assert_eq!(server.next().await.unwrap().unwrap(), WsMessage::Binary(vec![3]));
+        assert_eq!(in_rx.recv().await.unwrap(), vec![1]);
+        assert_eq!(in_rx.recv().await.unwrap(), vec![2]);
+    }).await.expect("backfill must not deadlock the upload direction");
+    drop(in_rx);
+    tokio::time::timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_outbound_queue_is_bounded() {
+    let (session, _wire) = readiness_session(LoroDoc::new());
+    for _ in 0..64 { session.tx.try_send(vec![]).unwrap(); }
+    let error = session.send(&ProtocolMessage::Leave {
+        crdt: CrdtType::Loro, room_id: session.room_id.clone(),
+    }).await.unwrap_err();
+    assert!(matches!(error, SyncError::WebSocket(message) if message == "outbound queue stalled"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unacknowledged_live_write_redials_without_waiting_for_idle_probe() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone()).await.unwrap();
+    let before = edge.dials.load(Ordering::SeqCst);
+    edge.mute.store(true, Ordering::SeqCst);
+    doc.get_text("t").insert(0, "durable offline write").unwrap();
+    doc.commit();
+    tokio::time::sleep(ACK_DEADLINE + Duration::from_secs(5)).await;
+    assert!(edge.dials.load(Ordering::SeqCst) > before);
+    edge.mute.store(false, Ordering::SeqCst);
+    tokio::time::timeout(JOIN_RESPONSE_DEADLINE + BACKOFF_CAP, async {
+        while doc_text(&edge.doc) != "durable offline write" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("reconnect must rederive the unacknowledged write from its version vector");
+    client.shutdown().await.unwrap();
+}
+
 async fn wait_until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
@@ -398,6 +453,7 @@ impl Connector for FakeConnector {
             Ok(Pipe {
                 tx: client_tx,
                 rx: client_rx,
+                room_reset: Arc::new(AtomicBool::new(false)),
             })
         })
     }
@@ -436,6 +492,54 @@ async fn join_backfills_server_state_into_fresh_doc() {
         .expect("connect");
     wait_until(|| doc_text(&doc) == "server state").await;
     client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compacted_room_adopts_snapshot_and_reconciles_offline_message_once() {
+    use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionDoc, SessionMessageEntry};
+    let chat = "00000000-0000-4000-8000-000000000001";
+    let source = SessionDoc::init(chat).unwrap();
+    let message = |id: &str, text: &str| SessionMessageEntry {
+        id:id.into(), role:MessageRole::User, parts:vec![MessagePart::Text { id:"text".into(),text:text.into() }],
+        created_at:1,device_id:"device".into(),status:Some(MessageStatus::Complete),continuation_of:None,peer_message:None,
+    };
+    source.push_message(&message("shared","before trim")).unwrap();
+    let raw = LoroDoc::new(); raw.import(&source.export_snapshot().unwrap()).unwrap();
+    let local = SessionDoc::from_doc(raw); let binding = local.binding();
+    binding.install_journal(Vec::new(),Arc::new(|_,_| Ok(())));
+    local.push_message(&message("offline","accepted while disconnected")).unwrap();
+    source.push_message(&message("server","after local went offline")).unwrap();
+    let compacted = LoroDoc::new();
+    compacted.import(&source.doc().export(ExportMode::shallow_snapshot(&source.doc().state_frontiers())).unwrap()).unwrap();
+    let mut edge = FakeEdge::new(); Arc::get_mut(&mut edge).unwrap().doc = compacted;
+    // Even an apparently successful join cannot make the old branch admissible.
+    edge.reject_next_update.store(true,Ordering::SeqCst);
+    let client = RoomClient::connect_with_tuned(edge.connector(),chat,binding.clone(),RoomTuning::default()).await.unwrap();
+    wait_until(|| {
+        SessionDoc::from_doc(edge.doc.clone()).read_entries().is_ok_and(|entries| {
+            entries.iter().filter(|entry| entry.id == "offline").count() == 1
+                && entries.iter().any(|entry| entry.id == "server")
+        })
+    }).await;
+    assert!(binding.generation() > 0);
+    let entries = local.read_entries().unwrap();
+    assert_eq!(entries.iter().filter(|entry| entry.id == "offline").count(),1);
+    assert!(entries.iter().any(|entry| entry.id == "server"));
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_initial_join_releases_its_document_actor() {
+    let edge = FakeEdge::new(); edge.mute.store(true,Ordering::SeqCst);
+    let binding = comet_doc::SharedDocument::new(LoroDoc::new());
+    let document_lifetime = Arc::downgrade(&binding.generation_clock());
+    let connector = edge.connector();
+    let connection = tokio::spawn(async move {
+        RoomClient::connect_with_tuned(connector,"room-1",binding,RoomTuning::default()).await
+    });
+    wait_until(|| edge.dials.load(Ordering::SeqCst) > 0).await;
+    connection.abort(); let _ = connection.await;
+    wait_until(|| document_lifetime.upgrade().is_none()).await;
 }
 
 #[tokio::test]
@@ -1082,7 +1186,7 @@ fn readiness_session(doc: LoroDoc) -> (Session, mpsc::Receiver<Vec<u8>>) {
     let (events, _) = broadcast::channel(32);
     (
         Session {
-            doc,
+            doc: doc.into(),
             eph: EphemeralStore::new(30_000),
             room_id: "workspace-readiness".into(),
             tx,
@@ -1102,9 +1206,54 @@ fn readiness_session(doc: LoroDoc) -> (Session, mpsc::Receiver<Vec<u8>>) {
             sync_started_at: Some(tokio::time::Instant::now()),
             synchronized: false,
             repairing_join: false,
+            recovering_snapshot: false,
+            recovery_doc: None,
+            scope_generation: 0,
         },
         rx,
     )
+}
+
+#[tokio::test]
+async fn journal_only_full_backfill_finishes_durable_binding_recovery() {
+    let source = LoroDoc::new();
+    source.get_text("t").insert(0, "accepted before restart").unwrap(); source.commit();
+    let first = source.export(ExportMode::updates(&VersionVector::default())).unwrap();
+    let before = source.oplog_vv();
+    source.get_text("t").insert(doc_text(&source).len(), " and while offline").unwrap(); source.commit();
+    let second = source.export(ExportMode::updates(&before)).unwrap();
+    let (mut session, mut wire) = readiness_session(LoroDoc::new());
+    let local = comet_doc::WorkspaceDoc::new();
+    session.doc = local.binding();
+    session.doc.install_journal(Vec::new(), Arc::new(|_, _| Ok(())));
+    local.upsert_space(&serde_json::from_value(serde_json::json!({
+        "id": "offline", "deviceId": "device-a", "path": "/retained",
+        "gitDetected": false, "createdAt": "2026-10-07T00:00:00Z"
+    })).unwrap()).unwrap();
+    let local_before = session.doc.oplog_vv();
+    session.recovering_snapshot = true;
+    let (tx, mut rx) = oneshot::channel();
+    let mut ready = Some(tx);
+    session.on_join_ok(CrdtType::Loro, source.oplog_vv().encode(), Permission::Write, false).await.unwrap();
+    session.apply_remote(CrdtType::Loro, vec![first]).await.unwrap();
+    session.finish_sync(&mut ready);
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    assert_eq!(session.doc.oplog_vv(), local_before, "partial backfill must not replace the live binding");
+    session.apply_remote(CrdtType::Loro, vec![second]).await.unwrap();
+    session.finish_sync(&mut ready);
+    assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)), "offline edit must be acknowledged before readiness");
+    // ACK the recovered offline edit only after the full backfill is adopted.
+    while let Ok(bytes) = wire.try_recv() {
+        if let ProtocolMessage::DocUpdate { crdt: CrdtType::Loro, batch_id, .. } = decode(&bytes).unwrap() {
+            session.on_ack(CrdtType::Loro, batch_id, UpdateStatusCode::Ok).await.unwrap();
+        }
+    }
+    session.finish_sync(&mut ready);
+    rx.try_recv().unwrap().unwrap();
+    assert!(session.stats.snapshot().connected);
+    assert!(!session.recovering_snapshot);
+    assert_eq!(doc_text(&session.doc.raw()), doc_text(&source));
+    assert_eq!(local.space("offline").unwrap().unwrap().path, "/retained");
 }
 
 #[tokio::test]
@@ -1143,6 +1292,49 @@ async fn initial_readiness_waits_for_materialized_server_state() {
     session.finish_sync(&mut ready);
     rx.try_recv().unwrap().unwrap();
     assert_eq!(session.doc.get_deep_value(), server.get_deep_value());
+    assert!(session.stats.snapshot().connected);
+}
+
+#[tokio::test]
+async fn reconnect_backfill_waits_for_snapshot_and_journal() {
+    let server = LoroDoc::new();
+    server.get_text("t").insert(0, "before outage").unwrap();
+    server.commit();
+    let baseline = server.export(ExportMode::Snapshot).unwrap();
+    let doc = LoroDoc::new();
+    doc.import(&baseline).unwrap();
+    let mut backfill = vec![baseline];
+    for suffix in [" during outage", " after reconnect"] {
+        let from = server.oplog_vv();
+        server
+            .get_text("t")
+            .insert(doc_text(&server).len(), suffix)
+            .unwrap();
+        server.commit();
+        backfill.push(server.export(ExportMode::updates(&from)).unwrap());
+    }
+    let (mut session, _wire) = readiness_session(doc);
+    let mut ready = None;
+    session
+        .on_join_ok(
+            CrdtType::Loro,
+            server.oplog_vv().encode(),
+            Permission::Write,
+            true,
+        )
+        .await
+        .unwrap();
+    for update in backfill {
+        session
+            .apply_remote(CrdtType::Loro, vec![update])
+            .await
+            .unwrap();
+        session.finish_sync(&mut ready);
+    }
+    assert_eq!(
+        doc_text(&session.doc.raw()),
+        "before outage during outage after reconnect"
+    );
     assert!(session.stats.snapshot().connected);
 }
 
@@ -1189,7 +1381,7 @@ async fn pending_remote_operations_survive_stale_join_and_unrelated_import() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     assert!(!session.stats.snapshot().connected);
-    // The join triggered by the incomplete unrelated import is still pending.
+    // A subsequent stale join must not forget the missing dependency.
     session
         .on_join_ok(
             CrdtType::Loro,
@@ -1208,7 +1400,7 @@ async fn pending_remote_operations_survive_stale_join_and_unrelated_import() {
         .unwrap();
     session.finish_sync(&mut ready);
     rx.try_recv().unwrap().unwrap();
-    assert_eq!(doc_text(&session.doc), "missing dependency then completion");
+    assert_eq!(doc_text(&session.doc.raw()), "missing dependency then completion");
     assert_eq!(
         session.doc.get_map("other").get_deep_value(),
         unrelated.get_map("other").get_deep_value()
@@ -1361,6 +1553,7 @@ async fn initial_disconnect_cannot_forget_advertised_backfill() {
         first: AtomicBool,
         version: Vec<u8>,
         fallback: Arc<FakeEdge>,
+        reset: bool,
     }
     impl Connector for AdvertiseThenDisconnect {
         fn connect(&self) -> BoxFuture<'static, Result<Pipe, SyncError>> {
@@ -1368,6 +1561,7 @@ async fn initial_disconnect_cannot_forget_advertised_backfill() {
                 return self.fallback.connector().connect();
             }
             let version = self.version.clone();
+            let room_reset = Arc::new(AtomicBool::new(self.reset));
             Box::pin(async move {
                 let (tx, mut requests) = mpsc::channel::<Vec<u8>>(8);
                 let (replies, rx) = mpsc::channel::<Vec<u8>>(8);
@@ -1392,7 +1586,7 @@ async fn initial_disconnect_cannot_forget_advertised_backfill() {
                         .unwrap();
                     // No backfill: the replacement connection advertises stale state.
                 });
-                Ok(Pipe { tx, rx })
+                Ok(Pipe { tx, rx, room_reset })
             })
         }
     }
@@ -1406,6 +1600,7 @@ async fn initial_disconnect_cannot_forget_advertised_backfill() {
     let connector = Arc::new(AdvertiseThenDisconnect {
         first: AtomicBool::new(true),
         version: source.oplog_vv().encode(),
+        reset: false,
         fallback: fallback.clone(),
     });
     let doc = LoroDoc::new();
@@ -1431,6 +1626,28 @@ async fn initial_disconnect_cannot_forget_advertised_backfill() {
         .unwrap()
         .unwrap();
     assert_eq!(doc_text(&doc), "advertised session history");
+    assert!(client.stats().connected);
+    client.shutdown().await.unwrap();
+
+    // A trusted reset replaces the advertised ancestry, not the accepted local goal.
+    let seeded = LoroDoc::new();
+    let row = seeded.get_map("chats").insert_container("server",loro::LoroMap::new()).unwrap();
+    row.insert("id","server").unwrap(); row.insert("title","new authoritative seed").unwrap(); seeded.commit();
+    let mut replacement = FakeEdge::new(); Arc::get_mut(&mut replacement).unwrap().doc = seeded;
+    let local = comet_doc::WorkspaceDoc::new(); let binding = local.binding();
+    binding.install_journal(Vec::new(),Arc::new(|_,_| Ok(())));
+    let row = binding.get_map("chats").insert_container("offline",loro::LoroMap::new()).unwrap();
+    row.insert("id","offline").unwrap(); row.insert("title","accepted offline goal").unwrap(); binding.commit().unwrap();
+    let connector = Arc::new(AdvertiseThenDisconnect {
+        first:AtomicBool::new(true),version:source.oplog_vv().encode(),reset:true,fallback:replacement.clone(),
+    });
+    let client = tokio::time::timeout(TEST_TIMEOUT,
+        RoomClient::connect_with_tuned(connector,"workspace-reset",binding.clone(),RoomTuning::default())
+    ).await.unwrap().unwrap();
+    let rows = binding.get_map("chats").get_deep_value().to_json_value();
+    assert_eq!(rows["server"]["title"],"new authoritative seed");
+    assert_eq!(rows["offline"]["title"],"accepted offline goal");
+    wait_until(|| replacement.doc.get_map("chats").get("offline").is_some()).await;
     assert!(client.stats().connected);
     client.shutdown().await.unwrap();
 }

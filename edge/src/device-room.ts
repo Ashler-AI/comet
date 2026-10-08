@@ -23,6 +23,9 @@ import {
   AUTH_USER_HEADER,
   DEVICE_HOST_AUTH_HEADER,
   GRANT_EVENT_HEADER,
+  DURABLE_SYNC_PROTOCOL,
+  SYNC_PROTOCOL_HEADER,
+  CREW_UPDATE_REQUIRED,
   type Env
 } from "./env";
 
@@ -153,6 +156,7 @@ interface SocketState {
   userId: string;
   projectScope: string;
   capabilities: string[];
+  durableSync?: boolean;
   role: "host" | "client";
   connId: string;
   grant?: TrustedDeviceGrant;
@@ -244,8 +248,8 @@ export const deviceGrantTargetsRoom = (
  *
  * Hosts ping every 15s (crates/rpc/src/device_room.rs PING_INTERVAL) and the
  * DO's auto-response stamps a timestamp without waking us, so liveness is free
- * to read. The window is sized for the 30s of older builds still in the fleet
- * — 2.5 of their intervals — so upgrading engines is never a prerequisite. */
+ * to read. The 75s lease tolerates transport jitter independently of the
+ * durable-sync protocol required for host registration. */
 const HOST_LIVENESS_MS = 75_000;
 
 /** Control frames the relay itself emits (kind " relay"). */
@@ -253,14 +257,13 @@ const HOST_LIVENESS_MS = 75_000;
 // with ===; a mismatch makes host_offline/host_closed invisible to them.
 const RELAY_KIND = " relay";
 
-/** Nudge frames (§7 cold-chat command delivery): payload `{chatId}` tells the
- * host "this chat's doc has pending commands — open it and drain". Durable:
- * queued in the DO while the host is offline, replayed on its next join, so a
- * command sent to a chat the host hasn't warm-opened is never stranded. */
+/** Wakeups remain durable until the current host acknowledges consumption of
+ * `{chatId,nudgeId}`. Older hosts still receive chatId, but cannot clear rows. */
 export const NUDGE_KIND = "nudge";
+export const NUDGE_ACK_KIND = "nudge-ack";
 export const GRANT_KIND = "grant";
 const NUDGE_MAX_PENDING = 256;
-const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export class DeviceRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
@@ -277,6 +280,13 @@ export class DeviceRoom implements DurableObject {
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS pending_nudges (chat_id TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)"
     );
+    const columns = [...ctx.storage.sql.exec("PRAGMA table_info(pending_nudges)")];
+    if (!columns.some((column) => column.name === "nudge_id")) {
+      ctx.storage.sql.exec("ALTER TABLE pending_nudges ADD COLUMN nudge_id TEXT");
+    }
+    for (const row of ctx.storage.sql.exec("SELECT chat_id FROM pending_nudges WHERE nudge_id IS NULL")) {
+      ctx.storage.sql.exec("UPDATE pending_nudges SET nudge_id = ? WHERE chat_id = ?", crypto.randomUUID(), row.chat_id);
+    }
     this.blobs = createBlobStore(ctx.storage.sql);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -303,7 +313,12 @@ export class DeviceRoom implements DurableObject {
    * suppress the very `host_closed` that close is supposed to announce. */
   private liveHost(exclude?: WebSocket): WebSocket | undefined {
     return pickLiveHost(
-      this.ctx.getWebSockets(HOST_TAG).map((ws) => ({
+      this.ctx.getWebSockets(HOST_TAG)
+        .filter((ws) => {
+          const state = ws.deserializeAttachment() as SocketState | null;
+          return state?.durableSync === true && !state.superseded;
+        })
+        .map((ws) => ({
         ws,
         // Auto-pongs are stamped even while hibernating; `joinedAt` covers the
         // window before a fresh socket's first ping. Sockets attached by an
@@ -325,7 +340,7 @@ export class DeviceRoom implements DurableObject {
     let latest: { ws: WebSocket; joinedAt: number } | undefined;
     for (const ws of this.ctx.getWebSockets(clientTag(connId))) {
       const state = ws.deserializeAttachment() as SocketState | null;
-      if (state?.role !== "client" || state.superseded) continue;
+      if (state?.role !== "client" || state.durableSync !== true || state.superseded) continue;
       const joinedAt = state.joinedAt ?? 0;
       if (!latest || joinedAt > latest.joinedAt) latest = { ws, joinedAt };
     }
@@ -347,6 +362,10 @@ export class DeviceRoom implements DurableObject {
 
   private async authorizeHost(ws: WebSocket): Promise<boolean> {
     const state = ws.deserializeAttachment() as SocketState | null;
+    if (state?.durableSync !== true) {
+      ws.close(4406, CREW_UPDATE_REQUIRED);
+      return false;
+    }
     return enforceDeviceHostGrantAuthority(ws, state, Date.now(), async (grantId) => {
       if (this.revokedGrants.has(grantId)) return false;
       const stub = this.env.AUTH_GRANTS.get(this.env.AUTH_GRANTS.idFromName(grantId));
@@ -418,8 +437,7 @@ export class DeviceRoom implements DurableObject {
       return new Response("forbidden", { status: 403 });
     }
     const boundScope = this.getMeta("projectScope");
-    if (!boundScope) this.setMeta("projectScope", projectScope);
-    else if (boundScope !== projectScope) return new Response("forbidden", { status: 403 });
+    if (boundScope && boundScope !== projectScope) return new Response("forbidden", { status: 403 });
     const encodedGrant = request.headers.get(AUTH_GRANT_HEADER);
     const grant = parseTrustedDeviceGrant(encodedGrant, userId, projectScope, Date.now());
     if (encodedGrant && !grant) return new Response("invalid grant", { status: 403 });
@@ -437,6 +455,7 @@ export class DeviceRoom implements DurableObject {
       }
     }
     const owner = this.getMeta("owner");
+    const durableSync = request.headers.get(SYNC_PROTOCOL_HEADER) === DURABLE_SYNC_PROTOCOL;
 
     if (url.pathname === "/ws") {
       const requestedPeerSessionId = url.searchParams.get("peerSessionId");
@@ -460,8 +479,7 @@ export class DeviceRoom implements DurableObject {
           return new Response("forbidden", { status: 403 });
         }
         const boundDevice = this.getMeta("targetDeviceId");
-        if (!boundDevice) this.setMeta("targetDeviceId", grant.targetDeviceId);
-        else if (boundDevice !== grant.targetDeviceId) {
+        if (boundDevice && boundDevice !== grant.targetDeviceId) {
           return new Response("forbidden", { status: 403 });
         }
       }
@@ -476,18 +494,29 @@ export class DeviceRoom implements DurableObject {
           const current = this.liveHost()?.deserializeAttachment() as SocketState | null | undefined;
           const principal = this.getMeta("localOwnerUserId") ?? current?.userId;
           if (principal && principal !== userId) return new Response("forbidden", { status: 403 });
-          this.setMeta("localOwnerUserId", userId);
         }
-        if (!owner) this.setMeta("owner", projectScope);
-        else if (owner !== projectScope) return new Response("forbidden", { status: 403 });
+        if (owner && owner !== projectScope) return new Response("forbidden", { status: 403 });
       } else if (!owner || owner !== projectScope) {
         return new Response("forbidden", { status: 403 });
       }
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
       const controlSessionId = url.searchParams.get("controlSessionId") ?? undefined;
+      if ((controlSessionId || url.searchParams.get("purpose") === "control") &&
+          (url.searchParams.has("controlDeploymentId") || url.searchParams.has("deploymentId"))) {
+        return new Response("scoped_control_not_supported", { status: 403 });
+      }
       if (controlSessionId && (role !== "client" || grant || peerSessionId ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(controlSessionId))) {
         return new Response("forbidden", { status: 403 });
+      }
+      if (!durableSync) {
+        return json({ error: "crew_update_required", message: CREW_UPDATE_REQUIRED }, 426);
+      }
+      if (!boundScope) this.setMeta("projectScope", projectScope);
+      if (role === "host") {
+        if (grant && !this.getMeta("targetDeviceId")) this.setMeta("targetDeviceId", grant.targetDeviceId);
+        if (hostAuthorization === "local") this.setMeta("localOwnerUserId", userId);
+        if (!owner) this.setMeta("owner", projectScope);
       }
       const staleClients =
         role === "client" ? this.ctx.getWebSockets(clientTag(connId)) : [];
@@ -501,6 +530,7 @@ export class DeviceRoom implements DurableObject {
         userId,
         projectScope,
         capabilities,
+        durableSync: true,
         role,
         connId,
         joinedAt: Date.now(),
@@ -530,13 +560,28 @@ export class DeviceRoom implements DurableObject {
         // Only an authorized successor may evict the previous host.
         for (const stale of this.ctx.getWebSockets(HOST_TAG)) {
           if (stale === pair[1]) continue;
+          const staleState = stale.deserializeAttachment() as SocketState | null;
+          if (staleState) stale.serializeAttachment({ ...staleState, superseded: true });
           try {
             stale.close(4409, "superseded by new host connection");
           } catch {
             /* already gone */
           }
         }
-        this.deliverHostStartup(pair[1], grant);
+        // The new host has no prior RPC/watch/terminal streams. Retire their
+        // client sockets now; the predecessor's close is deliberately ignored.
+        for (const client of this.ctx.getWebSockets()) {
+          const current = client.deserializeAttachment() as SocketState | null;
+          if (current?.role !== "client" || current.superseded) continue;
+          client.serializeAttachment({ ...current, superseded: true });
+          this.deliver(client, { s: "", k: RELAY_KIND }, encodeRelayError("host_closed"));
+          try {
+            client.close(1012, "engine reconnected");
+          } catch {
+            /* already gone */
+          }
+        }
+        await this.deliverHostStartup(pair[1], grant);
       }
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -557,6 +602,7 @@ export class DeviceRoom implements DurableObject {
         ) {
           return json({ error: "forbidden" }, 403);
         }
+        if (!durableSync) return json({ error: "crew_update_required", message: CREW_UPDATE_REQUIRED }, 426);
         putJsonBlob(this.blobs, `sidecar:${name}`, await request.json());
         return json({ ok: true });
       }
@@ -585,26 +631,33 @@ export class DeviceRoom implements DurableObject {
       ) {
         return json({ error: "forbidden" }, owner ? 403 : 404);
       }
+      if (!durableSync) return json({ error: "crew_update_required", message: CREW_UPDATE_REQUIRED }, 426);
       const body = (await request.json().catch(() => null)) as { chatId?: string } | null;
       const chatId = body?.chatId;
-      if (!chatId || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);
-      const host = this.liveHost();
-      if (host && (await this.authorizeHost(host))) {
-        this.deliver(host, { s: chatId, k: NUDGE_KIND }, new TextEncoder().encode(JSON.stringify({ chatId })));
-        return json({ delivered: true });
+      if (typeof chatId !== "string" || !CHAT_ID_RE.test(chatId)) return json({ error: "bad_chat_id" }, 400);
+      if (grant && grant.scope.sessionId !== chatId) return json({ error: "forbidden" }, 403);
+      const existing = [...this.ctx.storage.sql.exec("SELECT chat_id FROM pending_nudges WHERE chat_id = ?", chatId)];
+      const count = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM pending_nudges")][0]?.n as number;
+      if (existing.length === 0 && count >= NUDGE_MAX_PENDING) {
+        return json({ error: "nudge_capacity", delivered: false, queued: false }, 503);
       }
-      // Host offline: queue durably (dedup by chat — one open covers any
-      // number of pending commands), bounded so a runaway sender can't grow
-      // the DO forever. Overflow drops the OLDEST: recency wins.
+      // A new wakeup supersedes the receipt token, never the original queue time.
+      // An in-flight ACK for an older drain cannot consume this acceptance.
+      const nudgeId = crypto.randomUUID();
       this.ctx.storage.sql.exec(
-        "INSERT INTO pending_nudges (chat_id, queued_at) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET queued_at = excluded.queued_at",
-        chatId,
-        Date.now()
+        "INSERT INTO pending_nudges (chat_id, queued_at, nudge_id) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET nudge_id = excluded.nudge_id",
+        chatId, Date.now(), nudgeId
       );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM pending_nudges WHERE chat_id NOT IN (SELECT chat_id FROM pending_nudges ORDER BY queued_at DESC LIMIT ?)",
-        NUDGE_MAX_PENDING
-      );
+      await this.ctx.storage.sync();
+      const host = this.liveHost();
+      if (host && (await this.authorizeHost(host)) && this.liveHost() === host) {
+        const hostState = host.deserializeAttachment() as SocketState | null;
+        if (!hostState?.grant || hostState.grant.scope.sessionId === chatId) {
+          const delivered = this.deliver(host, { s: chatId, k: NUDGE_KIND },
+            new TextEncoder().encode(JSON.stringify({ chatId, nudgeId })));
+          return json({ delivered, queued: true });
+        }
+      }
       return json({ delivered: false, queued: true });
     }
 
@@ -613,20 +666,23 @@ export class DeviceRoom implements DurableObject {
 
   private replayNudges(host: WebSocket): void {
     const rows = [
-      ...this.ctx.storage.sql.exec("SELECT chat_id FROM pending_nudges ORDER BY queued_at ASC")
-    ] as Array<{ chat_id: string }>;
+      ...this.ctx.storage.sql.exec("SELECT chat_id, nudge_id FROM pending_nudges ORDER BY queued_at ASC")
+    ] as Array<{ chat_id: string; nudge_id: string }>;
     if (rows.length === 0) return;
     for (const row of rows) {
+      const state = host.deserializeAttachment() as SocketState | null;
+      if (state?.grant && state.grant.scope.sessionId !== row.chat_id) continue;
       this.deliver(
         host,
         { s: row.chat_id, k: NUDGE_KIND },
-        new TextEncoder().encode(JSON.stringify({ chatId: row.chat_id }))
+        new TextEncoder().encode(JSON.stringify({ chatId: row.chat_id, nudgeId: row.nudge_id }))
       );
     }
-    this.ctx.storage.sql.exec("DELETE FROM pending_nudges");
   }
 
-  deliverHostStartup(host: WebSocket, grant?: TrustedDeviceGrant): void {
+  async deliverHostStartup(host: WebSocket, grant?: TrustedDeviceGrant): Promise<void> {
+    await this.ctx.storage.sync();
+    if (this.liveHost() !== host || (host.deserializeAttachment() as SocketState | null)?.superseded) return;
     if (grant) {
       this.deliver(
         host,
@@ -643,9 +699,14 @@ export class DeviceRoom implements DurableObject {
       ws.close(1008, "Missing socket authority");
       return;
     }
+    if (state.durableSync !== true) {
+      ws.close(4406, CREW_UPDATE_REQUIRED);
+      return;
+    }
     if (state.role === "client" && !(await this.authorizePeerClient(ws, state))) return;
-    if (state.superseded) return;
     if (state.role === "host" && !(await this.authorizeHost(ws))) return;
+    // Authority checks yield: a successor may have retired this socket meanwhile.
+    if ((ws.deserializeAttachment() as SocketState | null)?.superseded) return;
     if (typeof message === "string") return; // ping/pong auto-response
     let frame: { header: DeviceFrameHeader; payload: Uint8Array };
     try {
@@ -706,11 +767,16 @@ export class DeviceRoom implements DurableObject {
         this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
         return;
       }
+      if ((ws.deserializeAttachment() as SocketState | null)?.superseded) return;
+      if (this.liveHost() !== host) {
+        this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_closed"));
+        return;
+      }
       const hostState = host.deserializeAttachment() as SocketState | null;
       const hostGrant = hostState?.grant;
       let method: string | undefined;
       try { method = JSON.parse(new TextDecoder().decode(frame.payload)).method; } catch { /* denied below */ }
-      if (method === "AdmitPeerCommand" || state.controlSessionId) {
+      if (method === "AdmitPeerCommand" || (method === "ReadSessionCommand" && !hostGrant) || state.controlSessionId) {
         // Re-read after the authority awaits: another message may have consumed it.
         const current = ws.deserializeAttachment() as SocketState | null;
         const admission = current && frame.header.k === "rpc"
@@ -730,11 +796,29 @@ export class DeviceRoom implements DurableObject {
         this.rejectRequest(ws, frame, "peer_command_authority_required");
         return;
       }
+      if (method === "ReadSessionCommand" &&
+          (state.userId !== hostState?.userId || state.projectScope !== hostState?.projectScope)) {
+        this.rejectRequest(ws, frame, "session_scope_denied");
+        return;
+      }
       if (hostGrant && !rpcAllowedForScopedHost(frame.header, frame.payload, hostGrant)) {
         this.rejectRequest(ws, frame, "session_scope_denied");
         return;
       }
       this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, frame.payload);
+      return;
+    }
+    if (frame.header.k === NUDGE_ACK_KIND) {
+      // Check after asynchronous authorization: superseded hosts cannot consume.
+      const current = ws.deserializeAttachment() as SocketState | null;
+      if (this.liveHost() !== ws || current?.superseded) return;
+      let receipt: { chatId?: unknown; nudgeId?: unknown };
+      try { receipt = JSON.parse(new TextDecoder().decode(frame.payload)); } catch { return; }
+      if (!receipt || typeof receipt.chatId !== "string" || !CHAT_ID_RE.test(receipt.chatId) ||
+          typeof receipt.nudgeId !== "string" || frame.header.s !== receipt.chatId ||
+          (current?.grant && current.grant.scope.sessionId !== receipt.chatId)) return;
+      this.ctx.storage.sql.exec("DELETE FROM pending_nudges WHERE chat_id = ? AND nudge_id = ?", receipt.chatId, receipt.nudgeId);
+      await this.ctx.storage.sync();
       return;
     }
     // Host frame: route by `to`.
@@ -750,7 +834,7 @@ export class DeviceRoom implements DurableObject {
 
   async webSocketClose(ws: WebSocket): Promise<void> {
     const state = ws.deserializeAttachment() as SocketState | null;
-    if (!state) return;
+    if (!state || state.durableSync !== true) return;
     if (state.superseded) return;
     if (state.role === "client") {
       // Tell the host so it can tear down any per-client streams (ptys etc.).
@@ -802,11 +886,12 @@ export class DeviceRoom implements DurableObject {
     this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError(code));
   }
 
-  private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): void {
+  private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): boolean {
     try {
       ws.send(encodeDeviceFrame(header, payload));
+      return true;
     } catch {
-      /* stale socket */
+      return false;
     }
   }
 }
@@ -871,6 +956,14 @@ export const rpcAllowedForScopedHost = (
         (value.params.targetDeviceId === undefined ||
           value.params.targetDeviceId === grant.targetDeviceId)
       );
+    }
+    if (value.method === "ReadSessionCommand") {
+      const projection = value.params?.roomProjection as Record<string, unknown> | undefined;
+      return grant.capabilities.includes(SESSION_READ) && value.params?.chatId === grant.scope.sessionId &&
+        typeof value.params.commandId === "string" && value.params.commandId.trim().length > 0 &&
+        (value.params.targetDeviceId === undefined || value.params.targetDeviceId === grant.targetDeviceId) &&
+        (projection === undefined || (projection !== null && projection.projectId === grant.scope.projectId &&
+          projection.deploymentId === grant.scope.deploymentId && projection.sessionId === grant.scope.sessionId));
     }
     if (value.method === "DeliverPeerMessage") {
       return (
@@ -1007,19 +1100,26 @@ export const peerCommandAdmission = (
     host.userId !== client.userId || host.projectScope !== client.projectScope ||
     !host.targetDeviceId || host.targetDeviceId !== client.targetDeviceId ||
     !client.controlSessionId || client.controlConsumed ||
-    !client.capabilities.includes("session.control") ||
     !client.joinedAt || client.joinedAt > now || now >= client.joinedAt + 30_000) return undefined;
   try {
     const request = JSON.parse(new TextDecoder().decode(payload));
-    if (request.method !== "AdmitPeerCommand" || !Number.isSafeInteger(request.id) || request.id < 0 ||
+    if (!["AdmitPeerCommand", "ReadSessionCommand"].includes(request.method) || !Number.isSafeInteger(request.id) || request.id < 0 ||
       request.cancel || request.params?.chatId !== client.controlSessionId ||
       typeof request.params.commandId !== "string" || !request.params.commandId.trim()) return undefined;
+    // Legacy ordinary authority cannot attest a deployment, even if the caller
+    // puts one in the DTO instead of the websocket query.
+    if (request.params.deploymentId != null || request.params.controlDeploymentId != null) return undefined;
+    if (request.params.roomProjection != null ||
+      (request.params.targetDeviceId != null && request.params.targetDeviceId !== host.targetDeviceId)) return undefined;
     const command = request.params.command;
-    if (command?.kind === "control") {
-      if (command.source !== "local" || command.ownerDeviceId !== host.targetDeviceId ||
-        command.actorSubject !== client.userId || typeof command.sessionId !== "string" ||
-        !command.sessionId.trim()) return undefined;
-    } else if (!["run", "steer", "queue", "interrupt", "respondInput"].includes(command?.kind)) return undefined;
+    if (request.method === "AdmitPeerCommand") {
+      if (!client.capabilities.includes("session.control")) return undefined;
+      if (command?.kind === "control") {
+        if (command.source !== "local" || command.ownerDeviceId !== host.targetDeviceId ||
+          command.actorSubject !== client.userId || typeof command.sessionId !== "string" ||
+          !command.sessionId.trim()) return undefined;
+      } else if (!["run", "steer", "queue", "interrupt", "respondInput"].includes(command?.kind)) return undefined;
+    }
     if (!client.capabilities.includes(requiredCapabilityForRpc({ s: "rpc", k: "rpc" }, payload))) return undefined;
     return { request, authority: {
       subject: client.userId,
@@ -1047,6 +1147,7 @@ export const requiredCapabilityForRpc = (
   }
   if (value.method === "DeliverPeerMessage") return "session.chat";
   if (value.method === "LocalDevice") return SESSION_READ;
+  if (value.method === "ReadSessionCommand") return SESSION_READ;
   if (value.method === "QueueCommand" || value.method === "AdmitPeerCommand") {
     const command = value.params?.command;
     if (command?.kind !== "control") return "session.control";
