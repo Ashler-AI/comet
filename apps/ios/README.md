@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (29)** and production **1.0 (20)** are available
+Mobile staging **1.0 (30)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -35,7 +35,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 30
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 31
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -69,14 +69,14 @@ The 7 GB runner saturated during live transport (zero CPU idle and roughly
 simulator/native/Edge transport and the staging build 30 archive in
 [run 37420927501](https://github.com/Ashler-AI/comet/actions/runs/37420927501)
 on PR merge source `d3344825` (head `de43e527`). Downloaded checksums and
-strict archive signature/APNs inspection passed. Signing remains ad-hoc;
-no Apple distribution upload, TestFlight processing or installed-phone proof.
+strict archive signature/APNs inspection passed. That earlier archive remained
+ad-hoc and was not uploaded; the released source and TestFlight evidence are below.
 
 The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-30-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-30-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-31-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-31-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
@@ -102,6 +102,39 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew Staging 1.0 (31): catalog recovery
+
+Workspace and session upload callbacks carry their original document binding.
+During authoritative snapshot/journal recovery, writes remain in the durable
+intent journal instead of uploading retired ancestry; queued old-document work
+is ignored after adoption. The existing reset regression verifies edits during
+backfill, recovered catalog updates and membership removal. Edge 0.1.145 also
+streams persisted workspace journal replay to stay below the batch import's
+observed WASM memory spike, without clearing accepted history.
+
+### Crew Staging 1.0 (30): sync and restart release evidence
+
+Merged source `6255cfa29da2b2c2c538b7cbe42aa23b8bcd8089` from
+[PR #84](https://github.com/Ashler-AI/comet/pull/84) passed the native, Edge and mobile
+gates in [release run 37706019519](https://github.com/Ashler-AI/comet/actions/runs/37706019519).
+The downloaded staging artifact's transport hash, all nine checksums and source
+provenance matched. Existing cloud-managed distribution signing exported it
+without local compilation or typechecks.
+
+Apple accepted the single staging-only upload at **2026-10-08 02:40:07 UTC**.
+Authenticated App Store Connect readback confirmed upload `COMPLETE`, build
+`VALID`, `INTERNAL_ONLY` and `IN_BETA_TESTING`; the UI showed **Testing** in the
+existing **Ashler Internal** group with one existing invitation.
+The exact uploaded IPA passed strict deep signature verification with bundle
+`ai.ashler.crew.staging`, version **1.0 (30)**, team `825LYXGJR6`, internal-only
+distribution, and matching production APNs signature/profile.
+Uploaded IPA SHA-256: `de88c1129d20b7e78614766e886a1f9f55cce7307db16d5fe3dd5c8386279dae`.
+Apple delivery/build ID: `a42e6145-37e3-4169-9586-fe20c4cbeda7`.
+
+Production, Scaffold image pins, tester memberships and account permissions were
+unchanged; no public App Store submission occurred. Physical-phone installation
+and notification receipt remain unverified.
 
 ### Crew Staging 1.0 (29): durable recovery release evidence
 
