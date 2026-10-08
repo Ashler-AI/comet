@@ -564,7 +564,7 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
                 truncated: snapshot.truncated,
                 published_at: chrono::Utc::now().timestamp_millis(),
             };
-            let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
+            let url = format!("{}/diff/{}?syncProtocol={}", edge.url.trim_end_matches('/'), chat.id, comet_proto::DURABLE_SYNC_PROTOCOL);
             // Fresh bearer per request — never the boot-time snapshot.
             let Some(bearer) = edge.bearer().await else {
                 tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (signed out)");

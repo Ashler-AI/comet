@@ -13,8 +13,6 @@ pub const COMPACT_LOG_BYTES: usize = 8 * 1024 * 1024;
 pub const SOFT_CEILING_BYTES: usize = 25 * 1024 * 1024;
 /// Host commits streamed assistant segments into the doc at this cadence (ms).
 pub const STREAM_COMMIT_MS: u64 = 120;
-/// Session DO batches update-log flushes at this cadence (ms).
-pub const DO_FLUSH_MS: u64 = 5_000;
 /// Byte budget for the in-memory doc LRU on device backends.
 pub const DOC_LRU_BYTE_BUDGET: usize = 80 * 1024 * 1024;
 /// Number of trailing messages materialized into the tail sidecar.

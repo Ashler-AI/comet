@@ -48,7 +48,7 @@ const until = async (fn, what, ms = 8000) => {
 }
 
 // ── session room: two peers converge ─────────────────────────────────────
-const sessionUrl = `${wsBase}/session/${chatId}/ws?token=${token}`;
+const sessionUrl = `${wsBase}/session/${chatId}/ws?token=${token}&syncProtocol=durable-records-v1`;
 
 const clientA = new LoroWebsocketClient({ url: sessionUrl });
 await clientA.waitConnected();
@@ -66,7 +66,7 @@ m1.set("deviceId", "peer-a");
 docA.commit();
 ok("peer A joined + wrote");
 
-const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${peerToken}` });
+const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${peerToken}&syncProtocol=durable-records-v1` });
 await clientB.waitConnected();
 const adaptorB = new LoroAdaptor();
 await clientB.join({ roomId: chatId, crdtAdaptor: adaptorB });
@@ -121,7 +121,7 @@ await new Promise((r) => setTimeout(r, 100));
 // ── diff sidecar ──────────────────────────────────────────────────────────
 {
   const diff = { chatId, deviceId: "peer-a", checkoutPath: "/tmp/x", patch: "diff --git a b", files: [], additions: 1, deletions: 0, truncated: false, publishedAt: Date.now() };
-  const post = await fetch(`${base}/diff/${chatId}?token=${peerToken}`, {
+  const post = await fetch(`${base}/diff/${chatId}?token=${peerToken}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(diff)
@@ -151,7 +151,7 @@ await new Promise((r) => setTimeout(r, 100));
 // ── device room ───────────────────────────────────────────────────────────
 {
   const { encodeDeviceFrame, decodeDeviceFrame } = await import("./device-frame.mjs");
-  const host = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host`);
+  const host = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host&syncProtocol=durable-records-v1`);
   host.binaryType = "arraybuffer";
   await new Promise((resolve, reject) => {
     host.onopen = resolve;
@@ -174,7 +174,7 @@ await new Promise((r) => setTimeout(r, 100));
   };
 
   const connId = "conn-1";
-  const client = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=client&connId=${connId}`);
+  const client = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=client&connId=${connId}&syncProtocol=durable-records-v1`);
   client.binaryType = "arraybuffer";
   await new Promise((resolve, reject) => {
     client.onopen = resolve;
@@ -191,18 +191,18 @@ await new Promise((r) => setTimeout(r, 100));
   if (echoed !== "hello-host") fail(`device echo got ${echoed}`);
   ok("device room rpc echo (client→host→client)");
 
-  // intruder cannot join the device room
-  const evil = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=evil&role=client`);
+  // A different project cannot join this project-scoped device room.
+  const evil = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=evil%40foreign-project&role=client&syncProtocol=durable-records-v1`);
   const evilResult = await new Promise((resolve) => {
     evil.onopen = () => resolve("open");
     evil.onerror = () => resolve("error");
     setTimeout(() => resolve("timeout"), 3000);
   });
   if (evilResult === "open") fail("intruder joined device room");
-  ok("device room ownership enforced");
+  ok("device room project boundary enforced");
 
   // sidecar slot
-  const post = await fetch(`${base}/device/${deviceId}/sidecar/repos?token=${token}`, {
+  const post = await fetch(`${base}/device/${deviceId}/sidecar/repos?token=${token}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ repos: [{ path: "/x", name: "x" }] })
@@ -213,30 +213,57 @@ await new Promise((r) => setTimeout(r, 100));
   ok("device sidecar slot round-trip");
 
   // nudge: live delivery to the connected host
-  const nudge = await fetch(`${base}/device/${deviceId}/nudge?token=${token}`, {
+  const nudge = await fetch(`${base}/device/${deviceId}/nudge?token=${token}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chatId: "chat-live" })
+    body: JSON.stringify({ chatId })
   });
   if ((await nudge.json()).delivered !== true) fail("live nudge not delivered");
   await until(
-    () => hostFrames.some((f) => f.header.k === "nudge" && new TextDecoder().decode(f.payload).includes("chat-live")),
+    () => hostFrames.some((f) => f.header.k === "nudge" && JSON.parse(new TextDecoder().decode(f.payload)).chatId === chatId),
     "live nudge frame"
   );
   ok("nudge delivered live to connected host");
+
+  // A new engine socket cannot inherit the prior engine's RPC subscriptions.
+  const successor = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host&syncProtocol=durable-records-v1`);
+  successor.binaryType = "arraybuffer";
+  successor.onmessage = (event) => {
+    if (typeof event.data === "string") return;
+    const frame = decodeDeviceFrame(new Uint8Array(event.data));
+    if (frame.header.k === "rpc" && frame.header.from) {
+      successor.send(encodeDeviceFrame({ s: frame.header.s, k: "rpc", to: frame.header.from }, frame.payload));
+    }
+  };
+  await until(() => clientFrames.some((frame) => frame.header.k === " relay"
+    && JSON.parse(new TextDecoder().decode(frame.payload)).error === "host_closed"), "old client generation invalidation");
+  const resumed = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=client&connId=${connId}&syncProtocol=durable-records-v1`);
+  resumed.binaryType = "arraybuffer";
+  const resumedFrames = [];
+  resumed.onmessage = (event) => {
+    if (typeof event.data !== "string") resumedFrames.push(decodeDeviceFrame(new Uint8Array(event.data)));
+  };
+  await until(() => resumed.readyState === WebSocket.OPEN, "client reconnect after host replacement");
+  resumed.send(encodeDeviceFrame({ s: "rpc-restarted", k: "rpc" }, new TextEncoder().encode("after-restart")));
+  await until(() => resumedFrames.some((frame) => frame.header.s === "rpc-restarted"
+    && new TextDecoder().decode(frame.payload) === "after-restart"), "replacement host RPC response");
+  ok("host replacement invalidated stale streams and reconnected client received its RPC response");
+  resumed.close();
+  successor.close();
 
   host.close();
   client.close();
 
   // nudge: queued while host offline, replayed on rejoin
+  const coldChatId = randomUUID();
   await new Promise((r) => setTimeout(r, 200)); // let the close land
-  const queued = await fetch(`${base}/device/${deviceId}/nudge?token=${token}`, {
+  const queued = await fetch(`${base}/device/${deviceId}/nudge?token=${token}&syncProtocol=durable-records-v1`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chatId: "chat-cold" })
+    body: JSON.stringify({ chatId: coldChatId })
   });
   if ((await queued.json()).queued !== true) fail("offline nudge not queued");
-  const host2 = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host`);
+  const host2 = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host&syncProtocol=durable-records-v1`);
   host2.binaryType = "arraybuffer";
   const replayed = [];
   host2.onmessage = (e) => {
@@ -244,7 +271,7 @@ await new Promise((r) => setTimeout(r, 100));
     replayed.push(decodeDeviceFrame(new Uint8Array(e.data)));
   };
   await until(
-    () => replayed.some((f) => f.header.k === "nudge" && new TextDecoder().decode(f.payload).includes("chat-cold")),
+    () => replayed.some((f) => f.header.k === "nudge" && JSON.parse(new TextDecoder().decode(f.payload)).chatId === coldChatId),
     "queued nudge replay on host join"
   );
   ok("nudge queued offline and replayed on host join");
@@ -276,7 +303,7 @@ await new Promise((r) => setTimeout(r, 100));
 
 // ── reconnect: new client with existing state catches up incrementally ───
 {
-  const clientC = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
+  const clientC = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}&syncProtocol=durable-records-v1` });
   await clientC.waitConnected();
   const preSeeded = new LoroDoc();
   preSeeded.import(docA.export({ mode: "snapshot" }));

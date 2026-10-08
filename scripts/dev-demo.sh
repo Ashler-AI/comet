@@ -10,16 +10,16 @@ set -euo pipefail
 export ASHLER_INCREMENTAL_TSC_CHECKS=false
 cd "$(dirname "$0")/.."
 
-DAEMON_DIR=/tmp/comet-demo-daemon
-UI_DIR=/tmp/comet-demo-ui
-IPC=27921
+DAEMON_DIR=${COMET_DEMO_DAEMON_DIR:-/tmp/comet-demo-daemon}
+UI_DIR=${COMET_DEMO_UI_DIR:-/tmp/comet-demo-ui}
+IPC=${COMET_DEMO_IPC_PORT:-27921}
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
 
 echo "▸ building Crew (first run takes a few minutes)…"
 DEMO_BIN="$(mktemp -d)"
 trap 'rm -rf "$DEMO_BIN"' EXIT
-python3 scripts/local-cargo.py build -p comet -p comet-rpc --bins --example rpc_probe -q \
+python3 scripts/local-cargo.py build --locked -p comet -p comet-rpc --bins --example rpc_probe -q \
   --copy-binary debug/comet "$DEMO_BIN/comet" \
   --copy-binary debug/examples/rpc_probe "$DEMO_BIN/rpc_probe"
 

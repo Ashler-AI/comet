@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { once } from "node:events";
+import { createRequire } from "node:module";
+import { promisify } from "node:util";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +15,16 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EDGE_DIR = path.join(ROOT, "edge");
 const COMET_BIN = process.env.COMET_BIN ?? path.join(ROOT, "target", "debug", "comet");
+const QUIET_OWNER = process.env.COMET_SYNC_QUIET_OWNER === "1";
+const MOBILE_SIMULATOR = process.env.COMET_MOBILE_SIMULATOR_ID;
+const MOBILE_BUNDLE = process.env.COMET_MOBILE_BUNDLE_ID;
+assert.equal(Boolean(MOBILE_SIMULATOR), Boolean(MOBILE_BUNDLE), "mobile fixture requires both simulator and bundle identity");
+const SOAK_TURNS = Number(process.env.COMET_SYNC_SOAK_TURNS ?? 24);
+assert.ok(Number.isSafeInteger(SOAK_TURNS) && SOAK_TURNS > 0 && SOAK_TURNS <= 2_000,
+  "COMET_SYNC_SOAK_TURNS must be an integer between 1 and 2000");
+const edgeRequire = createRequire(path.join(EDGE_DIR, "package.json"));
+const { WebSocket } = edgeRequire("ws");
+const DURABLE_SYNC_PROTOCOL = "durable-records-v1";
 const OWNER_TOKEN = "sc_rc_comet_integration_owner";
 const CLIENT_A_TOKEN = "sc_rc_comet_integration_client_a";
 const CLIENT_B_TOKEN = "sc_rc_comet_integration_client_b";
@@ -111,6 +124,7 @@ const startFakeScaffold = async (port) => {
       const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
       const subjectByToken = {
         [OWNER_TOKEN]: OWNER_SUBJECT,
+        [`${OWNER_SUBJECT}@${PROJECT_ID}`]: OWNER_SUBJECT,
         [CLIENT_A_TOKEN]: CLIENT_A_SUBJECT,
         [CLIENT_B_TOKEN]: CLIENT_B_SUBJECT
       };
@@ -181,6 +195,7 @@ const captureOutput = (child, label) => {
     child.spawnError = error;
     capture(error.stack ?? error.message);
   });
+  child.once("exit", (code, signal) => capture(`${new Date().toISOString()} ${label} exited code=${code} signal=${signal}`));
   child.outputSummary = () => `${label} output:\n${lines.join("\n")}`;
 };
 
@@ -212,6 +227,27 @@ const terminateChild = async (child) => {
     child.kill("SIGKILL");
   }
   await Promise.race([exited, delay(1_000)]);
+};
+
+const crashChild = async (child) => {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  if (process.platform === "win32") child.kill("SIGKILL");
+  else process.kill(-child.pid, "SIGKILL");
+  await withTimeout(exited, "crashed fixture process exit", 10_000);
+};
+
+const residentKiB = async (child) => {
+  if (process.platform === "linux") {
+    const status = await readFile(`/proc/${child.pid}/status`, "utf8");
+    const rss = status.match(/^VmRSS:\s+(\d+)\s+kB$/m);
+    assert.ok(rss, "headless fixture RSS is available");
+    return Number(rss[1]);
+  }
+  const { stdout } = await promisify(execFile)("ps", ["-p", String(child.pid), "-o", "rss="]);
+  const rss = Number(stdout.trim());
+  assert.ok(Number.isFinite(rss) && rss > 0, "headless fixture RSS is available");
+  return rss;
 };
 
 const cleanup = async () => {
@@ -249,7 +285,7 @@ const fetchJson = async (url, init = {}) => {
 };
 
 const ownerFetch = (edgeOrigin, pathname, init = {}) =>
-  fetchJson(`${edgeOrigin}${pathname}`, {
+  fetchJson(`${edgeOrigin}${pathname}${pathname.includes("?") ? "&" : "?"}syncProtocol=${DURABLE_SYNC_PROTOCOL}`, {
     ...init,
     headers: {
       authorization: `Bearer ${OWNER_TOKEN}`,
@@ -261,7 +297,9 @@ const ownerFetch = (edgeOrigin, pathname, init = {}) =>
 const openWebSocket = (url, label) =>
   withTimeout(
     new Promise((resolve, reject) => {
-      const socket = new WebSocket(url);
+      const target = new URL(url);
+      if (target.pathname !== "/") target.searchParams.set("syncProtocol", DURABLE_SYNC_PROTOCOL);
+      const socket = new WebSocket(target);
       socket.binaryType = "arraybuffer";
       const onOpen = () => {
         dispose();
@@ -285,7 +323,7 @@ const openWebSocket = (url, label) =>
       socket.addEventListener("error", onError);
       socket.addEventListener("close", onClose);
     }),
-    label
+    label, 30_000
   );
 
 const closeWebSocket = (socket, label) => {
@@ -431,36 +469,213 @@ const localRpc = async (port, method, params = {}) => {
       socket.addEventListener("message", (event) => {
         const reply = JSON.parse(event.data);
         if (reply.id !== 1) return;
-        if (Object.hasOwn(reply, "err")) reject(new Error(reply.err));
+        if (Object.hasOwn(reply, "err")) reject(new Error(`${method} local RPC (${params.command?.kind ?? "read"}): ${reply.err}`));
         else if (Object.hasOwn(reply, "ok")) resolve(reply.ok);
         else if (Object.hasOwn(reply, "item")) resolve(reply.item);
       });
       socket.send(JSON.stringify({ id: 1, method, params }));
-    }), `${method} local RPC`);
+    }), `${method} local RPC (${params.command?.kind ?? "read"})`);
   } finally { await closeWebSocket(socket, "local IPC"); }
 };
 
-const ordinaryDeviceSmoke = async (edgeOrigin, scaffoldOrigin) => {
+const seedWorkspaceHistory = async (edgeOrigin, ports) => {
+  const { LoroWebsocketClient } = await import(edgeRequire.resolve("loro-websocket"));
+  const { LoroAdaptor } = await import(edgeRequire.resolve("loro-adaptors/loro"));
+  const { LoroMap } = edgeRequire("loro-crdt");
+  const client = new LoroWebsocketClient({
+    url: `${edgeOrigin.replace("http:", "ws:")}/workspace/${PROJECT_ID}/ws?token=${OWNER_TOKEN}&syncProtocol=${DURABLE_SYNC_PROTOCOL}`
+  });
+  const adaptor = new LoroAdaptor();
+  const fixtureDeviceId = crypto.randomUUID();
+  const ids = Array.from({ length: 1_600 }, () => crypto.randomUUID());
+  try {
+    await withTimeout(client.waitConnected(), "workspace fixture transport");
+    await withTimeout(client.join({ roomId: `ws4/${PROJECT_ID}`, crdtAdaptor: adaptor }), "workspace fixture join");
+    await withTimeout(adaptor.waitForReachingServerVersion(), "workspace fixture backfill");
+    const doc = adaptor.getDoc();
+    const at = Date.now();
+    for (const [index, id] of ids.entries()) {
+      const chat = doc.getMap("chats").setContainer(id, new LoroMap());
+      for (const [key, value] of Object.entries({
+        id, deviceId: fixtureDeviceId, title: `Crew reliability history ${index}`,
+        archived: false, createdAt: at, lastMessageAt: at,
+        lastMessagePreview: "Preserved historical session", cwd: tempDir,
+        config: { harness: "mock", model: "fable-5", sandbox: "workspace-write" }
+      })) chat.set(key, value);
+      const ref = doc.getMap("sessionRefs").setContainer(
+        `${Buffer.byteLength(OWNER_SUBJECT)}:${OWNER_SUBJECT}:${id}`, new LoroMap());
+      ref.set("userId", OWNER_SUBJECT);
+      ref.set("chatId", id);
+      ref.set("addedAt", at);
+    }
+    doc.commit();
+    for (const port of ports) {
+      await waitFor("large workspace materialized on native client", async () => {
+        const chats = await localRpc(port, "WatchChats");
+        const imported = chats.filter((chat) => chat.deviceId === fixtureDeviceId);
+        if (imported.length !== ids.length) return false;
+        assert.deepEqual(new Set(imported.map((chat) => chat.id)), new Set(ids));
+        return true;
+      }, 30_000);
+    }
+  } finally { client.close(); }
+  return { fixtureDeviceId, ids };
+};
+
+const resetWorkspaceEpoch = async (edgeOrigin, ports, history, offlineChatId, chatId, remoteTitle) => {
+  const { LoroWebsocketClient } = await import(edgeRequire.resolve("loro-websocket"));
+  const { LoroAdaptor } = await import(edgeRequire.resolve("loro-adaptors/loro"));
+  const { LoroDoc, LoroMap } = edgeRequire("loro-crdt");
+  const reader = new LoroWebsocketClient({ url: `${edgeOrigin.replace("http:", "ws:")}/workspace/${PROJECT_ID}/ws?token=${OWNER_TOKEN}&syncProtocol=${DURABLE_SYNC_PROTOCOL}` });
+  const adaptor = new LoroAdaptor();
+  try {
+    await withTimeout(reader.waitConnected(), "reset seed reader");
+    await withTimeout(reader.join({ roomId: `ws4/${PROJECT_ID}`, crdtAdaptor: adaptor }), "reset seed join");
+    await withTimeout(adaptor.waitForReachingServerVersion(), "reset seed snapshot");
+    const seed = new LoroDoc();
+    try {
+      for (const [name, values] of Object.entries(adaptor.getDoc().toJSON())) {
+        assert.ok(values && typeof values === "object" && !Array.isArray(values), `workspace root ${name} is a map`);
+        const root = seed.getMap(name);
+        for (const [key, value] of Object.entries(values)) {
+          if (name !== "meta" && value && typeof value === "object" && !Array.isArray(value)) {
+            const row = root.setContainer(key, new LoroMap());
+            for (const [field, data] of Object.entries(value)) row.set(field, data);
+          } else root.set(key, value);
+        }
+      }
+      seed.getMap("chats").get(history.ids[0]).set("title", "Crew authoritative epoch seed");
+      seed.commit();
+      const result = await ownerFetch(edgeOrigin, `/workspace/${PROJECT_ID}/reset-log`, {
+        method: "POST", headers: { "content-type": "application/octet-stream" }, body: seed.export({ mode: "snapshot" }),
+      });
+      assert.equal(result.response.status, 200, "authenticated epoch reset accepts the complete seed");
+      for (const port of ports) await waitFor("native client adopts independent epoch seed", async () => {
+        const rows = await localRpc(port, "WatchChats");
+        return rows.find((row) => row.id === history.ids[0])?.title === "Crew authoritative epoch seed"
+          && rows.find((row) => row.id === offlineChatId)?.title === "Crew offline creation survives crash"
+          && rows.find((row) => row.id === chatId)?.title === remoteTitle
+          && rows.filter((row) => row.deviceId === history.fixtureDeviceId).length === history.ids.length
+          && (await localRpc(port, "SyncStatus")).workspace?.connected === true;
+      }, 30_000);
+      console.log("PASS authenticated independent workspace epoch reset preserves accepted creation, rename and all history rows");
+    } finally { seed.free(); }
+  } finally { reader.close(); }
+};
+
+const retiredProtocolSmoke = async (edgeOrigin, chatId, deviceId) => {
+  const { LoroWebsocketClient } = await import(edgeRequire.resolve("loro-websocket"));
+  const { LoroAdaptor } = await import(edgeRequire.resolve("loro-adaptors/loro"));
+  const { LoroDoc } = edgeRequire("loro-crdt");
+  const { CrdtType, MessageType, UpdateStatusCode, encode, decode } = edgeRequire("loro-protocol");
+  const oldURL = `${edgeOrigin.replace("http:", "ws:")}/session/${chatId}/ws?token=${OWNER_TOKEN}`;
+  const reader = new LoroWebsocketClient({ url: oldURL });
+  const adaptor = new LoroAdaptor();
+  const join = adaptor.handleJoinOk.bind(adaptor);
+  adaptor.handleJoinOk = async (response) => {
+    assert.equal(response.permission, "read", "retired protocol receives only read permission");
+    return join(response);
+  };
+  let socket;
+  const attempt = new LoroDoc();
+  try {
+    await withTimeout(reader.waitConnected(), "retired reader transport");
+    await withTimeout(reader.join({ roomId: chatId, crdtAdaptor: adaptor }), "retired reader join");
+    await withTimeout(adaptor.waitForReachingServerVersion(), "retired reader backfill");
+    const expectedIds = adaptor.getDoc().toJSON().messages.map((entry) => entry.id);
+    assert.ok(expectedIds.some((id) => typeof id === "string"), "retired reader receives accepted transcript identities");
+    socket = new WebSocket(oldURL);
+    socket.binaryType = "arraybuffer";
+    await withTimeout(once(socket, "open"), "retired write probe transport", 30_000);
+    const replies = [];
+    socket.addEventListener("message", (event) => replies.push(decode(new Uint8Array(event.data))));
+    socket.send(encode({ type: MessageType.JoinRequest, crdt: CrdtType.Loro, roomId: chatId,
+      auth: new Uint8Array(), version: new Uint8Array() }));
+    const joined = await waitFor("retired raw read-only join", async () => replies.find((reply) => reply.type === MessageType.JoinResponseOk));
+    assert.equal(joined.permission, "read");
+    attempt.getMap("meta").set("retiredWriteProbe", true); attempt.commit();
+    const batchId = "0x000000000000f135";
+    socket.send(encode({ type: MessageType.DocUpdate, crdt: CrdtType.Loro, roomId: chatId,
+      batchId, updates: [attempt.export({ mode: "snapshot" })] }));
+    const denied = await waitFor("retired raw write rejection", async () => replies.find((reply) => reply.type === MessageType.Ack && reply.refId === batchId));
+    assert.equal(denied.status, UpdateStatusCode.PermissionDenied);
+    const snapshot = await fetch(`${edgeOrigin}/snapshot/${chatId}`, { headers: { authorization: `Bearer ${OWNER_TOKEN}` } });
+    assert.equal(snapshot.status, 200);
+    const persisted = new LoroDoc();
+    try {
+      persisted.import(new Uint8Array(await snapshot.arrayBuffer()));
+      assert.notEqual(persisted.toJSON().meta.retiredWriteProbe, true, "rejected old write never persists");
+      assert.deepEqual(persisted.toJSON().messages.map((entry) => entry.id), expectedIds);
+    } finally { persisted.free(); }
+    for (const role of ["host", "client"]) {
+      const legacyRelay = `${edgeOrigin.replace("http:", "ws:")}/device/${deviceId}/ws?role=${role}&token=${OWNER_TOKEN}`;
+      const status = await withTimeout(new Promise((resolve, reject) => {
+        const probe = new WebSocket(legacyRelay);
+        probe.once("unexpected-response", (_request, response) => {
+          response.resume(); response.once("end", () => { resolve(response.statusCode); probe.terminate(); });
+        });
+        probe.once("open", () => { probe.close(); reject(new Error(`retired ${role} relay registered`)); });
+        probe.on("error", reject);
+      }), `retired ${role} relay rejection`, 30_000);
+      assert.equal(status, 426, "retired relay must require Crew update before registration/control");
+    }
+    console.log("PASS retired protocol reads accepted history but cannot publish or register/control a host");
+  } finally {
+    if (socket) await closeWebSocket(socket, "retired reader probe");
+    reader.close(); attempt.free();
+  }
+};
+
+const liveMobileSmoke = async (edgeOrigin, deviceId, workspacePath) => {
+  if (!MOBILE_SIMULATOR) return;
+  assert.equal(process.platform, "darwin", "mobile convergence requires the owned macOS simulator");
+  const exec = promisify(execFile);
+  await exec("xcrun", ["simctl", "bootstatus", MOBILE_SIMULATOR, "-b"], { timeout: 300_000 });
+  const { stdout } = await exec("xcrun", ["simctl", "get_app_container", MOBILE_SIMULATOR, MOBILE_BUNDLE, "data"]);
+  const log = path.join(stdout.trim(), "Documents", "e2e.log");
+  await rm(log, { force: true });
+  await exec("xcrun", ["simctl", "launch", "--terminate-running-process", MOBILE_SIMULATOR, MOBILE_BUNDLE, "-e2e"], {
+    env: { ...process.env, SIMCTL_CHILD_CREW_E2E_EDGE_URL: edgeOrigin,
+      SIMCTL_CHILD_CREW_E2E_ACCESS_TOKEN: OWNER_TOKEN,
+      SIMCTL_CHILD_CREW_E2E_USER_ID: OWNER_SUBJECT, SIMCTL_CHILD_CREW_E2E_PROJECT_SCOPE: PROJECT_ID,
+      SIMCTL_CHILD_CREW_E2E_DEVICE_ID: deviceId, SIMCTL_CHILD_CREW_E2E_WORKSPACE_PATH: workspacePath },
+  });
+  await waitFor("mobile/native/Edge live command and transcript convergence", async () => {
+    const text = await readFile(log, "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; });
+    assert.ok(!/\bFAIL\b/.test(text), `mobile live convergence failed:\n${text}`);
+    if (!/^\[\d+\] done$/m.test(text)) return false;
+    for (const marker of ["OK workspace synced", "OK relay ListFolders", "OK relay ListModels", "OK run admitted", "OK transcript streamed"])
+      assert.ok(text.includes(marker), `live mobile convergence misses ${marker}`);
+    console.log(text);
+    return true;
+  }, 120_000);
+  console.log("PASS real mobile/native/Edge transport convergence; deterministic mock inference");
+};
+
+const ordinaryDeviceSmoke = async (edgeOrigin, scaffoldOrigin, restartEdge) => {
   const ports = [await reservePort(), await reservePort()];
-  for (const [index, port] of ports.entries()) {
+  const devices = [];
+  const startDevice = async (index) => {
     const dataDir = path.join(tempDir, `ordinary-${index}`);
-    await mkdir(dataDir);
+    await mkdir(dataDir, { recursive: true });
     await writeFile(path.join(dataDir, "session.json"), JSON.stringify({
       accessToken: OWNER_TOKEN, user: { id: OWNER_SUBJECT, email: OWNER_SUBJECT, name: "Owner" },
       projectScope: PROJECT_ID, capabilities: CAPABILITIES
     }), { mode: 0o600 });
     const child = spawnTracked(`ordinary Crew device ${index}`, COMET_BIN,
       ["headless", "--edge-url", edgeOrigin], { cwd: ROOT, env: {
-        ...process.env, COMET_DATA_DIR: dataDir, COMET_IPC_PORT: String(port),
+        ...process.env, COMET_DATA_DIR: dataDir, COMET_IPC_PORT: String(ports[index]),
         COMET_PROJECT_SCOPE: PROJECT_ID, COMET_SCAFFOLD_URL: scaffoldOrigin,
-        COMET_HARNESS: "mock", COMET_MOCK_REPEAT: "30", COMET_MOCK_DELAY_MS: "200",
-        RUST_LOG: "info"
+        COMET_HARNESS: "mock", COMET_MOCK_REPEAT: QUIET_OWNER ? "1000" : "30", COMET_MOCK_DELAY_MS: "200",
+        ASHLER_INCREMENTAL_TSC_CHECKS: "false", RUST_LOG: "info"
       } });
+    devices[index] = child;
     await waitFor(`ordinary device ${index} IPC`, async () => {
       if (child.spawnError || child.exitCode !== null) throw new Error(child.outputSummary());
-      return localRpc(port, "LocalDevice");
+      return localRpc(ports[index], "LocalDevice");
     });
-  }
+  };
+  for (const index of [0, 1]) await startDevice(index);
   const [desktop, devbox] = ports;
   const { deviceId } = await localRpc(devbox, "LocalDevice");
   await waitFor("ordinary Devbox relay", async () => {
@@ -487,15 +702,35 @@ const ordinaryDeviceSmoke = async (edgeOrigin, scaffoldOrigin) => {
   const sessionId = crypto.randomUUID();
   const typed = (action) => ({ kind: "control", source: "local", sessionId,
     ownerDeviceId: deviceId, actorDeviceId: "desktop", actorSubject: OWNER_SUBJECT, grantId: "", action });
-  await send(typed({ action: "start", message_id: crypto.randomUUID(), request }));
-  await waitFor("ordinary Local session publication", async () =>
-    (await localRpc(desktop, "WatchCollaboration", { chatId })).sessions.some((session) =>
-      session.sessionId === sessionId && session.ownerDeviceId === deviceId && session.source === "local"));
+  const typedStart = await send(typed({ action: "start", message_id: crypto.randomUUID(), request }));
+  try {
+    await waitFor("ordinary Local session publication", async () =>
+      (await localRpc(desktop, "WatchCollaboration", { chatId })).sessions.some((session) =>
+        session.sessionId === sessionId && session.ownerDeviceId === deviceId && session.source === "local"));
+  } catch (error) {
+    const outcome = await localRpc(devbox, "ReadSessionCommand", { chatId, commandId: typedStart.commandId });
+    throw new Error(`${error.message}; owner command status=${outcome.command?.status ?? "missing"}, resolution=${String(outcome.command?.resolution ?? "none").slice(0, 500)}`);
+  }
   await send(typed({ action: "steer", prompt: "continue", message_id: crypto.randomUUID() }));
   await send(typed({ action: "stop" }));
   await waitFor("typed remote stop", async () =>
     (await localRpc(devbox, "WatchCollaboration", { chatId })).sessions.some((session) =>
       session.sessionId === sessionId && session.status === "idle"));
+  const readParams = { chatId, commandId: typedStart.commandId, targetDeviceId: deviceId, roomProjection: null };
+  const outcome = await localRpc(desktop, "ReadSessionCommand", readParams);
+  assert.equal(outcome.command?.status, "applied", "the observing device reads the original owner's durable outcome");
+  assert.equal(outcome.command?.payload.sessionId, sessionId);
+  for (const token of [OWNER_TOKEN, CLIENT_A_TOKEN]) {
+    const unscoped = await openWebSocket(
+      `${edgeOrigin.replace("http:", "ws:")}/device/${deviceId}/ws?role=client&token=${token}`,
+      "unscoped outcome reader"
+    );
+    try {
+      await assert.rejects(rpcCall(unscoped, 1, "ReadSessionCommand", {
+        chatId, commandId: typedStart.commandId
+      }), { message: "peer_command_scope_denied" });
+    } finally { await closeWebSocket(unscoped, "unscoped outcome reader"); }
+  }
   const attacker = await openWebSocket(
     `${edgeOrigin.replace("http:", "ws:")}/device/${deviceId}/ws?role=client&purpose=control&controlSessionId=${chatId}&token=${CLIENT_A_TOKEN}`,
     "foreign principal control"
@@ -503,8 +738,124 @@ const ordinaryDeviceSmoke = async (edgeOrigin, scaffoldOrigin) => {
   await assert.rejects(rpcCall(attacker, 1, "AdmitPeerCommand", {
     chatId, commandId: crypto.randomUUID(), command: { kind: "interrupt" }
   }), { message: "peer_command_scope_denied" });
+  if (QUIET_OWNER) {
+    await send({ kind: "run", messageId: crypto.randomUUID(), request });
+    await waitFor("observer sees quiet active owner", async () =>
+      (await localRpc(desktop, "WatchCollaboration", { chatId })).sessions.some((row) => row.sessionId === chatId && row.status === "working"));
+    await delay(50_000);
+    const owner = (await localRpc(desktop, "WatchCollaboration", { chatId })).sessions.find((row) => row.sessionId === chatId);
+    assert.equal(owner?.status, "working", "quiet owner stays active beyond the freshness lease");
+    assert.ok(Date.now() - owner.updatedAt <= 45_000, "observer consumes genuine owner register heartbeats");
+    await send({ kind: "interrupt" });
+    await waitFor("quiet owner stops", async () =>
+      (await localRpc(devbox, "WatchSessions")).some((row) => row.chatId === chatId && row.status === "idle"));
+    console.log("PASS durable owner register freshness beyond the 45-second lease");
+  }
   await closeWebSocket(attacker, "foreign principal");
   console.log("PASS ordinary two-device legacy start/response/stop and Local typed start/steer/stop; foreign principal denied");
+
+  const history = await seedWorkspaceHistory(edgeOrigin, ports);
+  const { deviceId: desktopId } = await localRpc(desktop, "LocalDevice");
+  const offlineChatId = crypto.randomUUID();
+  const offlineSpaceId = crypto.randomUUID();
+  const recoveredTitle = "Crew offline creation survives crash";
+  const remoteTitle = "Crew concurrent Devbox rename survives restart";
+  const reconnectStartedAt = await restartEdge(async () => {
+    for (const port of ports) await waitFor("workspace reports disconnected", async () =>
+      (await localRpc(port, "SyncStatus")).workspace?.connected === false, 30_000);
+    await localRpc(desktop, "Mutate", { op: "createSpace", spaceId: offlineSpaceId,
+      deviceId: desktopId, path: tempDir });
+    await localRpc(desktop, "Mutate", { op: "createChat", chatId: offlineChatId,
+      spaceId: offlineSpaceId });
+    await localRpc(desktop, "Mutate", { op: "renameChat", chatId: offlineChatId, title: recoveredTitle });
+    await localRpc(devbox, "Mutate", { op: "renameChat", chatId, title: remoteTitle });
+    await crashChild(devices[0]);
+    await startDevice(0);
+    const restored = (await localRpc(desktop, "WatchChats")).find((chat) => chat.id === offlineChatId);
+    assert.equal(restored?.title, recoveredTitle, "offline creation and rename persist before the RPC receipt");
+  });
+  for (const port of ports) {
+    await waitFor("workspace converges after simultaneous offline branches", async () => {
+      const chats = await localRpc(port, "WatchChats");
+      return chats.find((chat) => chat.id === offlineChatId)?.title === recoveredTitle
+        && chats.find((chat) => chat.id === chatId)?.title === remoteTitle
+        && chats.filter((chat) => chat.deviceId === history.fixtureDeviceId).length === history.ids.length
+        && (await localRpc(port, "SyncStatus")).workspace?.connected === true;
+    }, 30_000);
+  }
+  const catchupMs = Date.now() - reconnectStartedAt;
+  assert.ok(catchupMs <= 30_000, `workspace catch-up took ${catchupMs}ms`);
+  await waitFor("owner relay is available after workspace outage", async () =>
+    (await ownerFetch(edgeOrigin, `/device/${deviceId}/status`)).body?.hostConnected, 30_000);
+  const rss = [];
+  for (let turn = 0; turn < SOAK_TURNS; turn++) {
+    const commandId = crypto.randomUUID();
+    const messageId = crypto.randomUUID();
+    const queued = { chatId, commandId, command: { kind: "run", messageId, request } };
+    if (turn === 0) {
+      const uncertain = await openWebSocket(`ws://127.0.0.1:${desktop}`, "uncertain admission IPC");
+      try {
+        let admissionError;
+        uncertain.addEventListener("message", (event) => {
+          const reply = JSON.parse(event.data);
+          if (reply.id === 1 && Object.hasOwn(reply,"err")) admissionError = reply.err;
+        });
+        uncertain.send(JSON.stringify({ id: 1, method: "QueueCommand", params: queued }));
+        await waitFor("admission succeeded without consuming its reply", async () => {
+          if (admissionError) throw new Error(`unconsumed admission failed: ${admissionError}`);
+          return (await localRpc(devbox, "WatchDocMessages", { chatId })).reset.some((entry) =>
+            entry.id === messageId && entry.role === "user");
+        }, 30_000);
+      } finally { await closeWebSocket(uncertain, "discard admission acknowledgement"); }
+    }
+    const first = await localRpc(desktop, "QueueCommand", queued);
+    assert.deepEqual(await localRpc(desktop, "QueueCommand", queued), first,
+      "lost admission acknowledgement retry retains the same command receipt");
+    await waitFor("durable user send reaches its owning host once", async () => {
+      const snapshot = await localRpc(devbox, "WatchDocMessages", { chatId });
+      const matches = snapshot.reset.filter((entry) => entry.id === messageId);
+      assert.ok(matches.length <= 1, "a retry must not duplicate the user message");
+      return matches[0]?.role === "user";
+    }, 30_000);
+    if (turn === 0) {
+      await restartEdge(async () => {
+        await crashChild(devices[1]);
+        await startDevice(1);
+      });
+      await waitFor("owner relay reconnects before a new control", async () =>
+        (await ownerFetch(edgeOrigin, `/device/${deviceId}/status`)).body?.hostConnected, 30_000);
+      for (const port of ports) await waitFor("accepted send survives publisher and edge crash", async () => {
+        const snapshot = await localRpc(port, "WatchDocMessages", { chatId });
+        const matches = snapshot.reset.filter((entry) => entry.id === messageId);
+        assert.ok(matches.length <= 1, "crash recovery must not duplicate the accepted send");
+        return matches[0]?.role === "user";
+      }, 30_000);
+    }
+    await send({ kind: "interrupt" });
+    try {
+      await waitFor("owner completion reaches observing desktop", async () =>
+        (await localRpc(desktop, "WatchSessions")).some((session) =>
+          session.chatId === chatId && ["idle", "errored"].includes(session.status)), 30_000);
+    } catch (error) {
+      const [owner, observer, collaboration] = await Promise.all([
+        localRpc(devbox,"WatchSessions"),localRpc(desktop,"WatchSessions"),localRpc(devbox,"WatchCollaboration",{chatId}),
+      ]);
+      throw new Error(`${error.message}; turn=${turn}; owner=${JSON.stringify(owner)}; observer=${JSON.stringify(observer)}; collaboration=${JSON.stringify(collaboration)}`);
+    }
+    if (turn >= 3) rss.push(await residentKiB(devices[1]));
+  }
+  if (rss.length > 1) {
+    const growthKiB = Math.max(...rss) - rss[0];
+    assert.ok(growthKiB <= 128 * 1_024, `headless RSS grew ${growthKiB}KiB after warmup`);
+  }
+  await resetWorkspaceEpoch(edgeOrigin, ports, history, offlineChatId, chatId, remoteTitle);
+  await retiredProtocolSmoke(edgeOrigin, chatId, deviceId);
+  await liveMobileSmoke(edgeOrigin, (await localRpc(devbox, "LocalDevice")).deviceId, await realpath(tempDir));
+  console.log(JSON.stringify({ checks: ["large-workspace", "edge-crash", "offline-create-rename",
+    "local-crash-after-receipt", "concurrent-branch-convergence", "lost-admission-acknowledgement",
+    "admission-retry-deduplication", "publisher-and-edge-crash", "owner-completion",
+    ...(rss.length > 1 ? ["bounded-rss"] : [])], historyRows: history.ids.length,
+    catchupMs, turns: SOAK_TURNS, rssKiB: rss, quietOwner: QUIET_OWNER }));
 };
 
 const main = async () => {
@@ -515,7 +866,9 @@ const main = async () => {
   const edgePort = await reservePort();
   const edgeOrigin = `http://127.0.0.1:${edgePort}`;
   const wrangler = path.join(EDGE_DIR, "node_modules", ".bin", "wrangler");
-  const worker = spawnTracked(
+  let worker;
+  const startEdge = async () => {
+    worker = spawnTracked(
     "local Edge Worker",
     wrangler,
     [
@@ -525,6 +878,8 @@ const main = async () => {
       "127.0.0.1",
       "--port",
       String(edgePort),
+      "--inspector-port",
+      "0",
       "--persist-to",
       path.join(tempDir, "worker-state"),
       "--var",
@@ -538,17 +893,26 @@ const main = async () => {
       "--var",
       `SCAFFOLD_REQUIRED_CAPABILITIES:${CAPABILITIES.join(" ")}`
     ],
-    { cwd: EDGE_DIR, env: { ...process.env, NO_COLOR: "1" } }
-  );
-
-  const health = await waitFor("local Edge Worker readiness", async () => {
-    if (worker.spawnError) throw new Error(worker.outputSummary());
-    if (worker.exitCode !== null) throw new Error(worker.outputSummary());
-    const result = await fetchJson(`${edgeOrigin}/health`);
-    return result.response.ok ? result.body : undefined;
-  });
-  assert.deepEqual(health, { ok: true, auth: "scaffold", environment: "local" });
-  await ordinaryDeviceSmoke(edgeOrigin, fake.origin);
+      { cwd: EDGE_DIR, env: { ...process.env, NO_COLOR: "1", ASHLER_INCREMENTAL_TSC_CHECKS: "false",
+        WRANGLER_LOG_PATH: path.join(tempDir, "wrangler-logs"), WRANGLER_LOG_SANITIZE: "true" } }
+    );
+    const health = await waitFor("local Edge Worker readiness", async () => {
+      if (worker.spawnError) throw new Error(worker.outputSummary());
+      if (worker.exitCode !== null) throw new Error(worker.outputSummary());
+      const result = await fetchJson(`${edgeOrigin}/health`);
+      return result.response.ok ? result.body : undefined;
+    }, 30_000);
+    assert.deepEqual(health, { ok: true, auth: "scaffold", environment: "local" });
+  };
+  const restartEdge = async (duringOutage) => {
+    await crashChild(worker);
+    await duringOutage();
+    const startedAt = Date.now();
+    await startEdge();
+    return startedAt;
+  };
+  await startEdge();
+  await ordinaryDeviceSmoke(edgeOrigin, fake.origin, restartEdge);
   const ipcPort = await reservePort();
   const roomProbe = await ownerFetch(
     edgeOrigin,
@@ -758,6 +1122,12 @@ try {
 } catch (error) {
   for (const child of trackedChildren) {
     if (child.outputSummary) console.error(child.outputSummary());
+  }
+  if (tempDir) {
+    const logs = path.join(tempDir, "wrangler-logs");
+    for (const file of await readdir(logs).catch(() => [])) {
+      if (file.endsWith(".log")) console.error(`Wrangler diagnostic ${file}:\n${await readFile(path.join(logs, file), "utf8")}`);
+    }
   }
   throw error;
 } finally {

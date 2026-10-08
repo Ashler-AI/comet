@@ -4064,6 +4064,12 @@ impl Shell {
                 .rounded_full()
                 .bg(theme.attention)
                 .into_any_element(),
+            comet_proto::ChatIndicator::Unreachable => div()
+                .text_size(px(10.5))
+                .line_height(px(13.0))
+                .text_color(theme.text_muted)
+                .child("Unreachable")
+                .into_any_element(),
             comet_proto::ChatIndicator::Idle => div()
                 .text_size(px(10.5))
                 .line_height(px(13.0))
@@ -4336,7 +4342,7 @@ impl Shell {
         const SHARED_ROW_HEIGHT: f32 = 45.0;
         let now = Utc::now();
         let selected = self.state.read(cx).selected_chat.clone();
-        let rows: Vec<(String, SharedString, SharedString)> = {
+        let rows: Vec<(String, SharedString, SharedString, comet_proto::view::Indicator)> = {
             let state = self.state.read(cx);
             state
                 .shared_session_refs()
@@ -4378,12 +4384,22 @@ impl Shell {
                             None => format_time_ago(session_ref.added_at, now),
                         }
                         .into(),
+                        comet_proto::view::effective_indicator(
+                            state.sessions.iter().find(|session| session.chat_id == session_ref.chat_id), now,
+                        ),
                     )
                 })
                 .collect()
         };
         rows.into_iter()
-            .map(|(chat_id, title, added)| {
+            .map(|(chat_id, title, added, activity)| {
+                let activity = match activity {
+                    comet_proto::view::Indicator::Working => Some("Working"),
+                    comet_proto::view::Indicator::AwaitingInput => Some("Awaiting input"),
+                    comet_proto::view::Indicator::Errored => Some("Errored"),
+                    comet_proto::view::Indicator::Unreachable => Some("Unreachable"),
+                    comet_proto::view::Indicator::None => None,
+                };
                 let key = format!("g:{chat_id}");
                 let select_id = chat_id.clone();
                 let remove_id = chat_id.clone();
@@ -4432,7 +4448,10 @@ impl Shell {
                                 div()
                                     .text_size(px(10.5))
                                     .text_color(theme.text_faint)
-                                    .child(added),
+                                    .child(match activity {
+                                        Some(activity) => SharedString::from(format!("{activity} · {added}")),
+                                        None => added,
+                                    }),
                             ),
                     )
                     .child(
@@ -7979,6 +7998,10 @@ impl Shell {
             // No label: the QuestionPanel right below IS the awaiting-input
             // surface — a strip caption above it was redundant (user request).
             Indicator::AwaitingInput => strip.into_any_element(),
+            Indicator::Unreachable => strip
+                .text_color(theme.text_muted)
+                .child(SharedString::from("Owner unreachable — status is stale"))
+                .into_any_element(),
             Indicator::Errored => strip
                 .text_color(theme.danger)
                 .child(SharedString::from("Run failed"))

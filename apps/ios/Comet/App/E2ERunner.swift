@@ -1,8 +1,7 @@
-// Headless e2e rig — launch with `-e2e` (plus a local wrangler dev edge and a
-// `comet headless` engine in dev mode) and the app exercises the full live
-// stack with no taps: workspace room backfill, device-relay RPCs, space/chat
-// creation, the command plane, and session-room streaming. Results append to
-// Documents/e2e.log for the harness to read via simctl.
+// Headless e2e rig: `-e2e` plus the isolated loopback Edge, scoped fixture
+// credential and `comet headless` mock engine supplied by the CI harness.
+// Exercises workspace backfill, relay RPCs, commands and session streaming;
+// results append to Documents/e2e.log for simctl to read.
 
 import Foundation
 import Loro
@@ -27,12 +26,30 @@ enum E2ERunner {
         }
     }
 
+    private static func liveFixture() -> (edgeURL: URL, accessToken: String, userId: String, projectScope: String, deviceId: String, workspacePath: String)? {
+        let fixture = ProcessInfo.processInfo.environment
+        guard let edge = fixture["CREW_E2E_EDGE_URL"], let edgeURL = URL(string: edge),
+              edgeURL.scheme == "http", ["localhost", "127.0.0.1"].contains(edgeURL.host ?? ""),
+              edgeURL.port != nil, edgeURL.user == nil, edgeURL.password == nil,
+              edgeURL.query == nil, edgeURL.fragment == nil, ["", "/"].contains(edgeURL.path),
+              let accessToken = fixture["CREW_E2E_ACCESS_TOKEN"], !accessToken.isEmpty,
+              let userId = fixture["CREW_E2E_USER_ID"], !userId.isEmpty,
+              let projectScope = fixture["CREW_E2E_PROJECT_SCOPE"], !projectScope.isEmpty,
+              let deviceId = fixture["CREW_E2E_DEVICE_ID"], !deviceId.isEmpty,
+              let workspacePath = fixture["CREW_E2E_WORKSPACE_PATH"], workspacePath.hasPrefix("/"),
+              URL(fileURLWithPath: workspacePath).lastPathComponent.hasPrefix("comet-integration-smoke-") else {
+            log("FAIL Crew live fixture requires an isolated loopback edge, scoped credential, principal, device and temporary workspace")
+            return nil
+        }
+        return (edgeURL, accessToken, userId, projectScope, deviceId, workspacePath)
+    }
+
     static func run(model: AppModel) async {
         try? FileManager.default.removeItem(at: logURL)
         log("start")
+        guard let (edgeURL, accessToken, userId, projectScope, deviceId, workspacePath) = liveFixture() else { return }
         guard runSessionVisibility() else { return }
-        model.signInDev(edgeURL: URL(string: "http://localhost:8787")!,
-                        userId: "devuser", projectScope: "dev-org")
+        model.signInFixture(edgeURL: edgeURL, userId: userId, projectScope: projectScope, accessToken: accessToken)
 
         // 1. Workspace room: wait for connection + the engine's device row.
         guard let workspace = model.workspace else {
@@ -42,7 +59,7 @@ enum E2ERunner {
         // Warm-start probe: rows visible BEFORE any network = disk hydration.
         log("warm-start devices=\(workspace.devices.count) chats=\(workspace.chats.count)")
         let device = await poll(timeout: 15, label: "workspace device") {
-            workspace.connected ? workspace.devices.first { $0.platform != "ios" } : nil
+            workspace.connected ? workspace.devices.first { $0.id == deviceId && $0.platform != "ios" } : nil
         }
         guard let device else {
             log("FAIL workspace: connected=\(workspace.connected) devices=\(workspace.devices.map(\.id))")
@@ -50,26 +67,28 @@ enum E2ERunner {
         }
         log("OK workspace synced; engine device \(device.id) (\(device.name))")
 
-        // 2. Device relay: ListFolders on every engine device (stale rig
-        // devices linger in the dev workspace doc — report each).
-        var listing: FolderListing?
-        for candidate in workspace.devices where candidate.platform != "ios" {
-            do {
-                let l = try await workspace.listFoldersDetailed(deviceId: candidate.id, path: nil)
-                log("OK relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(l.path) → \(l.entries.count) entries")
-                listing = l
-            } catch {
-                log("FAIL relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(error.localizedDescription)")
+        // 2. Relay only to the owned native fixture and its temporary directory.
+        do {
+            let listing = try await workspace.listFoldersDetailed(deviceId: device.id, path: workspacePath)
+            guard listing.path == workspacePath else {
+                log("FAIL relay ListFolders returned a different workspace scope")
+                return
             }
+            log("OK relay ListFolders[\(device.name)/\(device.id.prefix(8))]: \(listing.path) → \(listing.entries.count) entries")
+            let models = try await workspace.listModels(deviceId: device.id, harness: "mock")
+            guard !models.isEmpty else {
+                log("FAIL relay ListModels returned an empty mock catalog")
+                return
+            }
+            log("OK relay ListModels: \(models.map(\.id))")
+        } catch {
+            log("FAIL relay fixture: \(error.localizedDescription)")
+            return
         }
-
-        // 2b. Live model catalog over the relay.
-        let models = try? await workspace.listModels(deviceId: device.id, harness: "mock")
-        log(models != nil ? "OK relay ListModels: \(models!.map(\.id))" : "FAIL relay ListModels nil")
 
         // 3. Space + chat + first run through the command plane (mock harness).
         let spaceId = await workspace.createSpace(deviceId: device.id,
-                                                  path: listing?.path ?? "/tmp", gitDetected: false)
+                                                  path: workspacePath, gitDetected: false)
         log("space created \(spaceId)")
         // Relay-created spaces land via doc sync — eventually consistent.
         let space = await poll(timeout: 10, label: "space row sync") {
@@ -97,7 +116,7 @@ enum E2ERunner {
             log("FAIL run admission: \(store.sendFailure ?? "unknown")")
             return
         }
-        log("run queued on \(chatId)")
+        log("OK run admitted on \(chatId)")
 
         let entries = await poll(timeout: 30, label: "assistant reply") {
             store.entries.contains { $0.role == .assistant && !$0.parts.isEmpty } ? store.entries : nil
@@ -106,29 +125,12 @@ enum E2ERunner {
             log("OK transcript streamed: \(entries.count) entries")
         } else {
             log("FAIL no assistant reply; entries=\(store.entries.count) connected=\(store.connected) sendFailure=\(store.sendFailure ?? "none") pending=\(store.pendingSends.count)")
+            return
         }
 
-        // 4. Big-doc backfill (fragmented): open the chat the seeder filled.
-        let bigChatId = "e2e-big-doc"
-        let bigChat = Chat(id: bigChatId, deviceId: device.id, title: "big", archived: false,
-                           cwd: nil, branch: nil, checkoutId: nil, config: nil,
-                           lastMessagePreview: nil, lastMessageAt: nil, createdAt: nowMs(),
-                           harnessSessionId: nil, harnessSessionCwd: nil,
-                           spaceId: spaceId, lastSeenAt: nil)
-        if let bigStore = model.sessionStore(for: bigChat) {
-            let big = await poll(timeout: 20, label: "big doc backfill") {
-                bigStore.entries.count >= 40 ? bigStore.entries : nil
-            }
-            if let big {
-                let bytes = big.flatMap(\.parts).reduce(0) { acc, part in
-                    if case .text(_, let t) = part { return acc + t.count }
-                    return acc
-                }
-                log("OK big-doc backfill: \(big.count) entries, ~\(bytes / 1024)KB text")
-            } else {
-                log("FAIL big-doc backfill: entries=\(bigStore.entries.count) connected=\(bigStore.connected)")
-            }
-        }
+        // 4. Isolated canonical large-doc fixture through production wire
+        // reassembly. This does not claim remote edge/engine convergence.
+        guard await RoomClient.runFragmentedBackfillRegression() else { return }
 
         log("done")
     }
@@ -453,14 +455,14 @@ enum E2ERunner {
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
                                userId: "parity-\(UUID().uuidString)", projectScope: "parity",
                                deviceId: "viewer", deviceName: "Crew regression")
-        let firstSend = SessionStore(chatId: "parity-preparation-origin", config: config)
+        let firstSend = SessionStore(chatId: UUID().uuidString.lowercased(), config: config)
         let firstChat = Chat(id: firstSend.chatId, deviceId: "host", archived: false, cwd: "/tmp", createdAt: 0)
         var admittedGenerations: [String] = []
-        firstSend.commandSender = { _ in admittedGenerations.append("originating-generation") }
+        firstSend.commandSender = { _, _ in admittedGenerations.append("originating-generation") }
         firstSend.attachmentUploader = { _ in
             // A route refresh during upload must not replace this send's
             // already-bound first-command receipt with a newer preparation.
-            firstSend.commandSender = { _ in admittedGenerations.append("newer-generation") }
+            firstSend.commandSender = { _, _ in admittedGenerations.append("newer-generation") }
             return ["/tmp/preparation-image.png"]
         }
         let image = MobileImageAttachment(id: UUID(), filename: "preparation.png",
@@ -471,10 +473,10 @@ enum E2ERunner {
             return
         }
         log("OK Crew Scaffold first command retains originating generation across upload route refresh")
-        let store = SessionStore(chatId: "parity-retry", config: config)
+        let store = SessionStore(chatId: UUID().uuidString.lowercased(), config: config)
         let chat = Chat(id: store.chatId, deviceId: "host", archived: false, cwd: "/tmp", createdAt: 0)
         var attempts: [SessionCommandPayload] = []
-        store.commandSender = { payload in
+        store.commandSender = { payload, _ in
             attempts.append(payload)
             throw RelayError.timeout
         }
@@ -635,11 +637,37 @@ enum E2ERunner {
             return
         }
         log("OK Crew live list projection")
+        guard await SessionStore.runLiveTranscriptProjectionRegression() else {
+            log("FAIL Crew live transcript projection: sustained imports starved publication")
+            return
+        }
+        log("OK Crew live transcript projection")
         #endif
     }
 
     static func runRepeatedRoomRecovery() async {
         #if DEBUG
+        func check(_ scenario: String, _ passed: Bool) -> Bool {
+            if !passed { log("FAIL Crew reliability recovery: \(scenario)") }
+            return passed
+        }
+        guard check("workspace record intents", WorkspaceStore.runRecordIntentRegression()),
+              check("disk record recovery", DocDisk.runRecordRecoveryRegression()),
+              check("nested tool calls", runNestedToolCallRecovery()),
+              check("deployment retarget", SessionStore.runDeploymentRetargetRegression()),
+              check("browse restore", await AppModel.runBrowseRestoreRegression()),
+              check("owner anchor replay", SessionStore.runOwnerAnchorReplayRegression()),
+              check("attachment journal", await SessionStore.runAttachmentJournalRegression()),
+              check("terminal controls", await SessionStore.runTerminalControlRegression()),
+              check("room reset epoch", await RoomClient.runResetEpochRegression()),
+              check("durable intents", await SessionStore.runDurableIntentRegression()),
+              check("admission readback", await SessionStore.runAdmissionReadbackRegression()),
+              check("transcript activity", await SessionStore.runTranscriptActivityRegression()),
+              check("metadata clear", await AppModel.runMetadataClearRegression()),
+              check("relay connection generation", await DeviceRelayClient.runConnectionGenerationRegression()),
+              check("foreground blocked", await RoomClient.runForegroundBlockedRegression()),
+              check("fragmented backfill", await RoomClient.runFragmentedBackfillRegression()),
+              check("owner publication register", await runOwnerPublicationRegister()) else { return }
         guard await RoomClient.runRepeatedRecoveryRegression() else {
             log("FAIL Crew room convergence: fresh principals, pending imports, shallow resubmit, or history repair")
             return
@@ -699,3 +727,153 @@ extension E2ERunner {
         log("done")
     }
 }
+
+#if DEBUG
+extension E2ERunner {
+    static func runOwnerPublicationRegister() async -> Bool {
+        do {
+            var doc = LoroDoc()
+            let chatId = UUID().uuidString.lowercased()
+            var value: [String: Any] = ["chatId": chatId, "sessionId": chatId,
+                "ownerSubject": "owner", "ownerDeviceId": "host", "source": "native",
+                "createdAt": Int64(1), "updatedAt": Int64(10), "status": "working", "environment": NSNull()]
+            func record(_ value: [String: Any], publisher: String = "owner") -> LoroValue {
+                LoroValue.fromJSON(["id": UUID().uuidString.lowercased(), "schemaVersion": 1,
+                    "kind": "agentSession", "publishedBy": publisher, "publishedAt": value["updatedAt"]!, "value": value])
+            }
+            let anchor = try doc.getList(id: "publications").pushContainer(child: LoroMap())
+            try anchor.insert(key: "record", v: record(value))
+            value["updatedAt"] = Int64(20); value["status"] = "idle"
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value))
+            doc.commit()
+            guard SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil).session?.status == .idle else { return false }
+            value["ownerDeviceId"] = "impostor"; value["updatedAt"] = Int64(999)
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value))
+            doc.commit()
+            guard SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil).session?.status == .working else { return false }
+            value["ownerDeviceId"] = "host"
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value, publisher: "impostor"))
+            doc.commit()
+            guard SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil).session?.status == .working else { return false }
+            doc = LoroDoc()
+            value["ownerDeviceId"] = "comet-scaffold-sandbox-e1"
+            let environment: [String: Any] = ["source": ["kind": "scaffold", "sandbox_id": "sandbox", "lifecycle_epoch": 1],
+                "ownerPrincipal": "owner", "scope": ["projectId": "project", "deploymentId": "deployment", "sessionId": chatId]]
+            value["source"] = "scaffold"; value["environment"] = environment
+            value["updatedAt"] = Int64(30); value["status"] = "working"
+            let scopedAnchor = try doc.getList(id: "publications").pushContainer(child: LoroMap())
+            try scopedAnchor.insert(key: "record", v: record(value))
+            var wrongGeneration = environment
+            wrongGeneration["source"] = ["kind": "scaffold", "sandbox_id": "sandbox", "lifecycle_epoch": 2]
+            value["environment"] = wrongGeneration; value["updatedAt"] = Int64(999); value["status"] = "idle"
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value))
+            doc.commit()
+            guard SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil).session?.status == .working else { return false }
+            var wrongScope = environment
+            wrongScope["scope"] = ["projectId": "project", "deploymentId": "other-deployment", "sessionId": chatId]
+            value["environment"] = wrongScope
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value))
+            doc.commit()
+            guard SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil).session?.status == .working else { return false }
+            value["environment"] = environment; value["updatedAt"] = Int64(40)
+            try doc.getMap(id: "agentSessions").insert(key: chatId, v: record(value))
+            doc.commit()
+            let valid = SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil)
+            guard valid.session?.status == .idle, valid.session?.updatedAt == 40,
+                  valid.environment?.scope.deploymentId == "deployment" else { return false }
+            let now = nowMs()
+            let childId = UUID().uuidString.lowercased()
+            var childEnvironment = environment
+            childEnvironment["scope"] = ["projectId": "project", "deploymentId": "deployment", "sessionId": childId]
+            var child = value
+            child["sessionId"] = childId; child["environment"] = childEnvironment
+            child["status"] = "working"; child["updatedAt"] = now - sessionStaleMs - 10_000
+            let childAnchor = try doc.getList(id: "publications").pushContainer(child: LoroMap())
+            try childAnchor.insert(key: "record", v: record(child))
+            child["updatedAt"] = now - 1
+            try doc.getMap(id: "agentSessions").insert(key: childId, v: record(child)); doc.commit()
+            let running = SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil)
+            guard running.session?.status == .working, running.session?.updatedAt == now - 1,
+                  running.publicationHasActiveChildren, running.environment?.scope.sessionId == chatId else { return false }
+            let waitingId = UUID().uuidString.lowercased()
+            var waitingEnvironment = environment
+            waitingEnvironment["scope"] = ["projectId": "project", "deploymentId": "deployment", "sessionId": waitingId]
+            var waiting = child
+            waiting["sessionId"] = waitingId; waiting["environment"] = waitingEnvironment
+            waiting["status"] = "awaitingInput"; waiting["updatedAt"] = now - sessionStaleMs - 10_000
+            let waitingAnchor = try doc.getList(id: "publications").pushContainer(child: LoroMap())
+            try waitingAnchor.insert(key: "record", v: record(waiting))
+            waiting["updatedAt"] = now - 2
+            try doc.getMap(id: "agentSessions").insert(key: waitingId, v: record(waiting)); doc.commit()
+            let awaiting = SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil, publicationCache: running.publicationCache)
+            guard awaiting.session?.status == .awaitingInput, awaiting.session?.updatedAt == now - 2 else { return false }
+            child["updatedAt"] = now - sessionStaleMs - 1
+            waiting["updatedAt"] = now - sessionStaleMs - 1
+            try doc.getMap(id: "agentSessions").insert(key: childId, v: record(child))
+            try doc.getMap(id: "agentSessions").insert(key: waitingId, v: record(waiting)); doc.commit()
+            let unreachable = SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil, publicationCache: awaiting.publicationCache)
+            guard unreachable.publicationHasActiveChildren,
+                  effectiveStatus(unreachable.session, now: now) == nil,
+                  unreachable.session?.updatedAt == now - sessionStaleMs - 1 else { return false }
+            child["status"] = "idle"; child["updatedAt"] = now
+            waiting["status"] = "idle"; waiting["updatedAt"] = now
+            try doc.getMap(id: "agentSessions").insert(key: childId, v: record(child))
+            try doc.getMap(id: "agentSessions").insert(key: waitingId, v: record(waiting)); doc.commit()
+            let completed = SessionStore.decodeProjection(from: doc, chatId: chatId, observedAt: nil, publicationCache: unreachable.publicationCache)
+            guard completed.session?.status == .idle, !completed.publicationHasActiveChildren else { return false }
+            log("OK Crew owner publication register: ordinary and Scaffold freshness, ownership publisher scope lifecycle isolation, active child precedence and genuine stale heartbeat")
+            return true
+        } catch { log("FAIL Crew owner publication register: \(error)"); return false }
+    }
+}
+#endif
+
+#if DEBUG
+extension E2ERunner {
+    static func runNestedToolCallRecovery() -> Bool {
+        do {
+            let source = LoroDoc()
+            let message = try source.getList(id: "messages").pushContainer(child: LoroMap())
+            try message.insert(key: "id", v: "mixed-tools"); try message.insert(key: "role", v: "assistant")
+            let parts = try message.getOrCreateContainer(key: "parts", child: LoroList())
+            let legacy = try parts.pushContainer(child: LoroMap())
+            try legacy.insert(key: "id", v: "legacy"); try legacy.insert(key: "kind", v: "tool")
+            try legacy.insert(key: "call", v: LoroValue.fromJSON(["kind": "exec", "command": "legacy command"]))
+            try legacy.insert(key: "isError", v: false)
+            let nested = try parts.pushContainer(child: LoroMap())
+            try nested.insert(key: "id", v: "nested"); try nested.insert(key: "kind", v: "tool")
+            let call = try nested.getOrCreateContainer(key: "call", child: LoroMap())
+            let kind = try call.getOrCreateContainer(key: "kind", child: LoroText())
+            try kind.insert(pos: 0, s: "exec")
+            let command = try call.getOrCreateContainer(key: "command", child: LoroText())
+            let original = String(repeating: "x", count: 300_000)
+            try command.insert(pos: 0, s: original)
+            let options = try call.getOrCreateContainer(key: "options", child: LoroMap())
+            let environment = try options.getOrCreateContainer(key: "env", child: LoroMap())
+            let value = try environment.getOrCreateContainer(key: "K", child: LoroText())
+            try value.insert(pos: 0, s: "V")
+            try call.insert(key: "timeout", v: Int64(42))
+            source.commit()
+            let restored = LoroDoc()
+            _ = try restored.importWith(bytes: source.export(mode: .snapshot), origin: "nested-tool-regression")
+            let version = source.oplogVv()
+            try command.insert(pos: UInt32(original.count), s: " suffix")
+            try nested.insert(key: "isError", v: false)
+            source.commit()
+            _ = try restored.importWith(bytes: source.export(mode: .updates(from: version)), origin: "nested-tool-regression")
+            guard let entry = SessionStore.decodeEntries(from: restored)?.first, entry.parts.count == 2,
+                  case .tool(_, let oldCall, let oldError, let oldResolved) = entry.parts[0],
+                  oldCall.fields["command"] as? String == "legacy command", !oldError, oldResolved,
+                  case .tool(_, let newCall, let newError, let newResolved) = entry.parts[1],
+                  newCall.tag == "exec", newCall.fields["command"] as? String == original + " suffix",
+                  newCall.fields["options"] as? String == #"{"env":{"K":"V"}}"#,
+                  newCall.fields["timeout"] as? Int64 == 42, !newError, newResolved else {
+                log("FAIL Crew mixed nested tool call recovery")
+                return false
+            }
+            log("OK Crew mixed nested tool calls: legacy scalar and rope containers, 300KB progressive arguments, nested JSON and terminal results")
+            return true
+        } catch { log("FAIL Crew mixed nested tool call recovery: \(error)"); return false }
+    }
+}
+#endif

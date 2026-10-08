@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { pickLiveHost } from "./device-room";
+import { DatabaseSync } from "node:sqlite";
+import { describe, expect, it, vi } from "vitest";
+import { DeviceRoom, decodeDeviceFrame, encodeDeviceFrame, pickLiveHost } from "./device-room";
+import { AUTH_CAPABILITIES_HEADER, AUTH_PROJECT_HEADER, AUTH_USER_HEADER, DEVICE_HOST_AUTH_HEADER,
+  DURABLE_SYNC_PROTOCOL, SYNC_PROTOCOL_HEADER, type Env } from "./env";
 
 // The bug this guards: a host whose uplink died silently leaves a socket the
 // runtime still lists (no close event ever fires, and the supersede `close()`
@@ -95,4 +98,70 @@ describe("device-room host selection", () => {
       )
     ).toBe("successor");
   });
+});
+
+it("ends old subscriptions on host replacement and routes only the reconnected client", async () => {
+  const db = new DatabaseSync(":memory:");
+  class Socket {
+    attachment: unknown;
+    send = vi.fn(); close = vi.fn();
+    serializeAttachment(value: unknown) { this.attachment = value; }
+    deserializeAttachment() { return this.attachment; }
+  }
+  const sockets: Array<{ socket: WebSocket; tags: string[] }> = [];
+  const NativeResponse = Response;
+  vi.stubGlobal("Response", class extends NativeResponse {
+    constructor(body?: BodyInit | null, init?: ResponseInit) {
+      super(body, init?.status === 101 ? { ...init, status: 200 } : init);
+      if (init?.status === 101) Object.defineProperty(this, "status", { value: 101 });
+    }
+  });
+  vi.stubGlobal("WebSocketPair", class { 0 = new Socket(); 1 = new Socket(); });
+  vi.stubGlobal("WebSocketRequestResponsePair", class {});
+  const ctx = {
+    storage: { sql: { exec: (query: string, ...values: (string | number)[]) => db.prepare(query).all(...values) }, sync: async () => {} },
+    acceptWebSocket: (socket: WebSocket, tags: string[] = []) => { sockets.push({ socket, tags }); },
+    getWebSockets: (tag?: string) => sockets.filter((entry) => !tag || entry.tags.includes(tag)).map((entry) => entry.socket),
+    getWebSocketAutoResponseTimestamp: () => null, setWebSocketAutoResponse: () => {}
+  } as unknown as DurableObjectState;
+  try {
+    const room = new DeviceRoom(ctx, {} as Env);
+    const connect = async (role: "host" | "client") => {
+      const response = await room.fetch(new Request(`https://device.internal/ws?role=${role}&connId=viewport`, {
+        headers: {
+          [AUTH_USER_HEADER]: "owner", [AUTH_PROJECT_HEADER]: "project-a",
+          [AUTH_CAPABILITIES_HEADER]: "session.read session.environment",
+          [SYNC_PROTOCOL_HEADER]: DURABLE_SYNC_PROTOCOL,
+          ...(role === "host" ? { [DEVICE_HOST_AUTH_HEADER]: "local" } : {})
+        }
+      }));
+      expect(response.status).toBe(101);
+      return sockets.at(-1)!.socket as unknown as Socket;
+    };
+    const frame = (to?: string) => encodeDeviceFrame({ s: "watch", k: "rpc", ...(to ? { to } : {}) },
+      new TextEncoder().encode(JSON.stringify({ id: 1, method: "WatchChats", params: {} }))).buffer as ArrayBuffer;
+    const host = await connect("host");
+    const client = await connect("client");
+    await room.webSocketMessage(client as unknown as WebSocket, frame());
+    expect(host.send).toHaveBeenCalledOnce();
+    const successor = await connect("host");
+    const ended = decodeDeviceFrame(client.send.mock.calls[0][0]);
+    expect(ended.header).toEqual({ s: "", k: " relay" });
+    expect(JSON.parse(new TextDecoder().decode(ended.payload))).toEqual({ error: "host_closed" });
+    expect(client.close).toHaveBeenCalledWith(1012, "engine reconnected");
+    await room.webSocketMessage(client as unknown as WebSocket, frame());
+    expect(successor.send).not.toHaveBeenCalled();
+    const resumed = await connect("client");
+    await room.webSocketClose(host as unknown as WebSocket);
+    await room.webSocketClose(client as unknown as WebSocket);
+    await room.webSocketMessage(host as unknown as WebSocket, frame("viewport"));
+    expect(resumed.send).not.toHaveBeenCalled();
+    await room.webSocketMessage(resumed as unknown as WebSocket, frame());
+    const routed = decodeDeviceFrame(successor.send.mock.calls[0][0]);
+    expect(routed.header).toEqual({ s: "watch", k: "rpc", from: "viewport" });
+    await room.webSocketMessage(successor as unknown as WebSocket, frame("viewport"));
+    expect(decodeDeviceFrame(resumed.send.mock.calls[0][0]).header).toEqual({ s: "watch", k: "rpc" });
+  } finally {
+    db.close(); vi.unstubAllGlobals();
+  }
 });

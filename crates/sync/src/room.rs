@@ -34,15 +34,15 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use loro::awareness::EphemeralStore;
-use loro::{ExportMode, LoroDoc, VersionVector};
+use loro::{ExportMode, LoroDoc, ToJson, VersionVector};
 use loro_protocol::{
     BatchId, CrdtType, JoinErrorCode, Permission, ProtocolMessage, RoomErrorCode, UpdateStatusCode,
     decode, encode,
 };
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
 /// Payload bytes per outbound fragment — mirrors the edge's `FRAGMENT_BYTES`
 /// (leaves envelope room under loro-protocol's 256KB message cap).
@@ -77,6 +77,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// answers them without ever waking the DO — so room-level liveness is
 /// enforced separately (`JOIN_RESPONSE_DEADLINE` / `ROOM_PROBE_AFTER` below).
 const SILENCE_LEASE: Duration = Duration::from_secs(40);
+/// A single durable write cannot wait for an idle-room probe (up to four hours).
+/// Other clients' broadcasts and transport pongs do not acknowledge this write.
+const ACK_DEADLINE: Duration = Duration::from_secs(60);
 /// Bound on one whole dial, enforced around `Connector::connect` in
 /// `RoomActor::run` so it covers every connector. For the production
 /// `WsConnector` both `provider.url()` (a token-endpoint HTTP call) and
@@ -234,6 +237,7 @@ pub struct RoomStatsSnapshot {
     pub full_resyncs: u64,
     /// Sessions lost (transport drops, deadlines, requested redials).
     pub disconnects: u64,
+    pub recovery_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -258,6 +262,7 @@ impl RoomStatsShared {
             probes: self.probes.load(Relaxed),
             full_resyncs: self.full_resyncs.load(Relaxed),
             disconnects: self.disconnects.load(Relaxed),
+            recovery_error: None,
         }
     }
 }
@@ -295,6 +300,7 @@ impl Default for RoomTuning {
 pub(crate) struct Pipe {
     pub(crate) tx: mpsc::Sender<Vec<u8>>,
     pub(crate) rx: mpsc::Receiver<Vec<u8>>,
+    pub(crate) room_reset: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Dials one connection attempt. The production impl speaks WebSocket; tests
@@ -305,11 +311,13 @@ pub(crate) trait Connector: Send + Sync + 'static {
 
 struct WsConnector {
     url: Arc<dyn UrlProvider>,
+    room_id: String,
 }
 
 impl Connector for WsConnector {
     fn connect(&self) -> BoxFuture<'static, Result<Pipe, SyncError>> {
         let provider = self.url.clone();
+        let room_id = self.room_id.clone();
         Box::pin(async move {
             // Fresh URL (and therefore fresh `?token=`) on every attempt — an
             // expired access token is never reused across a reconnect. Both
@@ -326,10 +334,12 @@ impl Connector for WsConnector {
                 })?;
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
-            tokio::spawn(pump(ws, out_rx, in_tx));
+            let room_reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tokio::spawn(pump(ws, out_rx, in_tx, room_reset.clone(), room_id));
             Ok(Pipe {
                 tx: out_tx,
                 rx: in_rx,
+                room_reset,
             })
         })
     }
@@ -338,58 +348,76 @@ impl Connector for WsConnector {
 /// Shuttle frames between the WebSocket and the actor's channels, plus the
 /// text-ping keepalive. Ends (dropping `in_tx`, which the actor observes) when
 /// either side closes.
-async fn pump(
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: WebSocketStream<S>,
     mut out_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<Vec<u8>>,
+    room_reset: Arc<std::sync::atomic::AtomicBool>,
+    room_id: String,
 ) {
     let (mut sink, mut stream) = ws.split();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping.tick().await; // consume the immediate first tick
-    let mut last_rx = tokio::time::Instant::now();
-    loop {
-        tokio::select! {
-            frame = out_rx.recv() => match frame {
-                Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    // Actor is done (shutdown): close politely.
-                    let _ = sink.send(WsMessage::Close(None)).await;
-                    break;
-                }
-            },
-            frame = stream.next() => match frame {
-                Some(Ok(WsMessage::Binary(bytes))) => {
-                    last_rx = tokio::time::Instant::now();
-                    if in_tx.send(bytes).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(_)) => {
-                    // Text "pong" / control frames: proof of life for the
-                    // TRANSPORT lease only. The CF runtime auto-answers our
-                    // ping without waking the DO, so this says nothing about
-                    // the room (2026-07-30 — see JOIN_RESPONSE_DEADLINE);
-                    // room-level liveness is judged in `run_session`, which
-                    // only ever sees the binary frames forwarded below.
-                    last_rx = tokio::time::Instant::now();
-                }
-                Some(Err(_)) | None => break,
-            },
-            _ = ping.tick() => {
-                if sink.send(WsMessage::Text("ping".into())).await.is_err() {
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                tracing::warn!("room socket silent past lease; treating as dead");
+    // A join can upload and backfill more than both bounded queues at once.
+    // Blocking reads on the actor must never prevent draining its writes.
+    let write = async {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await;
+        loop {
+            let message = tokio::select! {
+                frame = out_rx.recv() => match frame {
+                    Some(bytes) => WsMessage::Binary(bytes),
+                    None => WsMessage::Close(None),
+                },
+                _ = ping.tick() => WsMessage::Text("ping".into()),
+            };
+            let closing = matches!(message, WsMessage::Close(_));
+            // A blocked TCP write must not defeat the actor's reconnect lease.
+            if !matches!(tokio::time::timeout(SILENCE_LEASE, sink.send(message)).await, Ok(Ok(()))) || closing {
                 break;
             }
         }
+    };
+    let read = async {
+        let mut last_rx = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                frame = stream.next() => match frame {
+                    Some(Ok(WsMessage::Binary(bytes))) => {
+                        last_rx = tokio::time::Instant::now();
+                        if !matches!(tokio::time::timeout(SILENCE_LEASE, in_tx.send(bytes)).await, Ok(Ok(()))) {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        if let Some(frame) = frame {
+                            tracing::warn!(room = %room_id, code = u16::from(frame.code), reason = %frame.reason, "room socket closed by server");
+                            if u16::from(frame.code) == 4410 {
+                                room_reset.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        // Auto-pongs prove transport liveness, not room progress.
+                        last_rx = tokio::time::Instant::now();
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(room = %room_id, %error, "room socket receive failed");
+                        break;
+                    }
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
+                    tracing::warn!("room socket silent past lease; treating as dead");
+                    break;
+                }
+            }
+        }
+    };
+    tokio::select! {
+        _ = write => {},
+        _ = read => {},
+        _ = in_tx.closed() => {},
     }
 }
 
@@ -402,7 +430,7 @@ async fn pump(
 /// client aborts the task immediately; [`RoomClient::shutdown`] leaves the
 /// room cleanly first.
 pub struct RoomClient {
-    doc: LoroDoc,
+    doc: comet_doc::SharedDocument,
     eph: EphemeralStore,
     events: broadcast::Sender<RoomEvent>,
     shutdown: watch::Sender<bool>,
@@ -412,6 +440,12 @@ pub struct RoomClient {
     task: Option<tokio::task::JoinHandle<()>>,
     /// Doc + ephemeral local-update subscriptions (drop = unsubscribe).
     _subs: Vec<loro::Subscription>,
+    _sub_doc: comet_doc::DocumentSubscription,
+}
+
+struct PendingJoinGuard(Option<tokio::task::AbortHandle>);
+impl Drop for PendingJoinGuard {
+    fn drop(&mut self) { if let Some(task) = self.0.take() { task.abort(); } }
 }
 
 impl RoomClient {
@@ -420,13 +454,13 @@ impl RoomClient {
     /// `url` is the full, already-authenticated WebSocket URL (the edge takes
     /// the bearer as `?token=`, e.g. `wss://…/session/{chatId}/ws?token=…`);
     /// `room_id` is the doc room name carried inside the protocol frames (the
-    /// chatId, or `ws/{orgId}` for workspace docs).
+    /// chatId, or `ws4/{projectScope}` for workspace docs).
     ///
-    /// Resolves once the initial join handshake succeeds — the JoinRequest
-    /// carries the doc's version vector, and the server's backfill (updates or
-    /// a full snapshot) is imported as it arrives. A first-attempt failure
-    /// (unreachable edge, `JoinError`) is returned as `Err`; only after a
-    /// successful join does the client keep reconnecting in the background.
+    /// Resolves only after the advertised server history materializes and the
+    /// initial local upload is acknowledged. Backfill may be a snapshot followed
+    /// by journal deltas, or a journal alone. Once remote history is advertised,
+    /// retries retain that convergence obligation rather than reporting a false
+    /// ready state. Established clients reconnect automatically after failures.
     pub async fn connect(url: &str, room_id: &str, doc: LoroDoc) -> Result<Self, SyncError> {
         Self::connect_via(Arc::new(StaticUrl(url.to_string())), room_id, doc).await
     }
@@ -449,8 +483,15 @@ impl RoomClient {
         doc: LoroDoc,
         tuning: RoomTuning,
     ) -> Result<Self, SyncError> {
-        let connector = Arc::new(WsConnector { url: provider });
+        let connector = Arc::new(WsConnector { url: provider, room_id: room_id.to_string() });
         Self::connect_with_tuned(connector, room_id, doc, tuning).await
+    }
+    /// Join with a replaceable application binding; recovery remounts every observer.
+    pub async fn connect_binding_via_tuned(
+        provider: Arc<dyn UrlProvider>, room_id: &str,
+        doc: comet_doc::SharedDocument, tuning: RoomTuning,
+    ) -> Result<Self, SyncError> {
+        Self::connect_with_tuned(Arc::new(WsConnector { url: provider, room_id: room_id.to_string() }), room_id, doc, tuning).await
     }
 
     /// Test seam: production always dials through [`Self::connect_via_tuned`].
@@ -466,23 +507,24 @@ impl RoomClient {
     pub(crate) async fn connect_with_tuned(
         connector: Arc<dyn Connector>,
         room_id: &str,
-        doc: LoroDoc,
+        doc: impl Into<comet_doc::SharedDocument>,
         tuning: RoomTuning,
     ) -> Result<Self, SyncError> {
+        let doc = doc.into();
         let eph = EphemeralStore::new(EPHEMERAL_TIMEOUT_MS);
 
         let (overflow_tx, overflow_rx) = mpsc::channel(1);
         let local_overflow = overflow_tx.clone();
         let (local_tx, local_rx) = mpsc::channel(LOCAL_UPDATE_QUEUE_CAP);
-        let sub_doc = doc.subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
+        let local_generation = doc.generation_clock();
+        let sub_doc = doc.subscribe_local_update(Arc::new(move |bytes: &Vec<u8>| {
             match local_tx.try_reserve() {
-                Ok(permit) => permit.send(bytes.clone()),
+                Ok(permit) => permit.send((local_generation.load(std::sync::atomic::Ordering::Acquire), bytes.clone())),
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     let _ = local_overflow.try_send(());
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
-            true
         }));
         let (eph_tx, eph_rx) = mpsc::channel(LOCAL_UPDATE_QUEUE_CAP);
         let sub_eph = eph.subscribe_local_updates(Box::new(move |bytes: &Vec<u8>| {
@@ -518,11 +560,18 @@ impl RoomClient {
             events: events.clone(),
             shutdown: shutdown_rx,
             required_remote: VersionVector::default(),
+            recovering_snapshot: doc.has_journal(),
+            scope_generation: doc.scope_generation(),
         };
         let task = tokio::spawn(actor.run(ready_tx));
+        // Dropping a JoinHandle detaches, rather than cancels, its task. The
+        // caller can be evicted or retargeted while awaiting the first join.
+        let mut pending_join = PendingJoinGuard(Some(task.abort_handle()));
 
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(())) => {
+                pending_join.0.take();
+                Ok(Self {
                 doc,
                 eph,
                 events,
@@ -531,22 +580,22 @@ impl RoomClient {
                 redial: redial_tx,
                 stats,
                 task: Some(task),
-                _subs: vec![sub_doc, sub_eph],
-            }),
+                _subs: vec![sub_eph],
+                _sub_doc: sub_doc,
+                })
+            },
             Ok(Err(err)) => {
-                task.abort();
                 Err(err)
             }
             Err(_) => {
-                task.abort();
                 Err(SyncError::Closed)
             }
         }
     }
 
     /// The synced doc handle (reference clone of the one passed to `connect`).
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
+    pub fn doc(&self) -> LoroDoc {
+        self.doc.raw()
     }
 
     /// Presence store relayed through the room's `%EPH` channel: `set` keys
@@ -582,7 +631,9 @@ impl RoomClient {
 
     /// Live counters/clocks for this room (SyncStatus RPC / `comet sync`).
     pub fn stats(&self) -> RoomStatsSnapshot {
-        self.stats.snapshot()
+        let mut stats = self.stats.snapshot();
+        stats.recovery_error = self.doc.recovery_error();
+        stats
     }
 
     /// Leave the room (protocol `Leave` frames + close handshake) and stop the
@@ -614,11 +665,11 @@ impl Drop for RoomClient {
 // ── background actor ────────────────────────────────────────────────────────
 
 struct RoomActor {
-    doc: LoroDoc,
+    doc: comet_doc::SharedDocument,
     eph: EphemeralStore,
     room_id: String,
     connector: Arc<dyn Connector>,
-    local_rx: mpsc::Receiver<Vec<u8>>,
+    local_rx: mpsc::Receiver<(u64, Vec<u8>)>,
     eph_rx: mpsc::Receiver<Vec<u8>>,
     overflow_rx: mpsc::Receiver<()>,
     probe_rx: mpsc::Receiver<()>,
@@ -627,8 +678,10 @@ struct RoomActor {
     stats: Arc<RoomStatsShared>,
     events: broadcast::Sender<RoomEvent>,
     shutdown: watch::Receiver<bool>,
+    scope_generation: u64,
     // Retain advertised but unmaterialized operations across reconnects.
     required_remote: VersionVector,
+    recovering_snapshot: bool,
 }
 
 enum SessionEnd {
@@ -638,6 +691,8 @@ enum SessionEnd {
     Evicted(String),
     /// Connection failed or dropped — reconnect with backoff.
     Lost(SyncError),
+    /// The authenticated server retired the old history frontier.
+    Reset,
 }
 
 impl RoomActor {
@@ -649,7 +704,7 @@ impl RoomActor {
         // second of the lid opening instead of waiting out a silence lease.
         let mut wake = crate::wake::subscribe();
         loop {
-            if *self.shutdown.borrow() {
+            if *self.shutdown.borrow() || self.doc.scope_generation() != self.scope_generation {
                 return;
             }
             let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
@@ -677,9 +732,15 @@ impl RoomActor {
             }
             // A failed initial backfill is not a fresh connection attempt:
             // replacing this actor would forget operations already advertised.
-            let backfill_incomplete = !self.doc.state_vv().includes_vv(&self.required_remote);
+            let backfill_incomplete = self.recovering_snapshot || !self.doc.state_vv().includes_vv(&self.required_remote);
             match end {
                 SessionEnd::Shutdown => return,
+                SessionEnd::Reset => {
+                    self.required_remote = VersionVector::default();
+                    self.recovering_snapshot = self.doc.has_journal();
+                    let _ = self.events.send(RoomEvent::Disconnected);
+                    backoff = BACKOFF_BASE;
+                }
                 SessionEnd::Evicted(reason) => {
                     if !backfill_incomplete && let Some(tx) = ready.take() {
                         let _ = tx.send(Err(SyncError::JoinRefused(reason)));
@@ -775,11 +836,15 @@ impl RoomActor {
             sync_started_at: Some(tokio::time::Instant::now()),
             synchronized: false,
             repairing_join: false,
+            recovering_snapshot: self.recovering_snapshot,
+            recovery_doc: None,
+            scope_generation: self.scope_generation,
         };
 
-        let version = sess.local_version_bytes();
+        let version = if sess.recovering_snapshot { Vec::new() } else { sess.local_version_bytes() };
         if let Err(err) = sess.send_join_loro(version).await {
-            return (SessionEnd::Lost(err), false);
+            let end = if pipe.room_reset.load(std::sync::atomic::Ordering::Acquire) { SessionEnd::Reset } else { SessionEnd::Lost(err) };
+            return (end, false);
         }
 
         let mut probe_interval = ROOM_PROBE_AFTER;
@@ -806,11 +871,10 @@ impl RoomActor {
                 ),
                 None => (sess.last_pushed_rx + probe_interval, false),
             };
+            let ack_deadline = sess.pending.values().map(|(sent, _)| *sent + ACK_DEADLINE).min();
             tokio::select! {
-                // Biased so a buffered answer frame always beats an expired
-                // deadline in the same poll — never kill with the
-                // JoinResponseOk already readable.
-                biased;
+                // Fair polling: a busy workspace's inbound broadcasts must not
+                // starve local durable writes, presence, or recovery hints.
                 // Post-suspend the socket is almost certainly half-open (NAT
                 // state gone); ending the session redials immediately with a
                 // freshly-provided URL/token instead of waiting out the
@@ -868,8 +932,8 @@ impl RoomActor {
                 update = self.local_rx.recv() => match update {
                     None => break SessionEnd::Shutdown, // client dropped
                     // When not yet joined: covered by the join-time VV diff.
-                    Some(update) => {
-                        if sess.joined_lor
+                    Some((generation, update)) => {
+                        if generation == self.doc.generation() && sess.joined_lor && !sess.recovering_snapshot
                             && let Err(err) = sess.send_loro_updates(vec![update]).await
                         {
                             break SessionEnd::Lost(err);
@@ -931,7 +995,15 @@ impl RoomActor {
                         ));
                     }
                 }
+                _ = tokio::time::sleep_until(ack_deadline.unwrap_or(liveness_at)), if ack_deadline.is_some() => {
+                    break SessionEnd::Lost(SyncError::WebSocket(
+                        "durable update acknowledgement timed out; resyncing".into(),
+                    ));
+                }
                 _ = tokio::time::sleep_until(liveness_at) => {
+                    // Prefer a buffered answer over its deadline without giving
+                    // an unbounded inbound stream priority over local writes.
+                    if !pipe.rx.is_empty() { continue; }
                     if join_outstanding {
                         // The 2026-07-30 hang: a room that accepted the socket
                         // but never answered the join. Kill the session so the
@@ -964,7 +1036,11 @@ impl RoomActor {
                 }
             }
         };
+        let end = if !matches!(end,SessionEnd::Shutdown) && pipe.room_reset.load(std::sync::atomic::Ordering::Acquire) {
+            SessionEnd::Reset
+        } else { end };
         self.required_remote = sess.required_remote;
+        self.recovering_snapshot = sess.recovering_snapshot;
         let joined = sess.synchronized;
         (end, joined)
     }
@@ -980,14 +1056,14 @@ struct FragmentBuffer {
 }
 
 struct Session {
-    doc: LoroDoc,
+    doc: comet_doc::SharedDocument,
     eph: EphemeralStore,
     room_id: String,
     tx: mpsc::Sender<Vec<u8>>,
     events: broadcast::Sender<RoomEvent>,
     stats: Arc<RoomStatsShared>,
     /// Sent-but-unacked outbound batches, kept for FragmentTimeout resends.
-    pending: HashMap<BatchId, Vec<Vec<u8>>>,
+    pending: HashMap<BatchId, (tokio::time::Instant, Vec<Vec<u8>>)>,
     /// Inbound reassembly buffers.
     fragments: HashMap<BatchId, FragmentBuffer>,
     joined_lor: bool,
@@ -1028,6 +1104,9 @@ struct Session {
     sync_started_at: Option<tokio::time::Instant>,
     synchronized: bool,
     repairing_join: bool,
+    recovering_snapshot: bool,
+    recovery_doc: Option<LoroDoc>,
+    scope_generation: u64,
 }
 
 impl Session {
@@ -1049,6 +1128,7 @@ impl Session {
             || !self.joined_lor
             || self.join_sent_at.is_some()
             || !self.pending.is_empty()
+            || self.recovering_snapshot || self.recovery_doc.is_some()
             || self.doc.is_detached()
         {
             return;
@@ -1082,9 +1162,9 @@ impl Session {
 
     async fn send(&self, message: &ProtocolMessage) -> Result<(), SyncError> {
         let bytes = encode(message).map_err(SyncError::Protocol)?;
-        self.tx
-            .send(bytes)
+        tokio::time::timeout(SILENCE_LEASE, self.tx.send(bytes))
             .await
+            .map_err(|_| SyncError::WebSocket("outbound queue stalled".into()))?
             .map_err(|_| SyncError::WebSocket("connection closed".into()))
     }
 
@@ -1110,6 +1190,7 @@ impl Session {
         bytes: &[u8],
         ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
     ) -> Result<Option<SessionEnd>, SyncError> {
+        if self.doc.scope_generation() != self.scope_generation { return Err(SyncError::Closed); }
         let message = decode(bytes).map_err(SyncError::Protocol)?;
         // Advance the room-liveness clock for %LOR frames only (see
         // `last_lor_rx` for why %EPH must not count).
@@ -1159,6 +1240,7 @@ impl Session {
                     if code == JoinErrorCode::VersionUnknown {
                         // Server can't diff from our VV — fall back to a full
                         // snapshot backfill.
+                        self.recovering_snapshot = self.doc.has_journal();
                         self.send_join_loro(Vec::new()).await?;
                         return Ok(None);
                     }
@@ -1279,7 +1361,12 @@ impl Session {
                 } else {
                     VersionVector::decode(&version).map_err(|e| SyncError::Loro(e.to_string()))?
                 };
+                // Cold restoration can recreate list nodes. Reconcile against the
+                // server's original identities before publishing those restored edits.
+                // An empty server instead needs our retained state to bootstrap it.
+                if server_vv.is_empty() { self.recovering_snapshot = false; }
                 self.required_remote.merge(&server_vv);
+                self.doc.acknowledge_scoped(self.scope_generation,&server_vv).map_err(|error| SyncError::Loro(error.to_string()))?;
                 if !self.doc.state_vv().includes_vv(&self.required_remote)
                     || !server_vv.includes_vv(&self.doc.oplog_vv())
                 {
@@ -1298,7 +1385,7 @@ impl Session {
                 if self.invalid_rejoins >= MAX_INVALID_REJOINS {
                     return Err(SyncError::Loro("workspace synchronization rejected; retained local history requires recovery".into()));
                 }
-                if !self.doc.oplog_vv().is_empty() {
+                if !self.recovering_snapshot && !self.doc.oplog_vv().is_empty() {
                     if !server_vv.includes_vv(&self.doc.oplog_vv()) {
                         // Below a shallow boundary, an update export can omit
                         // required dependencies even when export itself succeeds.
@@ -1381,13 +1468,56 @@ impl Session {
             CrdtType::Loro => {
                 let mut imported = false;
                 for update in updates {
+                    if self.doc.scope_generation() != self.scope_generation { return Err(SyncError::Closed); }
                     if update.is_empty() {
                         continue;
                     }
-                    if let Ok(metadata) = LoroDoc::decode_import_blob_meta(&update, true) {
-                        self.required_remote.merge(&metadata.partial_end_vv);
+                    let metadata = LoroDoc::decode_import_blob_meta(&update, true).ok();
+                    if let Some(metadata) = &metadata { self.required_remote.merge(&metadata.partial_end_vv); }
+                    let snapshot = metadata.as_ref().is_some_and(|metadata| matches!(metadata.mode,
+                        loro::EncodedBlobMode::Snapshot | loro::EncodedBlobMode::ShallowSnapshot | loro::EncodedBlobMode::OutdatedSnapshot));
+                    // A fresh edge room can retain only SQL deltas, with no
+                    // snapshot yet. Build that full backfill in isolation too;
+                    // importing it directly leaves recovering_snapshot latched.
+                    if self.doc.has_journal() && (self.recovering_snapshot || snapshot) && self.recovery_doc.is_none()
+                        && metadata.as_ref().is_some_and(|metadata| !metadata.partial_end_vv.is_empty()) {
+                        self.recovering_snapshot = true;
+                        self.recovery_doc = Some(LoroDoc::new());
                     }
-                    let result = self.doc.import(&update);
+                    let result = if let Some(candidate) = &self.recovery_doc {
+                        candidate.import(&update).map_err(|error| comet_doc::DocError::Schema(error.to_string()))
+                    } else { self.doc.import_scoped(self.scope_generation,&update) };
+                    if self.doc.scope_generation() != self.scope_generation { return Err(SyncError::Closed); }
+                    if self.recovery_doc.is_some() && result.is_err() {
+                        self.recovery_doc = None;
+                        self.begin_sync();
+                        if self.full_resyncs >= MAX_FULL_RESYNCS { return Err(SyncError::Loro("replacement history is invalid; local records retained".into())); }
+                        self.full_resyncs += 1;
+                        self.send_join_loro(Vec::new()).await?;
+                        continue;
+                    }
+                    if let Some(candidate) = &self.recovery_doc {
+                        if !candidate.is_detached() && candidate.state_vv() == candidate.oplog_vv()
+                            && candidate.state_vv().includes_vv(&self.required_remote) {
+                            let bytes = candidate.export(ExportMode::Snapshot).map_err(|error| SyncError::Loro(error.to_string()))?;
+                            let expected = self.doc.get_map("meta").get("chatId").and_then(|value| value.get_deep_value().to_json_value().as_str().map(str::to_owned));
+                            if let Err(error) = self.doc.adopt_snapshot_scoped(&bytes, expected.as_deref(),self.scope_generation) {
+                                if self.doc.scope_generation() != self.scope_generation { return Err(SyncError::Closed); }
+                                self.doc.fail_recovery(error.to_string());
+                                return Err(SyncError::Loro(error.to_string()));
+                            }
+                            self.pending.clear();
+                            self.recovery_doc = None;
+                            self.recovering_snapshot = false;
+                            self.doc.acknowledge_scoped(self.scope_generation,&self.required_remote).map_err(|error| SyncError::Loro(error.to_string()))?;
+                            let missing = self.doc.export(ExportMode::updates(&self.required_remote)).map_err(|error| SyncError::Loro(error.to_string()))?;
+                            if !self.required_remote.includes_vv(&self.doc.oplog_vv()) { self.send_loro_updates(vec![missing]).await?; }
+                            imported = true;
+                        }
+                        // A snapshot prefix must wait for its advertised journal suffix,
+                        // never discard acknowledged records or restart streamed catch-up.
+                        continue;
+                    }
                     let complete = result.as_ref().is_ok_and(|status| {
                         status
                             .pending
@@ -1399,9 +1529,12 @@ impl Session {
                     if complete {
                         imported = true;
                     } else {
+                        // A join streams its snapshot and journal separately; a valid
+                        // prefix can trail required_remote while catch-up is underway.
+                        let request_backfill = result.is_err() || self.synchronized;
                         self.begin_sync();
-                        tracing::warn!(room = %self.room_id, error = ?result.err(), "remote update did not materialize; requesting full backfill");
-                        if self.join_sent_at.is_none() {
+                        if request_backfill && self.join_sent_at.is_none() {
+                            tracing::warn!(room = %self.room_id, error = ?result.err(), "remote update did not materialize; requesting full backfill");
                             if self.full_resyncs >= MAX_FULL_RESYNCS {
                                 return Err(SyncError::Loro(
                                     "remote history remains incomplete after full backfill".into(),
@@ -1411,6 +1544,7 @@ impl Session {
                             self.stats
                                 .full_resyncs
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.recovering_snapshot = self.doc.has_journal();
                             self.send_join_loro(Vec::new()).await?;
                         }
                     }
@@ -1493,7 +1627,13 @@ impl Session {
         }
         match status {
             UpdateStatusCode::Ok => {
-                let acknowledged = self.pending.remove(&ref_id).is_some();
+                let batch = self.pending.remove(&ref_id);
+                let acknowledged = batch.is_some();
+                if let Some((_, batch)) = batch {
+                    let mut version = VersionVector::default();
+                    for bytes in batch { if let Ok(metadata) = LoroDoc::decode_import_blob_meta(&bytes, true) { version.merge(&metadata.partial_end_vv); } }
+                    self.doc.acknowledge_scoped(self.scope_generation,&version).map_err(|error| SyncError::Loro(error.to_string()))?;
+                }
                 if crdt == CrdtType::Loro
                     && acknowledged
                     && self.repairing_join
@@ -1506,13 +1646,17 @@ impl Session {
             UpdateStatusCode::FragmentTimeout => {
                 // DO hibernated mid-batch and lost reassembly state — resend
                 // the whole batch (self-healing per the edge's design).
-                if let Some(batch) = self.pending.remove(&ref_id) {
+                if let Some((_, batch)) = self.pending.remove(&ref_id) {
                     self.send_loro_updates(batch).await?;
                 }
             }
             UpdateStatusCode::InvalidUpdate | UpdateStatusCode::PermissionDenied => {
                 self.pending.remove(&ref_id);
                 if crdt == CrdtType::Loro {
+                    if status == UpdateStatusCode::PermissionDenied {
+                        self.doc.fail_recovery("Crew room rejected the original command admission or owner scope".into());
+                        return Err(SyncError::Loro("room permission denied; original records retained".into()));
+                    }
                     self.begin_sync();
                     self.repairing_join = false;
                     if self.invalid_rejoins >= MAX_INVALID_REJOINS {
@@ -1525,10 +1669,9 @@ impl Session {
                         ));
                     }
                     self.invalid_rejoins += 1;
-                    // §3.1 stale peer: resync fresh (rejoin with our VV pulls
-                    // the server's post-trim state), then the JoinResponseOk
-                    // handler resubmits from the server's VV.
-                    let version = self.local_version_bytes();
+                    self.recovering_snapshot = self.doc.has_journal();
+                    self.recovery_doc = None;
+                    let version = if self.recovering_snapshot { Vec::new() } else { self.local_version_bytes() };
                     self.send_join_loro(version).await?;
                 } else {
                     tracing::warn!(room = %self.room_id, ?crdt, ?status, "update rejected");
@@ -1556,6 +1699,7 @@ impl Session {
     /// update above the protocol payload budget. Every batch is tracked in
     /// `pending` until its Ack.
     async fn send_loro_updates(&mut self, updates: Vec<Vec<u8>>) -> Result<(), SyncError> {
+        if self.doc.scope_generation() != self.scope_generation { return Err(SyncError::Closed); }
         let mut small: Vec<Vec<u8>> = Vec::new();
         let mut small_bytes = 0usize;
         for update in updates {
@@ -1582,20 +1726,21 @@ impl Session {
     async fn flush_small_batch(&mut self, updates: Vec<Vec<u8>>) -> Result<(), SyncError> {
         self.check_pending_capacity()?;
         let batch_id = new_batch_id();
-        self.pending.insert(batch_id, updates.clone());
+        let pending = updates.clone();
         self.send(&ProtocolMessage::DocUpdate {
             crdt: CrdtType::Loro,
             room_id: self.room_id.clone(),
             updates,
             batch_id,
         })
-        .await
+        .await?;
+        self.pending.insert(batch_id, (tokio::time::Instant::now(), pending));
+        Ok(())
     }
 
     async fn send_fragmented(&mut self, update: Vec<u8>) -> Result<(), SyncError> {
         self.check_pending_capacity()?;
         let batch_id = new_batch_id();
-        self.pending.insert(batch_id, vec![update.clone()]);
         let fragment_count = update.len().div_ceil(FRAGMENT_BYTES);
         self.send(&ProtocolMessage::DocUpdateFragmentHeader {
             crdt: CrdtType::Loro,
@@ -1615,6 +1760,7 @@ impl Session {
             })
             .await?;
         }
+        self.pending.insert(batch_id, (tokio::time::Instant::now(), vec![update]));
         Ok(())
     }
 

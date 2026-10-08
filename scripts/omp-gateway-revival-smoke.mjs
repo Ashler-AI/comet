@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Usage: node scripts/omp-gateway-revival-smoke.mjs [OMP_BINARY] [--compare-explicit]
+// Usage: node scripts/omp-gateway-revival-smoke.mjs [OMP_BINARY] [--compare-explicit|--opus-only]
 // No source checkout, credentials, live Crew instance, or external inference is used.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
-assert(args.every((arg) => !arg.startsWith("--") || arg === "--compare-explicit"), "Unknown option");
+assert(args.every((arg) => !arg.startsWith("--") || ["--compare-explicit", "--opus-only"].includes(arg)), "Unknown option");
 assert(args.filter((arg) => !arg.startsWith("--")).length <= 1, "Supply at most one OMP binary");
 const BINARY = path.resolve(args.find((arg) => !arg.startsWith("--")) ?? path.join(os.homedir(), ".local/bin/omp"));
 const MODEL_ID = "gateway-smoke";
@@ -141,18 +141,21 @@ async function gateway(request, response) {
   requests.push(record);
   if (request.method === "GET" && request.url === "/v1/models") {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ object: "list", data: [{ id: `openai-codex/${MODEL_ID}`,
-      owned_by: "openai-codex", api: "openai-codex-responses" }] }));
+    response.end(JSON.stringify({ object: "list", data: [
+      { id: `openai-codex/${MODEL_ID}`, owned_by: "openai-codex", api: "openai-codex-responses" },
+      { id: "anthropic/claude-opus-5-5", owned_by: "anthropic", api: "anthropic-messages" },
+    ] }));
     return;
   }
   assert.equal(request.method, "POST");
-  assert.equal(request.url, "/v1/responses");
   let raw = "";
   for await (const chunk of request) {
     raw += chunk;
     assert(raw.length < 4_000_000, "Unexpectedly large mock request");
   }
   const body = JSON.parse(raw);
+  if (new URL(request.url, "http://localhost").pathname === "/v1/messages") return opusResponse(body, response);
+  assert.equal(request.url, "/v1/responses");
   assert.equal(body.model, MODEL_ID);
   assert.equal(body.stream, true);
   assert(scenario, "Inference outside an active scenario");
@@ -199,15 +202,96 @@ async function gateway(request, response) {
   respondStream(response, item);
 }
 
+function opusResponse(body, response) {
+  assert.equal(scenario?.name, "opus-5-5");
+  assert.equal(body.model, "claude-opus-5-5");
+  assert.deepEqual(body.thinking, { type: "adaptive", display: "summarized" });
+  assert.equal(body.output_config.effort, scenario.effort);
+  assert(body.max_tokens <= 128_000);
+  assert(!body.tool_choice || ["auto", "none"].includes(body.tool_choice.type));
+  const first = !scenario.firstRequest;
+  const signed = { type: "thinking", thinking: "Checking the release fixture.", signature: "opaque-signature-smoke" };
+  let content;
+  if (first) {
+    scenario.firstRequest = body;
+    const tool = body.tools.find((tool) => /^_?read$/i.test(tool.name));
+    assert(tool, `OMP must advertise its real read tool; received: ${body.tools?.map((tool) => tool.name).join(", ")}`);
+    content = [signed, { type: "tool_use", id: "toolu_smoke", name: tool.name,
+      input: conform(tool.input_schema, { path: scenario.file }) }];
+  } else {
+    // Cache placement and the transport's per-request billing checksum are not conversation text.
+    const stablePrefix = (value) => JSON.parse(JSON.stringify(value, (key, item) =>
+      key === "cache_control" ? undefined : key === "text" && typeof item === "string" && item.startsWith("x-anthropic-billing-header:")
+        ? item.replace(/cch=[a-f0-9]+;/, "cch=CHECKSUM;") : item));
+    assert.deepEqual(stablePrefix(body.system), stablePrefix(scenario.firstRequest.system), "System prefix changed during tool replay");
+    assert.deepEqual(stablePrefix(body.tools), stablePrefix(scenario.firstRequest.tools), "Tools changed during tool replay");
+    assert.deepEqual(stablePrefix(body.messages.slice(0, scenario.firstRequest.messages.length)), stablePrefix(scenario.firstRequest.messages),
+      "Earlier conversation turns changed during tool replay");
+    const assistant = body.messages.findLast((message) => message.role === "assistant");
+    assert.deepEqual(assistant.content.find((block) => block.type === "thinking"), signed,
+      "Signed thinking must be replayed unmodified");
+    assert(body.messages.some((message) => Array.isArray(message.content) && message.content.some((block) =>
+      block.type === "tool_result" && block.tool_use_id === "toolu_smoke")), "Missing actual tool result");
+    content = [{ type: "text", text: "OPUS_COMPLETE" }];
+  }
+  scenario.calls++;
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  const event = (type, fields) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
+  event("message_start", { message: { id: `msg_${scenario.calls}`, type: "message", role: "assistant",
+    model: body.model, content: [], stop_reason: null, stop_sequence: null,
+    usage: { input_tokens: 10, output_tokens: 0 } } });
+  content.forEach((block, index) => {
+    if (block.type === "text") {
+      event("content_block_start", { index, content_block: { type: "text", text: "" } });
+      event("content_block_delta", { index, delta: { type: "text_delta", text: block.text } });
+    } else if (block.type === "thinking") {
+      event("content_block_start", { index, content_block: { type: "thinking", thinking: "" } });
+      event("content_block_delta", { index, delta: { type: "thinking_delta", thinking: block.thinking } });
+      event("content_block_delta", { index, delta: { type: "signature_delta", signature: block.signature } });
+    } else {
+      event("content_block_start", { index, content_block: { ...block, input: {} } });
+      event("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+    }
+    event("content_block_stop", { index });
+  });
+  event("message_delta", { delta: { stop_reason: first ? "tool_use" : "end_turn", stop_sequence: null },
+    usage: { output_tokens: 10 } });
+  event("message_stop", {});
+  response.end();
+}
+
+async function opusSmoke() {
+  const fixture = await prepare("opus-5-5");
+  const file = path.join(fixture.cwd, "release.txt");
+  await writeFile(file, "Opus 5.5 released\n");
+  for (const effort of ["medium", "xhigh"]) {
+    scenario = { name: "opus-5-5", effort, file, calls: 0 };
+    const rpc = new Rpc(fixture.env, fixture.cwd,
+      ["--model", "comet-anthropic/claude-opus-5-5"], effort, "read");
+    try {
+      await rpc.ready();
+      const { models } = await rpc.request("get_available_models");
+      const opus = models.find((model) => model.provider === "comet-anthropic" && model.id === "claude-opus-5-5");
+      assert.equal(opus.contextWindow, 1_000_000);
+      assert.equal(opus.maxTokens, 128_000);
+      assert.deepEqual(opus.cost, { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 });
+      assert.deepEqual(opus.thinking.efforts, ["low", "medium", "high", "xhigh", "max"]);
+      await rpc.prompt("Read the release fixture and report completion.", "OPUS_COMPLETE");
+      assert.equal(scenario.calls, 2);
+      console.log(`PASS Opus 5.5 ${effort}: real OMP adaptive request, read tool, unchanged signed replay`);
+    } finally { await rpc.stop(); }
+  }
+}
+
 class Rpc {
-  constructor(env, cwd, extra = []) {
+  constructor(env, cwd, extra = [], thinking = "off", tools = "task,hub,yield") {
     this.frames = [];
     this.pending = new Map();
     this.serial = 0;
     this.stderr = "";
     this.child = spawn(BINARY, ["--mode", "rpc", "--profile", "gateway-smoke", "--cwd", cwd,
       "--no-lsp", "--no-pty", "--no-skills", "--no-rules", "--no-title", "--no-prewalk",
-      "--thinking", "off", "--auto-approve", "--tools", "task,hub,yield", ...extra],
+      "--thinking", thinking, "--auto-approve", "--tools", tools, ...extra],
     { cwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
     children.add(this.child);
     this.child.stderr.setEncoding("utf8").on("data", (chunk) => { this.stderr = (this.stderr + chunk).slice(-16_000); });
@@ -466,12 +550,16 @@ try {
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
-  await checkGuard("bare-no-crew-env", ["COMET_SESSION_ID", "COMET_INFERENCE_TOKEN"]);
-  await checkGuard("bare-token-only", ["COMET_SESSION_ID"]);
-  await checkGuard("bare-session-only", ["COMET_INFERENCE_TOKEN"]);
-  await checkLegacy();
-  await revival();
-  if (args.includes("--compare-explicit")) await revival(true);
+  if (args.includes("--opus-only")) {
+    await opusSmoke();
+  } else {
+    await checkGuard("bare-no-crew-env", ["COMET_SESSION_ID", "COMET_INFERENCE_TOKEN"]);
+    await checkGuard("bare-token-only", ["COMET_SESSION_ID"]);
+    await checkGuard("bare-session-only", ["COMET_INFERENCE_TOKEN"]);
+    await checkLegacy();
+    await revival();
+    if (args.includes("--compare-explicit")) await revival(true);
+  }
   if (gatewayFailure) throw gatewayFailure;
   console.log(`PASS installed OMP gateway smoke: ${BINARY}; all requests used deterministic loopback credentials and isolated temporary profiles`);
 } catch (error) {

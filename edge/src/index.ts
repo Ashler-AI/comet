@@ -19,6 +19,9 @@ import {
   NOTIFICATION_BEARER_HEADER,
   ROOM_KIND_HEADER,
   SESSION_OWNER_AUTH_HEADER,
+  DURABLE_SYNC_PROTOCOL,
+  SYNC_PROTOCOL_HEADER,
+  SYNC_PROTOCOL_QUERY,
   stripTrustedAuthHeaders,
   type Env
 } from "./env";
@@ -47,9 +50,10 @@ const json = (value: unknown, status = 200): Response =>
     headers: { "content-type": "application/json" }
   });
 
-const requestInit = (request: Request): RequestInit => ({
+const requestInit = (request: Request): RequestInit & { duplex: "half" } => ({
   method: request.method,
-  body: request.body
+  body: request.body,
+  duplex: "half"
 });
 
 const forward = (
@@ -64,11 +68,14 @@ const forward = (
 ): Promise<Response> => {
   const stub = ns.get(ns.idFromName(name));
   const url = new URL(request.url);
+  const declarations = url.searchParams.getAll(SYNC_PROTOCOL_QUERY);
+  const durableSync = declarations.length === 1 && declarations[0] === DURABLE_SYNC_PROTOCOL;
   url.pathname = path;
   url.search = search;
   const headers = new Headers(request.headers);
   stripTrustedAuthHeaders(headers);
   headers.delete("authorization");
+  if (durableSync) headers.set(SYNC_PROTOCOL_HEADER, DURABLE_SYNC_PROTOCOL);
   headers.set(AUTH_USER_HEADER, identity.userId);
   headers.set(AUTH_PROJECT_HEADER, identity.projectScope);
   headers.set(AUTH_CAPABILITIES_HEADER, identity.capabilities.join(" "));
@@ -351,8 +358,7 @@ export default {
       ) {
         return json({ error: "forbidden" }, 403);
       }
-      const deviceId = await peerSessionOwnerDevice(env, identity, sessionId, deploymentId)
-        ?? (deploymentId ? await peerSessionOwnerDevice(env, identity, sessionId) : undefined);
+      const deviceId = await peerSessionOwnerDevice(env, identity, sessionId, deploymentId);
       if (!deviceId) return json({ error: "target_session_not_found" }, 404);
       const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
       return forward(
@@ -374,9 +380,16 @@ export default {
       const controlSessionId = peerPurpose === "control"
         ? canonicalSessionId(url.searchParams.get("controlSessionId") ?? undefined)
         : undefined;
+      // Ordinary hosts have no authenticated deployment-aware admission contract.
+      // Never erase explicit scope and downgrade it to the legacy UUID route.
+      if (peerPurpose === "control" &&
+          (url.searchParams.has("controlDeploymentId") || url.searchParams.has("deploymentId"))) {
+        return json({ error: "scoped_control_not_supported" }, 403);
+      }
       if (peerPurpose === "control" && (
         deviceCredential || !controlSessionId || requestedRole !== "client" ||
-        deviceId.startsWith(SANDBOX_DEVICE_PREFIX) || !hasCapability(identity, "session.control")
+        deviceId.startsWith(SANDBOX_DEVICE_PREFIX) ||
+          (!hasCapability(identity, "session.control") && !hasCapability(identity, "session.read"))
       )) return json({ error: "forbidden" }, 403);
       const directPeerReply = peerPurpose === "peer-reply";
       const peerClient =
@@ -412,6 +425,8 @@ export default {
             ? !hasCapability(identity, "session.environment")
             : peerClient
               ? !hasCapability(identity, "session.chat")
+              : controlSessionId
+                ? !hasCapability(identity, "session.read") && !hasCapability(identity, "session.control")
               : !hasCapability(identity, "session.control") &&
                 !hasCapability(identity, "session.environment")
         ) {

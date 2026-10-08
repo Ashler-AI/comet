@@ -27,7 +27,7 @@
 //! `chrono::DateTime<Utc>` through the `comet_proto` entity types.
 
 use chrono::{DateTime, Utc};
-use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
+use loro::{ContainerTrait, ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
 use comet_proto::{
@@ -35,6 +35,7 @@ use comet_proto::{
 };
 
 use crate::schema::DocError;
+use crate::SharedDocument;
 
 /// Workspace doc schema version. v3 adds the non-owning `sessionRefs` container.
 /// v2 was the spaces overhaul, shipped via a fresh doc/room (`workspace2` / `ws2/{orgId}`),
@@ -46,8 +47,156 @@ pub fn presence_key(device_id: &str) -> String {
     format!("presence/{device_id}")
 }
 
+/// A UUID followed by identical self-session components projects to that public UUID, never a child.
+/// This is deliberately independent of warm doc handles and never renames journals.
+pub fn execution_chat_id(key: &str) -> Option<&str> {
+    let mut parts = key.split("::session::");
+    let chat_id = parts.next()?;
+    let session_id = parts.next()?;
+    let bytes = chat_id.as_bytes();
+    (chat_id == session_id
+        && parts.all(|part| part == chat_id)
+        && bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f')
+            }
+        }))
+    .then_some(chat_id)
+}
+
+fn require_public_chat_id(chat_id: &str) -> Result<(), DocError> {
+    if chat_id.contains("::session::") {
+        return Err(DocError::Schema("execution key is not a public chat id".into()));
+    }
+    Ok(())
+}
+
 fn session_ref_key(user_id: &str, chat_id: &str) -> String {
     format!("{}:{user_id}:{chat_id}", user_id.len())
+}
+
+pub(crate) const WORKSPACE_IDENTITY_FIELDS: &[&str] = &[
+    "id", "chatId", "userId", "deviceId", "ownerSubject", "ownerDeviceId",
+    "ownerPrincipal", "projectId", "deploymentId",
+];
+
+/// A membership can learn its first route. Missing earlier metadata is not a
+/// different deployment; once known, all retained scopes and owners must agree.
+pub(crate) fn workspace_routes_compatible<'a>(container: &str, rows: impl IntoIterator<Item = &'a serde_json::Map<String, serde_json::Value>>) -> bool {
+    let mut rows = rows.into_iter();
+    let Some(first) = rows.next() else { return true };
+    let route = |row: &'a serde_json::Map<String, serde_json::Value>, field: &str| row.get("environment")
+        .and_then(|value| value.get(field)).filter(|value| !value.is_null());
+    let baseline = [route(first, "scope"), route(first, "ownerPrincipal")];
+    let mut known = baseline;
+    for row in rows {
+        for (index, field) in ["scope", "ownerPrincipal"].into_iter().enumerate() {
+            let current = route(row, field);
+            if container != "sessionRefs" || baseline[index].is_some() {
+                if current != baseline[index] { return false }
+            } else if let Some(current) = current {
+                if known[index].is_some_and(|known| known != current) { return false }
+                known[index] = Some(current);
+            }
+        }
+    }
+    true
+}
+
+/// A public row alias is recoverable only when key, every retained identity,
+/// and ownership all describe the same UUID self-session, never a child session.
+pub fn normalize_workspace_record(record: &crate::PendingRecord) -> Result<crate::PendingRecord, DocError> {
+    let identity = match record.container.as_str() {
+        "chats" => "id",
+        "sessions" | "sessionRefs" | "worktreeDeletions" => "chatId",
+        _ => return Ok(record.clone()),
+    };
+    let conflict = || DocError::Schema(format!("Crew recovery conflict in {}/{}; original intent retained", record.container, record.key));
+    let Some(row) = record.before.as_ref().or(record.value.as_ref()).and_then(|value| value.as_object()) else { return Ok(record.clone()) };
+    if row.get(identity).and_then(|value| value.as_str()).is_none() { return Ok(record.clone()) }
+    let user = row.get("userId").and_then(|value| value.as_str());
+    let key_id = if record.container == "sessionRefs" {
+        let Some(user) = user else { return Ok(record.clone()) };
+        let prefix = format!("{}:{user}:", user.len());
+        record.key.strip_prefix(&prefix).ok_or_else(conflict)?
+    } else { record.key.as_str() };
+    let Some(public) = execution_chat_id(key_id).or_else(|| record.before.iter().chain(record.value.iter())
+        .find_map(|value| value.get(identity).and_then(|id| id.as_str()).and_then(execution_chat_id))) else { return Ok(record.clone()) };
+    if key_id != public && execution_chat_id(key_id) != Some(public) { return Err(conflict()) }
+    let owner_fields: &[&str] = match record.container.as_str() {
+        "sessionRefs" => &["userId"],
+        "worktreeDeletions" => &["ownerSubject", "ownerDeviceId"],
+        _ => &["deviceId"],
+    };
+    if owner_fields.iter().any(|field| !row.get(*field).and_then(|value| value.as_str()).is_some_and(|value| !value.is_empty())) { return Err(conflict()) }
+    for value in record.before.iter().chain(record.value.iter()) {
+        let fields = value.as_object().ok_or_else(conflict)?;
+        if !fields.get(identity).and_then(|value| value.as_str()).is_some_and(|id| id == public || execution_chat_id(id) == Some(public)) { return Err(conflict()) }
+        for field in WORKSPACE_IDENTITY_FIELDS.iter().copied().filter(|field| *field != identity) {
+            if fields.get(field) != row.get(field) { return Err(conflict()) }
+        }
+    }
+    if !workspace_routes_compatible(&record.container, record.before.iter().chain(record.value.iter()).filter_map(|value| value.as_object())) { return Err(conflict()) }
+    let mut normalized = record.clone();
+    normalized.key = if let Some(user) = user.filter(|_| record.container == "sessionRefs") { session_ref_key(user, public) } else { public.into() };
+    for value in normalized.before.iter_mut().chain(normalized.value.iter_mut()) {
+        value.as_object_mut().ok_or_else(conflict)?.insert(identity.into(), public.into());
+    }
+    Ok(normalized)
+}
+
+/// Coexisting bootstrap creations may retain stale owner observations under an
+/// alias. Only a covered cached canonical creation supersedes those observations;
+/// edits to user-controlled fields and unknown ancestry still conflict.
+pub fn canonical_creation_covers_alias(alias: &crate::PendingRecord, canonical: &crate::PendingRecord, cached: &LoroDoc) -> bool {
+    if alias.container != canonical.container || alias.key == canonical.key || alias.before.is_some() || canonical.before.is_some()
+        || alias.version.is_empty() || canonical.version.is_empty() { return false }
+    let (Ok(alias_version), Ok(canonical_version)) = (loro::VersionVector::decode(&alias.version), loro::VersionVector::decode(&canonical.version)) else { return false };
+    let cached_version = cached.oplog_vv();
+    if !canonical_version.includes_vv(&alias_version) || !cached_version.includes_vv(&canonical_version) { return false }
+    let (Ok(local), Ok(public)) = (normalize_workspace_record(alias), normalize_workspace_record(canonical)) else { return false };
+    if local.key != public.key || public.key != canonical.key { return false }
+    let covered_row = |record: &crate::PendingRecord, normalized: &crate::PendingRecord, version: &loro::VersionVector| {
+        let root = cached.get_map(record.container.as_str());
+        let covers = |edit| cached.with_oplog(|oplog| oplog.idlp_to_id(edit))
+            .map(|id| version.includes_id(id)).unwrap_or_else(|| version.includes_vv(&cached_version));
+        if !root.to_handler().get_last_edit_idlp(&record.key).is_some_and(covers) { return false }
+        let value = root.get(&record.key).map(|row| row.get_deep_value().to_json_value());
+        let cached_record = crate::PendingRecord { container: record.container.clone(), key: record.key.clone(), value, before: None, version: Vec::new(), acknowledged: false };
+        let Ok(cached_record) = normalize_workspace_record(&cached_record) else { return false };
+        if cached_record.value != normalized.value { return false }
+        match root.get(&record.key) {
+            None => normalized.value.is_none(),
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => {
+                let Some(fields) = normalized.value.as_ref().and_then(|value| value.as_object()) else { return false };
+                fields.keys().all(|field| !matches!(row.get(field), Some(loro::ValueOrContainer::Container(_)))
+                    && row.to_handler().get_last_edit_idlp(field).is_some_and(covers))
+            }
+            _ => false,
+        }
+    };
+    if !covered_row(alias, &local, &alias_version) || !covered_row(canonical, &public, &canonical_version) { return false }
+    if public.value.is_none() { return true } // A proved canonical tombstone is never revived.
+    let (Some(local), Some(public)) = (local.value.as_ref().and_then(|value| value.as_object()), public.value.as_ref().and_then(|value| value.as_object())) else { return false };
+    let observations: &[&str] = match alias.container.as_str() {
+        "chats" => &["createdAt", "harnessSessionId", "harnessSessionCwd", "lastSeenAt", "lastMessageAt", "lastMessagePreview"],
+        "sessions" => &["status", "startedAt", "updatedAt"],
+        "sessionRefs" => &["addedAt"],
+        _ => return false,
+    };
+    if local.keys().chain(public.keys()).any(|field| local.get(field) != public.get(field) && !observations.contains(&field.as_str())) { return false }
+    for clock in if alias.container == "sessions" { &["updatedAt"][..] } else { &["lastSeenAt", "lastMessageAt"][..] } {
+        if let Some(local) = local.get(*clock).and_then(|value| value.as_i64())
+            && !public.get(*clock).and_then(|value| value.as_i64()).is_some_and(|public| public >= local) { return false }
+    }
+    if alias.container == "sessions" && local.get("updatedAt") == public.get("updatedAt")
+        && ["status", "startedAt"].iter().any(|field| local.get(*field) != public.get(*field)) { return false }
+    if alias.container == "chats" && local.get("lastMessageAt") == public.get("lastMessageAt")
+        && local.get("lastMessagePreview") != public.get("lastMessagePreview") { return false }
+    true
 }
 
 /// Everything in the workspace doc, materialized (`read_all`).
@@ -73,7 +222,7 @@ pub struct DeletedSpace {
 
 /// A workspace doc handle: typed access over a LoroDoc with the schema above.
 pub struct WorkspaceDoc {
-    doc: LoroDoc,
+    doc: SharedDocument,
 }
 
 impl Default for WorkspaceDoc {
@@ -86,20 +235,24 @@ impl WorkspaceDoc {
     /// Fresh, empty workspace doc.
     pub fn new() -> Self {
         Self {
-            doc: LoroDoc::new(),
+            doc: SharedDocument::new(LoroDoc::new()),
         }
     }
 
     /// Wrap an existing doc (e.g. imported from a snapshot).
     pub fn from_doc(doc: LoroDoc) -> Self {
-        Self { doc }
+        Self { doc: SharedDocument::new(doc) }
     }
 
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
+    pub fn doc(&self) -> LoroDoc {
+        self.doc.raw()
     }
 
-    /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
+    pub fn binding(&self) -> SharedDocument {
+        self.doc.clone()
+    }
+
+    /// Export full history for CRDT synchronization with an independent peer.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc
             .export(ExportMode::Snapshot)
@@ -110,6 +263,7 @@ impl WorkspaceDoc {
 
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
     pub fn upsert_device(&self, device: &Device) -> Result<(), DocError> {
+        let _operation = self.doc.operation();
         let row = self.row("devices", &device.id)?;
         row.insert("id", device.id.as_str())?;
         row.insert("name", device.name.as_str())?;
@@ -129,17 +283,18 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
         set_opt_str(&row, "version", device.version.as_deref())?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(())
     }
 
     /// LWW rename (settings UI; any device may write). `false` when no such row.
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("devices", device_id) else {
             return Ok(false);
         };
         row.insert("name", name)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -150,11 +305,12 @@ impl WorkspaceDoc {
         device_id: &str,
         at: DateTime<Utc>,
     ) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("devices", device_id) else {
             return Ok(false);
         };
         row.insert("lastSeenAt", at.timestamp_millis())?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -173,6 +329,7 @@ impl WorkspaceDoc {
     /// Upsert a full space row (creation from any device; owner-only fields are
     /// enforced one layer up, in the engine).
     pub fn upsert_space(&self, space: &Space) -> Result<(), DocError> {
+        let _operation = self.doc.operation();
         let row = self.row("spaces", &space.id)?;
         row.insert("id", space.id.as_str())?;
         row.insert("deviceId", space.device_id.as_str())?;
@@ -182,7 +339,7 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "gitCheckedAt", space.git_checked_at)?;
         set_opt_str(&row, "checkoutId", space.checkout_id.as_deref())?;
         row.insert("createdAt", space.created_at.timestamp_millis())?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(())
     }
 
@@ -203,11 +360,12 @@ impl WorkspaceDoc {
     /// LWW display-name set from any device; `None` clears back to the derived
     /// name (basename of path). `false` when no such row.
     pub fn rename_space(&self, space_id: &str, name: Option<&str>) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("spaces", space_id) else {
             return Ok(false);
         };
         set_opt_str(&row, "name", name)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -221,13 +379,14 @@ impl WorkspaceDoc {
         checkout_id: Option<&str>,
         checked_at: DateTime<Utc>,
     ) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("spaces", space_id) else {
             return Ok(false);
         };
         row.insert("gitDetected", detected)?;
         set_opt_str(&row, "checkoutId", checkout_id)?;
         row.insert("gitCheckedAt", checked_at.timestamp_millis())?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -236,6 +395,7 @@ impl WorkspaceDoc {
     /// one commit. Per-chat transcript docs remain (orphaned, accepted).
     /// Returns the removed chat ids so the engine can drop local state.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, DocError> {
+        let _operation = self.doc.operation();
         let spaces = self.doc.get_map("spaces");
         let existed = spaces.get(space_id).is_some();
         let chat_ids: Vec<String> = self
@@ -251,7 +411,7 @@ impl WorkspaceDoc {
             sessions.delete(chat_id)?;
         }
         spaces.delete(space_id)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(DeletedSpace { existed, chat_ids })
     }
 
@@ -259,6 +419,7 @@ impl WorkspaceDoc {
 
     /// Upsert a full chat row (host device, or CreateChat targeting a device).
     pub fn upsert_chat(&self, chat: &Chat) -> Result<(), DocError> {
+        let _operation = self.doc.operation();
         let row = self.row("chats", &chat.id)?;
         row.insert("id", chat.id.as_str())?;
         row.insert("deviceId", chat.device_id.as_str())?;
@@ -278,8 +439,7 @@ impl WorkspaceDoc {
         )?;
         set_opt_ms(&row, "lastMessageAt", chat.last_message_at)?;
         row.insert("createdAt", chat.created_at.timestamp_millis())?;
-        // Preserved on full-row upserts (set_chat_activity/set_chat_host read →
-        // modify → upsert; dropping these here would silently amnesia the chat).
+        // Preserve harness continuation metadata on full-row host updates.
         set_opt_str(&row, "harnessSessionId", chat.harness_session_id.as_deref())?;
         set_opt_str(
             &row,
@@ -292,7 +452,7 @@ impl WorkspaceDoc {
         }
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(())
     }
 
@@ -300,6 +460,7 @@ impl WorkspaceDoc {
     /// stored stamp is already >= `at` (idempotence backstop — the UI also
     /// guards on "currently unseen" before calling). `false` when no such row.
     pub fn set_chat_seen(&self, chat_id: &str, at: DateTime<Utc>) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
@@ -311,7 +472,7 @@ impl WorkspaceDoc {
             return Ok(true);
         }
         row.insert("lastSeenAt", at.timestamp_millis())?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -320,6 +481,7 @@ impl WorkspaceDoc {
     /// monotonic guard, so a later read can stamp seen again. No oplog write
     /// when the row is already unseen. `false` when no such row.
     pub fn set_chat_unread(&self, chat_id: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
@@ -327,7 +489,7 @@ impl WorkspaceDoc {
             return Ok(true);
         }
         row.delete("lastSeenAt")?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -359,12 +521,13 @@ impl WorkspaceDoc {
 
     /// LWW title set from any device. `false` when no such row.
     pub fn rename_chat(&self, chat_id: &str, title: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("title", title)?;
         row.insert("titleSource", "manual")?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -380,6 +543,7 @@ impl WorkspaceDoc {
     }
 
     pub fn set_generated_chat_title(&self, chat_id: &str, title: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
@@ -401,7 +565,7 @@ impl WorkspaceDoc {
             row.insert("title", title)?;
             row.insert("titleSource", "generated")?;
         }
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(replace)
     }
 
@@ -419,6 +583,7 @@ impl WorkspaceDoc {
         archived: bool,
         stage: Option<&WorktreeDeletionStage>,
     ) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
@@ -438,7 +603,7 @@ impl WorkspaceDoc {
         } else if !archived {
             self.doc.get_map("worktreeDeletions").delete(chat_id)?;
         }
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -453,21 +618,24 @@ impl WorkspaceDoc {
     }
 
     pub fn remove_worktree_deletion(&self, chat_id: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
+        require_public_chat_id(chat_id)?;
         let rows = self.doc.get_map("worktreeDeletions");
         let existed = rows.get(chat_id).is_some();
         rows.delete(chat_id)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(existed)
     }
 
     /// Host-side git metadata: the branch checked out at the chat's cwd (HEAD
     /// watcher reconciliation). `false` when no such row.
     pub fn set_chat_branch(&self, chat_id: &str, branch: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("branch", branch)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
     /// Host-side reconciliation with a stale-write guard. Updates only while
@@ -478,13 +646,17 @@ impl WorkspaceDoc {
         expected: Option<&str>,
         branch: &str,
     ) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(chat) = self.chat(chat_id)? else {
             return Ok(false);
         };
         if chat.branch.as_deref() != expected {
             return Ok(false);
         }
-        self.set_chat_branch(chat_id, branch)
+        let Some(row) = self.existing_row("chats", chat_id) else { return Ok(false) };
+        row.insert("branch", branch)?;
+        self.doc.commit()?;
+        Ok(true)
     }
 
     /// Retarget the chat onto another folder — the mid-session "switch to an
@@ -492,42 +664,60 @@ impl WorkspaceDoc {
     /// `false` when no such row. Harness resume is cwd-scoped, so the next
     /// run in the new folder starts a fresh harness conversation by design.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("cwd", cwd)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
     /// Move a chat row to another synced folder. `false` when no such row.
     pub fn set_chat_space(&self, chat_id: &str, space_id: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("spaceId", space_id)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
     /// Host-side checkout identity for the chat's cwd (diff grouping key).
     /// `false` when no such row.
     pub fn set_chat_checkout(&self, chat_id: &str, checkout_id: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("checkoutId", checkout_id)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
     /// LWW config set. `false` when no such row.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("config", LoroValue::from(serde_json::to_value(config)?))?;
-        self.doc.commit();
+        self.doc.commit()?;
+        Ok(true)
+    }
+
+    /// Activity publishers own timestamps, never concurrent user metadata.
+    pub fn set_chat_activity(&self, chat_id: &str, last_message_at: Option<i64>, created_at: Option<i64>) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
+        let Some(row) = self.existing_row("chats",chat_id) else { return Ok(false) };
+        if let Some(ms) = last_message_at {
+            set_opt_ms(&row,"lastMessageAt",DateTime::<Utc>::from_timestamp_millis(ms))?;
+        }
+        if let Some(ms) = created_at && let Some(at) = DateTime::<Utc>::from_timestamp_millis(ms) {
+            row.insert("createdAt",at.timestamp_millis())?;
+        }
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -542,21 +732,23 @@ impl WorkspaceDoc {
         session_id: &str,
         cwd: &str,
     ) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("harnessSessionId", session_id)?;
         row.insert("harnessSessionCwd", cwd)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
     /// Clear a consumed one-shot native fork source. `false` when no chat exists.
     pub fn clear_chat_fork(&self, chat_id: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.delete("forkFrom")?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
 
@@ -568,23 +760,27 @@ impl WorkspaceDoc {
         preview: &str,
         at: DateTime<Utc>,
     ) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("lastMessagePreview", preview)?;
         row.insert("lastMessageAt", at.timestamp_millis())?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(true)
     }
+
 
     /// Tombstone: delete the chat row (and its session-status row). The per-chat
     /// session doc remains — DeleteChat removes the index entry, not the transcript.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
+        require_public_chat_id(chat_id)?;
         let chats = self.doc.get_map("chats");
         let existed = chats.get(chat_id).is_some();
         chats.delete(chat_id)?;
         self.doc.get_map("sessions").delete(chat_id)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(existed)
     }
 
@@ -593,13 +789,14 @@ impl WorkspaceDoc {
     /// Upsert a session-status row (writer discipline: each device writes only its
     /// own runs' rows). Staleness is checked client-side against `updatedAt`.
     pub fn upsert_session(&self, session: &Session) -> Result<(), DocError> {
+        let _operation = self.doc.operation();
         let row = self.row("sessions", &session.chat_id)?;
         row.insert("chatId", session.chat_id.as_str())?;
         row.insert("deviceId", session.device_id.as_str())?;
         row.insert("status", status_str(session.status))?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(())
     }
 
@@ -626,6 +823,8 @@ impl WorkspaceDoc {
         user_id: &str,
         session_ref: &SessionRef,
     ) -> Result<(), DocError> {
+        let _operation = self.doc.operation();
+        require_public_chat_id(&session_ref.chat_id)?;
         let key = session_ref_key(user_id, &session_ref.chat_id);
         let row = self.row("sessionRefs", &key)?;
         row.insert("userId", user_id)?;
@@ -644,7 +843,7 @@ impl WorkspaceDoc {
             }
             None => row.delete("startup")?,
         }
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(())
     }
 
@@ -653,6 +852,7 @@ impl WorkspaceDoc {
         user_id: &str,
         chat_id: &str,
     ) -> Result<Option<SessionRef>, DocError> {
+        require_public_chat_id(chat_id)?;
         let key = session_ref_key(user_id, chat_id);
         let Some(row) = self.existing_row("sessionRefs", &key) else {
             return Ok(None);
@@ -705,11 +905,13 @@ impl WorkspaceDoc {
     /// Remove only one principal's membership pointer. The session room and
     /// any independently owned `chats` row are untouched.
     pub fn remove_session_ref(&self, user_id: &str, chat_id: &str) -> Result<bool, DocError> {
+        let _operation = self.doc.operation();
+        require_public_chat_id(chat_id)?;
         let refs = self.doc.get_map("sessionRefs");
         let key = session_ref_key(user_id, chat_id);
         let existed = refs.get(&key).is_some();
         refs.delete(&key)?;
-        self.doc.commit();
+        self.doc.commit()?;
         Ok(existed)
     }
 
@@ -731,6 +933,7 @@ impl WorkspaceDoc {
     /// Stamp `meta.schemaVersion` when absent or lower (idempotent — steady
     /// state adds nothing to the oplog). Returns the version now in the doc.
     pub fn ensure_schema_version(&self) -> Result<i64, DocError> {
+        let _operation = self.doc.operation();
         let meta = self.doc.get_map("meta");
         let current = match meta.get("schemaVersion") {
             Some(loro::ValueOrContainer::Value(LoroValue::I64(v))) => Some(v),
@@ -740,16 +943,74 @@ impl WorkspaceDoc {
             Some(v) if v >= WORKSPACE_SCHEMA_VERSION => Ok(v),
             _ => {
                 meta.insert("schemaVersion", WORKSPACE_SCHEMA_VERSION)?;
-                self.doc.commit();
+                self.doc.commit()?;
                 Ok(WORKSPACE_SCHEMA_VERSION)
             }
         }
+    }
+
+    /// Repair only self-session UUID aliases in the public index. Existing public
+    /// fields and explicit public tombstones win. Private transcripts and execution
+    /// journals are not part of this doc and are never renamed or discarded.
+    pub fn migrate_execution_rows(&self) -> Result<usize, DocError> {
+        let _operation = self.doc.operation();
+        let mut plans = Vec::new();
+        for container in ["chats", "sessions", "sessionRefs", "worktreeDeletions"] {
+            let parent = self.doc.get_map(container);
+            let serde_json::Value::Object(rows) = parent.get_deep_value().to_json_value() else { continue };
+            for (old_key, value) in rows {
+                let original = crate::PendingRecord { container: container.into(), key: old_key.clone(), before: None, value: Some(value), version: Vec::new(), acknowledged: false };
+                let normalized = normalize_workspace_record(&original)?;
+                if normalized.key == old_key && normalized.value == original.value { continue }
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(source))) = parent.get(&old_key) else { continue };
+                let Some(serde_json::Value::Object(fields)) = normalized.value else { continue };
+                if fields.keys().any(|field| matches!(source.get(field), Some(loro::ValueOrContainer::Container(_)))) { continue }
+                if normalized.key != old_key && let Some(target) = parent.get(&normalized.key) {
+                    let target = normalize_workspace_record(&crate::PendingRecord {
+                        container: container.into(), key: normalized.key.clone(), before: None,
+                        value: Some(target.get_deep_value().to_json_value()), version: Vec::new(), acknowledged: false,
+                    })?;
+                    let target = target.value.as_ref().and_then(|value| value.as_object()).ok_or_else(|| DocError::Schema("Crew alias target is not a workspace record".into()))?;
+                    if WORKSPACE_IDENTITY_FIELDS.iter().any(|field| target.get(*field) != fields.get(*field))
+                        || !workspace_routes_compatible(container, [target, &fields]) {
+                        return Err(DocError::Schema(format!("Crew recovery conflict in {container}/{old_key}; foreign identity retained")));
+                    }
+                }
+                plans.push((container, old_key, normalized.key, fields));
+            }
+        }
+        let migrated = plans.len();
+        for (container, old_key, new_key, fields) in plans {
+            let parent = self.doc.get_map(container);
+            let deleted = parent.get(&new_key).is_none() && parent.get_last_editor(&new_key).is_some();
+            if !deleted {
+                let target = self.row(container, &new_key)?;
+                let newer_status = container == "sessions"
+                    && fields.get("updatedAt").and_then(|at| at.as_i64())
+                        > target.get("updatedAt").and_then(|at| match at {
+                            loro::ValueOrContainer::Value(LoroValue::I64(ms)) => Some(ms), _ => None,
+                        });
+                for (field, value) in fields {
+                    if (old_key == new_key && field == if container == "chats" { "id" } else { "chatId" })
+                        || (newer_status && matches!(field.as_str(), "status" | "startedAt" | "updatedAt"))
+                        || (target.get(&field).is_none() && target.get_last_editor(&field).is_none()) {
+                        target.insert(&field, LoroValue::from(value))?;
+                    }
+                }
+            }
+            if old_key != new_key { parent.delete(&old_key)?; }
+        }
+        if migrated != 0 { self.doc.commit()?; }
+        Ok(migrated)
     }
 
     // ── row plumbing ────────────────────────────────────────────────────────
 
     /// The row map for `key`, creating it when absent.
     fn row(&self, container: &str, key: &str) -> Result<LoroMap, DocError> {
+        if matches!(container, "chats" | "sessions" | "worktreeDeletions") {
+            require_public_chat_id(key)?;
+        }
         let parent = self.doc.get_map(container);
         match parent.get(key) {
             Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Ok(map),
@@ -759,8 +1020,21 @@ impl WorkspaceDoc {
 
     /// The row map for `key`, or `None` when the row doesn't exist.
     fn existing_row(&self, container: &str, key: &str) -> Option<LoroMap> {
+        if matches!(container, "chats" | "sessions" | "worktreeDeletions")
+            && key.contains("::session::")
+        {
+            return None;
+        }
         match self.doc.get_map(container).get(key) {
-            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Some(map),
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => {
+                let identity = if container == "chats" { "id" } else { "chatId" };
+                if matches!(container, "chats" | "sessions" | "worktreeDeletions")
+                    && matches!(map.get(identity), Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.contains("::session::"))
+                {
+                    return None;
+                }
+                Some(map)
+            }
             _ => None,
         }
     }
@@ -777,6 +1051,14 @@ impl WorkspaceDoc {
         };
         let mut out = Vec::with_capacity(rows.len());
         for (key, row) in rows {
+            // Imported legacy execution rows remain private until safely migrated.
+            if matches!(container, "chats" | "sessions" | "sessionRefs" | "worktreeDeletions")
+                && ((container != "sessionRefs" && key.contains("::session::"))
+                    || row.get("id").and_then(|id| id.as_str()).is_some_and(|id| id.contains("::session::"))
+                    || row.get("chatId").and_then(|id| id.as_str()).is_some_and(|id| id.contains("::session::")))
+            {
+                continue;
+            }
             match serde_json::from_value::<T>(row) {
                 Ok(parsed) => out.push(parsed),
                 Err(err) => {
@@ -791,7 +1073,8 @@ impl WorkspaceDoc {
 fn set_opt_str(row: &LoroMap, key: &str, value: Option<&str>) -> Result<(), DocError> {
     match value {
         Some(v) => row.insert(key, v)?,
-        None => row.delete(key)?,
+        None if row.get(key).is_some() => row.delete(key)?,
+        None => {},
     }
     Ok(())
 }
@@ -799,7 +1082,8 @@ fn set_opt_str(row: &LoroMap, key: &str, value: Option<&str>) -> Result<(), DocE
 fn set_opt_ms(row: &LoroMap, key: &str, value: Option<DateTime<Utc>>) -> Result<(), DocError> {
     match value {
         Some(at) => row.insert(key, at.timestamp_millis())?,
-        None => row.delete(key)?,
+        None if row.get(key).is_some() => row.delete(key)?,
+        None => {},
     }
     Ok(())
 }
@@ -1016,6 +1300,131 @@ impl From<RawSessionRef> for SessionRef {
 mod tests {
     use super::*;
     use comet_proto::{HarnessId, SandboxLevel};
+
+    const PUBLIC_CHAT: &str = "018eeb58-6508-78e8-a544-44682ab94c50";
+
+    fn insert_legacy_row(ws: &WorkspaceDoc, container: &str, key: &str, fields: serde_json::Value) {
+        let row = ws.doc().get_map(container).insert_container(key, LoroMap::new()).unwrap();
+        for (field, value) in fields.as_object().unwrap() {
+            row.insert(field, LoroValue::from(value.clone())).unwrap();
+        }
+        ws.doc().commit();
+    }
+
+    #[test]
+    fn execution_keys_cannot_enter_public_workspace_rows() {
+        let ws = WorkspaceDoc::new();
+        let private = format!("{PUBLIC_CHAT}::session::{PUBLIC_CHAT}");
+        let before = ws.doc().oplog_vv();
+        assert!(ws.upsert_chat(&chat(&private, "dev-a")).is_err());
+        assert!(ws.upsert_session(&session(&private, "dev-a", SessionStatus::Working)).is_err());
+        assert!(ws.upsert_session_ref("owner-a", &session_ref(&private, 1)).is_err());
+        assert_eq!(ws.doc().oplog_vv(), before);
+        assert_eq!(execution_chat_id(&private), Some(PUBLIC_CHAT));
+        assert_eq!(execution_chat_id(&format!("{PUBLIC_CHAT}::session::other")), None);
+        assert_eq!(execution_chat_id("chat-a::session::chat-a"), None);
+        assert_eq!(execution_chat_id(&format!("{private}::session::{PUBLIC_CHAT}")), Some(PUBLIC_CHAT));
+        assert_eq!(execution_chat_id(&format!("{private}::session::018eeb58-6508-78e8-a544-44682ab94c51")), None);
+        assert_eq!(execution_chat_id(&format!("{PUBLIC_CHAT}::session::018eeb58-6508-78e8-a544-44682ab94c51::session::{PUBLIC_CHAT}")), None);
+        assert_eq!(execution_chat_id(&format!("{private}::session::")), None);
+        let owner = "owner::session::member";
+        ws.upsert_session_ref(owner, &session_ref(PUBLIC_CHAT, 1)).unwrap();
+        assert_eq!(ws.read_session_refs_for(owner).unwrap()[0].chat_id, PUBLIC_CHAT);
+    }
+
+    #[test]
+    fn polluted_rows_migrate_without_overwriting_public_metadata() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_chat(&chat(PUBLIC_CHAT, "dev-a")).unwrap();
+        ws.rename_chat(PUBLIC_CHAT, "Public title").unwrap();
+        ws.upsert_session(&session(PUBLIC_CHAT, "dev-a", SessionStatus::Idle)).unwrap();
+        let private = format!("{PUBLIC_CHAT}::session::{PUBLIC_CHAT}");
+        let mut fields = ws.doc().get_map("chats").get_deep_value().to_json_value()[PUBLIC_CHAT].clone();
+        fields["id"] = private.clone().into();
+        fields["title"] = "Stale private title".into();
+        fields["harnessSessionId"] = "native-session".into();
+        fields["generatedTitle"] = "Generated title".into();
+        insert_legacy_row(&ws, "chats", &private, fields);
+        let mut public = ws.chat(PUBLIC_CHAT).unwrap().unwrap();
+        public.cwd = None;
+        ws.upsert_chat(&public).unwrap();
+        insert_legacy_row(&ws, "sessions", &private, serde_json::json!({
+            "chatId": private, "deviceId": "dev-a", "status": "working", "updatedAt": 4_000,
+        }));
+        insert_legacy_row(&ws, "sessionRefs", &session_ref_key("owner-a", &private), serde_json::json!({
+            "chatId": private, "userId": "owner-a", "addedAt": 1_000,
+        }));
+        insert_legacy_row(&ws, "worktreeDeletions", &private, serde_json::json!({
+            "chatId": private, "path": "/tmp/worktree", "ownerSubject": "owner-a",
+            "ownerDeviceId": "dev-a", "deleteAfter": 9_000,
+        }));
+        let b = WorkspaceDoc::from_doc({
+            let doc = LoroDoc::new();
+            doc.import(&ws.export_snapshot().unwrap()).unwrap();
+            doc
+        });
+        // Pollution is never visible while awaiting migration.
+        assert_eq!(b.read_chats().unwrap(), ws.read_chats().unwrap());
+        assert!(b.read_session_refs().unwrap().is_empty());
+        assert_eq!(ws.migrate_execution_rows().unwrap(), 4);
+        cross_sync(&ws, &b);
+        assert_eq!(ws.read_all().unwrap(), b.read_all().unwrap());
+        let public = b.chat(PUBLIC_CHAT).unwrap().unwrap();
+        assert_eq!(public.title.as_deref(), Some("Public title"));
+        assert_eq!(public.cwd, None);
+        assert_eq!(public.harness_session_id.as_deref(), Some("native-session"));
+        assert_eq!(b.generated_chat_title(PUBLIC_CHAT).as_deref(), Some("Generated title"));
+        assert_eq!(b.read_sessions().unwrap()[0].status, SessionStatus::Working);
+        assert_eq!(b.session_ref("owner-a", PUBLIC_CHAT).unwrap().unwrap().chat_id, PUBLIC_CHAT);
+        assert_eq!(b.read_worktree_deletions().unwrap()[0].chat_id, PUBLIC_CHAT);
+        assert!(b.doc().get_map("chats").get(&private).is_none());
+        let before = b.doc().oplog_vv();
+        assert_eq!(b.migrate_execution_rows().unwrap(), 0);
+        assert_eq!(b.doc().oplog_vv(), before);
+    }
+
+    #[test]
+    fn migration_respects_public_tombstones_and_private_execution_state() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_chat(&chat(PUBLIC_CHAT, "dev-a")).unwrap();
+        let mut fields = ws.doc().get_map("chats").get_deep_value().to_json_value()[PUBLIC_CHAT].clone();
+        let private = format!("{PUBLIC_CHAT}::session::{PUBLIC_CHAT}");
+        fields["id"] = private.clone().into();
+        insert_legacy_row(&ws, "chats", &private, fields);
+        ws.doc().get_map("privateExecutionState").insert(&private, "journal-pointer").unwrap();
+        ws.delete_chat(PUBLIC_CHAT).unwrap();
+        assert_eq!(ws.migrate_execution_rows().unwrap(), 1);
+        assert!(ws.chat(PUBLIC_CHAT).unwrap().is_none());
+        assert!(ws.doc().get_map("privateExecutionState").get(&private).is_some());
+    }
+
+    #[test]
+    fn mixed_alias_rows_migrate_but_foreign_targets_remain_untouched() {
+        let ws = WorkspaceDoc::new();
+        let alias = format!("{PUBLIC_CHAT}::session::{PUBLIC_CHAT}::session::{PUBLIC_CHAT}");
+        insert_legacy_row(&ws, "chats", &alias, serde_json::json!({"id": PUBLIC_CHAT, "deviceId": "owner", "title": "kept"}));
+        assert_eq!(ws.migrate_execution_rows().unwrap(), 1);
+        assert_eq!(ws.doc().get_map("chats").get_deep_value().to_json_value()[PUBLIC_CHAT]["title"], "kept");
+        insert_legacy_row(&ws, "chats", &alias, serde_json::json!({"id": alias, "deviceId": "foreign", "title": "blocked"}));
+        let before = ws.export_snapshot().unwrap();
+        assert!(ws.migrate_execution_rows().is_err());
+        assert_eq!(ws.export_snapshot().unwrap(), before);
+        let mixed = crate::PendingRecord { container: "chats".into(), key: PUBLIC_CHAT.into(),
+            before: Some(serde_json::json!({"id": PUBLIC_CHAT, "deviceId": "owner"})),
+            value: Some(serde_json::json!({"id": alias, "deviceId": "owner"})), version: Vec::new(), acknowledged: false };
+        assert_eq!(normalize_workspace_record(&mixed).unwrap().value.unwrap()["id"], PUBLIC_CHAT);
+        let member = crate::PendingRecord { container: "sessionRefs".into(), key: session_ref_key("owner", &alias),
+            before: Some(serde_json::json!({"chatId": alias, "userId": "owner"})),
+            value: Some(serde_json::json!({"chatId": PUBLIC_CHAT, "userId": "foreign"})), version: Vec::new(), acknowledged: false };
+        assert!(normalize_workspace_record(&member).is_err());
+        let mut enriched = member;
+        enriched.value = Some(serde_json::json!({"chatId": PUBLIC_CHAT, "userId": "owner", "environment": {"ownerPrincipal": "session-owner", "scope": {"projectId": "project", "deploymentId": "deployment"}}}));
+        let normalized = normalize_workspace_record(&enriched).unwrap();
+        assert_eq!(normalized.value.as_ref().unwrap()["environment"]["scope"]["deploymentId"], "deployment");
+        enriched.before = normalized.value.clone();
+        enriched.value.as_mut().unwrap()["environment"]["ownerPrincipal"] = "foreign".into();
+        assert!(normalize_workspace_record(&enriched).is_err());
+    }
 
     fn ts(ms: i64) -> DateTime<Utc> {
         dt(ms)
@@ -1649,5 +2058,29 @@ mod tests {
         ));
         // Everything else on the row survived the conflict.
         assert_eq!(a.chat("chat-1").unwrap().unwrap().device_id, "dev-a");
+    }
+    #[test]
+    fn persisted_offline_edits_merge_after_reload() {
+        let reload = |workspace: &WorkspaceDoc| {
+            let doc = LoroDoc::new();
+            doc.import(&workspace.export_snapshot().unwrap()).unwrap();
+            WorkspaceDoc::from_doc(doc)
+        };
+        let a = WorkspaceDoc::new();
+        a.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        let b = reload(&a);
+
+        // Each replica persists a different offline frontier before reconnecting.
+        a.rename_chat("chat-1", "from-a").unwrap();
+        b.set_chat_archived("chat-1", true).unwrap();
+        let a = reload(&a);
+        let b = reload(&b);
+        cross_sync(&a, &b);
+
+        for workspace in [&a, &b] {
+            let chat = workspace.chat("chat-1").unwrap().unwrap();
+            assert_eq!(chat.title.as_deref(), Some("from-a"));
+            assert!(chat.archived);
+        }
     }
 }

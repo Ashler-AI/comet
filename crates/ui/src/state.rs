@@ -29,7 +29,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use comet_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionEntryWindow, SessionMessageEntry,
+    MessagePart, MessageRole, SessionEntryWindow, SessionMessageEntry,
     TranscriptDesync, TranscriptFrame,
 };
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
@@ -41,6 +41,208 @@ use comet_proto::{
     SessionEnvironment, SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
 };
 use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RetainedSend {
+    pub prompt: String,
+    pub message_id: String,
+    pub params: serde_json::Value,
+    pub accepted: bool,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default)]
+    pub terminal: bool,
+    #[serde(default)]
+    pub failure: Option<String>,
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+impl AppState {
+    pub(crate) fn send_journal_path(&self, chat_id: &str) -> Result<Option<PathBuf>, String> {
+        use base64::Engine as _;
+        let Some(data_dir) = &self.data_dir else { return Ok(None) };
+        let user = self.auth_user().ok_or("Sign in before recovering Crew sends")?;
+        let Some(AuthState::SignedIn { project_scope, .. }) = self.auth.as_ref() else { return Err("Crew project scope unavailable".into()) };
+        let projection = self.transcript_room_projection(chat_id);
+        let scope = serde_json::to_vec(&(project_scope, &user.id, &self.local_device_id, &self.scaffold_scope, projection, chat_id)).map_err(|error| error.to_string())?;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(scope);
+        let mut path = data_dir.join("composer-sends");
+        for chunk in encoded.as_bytes().chunks(120) { path.push(std::str::from_utf8(chunk).expect("base64 is ASCII")); }
+        Ok(Some(path.join("sends.json")))
+    }
+
+    pub(crate) fn retained_send_owner_matches(&self, chat_id: &str, send: &RetainedSend) -> bool {
+        let Some(original) = send.params["targetDeviceId"].as_str() else { return true };
+        let current = if send.params["command"]["kind"] == "control" {
+            let session_id = send.params["command"]["sessionId"].as_str();
+            self.collaboration.as_ref().and_then(|snapshot| snapshot.sessions.iter()
+                .find(|session| Some(session.session_id.as_str()) == session_id && session.chat_id == chat_id))
+                .map(|session| session.owner_device_id.as_str())
+        } else {
+            self.chats.iter().find(|chat| chat.id == chat_id).map(|chat| chat.device_id.as_str())
+        };
+        // Missing browse metadata cannot refresh authority; the original RPC
+        // still validates its exact host/grant before any new admission.
+        current.is_none_or(|device| device == original)
+    }
+
+}
+
+// ponytail: serialize small composer journals; shard by path if write contention matters.
+static SEND_JOURNAL_WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+impl RetainedSend {
+    pub(crate) fn is_message(&self) -> bool {
+        matches!(self.params["command"]["kind"].as_str(), Some("run" | "steer" | "queue"))
+            || matches!(self.params["command"]["action"]["action"].as_str(), Some("start" | "steer" | "queue"))
+    }
+
+    pub(crate) fn matches_control(&self, params: &serde_json::Value) -> bool {
+        let original = &self.params;
+        let command = &original["command"];
+        let candidate = &params["command"];
+        if original["chatId"] != params["chatId"] || original["roomProjection"] != params["roomProjection"]
+            || command["kind"] != candidate["kind"] || command["sessionId"] != candidate["sessionId"]
+            || command["source"] != candidate["source"] { return false }
+        if command["kind"] == "control" {
+            let action = &command["action"];
+            let requested = &candidate["action"];
+            if action["action"] == "respondInput" {
+                action["action"] == requested["action"] && action["request_id"] == requested["request_id"]
+            } else { action == requested }
+        } else if command["kind"] == "respondInput" {
+            command["requestId"] == candidate["requestId"]
+        } else { command == candidate }
+    }
+
+    pub(crate) fn load_input_outcome(path: Option<PathBuf>, prompt: &str, params: &serde_json::Value) -> Result<Option<Self>, String> {
+        let Some(path) = path else { return Ok(None) };
+        let Some(key) = input_outcome_key(params) else { return Ok(None) };
+        let Some(mut index) = input_outcome_path(&path, &key) else { return Ok(None) };
+        // Recover accepted inputs written before indexes included the session.
+        let scoped = index.exists();
+        if !scoped { if let Some(legacy) = input_outcome_path(&path, prompt) { index = legacy; } }
+        if std::fs::metadata(&index).map(|metadata| metadata.len() > 36).unwrap_or(false) { return Err("Crew input outcome index exceeds its byte limit".into()); }
+        let id = match std::fs::read_to_string(index) {
+            Ok(id) => id,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        if uuid::Uuid::parse_str(&id).is_err() { return Err("Crew input outcome identity conflicts; original retained".into()); }
+        let outcome = path.with_file_name(format!("{id}.outcome"));
+        if std::fs::metadata(&outcome).map_err(|error| error.to_string())?.len() > 8 * 1024 * 1024 { return Err("Crew input outcome exceeds its byte limit".into()); }
+        let send: Self = serde_json::from_slice(&std::fs::read(outcome).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        if send.message_id != id || !send.accepted { return Err("Crew input outcome payload conflicts; original retained".into()); }
+        if !send.matches_control(params) {
+            return if scoped { Err("Crew input outcome target conflicts; original retained".into()) } else { Ok(None) };
+        }
+        Ok(Some(send))
+    }
+    pub(crate) fn load(path: Option<PathBuf>, chat_id: &str) -> Result<Vec<Self>, String> {
+        let Some(path) = path else { return Ok(Vec::new()) };
+        if std::fs::metadata(&path).map(|metadata| metadata.len() > 8 * 1024 * 1024).unwrap_or(false) {
+            return Err("Crew send journal exceeds its safe byte limit; original retained".into());
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("Crew send journal is retained but unreadable: {error}")),
+        };
+        let mut sends: Vec<RetainedSend> = serde_json::from_slice(&bytes).map_err(|error| format!("Crew send journal is retained but invalid: {error}"))?;
+        if sends.len() > 16 || sends.iter().any(|send| send.params["chatId"].as_str() != Some(chat_id)
+            || uuid::Uuid::parse_str(&send.message_id).is_err()
+            || send.params["commandId"].as_str().is_none_or(|id| uuid::Uuid::parse_str(id).is_err())) {
+            return Err("Crew retained send journal has conflicting identity or exceeds its record limit".into());
+        }
+        for send in &mut sends {
+            let outcome = path.with_file_name(format!("{}.outcome", send.message_id));
+            if outcome.exists() {
+                if std::fs::metadata(&outcome).map_err(|error| error.to_string())?.len() > 8 * 1024 * 1024 {
+                    return Err("Crew retained outcome exceeds its byte limit".into());
+                }
+                let completed: RetainedSend = serde_json::from_slice(&std::fs::read(outcome).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+                if completed.params != send.params || completed.message_id != send.message_id || !(completed.accepted || completed.cancelled) { return Err("Crew retained admission outcome conflicts; original retained".into()); }
+                send.accepted = completed.accepted;
+                send.applied = completed.applied;
+                send.terminal = completed.terminal || completed.applied;
+                send.failure = completed.failure;
+                send.cancelled = completed.cancelled;
+            }
+        }
+        sends.retain(|send| !send.cancelled);
+        Ok(sends)
+    }
+
+    pub(crate) fn save(path: Option<PathBuf>, chat_id: &str, mut send: Self) -> Result<(), String> {
+        let Some(path) = path else { return Ok(()) };
+        let _write = SEND_JOURNAL_WRITE.lock();
+        send.terminal |= send.applied;
+        let mut sends = Self::load(Some(path.clone()), chat_id)?;
+        if let Some(existing) = sends.iter_mut().find(|record| record.message_id == send.message_id) {
+            if existing.params != send.params || existing.prompt != send.prompt { return Err("Crew send identity conflict; original retained".into()); }
+            existing.accepted |= send.accepted;
+            existing.applied |= send.applied;
+            send.accepted = existing.accepted;
+            send.applied = existing.applied;
+            existing.terminal |= send.terminal;
+            send.terminal = existing.terminal;
+            if existing.failure.is_some() { send.failure = existing.failure.clone(); }
+            existing.cancelled |= send.cancelled;
+        } else if !send.terminal && !send.cancelled {
+            if sends.iter().filter(|record| !record.terminal).count() >= 16 { return Err("Crew retains 16 unresolved sends; resolve them before sending another".into()); }
+        }
+        if send.accepted || send.cancelled {
+            let outcome = path.with_file_name(format!("{}.outcome", send.message_id));
+            if outcome.exists() {
+                if std::fs::metadata(&outcome).map_err(|error| error.to_string())?.len() > 8 * 1024 * 1024 { return Err("Crew retained outcome exceeds its byte limit".into()); }
+                let existing: Self = serde_json::from_slice(&std::fs::read(&outcome).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+                if existing.params != send.params || existing.prompt != send.prompt { return Err("Crew retained outcome identity conflicts; original retained".into()); }
+                if existing.accepted && send.cancelled { return Err("Crew cannot cancel an already admitted instruction".into()); }
+                send.applied |= existing.applied;
+                send.accepted |= existing.accepted;
+                send.terminal |= existing.terminal || existing.applied;
+                if existing.failure.is_some() { send.failure = existing.failure; }
+            }
+            write_send_journal(&outcome, &serde_json::to_vec(&send).map_err(|error| error.to_string())?)?;
+            if send.accepted { if let Some(key) = input_outcome_key(&send.params) && let Some(index) = input_outcome_path(&path, &key) { write_send_journal(&index, send.message_id.as_bytes())?; } }
+        }
+        if !send.terminal && !send.cancelled && !sends.iter().any(|existing| existing.message_id == send.message_id) {
+            sends.push(send);
+        }
+        sends.retain(|send| !send.terminal && !send.cancelled);
+        let bytes = serde_json::to_vec(&sends).map_err(|error| error.to_string())?;
+        write_send_journal(&path, &bytes)
+    }
+}
+fn input_outcome_key(params: &serde_json::Value) -> Option<String> {
+    let command = &params["command"];
+    let request = if command["kind"] == "respondInput" { &command["requestId"] }
+        else if command["kind"] == "control" && command["action"]["action"] == "respondInput" { &command["action"]["request_id"] }
+        else { return None };
+    Some(format!("Respond to Crew input {}", serde_json::json!([
+        params["chatId"], params["roomProjection"], command["sessionId"], command["source"], request
+    ])))
+}
+
+
+fn input_outcome_path(path: &std::path::Path, prompt: &str) -> Option<PathBuf> {
+    use base64::Engine as _;
+    if !prompt.starts_with("Respond to Crew input ") { return None }
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(prompt);
+    let mut index = path.parent()?.join("inputs");
+    for chunk in encoded.as_bytes().chunks(120) { index.push(std::str::from_utf8(chunk).expect("base64 is ASCII")); }
+    Some(index.join("command-id"))
+}
+
+fn write_send_journal(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > 8 * 1024 * 1024 { return Err("Crew send journal exceeds its safe byte limit; original retained".into()); }
+    std::fs::create_dir_all(path.parent().expect("journal parent")).map_err(|error| error.to_string())?;
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp).map_err(|error| error.to_string())?;
+    use std::io::Write as _;
+    file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|error| error.to_string())?;
+    std::fs::rename(tmp, path).map_err(|error| error.to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveHarnessGoal {
@@ -429,31 +631,6 @@ fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<(String, St
     Some((entry.id.clone(), preview))
 }
 
-fn agent_indicator_with_transcript(
-    session: Option<&comet_proto::AgentSessionRecord>,
-    transcript: &[SessionMessageEntry],
-    now: DateTime<Utc>,
-) -> Indicator {
-    let indicator = effective_agent_indicator(session, now);
-    let Some(session) = session else {
-        return indicator;
-    };
-    let run_started_at = session.updated_at.unwrap_or(session.created_at);
-    let latest_run_entry = transcript.iter().rev().find(|entry| {
-        entry.role == MessageRole::Assistant
-            && entry.device_id == session.owner_device_id
-            && entry.created_at >= run_started_at
-    });
-    match latest_run_entry.and_then(|entry| entry.status) {
-        Some(MessageStatus::Streaming) => Indicator::Working,
-        Some(MessageStatus::Complete | MessageStatus::Aborted)
-            if indicator == Indicator::Working =>
-        {
-            Indicator::None
-        }
-        _ => indicator,
-    }
-}
 
 pub(crate) fn session_ref_fallback(chat_id: &str) -> String {
     format!("Session {}", chat_id.chars().take(8).collect::<String>())
@@ -655,6 +832,40 @@ fn scaffold_session_attachment(
     })
 }
 
+#[derive(Debug)]
+pub(crate) enum ScaffoldReconnectError {
+    Terminal(ScaffoldLifecycle),
+    InvalidAttachment(RpcError),
+    ProviderUnavailable(RpcError),
+}
+
+impl std::fmt::Display for ScaffoldReconnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminal(lifecycle) => {
+                write!(formatter, "Scaffold sandbox is terminal ({lifecycle:?})")
+            }
+            Self::InvalidAttachment(error) | Self::ProviderUnavailable(error) => {
+                error.fmt(formatter)
+            }
+        }
+    }
+}
+
+fn scaffold_reconnect_control_error(error: RpcError) -> ScaffoldReconnectError {
+    // ponytail: RpcError has no stable provider/validation code. Crew's own
+    // "returned" checks are invariants; add wire error codes if more cases appear.
+    if matches!(
+        &error,
+        RpcError::Failed(message)
+            if message.starts_with("Scaffold ") && message.contains(" returned ")
+    ) {
+        ScaffoldReconnectError::InvalidAttachment(error)
+    } else {
+        ScaffoldReconnectError::ProviderUnavailable(error)
+    }
+}
+
 // Existing-session reconnects retry transient control failures for up to ten minutes.
 const SCAFFOLD_CONTROL_MAX_ATTEMPTS: usize = 1_200;
 #[cfg(not(test))]
@@ -695,8 +906,11 @@ async fn ensure_scaffold_session_attached_once(
     handle: &EngineHandle,
     sandbox_id: &str,
     scope: &CollaborationScope,
-) -> Result<ScaffoldSessionAttachment, RpcError> {
-    match inspect_scaffold_session(handle, sandbox_id, scope).await? {
+) -> Result<ScaffoldSessionAttachment, ScaffoldReconnectError> {
+    match inspect_scaffold_session(handle, sandbox_id, scope)
+        .await
+        .map_err(scaffold_reconnect_control_error)?
+    {
         ScaffoldLifecycle::Paused => {
             let value = handle
                 .client()
@@ -708,13 +922,16 @@ async fn ensure_scaffold_session_attached_once(
                     })
                     .unwrap_or_default(),
                 )
-                .await?;
+                .await
+                .map_err(scaffold_reconnect_control_error)?;
             let resumed: ScaffoldEnvironmentControlResult =
-                serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
+                serde_json::from_value(value).map_err(|err| {
+                    scaffold_reconnect_control_error(RpcError::Failed(err.to_string()))
+                })?;
             if resumed.environment.scope != *scope {
-                return Err(RpcError::Failed(
+                return Err(scaffold_reconnect_control_error(RpcError::Failed(
                     "Scaffold resume returned a different sandbox scope".into(),
-                ));
+                )));
             }
             let SessionEnvironmentSource::Scaffold {
                 sandbox_id: resumed_id,
@@ -722,28 +939,24 @@ async fn ensure_scaffold_session_attached_once(
                 ..
             } = resumed.environment.source
             else {
-                return Err(RpcError::Failed(
+                return Err(scaffold_reconnect_control_error(RpcError::Failed(
                     "Scaffold resume returned a local environment".into(),
-                ));
+                )));
             };
             if resumed_id != sandbox_id {
-                return Err(RpcError::Failed(
+                return Err(scaffold_reconnect_control_error(RpcError::Failed(
                     "Scaffold resume returned a different sandbox scope".into(),
-                ));
+                )));
             }
             if matches!(
                 lifecycle,
                 ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed
             ) {
-                return Err(RpcError::Failed(format!(
-                    "Scaffold resume returned terminal lifecycle {lifecycle:?}"
-                )));
+                return Err(ScaffoldReconnectError::Terminal(lifecycle));
             }
         }
-        ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed => {
-            return Err(RpcError::Failed(
-                "Scaffold session is no longer resumable".into(),
-            ));
+        lifecycle @ (ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed) => {
+            return Err(ScaffoldReconnectError::Terminal(lifecycle));
         }
         ScaffoldLifecycle::Creating
         | ScaffoldLifecycle::RestoringSnapshot
@@ -752,7 +965,9 @@ async fn ensure_scaffold_session_attached_once(
         | ScaffoldLifecycle::AgentRunning
         | ScaffoldLifecycle::Resuming => {}
     }
-    attach_scaffold_session(handle, sandbox_id, scope.clone()).await
+    attach_scaffold_session(handle, sandbox_id, scope.clone())
+        .await
+        .map_err(scaffold_reconnect_control_error)
 }
 
 /// Reconnect an existing Scaffold room with bounded automatic recovery for
@@ -762,16 +977,25 @@ pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
     sandbox_id: &str,
     scope: &CollaborationScope,
     wait: &Wait,
-) -> Result<ScaffoldSessionAttachment, RpcError>
+) -> Result<ScaffoldSessionAttachment, ScaffoldReconnectError>
 where
     Wait: Fn(std::time::Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
 {
-    retry_scaffold_control_operation(
-        || ensure_scaffold_session_attached_once(handle, sandbox_id, scope),
-        wait,
-    )
-    .await
+    let mut attempt = 1;
+    loop {
+        match ensure_scaffold_session_attached_once(handle, sandbox_id, scope).await {
+            Ok(attachment) => return Ok(attachment),
+            Err(ScaffoldReconnectError::ProviderUnavailable(error))
+                if attempt < SCAFFOLD_CONTROL_MAX_ATTEMPTS
+                    && comet_engine::scaffold::is_retryable_scaffold_control_error(&error) =>
+            {
+                attempt += 1;
+                wait(SCAFFOLD_CONTROL_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 async fn update_scaffold_session_agent_route_once(
     handle: &EngineHandle,
@@ -2133,7 +2357,7 @@ impl AppState {
 
     pub fn agent_indicator_for(&self, session_id: &str, now: DateTime<Utc>) -> Indicator {
         let selected_chat = self.selected_chat.as_deref();
-        agent_indicator_with_transcript(
+        effective_agent_indicator(
             self.collaboration
                 .as_ref()
                 .and_then(|snapshot| {
@@ -2143,7 +2367,6 @@ impl AppState {
                         .find(|session| session.session_id == session_id)
                 })
                 .filter(|session| Some(session.chat_id.as_str()) == selected_chat),
-            &self.transcript,
             now,
         )
     }
@@ -2477,7 +2700,7 @@ impl AppState {
         {
             ChatIndicator::Working
         } else {
-            display_status(chat, self.session_for(&chat.id), now)
+            comet_proto::view::display_indicator(chat, self.indicator_for(&chat.id, now))
         }
     }
 
@@ -2510,9 +2733,28 @@ impl AppState {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
 
+    fn owner_activity_for(&self, chat_id: &str, now: DateTime<Utc>) -> Option<&comet_proto::AgentSessionRecord> {
+        if self.selected_chat.as_deref() != Some(chat_id) { return None; }
+        let records = &self.collaboration.as_ref()?.sessions;
+        let canonical = records.iter().find(|record| record.session_id == chat_id && record.chat_id == chat_id)?;
+        let owner = comet_proto::view::owner_thread_activity(records, canonical, now.timestamp_millis())?;
+        if let Some(index) = self.session_for(chat_id) {
+            // A slower workspace/watch cannot mask this owner's newer room
+            // state. Neither another device nor an old active row may revive it.
+            if owner.owner_device_id != index.device_id
+                || owner.updated_at.unwrap_or(owner.created_at) <= index.updated_at.timestamp_millis() {
+                return None;
+            }
+        }
+        Some(owner)
+    }
+
     /// Staleness-checked status dot for a chat row.
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
-        effective_indicator(self.session_for(chat_id), now)
+        match self.owner_activity_for(chat_id, now) {
+            Some(owner) => effective_agent_indicator(Some(owner), now),
+            None => effective_indicator(self.session_for(chat_id), now),
+        }
     }
 
     pub fn selected_chat_row(&self) -> Option<&Chat> {
@@ -3920,6 +4162,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn input_outcome_index_migration_preserves_original_session_and_rejects_conflicts() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("sends.json");
+        let prompt = "Respond to Crew input request";
+        let mut send = RetainedSend {
+            prompt:prompt.into(), message_id:uuid::Uuid::new_v4().to_string(), accepted:true, applied:true, terminal:true, failure:None, cancelled:false,
+            params:serde_json::json!({"chatId":"chat", "commandId":uuid::Uuid::new_v4().to_string(), "command":{
+                "kind":"control", "sessionId":"agent-a", "source":"local", "action":{"action":"respondInput", "request_id":"request", "answers":[]}
+            }}),
+        };
+        RetainedSend::save(Some(path.clone()), "chat", send.clone()).unwrap();
+        let scoped_index = input_outcome_path(&path, &input_outcome_key(&send.params).unwrap()).unwrap();
+        std::fs::remove_file(&scoped_index).unwrap();
+        // A real pre-cutover index only knew the human prompt.
+        write_send_journal(&input_outcome_path(&path, prompt).unwrap(), send.message_id.as_bytes()).unwrap();
+        assert_eq!(RetainedSend::load_input_outcome(Some(path.clone()), prompt, &send.params).unwrap().unwrap().params, send.params);
+        let mut other = send.params.clone(); other["command"]["sessionId"] = "agent-b".into();
+        assert!(RetainedSend::load_input_outcome(Some(path.clone()), prompt, &other).unwrap().is_none());
+        RetainedSend::save(Some(path.clone()), "chat", send.clone()).unwrap();
+        // Scoped indexes must fail closed, not silently mint a replacement ID.
+        send.params = other; send.message_id = uuid::Uuid::new_v4().to_string(); send.params["commandId"] = uuid::Uuid::new_v4().to_string().into();
+        RetainedSend::save(Some(path.clone()), "chat", send.clone()).unwrap();
+        write_send_journal(&scoped_index, send.message_id.as_bytes()).unwrap();
+        let mut original = send.params; original["command"]["sessionId"] = "agent-a".into();
+        assert!(RetainedSend::load_input_outcome(Some(path), prompt, &original).err().unwrap().contains("target conflicts"));
+    }
+
+    #[test]
     fn omp_recovery_transitions_clear_busy_and_do_not_reactivate_resolved_errors() {
         let mut state = AppState::new();
         let snapshot = |phase, error| {
@@ -4432,6 +4701,46 @@ mod tests {
                 ]
             );
         });
+    }
+
+    #[tokio::test]
+    async fn scaffold_reconnect_preserves_terminal_lifecycle() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
+            operations: Arc::clone(&operations),
+            attach_failures_remaining: AtomicU16::new(0),
+            inspect_lifecycle: "stopped",
+            archive_fails: false,
+            update_route_failures_remaining: AtomicU16::new(0),
+        });
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service),
+                url: "memory://terminal-scaffold".into(),
+            }),
+        };
+        let scope = CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some("session-terminal".into()),
+            unknown: Default::default(),
+        };
+        let no_wait = |_| futures::future::ready(());
+
+        let error = ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ScaffoldReconnectError::Terminal(ScaffoldLifecycle::Stopped)
+        ));
+        assert_eq!(
+            operations
+                .lock()
+                .expect("Scaffold operation log")
+                .as_slice(),
+            ["inspect"]
+        );
     }
 
     #[tokio::test]
@@ -5296,9 +5605,9 @@ mod tests {
         // Fresh working session shows.
         let fresh = session("c", SessionStatus::Working, 10, now);
         assert_eq!(effective_indicator(Some(&fresh), now), Indicator::Working);
-        // Stale working session is suppressed — crashed backend, not eternal spinner.
+        // Expired active owners are unreachable, never successful completions.
         let stale = session("c", SessionStatus::Working, 46, now);
-        assert_eq!(effective_indicator(Some(&stale), now), Indicator::None);
+        assert_eq!(effective_indicator(Some(&stale), now), Indicator::Unreachable);
         // Exactly at the boundary still shows (strictly-older-than semantics).
         let edge = session("c", SessionStatus::Working, 45, now);
         assert_eq!(effective_indicator(Some(&edge), now), Indicator::Working);
@@ -5318,48 +5627,51 @@ mod tests {
         let stale = agent_session("c", SessionStatus::Working, 46, now);
         assert_eq!(
             effective_agent_indicator(Some(&stale), now),
-            Indicator::None
+            Indicator::Unreachable
         );
         let awaiting = agent_session("c", SessionStatus::AwaitingInput, 5, now);
         assert_eq!(
             effective_agent_indicator(Some(&awaiting), now),
             Indicator::AwaitingInput
         );
-        let mut streaming = transcript_entry("streaming");
-        streaming.status = Some(MessageStatus::Streaming);
-        streaming.device_id = stale.owner_device_id.clone();
-        streaming.created_at = now.timestamp_millis();
-        assert_eq!(
-            agent_indicator_with_transcript(Some(&stale), &[streaming], now),
-            Indicator::Working,
-            "live transcript activity must keep a long-running remote turn visible"
-        );
-        let idle = agent_session("c", SessionStatus::Idle, 0, now);
-        assert_eq!(
-            agent_indicator_with_transcript(Some(&idle), &[], now),
-            Indicator::None,
-            "the owner's terminal publication must clear the remote working state"
-        );
-        let fresh_working = agent_session("c", SessionStatus::Working, 5, now);
-        let mut completed = transcript_entry("completed");
-        completed.status = Some(MessageStatus::Complete);
-        completed.device_id = fresh_working.owner_device_id.clone();
-        completed.created_at = now.timestamp_millis();
-        assert_eq!(
-            agent_indicator_with_transcript(
-                Some(&fresh_working),
-                std::slice::from_ref(&completed),
-                now,
-            ),
-            Indicator::None,
-            "a completed owner transcript must bridge older owners that lack terminal publications"
-        );
-        completed.created_at = fresh_working.updated_at.unwrap() - 1;
-        assert_eq!(
-            agent_indicator_with_transcript(Some(&fresh_working), &[completed], now),
-            Indicator::Working,
-            "a completed prior turn must not hide the next turn before its first frame"
-        );
+    }
+
+    #[test]
+    fn owner_room_activity_outweighs_an_older_workspace_status() {
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let mut state = AppState::default();
+        state.selected_chat = Some("c".into());
+        state.apply_sessions(vec![session("c", SessionStatus::Working, 60, now)]);
+        let mut owner = agent_session("c", SessionStatus::Working, 5, now);
+        owner.session_id = "c".into();
+        owner.owner_device_id = "dev".into();
+        owner.source = AgentSessionSource::Local;
+        let publish = |state: &mut AppState, owner: &AgentSessionRecord| {
+            state.apply_collaboration(serde_json::from_value(serde_json::json!({
+                "schemaVersion": 2, "sessions": [owner],
+            })).unwrap());
+        };
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::Working);
+        assert_eq!(state.display_status_for(&chat("c", 0, None), now), ChatIndicator::Working);
+
+        // A newer terminal outcome wins over an older active room snapshot.
+        state.apply_sessions(vec![session("c", SessionStatus::Idle, 1, now)]);
+        assert_eq!(state.indicator_for("c", now), Indicator::None);
+        owner.status = Some(SessionStatus::AwaitingInput);
+        owner.updated_at = Some(now.timestamp_millis());
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::AwaitingInput);
+
+        // Another device's publication cannot refresh this owner's clock.
+        owner.owner_device_id = "other".into();
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::None);
+        owner.owner_device_id = "dev".into();
+        owner.updated_at = Some((now - TimeDelta::seconds(46)).timestamp_millis());
+        state.apply_sessions(vec![session("c", SessionStatus::Working, 60, now)]);
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::Unreachable);
     }
 
     #[test]
@@ -5379,13 +5691,13 @@ mod tests {
         let awaiting_stale = session("c", SessionStatus::AwaitingInput, 300, now);
         assert_eq!(
             effective_indicator(Some(&awaiting_stale), now),
-            Indicator::None
+            Indicator::Unreachable
         );
     }
 
     #[test]
     fn display_status_derivation() {
-        let now = Utc::now();
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
         let mut c = chat("c", 0, Some(10));
         // Live states win regardless of seen.
         let working = session("c", SessionStatus::Working, 5, now);
@@ -5406,15 +5718,18 @@ mod tests {
             display_status(&c, Some(&idle), now),
             ChatIndicator::Completed
         );
-        // Stale working session falls back to the seen check.
+        // Stale activity is unreachable, regardless of unseen/seen state.
         let stale = session("c", SessionStatus::Working, 300, now);
         assert_eq!(
             display_status(&c, Some(&stale), now),
-            ChatIndicator::Completed
+            ChatIndicator::Unreachable
         );
         // Seen after the last message = Idle.
         c.last_seen_at = c.last_message_at.map(|t| t + TimeDelta::minutes(1));
         assert_eq!(display_status(&c, Some(&idle), now), ChatIndicator::Idle);
+        assert_eq!(display_status(&c, Some(&stale), now), ChatIndicator::Unreachable);
+        let stale_input = session("c", SessionStatus::AwaitingInput, 300, now);
+        assert_eq!(display_status(&c, Some(&stale_input), now), ChatIndicator::Unreachable);
         // Errored + unseen = Errored; seen clears it to Idle.
         let errored = session("c", SessionStatus::Errored, 600, now);
         assert_eq!(display_status(&c, Some(&errored), now), ChatIndicator::Idle);

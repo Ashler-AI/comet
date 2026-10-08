@@ -11,9 +11,10 @@ members = [
     "crates/ui",
     "apps/comet",
 ]
+exclude = ["vendor/loro-internal", "vendor/loro-kv-store"]
 
 [workspace.package]
-version = "0.1.123"
+version = "0.1.144"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -100,6 +101,12 @@ ignore = "0.4"
 # Apache-licensed `tracing` crate rather than linking Zed's GPL wrapper crates.
 [patch."https://github.com/wingleeio/zed"]
 ztracing = { path = "vendor/ztracing" }
+
+# Pinned 1.13.9 source; normal snapshot flush must not re-decode live arena text.
+[patch.crates-io]
+loro-internal = { path = "vendor/loro-internal" }
+# Preserve proven compression fallbacks when reusing unchanged snapshot blocks.
+loro-kv-store = { path = "vendor/loro-kv-store" }
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

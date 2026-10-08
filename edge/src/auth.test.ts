@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   authenticateScaffold,
+  authenticateScaffoldResult,
   credentialTransportAllowed,
   verifyScaffoldToken,
   type ScaffoldAuthEnv
@@ -14,7 +15,10 @@ const env = {
   SCAFFOLD_REQUIRED_CAPABILITIES: "session.read session.chat session.control session.annotate session.invite session.files session.environment"
 } satisfies ScaffoldAuthEnv;
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 describe("credential transport", () => {
   it("allows secure remote and explicit loopback origins only", () => {
     expect(credentialTransportAllowed("https://comet.example/session/x")).toBe(true);
@@ -96,6 +100,56 @@ describe("Scaffold bearer validation", () => {
       ],
       credential: "scaffold"
     });
+  });
+
+  it("retries a transient callback failure once", async () => {
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new TypeError("network failure"))
+      .mockResolvedValueOnce(
+        Response.json({
+          ok: true,
+          resource: env.SCAFFOLD_CONTROL_PLANE_URL,
+          actor: { sub: "developer@ashler.ai", auth: "iap" },
+          scopes: [
+            "remote_code:create",
+            "remote_code:read",
+            "remote_code:write",
+            "remote_code:exec",
+            "remote_code:lifecycle"
+          ]
+        })
+      );
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(verifyScaffoldToken(env, "sc_rc_test")).resolves.toMatchObject({
+      userId: "developer@ashler.ai",
+      credential: "scaffold"
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns unavailable after both callback attempts time out", async () => {
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((delay) => {
+      expect(delay).toBe(2_918);
+      const controller = new AbortController();
+      controller.abort(new DOMException("timed out", "TimeoutError"));
+      return controller.signal;
+    });
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      init?.signal?.throwIfAborted();
+      return new Response(null, { status: 401 });
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(
+      authenticateScaffoldResult(
+        env,
+        new Request("https://comet.example/session/session-1", {
+          headers: { authorization: "Bearer sc_rc_test" }
+        })
+      )
+    ).resolves.toEqual({ status: "unavailable" });
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("keeps a read-only bearer least-privileged and rejects it when full capabilities are required", async () => {

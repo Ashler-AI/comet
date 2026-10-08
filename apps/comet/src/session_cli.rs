@@ -43,6 +43,12 @@ pub enum SessionCommand {
         /// Database environment: local, staging_snapshot, or production_snapshot.
         #[arg(long, default_value = "local", value_parser = parse_database_environment)]
         database_environment: comet_proto::ScaffoldDatabaseEnvironment,
+        /// Recover this accepted Crew chat instead of creating another target.
+        #[arg(long, value_name = "CHAT_ID", requires = "recover_sandbox_id")]
+        recover_chat_id: Option<String>,
+        /// Existing sandbox paired with --recover-chat-id; never falls back to creation.
+        #[arg(long, value_name = "SANDBOX_ID", requires = "recover_chat_id")]
+        recover_sandbox_id: Option<String>,
     },
     /// Send a message to another session.
     Send {
@@ -92,6 +98,8 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
             chat_id,
             prompt_file,
             database_environment,
+            recover_chat_id,
+            recover_sandbox_id,
         } => {
             let params = comet_rpc::HandoffSessionToScaffoldParams {
                 source_chat_id: current_session_id(chat_id)?,
@@ -99,13 +107,8 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
                 database_environment,
             };
             let client = connect_engine(ipc_port).await?;
-            let receipt: comet_rpc::HandoffSessionToScaffoldResult = client
-                .call_as(
-                    comet_rpc::methods::HANDOFF_SESSION_TO_SCAFFOLD,
-                    serde_json::to_value(params)?,
-                )
-                .await
-                .map_err(handoff_error)?;
+            let receipt =
+                call_handoff(&client, params, recover_chat_id, recover_sandbox_id).await?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             return Ok(());
         }
@@ -306,18 +309,49 @@ fn read_handoff_prompt(path: &Path) -> anyhow::Result<String> {
     Ok(prompt)
 }
 
-fn handoff_error(error: comet_rpc::RpcError) -> anyhow::Error {
+async fn call_handoff(
+    client: &comet_rpc::RpcClient,
+    params: comet_rpc::HandoffSessionToScaffoldParams,
+    recover_chat_id: Option<String>,
+    recover_sandbox_id: Option<String>,
+) -> anyhow::Result<comet_rpc::HandoffSessionToScaffoldResult> {
+    let (method, params) = match (recover_chat_id, recover_sandbox_id) {
+        (None, None) => (
+            comet_rpc::methods::HANDOFF_SESSION_TO_SCAFFOLD,
+            serde_json::to_value(params)?,
+        ),
+        (Some(chat_id), Some(sandbox_id)) => (
+            comet_rpc::methods::RECOVER_SESSION_HANDOFF_TO_SCAFFOLD,
+            serde_json::to_value(comet_rpc::RecoverSessionHandoffToScaffoldParams {
+                handoff: params,
+                recover_chat_id: chat_id,
+                recover_sandbox_id: sandbox_id,
+            })?,
+        ),
+        _ => {
+            return Err(anyhow!(
+                "recovery requires both --recover-chat-id and --recover-sandbox-id"
+            ));
+        }
+    };
+    client
+        .call_as(method, params)
+        .await
+        .map_err(|error| handoff_error(error, method))
+}
+
+fn handoff_error(error: comet_rpc::RpcError, method: &str) -> anyhow::Error {
     // The wire protocol transmits server errors as strings, including UnknownMethod.
     let unknown_method = matches!(&error, comet_rpc::RpcError::UnknownMethod(_))
         || matches!(&error, comet_rpc::RpcError::Failed(message)
-            if message.strip_prefix("unknown method: ") == Some(comet_rpc::methods::HANDOFF_SESSION_TO_SCAFFOLD));
+            if message.strip_prefix("unknown method: ") == Some(method));
     if unknown_method {
         anyhow!(
-            "the running Crew engine does not support native Scaffold handoff; update the engine to match this comet binary ({error})"
+            "the running Crew engine does not support this native Scaffold handoff/recovery command; update and restart the engine to match this Crew CLI ({error}). No target was created by this command"
         )
     } else {
         anyhow!(error).context(
-            "native Scaffold handoff failed; it was not retried automatically. Check Crew for a created remote session before retrying",
+            "native Scaffold handoff/recovery failed; it was not retried automatically. Inspect the preserved target in Crew; recovery never falls back to creation",
         )
     }
 }
@@ -347,6 +381,55 @@ fn print_json(value: &serde_json::Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{MAX_HANDOFF_PROMPT_BYTES, read_handoff_prompt, resolve_session_id};
+
+    #[tokio::test]
+    async fn recovery_old_engine_rejects_at_rpc_boundary_without_creation_fallback() {
+        let (out, mut requests) = tokio::sync::mpsc::channel(4);
+        let (responses, inbound) = tokio::sync::mpsc::channel(4);
+        let client = comet_rpc::RpcClient::new(out, inbound);
+        let server = tokio::spawn(async move {
+            let request: comet_rpc::ClientFrame =
+                serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+            assert_eq!(
+                request.method.as_deref(),
+                Some(comet_rpc::methods::RECOVER_SESSION_HANDOFF_TO_SCAFFOLD)
+            );
+            responses
+                .send(
+                    serde_json::to_string(&comet_rpc::ServerFrame {
+                        id: request.id,
+                        err: Some(format!(
+                            "unknown method: {}",
+                            comet_rpc::methods::RECOVER_SESSION_HANDOFF_TO_SCAFFOLD
+                        )),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), requests.recv())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = super::call_handoff(
+            &client,
+            comet_rpc::HandoffSessionToScaffoldParams {
+                source_chat_id: "source-chat".into(),
+                prompt: "Continue".into(),
+                database_environment: comet_proto::ScaffoldDatabaseEnvironment::Local,
+            },
+            Some("target-chat".into()),
+            Some("sandbox-a".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("update and restart"));
+        assert!(error.to_string().contains("recovery"));
+        server.await.unwrap();
+    }
 
     #[test]
     fn explicit_source_wins_over_environment_context() {
