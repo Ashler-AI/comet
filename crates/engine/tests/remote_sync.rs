@@ -435,7 +435,7 @@ fn rejected(status: u16, reason: &str) -> ErrorResponse {
         .expect("error response")
 }
 
-async fn start_relay() -> (String, Arc<LocalRoomRelay>, tokio::task::JoinHandle<()>) {
+async fn start_relay(deployment: Option<&'static str>) -> (String, Arc<LocalRoomRelay>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
     let url = format!("http://{}", listener.local_addr().expect("relay address"));
     let relay = LocalRoomRelay::new();
@@ -457,8 +457,11 @@ async fn start_relay() -> (String, Arc<LocalRoomRelay>, tokio::task::JoinHandle<
                         if query_parameter(&uri, "token") != Some(TEST_BEARER) {
                             return Err(rejected(401, "unauthenticated"));
                         }
-                        if query_parameter(&uri, "deploymentId") != Some(DEPLOYMENT) {
+                        if query_parameter(&uri, "deploymentId") != deployment {
                             return Err(rejected(403, "deployment mismatch"));
+                        }
+                        if query_parameter(&uri, "syncProtocol") != Some(comet_proto::DURABLE_SYNC_PROTOCOL) {
+                            return Err(rejected(426, "Crew update required for durable sync"));
                         }
                         let Some(device_id) = query_parameter(&uri, "device").map(str::to_string)
                         else {
@@ -591,12 +594,11 @@ fn registry() -> Arc<HarnessRegistry> {
     Arc::new(registry)
 }
 
-fn assemble_remote(dir: &std::path::Path, device_id: &str, edge_url: &str) -> EngineCore {
+fn assemble_remote(dir: &std::path::Path, device_id: &str, edge_url: &str, deployment: Option<&str>) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create engine directory");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    let edge = EdgeConfig::with_static_token(edge_url, TEST_BEARER)
-        .with_device(device_id)
-        .with_deployment(DEPLOYMENT);
+    let mut edge = EdgeConfig::with_static_token(edge_url, TEST_BEARER).with_device(device_id);
+    if let Some(deployment) = deployment { edge = edge.with_deployment(deployment); }
     EngineCore::assemble_with_identity(
         dir,
         registry(),
@@ -643,10 +645,10 @@ fn entry_contains(entry: &comet_doc::SessionMessageEntry, text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill() {
-    let (edge_url, relay, relay_task) = start_relay().await;
+    let (edge_url, relay, relay_task) = start_relay(None).await;
     let dirs = tempfile::tempdir().expect("tempdir");
-    let a = assemble_remote(&dirs.path().join("a"), "device-a", &edge_url);
-    let b = assemble_remote(&dirs.path().join("b"), "device-b", &edge_url);
+    let a = assemble_remote(&dirs.path().join("a"), "device-a", &edge_url, None);
+    let b = assemble_remote(&dirs.path().join("b"), "device-b", &edge_url, None);
 
     wait_for(
         || a.workspace.connected() && b.workspace.connected(),
@@ -675,15 +677,15 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
         .create_space("space-a", "device-a", "/tmp", None, false)
         .expect("create shared space");
     a.workspace
-        .create_chat("chat-shared", "space-a", None, None)
+        .create_chat("00000000-0000-4000-8000-000000000101", "space-a", None, None)
         .expect("create shared chat");
     a.workspace
-        .set_chat_harness_session("chat-shared", "native-session", "/tmp");
+        .set_chat_harness_session("00000000-0000-4000-8000-000000000101", "native-session", "/tmp");
     wait_for(
         || {
             b.workspace
                 .doc()
-                .chat("chat-shared")
+                .chat("00000000-0000-4000-8000-000000000101")
                 .ok()
                 .flatten()
                 .is_some_and(|chat| {
@@ -695,8 +697,8 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
     )
     .await;
 
-    let handle_a = a.doc_host.open("chat-shared").expect("open A chat");
-    let handle_b = b.doc_host.open("chat-shared").expect("open B chat");
+    let handle_a = a.doc_host.open("00000000-0000-4000-8000-000000000101").expect("open A chat");
+    let handle_b = b.doc_host.open("00000000-0000-4000-8000-000000000101").expect("open B chat");
     let mut messages_b = handle_b.watch_messages();
     wait_for(
         || handle_a.connected() && handle_b.connected(),
@@ -706,7 +708,7 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
 
     a.doc_host
         .queue_command(
-            "chat-shared",
+            "00000000-0000-4000-8000-000000000101",
             SessionCommandPayload::Run {
                 request: run_request("prompt from A"),
                 message_id: "user-1".into(),
@@ -748,13 +750,13 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
     );
 
     b.workspace
-        .rename_chat("chat-shared", "renamed by device B")
+        .rename_chat("00000000-0000-4000-8000-000000000101", "renamed by device B")
         .expect("B renames shared chat");
     wait_for(
         || {
             a.workspace
                 .doc()
-                .chat("chat-shared")
+                .chat("00000000-0000-4000-8000-000000000101")
                 .ok()
                 .flatten()
                 .and_then(|chat| chat.title)
@@ -778,13 +780,13 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
         .write_user_message("user-during-reconnect", "missed live broadcast", 2_000)
         .expect("write while B disconnected");
     a.workspace
-        .set_chat_archived("chat-shared", true)
+        .set_chat_archived("00000000-0000-4000-8000-000000000101", true)
         .expect("archive while B disconnected");
     let session_version = handle_a.doc().doc().oplog_vv();
     let workspace_version = a.workspace.doc().doc().oplog_vv();
     wait_for(
         || {
-            relay.room_includes("chat-shared", &session_version)
+            relay.room_includes("00000000-0000-4000-8000-000000000101", &session_version)
                 && relay.room_includes(&format!("ws4/{PROJECT}"), &workspace_version)
         },
         "relay to persist A's disconnected-window updates",
@@ -825,7 +827,7 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
         || {
             b.workspace
                 .doc()
-                .chat("chat-shared")
+                .chat("00000000-0000-4000-8000-000000000101")
                 .ok()
                 .flatten()
                 .is_some_and(|chat| chat.archived)
@@ -841,9 +843,9 @@ async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scaffold_host_joins_project_workspace_and_publishes_status() {
-    let (edge_url, _, relay_task) = start_relay().await;
+    let (edge_url, _, relay_task) = start_relay(Some(DEPLOYMENT)).await;
     let dirs = tempfile::tempdir().unwrap();
-    let controller = assemble_remote(&dirs.path().join("controller"), "controller", &edge_url);
+    let controller = assemble_remote(&dirs.path().join("controller"), "controller", &edge_url, Some(DEPLOYMENT));
     std::fs::create_dir_all(dirs.path().join("sandbox")).unwrap();
     std::fs::write(dirs.path().join("sandbox/device-id"), "sandbox").unwrap();
     let sandbox = EngineCore::assemble_with_identity(

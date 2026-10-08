@@ -13,43 +13,24 @@ export const MSG_INLINE_MAX = 256 * 1024;
 
 /** Shallow-compaction retention: the DO re-exports a shallow snapshot at the
  * `now − RETAIN_DAYS` frontier when the update log grows past
- * {@link COMPACT_LOG_BYTES}. Trimmed op history is discarded permanently;
- * state is fully preserved. A peer offline longer than this re-syncs fresh and
- * re-submits its unacked entries at the app layer (idempotent by entry id).
+ * {@link COMPACT_LOG_BYTES}. Current state is preserved while superseded op
+ * history is discarded. A peer offline beyond this boundary re-syncs current
+ * state; session entries remain idempotent by entry id, workspace state remains
+ * locally persisted, and transcripts live in independent session documents.
  *
- * 30 days proved fatal in practice (2026-08-04): the ws3-era rooms were ~12
- * days old, so no frontier checkpoint was ever past retention and HISTORY
- * TRIM had never run ANYWHERE — every doc carried full op history from birth.
- * A high-churn workspace room (6 devices flipping session rows all day) plus
- * a dozen chat docs co-materialized in one isolate's loro-wasm heap (which
- * only ever grows) hit the DO memory limit, poisoning every byte-exporting
- * wasm call and silently wedging joins fleet-wide. Presence/status rows do
- * not need weeks of op history; 3 days keeps materialized docs small while a
- * briefly-offline device still diff-syncs. */
+ * 30 days proved fatal in practice (2026-08-04): rooms were ~12 days old, so
+ * no frontier checkpoint was past retention and every doc carried full history
+ * from birth. A high-churn workspace room plus chat docs co-materialized in one
+ * isolate exhausted the shared loro-wasm heap. Three days bounds materialized
+ * history while allowing briefly-offline devices to diff-sync.
+ */
 export const RETAIN_DAYS = 3;
 
-/** Update-log size that triggers a compaction pass in the session DO.
- *
- * Cold-start cost (`ensureDoc` after a hibernation or a CPU-limit reset)
- * replays the snapshot plus every logged update, so this cap is really a
- * cold-start budget. 8 MiB was too generous for a high-churn room like the
- * per-user workspace doc (3 devices writing device/session rows continuously):
- * the log grew large enough that a cold replay exceeded the DO's per-invocation
- * CPU limit, the runtime reset the DO, every client reconnected into another
- * cold start, and the memory-only presence store was wiped each time — so
- * devices flapped permanently offline. 2 MiB keeps the replay cheap. */
-export const COMPACT_LOG_BYTES = 2 * 1024 * 1024;
-
-/** Update-log ROW count that also triggers a compaction pass. Cold-start cost
- * scales with the NUMBER of `doc.import()` calls (one WASM boundary crossing
- * each), not just their total bytes — a workspace room accumulates thousands
- * of tiny row/presence-adjacent updates well under {@link COMPACT_LOG_BYTES}.
- * Fold on row count too so many-small-updates can't blow the cold-start
- * budget the byte cap alone would miss. 1500 proved too generous: a per-user
- * workspace room wedged its cold replay at ~1400 rows (Jul 2026), under the
- * trigger — folding is cheap while the doc is hot (one snapshot export), so
- * fold early and keep cold replays trivially affordable. */
-export const COMPACT_LOG_ROWS = 400;
+/** Bound the durable delta tail, not retained history. Lossless warm folds keep
+ * a restarted room at one lazy baseline plus at most 31 tiny deltas. The former
+ * 400-row gate missed a measured 343-row, 31-second workspace replay. */
+export const COMPACT_LOG_BYTES = 256 * 1024;
+export const COMPACT_LOG_ROWS = 32;
 
 /** Soft ceiling: past this much doc state the UI nudges toward a fresh
  * session. No enforcement machinery — a product stance, not a limit. */
@@ -58,11 +39,6 @@ export const SOFT_CEILING_BYTES = 25 * 1024 * 1024;
 /** Host stream batching: token/part deltas are committed to the doc on this
  * cadence while a run is streaming (single-peer appends RLE-merge in Loro). */
 export const STREAM_COMMIT_MS = 120;
-
-/** DO durability batching during active streams: buffered updates are flushed
- * to SQLite on this cadence. A crash losing the buffer is healed by normal
- * CRDT resync from the host on reconnect. */
-export const DO_FLUSH_MS = 5_000;
 
 /** Mobile doc LRU budget — bytes of resident doc *state*, not doc count.
  * Eviction drops the Mirror + doc; state stays on disk. */

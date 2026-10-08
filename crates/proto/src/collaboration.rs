@@ -760,6 +760,9 @@ pub struct AgentSessionRecord {
     pub harness_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<crate::SessionStatus>,
+    /// Start of the most recent turn; unchanged by heartbeats and input resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_retry: Option<crate::ModelRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1162,6 +1165,10 @@ mod tests {
                 "routingMode": "automatic",
             })
         );
+        let sol = AgentRoute::from_omp_model("openai-codex/gpt-6.1-sol").unwrap();
+        assert_eq!(sol.provider, AgentProvider::OpenAi);
+        assert_eq!(sol.model, "gpt-6.1-sol");
+        assert_eq!(sol.omp_model(), "openai-codex/gpt-6.1-sol");
 
         let pinned = AgentRoute::pinned(
             AgentProvider::Anthropic,

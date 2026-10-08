@@ -17,7 +17,7 @@ let failures = 0;
 const check = (n, c, d = "") => { console.log(`${c ? "PASS" : "FAIL"}  ${n}${d ? " — " + d : ""}`); if (!c) failures++; };
 
 // 1. First device joins and writes a bunch of rows.
-const c1 = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}` });
+const c1 = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}&syncProtocol=durable-records-v1` });
 await c1.waitConnected();
 const a1 = new LoroAdaptor();
 await c1.join({ roomId: room, crdtAdaptor: a1 });
@@ -30,7 +30,7 @@ const s0 = await stats();
 check("log has rows before reset", s0.updateRows > 0, `updateRows=${s0.updateRows}`);
 
 // 2. Reset the log.
-const res = await fetch(`${base}/workspace/${projectScope}/reset-log`, {
+const res = await fetch(`${base}/workspace/${projectScope}/reset-log?syncProtocol=durable-records-v1`, {
   method: "POST",
   headers: { authorization: `Bearer ${token}` }
 });
@@ -47,7 +47,7 @@ check("log cleared after reset", s1.updateRows === 0, `updateRows=${s1.updateRow
 //    re-uploads; the loro-websocket lib used here doesn't, so this asserts the
 //    harness-independent property: the empty room accepts joins + writes.)
 await sleep(400);
-const c2 = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}` });
+const c2 = new LoroWebsocketClient({ url: `${wsBase}/workspace/${projectScope}/ws?token=${token}&syncProtocol=durable-records-v1` });
 await c2.waitConnected();
 const a2 = new LoroAdaptor();
 await c2.join({ roomId: room, crdtAdaptor: a2 });

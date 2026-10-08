@@ -295,8 +295,8 @@ async fn target_device_id_routes_over_the_relay() {
         }
     }
 
-    // QueueCommand ignores caller-carried targetDeviceId. The workspace
-    // owner is A, so this stays local; only an actual remote owner selects the
+    // A stale explicit destination must fail closed, not reroute a command.
+    // The workspace owner is A, so only an actual remote owner selects the
     // separately authenticated peer-command admission path.
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
@@ -324,12 +324,16 @@ async fn target_device_id_routes_over_the_relay() {
             .set_chat_archived("chat-remote", true)
             .expect("archive chat on A")
     );
+    let rejected = client.call(methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId": "chat-remote", "targetDeviceId": "device-b", "command": command,
+    })).await.expect_err("stale destination must not admit a command");
+    assert!(matches!(rejected, comet_rpc::RpcError::Failed(code) if code == "command_destination_changed"));
     let queued = client
         .call(
             methods::QUEUE_COMMAND,
             serde_json::json!({
                 "chatId": "chat-remote",
-                "targetDeviceId": "device-b",
+                "targetDeviceId": "device-a",
                 "command": command,
             }),
         )

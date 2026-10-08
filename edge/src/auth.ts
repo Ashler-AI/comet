@@ -106,6 +106,10 @@ export const bearerFromRequest = (request: Request): string | undefined => {
   return url.searchParams.get("token")?.trim() || undefined;
 };
 
+// ponytail: the exact callback stall is unknown; 2,918 ms is the retained
+// successful-launch p50, so two attempts leave 9,164 ms of the 15-second budget.
+const SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS = 2_918;
+
 const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): Promise<ScaffoldAuthenticationResult> => {
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
@@ -113,14 +117,19 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): P
   const required = requiredCapabilities(env);
   if (!resource || !projectScope || required.length === 0) return { status: "unavailable" };
 
-  let response: Response;
-  try {
-    response = await fetch(`${resource}/api/code-sandboxes/auth/session`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" }
-    });
-  } catch {
-    return { status: "unavailable" };
+  let response: Response | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetch(`${resource}/api/code-sandboxes/auth/session`, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+        signal: AbortSignal.timeout(SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS)
+      });
+      if (response.status !== 408 && response.status !== 429 && response.status < 500) break;
+    } catch {
+      response = undefined;
+    }
   }
+  if (!response) return { status: "unavailable" };
   // Only an explicit credential rejection is authoritative. Network errors,
   // other HTTP failures and malformed authority responses must not revoke state.
   if (response.status === 401 || response.status === 403) return { status: "invalid" };

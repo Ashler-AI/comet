@@ -132,9 +132,14 @@ jobs:
           echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
 
+  sync-reliability:
+    if: ${{ inputs.candidate_run_id == '' }}
+    needs: version
+    uses: ./.github/workflows/sync-reliability.yml
+
   linux:
     if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
-    needs: version
+    needs: [version, sync-reliability]
     strategy:
       fail-fast: false
       matrix:
@@ -182,7 +187,7 @@ jobs:
 
   macos:
     if: ${{ inputs.candidate_run_id == '' }}
-    needs: version
+    needs: [version, sync-reliability]
     runs-on: macos-14
     env:
       COMET_RELEASE_VERSION: ${{ needs.version.outputs.version }}
@@ -256,6 +261,8 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Verify room catch-up and corruption recovery
+        run: cargo test --locked -p comet-sync --lib
       - name: Verify desktop session and attachment behavior
         run: cargo test --locked -p comet-ui --lib
       - name: Verify production and staging updater identities

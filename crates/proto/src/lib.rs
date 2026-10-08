@@ -4,6 +4,9 @@
 //! Token-usage *display* types are excluded by design; the `Usage` agent event is kept as a
 //! harness-level passthrough (rate-limit meters), never persisted into docs.
 
+/// Writable room sync and relay compatibility declaration; independent of authority.
+pub const DURABLE_SYNC_PROTOCOL: &str = "durable-records-v1";
+
 pub mod agent;
 pub mod collaboration;
 pub mod entities;

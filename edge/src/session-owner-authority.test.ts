@@ -3,15 +3,16 @@ import {
   AUTH_PROJECT_HEADER,
   AUTH_USER_HEADER,
   SESSION_OWNER_AUTH_HEADER,
+  DURABLE_SYNC_PROTOCOL,
   stripTrustedAuthHeaders
 } from "./env";
 import { SessionRoom, sessionOwnerForConnection } from "./session-room";
 
-const roomWithMeta = (values: Record<string, string>): SessionRoom => {
+const roomWithMeta = (values: Record<string, string>, sockets: WebSocket[] = []): SessionRoom => {
   const room = Object.create(SessionRoom.prototype) as SessionRoom;
   Object.defineProperty(room, "ctx", {
     value: {
-      getWebSockets: () => [],
+      getWebSockets: () => sockets,
       storage: {
         sql: {
           exec: (query: string, key: string) => {
@@ -58,12 +59,34 @@ describe("session owner authority", () => {
       roomWithMeta({
         projectScope: "project-a",
         ownerUserId: "owner@example.com",
-        hostDeviceId: "owner-device"
+        hostDeviceId: "owner-device",
+        hostDeviceOwnerUserId: "owner@example.com",
+        hostDeviceSyncProtocol: DURABLE_SYNC_PROTOCOL
       }),
       "owner@example.com"
     );
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ownsSession: true, deviceId: "owner-device" });
+  });
+
+  it("retains legacy ownership without granting device relay authority", async () => {
+    const response = await ownerCheck(roomWithMeta({
+      projectScope: "project-a", ownerUserId: "owner@example.com",
+      hostDeviceId: "legacy-device", hostDeviceOwnerUserId: "owner@example.com"
+    }), "owner@example.com");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ownsSession: true });
+  });
+
+  it.each([undefined, false])("does not infer device authority from a legacy socket (%s)", async (durableSync) => {
+    const socket = { deserializeAttachment: () => ({
+      userId: "owner@example.com", projectScope: "project-a", capabilities: ["session.read", "session.control"],
+      deviceId: "legacy-device", rooms: ["%LOR"], durableSync
+    }) } as unknown as WebSocket;
+    const response = await ownerCheck(roomWithMeta({
+      projectScope: "project-a", ownerUserId: "owner@example.com"
+    }, [socket]), "owner@example.com");
+    expect(await response.json()).toEqual({ ownsSession: true });
   });
 
   it("denies an alternate authenticated user", async () => {

@@ -37,6 +37,7 @@ struct CometApp: App {
                         model.flushDocs()
                     } else if phase == .active {
                         model.notifications.refresh()
+                        Task { await model.refreshSync() }
                     }
                 }
         }

@@ -25,7 +25,8 @@ mod server;
 pub use client::{RpcClient, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, GRANT_KIND, GrantHandler, GrantResetHandler, HostRelay,
-    HostRelayConfig, LinkCache, LinkCacheConfig, NudgeHandler, StaticToken, TokenSource,
+    HostRelayConfig, LinkCache, LinkCacheConfig, NUDGE_ACK_KIND, Nudge, NudgeHandler, StaticToken,
+    TokenSource,
     decode_device_frame, device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
@@ -58,6 +59,8 @@ pub mod methods {
     pub const FORK_SESSION: &str = "ForkSession";
     /// Transfer native context to Scaffold and queue its initial remote command.
     pub const HANDOFF_SESSION_TO_SCAFFOLD: &str = "HandoffSessionToScaffold";
+    /// Recover only an explicitly accepted native handoff target; never create.
+    pub const RECOVER_SESSION_HANDOFF_TO_SCAFFOLD: &str = "RecoverSessionHandoffToScaffold";
     /// Create and attach a Scaffold environment, transferring native session context.
     pub const PREPARE_SCAFFOLD_SESSION: &str = "PrepareScaffoldSession";
     /// Retain an interrupted preparation without changing newer attempts or admission.
@@ -102,6 +105,9 @@ pub mod methods {
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// Explicit local-controller wake of a registered Namespace device. Never forwarded.
     pub const WAKE_DEVICE: &str = "WakeDevice";
+    /// Start the bounded Namespace auth callback tunnel without waking or relinking the device.
+    /// IPC-only; never relay-forwarded.
+    pub const ENSURE_DEVBOX_CALLBACK_FORWARD: &str = "EnsureDevboxCallbackForward";
     /// Non-secret edge grant metadata for a deployment-bound Scaffold host.
     /// IPC-only; local controllers use it to reuse an already-running host.
     pub const SCAFFOLD_HOST_AUTHORITY: &str = "ScaffoldHostAuthority";
@@ -277,6 +283,15 @@ pub struct HandoffSessionToScaffoldParams {
     pub database_environment: comet_proto::ScaffoldDatabaseEnvironment,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverSessionHandoffToScaffoldParams {
+    #[serde(flatten)]
+    pub handoff: HandoffSessionToScaffoldParams,
+    pub recover_chat_id: String,
+    pub recover_sandbox_id: String,
+}
+
 /// Receipt for a transferred native session with its initial remote command queued.
 /// This does not indicate that the remote task has completed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -363,6 +378,11 @@ pub struct PeerReplyResult {
 pub struct PeerMessageResult {
     pub command_id: String,
     pub thread_id: String,
+    pub delivery: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<PeerReplyResult>,
 }
@@ -453,8 +473,9 @@ pub trait RpcService: Send + Sync + 'static {
 
     /// Only the authenticated host relay invokes this seam. Ordinary JSON RPC
     /// dispatch cannot manufacture a verified principal by claiming its fields.
-    async fn admit_peer_command(
+    async fn peer_command(
         &self,
+        _method: &str,
         _authority: PeerCommandAuthority,
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {

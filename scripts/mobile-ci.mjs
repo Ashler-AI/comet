@@ -20,8 +20,8 @@ const work = path.join(process.env.RUNNER_TEMP, "crew-mobile");
 for (const directory of [logs, release, work]) mkdirSync(directory, { recursive: true });
 const environment = process.env.CREW_MOBILE_ENVIRONMENT ?? "staging";
 const profiles = {
-  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "24", suffix: "-Staging", name: "Crew-Staging" },
-  production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "18", suffix: "", name: "Crew" },
+  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "31", suffix: "-Staging", name: "Crew-Staging" },
+  production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "21", suffix: "", name: "Crew" },
 };
 if (!Object.hasOwn(profiles, environment)) throw new Error(`Unsupported mobile environment: ${environment}`);
 const { scheme, bundleId, build, suffix, name } = profiles[environment];
@@ -38,8 +38,27 @@ const markers = [
   "OK Crew store eviction",
   "OK Crew peer message visibility",
   "OK Crew live list projection",
+  "OK Crew live transcript projection",
   "OK Crew room convergence",
+  "OK Crew workspace intents",
+  "OK Crew saved record recovery",
+  "OK Crew durable intents",
+  "OK Crew transcript freshness",
+  "OK Crew foreground and blocked recovery",
+  "OK Crew owner publication register",
+  "OK Crew mixed nested tool calls",
+  "OK Crew deployment retarget",
+  "OK Crew browse restore",
+  "OK Crew owner anchors",
+  "OK Crew attachment journal",
+  "OK Crew terminal controls",
+  "OK Crew authenticated reset",
+  "OK Crew metadata clear",
+  "OK Crew relay lifecycle",
+  "OK Crew fragmented backfill",
 ];
+const liveMarkers = ["OK workspace synced", "OK relay ListFolders", "OK relay ListModels",
+  "OK run admitted", "OK transcript streamed", "OK Crew fragmented backfill", "done"];
 const project = "apps/ios/Comet.xcodeproj";
 const lockfile = path.join(project, "project.xcworkspace/xcshareddata/swiftpm/Package.resolved");
 const lockBefore = readFileSync(lockfile);
@@ -50,13 +69,13 @@ function requireEqual(actual, expected, label) {
   if (actual !== expected) throw new Error(`${label}: got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
 }
 
-function run(command, args, { timeout = 120_000, log, allowFailure = false } = {}) {
+function run(command, args, { timeout = 120_000, log, allowFailure = false, env = process.env } = {}) {
   console.log(`+ ${command} ${args.join(" ")}`);
   const fd = log ? openSync(path.join(logs, log), "a") : undefined;
   let result;
   try {
     result = spawnSync(command, args, {
-      cwd: root, env: process.env, encoding: "utf8", timeout, killSignal: "SIGKILL",
+      cwd: root, env, encoding: "utf8", timeout, killSignal: "SIGKILL",
       maxBuffer: 16 * 1024 * 1024,
       stdio: fd === undefined ? ["ignore", "pipe", "pipe"] : ["ignore", fd, fd],
     });
@@ -110,6 +129,10 @@ async function verifySimulator(app) {
   const types = JSON.parse(run("xcrun", ["simctl", "list", "devicetypes", "--json"])).devicetypes;
   const deviceType = template?.deviceTypeIdentifier ?? types.find((item) => item.name === template?.name)?.identifier;
   if (!deviceType) throw new Error(`No compatible installed iPhone template for ${runtime.identifier}`);
+  run("cargo", ["build", "--locked", "-p", "comet", "--bin", "comet"], {
+    timeout: 2_400_000, log: "native-build.log", env: { ...process.env, CARGO_BUILD_JOBS: "2" },
+  });
+  run("npm", ["ci", "--prefix", "edge"], { timeout: 300_000, log: "edge-install.log" });
   simulator = run("xcrun", ["simctl", "create", `Crew CI ${process.env.GITHUB_RUN_ID}`, deviceType, runtime.identifier]);
   run("xcrun", ["simctl", "boot", simulator]);
   run("xcrun", ["simctl", "bootstatus", simulator, "-b"], { timeout: 300_000, log: "simulator.log" });
@@ -119,14 +142,60 @@ async function verifySimulator(app) {
   // A newly created simulator has no prior auth, preferences, or stale markers.
   // This hook enters demo mode; its APNs probe injects URLProtocol and never
   // requests notification authorization, registers with APNs, or uses live auth.
-  run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId, "-visibility-e2e"], { log: "simulator.log" });
+  run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId, "-visibility-e2e"], { timeout: 300_000, log: "simulator.log" });
   const deadline = Date.now() + 180_000;
   while (Date.now() < deadline) {
     const text = snapshotE2ELog();
     if (/\bFAIL\b/.test(text)) throw new Error(`Mobile regression failed:\n${text}`);
-    if (markers.every((marker) => text.split("\n").some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=[:\\s]|$)`).test(line)))) {
+    if (markers.every((marker) => text.split("\n").some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=\\W|$)`).test(line)))) {
       console.log(text);
-      return { identifier: runtime.identifier, version: runtime.version, deviceType, markers };
+      run("xcrun", ["simctl", "io", simulator, "screenshot", path.join(logs, "convergence-surface.png")]);
+      writeFileSync(path.join(logs, "visibility-e2e.log"), text);
+      for (const [argument, marker, prefix] of [
+        ["-recoveryblocked-e2e", "OK Crew blocked recovery surface fixture", "blocked-recovery"],
+        ["-unreachable-e2e", "OK Crew unreachable surface fixture", "unreachable"],
+      ]) {
+        run("xcrun", ["simctl", "launch", "--terminate-running-process", simulator, bundleId,
+          argument], { timeout: 300_000, log: `${prefix}-simulator.log` });
+        const surfaceDeadline = Date.now() + 30_000;
+        for (;;) {
+          const surface = snapshotE2ELog();
+          if (/\bFAIL\b/.test(surface)) throw new Error(`${prefix} surface failed:\n${surface}`);
+          if (surface.includes(marker)) {
+            // ponytail: fixed navigation settle; use a render-ready hook if startup exceeds one second.
+            await sleep(1_000);
+            run("xcrun", ["simctl", "io", simulator, "screenshot", path.join(logs, `${prefix}-surface.png`)]);
+            writeFileSync(path.join(logs, `${prefix}-e2e.log`), surface);
+            break;
+          }
+          if (Date.now() >= surfaceDeadline) throw new Error(`${prefix} surface did not appear`);
+          await sleep(250);
+        }
+      }
+      // Keep the unused simulator OS off during native preflight; the live hook boots it on demand.
+      run("xcrun", ["simctl", "terminate", simulator, bundleId], { log: "simulator.log" });
+      run("xcrun", ["simctl", "shutdown", simulator], { log: "simulator.log" });
+        run("node", ["scripts/headless-collaboration-smoke.mjs"], {
+          timeout: 600_000, log: "live-convergence.log",
+          env: { ...process.env, COMET_BIN: path.join(root, "target/debug/comet"), COMET_SYNC_SOAK_TURNS: "4",
+            COMET_MOBILE_SIMULATOR_ID: simulator, COMET_MOBILE_BUNDLE_ID: bundleId },
+        });
+      const liveText = snapshotE2ELog();
+      if (/\bFAIL\b/.test(liveText) || !liveMarkers.every((marker) => liveText.split("\n")
+        .some((line) => new RegExp(`^\\[\\d+\\] ${marker}(?=\\W|$)`).test(line)))) {
+        throw new Error(`Live mobile convergence did not finish all checks:\n${liveText}`);
+      }
+      const transportLog = readFileSync(path.join(logs, "live-convergence.log"), "utf8");
+      if (!transportLog.includes("PASS real mobile/native/Edge transport convergence; deterministic mock inference")) {
+        throw new Error("Native smoke did not report live mobile transport convergence; see live-convergence.log");
+      }
+      writeFileSync(path.join(logs, "live-e2e.log"), liveText);
+      run("xcrun", ["simctl", "io", simulator, "screenshot", path.join(logs, "live-convergence-surface.png")]);
+      return { identifier: runtime.identifier, version: runtime.version, deviceType, markers,
+        recoverySurface: "OK Crew blocked recovery surface fixture",
+        unreachableSurface: "OK Crew unreachable surface fixture",
+        liveConvergence: { transport: "real mobile/native/Edge", inference: "deterministic mock; no provider calls",
+          markers: liveMarkers, turns: 4, logs: ["visibility-e2e.log", "live-e2e.log", "live-convergence.log"] } };
     }
     await sleep(1_000);
   }
@@ -222,6 +291,9 @@ try {
   run("tar", ["-czf", path.join(release, `${artifactPrefix}-simulator-arm64.tar.gz`), "-C", path.dirname(simulatorApp), path.basename(simulatorApp)], { timeout: 300_000 });
   run("tar", ["-czf", path.join(release, `${artifactPrefix}-unsigned.xcarchive.tar.gz`), "-C", work, path.basename(archive)], { timeout: 300_000 });
   copyFileSync(path.join(logs, "e2e.log"), path.join(release, "e2e.log"));
+  copyFileSync(path.join(logs, "visibility-e2e.log"), path.join(release, "visibility-e2e.log"));
+  copyFileSync(path.join(logs, "live-convergence.log"), path.join(release, "live-convergence.log"));
+  copyFileSync(path.join(logs, "live-e2e.log"), path.join(release, "live-e2e.log"));
   copyFileSync(path.join(logs, "archive-signed.entitlements"), path.join(release, "archive-signed.entitlements"));
   writeFileSync(path.join(release, "source-sha.txt"), `${process.env.GITHUB_SHA}\n`);
   writeFileSync(path.join(release, "provenance.json"), `${JSON.stringify({

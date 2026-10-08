@@ -1,6 +1,7 @@
 //! Explicit Namespace wake, shared across local RPC connections. No background wake.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -15,12 +16,19 @@ use tokio::process::Command;
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(110);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(60);
+const AUTH_FORWARD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const AUTH_FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_FORWARD_PORTS: &[(u16, u16)] = &[(8085, 8085)];
+const SERVICE_FORWARD_PORTS: &[(u16, u16)] = &[(13_000, 3000), (20_350, 10_350)];
 const OUTPUT_LIMIT: usize = 16 * 1024;
 type WakeFuture = BoxFuture<'static, Result<(), String>>;
 
 #[derive(Default)]
 pub(crate) struct DeviceWake {
     operations: Mutex<HashMap<String, WeakShared<WakeFuture>>>,
+    forward_operations: Mutex<HashMap<String, WeakShared<WakeFuture>>>,
+    auth_forward: Arc<Mutex<Option<String>>>,
+    service_forward: Arc<Mutex<Option<String>>>,
 }
 
 impl DeviceWake {
@@ -33,13 +41,77 @@ impl DeviceWake {
     ) -> Result<(), String> {
         let target = device_id.to_owned();
         let command = bootstrap_command(project_scope)?;
-        self.coalesce(device_id, async move {
-            let executable = devbox_executable().ok_or_else(|| {
-                "Namespace CLI not found. Install devbox (including ~/.local/bin/devbox), then run devbox login on this controller.".to_string()
-            })?;
-            run_bootstrap(executable, &provider_id, command).await?;
-            await_peer(&links, &target).await
-        }.boxed()).await
+        let executable = devbox_executable().ok_or_else(|| {
+            "Namespace CLI not found. Install devbox (including ~/.local/bin/devbox), then run devbox login on this controller.".to_string()
+        })?;
+        let boot_executable = executable.clone();
+        let forwards = self.prepare_forwards(executable, &provider_id);
+        self.coalesce(
+            device_id,
+            async move {
+                run_bootstrap(boot_executable, &provider_id, command).await?;
+                await_peer(&links, &target).await?;
+                let _ = await_forwards(forwards).await;
+                Ok(())
+            }
+            .boxed(),
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_callback_forward(&self, provider_id: String) -> Result<(), String> {
+        let executable = devbox_executable().ok_or_else(|| {
+            "Namespace CLI not found. Install devbox (including ~/.local/bin/devbox), then run devbox login on this controller.".to_string()
+        })?;
+        await_forwards(self.prepare_forwards(executable, &provider_id)).await
+    }
+
+    pub(crate) fn auth_forward_active(&self, provider_id: &str) -> bool {
+        self.auth_forward
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            == Some(provider_id)
+    }
+    fn prepare_forwards(
+        &self,
+        executable: PathBuf,
+        provider_id: &str,
+    ) -> (Shared<WakeFuture>, Option<Shared<WakeFuture>>) {
+        let auth_key = format!("auth:{provider_id}");
+        let auth = self.coalesce_forward(
+            &auth_key,
+            ensure_auth_forward(
+                executable.clone(),
+                provider_id.to_owned(),
+                AUTH_FORWARD_PORTS.to_vec(),
+                AUTH_FORWARD_READY_TIMEOUT,
+                AUTH_FORWARD_TIMEOUT,
+                self.auth_forward.clone(),
+            )
+            .boxed(),
+        );
+        let service_ports = available_service_ports(SERVICE_FORWARD_PORTS);
+        let services = if service_ports.is_empty() {
+            None
+        } else {
+            let service_key = format!("services:{provider_id}");
+            Some(
+                self.coalesce_forward(
+                    &service_key,
+                    ensure_auth_forward(
+                        executable,
+                        provider_id.to_owned(),
+                        service_ports,
+                        AUTH_FORWARD_READY_TIMEOUT,
+                        AUTH_FORWARD_TIMEOUT,
+                        self.service_forward.clone(),
+                    )
+                    .boxed(),
+                ),
+            )
+        };
+        (auth, services)
     }
 
     fn coalesce(&self, device_id: &str, operation: WakeFuture) -> Shared<WakeFuture> {
@@ -60,8 +132,246 @@ impl DeviceWake {
         );
         shared
     }
+
+    fn coalesce_forward(&self, provider_id: &str, operation: WakeFuture) -> Shared<WakeFuture> {
+        let mut operations = self
+            .forward_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pending) = operations.get(provider_id).and_then(WeakShared::upgrade) {
+            return pending;
+        }
+        operations.retain(|_, operation| operation.upgrade().is_some());
+        let shared = operation.shared();
+        operations.insert(
+            provider_id.to_owned(),
+            shared.downgrade().expect("new forward future"),
+        );
+        shared
+    }
 }
 
+async fn await_forwards(
+    (auth, services): (Shared<WakeFuture>, Option<Shared<WakeFuture>>),
+) -> Result<(), String> {
+    let service = async move {
+        if let Some(services) = services {
+            services.await
+        } else {
+            Ok(())
+        }
+    };
+    let (auth, service) = tokio::join!(auth, service);
+    if let Err(error) = service {
+        tracing::warn!(error, "Namespace app/Tilt forward unavailable");
+    }
+    auth
+}
+
+fn local_port_available(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+fn available_service_ports(ports: &[(u16, u16)]) -> Vec<(u16, u16)> {
+    ports
+        .iter()
+        .copied()
+        .filter(|(local, remote)| {
+            let available = local_port_available(*local);
+            if !available {
+                tracing::warn!(local, remote, "Skipping occupied Namespace service forward");
+            }
+            available
+        })
+        .collect()
+}
+
+fn forward_port_spec(ports: &[(u16, u16)]) -> String {
+    let mut spec = String::with_capacity(ports.len() * 12);
+    for (index, (local, remote)) in ports.iter().enumerate() {
+        if index > 0 {
+            spec.push(',');
+        }
+        write!(spec, "{local}:{remote}").expect("writing to String cannot fail");
+    }
+    spec
+}
+
+fn release_auth_forward(active: &Mutex<Option<String>>, provider_id: &str) {
+    let mut forward = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if forward.as_deref() == Some(provider_id) {
+        *forward = None;
+    }
+}
+
+struct AuthForwardLease {
+    active: Arc<Mutex<Option<String>>>,
+    provider_id: String,
+}
+
+impl Drop for AuthForwardLease {
+    fn drop(&mut self) {
+        release_auth_forward(&self.active, &self.provider_id);
+    }
+}
+
+struct ForwardProcessGroup {
+    child: tokio::process::Child,
+    #[cfg(unix)]
+    group: Option<u32>,
+    // Release the reservation only after group cleanup, including cancellation.
+    _lease: AuthForwardLease,
+}
+
+impl ForwardProcessGroup {
+    fn kill_group(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.group.take() {
+            // SAFETY: the unreaped child reserves this group ID. Disarm before
+            // reaping, so cancellation cannot signal a subsequently reused ID.
+            unsafe {
+                libc::killpg(group as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn has_exited(&mut self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            let Some(group) = self.group else {
+                return Ok(true);
+            };
+            // Observe exit without reaping: descendants may still hold listeners,
+            // and the leader must reserve the group ID until we kill the group.
+            let mut status = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    group as libc::id_t,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.group = None;
+                }
+                return Err(error);
+            }
+            Ok(unsafe { status.si_pid() } != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.try_wait().map(|status| status.is_some())
+        }
+    }
+
+    async fn wait_for_exit(&mut self) -> std::io::Result<()> {
+        loop {
+            if self.has_exited()? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn stop(&mut self) {
+        self.kill_group();
+        #[cfg(not(unix))]
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+}
+
+impl Drop for ForwardProcessGroup {
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
+
+async fn ensure_auth_forward(
+    executable: PathBuf,
+    provider_id: String,
+    ports: Vec<(u16, u16)>,
+    ready_timeout: Duration,
+    lease_duration: Duration,
+    active: Arc<Mutex<Option<String>>>,
+) -> Result<(), String> {
+    {
+        let mut forward = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match forward.as_deref() {
+            Some(current) if current == provider_id => return Ok(()),
+            Some(_) => return Err("Another Namespace port forward is already active".into()),
+            None => {}
+        }
+        if let Some((port, _)) = ports.iter().find(|(port, _)| !local_port_available(*port)) {
+            return Err(format!("Namespace forward port {port} is already in use"));
+        }
+        *forward = Some(provider_id.clone());
+    }
+    let lease = AuthForwardLease {
+        active: active.clone(),
+        provider_id: provider_id.clone(),
+    };
+    let port_spec = forward_port_spec(&ports);
+    let mut command = Command::new(executable);
+    command
+        .args(["port-forward", &provider_id, "--ports", &port_spec])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(!cfg!(unix));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Could not start Namespace port forward: {error}"))?;
+    let mut process = ForwardProcessGroup {
+        #[cfg(unix)]
+        group: child.id(),
+        child,
+        _lease: lease,
+    };
+    let ready = tokio::time::timeout(ready_timeout, async {
+        loop {
+            if process.has_exited().map_err(|error| error.to_string())? {
+                return Err("Namespace port forward exited early".into());
+            }
+            if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, ports[0].0))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err("Namespace port forward did not become ready within 10 seconds".to_string())
+    });
+    if let Err(error) = ready {
+        process.stop().await;
+        return Err(error);
+    }
+    let expires_at = tokio::time::Instant::now() + lease_duration;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep_until(expires_at) => {}
+            _ = process.wait_for_exit() => {}
+        }
+        process.stop().await;
+    });
+    Ok(())
+}
 pub(crate) fn valid_devbox_id(id: &str) -> bool {
     // Namespace immutable IDs are 13 lowercase alphanumeric characters, not names.
     id.len() == 13
@@ -72,7 +382,7 @@ pub(crate) fn valid_devbox_id(id: &str) -> bool {
 
 pub(crate) fn bound_devbox_id<'a>(device: &'a Device, local_id: &str) -> Result<&'a str, String> {
     if device.id == local_id || device.environment != Some(DeviceEnvironment::Namespace) {
-        return Err("Only a remote Namespace Devbox can be woken".into());
+        return Err("Only a remote Namespace Devbox can be controlled".into());
     }
     device.namespace_devbox_id.as_deref().filter(|id| valid_devbox_id(id)).ok_or_else(|| {
         "This device has no valid Namespace Devbox ID. Reconfigure its Crew launcher with NAMESPACE_DEVBOX_ID and register it again; the display name cannot be used.".into()
@@ -225,6 +535,52 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn unused_port() -> u16 {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[cfg(unix)]
+    fn write_forward_executable(directory: &std::path::Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = directory.join("devbox");
+        std::fs::write(&executable, script).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        executable
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_callback_state(
+        wake: &DeviceWake,
+        provider_id: &str,
+        ports: &[u16],
+        active: bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut matches = wake.auth_forward_active(provider_id) == active;
+                for port in ports {
+                    matches &= tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, *port))
+                        .await
+                        .is_ok()
+                        == active;
+                }
+                if matches {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("callback lease state and listener reachability did not converge");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timeout_releases_all_waiters_and_allows_retry() {
         let wake = DeviceWake::default();
@@ -246,6 +602,41 @@ mod tests {
         assert_eq!(
             wake.coalesce("device", async { Ok(()) }.boxed()).await,
             Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_forward_waiters_share_readiness() {
+        let wake = DeviceWake::default();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let first_starts = starts.clone();
+        let first = wake.coalesce_forward(
+            "ofpf7g22n4412",
+            async move {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(())
+            }
+            .boxed(),
+        );
+        let second = wake.coalesce_forward(
+            "ofpf7g22n4412",
+            async { panic!("duplicate forward") }.boxed(),
+        );
+        let (a, b) = tokio::join!(first, second);
+        assert_eq!(a, Ok(()));
+        assert_eq!(a, b);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn occupied_service_port_does_not_drop_other_mappings() {
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let open_port = unused_port();
+        assert_eq!(
+            available_service_ports(&[(occupied_port, 3000), (open_port, 10_350)]),
+            vec![(open_port, 10_350)]
         );
     }
 
@@ -272,6 +663,278 @@ mod tests {
             device.namespace_devbox_id = invalid.map(str::to_owned);
             assert!(bound_devbox_id(&device, "local").is_err());
         }
+    }
+
+    #[test]
+    fn bootstrap_commands_follow_the_crew_channel() {
+        assert!(
+            bootstrap_command("ashler-staging")
+                .unwrap()
+                .ends_with(" staging")
+        );
+        assert!(
+            bootstrap_command("ashler-production")
+                .unwrap()
+                .ends_with(" production")
+        );
+        assert!(bootstrap_command("other").is_err());
+    }
+
+    #[test]
+    fn default_forward_ports_are_split_by_lifecycle() {
+        assert_eq!(forward_port_spec(AUTH_FORWARD_PORTS), "8085:8085");
+        assert_eq!(
+            forward_port_spec(SERVICE_FORWARD_PORTS),
+            "13000:3000,20350:10350"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_callback_tunnel_can_retry() {
+        let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
+        let result = ensure_auth_forward(
+            PathBuf::from("/definitely/missing/devbox"),
+            provider_id.into(),
+            vec![(unused_port(), 8085)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            wake.auth_forward.clone(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!wake.auth_forward_active(provider_id));
+    }
+
+    #[tokio::test]
+    async fn occupied_ports_and_other_devices_fail_without_spawning() {
+        let wake = DeviceWake::default();
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let result = ensure_auth_forward(
+            PathBuf::from("/definitely/missing/devbox"),
+            "ofpf7g22n4412".into(),
+            vec![(occupied.local_addr().unwrap().port(), 8085)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            wake.auth_forward.clone(),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("already in use"));
+        assert!(!wake.auth_forward_active("ofpf7g22n4412"));
+
+        *wake.auth_forward.lock().unwrap() = Some("another-device".into());
+        let result = ensure_auth_forward(
+            PathBuf::from("/definitely/missing/devbox"),
+            "ofpf7g22n4412".into(),
+            vec![(unused_port(), 8085)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            wake.auth_forward.clone(),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("Another Namespace"));
+        assert_eq!(
+            wake.auth_forward.lock().unwrap().as_deref(),
+            Some("another-device")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_callback_tunnel_can_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("devbox");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
+        let port = unused_port();
+        let result = ensure_auth_forward(
+            executable,
+            provider_id.into(),
+            vec![(port, 8085)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            wake.auth_forward.clone(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!wake.auth_forward_active(provider_id));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_readiness_releases_callback_lease() {
+        let callback_port = unused_port();
+        let temp = tempfile::tempdir().unwrap();
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwait\n",
+                std::env::current_exe().unwrap().display()
+            ),
+        );
+        let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
+        let mut first = wake.coalesce_forward(
+            provider_id,
+            ensure_auth_forward(
+                executable,
+                provider_id.into(),
+                // Keep readiness pending while a descendant holds a listener.
+                vec![(0, 8085)],
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                wake.auth_forward.clone(),
+            )
+            .boxed(),
+        );
+        let second = wake.coalesce_forward(
+            provider_id,
+            async { panic!("duplicate forward") }.boxed(),
+        );
+        let callback_ports = [callback_port];
+        tokio::select! {
+            result = &mut first => panic!("tunnel exited before cancellation: {result:?}"),
+            _ = wait_for_callback_state(&wake, provider_id, &callback_ports, true) => {}
+        }
+        drop(first);
+        wait_for_callback_state(&wake, provider_id, &[callback_port], true).await;
+        drop(second);
+        wait_for_callback_state(&wake, provider_id, &[callback_port], false).await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_forward_child() {
+        let Ok(raw) = std::env::var("COMET_TEST_AUTH_FORWARD_PORT") else {
+            return;
+        };
+        let _callbacks: Vec<_> = raw
+            .split(',')
+            .map(|port| {
+                std::net::TcpListener::bind((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    port.parse::<u16>().unwrap(),
+                ))
+                .unwrap()
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn callback_tunnel_becomes_ready_and_is_coalesced() {
+        let callback_port = unused_port();
+        let temp = tempfile::tempdir().unwrap();
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' exec '{}' --exact device_wake::tests::auth_forward_child --nocapture\n",
+                std::env::current_exe().unwrap().display()
+            ),
+        );
+
+        let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
+        ensure_auth_forward(
+            executable.clone(),
+            provider_id.into(),
+            vec![(callback_port, 8085)],
+            Duration::from_secs(2),
+            AUTH_FORWARD_TIMEOUT,
+            wake.auth_forward.clone(),
+        )
+        .await
+        .unwrap();
+        // Real subprocess startup cannot use paused time; control only expiry.
+        tokio::time::pause();
+        assert!(wake.auth_forward_active(provider_id));
+        ensure_auth_forward(
+            executable,
+            provider_id.into(),
+            vec![(callback_port, 8085)],
+            Duration::from_secs(2),
+            AUTH_FORWARD_TIMEOUT,
+            wake.auth_forward.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::time::advance(AUTH_FORWARD_TIMEOUT).await;
+        tokio::time::resume();
+        wait_for_callback_state(&wake, provider_id, &[callback_port], false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn callback_tunnel_lease_kills_spawned_process_group() {
+        let reserved = [
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        ];
+        let ports = reserved
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap().port());
+        drop(reserved);
+        let temp = tempfile::tempdir().unwrap();
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{},{}' '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwait\n",
+                ports[0], ports[1], std::env::current_exe().unwrap().display()
+            ),
+        );
+        let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
+        ensure_auth_forward(
+            executable,
+            provider_id.into(),
+            vec![(ports[0], 8085), (ports[1], 8086)],
+            Duration::from_secs(2),
+            AUTH_FORWARD_TIMEOUT,
+            wake.auth_forward.clone(),
+        )
+        .await
+        .unwrap();
+        wait_for_callback_state(&wake, provider_id, &ports, true).await;
+        tokio::time::pause();
+        tokio::time::advance(AUTH_FORWARD_TIMEOUT).await;
+        tokio::time::resume();
+        wait_for_callback_state(&wake, provider_id, &ports, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn callback_tunnel_leader_exit_kills_spawned_process_group() {
+        let callback_port = unused_port();
+        let temp = tempfile::tempdir().unwrap();
+        let exit_marker = temp.path().join("exit");
+        let executable = write_forward_executable(
+            temp.path(),
+            &format!(
+                "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{callback_port}' '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+                std::env::current_exe().unwrap().display(), exit_marker.display()
+            ),
+        );
+        let wake = DeviceWake::default();
+        let provider_id = "ofpf7g22n4412";
+        ensure_auth_forward(
+            executable,
+            provider_id.into(),
+            vec![(callback_port, 8085)],
+            Duration::from_secs(2),
+            AUTH_FORWARD_TIMEOUT,
+            wake.auth_forward.clone(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(exit_marker, b"").unwrap();
+        wait_for_callback_state(&wake, provider_id, &[callback_port], false).await;
     }
 
     #[tokio::test]

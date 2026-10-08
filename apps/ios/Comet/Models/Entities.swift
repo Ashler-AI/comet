@@ -309,10 +309,10 @@ func sessionActivity(
     }
     var status = effectiveStatus(transcript, now: now)
     if transcript.status == .working, status != .working {
-        // Match desktop agent_indicator_with_transcript for remote owners:
-        // the current streaming turn outlives a one-shot working publication.
-        // Local fallback still expires when neither room delivers activity.
-        guard usesPublication, row?.status == .working else { return base }
+        // An owner heartbeat can keep a quiet stream working. Neither stale
+        // content nor a stale publication is proof that its owner is alive.
+        guard usesPublication, let row, row.status == .working,
+              effectiveStatus(row, now: now) == .working else { return base }
         status = .working
     }
     if let row, row.status == .working || row.status == .awaitingInput {
@@ -496,6 +496,26 @@ struct RunRequest: Codable {
     var autoApprove: Bool = true
     var resume: String?
     var attachments: [String] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case prompt, model, reasoning, modelOptions, cwd, sandbox, autoApprove, resume, attachments
+    }
+}
+
+extension RunRequest {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        prompt = try c.decode(String.self, forKey: .prompt)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)
+        modelOptions = try c.decode([String: String].self, forKey: .modelOptions)
+        cwd = try c.decode(String.self, forKey: .cwd)
+        sandbox = try c.decode(String.self, forKey: .sandbox)
+        autoApprove = try c.decode(Bool.self, forKey: .autoApprove)
+        resume = try c.decodeIfPresent(String.self, forKey: .resume)
+        // Native omits empty attachments; a present null or malformed value is not empty.
+        attachments = c.contains(.attachments) ? try c.decode([String].self, forKey: .attachments) : []
+    }
 }
 
 enum SessionCommandPayload {
@@ -524,4 +544,11 @@ enum SessionCommandPayload {
 
 func nowMs() -> Int64 {
     Int64(Date().timeIntervalSince1970 * 1000)
+}
+
+func encodableDictionary<T: Encodable>(_ value: T) -> [String: Any] {
+    guard let data = try? JSONEncoder().encode(value),
+          let object = try? JSONSerialization.jsonObject(with: data),
+          let dictionary = object as? [String: Any] else { return [:] }
+    return dictionary
 }

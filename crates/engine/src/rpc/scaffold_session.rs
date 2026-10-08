@@ -37,9 +37,7 @@ impl EngineRpc {
         cancellation: &CancellationToken,
     ) -> Result<ScaffoldEnvironmentControlResult, RpcError> {
         let scaffold = self.scaffold()?;
-        let owner_room = self.prepare_scaffold_attach(&control)?;
-        self.await_scaffold_owner_room(owner_room.as_deref(), cancellation)
-            .await?;
+        let owner_projection = self.scaffold_attach_projection(&control)?;
         let result = scaffold
             .control(control, cancellation)
             .await
@@ -59,8 +57,14 @@ impl EngineRpc {
                 .upsert_session_ref(&projection.session_id, Some(result.environment.clone()))
                 .map_err(|error| RpcError::Failed(error.to_string()))?;
         }
-        if let Err(error) = self.install_scaffold_control_grant(&result) {
-            tracing::warn!(error = %error, "Scaffold attached without local control grant projection");
+        self.install_scaffold_control_grant(&result)?;
+        // Legacy scoped caches need the exact verified grant before opening.
+        // Waiting for the owner's room before Attach also prevents waking it.
+        if let Some(projection) = owner_projection {
+            let owner_room = self.doc_host
+                .open_projection(&projection.session_id, Some(&projection))
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            self.await_scaffold_owner_room(Some(&owner_room), cancellation).await?;
         }
         Ok(result)
     }
@@ -68,6 +72,21 @@ impl EngineRpc {
     pub(super) async fn prepare_scaffold_session(
         &self,
         params: PrepareScaffoldSessionParams,
+    ) -> Result<ScaffoldEnvironmentControlResult, RpcError> {
+        let _preparation = self.scaffold()?.preparation_gate(&params.scope)
+            .try_lock_owned().map_err(|_| RpcError::Failed(
+                "Scaffold session preparation already in progress; wait for the existing request".into()
+            ))?;
+        self.prepare_scaffold_session_locked(params, None, None)
+            .await
+    }
+
+    // The caller holds the scope gate through native transfer and command admission.
+    async fn prepare_scaffold_session_locked(
+        &self,
+        params: PrepareScaffoldSessionParams,
+        recovery_sandbox: Option<&str>,
+        native_source: Option<&Chat>,
     ) -> Result<ScaffoldEnvironmentControlResult, RpcError> {
         self.scaffold()?;
         let state = self.auth()?.state();
@@ -105,12 +124,6 @@ impl EngineRpc {
         let actor = state
             .user()
             .ok_or_else(|| RpcError::Failed("authenticated local identity unavailable".into()))?;
-        // Runtime clones share this gate. Reject a concurrent same-session call
-        // before reading the accepted ref or issuing any create request.
-        let _preparation = self.scaffold()?.preparation_gate(&params.scope)
-            .try_lock_owned().map_err(|_| RpcError::Failed(
-                "Scaffold session preparation already in progress; wait for the existing request".into()
-            ))?;
         params
             .agent_route
             .validate()
@@ -120,6 +133,29 @@ impl EngineRpc {
             .doc()
             .session_ref(&actor.id, session_id)
             .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if let Some(sandbox_id) = recovery_sandbox {
+            let environment = reference
+                .as_ref()
+                .and_then(|reference| reference.environment.as_ref())
+                .ok_or_else(|| {
+                    recovery_error(
+                        "accepted target is missing from the signed-in owner's session references",
+                    )
+                })?;
+            validate_recovery_environment(
+                environment,
+                sandbox_id,
+                &params.scope,
+                params.database_environment,
+            )?;
+            if environment.owner_principal != actor.id && environment.owner_principal != actor.email
+            {
+                return Err(recovery_error(
+                    "accepted target belongs to a different owner",
+                ));
+            }
+            self.require_unadmitted_handoff(session_id)?;
+        }
         if reference.as_ref().is_some_and(|reference| {
             reference.environment.is_none()
                 && reference.startup.as_ref().is_some_and(|startup| {
@@ -138,16 +174,51 @@ impl EngineRpc {
                     SessionEnvironmentSource::Scaffold { .. }
                 ) && environment.scope == params.scope
             });
-        let mut startup = PreparationOutcome::begin(self.workspace.clone(), session_id)?;
-        let expected_scope = params.scope.clone();
+        // Explicit recovery can never reach Create, even if its reference was removed.
+        if recovery_sandbox.is_some() && accepted.is_none() {
+            return Err(recovery_error(
+                "accepted target no longer matches this session scope",
+            ));
+        }
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = cancellation.clone().drop_guard();
+        if let Some(sandbox_id) = recovery_sandbox {
+            self.validate_recovery_route(sandbox_id, &params.scope, &params.agent_route, &cancellation)
+                .await?;
+        }
+        let mut startup = PreparationOutcome::begin(self.workspace.clone(), session_id)?;
+        let expected_scope = params.scope.clone();
+        let expected_database = params.database_environment;
+        let expected_route = params.agent_route.clone();
         let startup_state = &startup.startup;
+        let attached_device = std::sync::Mutex::new(None::<String>);
         let mut result = prepare_scaffold_session_with(params, accepted, |control| {
             let expected_scope = &expected_scope;
             let cancellation = &cancellation;
+            let expected_route = &expected_route;
+            let attached_device = &attached_device;
             async move {
                 let creating = matches!(&control, ScaffoldEnvironmentControl::Create { .. });
+                let attaching = matches!(&control, ScaffoldEnvironmentControl::Attach { .. });
+                let importing = matches!(&control, ScaffoldEnvironmentControl::HandoffOmpSession { .. });
+                if let Some(sandbox_id) = recovery_sandbox {
+                    if creating {
+                        return Err(recovery_error("refusing to create a replacement target"));
+                    }
+                    self.require_unadmitted_handoff(expected_scope.session_id.as_deref().unwrap())?;
+                    if matches!(&control, ScaffoldEnvironmentControl::HandoffOmpSession { .. }) {
+                        self.validate_recovery_route(sandbox_id, expected_scope, expected_route, cancellation).await?;
+                    }
+                    // Check the persisted owner reference again before each external control.
+                    let current = self.workspace.doc().session_ref(&actor.id, expected_scope.session_id.as_deref().unwrap())
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                        .and_then(|reference| reference.environment)
+                        .ok_or_else(|| recovery_error("accepted target disappeared; no replacement will be created"))?;
+                    validate_recovery_environment(&current, sandbox_id, expected_scope, expected_database)?;
+                    if current.owner_principal != actor.id && current.owner_principal != actor.email {
+                        return Err(recovery_error("accepted target owner changed"));
+                    }
+                }
                 if creating {
                     let mut uncertain = startup_state.clone();
                     uncertain.status = comet_proto::SessionStartupStatus::CreationUncertain;
@@ -169,6 +240,22 @@ impl EngineRpc {
                         return Err(error);
                     }
                 };
+                if let Some(sandbox_id) = recovery_sandbox {
+                    validate_recovery_environment(&result.environment, sandbox_id, expected_scope, expected_database)?;
+                    if result.environment.owner_principal != actor.id && result.environment.owner_principal != actor.email {
+                        return Err(recovery_error("remote target owner changed"));
+                    }
+                }
+                if attaching {
+                    *attached_device.lock().unwrap_or_else(|error| error.into_inner()) = result.attached_device_id.clone();
+                }
+                if importing {
+                    if let Some(source) = native_source {
+                        let device = attached_device.lock().unwrap_or_else(|error| error.into_inner());
+                        let device = device.as_deref().ok_or_else(|| recovery_error("attachment device disappeared after native import"))?;
+                        self.persist_handoff_context(source, expected_route.omp_model(), device, &result)?;
+                    }
+                }
                 if creating {
                     let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source else {
                         return Err(RpcError::Failed("Scaffold returned a local environment".into()));
@@ -208,6 +295,32 @@ impl EngineRpc {
     pub(super) async fn handoff_session_to_scaffold(
         &self,
         params: HandoffSessionToScaffoldParams,
+    ) -> Result<HandoffSessionToScaffoldResult, RpcError> {
+        self.handoff_session_to_scaffold_with(params, None).await
+    }
+
+    pub(super) async fn recover_session_handoff_to_scaffold(
+        &self,
+        params: comet_rpc::RecoverSessionHandoffToScaffoldParams,
+    ) -> Result<HandoffSessionToScaffoldResult, RpcError> {
+        let chat_id = canonical_session_id(&params.recover_chat_id)
+            .ok_or_else(|| recovery_error("--recover-chat-id must be a Crew session UUID"))?;
+        if params.recover_sandbox_id.trim().is_empty() || params.recover_sandbox_id.len() > 256 {
+            return Err(recovery_error(
+                "--recover-sandbox-id must identify the preserved sandbox",
+            ));
+        }
+        self.handoff_session_to_scaffold_with(
+            params.handoff,
+            Some((chat_id, params.recover_sandbox_id)),
+        )
+        .await
+    }
+
+    async fn handoff_session_to_scaffold_with(
+        &self,
+        params: HandoffSessionToScaffoldParams,
+        recovery: Option<(String, String)>,
     ) -> Result<HandoffSessionToScaffoldResult, RpcError> {
         self.require_session_import()?;
         if self.runtime_profile != RuntimeProfile::LocalController {
@@ -288,7 +401,14 @@ impl EngineRpc {
             .project_scope()
             .ok_or_else(|| RpcError::Failed("authenticated project scope unavailable".into()))?
             .to_string();
-        let chat_id = crate::new_id();
+        let chat_id = recovery
+            .as_ref()
+            .map_or_else(crate::new_id, |(chat_id, _)| chat_id.clone());
+        if chat_id == source_id {
+            return Err(recovery_error(
+                "source and recovery target must be different sessions",
+            ));
+        }
         let scope = CollaborationScope {
             project_id: project_id.clone(),
             deployment_id: Some(self.scaffold()?.deployment_id().to_string()),
@@ -296,20 +416,214 @@ impl EngineRpc {
             unknown: Default::default(),
         };
         let remote_model = agent_route.omp_model();
+        let _preparation = self.scaffold()?.preparation_gate(&scope)
+            .try_lock_owned().map_err(|_| RpcError::Failed(
+                "Scaffold session preparation already in progress; wait for the existing request".into()
+            ))?;
+        let recovery_sandbox = recovery.as_ref().map(|(_, sandbox_id)| sandbox_id.as_str());
         let attached = self
-            .prepare_scaffold_session(PrepareScaffoldSessionParams {
-                scope,
-                name: source.title.clone(),
-                source_ref: Some("master".into()),
-                database_environment: params.database_environment,
-                agent_route,
-                omp_handoff: Some(OmpHandoff {
-                    native_session_id: native_session_id.clone(),
-                    cwd: cwd.clone(),
-                }),
-            })
+            .prepare_scaffold_session_locked(
+                PrepareScaffoldSessionParams {
+                    scope,
+                    name: source.title.clone(),
+                    source_ref: Some("master".into()),
+                    database_environment: params.database_environment,
+                    agent_route,
+                    omp_handoff: Some(OmpHandoff {
+                        native_session_id: native_session_id.clone(),
+                        cwd: cwd.clone(),
+                    }),
+                },
+                recovery_sandbox,
+                Some(&source),
+            )
             .await?;
-        self.admit_scaffold_handoff(source, params.prompt, remote_model, actor_subject, attached)
+        let admitted = self.admit_scaffold_handoff(source, params.prompt, remote_model, actor_subject, attached)?;
+        // Admission is durable even if its wakeup cannot be enqueued. Do not
+        // re-arm preparation rollback or mint another command on a retry.
+        self.doc_host.wake_queued_command(&admitted.chat_id,&admitted.command_id).await
+            .map_err(|error| RpcError::Failed(format!("{error}; session {}; durable command {} remains admitted",admitted.chat_id,admitted.command_id)))?;
+        Ok(admitted)
+    }
+
+    fn require_unadmitted_handoff(&self, session_id: &str) -> Result<(), RpcError> {
+        self.require_no_handoff_command(session_id)?;
+        if self
+            .workspace
+            .doc()
+            .chat(session_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+            .is_some_and(|chat| {
+                chat.harness_session_id.is_some() || chat.harness_session_cwd.is_some()
+            })
+        {
+            return Err(recovery_error(
+                "target already imported native context; inspect the existing chat instead of replaying handoff",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_no_handoff_command(&self, session_id: &str) -> Result<(), RpcError> {
+        let reference = self
+            .workspace
+            .session_startup(session_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if reference.is_some_and(|startup| {
+            startup.status == comet_proto::SessionStartupStatus::Admitted
+                || startup.command_id.is_some()
+        }) || self.target_has_start_command(session_id)?
+            || self
+                .sessions
+                .session_status(session_id)
+                .is_some_and(|session| {
+                    matches!(
+                        session.status,
+                        SessionStatus::Working | SessionStatus::AwaitingInput
+                    )
+                })
+        {
+            return Err(recovery_error(
+                "target already admitted a command or is active; inspect the existing chat instead of replaying handoff",
+            ));
+        }
+        Ok(())
+    }
+
+    fn target_has_start_command(&self, session_id: &str) -> Result<bool, RpcError> {
+        // Read only discriminants, not transcript-sized command payloads or the whole ledger.
+        let handle = self
+            .doc_host
+            .open(session_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        let commands = handle.doc().doc().get_list("commands");
+        for index in 0..commands.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
+                commands.get(index)
+            else {
+                continue;
+            };
+            let Some(loro::ValueOrContainer::Value(loro::LoroValue::Map(payload))) =
+                row.get("payload")
+            else {
+                continue;
+            };
+            if matches!(payload.get("kind"), Some(loro::LoroValue::String(kind)) if kind.as_str() == "run")
+            {
+                return Ok(true);
+            }
+            if matches!(payload.get("kind"), Some(loro::LoroValue::String(kind)) if kind.as_str() == "control")
+            {
+                if let Some(loro::LoroValue::Map(action)) = payload.get("action") {
+                    if matches!(action.get("action"), Some(loro::LoroValue::String(kind)) if kind.as_str() == "start")
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn validate_recovery_route(
+        &self,
+        sandbox_id: &str,
+        scope: &CollaborationScope,
+        expected: &AgentRoute,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RpcError> {
+        let (environment, route) = self.scaffold()?.client()
+            .inspect_agent_route(sandbox_id, scope, cancellation).await
+            .map_err(|error| recovery_error(&format!("cannot verify the preserved agent route: {error}")))?;
+        let state = self.auth()?.state();
+        let actor = state.user().ok_or_else(|| recovery_error("authenticated owner is unavailable"))?;
+        if environment.owner_principal != actor.id && environment.owner_principal != actor.email {
+            return Err(recovery_error("preserved agent route belongs to a different owner"));
+        }
+        if route != *expected
+        {
+            return Err(recovery_error(
+                "preserved target's agent route differs from the source model; restore the original source model, do not create a replacement",
+            ));
+        }
+        Ok(())
+    }
+
+    fn persist_handoff_context(
+        &self,
+        source: &Chat,
+        remote_model: String,
+        owner_device_id: &str,
+        attached: &ScaffoldEnvironmentControlResult,
+    ) -> Result<(), RpcError> {
+        let chat_id = attached
+            .environment
+            .scope
+            .session_id
+            .as_deref()
+            .ok_or_else(|| recovery_error("native import returned no target session"))?;
+        let native_id = attached
+            .handoff_native_session_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| recovery_error("native import returned no context identity"))?;
+        let remote_cwd = attached
+            .handoff_cwd
+            .as_ref()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .ok_or_else(|| recovery_error("native import returned no context directory"))?;
+        let config = source
+            .config
+            .as_ref()
+            .ok_or_else(|| recovery_error("source configuration disappeared"))?;
+        if let Some(existing) = self
+            .workspace
+            .doc()
+            .chat(chat_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+        {
+            if existing.harness_session_id.as_deref() == Some(native_id.as_str())
+                && existing.harness_session_cwd.as_deref() == Some(remote_cwd.as_str())
+                && existing.device_id == owner_device_id
+            {
+                return Ok(());
+            }
+            if existing.harness_session_id.is_some() || existing.harness_session_cwd.is_some() {
+                return Err(recovery_error(
+                    "target already contains different native context",
+                ));
+            }
+        }
+        self.workspace
+            .doc()
+            .upsert_chat(&Chat {
+                id: chat_id.to_string(),
+                device_id: owner_device_id.to_string(),
+                title: source.title.clone(),
+                archived: false,
+                cwd: Some(remote_cwd.clone()),
+                branch: attached.environment.source_ref.clone(),
+                checkout_id: None,
+                config: Some(ChatConfig {
+                    model: Some(remote_model),
+                    agent_account_id: None,
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    ..config.clone()
+                }),
+                last_message_preview: None,
+                last_message_at: None,
+                created_at: chrono::Utc::now(),
+                harness_session_id: Some(native_id.clone()),
+                harness_session_cwd: Some(remote_cwd.clone()),
+                fork_from: None,
+                space_id: source.space_id.clone(),
+                last_seen_at: None,
+            })
+            .map_err(|error| {
+                recovery_error(&format!(
+                    "native context imported but its local identity could not be persisted: {error}"
+                ))
+            })
     }
 
     fn admit_scaffold_handoff(
@@ -327,6 +641,7 @@ impl EngineRpc {
             .as_ref()
             .ok_or_else(|| RpcError::Failed("native_handoff_target_identity_missing".into()))?
             .clone();
+        self.require_no_handoff_command(&chat_id)?;
         let mut outcome = PreparationOutcome::for_command(
             self,
             &chat_id,
@@ -366,12 +681,7 @@ impl EngineRpc {
             .filter(|id| !id.trim().is_empty())
             .ok_or_else(|| RpcError::Failed("native_handoff_native_identity_missing".into()))?
             .clone();
-        let remote_config = ChatConfig {
-            model: Some(remote_model.clone()),
-            agent_account_id: None,
-            sandbox: SandboxLevel::WorkspaceWrite,
-            ..config.clone()
-        };
+        self.persist_handoff_context(&source, remote_model.clone(), owner_device_id, &attached)?;
         let run = RunRequest {
             prompt,
             model: Some(remote_model),
@@ -384,30 +694,6 @@ impl EngineRpc {
             resume: Some(native_id.clone()),
             attachments: Vec::new(),
         };
-        let remote_chat = Chat {
-            id: chat_id.clone(),
-            device_id: owner_device_id.clone(),
-            title: source.title,
-            archived: false,
-            cwd: Some(remote_cwd.clone()),
-            branch: attached.environment.source_ref.clone(),
-            checkout_id: None,
-            config: Some(remote_config),
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: chrono::Utc::now(),
-            harness_session_id: Some(native_id),
-            harness_session_cwd: Some(remote_cwd),
-            fork_from: None,
-            space_id: source.space_id,
-            last_seen_at: None,
-        };
-        self.workspace
-            .doc()
-            .upsert_chat(&remote_chat)
-            .map_err(|error| {
-                RpcError::Failed(format!("{error}; sandbox {sandbox_id}; session {chat_id}"))
-            })?;
         let command_id = self
             .doc_host
             .queue_command(
@@ -538,6 +824,43 @@ impl Drop for PreparationOutcome {
             tracing::warn!(session_id = %self.session_id, %error, "could not retain interrupted preparation outcome");
         }
     }
+}
+
+fn recovery_error(reason: &str) -> RpcError {
+    RpcError::Failed(format!(
+        "native handoff recovery refused: {reason}; check --recover-chat-id and --recover-sandbox-id against the preserved Crew target; no replacement will be created"
+    ))
+}
+
+fn validate_recovery_environment(
+    environment: &comet_proto::SessionEnvironment,
+    sandbox_id: &str,
+    scope: &CollaborationScope,
+    database: ScaffoldDatabaseEnvironment,
+) -> Result<(), RpcError> {
+    if environment.scope != *scope
+        || !matches!(&environment.source,
+        SessionEnvironmentSource::Scaffold { sandbox_id: actual, .. } if actual == sandbox_id)
+    {
+        return Err(recovery_error(
+            "accepted target sandbox/project/deployment/session scope mismatch",
+        ));
+    }
+    if environment.database_environment != Some(database) {
+        return Err(recovery_error(
+            "database environment differs from the accepted target; pass its original --database-environment",
+        ));
+    }
+    if matches!(
+        &environment.source,
+        SessionEnvironmentSource::Scaffold {
+            lifecycle: ScaffoldLifecycle::AgentRunning,
+            ..
+        }
+    ) {
+        return Err(recovery_error("target is already running an agent"));
+    }
+    Ok(())
 }
 
 fn scaffold_control_error(error: crate::scaffold::ScaffoldError) -> RpcError {

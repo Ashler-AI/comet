@@ -9,7 +9,8 @@
 //! - host → DO: must carry `to = connId`; the DO strips routing keys and delivers;
 //! - relay control frames use kind [`RELAY_KIND`] with payload `{"error": code}` —
 //!   codes `host_offline`, `host_closed`, `client_gone`, `client_closed`;
-//! - nudge frames use kind [`NUDGE_KIND`] with payload `{"chatId": …}`.
+//! - nudge frames use kind [`NUDGE_KIND`] with payload `{"chatId": …, "nudgeId": …}`;
+//!   [`NUDGE_ACK_KIND`] acknowledges the exact token only after durable acceptance.
 //!
 //! The RPC path multiplexes NOTHING new: each distinct client `connId` becomes a virtual
 //! string-frame connection feeding the existing [`serve_connection`] seam, so every RPC
@@ -30,8 +31,11 @@ use crate::{RpcClient, RpcError, RpcService, serve_connection};
 /// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
 /// leading space — clients compare with equality; a mismatch makes host_offline invisible).
 pub const RELAY_KIND: &str = " relay";
-/// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId}`.
+/// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId,nudgeId?}`.
 pub const NUDGE_KIND: &str = "nudge";
+/// Host receipt for the exact durably accepted `{chatId,nudgeId}` wakeup.
+pub const NUDGE_ACK_KIND: &str = "nudge-ack";
+const NUDGE_ID_MAX_BYTES: usize = 128;
 /// Edge-verified authority grant emitted only on the authenticated host socket.
 pub const GRANT_KIND: &str = "grant";
 /// The RPC stream over the relay: both `s` (stream id) and `k` (kind) are `"rpc"`.
@@ -176,7 +180,7 @@ pub fn device_room_ws_url(
     let ws_base = edge_url.replacen("http", "ws", 1);
     let ws_base = ws_base.trim_end_matches('/');
     let conn = conn_id.map(|c| format!("&connId={c}")).unwrap_or_default();
-    format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}")
+    format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL)
 }
 
 fn peer_session_ws_url(
@@ -191,7 +195,7 @@ fn peer_session_ws_url(
     let deployment = deployment_id
         .map(|value| format!("&deploymentId={value}"))
         .unwrap_or_default();
-    format!("{ws_base}/peer/{session_id}/ws?connId={conn_id}&token={token}{deployment}")
+    format!("{ws_base}/peer/{session_id}/ws?connId={conn_id}&token={token}{deployment}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL)
 }
 
 fn peer_device_ws_url(
@@ -208,7 +212,8 @@ fn peer_device_ws_url(
         .map(|value| format!("&peerDeploymentId={value}"))
         .unwrap_or_default();
     format!(
-        "{ws_base}/device/{device_id}/ws?role=client&connId={conn_id}&token={token}&purpose=peer-reply&peerSessionId={session_id}{deployment}"
+        "{ws_base}/device/{device_id}/ws?role=client&connId={conn_id}&token={token}&purpose=peer-reply&peerSessionId={session_id}{deployment}&syncProtocol={}",
+        comet_proto::DURABLE_SYNC_PROTOCOL
     )
 }
 
@@ -237,9 +242,16 @@ impl TokenSource for StaticToken {
 // Host relay
 // ---------------------------------------------------------------------------
 
-/// Called with the chat id of every nudge frame ("this chat's doc has pending commands —
-/// open it and drain"); the engine warms/opens the chat doc.
-pub type NudgeHandler = Arc<dyn Fn(String) + Send + Sync>;
+/// A relay wakeup. Legacy frames omit the token and must never be acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Nudge {
+    pub chat_id: String,
+    pub nudge_id: Option<String>,
+}
+
+/// Return success only after the wakeup is durably accepted, not merely scheduled.
+pub type NudgeHandler = Arc<dyn Fn(Nudge) -> Result<(), RpcError> + Send + Sync>;
 /// Called only for an edge-emitted [`GRANT_KIND`] frame. The stream id is the
 /// edge-verified session id and the bytes are the edge-derived grant envelope.
 pub type GrantHandler = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
@@ -435,6 +447,9 @@ async fn host_session(
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
     let mut conns: HashMap<String, VirtualConn> = HashMap::new();
+    // Like ordinary virtual RPC requests, peer admissions must not block the
+    // socket reader/writer. Dropping the session cancels unfinished handlers.
+    let mut peer_commands = tokio::task::JoinSet::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
@@ -442,6 +457,7 @@ async fn host_session(
 
     loop {
         tokio::select! {
+            _ = peer_commands.join_next(), if !peer_commands.is_empty() => {}
             frame = out_rx.recv() => match frame {
                 Some(bytes) => {
                     if sink.send(WsMessage::Binary(bytes)).await.is_err() {
@@ -460,6 +476,7 @@ async fn host_session(
                         &out_tx,
                         on_nudge,
                         on_grant,
+                        &mut peer_commands,
                     ).await;
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
@@ -499,6 +516,7 @@ async fn handle_host_frame(
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
     on_grant: &GrantHandler,
+    peer_commands: &mut tokio::task::JoinSet<()>,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -522,17 +540,39 @@ async fn handle_host_frame(
         return;
     }
     if header.k == NUDGE_KIND {
-        // Durable command nudge (§7): open the chat doc so drain fires.
-        #[derive(Deserialize)]
-        struct Nudge {
-            #[serde(rename = "chatId")]
-            chat_id: Option<String>,
+        let Ok(nudge) = serde_json::from_slice::<Nudge>(&payload) else {
+            tracing::warn!("device-room: malformed nudge — ignoring");
+            return;
+        };
+        if header.from.is_some()
+            || header.to.is_some()
+            || header.s != nudge.chat_id
+            || !uuid::Uuid::parse_str(&nudge.chat_id)
+                .is_ok_and(|id| id.to_string() == nudge.chat_id)
+            || nudge.nudge_id.as_ref().is_some_and(|id| {
+                id.is_empty() || id.len() > NUDGE_ID_MAX_BYTES
+            })
+        {
+            tracing::warn!("device-room: invalid nudge identity — ignoring");
+            return;
         }
-        match serde_json::from_slice::<Nudge>(&payload) {
-            Ok(Nudge {
-                chat_id: Some(chat_id),
-            }) => on_nudge(chat_id),
-            _ => tracing::warn!("device-room: malformed nudge — ignoring"),
+        let nudge_id = nudge.nudge_id.clone();
+        if let Err(error) = on_nudge(nudge) {
+            tracing::warn!(%error, "device-room: durable nudge acceptance failed");
+            return;
+        }
+        if let Some(nudge_id) = nudge_id {
+            let receipt = serde_json::json!({ "chatId": header.s, "nudgeId": nudge_id });
+            if let Ok(frame) = encode_device_frame(
+                &DeviceFrameHeader::new(header.s, NUDGE_ACK_KIND),
+                receipt.to_string().as_bytes(),
+            ) {
+                // The session also drains this queue: waiting for capacity here
+                // would deadlock. Edge keeps the token and retries a lost receipt.
+                if let Err(error) = out_tx.try_send(frame) {
+                    tracing::warn!(%error, "device-room: nudge receipt not queued");
+                }
+            }
         }
         return;
     }
@@ -547,28 +587,32 @@ async fn handle_host_frame(
             let Ok(admission) = serde_json::from_slice::<Admission>(&payload) else {
                 return;
             };
-            if admission.request.method.as_deref() != Some("AdmitPeerCommand") {
-                return;
-            }
-            let result = service
-                .admit_peer_command(admission.authority, admission.request.params)
-                .await;
-            let mut response = crate::ServerFrame {
-                id: admission.request.id,
-                ..Default::default()
-            };
-            match result {
-                Ok(value) => response.ok = Some(value),
-                Err(error) => response.err = Some(error.to_string()),
-            }
-            if let Ok(payload) = serde_json::to_vec(&response)
-                && let Ok(frame) = encode_device_frame(
-                    &DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(from),
-                    &payload,
-                )
-            {
-                let _ = out_tx.send(frame).await;
-            }
+            let Some(method) = admission.request.method.filter(|method| {
+                matches!(method.as_str(), "AdmitPeerCommand" | "ReadSessionCommand")
+            }) else { return };
+            let service = service.clone();
+            let out_tx = out_tx.clone();
+            peer_commands.spawn(async move {
+                let result = service
+                    .peer_command(&method, admission.authority, admission.request.params)
+                    .await;
+                let mut response = crate::ServerFrame {
+                    id: admission.request.id,
+                    ..Default::default()
+                };
+                match result {
+                    Ok(value) => response.ok = Some(value),
+                    Err(error) => response.err = Some(error.to_string()),
+                }
+                if let Ok(payload) = serde_json::to_vec(&response)
+                    && let Ok(frame) = encode_device_frame(
+                        &DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(from),
+                        &payload,
+                    )
+                {
+                    let _ = out_tx.send(frame).await;
+                }
+            });
         }
         return; // future stream kinds (term, tunnel)
     }
@@ -845,12 +889,13 @@ impl LinkCache {
         Err(last_err.unwrap_or(RpcError::Closed))
     }
 
-    /// Fresh authentication for each ordinary remote command; no cached socket
-    /// may extend a revoked sign-in's control authority.
+    /// Fresh authentication for each remote command or outcome read; no cached
+    /// socket may extend a revoked sign-in's authority.
     pub async fn command_call(
         &self,
         device_id: &str,
         chat_id: &str,
+        method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
         let token = self
@@ -866,15 +911,17 @@ impl LinkCache {
             Some(&uuid::Uuid::new_v4().to_string()),
             &token,
         );
-        url.push_str("&purpose=control&controlSessionId=");
-        url.push_str(chat_id);
+        if params.get("roomProjection").is_none_or(serde_json::Value::is_null) {
+            url.push_str("&purpose=control&controlSessionId=");
+            url.push_str(chat_id);
+        }
         let link = DeviceLink::connect(&url).await?;
         tokio::time::timeout(
             self.config.probe_timeout,
-            link.client().call("AdmitPeerCommand", params),
+            link.client().call(method, params),
         )
         .await
-        .map_err(|_| RpcError::Transport("peer command admission timed out".into()))?
+        .map_err(|_| RpcError::Transport("peer command timed out".into()))?
     }
 
     /// Drop a cached link after a failed RPC so the next call re-dials.
@@ -1104,6 +1151,210 @@ mod tests {
         DeviceFrameHeader::new(s, k)
     }
 
+    const NUDGE_CHAT: &str = "00fd510b-d334-4e38-8eae-d62230f00d00";
+
+    struct NudgeTestService;
+
+    #[async_trait]
+    impl RpcService for NudgeTestService {
+        async fn handle(
+            &self,
+            method: &str,
+            _: serde_json::Value,
+        ) -> Result<crate::RpcReply, RpcError> {
+            Err(RpcError::UnknownMethod(method.into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_admission_does_not_block_relay_grants_or_outbound_drain() {
+        struct WaitingPeer(tokio::sync::Notify);
+        #[async_trait]
+        impl RpcService for WaitingPeer {
+            async fn handle(&self, method: &str, _: serde_json::Value) -> Result<crate::RpcReply, RpcError> {
+                Err(RpcError::UnknownMethod(method.into()))
+            }
+            async fn peer_command(&self, _: &str, _: crate::PeerCommandAuthority, _: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+                self.0.notified().await;
+                Ok(serde_json::json!({"accepted": true}))
+            }
+        }
+        let waiting = Arc::new(WaitingPeer(tokio::sync::Notify::new()));
+        let service: Arc<dyn RpcService> = waiting.clone();
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        out_tx.send(vec![0]).await.unwrap();
+        let mut conns = HashMap::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let on_nudge: NudgeHandler = Arc::new(|_| Ok(()));
+        let granted = Arc::new(Mutex::new(false));
+        let received_grant = granted.clone();
+        let on_grant: GrantHandler = Arc::new(move |_, _| *lock(&received_grant) = true);
+        let mut header = DeviceFrameHeader::new("rpc", "peer-command");
+        header.from = Some("exact-client".into());
+        let frame = encode_device_frame(&header, serde_json::json!({
+            "authority": {"subject": "owner", "projectId": "project", "deviceId": "host", "chatId": NUDGE_CHAT, "expiresAt": 123},
+            "request": {"id": 42, "method": "AdmitPeerCommand", "params": {}}
+        }).to_string().as_bytes()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle_host_frame(
+            &frame, &mut conns, &service, &out_tx, &on_nudge, &on_grant, &mut tasks,
+        )).await.expect("a pending admission must not hold the relay reader");
+        let grant = encode_device_frame(&DeviceFrameHeader::new(NUDGE_CHAT, GRANT_KIND), b"grant").unwrap();
+        handle_host_frame(&grant, &mut conns, &service, &out_tx, &on_nudge, &on_grant, &mut tasks).await;
+        assert!(*lock(&granted));
+        waiting.0.notify_one();
+        assert_eq!(out_rx.recv().await.unwrap(), vec![0]);
+        let reply = tokio::time::timeout(Duration::from_secs(1), out_rx.recv()).await.unwrap().unwrap();
+        let (header, payload) = decode_device_frame(&reply).unwrap();
+        assert_eq!(header.to.as_deref(), Some("exact-client"));
+        let response: crate::ServerFrame = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(response.id, 42);
+        assert_eq!(response.ok, Some(serde_json::json!({"accepted": true})));
+        tasks.join_next().await.unwrap().unwrap();
+    }
+
+    async fn dispatch_nudge_frame(
+        header: DeviceFrameHeader,
+        payload: &[u8],
+        out_tx: &mpsc::Sender<Vec<u8>>,
+        on_nudge: &NudgeHandler,
+    ) {
+        let frame = encode_device_frame(&header, payload).expect("encode nudge");
+        let service: Arc<dyn RpcService> = Arc::new(NudgeTestService);
+        let on_grant: GrantHandler = Arc::new(|_, _| {});
+        tokio::time::timeout(Duration::from_secs(1), handle_host_frame(
+            &frame,
+            &mut HashMap::new(),
+            &service,
+            out_tx,
+            on_nudge,
+            &on_grant,
+            &mut tokio::task::JoinSet::new(),
+        ))
+        .await.expect("frame processing must not wait on its own outbound queue");
+    }
+
+    #[tokio::test]
+    async fn durable_nudge_storage_failure_emits_no_ack() {
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let admitted = Arc::new(Mutex::new(None));
+        let captured = admitted.clone();
+        let on_nudge: NudgeHandler = Arc::new(move |nudge| {
+            *lock(&captured) = Some(nudge);
+            Err(RpcError::Failed("wake journal unavailable".into()))
+        });
+        dispatch_nudge_frame(
+            header(NUDGE_CHAT, NUDGE_KIND),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "acceptance-1"})
+                .to_string().as_bytes(),
+            &out_tx,
+            &on_nudge,
+        ).await;
+        assert_eq!(*lock(&admitted), Some(Nudge {
+            chat_id: NUDGE_CHAT.into(), nudge_id: Some("acceptance-1".into()),
+        }));
+        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn durable_nudge_ack_preserves_each_exact_token() {
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let accepted = Arc::new(Mutex::new(None));
+        let captured = accepted.clone();
+        let on_nudge: NudgeHandler = Arc::new(move |nudge| {
+            *lock(&captured) = Some(nudge);
+            Ok(())
+        });
+        let old_id = "old-acceptance";
+        let new_id = "n".repeat(NUDGE_ID_MAX_BYTES);
+        for id in [old_id, new_id.as_str()] {
+            dispatch_nudge_frame(
+                header(NUDGE_CHAT, NUDGE_KIND),
+                serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": id})
+                    .to_string().as_bytes(),
+                &out_tx,
+                &on_nudge,
+            ).await;
+        }
+        assert_eq!(lock(&accepted).as_ref().unwrap().nudge_id.as_deref(), Some(new_id.as_str()));
+        // A newer acceptance is already stored before the old ACK is sent.
+        // The old receipt must not consume the new token's pending edge row.
+        for id in [old_id, new_id.as_str()] {
+            let frame = out_rx.try_recv().expect("durable acceptance ACK");
+            let (ack, payload) = decode_device_frame(&frame).expect("decode ACK");
+            assert_eq!(ack, header(NUDGE_CHAT, NUDGE_ACK_KIND));
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+                serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": id}));
+        }
+        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn durable_nudge_legacy_no_id_emits_no_ack() {
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let captured = accepted.clone();
+        let on_nudge: NudgeHandler = Arc::new(move |nudge| {
+            lock(&captured).push(nudge);
+            Ok(())
+        });
+        for payload in [serde_json::json!({"chatId": NUDGE_CHAT}),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": null})] {
+            dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND),
+                payload.to_string().as_bytes(), &out_tx, &on_nudge).await;
+        }
+        assert_eq!(*lock(&accepted), vec![Nudge {
+            chat_id: NUDGE_CHAT.into(), nudge_id: None,
+        }; 2]);
+        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn durable_nudge_invalid_identity_never_admitted_or_acked() {
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let on_nudge: NudgeHandler = Arc::new(|_| panic!("invalid nudge reached durable storage"));
+        for payload in [
+            serde_json::json!({"chatId": "not-a-uuid", "nudgeId": "token"}),
+            serde_json::json!({"chatId": NUDGE_CHAT.to_uppercase(), "nudgeId": "token"}),
+            serde_json::json!({"chatId": NUDGE_CHAT.replace('-', ""), "nudgeId": "token"}),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": ""}),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "x".repeat(NUDGE_ID_MAX_BYTES + 1)}),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": 1}),
+            serde_json::json!({"nudgeId": "token"}),
+        ] {
+            let stream = payload.get("chatId").and_then(serde_json::Value::as_str).unwrap_or(NUDGE_CHAT);
+            dispatch_nudge_frame(header(stream, NUDGE_KIND),
+                payload.to_string().as_bytes(), &out_tx, &on_nudge).await;
+        }
+        let valid = serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "token"}).to_string();
+        let mut client_origin = header(NUDGE_CHAT, NUDGE_KIND);
+        client_origin.from = Some("client-1".into());
+        for header in [header("5cfe764f-62f5-4fe7-ad89-538d19931309", NUDGE_KIND),
+            client_origin, header(NUDGE_CHAT, NUDGE_KIND).with_to("client-1")] {
+            dispatch_nudge_frame(header, valid.as_bytes(), &out_tx, &on_nudge).await;
+        }
+        dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND), b"not-json", &out_tx, &on_nudge).await;
+        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn durable_nudge_full_outbound_queue_does_not_deadlock_acceptance() {
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        out_tx.try_send(vec![42]).unwrap();
+        let on_nudge: NudgeHandler = Arc::new(|_| Ok(()));
+        dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "retry-token"})
+                .to_string().as_bytes(), &out_tx, &on_nudge).await;
+        assert_eq!(out_rx.try_recv().unwrap(), vec![42]);
+        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "retry-token"})
+                .to_string().as_bytes(), &out_tx, &on_nudge).await;
+        let (ack, payload) = decode_device_frame(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(ack, header(NUDGE_CHAT, NUDGE_ACK_KIND));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "retry-token"}));
+    }
+
     #[test]
     fn round_trips_header_and_payload() {
         // device-frame.test.ts: "round-trips header + payload"
@@ -1185,42 +1436,4 @@ mod tests {
         assert!(!exact_device_response(&serde_json::json!({}), "dev-1"));
     }
 
-    #[test]
-    fn ws_url_shapes() {
-        let url = device_room_ws_url(
-            "https://edge.example/",
-            "dev-1",
-            "client",
-            Some("c1"),
-            "tok",
-        );
-        assert_eq!(
-            url,
-            "wss://edge.example/device/dev-1/ws?role=client&connId=c1&token=tok"
-        );
-        let host = device_room_ws_url("http://localhost:26640", "d", "host", None, "t");
-        assert_eq!(host, "ws://localhost:26640/device/d/ws?role=host&token=t");
-
-        assert_eq!(
-            peer_session_ws_url(
-                "https://edge.example/",
-                "c1",
-                "tok",
-                "session-1",
-                Some("deployment-1"),
-            ),
-            "wss://edge.example/peer/session-1/ws?connId=c1&token=tok&deploymentId=deployment-1"
-        );
-        assert_eq!(
-            peer_device_ws_url(
-                "https://edge.example/",
-                "c1",
-                "tok",
-                "session-1",
-                Some("deployment-1"),
-                "device-1",
-            ),
-            "wss://edge.example/device/device-1/ws?role=client&connId=c1&token=tok&purpose=peer-reply&peerSessionId=session-1&peerDeploymentId=deployment-1"
-        );
-    }
 }

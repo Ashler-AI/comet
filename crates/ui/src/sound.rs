@@ -231,8 +231,8 @@ mod tests {
 
         assert_eq!(
             comet_proto::view::effective_indicator(Some(&stale_working), now),
-            comet_proto::view::Indicator::None,
-            "the display may expire a working row"
+            comet_proto::view::Indicator::Unreachable,
+            "an expired active owner is unreachable, not idle"
         );
         assert_eq!(
             sound_for_session_update(Working, &stale_working, now),

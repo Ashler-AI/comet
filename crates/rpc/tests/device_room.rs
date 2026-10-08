@@ -142,6 +142,7 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
         .filter_map(|kv| kv.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    assert_eq!(query.get("syncProtocol").map(String::as_str), Some(comet_proto::DURABLE_SYNC_PROTOCOL));
     let is_host = query.get("role").map(String::as_str) == Some("host");
     let conn_id = query
         .get("connId")
@@ -341,7 +342,7 @@ fn cache(edge_url: &str) -> Arc<LinkCache> {
 }
 
 fn noop_nudge() -> comet_rpc::NudgeHandler {
-    Arc::new(|_| {})
+    Arc::new(|_| Ok(()))
 }
 
 async fn next_rpc_request(requests: &mut mpsc::UnboundedReceiver<Out>) -> comet_rpc::ClientFrame {
@@ -688,19 +689,21 @@ async fn host_supersede_drops_old_links_and_recovers() {
 async fn nudges_reach_the_host_callback() {
     let relay = FakeRelay::start().await;
     let service = TestService::new("host-a", "dev-a");
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id| {
-        let _ = tx.send(chat_id);
+    let (tx, mut rx) = mpsc::unbounded_channel::<comet_rpc::Nudge>();
+    let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |nudge| {
+        let _ = tx.send(nudge);
+        Ok(())
     });
     let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, on_nudge);
     relay.wait_host_connected().await;
 
-    relay.nudge("chat-42");
+    let chat_id = "00fd510b-d334-4e38-8eae-d62230f00d00";
+    relay.nudge(chat_id);
     let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("nudge delivered")
         .expect("channel open");
-    assert_eq!(got, "chat-42");
+    assert_eq!(got, comet_rpc::Nudge { chat_id: chat_id.into(), nudge_id: None });
 }
 
 /// Live-edge variant: run the same host+client path through a real DeviceRoom DO.

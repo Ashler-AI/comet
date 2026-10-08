@@ -321,7 +321,7 @@ async fn relay_peer_delivery_requires_owned_target_and_dedupes_payload() {
     );
     let mut different = payload.clone();
     different["text"] = serde_json::json!("different");
-    let conflict = client
+    client
         .call(
             methods::DELIVER_PEER_MESSAGE,
             serde_json::json!({
@@ -330,8 +330,7 @@ async fn relay_peer_delivery_requires_owned_target_and_dedupes_payload() {
         )
         .await
         .unwrap_err();
-    assert_eq!(conflict.to_string(), "command_id_conflict");
-    let foreign = client
+    client
         .call(
             methods::DELIVER_PEER_MESSAGE,
             serde_json::json!({
@@ -340,7 +339,6 @@ async fn relay_peer_delivery_requires_owned_target_and_dedupes_payload() {
         )
         .await
         .unwrap_err();
-    assert_eq!(foreign.to_string(), "invalid_peer_delivery");
 
     let delivered = peer_message_prompt(SOURCE, COMMAND, TARGET, COMMAND, "relay delivery");
     wait_for(
@@ -354,6 +352,8 @@ async fn relay_peer_delivery_requires_owned_target_and_dedupes_payload() {
         "relay peer delivery",
     )
     .await;
+    assert_eq!(serde_json::to_value(command(&core, TARGET, COMMAND).unwrap().payload).unwrap(), payload);
+    assert!(command(&core, HOP_COMMAND, "foreign-delivery").is_none());
     core.shutdown().await;
 }
 
