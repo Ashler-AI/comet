@@ -2092,6 +2092,7 @@ mod tests {
                     model: None,
                     harness_session_id: None,
                     status: None,
+                    started_at: None,
                     updated_at: None,
                     created_at: 1,
                     unknown: Default::default(),

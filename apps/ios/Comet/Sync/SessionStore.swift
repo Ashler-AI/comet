@@ -430,7 +430,7 @@ final class SessionStore {
             session = SessionRow(
                 chatId: chatId, deviceId: deviceId,
                 status: value["status"]?.stringValue.flatMap(SessionStatus.init(rawValue:)) ?? .idle,
-                startedAt: updatedAt, updatedAt: updatedAt
+                startedAt: value["startedAt"]?.i64Value, updatedAt: updatedAt
             )
             if let value = value["environment"],
                let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) {

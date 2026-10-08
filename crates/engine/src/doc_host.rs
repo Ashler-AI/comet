@@ -1253,11 +1253,16 @@ impl DocHost {
             return Ok(());
         };
         let updated_at = status.updated_at.timestamp_millis();
-        if session.status == Some(status.status) && session.updated_at == Some(updated_at) {
+        let started_at = status.started_at.map(|at| at.timestamp_millis());
+        if session.status == Some(status.status)
+            && session.updated_at == Some(updated_at)
+            && session.started_at == started_at
+        {
             return Ok(());
         }
         session.status = Some(status.status);
         session.updated_at = Some(updated_at);
+        session.started_at = started_at;
         // Publication ids are immutable replay keys, not upsert keys. The engine
         // already throttles heartbeats; only changed owner snapshots append here.
         handle.doc.append_publication(&PublicationRecord {
@@ -2325,6 +2330,7 @@ impl DocHost {
                                 .as_ref()
                                 .and_then(|session| session.harness_session_id.clone()),
                             status: Some(comet_proto::SessionStatus::Working),
+                            started_at: Some(at),
                             updated_at: Some(at),
                             created_at: previous.as_ref().map_or(at, |session| session.created_at),
                             unknown: Default::default(),
@@ -3001,6 +3007,7 @@ mod authority_tests {
                         model: None,
                         harness_session_id: None,
                         status: Some(SessionStatus::Working),
+                        started_at: None,
                         updated_at: Some(1),
                         created_at: 1,
                         unknown: Default::default(),
@@ -3026,6 +3033,9 @@ mod authority_tests {
             (SessionStatus::Errored, 20_006),
         ] {
             source.status = status;
+            if at == 10_001 || at == 20_005 {
+                source.started_at = chrono::DateTime::from_timestamp_millis(at);
+            }
             source.updated_at = chrono::DateTime::from_timestamp_millis(at).unwrap();
             host.record_agent_session(&source).unwrap();
             let snapshot = handle.doc.collaboration_snapshot().unwrap();
@@ -3037,6 +3047,10 @@ mod authority_tests {
             assert_eq!(
                 (assigned.status, assigned.updated_at),
                 (Some(status), Some(at))
+            );
+            assert_eq!(
+                assigned.started_at,
+                Some(if at < 20_005 { 10_001 } else { 20_005 })
             );
             let other = snapshot
                 .sessions

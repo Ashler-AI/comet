@@ -104,7 +104,7 @@ impl SessionActivity {
                                                 chat_id: room.session_id.clone(),
                                                 device_id: agent.owner_device_id.clone(),
                                                 status,
-                                                started_at: None,
+                                                started_at: agent.started_at.and_then(DateTime::<Utc>::from_timestamp_millis),
                                                 updated_at,
                                             }, last_message_at)
                                         })
@@ -271,6 +271,7 @@ mod tests {
                         model: None,
                         harness_session_id: None,
                         status: Some(status),
+                        started_at: None,
                         updated_at: Some(at),
                         created_at: 1_000,
                         unknown: Default::default(),

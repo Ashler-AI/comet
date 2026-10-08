@@ -7946,11 +7946,9 @@ impl Shell {
                 state
                     .selected_agent_session()
                     .filter(|session| session.chat_id == chat_id)
-                    .map(|session| {
-                        now.timestamp_millis()
-                            .saturating_sub(session.created_at)
-                            .max(0)
-                            / 1_000
+                    .and_then(|session| session.started_at)
+                    .map(|started_at| {
+                        now.timestamp_millis().saturating_sub(started_at).max(0) / 1_000
                     })
             })
             .unwrap_or(0);

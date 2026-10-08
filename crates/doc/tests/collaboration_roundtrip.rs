@@ -209,6 +209,7 @@ fn reconnect_and_model_handoff_keep_both_sessions_publications() {
                 model: Some("model-a".into()),
                 harness_session_id: None,
                 status: Some(SessionStatus::Working),
+                started_at: None,
                 updated_at: Some(30),
                 created_at: 30,
                 unknown: BTreeMap::new(),

@@ -5264,6 +5264,7 @@ mod tests {
             model: Some("openai-codex/gpt-5.6-sol".into()),
             harness_session_id: None,
             status: Some(status),
+            started_at: None,
             updated_at: Some((now - TimeDelta::seconds(updated_secs_ago)).timestamp_millis()),
             created_at: (now - TimeDelta::minutes(1)).timestamp_millis(),
             unknown: BTreeMap::new(),

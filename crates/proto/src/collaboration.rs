@@ -760,6 +760,9 @@ pub struct AgentSessionRecord {
     pub harness_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<crate::SessionStatus>,
+    /// Start of the most recent turn; unchanged by heartbeats and input resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
     pub created_at: i64,

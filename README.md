@@ -274,6 +274,11 @@ heartbeats feed the normal sidebar indicators; explicit completion updates
 the recency-sorted list. Reconnecting does not manufacture new activity or unread
 state, and removing a session reference stops its activity observer.
 
+The composer’s working timer measures the most recent turn, not the age of the
+session. Shared session publications carry `startedAt`; heartbeats and input
+resolution preserve it, and a new turn resets it. Desktop and iOS consume that
+turn start. Accurate shared-session timing requires an updated owner runtime.
+
 Scaffold hosts remain excluded from workspace-room access. Status publication
 changes require an updated sandbox runtime; local projection changes require an
 updated Crew controller. These source changes do not upgrade running installations.
