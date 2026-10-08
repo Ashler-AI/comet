@@ -137,6 +137,12 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: edge
         run: npm test
+      - name: Verify lossless workspace replay memory budget
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          node edge/scripts/workspace-replay-memory-smoke.mjs 2>&1 | tee native-evidence/workspace-replay-memory.log
       - name: Exercise real Edge and native failure recovery
         if: runner.os == 'Linux'
         env:

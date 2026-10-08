@@ -2,6 +2,47 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.147: lossless workspace recovery
+
+Loro's immutable causal-vector merges used mutable lookups for unchanged
+counters, copying shared tree nodes. Rebuilding the same shallow-root vector
+amplified that cost. A tiny accepted update could exhaust the shared Worker's
+128 MiB limit, disconnecting catalog readers and rejecting subsequent writes.
+Both native and Edge now preserve that structural sharing. Snapshot folds also
+reuse the encoded history at the existing retained boundary instead of decoding
+and copying every operation; no history boundary or permission is changed.
+
+Exact-byte replay of the captured snapshot and 27 accepted records, lossless
+folding, cold reopen and a returning offline edit used **80.94 MiB** of WASM,
+versus **174.13 MiB** before. All **299,330 operations**, complete state, version
+vector and retained frontier matched. The synthetic 450-peer concurrent-history
+regression fails the old runtime at **240.06 MiB** and passes at **11.75 MiB**.
+Run it with `node edge/scripts/workspace-replay-memory-smoke.mjs`; private
+baseline/delta paths remain supported and are never committed.
+
+Local verification also passed all **217 Edge**, **111 document** and **56 sync**
+tests, the 24-turn real two-device/Worker smoke with **1,600** retained rows,
+and quiet-owner freshness beyond the 45-second lease. The rebuilt headed demo
+rendered a new mock command's completed response, with an authoritative `applied`
+outcome. These are isolated checks, not proof that installed clients updated or
+that hosted rollout completed.
+
+Native recovery includes guarded complete-cache adoption and clears the cold
+repair latch only after the matching authenticated repair ACK. Unknown ACKs,
+foreign histories, genuine competing edits and resurrections remain blocked.
+The original intents are preserved; recovery does not reset a live workspace.
+
+The private Edge runtime is built from Loro
+`45708d059d8620fb53066c9f86cefa1601e0e1c6` with
+`edge/vendor/loro-1.16.4-crew.1.patch`. Apply that patch to the pinned checkout,
+then build `loro-wasm` for `wasm32-unknown-unknown` through
+`python3 scripts/local-cargo.py build --locked --release --manifest-path
+UPSTREAM/Cargo.toml -p loro-wasm --target wasm32-unknown-unknown`.
+Use `edge/scripts/build-loro-runtime.mjs WASM_PATH WASM_BINDGEN_PATH OUTPUT_TGZ
+UPSTREAM_SOURCE` with wasm-bindgen **0.2.100**; it verifies the published wrapper
+archive's SHA-512 and packages only fresh Node/web bindings. It never runs a
+local TypeScript check. Local typechecks remain intentionally disabled.
+
 ## Crew 0.1.146: published Scaffold source by default
 
 New Scaffold drafts select **Published source**, omitting a source override so

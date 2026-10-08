@@ -1,0 +1,79 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c2b079b..9c4ff45 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1935,7 +1935,7 @@ checksum = "3f3d053a135388e6b1df14e8af1212af5064746e9b87a06a345a7a779ee9695a"
+ 
+ [[package]]
+ name = "loro-wasm"
+-version = "1.16.3"
++version = "1.16.4"
+ dependencies = [
+  "js-sys",
+  "loro-common 1.16.0",
+diff --git a/crates/loro-internal/src/encoding/shallow_snapshot.rs b/crates/loro-internal/src/encoding/shallow_snapshot.rs
+index 074c60f..126508c 100644
+--- a/crates/loro-internal/src/encoding/shallow_snapshot.rs
++++ b/crates/loro-internal/src/encoding/shallow_snapshot.rs
+@@ -347,7 +347,12 @@ pub(crate) fn export_shallow_snapshot_inner(
+     let latest_frontiers = oplog.frontiers().clone();
+     let state_frontiers = doc.state_frontiers();
+     let is_attached = !doc.is_detached();
+-    let oplog_bytes = oplog.export_change_store_from(&start_vv, &start_from);
++    // Folding the existing boundary must not copy every retained operation.
++    let oplog_bytes = if &start_from == oplog.shallow_since_frontiers() {
++        oplog.encode_change_store()
++    } else {
++        oplog.export_change_store_from(&start_vv, &start_from)
++    };
+     let latest_vv = oplog.vv();
+     let ops_num: usize = latest_vv.sub_iter(&start_vv).map(|x| x.atom_len()).sum();
+     // Pre-encode the pre-root history for the forward-replay path below while
+diff --git a/crates/loro-internal/src/oplog/loro_dag.rs b/crates/loro-internal/src/oplog/loro_dag.rs
+index 4c7684d..40b211b 100644
+--- a/crates/loro-internal/src/oplog/loro_dag.rs
++++ b/crates/loro-internal/src/oplog/loro_dag.rs
+@@ -1123,9 +1123,7 @@ impl AppDag {
+ 
+                 let mut ans_vv = ImVersionVector::default();
+                 if top_node.deps == self.shallow_root_frontiers_deps {
+-                    for (&p, &c) in self.shallow_since_vv.iter() {
+-                        ans_vv.insert(p, c);
+-                    }
++                    ans_vv = self.shallow_since_vv.clone();
+                 } else {
+                     let mut all_deps_processed = true;
+                     for id in top_node.deps.iter() {
+diff --git a/crates/loro-internal/src/version.rs b/crates/loro-internal/src/version.rs
+index 3efbe14..30f1ee3 100644
+--- a/crates/loro-internal/src/version.rs
++++ b/crates/loro-internal/src/version.rs
+@@ -240,12 +240,8 @@ impl ImVersionVector {
+                 continue;
+             }
+ 
+-            if let Some(my_counter) = self.0.get_mut(&client_id) {
+-                *my_counter = normalize_vv_counter(*my_counter);
+-                if *my_counter < counter {
+-                    *my_counter = counter;
+-                }
+-            } else {
++            // A mutable lookup clones shared HAMT nodes even when the counter is unchanged.
++            if self.0.get(&client_id).copied().unwrap_or(0) < counter {
+                 self.0.insert(client_id, counter);
+             }
+         }
+@@ -277,12 +273,7 @@ impl ImVersionVector {
+             return;
+         }
+ 
+-        if let Some(counter) = self.0.get_mut(&id.peer) {
+-            *counter = normalize_vv_counter(*counter);
+-            if *counter < end {
+-                *counter = end;
+-            }
+-        } else {
++        if self.0.get(&id.peer).copied().unwrap_or(0) < end {
+             self.0.insert(id.peer, end);
+         }
+     }

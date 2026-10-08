@@ -70,7 +70,12 @@ pub(crate) fn export_shallow_snapshot_inner(
     let latest_frontiers = oplog.frontiers().clone();
     let state_frontiers = doc.state_frontiers();
     let is_attached = !doc.is_detached();
-    let oplog_bytes = oplog.export_change_store_from(&start_vv, &start_from);
+    // Folding the existing boundary must not copy every retained operation.
+    let oplog_bytes = if &start_from == oplog.shallow_since_frontiers() {
+        oplog.encode_change_store()
+    } else {
+        oplog.export_change_store_from(&start_vv, &start_from)
+    };
     let latest_vv = oplog.vv();
     let ops_num: usize = latest_vv.sub_iter(&start_vv).map(|x| x.atom_len()).sum();
     if &start_from == oplog.shallow_since_frontiers()
