@@ -866,10 +866,10 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("scaffold_control_plane_unavailable".into()))
     }
 
-    fn prepare_scaffold_attach(
+    fn scaffold_attach_projection(
         &self,
         control: &ScaffoldEnvironmentControl,
-    ) -> Result<Option<std::sync::Arc<crate::doc_host::ChatDocHandle>>, RpcError> {
+    ) -> Result<Option<SessionRoomProjection>, RpcError> {
         let ScaffoldEnvironmentControl::Attach { scope, .. } = control else {
             return Ok(None);
         };
@@ -894,15 +894,11 @@ impl EngineRpc {
         else {
             return Ok(None);
         };
-        let projection = SessionRoomProjection {
+        Ok(Some(SessionRoomProjection {
             project_id: scope.project_id.clone(),
             deployment_id: deployment_id.to_string(),
             session_id: session_id.to_string(),
-        };
-        self.doc_host
-            .open_projection(session_id, Some(&projection))
-            .map(Some)
-            .map_err(|error| RpcError::Failed(error.to_string()))
+        }))
     }
 
     async fn await_scaffold_owner_room(
@@ -4458,38 +4454,6 @@ mod tests {
         assert_eq!(projected.state, comet_proto::AnnotationState::Reanchored);
     }
 
-    #[tokio::test]
-    async fn scaffold_attach_preparation_does_not_wait_for_the_remote_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let core = crate::EngineCore::assemble_with_identity(
-            dir.path(),
-            std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
-            HarnessId::Mock,
-            None,
-            "project-a",
-            "accounts.google.com:subject-alice",
-            RuntimeProfile::Mock,
-        )
-        .unwrap();
-        let rpc = core.rpc_service();
-        let control = ScaffoldEnvironmentControl::Attach {
-            sandbox_id: "sandbox-a".into(),
-            scope: CollaborationScope {
-                project_id: "project-a".into(),
-                deployment_id: Some("deployment-a".into()),
-                session_id: Some("session-a".into()),
-                unknown: Default::default(),
-            },
-        };
-
-        tokio::time::timeout(Duration::from_millis(100), async {
-            rpc.prepare_scaffold_attach(&control)
-        })
-        .await
-        .expect("preparing an attach must not wait for the stopped remote owner")
-        .unwrap();
-        core.shutdown().await;
-    }
 
     #[test]
     fn tool_file_paths_keep_workspace_activity_only() {

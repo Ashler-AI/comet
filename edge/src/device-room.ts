@@ -568,6 +568,19 @@ export class DeviceRoom implements DurableObject {
             /* already gone */
           }
         }
+        // The new host has no prior RPC/watch/terminal streams. Retire their
+        // client sockets now; the predecessor's close is deliberately ignored.
+        for (const client of this.ctx.getWebSockets()) {
+          const current = client.deserializeAttachment() as SocketState | null;
+          if (current?.role !== "client" || current.superseded) continue;
+          client.serializeAttachment({ ...current, superseded: true });
+          this.deliver(client, { s: "", k: RELAY_KIND }, encodeRelayError("host_closed"));
+          try {
+            client.close(1012, "engine reconnected");
+          } catch {
+            /* already gone */
+          }
+        }
         await this.deliverHostStartup(pair[1], grant);
       }
       return new Response(null, { status: 101, webSocket: pair[0] });
@@ -691,8 +704,9 @@ export class DeviceRoom implements DurableObject {
       return;
     }
     if (state.role === "client" && !(await this.authorizePeerClient(ws, state))) return;
-    if (state.superseded) return;
     if (state.role === "host" && !(await this.authorizeHost(ws))) return;
+    // Authority checks yield: a successor may have retired this socket meanwhile.
+    if ((ws.deserializeAttachment() as SocketState | null)?.superseded) return;
     if (typeof message === "string") return; // ping/pong auto-response
     let frame: { header: DeviceFrameHeader; payload: Uint8Array };
     try {
@@ -751,6 +765,11 @@ export class DeviceRoom implements DurableObject {
         // Host offline or unauthorized: bounce a relay-level error so the
         // client can surface "device is asleep" instead of hanging.
         this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
+        return;
+      }
+      if ((ws.deserializeAttachment() as SocketState | null)?.superseded) return;
+      if (this.liveHost() !== host) {
+        this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_closed"));
         return;
       }
       const hostState = host.deserializeAttachment() as SocketState | null;

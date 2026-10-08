@@ -19,43 +19,8 @@ pub(crate) fn aggregate_owner_thread(
     canonical: &comet_proto::AgentSessionRecord,
     now: i64,
 ) -> Option<Session> {
-    if canonical.session_id != canonical.chat_id { return None; }
-    let matching_environment = |record: &comet_proto::AgentSessionRecord| match (&canonical.environment, &record.environment) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
-            let source_matches = match (&a.source, &b.source) {
-                (SessionEnvironmentSource::Local, SessionEnvironmentSource::Local) => true,
-                (SessionEnvironmentSource::Scaffold { sandbox_id: a, lifecycle: al, lifecycle_epoch: ae, .. },
-                 SessionEnvironmentSource::Scaffold { sandbox_id: b, lifecycle: bl, lifecycle_epoch: be, .. }) => a == b && al == bl && ae == be,
-                _ => false,
-            };
-            source_matches && a.owner_principal == b.owner_principal
-                && a.scope.project_id == b.scope.project_id && a.scope.deployment_id == b.scope.deployment_id
-                && a.database_environment == b.database_environment
-        }
-        _ => false,
-    };
-    let (writer, updated_at) = records.iter().filter(|record| {
-        record.chat_id == canonical.chat_id && record.owner_subject == canonical.owner_subject
-            && record.owner_device_id == canonical.owner_device_id && record.source == canonical.source
-            && matching_environment(record)
-    }).filter_map(|record| {
-        let status = record.status?;
-        let at = record.updated_at.unwrap_or(record.created_at);
-        let updated_at = DateTime::<Utc>::from_timestamp_millis(at)?;
-        let fresh = now.saturating_sub(at) <= comet_proto::view::SESSION_STALE_MS;
-        let rank = match status {
-            SessionStatus::AwaitingInput if fresh => 4,
-            SessionStatus::Working if fresh => 3,
-            SessionStatus::AwaitingInput | SessionStatus::Working => 2,
-            SessionStatus::Idle | SessionStatus::Errored => 1,
-        };
-        Some((record, updated_at, rank))
-    }).max_by(|(a, at, ar), (b, bt, br)| {
-        ar.cmp(br).then_with(|| at.cmp(bt))
-            .then_with(|| (a.status == Some(SessionStatus::Errored)).cmp(&(b.status == Some(SessionStatus::Errored))))
-            .then_with(|| a.session_id.cmp(&b.session_id))
-    }).map(|(record, at, _)| (record, at))?;
+    let writer = comet_proto::view::owner_thread_activity(records, canonical, now)?;
+    let updated_at = DateTime::<Utc>::from_timestamp_millis(writer.updated_at.unwrap_or(writer.created_at))?;
     Some(Session {
         chat_id: canonical.chat_id.clone(), device_id: canonical.owner_device_id.clone(),
         status: writer.status?, started_at: None, updated_at,
@@ -82,7 +47,9 @@ fn projected_rooms<'a>(
         let scaffold = reference.environment.as_ref().is_some_and(|environment| {
             matches!(environment.source, SessionEnvironmentSource::Scaffold { .. })
         });
-        if !scaffold && chat.is_none_or(|chat| chat.device_id == local_device) { return None; }
+        // Exact-id imports initially have only membership. Observe their owner
+        // publication too; a workspace host row may arrive later or never.
+        if !scaffold && chat.is_some_and(|chat| chat.device_id == local_device) { return None; }
         let recency = chat.and_then(|chat| chat.last_message_at).unwrap_or(reference.added_at);
         Some((reference, recency))
     }).collect();
@@ -148,7 +115,12 @@ impl SessionActivity {
                                         handle.doc().collaboration_snapshot().map(|snapshot| {
                                             let Some(agent) = snapshot.sessions.iter().find(|agent| {
                                                 agent.session_id == chat_id && agent.chat_id == chat_id
-                                                    && (room.is_none() || agent.source == comet_proto::AgentSessionSource::Scaffold)
+                                                    && !agent.owner_device_id.is_empty()
+                                                    && agent.source == if room.is_some() {
+                                                        comet_proto::AgentSessionSource::Scaffold
+                                                    } else {
+                                                        comet_proto::AgentSessionSource::Local
+                                                    }
                                             }) else { return Ok(()); };
                                             // Transcript segments are not turn boundaries or liveness evidence.
                                             // Only the owning runtime may publish working, idle, or input state.
@@ -382,6 +354,73 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("{stage} did not arrive; last observed value: {:?}", *rx.borrow()))
+    }
+
+    #[tokio::test]
+    async fn ordinary_membership_hydrates_unselected_status_without_claiming_a_chat() {
+        const CHAT: &str = "00000000-0000-4000-8000-000000000019";
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let workspace = WorkspaceHost::open(store.clone(), crate::WorkspaceHostConfig {
+            device_id: "local".into(), device_name: "Local".into(), platform: "test".into(),
+            project_scope: "project".into(), user_id: "owner".into(), edge: None,
+        }).unwrap();
+        // This is exactly AddSessionRef's ordinary UUID write: no chat placement.
+        workspace.upsert_session_ref(CHAT, None).unwrap();
+        let at = crate::now_ms();
+        let publication = |status, at| PublicationRecord {
+            id: format!("owner/{at}"), schema_version: COLLABORATION_SCHEMA_VERSION,
+            published_at: at, published_by: "owner".into(),
+            value: PublicationValue::AgentSession(Box::new(AgentSessionRecord {
+                session_id: CHAT.into(), chat_id: CHAT.into(), owner_subject: "owner".into(),
+                owner_device_id: "remote".into(), source: AgentSessionSource::Local,
+                environment: None, harness: None, model: None, harness_session_id: None,
+                status: Some(status), updated_at: Some(at), created_at: at,
+                unknown: Default::default(),
+            })), unknown: Default::default(),
+        };
+        let source = comet_doc::SessionDoc::init(CHAT).unwrap();
+        source.append_publication(&publication(SessionStatus::Working, at)).unwrap();
+        store.save_snapshot(CHAT, &source.export_snapshot().unwrap()).unwrap();
+        let host = DocHost::new(store, crate::DocHostConfig {
+            device_id: "local".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        host.set_workspace(workspace.clone());
+        let (_local, local) = watch::channel(Vec::new());
+        let mut sessions = workspace.merged_sessions_watch(local);
+        let bridge = SessionActivity::start(host.clone(), workspace.clone());
+        receive_for(&mut sessions, "rowless owner working", |rows| rows.iter().any(|row| {
+            row.chat_id == CHAT && row.device_id == "remote" && row.status == SessionStatus::Working
+        })).await;
+        let room = host.open(CHAT).unwrap();
+        room.doc().append_publication(&publication(SessionStatus::Idle, at + 1)).unwrap();
+        let rows = receive_for(&mut sessions, "rowless owner completed", |rows| rows.iter().any(|row| {
+            row.chat_id == CHAT && row.status == SessionStatus::Idle
+        })).await;
+        assert!(workspace.doc().chat(CHAT).unwrap().is_none(), "imports must retain shared-session routing");
+        assert!(!workspace.is_host(CHAT), "membership cannot claim execution ownership");
+        let current = rows.iter().find(|row| row.chat_id == CHAT).unwrap();
+        let before = workspace.doc().read_sessions().unwrap();
+        workspace.record_session_activity(None, "other-principal", &Session {
+            status: SessionStatus::Working, ..current.clone()
+        }, None).unwrap();
+        assert_eq!(workspace.doc().read_sessions().unwrap(), before);
+
+        // A later workspace host row is authoritative; an old canonical owner
+        // cannot relocate it or publish over the newly recorded device.
+        workspace.create_space("real-space", "new-owner-device", "/tmp", None, false).unwrap();
+        workspace.create_chat(CHAT, "real-space", None, None).unwrap();
+        workspace.record_session_activity(None, "owner", &Session {
+            status: SessionStatus::Working, ..current.clone()
+        }, None).unwrap();
+        assert_eq!(workspace.doc().read_sessions().unwrap(), before);
+        assert_eq!(workspace.doc().chat(CHAT).unwrap().unwrap().device_id, "new-owner-device");
+        workspace.remove_session_ref(CHAT).unwrap();
+        receive_for(&mut sessions, "rowless membership removed", |rows| rows.iter().all(|row| row.chat_id != CHAT)).await;
+        workspace.record_session_activity(None, "owner", current, None).unwrap();
+        assert!(workspace.doc().session_ref("owner", CHAT).unwrap().is_none());
+        assert_eq!(workspace.doc().read_sessions().unwrap(), before);
+        drop(bridge);
     }
 
     #[tokio::test]

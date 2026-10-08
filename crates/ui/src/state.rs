@@ -2700,7 +2700,7 @@ impl AppState {
         {
             ChatIndicator::Working
         } else {
-            display_status(chat, self.session_for(&chat.id), now)
+            comet_proto::view::display_indicator(chat, self.indicator_for(&chat.id, now))
         }
     }
 
@@ -2733,9 +2733,28 @@ impl AppState {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
 
+    fn owner_activity_for(&self, chat_id: &str, now: DateTime<Utc>) -> Option<&comet_proto::AgentSessionRecord> {
+        if self.selected_chat.as_deref() != Some(chat_id) { return None; }
+        let records = &self.collaboration.as_ref()?.sessions;
+        let canonical = records.iter().find(|record| record.session_id == chat_id && record.chat_id == chat_id)?;
+        let owner = comet_proto::view::owner_thread_activity(records, canonical, now.timestamp_millis())?;
+        if let Some(index) = self.session_for(chat_id) {
+            // A slower workspace/watch cannot mask this owner's newer room
+            // state. Neither another device nor an old active row may revive it.
+            if owner.owner_device_id != index.device_id
+                || owner.updated_at.unwrap_or(owner.created_at) <= index.updated_at.timestamp_millis() {
+                return None;
+            }
+        }
+        Some(owner)
+    }
+
     /// Staleness-checked status dot for a chat row.
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
-        effective_indicator(self.session_for(chat_id), now)
+        match self.owner_activity_for(chat_id, now) {
+            Some(owner) => effective_agent_indicator(Some(owner), now),
+            None => effective_indicator(self.session_for(chat_id), now),
+        }
     }
 
     pub fn selected_chat_row(&self) -> Option<&Chat> {
@@ -5615,6 +5634,44 @@ mod tests {
             effective_agent_indicator(Some(&awaiting), now),
             Indicator::AwaitingInput
         );
+    }
+
+    #[test]
+    fn owner_room_activity_outweighs_an_older_workspace_status() {
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let mut state = AppState::default();
+        state.selected_chat = Some("c".into());
+        state.apply_sessions(vec![session("c", SessionStatus::Working, 60, now)]);
+        let mut owner = agent_session("c", SessionStatus::Working, 5, now);
+        owner.session_id = "c".into();
+        owner.owner_device_id = "dev".into();
+        owner.source = AgentSessionSource::Local;
+        let publish = |state: &mut AppState, owner: &AgentSessionRecord| {
+            state.apply_collaboration(serde_json::from_value(serde_json::json!({
+                "schemaVersion": 2, "sessions": [owner],
+            })).unwrap());
+        };
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::Working);
+        assert_eq!(state.display_status_for(&chat("c", 0, None), now), ChatIndicator::Working);
+
+        // A newer terminal outcome wins over an older active room snapshot.
+        state.apply_sessions(vec![session("c", SessionStatus::Idle, 1, now)]);
+        assert_eq!(state.indicator_for("c", now), Indicator::None);
+        owner.status = Some(SessionStatus::AwaitingInput);
+        owner.updated_at = Some(now.timestamp_millis());
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::AwaitingInput);
+
+        // Another device's publication cannot refresh this owner's clock.
+        owner.owner_device_id = "other".into();
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::None);
+        owner.owner_device_id = "dev".into();
+        owner.updated_at = Some((now - TimeDelta::seconds(46)).timestamp_millis());
+        state.apply_sessions(vec![session("c", SessionStatus::Working, 60, now)]);
+        publish(&mut state, &owner);
+        assert_eq!(state.indicator_for("c", now), Indicator::Unreachable);
     }
 
     #[test]

@@ -38,6 +38,7 @@ const markers = [
   "OK Crew store eviction",
   "OK Crew peer message visibility",
   "OK Crew live list projection",
+  "OK Crew live transcript projection",
   "OK Crew room convergence",
   "OK Crew workspace intents",
   "OK Crew saved record recovery",

@@ -2,6 +2,51 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.144: sync and restart reliability
+
+Crew repairs journal-only workspace catch-up, bidirectional room backpressure,
+lost upload acknowledgements, and concurrent Loro/presence membership updates.
+Accepted durable updates still reach authorized readers when their publisher
+disconnects; a stalled reader's authority lookup no longer blocks other readers.
+Engine relay replacement ends the old RPC subscriptions so clients reconnect
+instead of retaining streams the new engine does not own.
+
+Online startup leaves completed histories cold and recovers outstanding work.
+Planned exits refresh interrupted-request eligibility without spending the crash
+retry budget; teardown errors do not retire resumable work. Explicit Stop and
+successful completion remain terminal. Presence probes start immediately and
+publish healthy peers without waiting for dead ones.
+
+Ordinary UUID imports observe canonical same-owner room activity before their
+workspace chat row arrives, without claiming host placement. Desktop imported
+rows display that activity. Mobile publishes coherent completed transcript
+projections during continuous streaming and performs a trailing catch-up pass;
+ambiguous unary relay failures are not automatically replayed. Explicit Scaffold
+attachment obtains verified authority before reopening legacy scoped caches.
+Desktop status strips, sidebar indicators and composer activity now consume newer
+same-owner room activity ahead of an older workspace/watch row. Child activity
+uses the engine's shared owner/scope selection; genuine stale heartbeats and
+newer terminal outcomes retain their precedence.
+
+Project/principal isolation, removed memberships, scoped-cache conflicts and
+single-writer protections remain enforced. Roll out Edge before native clients;
+existing remote engines require their own update/restart. Conflicting local caches
+are retained, not silently rewritten.
+
+Local verification exercised 1,600 retained workspace rows and 24 turns through
+real native engines and a local Worker, including offline edits, crashes, lost
+admission replies, reconnect and revocation. That 24-turn run's workspace catch-up
+took 4.006 seconds; agent inference and Scaffold authority use isolated test fixtures.
+All 575 desktop tests passed, including a failing-before/passing-after stale-index
+regression. A rebuilt headed demo showed Working with a two-minute-old workspace
+row and a fresh owner publication. The earlier demo rendered its completed response
+with one original user entry and authoritative `applied` command readback.
+A subsequent two-device run kept owner activity fresh beyond the 45-second lease,
+then passed reconnect, crash recovery and revocation checks with 1,600 history rows.
+Initial local mobile verification was syntax-only parsing. Exact-source remote
+native, Edge and mobile gates are required before staging publication. Local
+typechecks were intentionally skipped to preserve workstation resources.
+
 ## Unreleased: cross-device workspace recovery
 
 Legacy workspace rows and retained journals normalize repeated self-session

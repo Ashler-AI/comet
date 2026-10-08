@@ -164,6 +164,7 @@ interface SessionRoomInternals {
   trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean>;
   foldLog(): Promise<void>;
   handleJoin(ws: WebSocket, state: JoinState, message: JoinRequest): Promise<void>;
+  relay(from: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): Promise<void>;
   applyUpdates(
     ws: WebSocket,
     state: JoinState,
@@ -322,6 +323,126 @@ describe("SessionRoom chat authorization", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it("preserves ephemeral membership when a concurrent document join finishes cold replay", async () => {
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let cold = true;
+    const { room } = makeRoom(new MemorySql(), async () => {
+      if (!cold) return;
+      cold = false; entered.resolve(); await resume.promise;
+    });
+    const socket = new CapturingSocket();
+    const state: JoinState = { userId: "user-a", projectScope: PROJECT_SCOPE,
+      capabilities: CAPABILITIES, durableSync: true, rooms: [] };
+    socket.serializeAttachment(structuredClone(state));
+    const internals = room as unknown as SessionRoomInternals;
+    const joining = internals.handleJoin(socket as unknown as WebSocket, state, joinRequest("room-a"));
+    try {
+      await entered.promise;
+      // Real hibernation attachments deserialize to independent values.
+      await internals.handleJoin(socket as unknown as WebSocket,
+        structuredClone(socket.deserializeAttachment()) as JoinState,
+        { ...joinRequest("room-a"), crdt: CrdtType.LoroEphemeralStore });
+      resume.resolve(); await joining;
+      expect((socket.deserializeAttachment() as JoinState).rooms).toEqual(
+        expect.arrayContaining([CrdtType.Loro, CrdtType.LoroEphemeralStore]));
+      socket.sent.length = 0;
+      await room.webSocketMessage(socket as unknown as WebSocket, encode({
+        type: MessageType.DocUpdate, crdt: CrdtType.LoroEphemeralStore,
+        roomId: "room-a", batchId: "0x0000000000000001", updates: []
+      }).buffer as ArrayBuffer);
+      expect(socket.sent.map((bytes) => decode(bytes))).toContainEqual(
+        expect.objectContaining({ type: MessageType.Ack, status: UpdateStatusCode.Ok }));
+    } finally { resume.resolve(); await joining; }
+  });
+
+  it.each(["disconnect", "revoke"] as const)("relays durable writes when the publisher loses authority via %s before ACK", async (loss) => {
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let pause = false;
+    let revoked = false;
+    const sql = new MemorySql();
+    sql.meta.set("roomKind", "workspace");
+    const { room, sockets } = makeRoom(sql, async () => {
+      if (!pause) return;
+      pause = false; entered.resolve(); await resume.promise;
+    }, async () => new Response(null, { status: revoked ? 403 : 200 }));
+    const source = new LoroDoc();
+    const mirror = new LoroDoc();
+    let writing: Promise<void> | undefined;
+    try {
+      source.getMap("metadata").set("before", "accepted"); source.commit();
+      const baseline = source.export({ mode: "snapshot" });
+      sql.putBlob("snapshot", baseline); mirror.import(baseline);
+      const publisher = await join(room, "user-a", "room-a");
+      const reader = await join(room, "user-a", "room-a");
+      sockets.push(publisher as unknown as WebSocket, reader as unknown as WebSocket);
+      const state = publisher.deserializeAttachment() as JoinState;
+      state.grantId = "grant-1"; state.grantExpiresAt = Date.now() + 600_000;
+      publisher.serializeAttachment(state);
+      const from = source.oplogVersion();
+      let delta: Uint8Array;
+      try {
+        source.getMap("metadata").set("live", "must reach readers"); source.commit();
+        delta = source.export({ mode: "update", from });
+      } finally { from.free(); }
+      publisher.sent.length = 0; reader.sent.length = 0; pause = true;
+      writing = (room as unknown as SessionRoomInternals).applyUpdates(publisher as unknown as WebSocket,
+        state, CrdtType.Loro, "room-a", "0x0000000000000001", [delta]);
+      await entered.promise;
+      if (loss === "disconnect") publisher.close(); else revoked = true;
+      resume.resolve(); await writing;
+      expect(publisher.sent.map((bytes) => decode(bytes))).not.toContainEqual(
+        expect.objectContaining({ type: MessageType.Ack, status: UpdateStatusCode.Ok }));
+      for (const bytes of reader.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) mirror.importBatch(message.updates);
+      }
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+      expect((await (makeRoom(sql).room as unknown as SessionRoomInternals).ensureDoc()).toJSON()).toEqual(source.toJSON());
+    } finally { resume.resolve(); await writing; source.free(); mirror.free(); }
+  });
+
+  it("delivers live updates without waiting for another reader's grant authority", async () => {
+    const authority = Promise.withResolvers<Response>();
+    const entered = Promise.withResolvers<void>();
+    const delivered = Promise.withResolvers<void>();
+    const { room, sockets } = makeRoom(new MemorySql(), async () => {}, async () => {
+      entered.resolve(); return authority.promise;
+    });
+    const publisher = await join(room, "user-a", "room-a");
+    const slow = await join(room, "user-a", "room-a");
+    const reader = await join(room, "user-a", "room-a");
+    const state = slow.deserializeAttachment() as JoinState;
+    state.grantId = "grant-1"; state.grantExpiresAt = Date.now() + 600_000;
+    slow.serializeAttachment(state);
+    sockets.push(slow as unknown as WebSocket, reader as unknown as WebSocket);
+    slow.sent.length = 0; reader.sent.length = 0;
+    vi.spyOn(reader, "send").mockImplementation((bytes) => {
+      reader.sent.push(bytes); delivered.resolve();
+    });
+    const source = new LoroDoc();
+    const mirror = new LoroDoc();
+    source.getText("t").insert(0, "live for the other reader"); source.commit();
+    const sending = (room as unknown as SessionRoomInternals).relay(publisher as unknown as WebSocket,
+      CrdtType.Loro, "room-a", [source.export({ mode: "snapshot" })]);
+    try {
+      await entered.promise;
+      await delivered.promise; // Must resolve BEFORE the stalled authority does.
+      for (const bytes of reader.sent) {
+        const message = decode(bytes);
+        if (message.type === MessageType.DocUpdate) mirror.importBatch(message.updates);
+      }
+      expect(mirror.toJSON()).toEqual(source.toJSON());
+      authority.resolve(new Response(null, { status: 403 })); await sending;
+      expect(slow.sent).toHaveLength(0);
+      expect(slow.closed).toContainEqual({ code: 4403, reason: "device grant invalid" });
+    } finally {
+      authority.resolve(new Response(null, { status: 403 })); await sending;
+      source.free(); mirror.free();
+    }
   });
 
   it.each(["", "?syncProtocol=unknown", "?syncProtocol=durable-records-v1&syncProtocol=unknown"])(

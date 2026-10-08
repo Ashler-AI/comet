@@ -33,6 +33,16 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
 
 For the separate browser surface, see the [Scaffold session web view](README.md#scaffold-session-web-view).
 
+Discovery, transcript replication, and device RPC are independent transports, not
+one user-wide streaming room. Same-user discovery requires the same authenticated
+principal and project/environment; staging and production remain isolated. A live
+session room does not prove workspace convergence or owner-engine reachability.
+The browser surface is a bound single-session viewport, not the session directory.
+Replacing a device's host socket invalidates prior client RPC streams: the new
+host has a new virtual-connection map. Clients reconnect and resubscribe; ambiguous
+unary calls are not automatically replayed. Durable commands reconcile their
+original identities through the command ledger.
+
 ### Headed / headless
 Single binary `comet`:
 - `comet` — headed. If a local engine daemon is already listening on the IPC port, connect to it;
@@ -43,6 +53,13 @@ Single binary `comet`:
   window still opens, having lost only the ability to host peers.
 - `comet headless` — engine only; prints sign-in URL on TTY (paste-code flow), serves IPC on
   localhost + hosts its DeviceRoom for remote control. A VPS runs this; a laptop's UI drives it.
+
+Planned shutdown checkpoints interrupted requests before cancellation, refreshing
+their recovery age and resetting the crash-attempt budget. Cancellation-induced
+harness errors are interruptions, not successful retirement; explicit user stops
+and completed turns remain terminal. Online boot restores pending work but leaves
+settled history cold until selection or a durable nudge opens its room. Targeted
+room recovery filters journal candidates before reading unrelated histories.
 
 ## 2. Data model — all Loro
 
@@ -147,6 +164,17 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    without rekeying existing bare-chat writers. Controllers observe pinned remote rooms
    through existing DocHost handles and merge a principal-local activity watch ahead of
    stale workspace status; locally hosted runs keep direct live-status precedence.
+   The selected desktop thread also compares its direct room projection against
+   the workspace watch: a newer same-device owner heartbeat/outcome wins. Engine
+   and viewport share the principal/environment/lifecycle-aware child selector;
+   metadata, unrelated writers and expired heartbeats cannot refresh liveness.
+   Observers cover recent remote rooms plus fresh active sessions. Ordinary imported
+   memberships without a chat row may consume canonical same-owner Local status,
+   but do not invent a workspace placement; an arriving chat row fences device
+   ownership. Desktop device probes start immediately and publish each reachable
+   peer independently. Local presence does not depend on
+   the workspace socket. Background observation never resumes a paused sandbox;
+   explicit Attach obtains verified grant authority before opening legacy caches.
 
    *Why a workspace doc and not N tiny metadata docs:* the sidebar consumes one engine
    subscription for the whole list (grouping, resort animations, unseen markers).
@@ -180,6 +208,16 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    transient resource failures; the transcript crash budget must not permanently lock
    workspace discovery. Irreversibly trimmed gaps still require a replica or backup
    covering their dependencies, never automatic resets or silent loss.
+   Full backfill may be a snapshot plus journal or a journal alone. Journal-backed
+   clients assemble either shape in an isolated recovery document and adopt only
+   after the advertised frontier materializes, then wait for retained local edits'
+   upload acknowledgements. Socket read/write progress is independent and bounded;
+   unacknowledged writes redial rather than waiting for the idle-room probe.
+   Edge membership changes reread WebSocket attachments after asynchronous work.
+   Persisted updates fan out to independently authorized readers even if the
+   publisher disconnects; publisher acknowledgements remain authority-gated.
+   Mobile transcript projection publishes each coherent completed read and schedules
+   a trailing pass, so an ongoing stream cannot indefinitely invalidate rendering.
 
    Rollout: deploy the edge changes before publishing desktop and mobile builds. Older clients
    cannot perform the new incomplete-history handshake, so both native updates are needed for

@@ -637,6 +637,11 @@ enum E2ERunner {
             return
         }
         log("OK Crew live list projection")
+        guard await SessionStore.runLiveTranscriptProjectionRegression() else {
+            log("FAIL Crew live transcript projection: sustained imports starved publication")
+            return
+        }
+        log("OK Crew live transcript projection")
         #endif
     }
 

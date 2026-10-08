@@ -956,7 +956,7 @@ impl Harness for InterruptedHarness {
     async fn run(
         &self,
         request: RunRequest,
-        _controls: RunControls,
+        controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.requests.lock().unwrap().push(request.clone());
         Ok(futures::stream::iter([
@@ -972,13 +972,16 @@ impl Harness for InterruptedHarness {
                 text: "partial answer".into(),
             }),
         ])
-        .chain(futures::stream::pending())
+        .chain(futures::stream::once(async move {
+            controls.interrupt.cancelled().await;
+            Err(HarnessError::Protocol("child exited during cancellation".into()))
+        }))
         .boxed())
     }
 }
 
 #[tokio::test]
-async fn graceful_shutdown_recovers_exact_active_request_across_two_restarts() {
+async fn graceful_shutdown_recovers_long_active_request_across_repeated_restarts() {
     let dir = tempfile::tempdir().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let registry = Arc::new(HarnessRegistry::for_profile(RuntimeProfile::Mock));
@@ -992,7 +995,7 @@ async fn graceful_shutdown_recovers_exact_active_request_across_two_restarts() {
     request
         .model_options
         .insert("effort".into(), serde_json::json!("high"));
-    for generation in 0..3 {
+    for generation in 0..5 {
         let core = assemble_registry(dir.path(), registry.clone());
         if generation == 0 {
             pre_title(&core);
@@ -1038,6 +1041,14 @@ async fn graceful_shutdown_recovers_exact_active_request_across_two_restarts() {
             generation + 1,
             "live runtime must not replay"
         );
+        if generation == 0 {
+            // This turn has been active for a day. Its planned interruption is
+            // fresh even though its original dispatch predates the crash cutoff.
+            let path = dir.path().join("projects/ashler-local/dev-user/journals/chat-restart.recovery");
+            let mut pending: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            pending[1]["updated_at"] = serde_json::json!(chrono::Utc::now().timestamp_millis() - 24 * 60 * 60 * 1000);
+            std::fs::write(path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        }
         core.shutdown().await;
         assert!(!core.sessions.any_active());
         assert!(
@@ -1063,4 +1074,27 @@ async fn graceful_shutdown_recovers_exact_active_request_across_two_restarts() {
         );
         drop(core);
     }
+}
+
+#[tokio::test]
+async fn intentional_stop_stays_retired_after_shutdown_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(HarnessRegistry::for_profile(RuntimeProfile::Mock));
+    registry.register(Arc::new(InterruptedHarness { requests: requests.clone() }));
+    let core = assemble_registry(dir.path(), registry.clone());
+    pre_title(&core);
+    core.sessions.dispatch(CHAT, HarnessId::Mock, run_request("stop this work", "/tmp"), Some("stopped-user".into())).await.unwrap();
+    wait_for(|| entries_now(&core).iter().any(|entry| entry.status == Some(MessageStatus::Streaming)), "work starts").await;
+    assert!(core.sessions.interrupt(CHAT).await.unwrap());
+    core.shutdown().await;
+    drop(core);
+
+    let core = assemble_registry(dir.path(), registry);
+    assert_eq!(core.sessions.recover_stale().unwrap(), 0);
+    tokio::task::yield_now().await;
+    assert!(!core.sessions.any_active());
+    core.shutdown().await;
+    assert_eq!(requests.lock().unwrap().len(), 1, "user Stop must never become engine recovery");
+    assert_eq!(entries_now(&core).iter().filter(|entry| entry.id == "stopped-user").count(), 1);
 }

@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AgentSessionRecord, AuthState, Chat, ChatIndicator, Session, SessionStatus, Space};
+use crate::{AgentSessionRecord, AuthState, Chat, ChatIndicator, Session, SessionEnvironmentSource, SessionStatus, Space};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -91,14 +91,67 @@ pub fn effective_agent_indicator(
     }
 }
 
+/// Select the genuine writer heartbeat for one public thread, including children.
+pub fn owner_thread_activity<'a>(
+    records: &'a [AgentSessionRecord],
+    canonical: &AgentSessionRecord,
+    now: i64,
+) -> Option<&'a AgentSessionRecord> {
+    if canonical.session_id != canonical.chat_id { return None; }
+    let matching_environment = |record: &AgentSessionRecord| match (&canonical.environment, &record.environment) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            let source_matches = match (&a.source, &b.source) {
+                (SessionEnvironmentSource::Local, SessionEnvironmentSource::Local) => true,
+                (SessionEnvironmentSource::Scaffold { sandbox_id: a, lifecycle: al, lifecycle_epoch: ae, .. },
+                 SessionEnvironmentSource::Scaffold { sandbox_id: b, lifecycle: bl, lifecycle_epoch: be, .. }) => a == b && al == bl && ae == be,
+                _ => false,
+            };
+            source_matches && a.owner_principal == b.owner_principal
+                && a.scope.project_id == b.scope.project_id && a.scope.deployment_id == b.scope.deployment_id
+                && a.database_environment == b.database_environment
+        }
+        _ => false,
+    };
+    records.iter().filter(|record| {
+        record.chat_id == canonical.chat_id && record.owner_subject == canonical.owner_subject
+            && record.owner_device_id == canonical.owner_device_id && record.source == canonical.source
+            && matching_environment(record)
+    }).filter_map(|record| {
+        let status = record.status?;
+        let at = record.updated_at.unwrap_or(record.created_at);
+        let updated_at = DateTime::<Utc>::from_timestamp_millis(at)?;
+        let fresh = now.saturating_sub(at) <= SESSION_STALE_MS;
+        let rank = match status {
+            SessionStatus::AwaitingInput if fresh => 4,
+            SessionStatus::Working if fresh => 3,
+            SessionStatus::AwaitingInput | SessionStatus::Working => 2,
+            SessionStatus::Idle | SessionStatus::Errored => 1,
+        };
+        Some((record, updated_at, rank))
+    }).max_by(|(a, at, ar), (b, bt, br)| {
+        ar.cmp(br).then_with(|| at.cmp(bt))
+            .then_with(|| (a.status == Some(SessionStatus::Errored)).cmp(&(b.status == Some(SessionStatus::Errored))))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    }).map(|(record, _, _)| record)
+}
+
 /// Fresh active state wins; expired active state stays visibly unreachable
 /// instead of manufacturing completion. Terminal/history rows use the synced
 /// seen marker via [`crate::chat_indicator`].
 pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
-    match effective_indicator(session, now) {
+    display_indicator(chat, effective_indicator(session, now))
+}
+
+/// Keep sidebar completion/seen semantics identical for either activity source.
+pub fn display_indicator(chat: &Chat, indicator: Indicator) -> ChatIndicator {
+    match indicator {
+        Indicator::Working => ChatIndicator::Working,
+        Indicator::AwaitingInput => ChatIndicator::AwaitingInput,
         Indicator::Unreachable => ChatIndicator::Unreachable,
-        Indicator::None => crate::chat_indicator(chat, None),
-        _ => crate::chat_indicator(chat, session),
+        Indicator::Errored if chat.unseen() => ChatIndicator::Errored,
+        _ if chat.unseen() => ChatIndicator::Completed,
+        _ => ChatIndicator::Idle,
     }
 }
 

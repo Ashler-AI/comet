@@ -39,10 +39,10 @@ use loro_protocol::{
     BatchId, CrdtType, JoinErrorCode, Permission, ProtocolMessage, RoomErrorCode, UpdateStatusCode,
     decode, encode,
 };
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
 /// Payload bytes per outbound fragment — mirrors the edge's `FRAGMENT_BYTES`
 /// (leaves envelope room under loro-protocol's 256KB message cap).
@@ -77,6 +77,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// answers them without ever waking the DO — so room-level liveness is
 /// enforced separately (`JOIN_RESPONSE_DEADLINE` / `ROOM_PROBE_AFTER` below).
 const SILENCE_LEASE: Duration = Duration::from_secs(40);
+/// A single durable write cannot wait for an idle-room probe (up to four hours).
+/// Other clients' broadcasts and transport pongs do not acknowledge this write.
+const ACK_DEADLINE: Duration = Duration::from_secs(60);
 /// Bound on one whole dial, enforced around `Connector::connect` in
 /// `RoomActor::run` so it covers every connector. For the production
 /// `WsConnector` both `provider.url()` (a token-endpoint HTTP call) and
@@ -308,11 +311,13 @@ pub(crate) trait Connector: Send + Sync + 'static {
 
 struct WsConnector {
     url: Arc<dyn UrlProvider>,
+    room_id: String,
 }
 
 impl Connector for WsConnector {
     fn connect(&self) -> BoxFuture<'static, Result<Pipe, SyncError>> {
         let provider = self.url.clone();
+        let room_id = self.room_id.clone();
         Box::pin(async move {
             // Fresh URL (and therefore fresh `?token=`) on every attempt — an
             // expired access token is never reused across a reconnect. Both
@@ -330,7 +335,7 @@ impl Connector for WsConnector {
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
             let room_reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            tokio::spawn(pump(ws, out_rx, in_tx, room_reset.clone()));
+            tokio::spawn(pump(ws, out_rx, in_tx, room_reset.clone(), room_id));
             Ok(Pipe {
                 tx: out_tx,
                 rx: in_rx,
@@ -343,65 +348,76 @@ impl Connector for WsConnector {
 /// Shuttle frames between the WebSocket and the actor's channels, plus the
 /// text-ping keepalive. Ends (dropping `in_tx`, which the actor observes) when
 /// either side closes.
-async fn pump(
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: WebSocketStream<S>,
     mut out_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<Vec<u8>>,
     room_reset: Arc<std::sync::atomic::AtomicBool>,
+    room_id: String,
 ) {
     let (mut sink, mut stream) = ws.split();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping.tick().await; // consume the immediate first tick
-    let mut last_rx = tokio::time::Instant::now();
-    loop {
-        tokio::select! {
-            frame = out_rx.recv() => match frame {
-                Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    // Actor is done (shutdown): close politely.
-                    let _ = sink.send(WsMessage::Close(None)).await;
-                    break;
-                }
-            },
-            frame = stream.next() => match frame {
-                Some(Ok(WsMessage::Binary(bytes))) => {
-                    last_rx = tokio::time::Instant::now();
-                    if in_tx.send(bytes).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(WsMessage::Close(frame))) => {
-                    if frame.is_some_and(|frame| u16::from(frame.code) == 4410) {
-                        room_reset.store(true,std::sync::atomic::Ordering::Release);
-                    }
-                    break;
-                }
-                Some(Ok(_)) => {
-                    // Text "pong" / control frames: proof of life for the
-                    // TRANSPORT lease only. The CF runtime auto-answers our
-                    // ping without waking the DO, so this says nothing about
-                    // the room (2026-07-30 — see JOIN_RESPONSE_DEADLINE);
-                    // room-level liveness is judged in `run_session`, which
-                    // only ever sees the binary frames forwarded below.
-                    last_rx = tokio::time::Instant::now();
-                }
-                Some(Err(_)) | None => break,
-            },
-            _ = ping.tick() => {
-                if sink.send(WsMessage::Text("ping".into())).await.is_err() {
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                tracing::warn!("room socket silent past lease; treating as dead");
+    // A join can upload and backfill more than both bounded queues at once.
+    // Blocking reads on the actor must never prevent draining its writes.
+    let write = async {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await;
+        loop {
+            let message = tokio::select! {
+                frame = out_rx.recv() => match frame {
+                    Some(bytes) => WsMessage::Binary(bytes),
+                    None => WsMessage::Close(None),
+                },
+                _ = ping.tick() => WsMessage::Text("ping".into()),
+            };
+            let closing = matches!(message, WsMessage::Close(_));
+            // A blocked TCP write must not defeat the actor's reconnect lease.
+            if !matches!(tokio::time::timeout(SILENCE_LEASE, sink.send(message)).await, Ok(Ok(()))) || closing {
                 break;
             }
         }
+    };
+    let read = async {
+        let mut last_rx = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                frame = stream.next() => match frame {
+                    Some(Ok(WsMessage::Binary(bytes))) => {
+                        last_rx = tokio::time::Instant::now();
+                        if !matches!(tokio::time::timeout(SILENCE_LEASE, in_tx.send(bytes)).await, Ok(Ok(()))) {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        if let Some(frame) = frame {
+                            tracing::warn!(room = %room_id, code = u16::from(frame.code), reason = %frame.reason, "room socket closed by server");
+                            if u16::from(frame.code) == 4410 {
+                                room_reset.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        // Auto-pongs prove transport liveness, not room progress.
+                        last_rx = tokio::time::Instant::now();
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(room = %room_id, %error, "room socket receive failed");
+                        break;
+                    }
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
+                    tracing::warn!("room socket silent past lease; treating as dead");
+                    break;
+                }
+            }
+        }
+    };
+    tokio::select! {
+        _ = write => {},
+        _ = read => {},
+        _ = in_tx.closed() => {},
     }
 }
 
@@ -438,13 +454,13 @@ impl RoomClient {
     /// `url` is the full, already-authenticated WebSocket URL (the edge takes
     /// the bearer as `?token=`, e.g. `wss://…/session/{chatId}/ws?token=…`);
     /// `room_id` is the doc room name carried inside the protocol frames (the
-    /// chatId, or `ws/{orgId}` for workspace docs).
+    /// chatId, or `ws4/{projectScope}` for workspace docs).
     ///
-    /// Resolves once the initial join handshake succeeds — the JoinRequest
-    /// carries the doc's version vector, and the server's backfill (updates or
-    /// a full snapshot) is imported as it arrives. A first-attempt failure
-    /// (unreachable edge, `JoinError`) is returned as `Err`; only after a
-    /// successful join does the client keep reconnecting in the background.
+    /// Resolves only after the advertised server history materializes and the
+    /// initial local upload is acknowledged. Backfill may be a snapshot followed
+    /// by journal deltas, or a journal alone. Once remote history is advertised,
+    /// retries retain that convergence obligation rather than reporting a false
+    /// ready state. Established clients reconnect automatically after failures.
     pub async fn connect(url: &str, room_id: &str, doc: LoroDoc) -> Result<Self, SyncError> {
         Self::connect_via(Arc::new(StaticUrl(url.to_string())), room_id, doc).await
     }
@@ -467,7 +483,7 @@ impl RoomClient {
         doc: LoroDoc,
         tuning: RoomTuning,
     ) -> Result<Self, SyncError> {
-        let connector = Arc::new(WsConnector { url: provider });
+        let connector = Arc::new(WsConnector { url: provider, room_id: room_id.to_string() });
         Self::connect_with_tuned(connector, room_id, doc, tuning).await
     }
     /// Join with a replaceable application binding; recovery remounts every observer.
@@ -475,7 +491,7 @@ impl RoomClient {
         provider: Arc<dyn UrlProvider>, room_id: &str,
         doc: comet_doc::SharedDocument, tuning: RoomTuning,
     ) -> Result<Self, SyncError> {
-        Self::connect_with_tuned(Arc::new(WsConnector { url: provider }), room_id, doc, tuning).await
+        Self::connect_with_tuned(Arc::new(WsConnector { url: provider, room_id: room_id.to_string() }), room_id, doc, tuning).await
     }
 
     /// Test seam: production always dials through [`Self::connect_via_tuned`].
@@ -855,11 +871,10 @@ impl RoomActor {
                 ),
                 None => (sess.last_pushed_rx + probe_interval, false),
             };
+            let ack_deadline = sess.pending.values().map(|(sent, _)| *sent + ACK_DEADLINE).min();
             tokio::select! {
-                // Biased so a buffered answer frame always beats an expired
-                // deadline in the same poll — never kill with the
-                // JoinResponseOk already readable.
-                biased;
+                // Fair polling: a busy workspace's inbound broadcasts must not
+                // starve local durable writes, presence, or recovery hints.
                 // Post-suspend the socket is almost certainly half-open (NAT
                 // state gone); ending the session redials immediately with a
                 // freshly-provided URL/token instead of waiting out the
@@ -980,7 +995,15 @@ impl RoomActor {
                         ));
                     }
                 }
+                _ = tokio::time::sleep_until(ack_deadline.unwrap_or(liveness_at)), if ack_deadline.is_some() => {
+                    break SessionEnd::Lost(SyncError::WebSocket(
+                        "durable update acknowledgement timed out; resyncing".into(),
+                    ));
+                }
                 _ = tokio::time::sleep_until(liveness_at) => {
+                    // Prefer a buffered answer over its deadline without giving
+                    // an unbounded inbound stream priority over local writes.
+                    if !pipe.rx.is_empty() { continue; }
                     if join_outstanding {
                         // The 2026-07-30 hang: a room that accepted the socket
                         // but never answered the join. Kill the session so the
@@ -1040,7 +1063,7 @@ struct Session {
     events: broadcast::Sender<RoomEvent>,
     stats: Arc<RoomStatsShared>,
     /// Sent-but-unacked outbound batches, kept for FragmentTimeout resends.
-    pending: HashMap<BatchId, Vec<Vec<u8>>>,
+    pending: HashMap<BatchId, (tokio::time::Instant, Vec<Vec<u8>>)>,
     /// Inbound reassembly buffers.
     fragments: HashMap<BatchId, FragmentBuffer>,
     joined_lor: bool,
@@ -1139,9 +1162,9 @@ impl Session {
 
     async fn send(&self, message: &ProtocolMessage) -> Result<(), SyncError> {
         let bytes = encode(message).map_err(SyncError::Protocol)?;
-        self.tx
-            .send(bytes)
+        tokio::time::timeout(SILENCE_LEASE, self.tx.send(bytes))
             .await
+            .map_err(|_| SyncError::WebSocket("outbound queue stalled".into()))?
             .map_err(|_| SyncError::WebSocket("connection closed".into()))
     }
 
@@ -1453,7 +1476,10 @@ impl Session {
                     if let Some(metadata) = &metadata { self.required_remote.merge(&metadata.partial_end_vv); }
                     let snapshot = metadata.as_ref().is_some_and(|metadata| matches!(metadata.mode,
                         loro::EncodedBlobMode::Snapshot | loro::EncodedBlobMode::ShallowSnapshot | loro::EncodedBlobMode::OutdatedSnapshot));
-                    if self.doc.has_journal() && snapshot && self.recovery_doc.is_none()
+                    // A fresh edge room can retain only SQL deltas, with no
+                    // snapshot yet. Build that full backfill in isolation too;
+                    // importing it directly leaves recovering_snapshot latched.
+                    if self.doc.has_journal() && (self.recovering_snapshot || snapshot) && self.recovery_doc.is_none()
                         && metadata.as_ref().is_some_and(|metadata| !metadata.partial_end_vv.is_empty()) {
                         self.recovering_snapshot = true;
                         self.recovery_doc = Some(LoroDoc::new());
@@ -1603,7 +1629,7 @@ impl Session {
             UpdateStatusCode::Ok => {
                 let batch = self.pending.remove(&ref_id);
                 let acknowledged = batch.is_some();
-                if let Some(batch) = batch {
+                if let Some((_, batch)) = batch {
                     let mut version = VersionVector::default();
                     for bytes in batch { if let Ok(metadata) = LoroDoc::decode_import_blob_meta(&bytes, true) { version.merge(&metadata.partial_end_vv); } }
                     self.doc.acknowledge_scoped(self.scope_generation,&version).map_err(|error| SyncError::Loro(error.to_string()))?;
@@ -1620,7 +1646,7 @@ impl Session {
             UpdateStatusCode::FragmentTimeout => {
                 // DO hibernated mid-batch and lost reassembly state — resend
                 // the whole batch (self-healing per the edge's design).
-                if let Some(batch) = self.pending.remove(&ref_id) {
+                if let Some((_, batch)) = self.pending.remove(&ref_id) {
                     self.send_loro_updates(batch).await?;
                 }
             }
@@ -1700,20 +1726,21 @@ impl Session {
     async fn flush_small_batch(&mut self, updates: Vec<Vec<u8>>) -> Result<(), SyncError> {
         self.check_pending_capacity()?;
         let batch_id = new_batch_id();
-        self.pending.insert(batch_id, updates.clone());
+        let pending = updates.clone();
         self.send(&ProtocolMessage::DocUpdate {
             crdt: CrdtType::Loro,
             room_id: self.room_id.clone(),
             updates,
             batch_id,
         })
-        .await
+        .await?;
+        self.pending.insert(batch_id, (tokio::time::Instant::now(), pending));
+        Ok(())
     }
 
     async fn send_fragmented(&mut self, update: Vec<u8>) -> Result<(), SyncError> {
         self.check_pending_capacity()?;
         let batch_id = new_batch_id();
-        self.pending.insert(batch_id, vec![update.clone()]);
         let fragment_count = update.len().div_ceil(FRAGMENT_BYTES);
         self.send(&ProtocolMessage::DocUpdateFragmentHeader {
             crdt: CrdtType::Loro,
@@ -1733,6 +1760,7 @@ impl Session {
             })
             .await?;
         }
+        self.pending.insert(batch_id, (tokio::time::Instant::now(), vec![update]));
         Ok(())
     }
 

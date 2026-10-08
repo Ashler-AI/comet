@@ -585,6 +585,9 @@ final class SessionStore {
     @ObservationIgnored private var lastProjectionKey: ProjectionKey?
     @ObservationIgnored private(set) var projectionCount: UInt64 = 0
     var isProjecting: Bool { projectionTask != nil }
+    #if DEBUG
+    @ObservationIgnored private var projectionReadDidFinish: (() -> Void)?
+    #endif
 
     private struct ProjectionKey: Equatable {
         var version: VersionVector
@@ -632,15 +635,19 @@ final class SessionStore {
         let previousActivity = transcriptActivity
         let work = Task.detached(priority: .userInitiated) { () -> ProjectionResult? in
             guard !Task.isCancelled else { return nil }
-            let key = ProjectionKey(version: doc.stateVv(), metadataOnly: metadataOnly,
+            var key = ProjectionKey(version: doc.stateVv(), metadataOnly: metadataOnly,
                                     observedAt: metadataOnly ? nil : observedAt,
                                     pendingMessageIds: pendingMessageIds)
             if key == previousKey {
                 return ProjectionResult(key: key, decoded: nil, entriesChanged: false, failures: [:])
             }
+            // Read one coherent replica without making publication wait for a
+            // quiet network. A newer import schedules the trailing projection.
+            let snapshot = doc.fork()
+            key.version = snapshot.stateVv()
             var decoded = metadataOnly
-                ? Self.decodeMetadata(from: doc, chatId: chatId, publicationCache: publicationCache)
-                : Self.decodeProjection(from: doc, chatId: chatId, observedAt: observedAt, publicationCache: publicationCache)
+                ? Self.decodeMetadata(from: snapshot, chatId: chatId, publicationCache: publicationCache)
+                : Self.decodeProjection(from: snapshot, chatId: chatId, observedAt: observedAt, publicationCache: publicationCache)
             let entriesChanged = !metadataOnly && decoded.entries != previousEntries
             if !entriesChanged, var activity = decoded.activity, activity.status == .working {
                 // A status heartbeat is not transcript activity. Keep the last
@@ -649,7 +656,7 @@ final class SessionStore {
                 decoded.activity = activity
             }
             guard !Task.isCancelled else { return nil }
-            let commands = pendingMessageIds.isEmpty || metadataOnly ? [] : doc.getList(id: "commands").getDeepValue().listValue ?? []
+            let commands = pendingMessageIds.isEmpty || metadataOnly ? [] : snapshot.getList(id: "commands").getDeepValue().listValue ?? []
             let failures = Self.commandFailures(from: commands, messageIds: pendingMessageIds)
             let completions = Set(commands.compactMap { value -> String? in
                 guard let command = value.mapValue, command["status"]?.stringValue == "applied",
@@ -665,10 +672,11 @@ final class SessionStore {
             let result = await work.value
             guard let self, self.roomEpoch == epoch, self.projectionEpoch == generation,
                   self.doc === doc, self.metadataOnly == metadataOnly, !work.isCancelled else { return }
+            #if DEBUG
+            self.projectionReadDidFinish?()
+            #endif
             self.projectionTask = nil
-            // A multi-container read can straddle a remote import. Do not
-            // publish that mixed view, or let it resolve an optimistic echo.
-            guard let result, doc.stateVv() == result.key.version else {
+            guard let result else {
                 self.projectPending = false
                 self.project()
                 return
@@ -682,7 +690,7 @@ final class SessionStore {
                 self.projectionCount &+= 1
                 self.apply(decoded, metadataOnly: metadataOnly, entriesChanged: result.entriesChanged)
             }
-            if self.connected, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
+            if self.connected, doc.stateVv() == result.key.version, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
                 self.hasAuthoritativeProjection = true
             }
             for id in result.completions { self.resolveAcceptedDraft(id) }
@@ -2019,6 +2027,42 @@ extension SessionStore {
 
 #if DEBUG
 extension SessionStore {
+    static func runLiveTranscriptProjectionRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "live-transcript-\(UUID().uuidString)", projectScope: "live-transcript",
+            deviceId: "viewer", deviceName: "Crew regression")
+        let store = SessionStore(chatId: UUID().uuidString.lowercased(), config: config)
+        defer {
+            store.projectionReadDidFinish = nil
+            store.stop()
+            try? FileManager.default.removeItem(at: DocDisk.intentURL(for: store.intentCacheId))
+        }
+        do {
+            let row = try store.doc.getList(id: "messages").pushContainer(child: LoroMap())
+            try row.insert(key: "id", v: "stream"); try row.insert(key: "role", v: "assistant")
+            try row.insert(key: "parts", v: LoroValue.fromJSON([["id": "text", "kind": "text", "text": "0"]]))
+            store.doc.commit()
+            var reads = 0
+            var publishedEveryRead = true
+            store.projectionReadDidFinish = {
+                publishedEveryRead = publishedEveryRead && store.projectionCount == UInt64(reads)
+                reads += 1
+                guard reads <= 5 else { return }
+                do {
+                    try row.insert(key: "parts", v: LoroValue.fromJSON([["id": "text", "kind": "text", "text": "\(reads)"]]))
+                    store.doc.commit()
+                    store.handle(.remoteUpdate)
+                } catch { publishedEveryRead = false }
+            }
+            store.project()
+            guard await E2ERunner.poll(timeout: 5, label: "live transcript projections", {
+                !store.isProjecting ? true : nil
+            }) != nil else { return false }
+            return publishedEveryRead && reads == 6 && store.projectionCount == 6
+                && store.entries == Self.decodeProjection(from: store.doc, chatId: store.chatId, observedAt: nil).entries
+        } catch { return false }
+    }
+
     static func runTranscriptActivityRegression() async -> Bool {
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
             userId: "activity-\(UUID().uuidString)", projectScope: "activity", deviceId: "viewer", deviceName: "Crew regression")

@@ -167,6 +167,82 @@ fn recovery_core(path: &std::path::Path, origin: &str) -> crate::EngineCore {
     core
 }
 
+#[tokio::test]
+async fn scaffold_attach_verifies_authority_before_opening_a_legacy_cache() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let scope = params().scope;
+    let chat_id = scope.session_id.as_deref().unwrap();
+    let store = comet_sync::DocsStore::open(dir.path().join("projects")
+        .join(crate::sanitize_path_id("project-a"))
+        .join(crate::sanitize_path_id("owner@example.com"))).unwrap();
+    let legacy = comet_doc::SessionDoc::init(chat_id).unwrap();
+    legacy.push_message(&comet_doc::SessionMessageEntry {
+        id: "retained-output".into(), role: comet_doc::MessageRole::Assistant,
+        parts: vec![comet_doc::MessagePart::Text { id: "text".into(), text: "accepted output".into() }],
+        created_at: 1, device_id: "comet-scaffold-sandbox-a-e1".into(),
+        status: Some(comet_doc::MessageStatus::Complete), continuation_of: None, peer_message: None,
+    }).unwrap();
+    store.save_snapshot(chat_id, &legacy.export_snapshot().unwrap()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let core = recovery_core(dir.path(), &format!("http://{}", listener.local_addr().unwrap()));
+    let environment = serde_json::json!({"sandbox": {
+        "id": "sandbox-a", "lifecycleEpoch": 1, "status": "ready", "kind": "remote_code",
+        "runtimeProfile": "remote_code", "ownerEmail": "owner@example.com",
+        "createdAt": "2026-08-04T00:00:00Z", "updatedAt": "2026-08-04T00:00:00Z"
+    }}).to_string();
+    let authority = serde_json::json!({"ok": true, "exitCode": 0, "stdout": serde_json::json!({
+        "grantId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expiresAt": crate::now_ms() + 60_000,
+        "principalSubject": "owner@example.com", "scope": scope,
+        "sandboxId": "sandbox-a", "deviceId": "comet-scaffold-sandbox-a-e1", "lifecycleEpoch": 1,
+        "capabilities": ["session.read", "session.chat", "session.control", "session.annotate", "session.files", "session.environment"]
+    }).to_string()}).to_string();
+    let provider = tokio::spawn(async move {
+        for (method, body) in [("GET", environment), ("POST", authority)] {
+            let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+            let mut reader = BufReader::new(connection);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with(&format!("{method} /api/code-sandboxes/sandbox-a")));
+            let mut length = 0;
+            loop {
+                line.clear(); reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).await.unwrap();
+            if method == "POST" {
+                let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(request["argv"], serde_json::json!(["comet", "scaffold-authority"]));
+            }
+            reader.get_mut().write_all(format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        }
+    });
+    let cancellation = CancellationToken::new();
+    let operation_cancel = cancellation.clone();
+    let rpc = core.rpc_service();
+    let control = ScaffoldEnvironmentControl::Attach { sandbox_id: "sandbox-a".into(), scope: scope.clone() };
+    let operation = tokio::spawn(async move { rpc.control_scaffold_environment(control, &operation_cancel).await });
+    provider.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while store.document_scope(chat_id).unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.unwrap();
+    cancellation.cancel();
+    assert!(operation.await.unwrap().unwrap_err().to_string().contains("scaffold_request_cancelled"));
+    let handle = core.doc_host.open_projection(chat_id, Some(&SessionRoomProjection {
+        project_id: scope.project_id, deployment_id: scope.deployment_id.unwrap(), session_id: chat_id.into(),
+    })).unwrap();
+    assert_eq!(handle.doc().read_entries().unwrap(), legacy.read_entries().unwrap());
+    core.shutdown().await;
+}
+
 fn recovery_request() -> comet_rpc::RecoverSessionHandoffToScaffoldParams {
     comet_rpc::RecoverSessionHandoffToScaffoldParams {
         handoff: HandoffSessionToScaffoldParams {
@@ -471,6 +547,7 @@ async fn explicit_recovery_missing_mismatched_imported_or_admitted_target_never_
 
 #[tokio::test]
 async fn concurrent_recovery_rejects_same_target_before_transfer_and_admission() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let core = recovery_core(
@@ -527,6 +604,13 @@ async fn concurrent_recovery_rejects_same_target_before_transfer_and_admission()
     })
     .await
     .unwrap();
+    // The first operation is allowed to inspect its preserved sandbox while
+    // competitors remain fenced; no owner-room connection is a prerequisite.
+    let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+    let mut attachment = BufReader::new(connection);
+    let mut request = String::new();
+    attachment.read_line(&mut request).await.unwrap();
+    assert!(request.starts_with("GET /api/code-sandboxes/sandbox-a"), "{request:?}");
     assert!(
         !first.is_finished(),
         "first recovery must retain its target gate while waiting for attachment"
@@ -1208,15 +1292,29 @@ async fn concurrent_and_interrupted_preparation_never_duplicates_creation() {
         ref sandbox_id, lifecycle_epoch: None, ..
     } if sandbox_id == "sandbox-a")
     );
+    let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+    let mut initial_attach = BufReader::new(connection);
+    line.clear();
+    initial_attach.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("GET /api/code-sandboxes/sandbox-a"));
     first.abort();
     let _ = first.await;
     let retry_rpc = core.rpc_service();
     tokio::select! {
         result = retry_rpc.prepare_scaffold_session(params()) => {
-            panic!("recovery should await the same target's owner room: {result:?}");
+            panic!("recovery should inspect the same target before attachment: {result:?}");
         }
-        _ = listener.accept() => panic!("retry must not allocate another sandbox"),
-        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        accepted = async {
+            loop {
+                let mut retry_attach = BufReader::new(listener.accept().await.unwrap().0);
+                line.clear();
+                // Cancellation can leave an accepted TCP connection with no request.
+                if retry_attach.read_line(&mut line).await.unwrap() != 0 { break line.clone(); }
+            }
+        } => {
+            assert!(accepted.starts_with("GET /api/code-sandboxes/sandbox-a"), "{accepted:?}");
+        }
+        _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("retry did not inspect the preserved sandbox"),
     }
     core.shutdown().await;
 }
