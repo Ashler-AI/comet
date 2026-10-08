@@ -1691,18 +1691,21 @@ export class SessionRoom implements DurableObject {
   }
   /** Materialize the complete journal union after bootstrapping its snapshot. */
   private replayLog(doc: LoroDoc): { rows: number; batches: number; pendingEnds?: Map<PeerID, number> } {
-    const updates: Uint8Array[] = [];
-    for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
-      updates.push(new Uint8Array(row.bytes as ArrayBuffer));
-    }
-    if (!updates.length) return { rows: 0, batches: 0 };
-    const imported = doc.importBatch(updates);
+    let rows = 0;
     let pendingEnds: Map<PeerID, number> | undefined;
-    for (const [peer, span] of imported.pending ?? []) {
-      pendingEnds ??= new Map();
-      pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
+    // Import one accepted row at a time. Loro's batch replay of a real 76-row
+    // workspace grew WASM to 134 MiB, beyond the Worker's entire 128 MiB heap;
+    // sequential replay of the same bytes stayed below 100 MiB. Keep every
+    // pending span until the caller checks the final union's version vector.
+    for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
+      const imported = doc.import(new Uint8Array(row.bytes as ArrayBuffer));
+      rows++;
+      for (const [peer, span] of imported.pending ?? []) {
+        pendingEnds ??= new Map();
+        pendingEnds.set(peer, Math.max(pendingEnds.get(peer) ?? 0, span.end));
+      }
     }
-    return { rows: updates.length, batches: 1, pendingEnds };
+    return { rows, batches: rows, pendingEnds };
   }
 
   private async materializeDoc(): Promise<LoroDoc> {

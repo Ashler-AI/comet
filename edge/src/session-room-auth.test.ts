@@ -836,7 +836,7 @@ describe("SessionRoom chat authorization", () => {
     } finally { mirror.free(); metadata.free(); source.free(); }
   });
 
-  it("heals a 343-row workspace after repeated replay deaths and merges stale concurrent writers losslessly", async () => {
+  it("streams a 343-row workspace journal after replay deaths and merges stale concurrent writers losslessly", async () => {
     const source = new LoroDoc();
     const first = new LoroDoc();
     const second = new LoroDoc();
@@ -845,9 +845,14 @@ describe("SessionRoom chat authorization", () => {
     const sessions = source.getMap("sessions");
     const commands = source.getMap("commands");
     const history = source.getList("history");
+    const chats = source.getMap("chats");
+    const refs = source.getMap("sessionRefs");
     try {
       metadata.set("payload", oversizedPayload());
       commands.set("removed", { id: "removed", status: "accepted" });
+      chats.set("existing", { id: "existing", deviceId: "host" });
+      refs.set("6:user-a:existing", { userId: "user-a", chatId: "existing", addedAt: 1 });
+      refs.set("6:user-b:existing", { userId: "user-b", chatId: "existing", addedAt: 1 });
       source.commit();
       const baseline = source.export({ mode: "snapshot" });
       first.import(baseline); second.import(baseline);
@@ -862,6 +867,11 @@ describe("SessionRoom chat authorization", () => {
         try {
           metadata.set("payload", "current");
           commands.delete("removed");
+          if (i === 0) {
+            refs.delete("6:user-a:existing");
+            chats.set("new", { id: "new", deviceId: "host" });
+            refs.set("6:user-a:new", { userId: "user-a", chatId: "new", addedAt: 2 });
+          }
           sessions.set(`session-${i % 21}`, { status: i % 2 ? "working" : "idle", updatedAt: Date.now() + i });
           history.push({ id: `event-${i}`, value: i });
           source.commit();
@@ -874,7 +884,6 @@ describe("SessionRoom chat authorization", () => {
       const internals = room as unknown as SessionRoomInternals;
       expect((await internals.ensureDoc()).toJSON()).toEqual(source.toJSON());
       expect(sql.meta.get("replayAttempts")).toBe("0");
-      expect(sql.meta.get("lastReplayBatches")).toBe("1");
       expect(sql.updateCount()).toBe(0);
       for (const [client, key] of [[first, "offline-a"], [second, "offline-b"]] as const) {
         const map = client.getMap("metadata");
@@ -888,6 +897,10 @@ describe("SessionRoom chat authorization", () => {
       const recovered = await restarted.ensureDoc();
       mirror.import(recovered.export({ mode: "snapshot" }));
       expect(mirror.toJSON()).toEqual(source.toJSON());
+      expect(mirror.toJSON().sessionRefs).toEqual({
+        "6:user-b:existing": { userId: "user-b", chatId: "existing", addedAt: 1 },
+        "6:user-a:new": { userId: "user-a", chatId: "new", addedAt: 2 }
+      });
       expect(sql.meta.get("lastReplayRows")).toBe("0");
       const expectedVersion = source.oplogVersion();
       const restoredVersion = recovered.oplogVersion();
@@ -898,7 +911,7 @@ describe("SessionRoom chat authorization", () => {
       expect(first.toJSON()).toEqual(source.toJSON());
       expect(second.toJSON()).toEqual(source.toJSON());
     } finally {
-      history.free(); commands.free(); sessions.free(); metadata.free();
+      refs.free(); chats.free(); history.free(); commands.free(); sessions.free(); metadata.free();
       mirror.free(); second.free(); first.free(); source.free();
     }
   });

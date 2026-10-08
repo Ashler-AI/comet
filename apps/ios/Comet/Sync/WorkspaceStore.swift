@@ -252,10 +252,11 @@ final class WorkspaceStore {
     private func subscribeLocalUpdates(client: RoomClient) {
         // Local commits → room. The subscription fires synchronously inside
         // commit; hop to the actor to send.
-        subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self] update in
-            guard let client else { return }
+        let subscribedDoc = doc
+        subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self, weak subscribedDoc] update in
+            guard let client, let subscribedDoc else { return }
             let bytes = [UInt8](update)
-            Task { await client.sendLocalUpdate(bytes) }
+            Task { await client.sendLocalUpdate(bytes, from: subscribedDoc) }
             Task { @MainActor [weak self] in self?.saver?.poke() }
         })
     }

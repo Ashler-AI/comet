@@ -465,9 +465,9 @@ final class SessionStore {
         let epoch = roomEpoch
         let subscribedDoc = doc
         subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self, weak subscribedDoc] update in
-            guard let client else { return }
+            guard let client, let subscribedDoc else { return }
             let bytes = [UInt8](update)
-            Task { await client.sendLocalUpdate(bytes) }
+            Task { await client.sendLocalUpdate(bytes, from: subscribedDoc) }
             Task { @MainActor [weak self, weak subscribedDoc] in
                 guard let self, let subscribedDoc, self.roomEpoch == epoch,
                       self.doc === subscribedDoc else { return }
