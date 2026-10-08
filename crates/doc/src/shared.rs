@@ -153,14 +153,18 @@ impl SharedDocument {
                 return Err(DocError::Schema("replacement snapshot has a different public chat identity".into()));
             }
         }
+        // Alias normalization creates local operations, not unseen remote edits.
+        // Reconciliation must use the causal frontiers of the imported histories.
+        let candidate_version = candidate.oplog_vv();
+        let original_cache = self.raw();
+        let cached_version = original_cache.oplog_vv();
         let mut pending = self.pending_records();
         let mut retired = Vec::new();
         let cached = if expected_chat.is_none() {
             crate::WorkspaceDoc::from_doc(candidate.clone()).migrate_execution_rows()?;
-            let cached = self.raw().fork();
+            let cached = original_cache.fork();
             crate::WorkspaceDoc::from_doc(cached.clone()).migrate_execution_rows()?;
             let originals = std::mem::take(&mut pending);
-            let original_cache = self.raw();
             for record in &originals {
                 let normalized = crate::workspace::normalize_workspace_record(record)?;
                 if normalized.key != record.key {
@@ -179,8 +183,8 @@ impl SharedDocument {
                 return Err(DocError::Schema("Crew recovery has competing canonical workspace intents; originals retained".into()));
             }
             cached
-        } else { self.raw() };
-        reconcile(&candidate, &pending, &cached, expected_chat.is_some())?;
+        } else { original_cache };
+        reconcile(&candidate, &pending, &cached, expected_chat.is_some(), candidate_version, cached_version)?;
         let version = candidate.oplog_vv().encode();
         for record in &mut pending {
             record.version = version.clone();
@@ -306,10 +310,9 @@ fn row_value(doc: &LoroDoc, container: &str, key: &str) -> Option<serde_json::Va
     } }
     None
 }
-fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session_context: bool) -> Result<(),DocError> {
+fn reconcile(doc: &LoroDoc, pending: &[PendingRecord], cached: &LoroDoc, session_context: bool,
+    candidate_version: loro::VersionVector, cached_version: loro::VersionVector) -> Result<(),DocError> {
     let session = std::cell::LazyCell::new(|| SessionDoc::from_doc(doc.clone()));
-    let candidate_version = doc.oplog_vv();
-    let cached_version = cached.oplog_vv();
     if session_context { std::cell::LazyCell::force(&session); }
     for record in pending.iter().filter(|record| record.container != "agentSessions" && record.container != "meta")
         .chain(pending.iter().filter(|record| record.container == "agentSessions" || record.container == "meta")) {
@@ -786,6 +789,52 @@ mod tests {
             row.insert(field, value).unwrap(); changed.doc().commit();
             assert!(binding.adopt_snapshot(&changed.export_snapshot().unwrap(), None).is_err());
             assert_eq!(local.export_snapshot().unwrap(), preserved);
+            assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), intents);
+        }
+    }
+
+    #[test]
+    fn alias_normalization_preserves_causal_proof_for_compacted_creation_intents() {
+        let source = LoroDoc::new();
+        source.set_peer_id(3).unwrap();
+        let clock = source.get_map("devices").insert_container("clock", LoroMap::new()).unwrap();
+        for tick in 0..64 { clock.insert("tick", tick).unwrap(); source.commit(); }
+        source.set_peer_id(1).unwrap();
+        let row = source.get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+        row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner").unwrap();
+        row.insert("title", "before").unwrap(); source.commit();
+        let public = "018eeb58-6508-78e8-a544-44682ab94c50";
+        let alias = format!("{public}::session::{public}");
+        let legacy = source.get_map("chats").insert_container(&alias, LoroMap::new()).unwrap();
+        legacy.insert("id", alias.as_str()).unwrap(); legacy.insert("deviceId", "owner").unwrap();
+        legacy.insert("title", "legacy session").unwrap(); source.commit();
+        let snapshot = source.export(ExportMode::shallow_snapshot(&source.state_frontiers())).unwrap();
+        let cached = source.fork(); cached.set_peer_id(2).unwrap();
+        let loro::ValueOrContainer::Container(loro::Container::Map(row)) = cached.get_map("chats").get("chat").unwrap() else { panic!("missing chat") };
+        row.insert("title", "accepted offline rename").unwrap(); cached.commit();
+        let original = PendingRecord { container: "chats".into(), key: "chat".into(), before: None,
+            value: row_value(&cached, "chats", "chat"), version: cached.oplog_vv().encode(), acknowledged: false };
+        // Later unrelated cache activity must not erase the retained intent's proof.
+        cached.get_map("devices").insert("later", true).unwrap(); cached.commit();
+        let raw = LoroDoc::new();
+        raw.import(&cached.export(ExportMode::shallow_snapshot(&cached.state_frontiers())).unwrap()).unwrap();
+        let binding = SharedDocument::new(raw);
+        binding.install_journal(vec![original.clone()], Arc::new(|_, _| Ok(())));
+        for _ in 0..2 {
+            binding.adopt_snapshot(&snapshot, None).unwrap();
+            assert_eq!(row_value(&binding.raw(), "chats", "chat").unwrap()["title"], "accepted offline rename");
+            assert_eq!(row_value(&binding.raw(), "chats", public).unwrap()["title"], "legacy session");
+            assert!(binding.get_map("chats").get(&alias).is_none());
+            assert_eq!(binding.pending_records()[0].value, original.value);
+        }
+        let preserved = binding.export(ExportMode::Snapshot).unwrap();
+        let intents = serde_json::to_vec(&binding.pending_records()).unwrap();
+        for (field, value) in [("title", "unseen competing rename"), ("deviceId", "foreign-owner")] {
+            let foreign = LoroDoc::new(); foreign.import(&snapshot).unwrap();
+            let loro::ValueOrContainer::Container(loro::Container::Map(row)) = foreign.get_map("chats").get("chat").unwrap() else { panic!("missing chat") };
+            row.insert(field, value).unwrap(); foreign.commit();
+            assert!(binding.adopt_snapshot(&foreign.export(ExportMode::Snapshot).unwrap(), None).is_err());
+            assert_eq!(binding.export(ExportMode::Snapshot).unwrap(), preserved);
             assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), intents);
         }
     }
