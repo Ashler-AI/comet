@@ -16,7 +16,11 @@ scripts/dev-demo.sh
 # Use scripts/dev-demo.sh --slow to inspect streamed UI states.
 ```
 
-The script builds `comet`, starts a mock headless engine on port 27921, seeds isolated data under `/tmp/comet-demo-*`, and opens the headed Crew app. Exercise the changed behavior in that instance and run the narrow checks required by the change. Do not substitute tests alone for the local-instance check.
+The script builds `comet` and `rpc_probe` once through `python3 scripts/local-cargo.py`, snapshots the executables from the selected compilation cache while the build gate is held, starts a mock headless engine on port 27921, seeds isolated data under `/tmp/comet-demo-*`, and opens the headed Crew app. The UI and RPC probes execute directly without holding the build gate. Exercise the changed behavior in that instance and run the narrow checks required by the change. Do not substitute tests alone for the local-instance check.
+
+Keep Rust builds local. Use `python3 scripts/local-cargo.py build ...` or `python3 scripts/local-cargo.py test ...`; resolve executable paths with `python3 scripts/local-cargo.py --print-target-dir`, not `./target/debug`. Native Crew sessions always get the local policy, even with `CI=true`. See [local Rust builds](../../README.md#local-rust-builds) for shared caches, job limits, priority, build gates, packaging snapshots, and the separate user-local workstation guard.
+
+Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false` for shell and Git operations; never run local typechecks. For runner changes, `python3 scripts/test_local_cargo.py` compiles only a tiny offline crate and checks real command exclusion, cache selection, snapshots, job counts, priority, exits, and signals. `node --test scripts/package-macos.test.mjs` checks packaging preflight without compiling/signing/notarizing. These targeted checks do not require a full desktop rebuild or a remote build.
 
 ## 2. Land the change on `main`
 

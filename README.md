@@ -549,6 +549,53 @@ the app with another build between approving access and retesting.
 The independently packaged **Crew Staging.app** has its own permission identity;
 it is not a launcher for the production app. See [macOS packaging](dist/README.md#macos)
 for signing prerequisites, staging isolation, and migration from ad-hoc installs.
+
+## Local Rust builds
+
+Rust builds stay local. Use the standard-library runner rather than invoking Cargo
+directly from development scripts:
+
+```bash
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
+python3 scripts/local-cargo.py build -p comet --bin comet
+target_dir="$(python3 scripts/local-cargo.py --print-target-dir)"
+"$target_dir/debug/comet"
+scripts/dev-demo.sh --slow
+```
+
+Local Cargo commands share the main checkout's `target` cache across worktrees
+(resolved from the absolute Git common directory). `CARGO_TARGET_DIR` overrides
+that default; relative paths resolve against this checkout. Cargo's `--target-dir`
+takes precedence. The runner caps jobs at two (one is allowed), sets scheduling
+priority to at least nice 10, and serializes commands through the per-user
+`~/.cache/crew/cargo-build.lock`, even for different target directories. Cargo exit
+statuses and termination signals are preserved. `--print-target-dir` never builds
+or waits for that lock. Native Crew sessions (`COMET_LOCAL_AGENT_RUNTIME=1`) always
+use the local policy, even though their shell sets `CI=true`. Outside that runtime,
+truthy `CI` (other than `false`/`0`) keeps checkout-local cache defaults and skips
+the runner's job, priority, and gate restrictions.
+
+The demo builds Crew and `rpc_probe` once, snapshots both executables before
+releasing the build gate, then launches them directly; the running UI and RPCs
+do not hold the gate. Packaging similarly snapshots its executable under the gate,
+then creates artifacts in this worktree's `target/package`. macOS staging uses a
+separate `staging` subtree of the selected compilation cache. The repeatable
+`--copy-binary RELATIVE_TARGET_PATH DEST` runner option provides that snapshot.
+Build then execute a binary directly for long-lived apps; manual `cargo run`
+through the runner retains native Cargo behavior and holds the command gate.
+
+On the configured workstation, `~/.cargo/config.toml` also caps default jobs and
+uses a low-priority, single-compiler wrapper with its own lock, protecting raw
+Cargo invocations outside these scripts. Those user-local settings are not
+repository configuration. Never run local typechecks; keep
+`ASHLER_INCREMENTAL_TSC_CHECKS=false`, including for Git operations.
+
+Small offline regression (a disposable real Rust crate, not a desktop rebuild):
+`python3 scripts/test_local_cargo.py`. Packaging preflight without compiling,
+signing, or notarizing: `node --test scripts/package-macos.test.mjs`.
+Where the user-local compiler guard is installed, check it without compiling:
+`python3 ~/.cargo/test-crew-rustc-wrapper.py`.
+
 ## Local collaboration smoke
 
 The deterministic smoke uses two in-memory headless devices and needs no cloud credentials, agent CLI, network, or persistent state:

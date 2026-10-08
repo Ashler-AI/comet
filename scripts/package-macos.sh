@@ -4,9 +4,9 @@
 # Distribution requires Developer ID signing and a notarytool keychain profile.
 # COMET_MACOS_SIGNING=adhoc explicitly opts into local-only, non-distribution output.
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "macOS packaging requires a macOS runner" >&2
   exit 1
@@ -25,7 +25,7 @@ fi
 
 PACKAGE_ENVIRONMENT="${COMET_PACKAGE_ENVIRONMENT:-production}"
 OUT_DIR="$ROOT/target/package"
-BUILD_DIR="$ROOT/target"
+BUILD_DIR="$(python3 "$ROOT/scripts/local-cargo.py" --print-target-dir)"
 case "$PACKAGE_ENVIRONMENT" in
   production)
     APP_NAME="Crew"
@@ -37,7 +37,7 @@ case "$PACKAGE_ENVIRONMENT" in
     BUNDLE_ID="ai.ashler.comet.staging"
     ARTIFACT_PREFIX="comet-staging"
     OUT_DIR="$OUT_DIR/staging"
-    BUILD_DIR="$ROOT/target/staging"
+    BUILD_DIR="$BUILD_DIR/staging"
     ;;
   *) echo "COMET_PACKAGE_ENVIRONMENT must be production or staging" >&2; exit 1 ;;
 esac
@@ -145,11 +145,15 @@ DMG="$OUT_DIR/$ARTIFACT_PREFIX-$VERSION-macos-$ARCH.dmg"
 APP_TARBALL="$OUT_DIR/$ARTIFACT_PREFIX-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
-cargo build --release -p comet --target-dir "$BUILD_DIR"
+BUILD_BIN="$(mktemp)"
+trap 'rm -f "$BUILD_BIN"' EXIT
+python3 scripts/local-cargo.py build --release -p comet --target-dir "$BUILD_DIR" \
+  --copy-binary release/comet "$BUILD_BIN"
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-install -m 755 "$BUILD_DIR/release/comet" "$APP/Contents/MacOS/comet"
+install -m 755 "$BUILD_BIN" "$APP/Contents/MacOS/comet"
+rm -f "$BUILD_BIN"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$APP/Contents/Info.plist"
@@ -178,7 +182,7 @@ codesign "${SIGN_ARGS[@]}" ${APP_SIGN_ARGS[@]+"${APP_SIGN_ARGS[@]}"} "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 NOTARY_DIR="$(mktemp -d)"
-trap 'rm -rf "$NOTARY_DIR"' EXIT
+trap 'rm -f "$BUILD_BIN"; rm -rf "$NOTARY_DIR"' EXIT
 notarize() {
   xcrun notarytool submit "$1" --keychain-profile "$NOTARYTOOL_KEYCHAIN_PROFILE" \
     ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} --wait --output-format json >"$NOTARY_DIR/result.json"
