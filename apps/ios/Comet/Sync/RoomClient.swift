@@ -758,14 +758,13 @@ actor RoomClient {
     // MARK: Outbound
 
     /// Called by the doc store on local commit (subscribeLocalUpdate bytes).
-    func sendLocalUpdate(_ update: [UInt8]) async {
-        guard !readOnly else { return }
-        guard joinedLor else {
-            // Not lost — the commit is durable in the doc and the next
-            // successful join resubmits from VV. But it IS invisible to the
-            // user, so say so loudly (2026-07-31: sends queued behind a
-            // failing join looked exactly like a working app).
-            roomLog.warning("room \(self.roomId, privacy: .public): local update (\(update.count)B) deferred — not joined; will resubmit on join")
+    func sendLocalUpdate(_ update: [UInt8], from source: LoroDoc) async {
+        guard !readOnly, source === doc else { return }
+        // A joined socket can still be receiving the authoritative replacement.
+        // Its adoption replays current intents; never publish retired ancestry.
+        guard joinedLor, !recoverApplicationIntents, snapshotRecovery == nil else {
+            // The durable doc/journal retains the edit for rejoin or adoption.
+            roomLog.warning("room \(self.roomId, privacy: .public): local update (\(update.count)B) deferred — awaiting authoritative recovery")
             return
         }
         await sendLoroUpdates([update])
@@ -920,8 +919,8 @@ actor RoomClient {
                 recoverApplicationIntents: true, urlProvider: { nil }, events: { _ in },
                 adoptSnapshot: { previous, replacement in
                     // A retained semantic goal, not old ancestry or command replay.
-                    guard previous.getMap(id: "meta").get(key: "draft")?.asValue()?.stringValue == "retained" else { return false }
-                    do { try replacement.getMap(id: "meta").insert(key: "draft", v: "retained"); replacement.commit(); return true }
+                    guard let draft = previous.getMap(id: "meta").get(key: "draft")?.asValue()?.stringValue else { return false }
+                    do { try replacement.getMap(id: "meta").insert(key: "draft", v: draft); replacement.commit(); return true }
                     catch { return false }
                 })
             guard await client.exerciseResetEpoch(withSnapshot: withSnapshot) else {
@@ -929,12 +928,15 @@ actor RoomClient {
                 return false
             }
         }
-        await E2ERunner.log("OK Crew authenticated reset: snapshot and journal-only backfill, retained semantic draft, frontier gating")
+        await E2ERunner.log("OK Crew authenticated reset: snapshot and journal backfill, edits during recovery, retired-binding suppression, catalog updates and revocation")
         return true
     }
 
     private func exerciseResetEpoch(withSnapshot: Bool) async -> Bool {
-        regressionSend = { _ in }
+        var uploads = 0
+        regressionSend = { message in
+            if case .docUpdate(.loro, _, _, _) = message { uploads += 1 }
+        }
         defer { regressionSend = nil; stop() }
         do {
             try doc.getMap(id: "meta").insert(key: "draft", v: "retained"); doc.commit()
@@ -952,21 +954,53 @@ actor RoomClient {
             try reset.getMap(id: "meta").insert(key: "seed", v: "new"); reset.commit()
             let baselineVersion = reset.oplogVv()
             let baseline = try reset.export(mode: withSnapshot ? .snapshot : .updates(from: VersionVector()))
+            let chatId = "2b267bc0-7901-4560-966d-408f427d79b1"
+            let chat = try reset.getMap(id: "chats").getOrCreateContainer(key: chatId, child: LoroMap())
+            try chat.insert(key: "id", v: chatId)
+            try chat.insert(key: "deviceId", v: "host")
+            try chat.insert(key: "title", v: "Recovered catalog session")
+            let ref = try reset.getMap(id: "sessionRefs").getOrCreateContainer(key: "reader", child: LoroMap())
+            try ref.insert(key: "userId", v: "reader")
+            try ref.insert(key: "chatId", v: chatId)
+            try ref.insert(key: "addedAt", v: Int64(1))
             try reset.getMap(id: "meta").insert(key: "tail", v: "new frontier"); reset.commit()
             guard !reset.oplogVv().includesVv(other: old.oplogVv()) else { return false }
             await onJoinOk(crdt: .loro, version: [UInt8](reset.oplogVv().encode()))
             let previous = doc
+            let before = previous.oplogVv()
+            try previous.getMap(id: "meta").insert(key: "draft", v: "edited before backfill"); previous.commit()
+            await sendLocalUpdate([UInt8](try previous.export(mode: .updates(from: before))), from: previous)
+            guard uploads == 0, pending.isEmpty else { return false }
             await applyRemote(crdt: .loro, updates: [[UInt8](baseline)])
             guard doc === previous, snapshotRecovery != nil, recovering else { return false }
+            try previous.getMap(id: "meta").insert(key: "draft", v: "edited during backfill"); previous.commit()
+            let queuedOldUpdate = [UInt8](try previous.export(mode: .updates(from: before)))
+            await sendLocalUpdate(queuedOldUpdate, from: previous)
+            guard uploads == 0, pending.isEmpty else { return false }
             await applyRemote(crdt: .loro, updates: [[UInt8](try reset.export(mode: .updates(from: baselineVersion)))])
             guard doc !== previous, !recoverApplicationIntents,
                   doc.getMap(id: "meta").get(key: "seed")?.asValue()?.stringValue == "new",
-                  doc.getMap(id: "meta").get(key: "draft")?.asValue()?.stringValue == "retained",
+                  doc.getMap(id: "meta").get(key: "draft")?.asValue()?.stringValue == "edited during backfill",
                   doc.getMap(id: "meta").get(key: "tail")?.asValue()?.stringValue == "new frontier",
                   doc.stateVv().includesVv(other: reset.oplogVv()),
                   !doc.stateVv().includesVv(other: old.oplogVv()) else { return false }
             for batch in Array(catchupBatches) { await onAck(crdt: .loro, refId: batch, status: .ok) }
-            return !recovering
+            guard !recovering, WorkspaceStore.decodeProjection(from: doc, userId: "reader")?
+                .lists.overviewChats.first?.title == "Recovered catalog session" else { return false }
+            let adoptedUploads = uploads
+            // A subscription task queued before the main-actor binding swap
+            // can run after adoption; it must not publish retired operations.
+            await sendLocalUpdate(queuedOldUpdate, from: previous)
+            guard uploads == adoptedUploads, pending.isEmpty else { return false }
+            let updatedVersion = reset.oplogVv()
+            try chat.insert(key: "title", v: "Live catalog update"); reset.commit()
+            await applyRemote(crdt: .loro, updates: [[UInt8](try reset.export(mode: .updates(from: updatedVersion)))])
+            guard WorkspaceStore.decodeProjection(from: doc, userId: "reader")?
+                .lists.overviewChats.first?.title == "Live catalog update" else { return false }
+            let revokedVersion = reset.oplogVv()
+            try reset.getMap(id: "sessionRefs").delete(key: "reader"); reset.commit()
+            await applyRemote(crdt: .loro, updates: [[UInt8](try reset.export(mode: .updates(from: revokedVersion)))])
+            return !recovering && WorkspaceStore.decodeProjection(from: doc, userId: "reader")?.chats.isEmpty == true
         } catch { return false }
     }
 
@@ -1209,7 +1243,7 @@ actor RoomClient {
                 let prior = doc.oplogVv()
                 try doc.getMap(id: "meta").insert(key: "live", v: "retained")
                 doc.commit()
-                await sendLocalUpdate([UInt8](try doc.export(mode: .updates(from: prior))))
+                await sendLocalUpdate([UInt8](try doc.export(mode: .updates(from: prior))), from: doc)
                 guard batches.count == 2, !recovering,
                       connectionEvents.withLock({ $0 == [false, true] }) else { return false }
                 await onAck(crdt: .loro, refId: batches[1], status: .permissionDenied)
@@ -1462,7 +1496,7 @@ actor RoomClient {
             let before = doc.oplogVv()
             try doc.getMap(id: "meta").insert(key: "offline", v: "retained")
             doc.commit()
-            await sendLocalUpdate([UInt8](try doc.export(mode: .updates(from: before))))
+            await sendLocalUpdate([UInt8](try doc.export(mode: .updates(from: before))), from: doc)
             guard let sent = pending.values.first?.sent else { return false }
             let deadline = DispatchTime(uptimeNanoseconds: sent.uptimeNanoseconds + Self.ackDeadlineNs)
             // Other room traffic must not acknowledge or extend this write's lease.
