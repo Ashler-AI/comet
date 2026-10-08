@@ -57,6 +57,8 @@ if [ -f "$SESSION_ID" ]; then
 fi
 SESSION_ID="${OMP_REPORTED_SESSION_ID:-$SESSION_ID}"
 ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
+TODO_PHASES='[]'
+STATE_SILENT=0
 
 
 if [ "$NO_SESSION" != "1" ]; then
@@ -92,6 +94,7 @@ finish_turn() {
 }
 
 turn_open=0
+state_requests=0
 while IFS= read -r line; do
   type=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -100,14 +103,26 @@ while IFS= read -r line; do
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"negotiate_protocol\",\"success\":true}"
       ;;
     get_state)
+      state_requests=$((state_requests + 1))
+      [ "$state_requests" -le 1 ] || [ "$STATE_SILENT" = "0" ] || continue
+      if [ "$state_requests" -gt 1 ] && [ -n "${OMP_STATE_BURST:-}" ]; then
+        i=0
+        while [ "$i" -lt 512 ]; do
+          printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"queued event\n"}}'
+          i=$((i + 1))
+        done
+      fi
       if [ -n "${OMP_SESSION_LOG:-}" ]; then
         printf 'config:%s\n' "$CONFIG_PATH" >> "$OMP_SESSION_LOG"
         printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"
       fi
       if [ -n "$ACTIVE_GOAL" ]; then
-        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[],\"goalMode\":{\"enabled\":true,\"mode\":\"active\",\"goal\":{\"id\":\"goal-1\",\"objective\":\"$ACTIVE_GOAL\",\"status\":\"active\"}}}}"
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":$TODO_PHASES,\"goalMode\":{\"enabled\":true,\"mode\":\"active\",\"goal\":{\"id\":\"goal-1\",\"objective\":\"$ACTIVE_GOAL\",\"status\":\"active\"}}}}"
       else
-        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":[]}}"
+        printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"$SESSION_ID\",\"model\":{\"provider\":\"openai-codex\",\"id\":\"gpt-5.6-sol\"},\"todoPhases\":$TODO_PHASES}}"
+      fi
+      if [ "$state_requests" -gt 1 ] && [ -n "${OMP_STATE_BURST:-}" ] && [ -z "$ACTIVE_GOAL" ]; then
+        finish_turn
       fi
       ;;
     prompt)
@@ -159,6 +174,12 @@ while IFS= read -r line; do
           ;;
       esac
       printf '%s\n' '{"type":"agent_start"}'
+      if has "$line" 'scenario:todo-refresh'; then
+        TODO_PHASES='[{"tasks":[{"content":"Verify migration","status":"completed"}]}]'
+        if has "$line" 'scenario:todo-refresh-no-response'; then STATE_SILENT=1; fi
+        printf '%s\n' '{"type":"tool_execution_end","toolCallId":"todo-1","toolName":"todo","isError":false,"result":{"content":[{"type":"text","text":"Plan updated"}]}}'
+        continue
+      fi
       printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking"}}'
       printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello from omp"}}'
       if [ -n "${OMP_STEER_SCENARIO:-}" ]; then

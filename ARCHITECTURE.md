@@ -348,6 +348,11 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   write/append journal descriptors; verified takeover accepts configured OMP ancestry or a
   same-user holder orphaned directly under PID 1, while unrelated live holders
   fail closed.
+  OMP todo and goal-command snapshots use nonblocking `get_state` requests so the
+  bounded stdout queue keeps draining while replies arrive behind tool output.
+  Refreshes retain only the latest request per state kind, expire after 15 seconds
+  without another refresh, and never prevent steering or Stop. Mailbox-close
+  teardown waits for pending snapshots to settle or expire.
   Managed OMP runs pass configuration overlays through repeatable `--config <path>`
   arguments. Inherited `PI_CONFIG_FILES` entries are split using the host's path-list
   syntax and forwarded unchanged in their original order, leaving path resolution and
