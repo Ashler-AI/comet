@@ -319,6 +319,8 @@ pub struct Session {
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_retry: Option<crate::ModelRetry>,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }

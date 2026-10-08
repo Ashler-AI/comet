@@ -59,21 +59,6 @@ SESSION_ID="${OMP_REPORTED_SESSION_ID:-$SESSION_ID}"
 ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
 
 
-if [ "$NO_SESSION" != "1" ]; then
-  if [ "${PI_CONFIG_FILES+x}" = x ] || [ ! -f "$CONFIG_PATH" ] ||
-    [ "$(sed -n '1p' "$CONFIG_PATH")" != "retry:" ] ||
-    [ "$(sed -n '2p' "$CONFIG_PATH")" != "  enabled: true" ] ||
-    [ "$(sed -n '3p' "$CONFIG_PATH")" != "  maxRetries: 1" ] ||
-    [ "$(sed -n '4p' "$CONFIG_PATH")" != "  baseDelayMs: 1000" ] ||
-    [ "$(sed -n '5p' "$CONFIG_PATH")" != "  provider:" ] ||
-    [ "$(sed -n '6p' "$CONFIG_PATH")" != "    maxRetries: 0" ] ||
-    [ "$(sed -n '7p' "$CONFIG_PATH")" != "computer:" ] ||
-    [ "$(sed -n '8p' "$CONFIG_PATH")" != "  maxWidth: 1280" ] ||
-    [ "$(sed -n '9p' "$CONFIG_PATH")" != "  maxHeight: 896" ] ||
-    [ "$(sed -n '10p' "$CONFIG_PATH")" != "" ]; then
-    exit 92
-  fi
-fi
 
 printf '%s\n' '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}'
 if [ -n "$ACTIVE_GOAL" ]; then

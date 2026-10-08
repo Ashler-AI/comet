@@ -432,6 +432,10 @@ final class SessionStore {
                 status: value["status"]?.stringValue.flatMap(SessionStatus.init(rawValue:)) ?? .idle,
                 startedAt: updatedAt, updatedAt: updatedAt
             )
+            if let value = value["modelRetry"],
+               let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
+                session?.modelRetry = try? JSONDecoder().decode(ModelRetry.self, from: data)
+            }
             if let value = value["environment"],
                let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
                 environment = try? JSONDecoder().decode(SessionEnvironment.self, from: data)

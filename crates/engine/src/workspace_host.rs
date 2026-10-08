@@ -1780,6 +1780,7 @@ mod tests {
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status: SessionStatus::Idle,
+            model_retry: None,
             started_at: None,
             updated_at: Utc.timestamp_millis_opt(1).unwrap(),
         }
@@ -2092,6 +2093,7 @@ mod tests {
                     model: None,
                     harness_session_id: None,
                     status: None,
+                    model_retry: None,
                     updated_at: None,
                     created_at: 1,
                     unknown: Default::default(),

@@ -340,7 +340,9 @@ struct SessionView: View {
                     WorkingSpinner()
                     let elapsedMs = now.subtractingReportingOverflow(activity.row?.startedAt ?? activity.row?.updatedAt ?? now)
                     let elapsed = max(0, elapsedMs.overflow ? 0 : elapsedMs.partialValue / 1000)
-                    Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chatId), elapsedSecs: elapsed))\u{2026}")
+                    Text(activity.row?.modelRetry.map {
+                        "Reconnecting to model — attempt \($0.attempt)/\($0.maxAttempts)"
+                    } ?? "\(Motion.flavourWord(seed: Motion.flavourSeed(chatId), elapsedSecs: elapsed))\u{2026}")
                         .font(Theme.sans(12))
                         .foregroundStyle(Theme.textMuted)
                     Text(Motion.formatElapsed(elapsed))

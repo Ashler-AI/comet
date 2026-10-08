@@ -761,6 +761,8 @@ pub struct AgentSessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<crate::SessionStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_retry: Option<crate::ModelRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
     pub created_at: i64,
     #[serde(flatten, default)]

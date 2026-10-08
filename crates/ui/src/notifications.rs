@@ -253,6 +253,7 @@ mod tests {
             chat_id: "chat".into(),
             device_id: "device".into(),
             status,
+            model_retry: None,
             started_at: None,
             updated_at,
         }]);
@@ -462,6 +463,7 @@ mod tests {
             chat_id: "chat".into(),
             device_id: "device".into(),
             status: AwaitingInput,
+            model_retry: None,
             started_at: None,
             updated_at: now,
         };

@@ -29,7 +29,7 @@ use tokio::time::Instant;
 
 use comet_proto::{
     AgentActivity, AgentActivityStatus, AgentEvent, DoneStatus, HarnessCommand,
-    HarnessCommandSubcommand, HarnessId, OMP_GOAL_STATE_CALL_ID, OMP_GOAL_STATE_CALL_NAME,
+    HarnessCommandSubcommand, HarnessId, ModelRetry, OMP_GOAL_STATE_CALL_ID, OMP_GOAL_STATE_CALL_NAME,
     TodoItem, ToolCall, UserInputQuestion,
 };
 
@@ -612,6 +612,26 @@ fn assistant_error(message: &Value) -> Option<String> {
     )
 }
 
+fn model_retry_from_frame(frame: &Value) -> Option<AgentEvent> {
+    let retry = match frame.get("type")?.as_str()? {
+        "auto_retry_start" => {
+            let attempt = u32::try_from(frame.get("attempt")?.as_u64()?).ok()?;
+            let max_attempts = u32::try_from(frame.get("maxAttempts")?.as_u64()?).ok()?;
+            if attempt == 0 || attempt > max_attempts {
+                return None;
+            }
+            // OMP counts retries; the composer shows total model-call attempts.
+            Some(ModelRetry {
+                attempt: attempt.checked_add(1)?,
+                max_attempts: max_attempts.checked_add(1)?,
+            })
+        }
+        "auto_retry_end" => None,
+        _ => return None,
+    };
+    Some(AgentEvent::ModelRetry { retry })
+}
+
 fn usage_event(message: &Value) -> Option<AgentEvent> {
     let usage = message.get("usage")?;
     let read = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -1119,6 +1139,14 @@ pub(crate) async fn run_rpc(
                     }
                     "goal_updated" => {
                         if let Some(event) = goal_state_event_from_frame(&frame)
+                            && events.send(Ok(event)).await.is_err()
+                        {
+                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                            return Ok(());
+                        }
+                    }
+                    "auto_retry_start" | "auto_retry_end" => {
+                        if let Some(event) = model_retry_from_frame(&frame)
                             && events.send(Ok(event)).await.is_err()
                         {
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
@@ -1697,6 +1725,33 @@ mod tests {
         );
         let clean = json!({ "role": "assistant", "stopReason": "toolUse" });
         assert_eq!(assistant_error(&clean), None);
+    }
+
+    #[test]
+    fn retry_progress_counts_total_attempts_and_rejects_invalid_bounds() {
+        for (attempt, total) in [(1, 2), (3, 4)] {
+            assert_eq!(
+                model_retry_from_frame(&json!({
+                    "type": "auto_retry_start", "attempt": attempt, "maxAttempts": 3,
+                    "errorMessage": "private provider response",
+                })),
+                Some(AgentEvent::ModelRetry {
+                    retry: Some(ModelRetry { attempt: total, max_attempts: 4 }),
+                }),
+            );
+        }
+        for (attempt, max_attempts) in [(0, 3), (4, 3), (1, u64::MAX), (1, u32::MAX as u64)] {
+            assert_eq!(
+                model_retry_from_frame(&json!({
+                    "type": "auto_retry_start", "attempt": attempt, "maxAttempts": max_attempts,
+                })),
+                None,
+            );
+        }
+        assert_eq!(
+            model_retry_from_frame(&json!({ "type": "auto_retry_end", "success": false })),
+            Some(AgentEvent::ModelRetry { retry: None }),
+        );
     }
 
     #[test]

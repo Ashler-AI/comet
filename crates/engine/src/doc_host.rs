@@ -1210,6 +1210,7 @@ impl DocHost {
             }
             session.owner_device_id = self.device_id().to_string();
             session.status = Some(comet_proto::SessionStatus::Idle);
+            session.model_retry = None;
             session.updated_at = Some(now);
             handle.doc.append_publication(&PublicationRecord {
                 id: new_id(),
@@ -1253,17 +1254,21 @@ impl DocHost {
             return Ok(());
         };
         let updated_at = status.updated_at.timestamp_millis();
-        if session.status == Some(status.status) && session.updated_at == Some(updated_at) {
+        if session.status == Some(status.status)
+            && session.updated_at == Some(updated_at)
+            && session.model_retry == status.model_retry
+        {
             return Ok(());
         }
         session.status = Some(status.status);
         session.updated_at = Some(updated_at);
+        session.model_retry = status.model_retry;
         // Publication ids are immutable replay keys, not upsert keys. The engine
         // already throttles heartbeats; only changed owner snapshots append here.
         handle.doc.append_publication(&PublicationRecord {
             id: format!(
-                "session/{session_id}/status/{}/{:?}",
-                status.updated_at, status.status
+                "session/{session_id}/status/{}/{:?}/{:?}",
+                status.updated_at, status.status, status.model_retry
             ),
             schema_version: COLLABORATION_SCHEMA_VERSION,
             published_at: updated_at,
@@ -2325,6 +2330,7 @@ impl DocHost {
                                 .as_ref()
                                 .and_then(|session| session.harness_session_id.clone()),
                             status: Some(comet_proto::SessionStatus::Working),
+                            model_retry: None,
                             updated_at: Some(at),
                             created_at: previous.as_ref().map_or(at, |session| session.created_at),
                             unknown: Default::default(),
@@ -3001,6 +3007,7 @@ mod authority_tests {
                         model: None,
                         harness_session_id: None,
                         status: Some(SessionStatus::Working),
+                        model_retry: None,
                         updated_at: Some(1),
                         created_at: 1,
                         unknown: Default::default(),
@@ -3013,19 +3020,24 @@ mod authority_tests {
             chat_id: execution_key,
             device_id: "device-a".into(),
             status: SessionStatus::Working,
+            model_retry: None,
             started_at: None,
             updated_at: chrono::DateTime::from_timestamp_millis(1).unwrap(),
         };
-        for (status, at) in [
-            (SessionStatus::Working, 10_001),
-            (SessionStatus::Working, 20_001),
-            (SessionStatus::AwaitingInput, 20_002),
-            (SessionStatus::Working, 20_003),
-            (SessionStatus::Idle, 20_004),
-            (SessionStatus::Working, 20_005),
-            (SessionStatus::Errored, 20_006),
+        let retry = Some(comet_proto::ModelRetry { attempt: 2, max_attempts: 4 });
+        for (status, at, model_retry) in [
+            (SessionStatus::Working, 10_001, None),
+            (SessionStatus::Working, 10_001, retry),
+            (SessionStatus::Working, 20_001, retry),
+            (SessionStatus::Working, 20_001, None),
+            (SessionStatus::AwaitingInput, 20_002, None),
+            (SessionStatus::Working, 20_003, retry),
+            (SessionStatus::Idle, 20_004, None),
+            (SessionStatus::Working, 20_005, retry),
+            (SessionStatus::Errored, 20_006, None),
         ] {
             source.status = status;
+            source.model_retry = model_retry;
             source.updated_at = chrono::DateTime::from_timestamp_millis(at).unwrap();
             host.record_agent_session(&source).unwrap();
             let snapshot = handle.doc.collaboration_snapshot().unwrap();
@@ -3038,6 +3050,7 @@ mod authority_tests {
                 (assigned.status, assigned.updated_at),
                 (Some(status), Some(at))
             );
+            assert_eq!(assigned.model_retry, model_retry);
             let other = snapshot
                 .sessions
                 .iter()

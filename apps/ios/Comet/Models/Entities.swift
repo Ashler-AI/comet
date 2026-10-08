@@ -236,12 +236,18 @@ enum SessionStatus: String {
     case idle, working, awaitingInput, errored
 }
 
+struct ModelRetry: Decodable, Hashable {
+    var attempt: UInt32
+    var maxAttempts: UInt32
+}
+
 struct SessionRow: Hashable {
     var chatId: String
     var deviceId: String
     var status: SessionStatus
     var startedAt: Int64?
     var updatedAt: Int64
+    var modelRetry: ModelRetry? = nil
 }
 
 // MARK: - Derived display status (entities.rs / state.rs ports)

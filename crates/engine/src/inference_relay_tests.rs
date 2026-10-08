@@ -28,6 +28,7 @@ mod tests {
         RelayStreamContext {
             session_id: "diagnostic-session".into(),
             request_id: request_id.into(),
+            upstream_request_id: None,
         }
     }
 
@@ -80,13 +81,20 @@ mod tests {
         assert!(cancelled.next().await.is_none());
 
         let mut failed = instrumented_test_stream(
-            vec![Err(Box::new(std::io::Error::other("body closed")))],
+            vec![
+                Ok(Bytes::from_static(b"partial response")),
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "private authorization=Bearer secret-token prompt-private",
+                ))),
+            ],
             comet_harness::CancellationToken::new(),
             "request-failed",
         );
+        assert_eq!(failed.next().await.unwrap().unwrap(), Bytes::from_static(b"partial response"));
         assert_eq!(
             failed.next().await.unwrap().unwrap_err().to_string(),
-            "body closed"
+            "private authorization=Bearer secret-token prompt-private"
         );
 
         drop(InstrumentedRelayStream::new(
@@ -111,10 +119,21 @@ mod tests {
             assert!(line.contains("status=200"), "{line}");
             assert!(line.contains("bytes_received="), "{line}");
         }
-        assert!(
-            logs.lines()
-                .any(|line| line.contains("request-failed") && line.contains("body closed"))
-        );
+        assert!(logs.lines().any(|line| line.contains("request-failed")
+            && line.contains("cause=connection_reset_or_closed")));
+        assert!(!logs.contains("secret-token"));
+        assert!(!logs.contains("prompt-private"));
+    }
+
+    #[test]
+    fn diagnostic_ids_reject_log_injection_and_credential_shapes() {
+        for valid in ["request-1", "fba6da1d-ddfc-477e-b3eb-376fe16542c6", "req_abc"] {
+            assert!(diagnostic_request_id(valid));
+        }
+        for invalid in ["", "req\nforged-log", "private prompt", "req/secret", "é", "sk-secret", "sk_secret", "ia2credential", "cs1credential", "eyJcredential"] {
+            assert!(!diagnostic_request_id(invalid));
+        }
+        assert!(!diagnostic_request_id(&"a".repeat(129)));
     }
 
     struct StaticToken;

@@ -1032,6 +1032,7 @@ impl SessionsEngine {
                             if !was_turn_active {
                                 self.set_status(chat_id, SessionStatus::Working, true);
                             }
+                            self.inner.touch_session(chat_id, Some(None));
                             let status = handle.mailbox_message_status(was_turn_active, message);
                             handle.user_message_id = user_id.clone();
                             ExistingRunDecision::Routed {
@@ -1384,6 +1385,7 @@ impl SessionsEngine {
             if !was_turn_active {
                 self.set_status(chat_id, SessionStatus::Working, true);
             }
+            self.inner.touch_session(chat_id, Some(None));
             handle.mailbox_message_status(was_turn_active, message)
         };
         let handle = self.doc_handle(chat_id)?;
@@ -2096,7 +2098,7 @@ impl Inner {
     /// tool input being generated) still carry events — the UI's 45s
     /// staleness gate must not flip "Working" off mid-run. Throttled: a
     /// workspace-doc mirror per delta would be far too chatty.
-    fn touch_session(&self, chat_id: &str) {
+    fn touch_session(&self, chat_id: &str, retry: Option<Option<comet_proto::ModelRetry>>) {
         const TOUCH_THROTTLE_MS: i64 = 10_000;
         let now = Utc::now();
         let session = {
@@ -2107,7 +2109,12 @@ impl Inner {
             let age = now
                 .signed_duration_since(entry.updated_at)
                 .num_milliseconds();
-            if age < TOUCH_THROTTLE_MS {
+            let retry = retry.map(|retry| retry.filter(|_| entry.status == SessionStatus::Working));
+            let retry_changed = retry.is_some_and(|retry| entry.model_retry != retry);
+            if let Some(retry) = retry {
+                entry.model_retry = retry;
+            }
+            if age < TOUCH_THROTTLE_MS && !retry_changed {
                 return;
             }
             entry.updated_at = now;
@@ -2133,6 +2140,7 @@ impl Inner {
                     chat_id: chat_id.to_string(),
                     device_id: self.device_id.clone(),
                     status,
+                    model_retry: None,
                     started_at: None,
                     updated_at: now,
                 });
@@ -2142,6 +2150,9 @@ impl Inner {
             ) && matches!(status, SessionStatus::Idle | SessionStatus::Errored);
             entry.status = status;
             entry.updated_at = now;
+            if fresh_start || status != SessionStatus::Working {
+                entry.model_retry = None;
+            }
             if fresh_start {
                 entry.started_at = Some(entry.started_at.map_or(now, |previous| {
                     now.max(previous + chrono::Duration::nanoseconds(1))
@@ -2551,6 +2562,7 @@ async fn drive_run(
             changed = cancel_rx.changed(), if !interrupted => {
                 let _ = changed;
                 interrupted = true;
+                inner.touch_session(&chat_id, Some(None));
                 interrupt_deadline = Some(
                     tokio::time::Instant::now() + std::time::Duration::from_secs(3),
                 );
@@ -2565,7 +2577,7 @@ async fn drive_run(
                 session_id: None,
             },
             _ = live_heartbeat.tick() => {
-                inner.touch_session(&chat_id);
+                inner.touch_session(&chat_id, None);
                 continue;
             }
             // Idle reaper (comet SESSION_IDLE_MS): a parked persistent session
@@ -2625,7 +2637,25 @@ async fn drive_run(
 
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
-        inner.touch_session(&chat_id);
+        let retry = match &event {
+            AgentEvent::ModelRetry { retry } => Some(if interrupted { None } else { *retry }),
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::ReasoningStarted
+            | AgentEvent::ReasoningCompleted
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::Usage { .. }
+            | AgentEvent::AssistantMessageCompleted { .. }
+            | AgentEvent::InputRequested { .. }
+            | AgentEvent::Steered { .. }
+            | AgentEvent::Error { .. }
+            | AgentEvent::Done { .. } => Some(None),
+            AgentEvent::ReasoningDelta { text } if !text.is_empty() => Some(None),
+            _ => None,
+        };
+        inner.touch_session(&chat_id, retry);
+        if matches!(&event, AgentEvent::ModelRetry { .. }) {
+            continue;
+        }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
         // tool-input-generation windows stream them with no text. They fold
         // to nothing, so journaling/publishing them is only noise (hundreds
@@ -3257,6 +3287,44 @@ mod tests {
             Arc::new(HarnessRegistry::new()),
             27654,
         )
+    }
+
+    #[test]
+    fn model_retry_transitions_bypass_heartbeat_throttle_and_clear_at_turn_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = bare_sessions(dir.path());
+        let mut watch = sessions.watch_sessions();
+        sessions.set_status("chat", SessionStatus::Working, true);
+        let started_at = watch.borrow_and_update()[0].started_at;
+        for attempt in [2, 3, 4] {
+            let retry = Some(comet_proto::ModelRetry { attempt, max_attempts: 4 });
+            sessions.inner.touch_session("chat", Some(retry));
+            assert!(watch.has_changed().unwrap());
+            let rows = watch.borrow_and_update();
+            assert_eq!(rows[0].model_retry, retry);
+            assert_eq!(rows[0].status, SessionStatus::Working);
+            assert_eq!(rows[0].started_at, started_at);
+            let mut parts = Vec::new();
+            fold_event_into_parts(&mut parts, &AgentEvent::ModelRetry { retry });
+            assert!(parts.is_empty());
+        }
+        sessions.inner.touch_session("chat", None);
+        assert_eq!(watch.borrow()[0].model_retry.unwrap().attempt, 4);
+        sessions.inner.touch_session("chat", Some(None));
+        assert!(watch.borrow()[0].model_retry.is_none());
+        for (status, fresh_start) in [
+            (SessionStatus::Working, true),
+            (SessionStatus::Idle, false),
+            (SessionStatus::Errored, false),
+            (SessionStatus::AwaitingInput, false),
+        ] {
+            sessions.set_status("chat", SessionStatus::Working, true);
+            sessions.inner.touch_session("chat", Some(Some(comet_proto::ModelRetry {
+                attempt: 2, max_attempts: 4,
+            })));
+            sessions.set_status("chat", status, fresh_start);
+            assert!(watch.borrow()[0].model_retry.is_none());
+        }
     }
 
     #[tokio::test]

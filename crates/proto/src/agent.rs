@@ -349,6 +349,13 @@ pub enum DoneStatus {
     Errored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRetry {
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -406,6 +413,11 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
+    /// Live model recovery status; never folded into transcript parts.
+    ModelRetry {
+        #[serde(default)]
+        retry: Option<ModelRetry>,
+    },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
@@ -452,6 +464,16 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+        let retry = AgentEvent::ModelRetry {
+            retry: Some(ModelRetry { attempt: 2, max_attempts: 4 }),
+        };
+        let json = serde_json::to_value(&retry).unwrap();
+        assert_eq!(json["retry"]["maxAttempts"], 4);
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), retry);
+        assert_eq!(
+            serde_json::from_str::<AgentEvent>(r#"{"type":"modelRetry","futureField":true}"#).unwrap(),
+            AgentEvent::ModelRetry { retry: None },
+        );
     }
 
     #[test]

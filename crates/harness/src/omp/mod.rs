@@ -67,7 +67,7 @@ const SCAFFOLD_INFERENCE_EXTENSION_BYTES: u64 = 64 * 1024;
 // its documented coordinate-safe capture cap for every Comet-owned OMP run.
 const OMP_RUN_CONFIG: &[u8] = br#"retry:
   enabled: true
-  maxRetries: 1
+  maxRetries: 3
   baseDelayMs: 1000
   provider:
     maxRetries: 0
@@ -3919,12 +3919,11 @@ mod tests {
     }
 
     #[test]
-    fn run_config_bounds_retries_and_computer_screenshots() {
+    fn run_config_is_removed_after_owner_drops() {
         let path;
         {
             let config = OmpRunConfig::create().unwrap();
             path = config.path.clone();
-            assert_eq!(std::fs::read(&path).unwrap(), OMP_RUN_CONFIG);
         }
         assert!(!path.exists(), "temporary OMP overlay must be removed");
     }

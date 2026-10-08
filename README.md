@@ -378,6 +378,21 @@ This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-p
 
 To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
 
+### Model-stream recovery
+
+Crew-owned OMP runs allow three model-level retries with OMP's bounded backoff;
+provider/SDK HTTP retries remain disabled. Completed tools and the user task are
+not replayed by Crew. Existing OMP replay-safe stream repair remains unchanged.
+Desktop, iOS, and web show **Reconnecting to model — attempt 2/4** during recovery
+and clear the indicator on resumed progress, interruption, or terminal completion.
+Retry counters are live session metadata, not transcript errors or reasoning text.
+
+Inference diagnostics join Crew's `request_id` to the server's `requestId` using
+`x-agent-auth-request-id`, separately from OpenAI's `x-request-id`. IDs are bounded
+and credential-like values are omitted; transport causes are classified without
+logging raw exception messages, prompts, or credentials. Partial HTTP 200 streams
+remain errors, and inference timeout behavior is unchanged.
+
 ### Desktop gateway extension discovery
 
 Crew 0.1.83 installs a credential-free, Crew-owned discovery adapter at

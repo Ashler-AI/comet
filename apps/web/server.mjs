@@ -246,12 +246,16 @@ export class Viewport {
     const context = this.context;
     const record = this.collaboration?.sessions?.find(row => row.sessionId === this.config.sessionId);
     const status = this.live?.status || record?.status || 'idle';
+    const updatedAt = this.live ? Date.parse(this.live.updatedAt) : record?.updatedAt ?? record?.createdAt;
+    const modelRetry = status === 'working' && Date.now() - updatedAt <= 45_000
+      ? (this.live ? this.live.modelRetry : record?.modelRetry) : null;
     const active = this.ready() && this.currentAuthority?.expiresAt > Date.now();
     const caps = this.currentAuthority?.capabilities || [];
     return {
       sandboxId: this.config.sandboxId,
       session: { id: this.config.sessionId, title: context?.title || 'Crew', cwd: context?.cwd || '', branch: context?.branch || '', status,
         turnId: this.live?.startedAt ? JSON.stringify([this.live.chatId, this.live.deviceId, this.live.startedAt]) : null,
+        modelRetry,
         model: this.selection?.model || record?.model || context?.config?.model,
         reasoning: this.selection ? this.selection.reasoning : context?.config?.reasoning },
       messages: this.messages, models: this.models, history: { hasOlder: this.before != null, before: this.before ?? null },

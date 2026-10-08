@@ -104,6 +104,7 @@ impl SessionActivity {
                                                 chat_id: room.session_id.clone(),
                                                 device_id: agent.owner_device_id.clone(),
                                                 status,
+                                                model_retry: if status == SessionStatus::Working { agent.model_retry } else { None },
                                                 started_at: None,
                                                 updated_at,
                                             }, last_message_at)
@@ -271,6 +272,7 @@ mod tests {
                         model: None,
                         harness_session_id: None,
                         status: Some(status),
+                        model_retry: None,
                         updated_at: Some(at),
                         created_at: 1_000,
                         unknown: Default::default(),
@@ -300,6 +302,7 @@ mod tests {
             chat_id: "chat".into(),
             device_id: "local".into(),
             status: SessionStatus::Idle,
+            model_retry: None,
             started_at: None,
             updated_at: DateTime::from_timestamp_millis(99_000).unwrap(),
         };

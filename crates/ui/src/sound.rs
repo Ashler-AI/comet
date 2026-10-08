@@ -218,6 +218,7 @@ mod tests {
                 chat_id: "chat-a".into(),
                 device_id: "device-a".into(),
                 status,
+                model_retry: None,
                 started_at: None,
                 updated_at,
             }
