@@ -2,6 +2,14 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.150: cold-checkpoint recovery
+
+Packages the verified cold-reopen repair from [PR #93](https://github.com/Ashler-AI/comet/pull/93):
+older workspace checkpoints retain already-reconciled activity without dropping
+original intents or accepting unseen conflicts. The Scaffold runtime contract and
+mobile build numbers are unchanged. Publish staging only; installed-client restart
+and manual acceptance remain required before production promotion.
+
 ## Crew 0.1.149: concurrent read-marker recovery
 
 The installed 0.1.148 client still rejected new-session creation when retained
