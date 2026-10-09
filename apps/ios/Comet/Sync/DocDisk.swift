@@ -228,6 +228,26 @@ enum DocDisk {
                 throw MobileSessionError.unavailable("Crew recovery cannot replace a known record owner or deployment route.")
             }
         }
+        let independentCreation = root == "chats" && before == nil
+            && after?.mapValue?["id"]?.stringValue == key && server?.mapValue?["id"]?.stringValue == key
+        func same(_ field: String, _ left: LoroValue?, _ right: LoroValue?) -> Bool {
+            if left == right { return true }
+            guard root == "chats" else { return false }
+            if independentCreation && field == "createdAt", left?.i64Value != nil, right?.i64Value != nil { return true }
+            guard field == "config", let left = left?.mapValue, let right = right?.mapValue else { return false }
+            // Swift omits nil optionals; native serialization writes null.
+            // Unknown fields and non-null changes remain genuine conflicts.
+            func matches(_ row: [String: LoroValue], _ other: [String: LoroValue]) -> Bool {
+                row.allSatisfy { field, value in
+                    if other[field] == value { return true }
+                    switch field {
+                    case "model", "reasoning", "sandbox": return value == .null && other[field] == nil
+                    default: return false
+                    }
+                }
+            }
+            return matches(left, right) && matches(right, left)
+        }
         if server == after { return }
         var before = before
         if let desired = after?.mapValue, let remote = server?.mapValue, !alternatives.isEmpty {
@@ -235,7 +255,7 @@ enum DocDisk {
             guard let match = bases.firstIndex(where: { value in
                 let base = value?.mapValue ?? [:]
                 return Set(base.keys).union(desired.keys).allSatisfy { field in
-                    base[field] == desired[field] || remote[field] == desired[field] || remote[field] == base[field] ||
+                    same(field, base[field], desired[field]) || same(field, remote[field], desired[field]) || same(field, remote[field], base[field]) ||
                     (root == "chats" && field == "lastSeenAt" && desired[field]?.i64Value != nil && remote[field]?.i64Value != nil)
                 }
             }) else { throw MobileSessionError.unavailable("Crew recovery conflicts with retained intermediate edits on \(root)/\(key). Original intents are retained.") }
@@ -259,14 +279,14 @@ enum DocDisk {
             if row.getDeepValue().mapValue?.isEmpty == true, !remote.isEmpty {
                 for (field, value) in remote { try row.insert(key: field, v: value) }
             }
-            for field in Set(base.keys).union(desired.keys) where base[field] != desired[field] {
-                if remote[field] == desired[field] { continue }
+            for field in Set(base.keys).union(desired.keys) where !same(field, base[field], desired[field]) {
+                if same(field, remote[field], desired[field]) { continue }
                 if root == "chats", field == "lastSeenAt", let value = desired[field],
                    let desiredAt = value.i64Value, let serverAt = remote[field]?.i64Value {
                     if desiredAt > serverAt { try row.insert(key: field, v: value) }
                     continue
                 }
-                guard remote[field] == base[field], isRecoveryValue(desired[field]) else {
+                guard same(field, remote[field], base[field]), isRecoveryValue(desired[field]) else {
                     throw MobileSessionError.unavailable("Crew recovery conflicts on \(root)/\(key)/\(field). Both the original intent and authoritative record are retained.")
                 }
                 if let value = desired[field] { try row.insert(key: field, v: value) }
@@ -637,6 +657,29 @@ extension DocDisk {
             try lateAlias.insert(key: "id", v: alias); try lateAlias.insert(key: "deviceId", v: "owner")
             aliasDoc.commit()
             guard try migrateWorkspaceRows(in: aliasDoc), aliasDoc.getMap(id: "chats").get(key: publicId) == nil else { return false }
+            let creation = LoroDoc()
+            let native = try creation.getMap(id: "chats").getOrCreateContainer(key: "created", child: LoroMap())
+            try native.insert(key: "id", v: "created"); try native.insert(key: "deviceId", v: "owner")
+            try native.insert(key: "createdAt", v: Int64(100))
+            try native.insert(key: "config", v: LoroValue.fromJSON([
+                "harness": "mock", "model": NSNull(), "reasoning": NSNull(), "sandbox": "workspace-write"
+            ] as [String: Any]))
+            creation.commit()
+            let authoritativeCreation = creation.getDeepValue()
+            let creationVersion = creation.oplogVv()
+            let mobileConfig: [String: LoroValue] = ["harness": .string(value: "mock"), "sandbox": .string(value: "workspace-write")]
+            var mobileCreation: [String: LoroValue] = ["id": .string(value: "created"), "deviceId": .string(value: "owner"),
+                "createdAt": .i64(value: 200), "config": .map(value: mobileConfig)]
+            try applyRecordChange(root: "chats", key: "created", before: nil, after: .map(value: mobileCreation), in: creation)
+            guard creation.getDeepValue() == authoritativeCreation, creation.oplogVv() == creationVersion else { return false }
+            for field in ["model", "unknownOption"] {
+                var changed = mobileConfig
+                changed[field] = .string(value: "retained user choice")
+                mobileCreation["config"] = .map(value: changed)
+                do { try applyRecordChange(root: "chats", key: "created", before: nil, after: .map(value: mobileCreation), in: creation); return false }
+                catch MobileSessionError.unavailable(_) {}
+                guard creation.getDeepValue() == authoritativeCreation else { return false }
+            }
             let source = LoroDoc()
             let row = try source.getMap(id: "chats").getOrCreateContainer(key: "existing", child: LoroMap())
             try row.insert(key: "id", v: "existing")

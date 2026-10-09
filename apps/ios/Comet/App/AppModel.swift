@@ -755,10 +755,10 @@ final class AppModel {
     }
 
     @discardableResult
-    func createChat(space: Space, config chatConfig: ChatConfig,
+    func createChat(id: String, space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) async throws -> String {
         if let demo {
-            let id = "chat-\(UUID().uuidString.lowercased().prefix(8))"
+            if demo.lists.chatsById[id] != nil { return id }
             demo.chats.append(Chat(id: id, deviceId: space.deviceId, title: nil, archived: false,
                                    cwd: cwd ?? space.path, branch: branch, checkoutId: nil,
                                    config: chatConfig, lastMessagePreview: nil, lastMessageAt: nil,
@@ -767,7 +767,13 @@ final class AppModel {
             return id
         }
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
-        return try await workspace.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        return try await workspace.createChat(id: id, space: space, config: chatConfig, branch: branch, cwd: cwd)
+    }
+
+    func waitForCreatedChat(id: String) async throws -> Chat {
+        if let demo, let chat = demo.lists.chatsById[id] { return chat }
+        guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
+        return try await workspace.waitForCreatedChat(id: id)
     }
 
     var launchesScaffoldSessions: Bool {

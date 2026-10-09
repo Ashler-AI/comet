@@ -544,6 +544,50 @@ final class WorkspaceStore {
                 && store.overviewChats.first?.title == "Local edit"
         } catch { return false }
     }
+
+    static func runCreatedChatRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "creation-\(UUID().uuidString)", projectScope: "creation-regression",
+            deviceId: "viewer", deviceName: "Crew regression")
+        let store = WorkspaceStore(config: config)
+        defer {
+            store.stop()
+            try? FileManager.default.removeItem(at: DocDisk.intentURL(for: store.recordCacheId))
+        }
+        do {
+            let row = try store.doc.getMap(id: "chats").getOrCreateContainer(key: "created", child: LoroMap())
+            try row.insert(key: "id", v: "created"); try row.insert(key: "deviceId", v: "host")
+            try row.insert(key: "createdAt", v: Int64(1234))
+            try row.insert(key: "config", v: LoroValue.fromJSON([
+                "harness": "mock", "model": NSNull(), "reasoning": NSNull(), "sandbox": "workspace-write"
+            ] as [String: Any]))
+            let member = try store.doc.getMap(id: "sessionRefs").getOrCreateContainer(key: "membership", child: LoroMap())
+            try member.insert(key: "chatId", v: "created"); try member.insert(key: "userId", v: "other-user")
+            try member.insert(key: "addedAt", v: Int64(1234))
+            store.doc.commit(); store.project()
+            var entered = false
+            let waiting = Task { @MainActor in
+                entered = true
+                return try await store.waitForCreatedChat(id: "created")
+            }
+            defer { waiting.cancel() }
+            guard await E2ERunner.poll(timeout: 1, label: "creation membership wait", { entered ? true : nil }) != nil else { return false }
+            waiting.cancel()
+            do { _ = try await waiting.value; return false } catch is CancellationError {}
+            try member.insert(key: "userId", v: config.userId)
+            store.doc.commit(); store.project()
+            let version = store.doc.oplogVv()
+            let created = try await store.waitForCreatedChat(id: "created")
+            guard created.createdAt == 1234,
+                  created.config == ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"),
+                  store.doc.oplogVv() == version, store.recordIntents.isEmpty else { return false }
+            store.blockRecordRecovery(MobileSessionError.unavailable("Retained user-edit conflict"))
+            do { _ = try await store.waitForCreatedChat(id: "created"); return false }
+            catch MobileSessionError.unavailable(_) {}
+            E2ERunner.log("OK Crew host-created catalog: principal membership, cancellation, authoritative config/clock, no duplicate creation intent and visible recovery failure")
+            return true
+        } catch { return false }
+    }
     #endif
 
     nonisolated static func decodeProjection(from doc: LoroDoc, userId: String,
@@ -875,8 +919,7 @@ final class WorkspaceStore {
                 "config": encodableDictionary(chatConfig),
             ]
         )
-        try putChat(chatId: chatId, space: space, config: chatConfig,
-                    branch: launch.sourceRef, cwd: ".")
+        _ = try await waitForCreatedChat(id: chatId)
         _ = addSessionRef(chatId: chatId, environment: attachment.environment)
 
         let route = ScaffoldControlRoute(
@@ -1157,12 +1200,11 @@ final class WorkspaceStore {
     /// Create through the actual host so its verified principal membership is
     /// installed before the first QueueCommand can reach command draining.
     @discardableResult
-    func createChat(space: Space, config chatConfig: ChatConfig,
+    func createChat(id chatId: String, space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) async throws -> String {
         guard !space.deviceId.isEmpty else {
             throw MobileSessionError.unavailable("This space has no desktop host")
         }
-        let chatId = UUID().uuidString.lowercased()
         var params: [String: Any] = [
             "op": "createChat",
             "chatId": chatId,
@@ -1176,29 +1218,24 @@ final class WorkspaceStore {
         guard reply.ok else {
             throw MobileSessionError.unavailable("The desktop did not create this session")
         }
-        try putChat(chatId: chatId, space: space, config: chatConfig,
-                    branch: branch, cwd: cwd ?? space.path)
         return chatId
     }
 
-    private func putChat(chatId: String, space: Space, config chatConfig: ChatConfig,
-                         branch: String?, cwd: String) throws {
-        try mutateRecord(root: "chats", key: chatId) { row in
-            try row.insert(key: "id", v: chatId)
-            try row.insert(key: "deviceId", v: space.deviceId)
-            try row.insert(key: "archived", v: false)
-            try row.insert(key: "cwd", v: cwd)
-            try row.insert(key: "spaceId", v: space.id)
-            let createdAt = row.get(key: "createdAt")?.asValue()?.i64Value ?? nowMs()
-            try row.insert(key: "createdAt", v: createdAt)
-            if let branch { try row.insert(key: "branch", v: branch) }
-            if let value = LoroValue.fromEncodable(chatConfig) {
-                try row.insert(key: "config", v: value)
+    /// The host already committed the chat and principal membership. Recreating
+    /// them here races its publication with different config encoding and clocks.
+    func waitForCreatedChat(id: String) async throws -> Chat {
+        let epoch = roomEpoch
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            guard epoch == roomEpoch else {
+                throw MobileSessionError.unavailable("The workspace connection changed while waiting for the created session.")
             }
+            if let recoveryFailure { throw MobileSessionError.unavailable(recoveryFailure) }
+            if let chat = chat(id: id), sessionRef(id: id) != nil { return chat }
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
-        guard addSessionRef(chatId: chatId) != nil else {
-            throw MobileSessionError.unavailable("Couldn’t save this session’s membership")
-        }
+        throw MobileSessionError.unavailable("The desktop created this session, but its catalog has not synced yet. Retry to continue the same session.")
     }
 
     /// Create a space. Preferred path: `Mutate {op:createSpace}` straight to

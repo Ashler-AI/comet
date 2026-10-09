@@ -20,7 +20,7 @@ const work = path.join(process.env.RUNNER_TEMP, "crew-mobile");
 for (const directory of [logs, release, work]) mkdirSync(directory, { recursive: true });
 const environment = process.env.CREW_MOBILE_ENVIRONMENT ?? "staging";
 const profiles = {
-  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "31", suffix: "-Staging", name: "Crew-Staging" },
+  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "32", suffix: "-Staging", name: "Crew-Staging" },
   production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "21", suffix: "", name: "Crew" },
 };
 if (!Object.hasOwn(profiles, environment)) throw new Error(`Unsupported mobile environment: ${environment}`);
@@ -41,6 +41,7 @@ const markers = [
   "OK Crew live transcript projection",
   "OK Crew room convergence",
   "OK Crew workspace intents",
+  "OK Crew host-created catalog",
   "OK Crew saved record recovery",
   "OK Crew durable intents",
   "OK Crew transcript freshness",

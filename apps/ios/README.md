@@ -103,6 +103,27 @@ produce these build candidates.
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
 
+### Crew Staging 1.0 (32): host-owned creation candidate
+
+The first [0.1.149 release attempt](https://github.com/Ashler-AI/comet/actions/runs/37948039570)
+stopped before desktop publication: its live mobile/native/Edge smoke rejected a
+new chat's `config`. Mobile called the host's `createChat` mutation, then created
+the same row locally while the room imported the host's publication. Swift omitted
+nil config fields that native encoded as null, and both writers chose creation clocks.
+
+Local and Scaffold creation now leave the chat and principal membership to the
+host. First send waits for their scoped projection, with cancellation, connection
+epoch and recovery-error guards; retries retain the accepted Local creation ID.
+Retained older creation records recognize equivalent optional config values and
+keep the authoritative creation clock. Non-null/unknown config edits, ownership
+changes, deletions and other genuine conflicts remain guarded.
+
+The simulator regressions cover membership readiness, cancellation, unchanged
+authoritative config/clock, retained equivalent creation and real edit rejection.
+The existing live smoke still requires real native admission and streamed output.
+Build **32** is a separate candidate, not a TestFlight upload; the latest published
+staging mobile build remains **31**. Physical-phone acceptance is still required.
+
 ### Crew Staging 1.0 (31): catalog recovery
 
 Workspace and session upload callbacks carry their original document binding.

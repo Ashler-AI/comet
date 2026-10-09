@@ -409,10 +409,13 @@ fn reconcile(
                         }
                         let clock = |row: &serde_json::Map<String, serde_json::Value>, field: &str| row.get(field).and_then(serde_json::Value::as_i64)
                             .filter(|at| chrono::DateTime::from_timestamp_millis(*at).is_some());
-                        let activity_fields: &[&str] = if name == "chats" { &["lastMessageAt", "lastMessagePreview"] } else { &[] };
                         let clocks: &[&str] = if name == "chats" { &["createdAt", "lastSeenAt"] } else { &["addedAt"] };
-                        let activity_times = if name == "chats" { Some((clock(local, "lastMessageAt")?, clock(remote, "lastMessageAt")?)) }
-                            else { clock(local, "addedAt")?; clock(remote, "addedAt")?; None };
+                        let activity_times = if name == "chats" {
+                            let (a, b) = (clock(local, "lastMessageAt"), clock(remote, "lastMessageAt"));
+                            if (local.contains_key("lastMessageAt") && a.is_none()) || (remote.contains_key("lastMessageAt") && b.is_none()) { return None }
+                            a.zip(b)
+                        } else { clock(local, "addedAt")?; clock(remote, "addedAt")?; None };
+                        let activity_fields: &[&str] = if activity_times.is_some() { &["lastMessageAt", "lastMessagePreview"] } else { &[] };
                         let cached_value = row_value(cached, name, &record.key);
                         let cached_fields = cached_value.as_ref().and_then(serde_json::Value::as_object)?;
                         if crate::workspace::WORKSPACE_IDENTITY_FIELDS.iter().any(|field| cached_fields.get(*field) != local.get(*field))
@@ -427,6 +430,27 @@ fn reconcile(
                             if clocks.contains(&field.as_str()) && remote.contains_key(field) {
                                 let (a, b) = (clock(local, field)?, clock(remote, field)?);
                                 merged.insert(field.clone(), serde_json::json!(if field == "lastSeenAt" { a.max(b) } else { a.min(b) }));
+                            } else if name == "chats" && field == "archived" && value.as_bool() == Some(true)
+                                && remote.get(field).and_then(serde_json::Value::as_bool) == Some(false)
+                                && cached_fields.get(field) == Some(value)
+                            {
+                                // A new host's default is not a competing restore. Prove both
+                                // the row and its false flag were first insertions, not tombstones.
+                                let inserted = doc.get_map(name).to_handler().get_last_edit_idlp(&record.key)?;
+                                let stamped = remote_row.to_handler().get_last_edit_idlp(field)?;
+                                let (before_insert, before_stamp) = doc.with_oplog(|log| Some((
+                                    log.get_deps_of(log.idlp_to_id(inserted)?)?,
+                                    log.get_deps_of(log.idlp_to_id(stamped)?)?,
+                                )))?;
+                                // ponytail: one history fork on this rare seed conflict; index field baselines if recovery gets hot.
+                                let prior = doc.fork();
+                                prior.checkout(&before_insert).ok()?;
+                                let prior_root = prior.get_map(name);
+                                if prior_root.get(&record.key).is_some() || prior_root.to_handler().get_last_edit_idlp(&record.key).is_some() { return None }
+                                prior.checkout(&before_stamp).ok()?;
+                                let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = prior.get_map(name).get(&record.key) else { return None };
+                                if row.id() != remote_row.id() || row.get(field).is_some() || row.to_handler().get_last_edit_idlp(field).is_some() { return None }
+                                merged.insert(field.clone(), value.clone());
                             } else {
                                 // Independent seeds may add metadata, but a tombstone is not an absent field.
                                 if remote.contains_key(field) || remote_row.to_handler().get_last_edit_idlp(field).is_some() { return None }
@@ -1206,6 +1230,52 @@ mod tests {
                 assert!(blocked.adopt_snapshot(&deleted, None).is_err());
                 assert_eq!(blocked.export(ExportMode::Snapshot).unwrap(), preserved);
                 assert_eq!(serde_json::to_vec(&blocked.pending_records()).unwrap(), retained);
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_archive_beats_initial_default_but_not_restore_or_recreation() {
+        for has_activity in [false, true] {
+            let local = WorkspaceDoc::new(); let remote = WorkspaceDoc::new();
+            let binding = local.binding(); journal(&binding);
+            for doc in [&local, &remote] {
+                let row = doc.binding().get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+                row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner").unwrap();
+                row.insert("createdAt", 1_000i64).unwrap(); row.insert("archived", false).unwrap();
+                if has_activity { row.insert("lastMessageAt", 2_000i64).unwrap(); }
+                doc.binding().commit().unwrap();
+            }
+            local.set_chat_archived("chat", true).unwrap();
+            let original = local.export_snapshot().unwrap(); let records = binding.pending_records();
+            assert!(records[0].before.is_none());
+            let incoming = remote.export_snapshot().unwrap();
+            binding.adopt_snapshot(&incoming, None).unwrap();
+            assert_eq!(binding.get_map("chats").get("chat").unwrap().get_deep_value().to_json_value()["archived"], true);
+            assert_eq!(binding.pending_records()[0].value, records[0].value);
+            for recreate in [false, true] {
+                let changed = LoroDoc::new(); changed.import(&incoming).unwrap();
+                let root = changed.get_map("chats");
+                let row = if recreate {
+                    root.delete("chat").unwrap(); changed.commit();
+                    let row = root.insert_container("chat", LoroMap::new()).unwrap();
+                    row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner").unwrap();
+                    row.insert("createdAt", 1_000i64).unwrap();
+                    if has_activity { row.insert("lastMessageAt", 2_000i64).unwrap(); }
+                    row
+                } else {
+                    let loro::ValueOrContainer::Container(loro::Container::Map(row)) = root.get("chat").unwrap() else { panic!("chat map") };
+                    row.insert("archived", true).unwrap(); changed.commit(); row
+                };
+                row.insert("archived", false).unwrap(); changed.commit();
+                let raw = LoroDoc::new(); raw.import(&original).unwrap();
+                let blocked = WorkspaceDoc::from_doc(raw); let pending = blocked.binding();
+                pending.install_journal(records.clone(), Arc::new(|_, _| Ok(())));
+                let preserved = blocked.export_snapshot().unwrap();
+                let intents = serde_json::to_vec(&pending.pending_records()).unwrap();
+                assert!(pending.adopt_snapshot(&changed.export(ExportMode::Snapshot).unwrap(), None).is_err());
+                assert_eq!(blocked.export_snapshot().unwrap(), preserved);
+                assert_eq!(serde_json::to_vec(&pending.pending_records()).unwrap(), intents);
             }
         }
     }

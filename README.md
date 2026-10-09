@@ -13,7 +13,7 @@ The metadata warning and creation failure share this cause; neither is suppresse
 
 Private replay against a fresh read-only server capture recovered all **156**
 retained records, preserving every original before/value, and passed new-chat
-creation, principal membership and cold reopen. All **115** document tests passed,
+creation, principal membership and cold reopen. All **116** document tests passed,
 including concurrent reads and explicit unread conflicts. This is isolated
 verification, not installed-client or phone acceptance. No live cache was reset.
 
@@ -22,15 +22,33 @@ and cold reopen, with only the normal local device boot clock/version restamp.
 The isolated headed client displayed the new session; typed Local start completed
 with mock-agent output and no metadata error. **315** engine and **57** sync tests
 also passed. The real native/Edge 24-turn smoke preserved **1,600** history rows
-through outages, crashes and lost acknowledgements, catching up in **2,190 ms**
-with **88,400 KiB** peak observed RSS. Local typechecks were intentionally skipped.
+through outages, crashes and lost acknowledgements, catching up in **2,494 ms**
+with **89,632 KiB** peak observed RSS. Local typechecks were intentionally skipped.
 
-Desktop and Devbox engines require independent native updates. Mobile has its
-own TestFlight distribution; [staging build 31](apps/ios/README.md#crew-staging-10-31-catalog-recovery)
-contains the mobile recovery fixes, and its read-marker replay already merges
-concurrent reads. No new iOS source change is needed for this native correction.
-Production and both Scaffold image pins remain gated on captain verification of
-the restarted staging desktop. Physical-phone convergence is not yet verified.
+A later fresh capture exposed a coalesced archive intent against an independently
+created host row. Recovery now distinguishes the host's initial `archived=false`
+from a deliberate restore: retained causal history must prove both the row and
+flag were first insertions. Real restores, row recreations and unavailable proof
+remain blocked. Empty chats no longer require a message clock to reconcile their
+initial metadata. All **176** retained intents then replayed unchanged, preserving
+the archive choice and passing new-chat creation, membership and cold reopen.
+
+Mobile build 32's source-matched simulator and live native/Edge checks passed in
+[run 37954096697](https://github.com/Ashler-AI/comet/actions/runs/37954096697), including
+actual command admission and streamed output. The final native archive correction
+also passed the local **116 document / 315 engine / 57 sync** suite and headed demo.
+
+Desktop and Devbox engines require independent native updates. The first 0.1.149
+release was blocked before publication by a separate live mobile creation failure:
+iOS duplicated the host's accepted row while its publication arrived, with different
+nil/null config encoding and creation clocks. Mobile staging build **32** removes
+that second writer for Local and Scaffold creation, waits for principal-scoped
+catalog readiness, and retains the creation ID across retries. Older equivalent
+creation intents recover without discarding real config edits or ownership guards.
+Build **31** remains the latest published TestFlight release until build 32 is
+separately signed and uploaded. Production and both Scaffold image pins remain
+gated on captain verification of the restarted staging desktop. Physical-phone
+convergence is not yet verified.
 
 ## Crew 0.1.148: retained catalog convergence
 
