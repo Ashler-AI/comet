@@ -99,16 +99,17 @@ enum E2ERunner {
             return
         }
         let chatId: String
+        let chat: Chat
         do {
             chatId = try await workspace.createChat(
-                space: space,
+                id: UUID().uuidString.lowercased(), space: space,
                 config: ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"))
+            chat = try await workspace.waitForCreatedChat(id: chatId)
         } catch {
             log("FAIL create chat: \(error.localizedDescription)")
             return
         }
-        guard let chat = workspace.chats.first(where: { $0.id == chatId }),
-              let store = model.sessionStore(for: chat) else {
+        guard let store = model.sessionStore(for: chat) else {
             log("FAIL chat/session store")
             return
         }
@@ -652,6 +653,7 @@ enum E2ERunner {
             return passed
         }
         guard check("workspace record intents", WorkspaceStore.runRecordIntentRegression()),
+              check("host-created catalog", await WorkspaceStore.runCreatedChatRegression()),
               check("disk record recovery", DocDisk.runRecordRecoveryRegression()),
               check("nested tool calls", runNestedToolCallRecovery()),
               check("deployment retarget", SessionStore.runDeploymentRetargetRegression()),

@@ -510,12 +510,12 @@ struct NewSessionView: View {
                 if let existing = createdChatId {
                     chatId = existing
                 } else {
-                    chatId = try await model.createChat(space: space, config: config,
+                    chatId = try await model.createChat(id: creationId, space: space, config: config,
                                                         branch: branch, cwd: cwd)
                     createdChatId = chatId
                 }
-                guard let chat = model.chat(id: chatId),
-                      let store = model.sessionStore(for: chat) else {
+                let chat = try await model.waitForCreatedChat(id: chatId)
+                guard let store = model.sessionStore(for: chat) else {
                     throw MobileSessionError.unavailable("The created session is not available")
                 }
                 guard await store.sendRun(prompt: prompt, chat: chat, images: submittedImages) else {
