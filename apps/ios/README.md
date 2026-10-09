@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (31)** and production **1.0 (20)** are available
+Mobile staging **1.0 (32)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -35,7 +35,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 31
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 32
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -76,7 +76,7 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-31-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-31-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-32-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-32-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
@@ -121,8 +121,23 @@ changes, deletions and other genuine conflicts remain guarded.
 The simulator regressions cover membership readiness, cancellation, unchanged
 authoritative config/clock, retained equivalent creation and real edit rejection.
 The existing live smoke still requires real native admission and streamed output.
-Build **32** is a separate candidate, not a TestFlight upload; the latest published
-staging mobile build remains **31**. Physical-phone acceptance is still required.
+
+Build **32** is now **Testing** in the existing **Ashler Internal** group. The
+verified archive comes from merged source `799ab569c17a996f1a9e6f4d47f34e4323a30bab`
+in [run 37960950422](https://github.com/Ashler-AI/comet/actions/runs/37960950422).
+All nine artifact checksums and source provenance matched. Apple accepted one
+internal-only upload on **2026-10-09**; authenticated readback returned upload
+**COMPLETE**, processing **VALID**, and **BETA_INTERNAL_TESTING** for build
+`be67fbc6-730a-4b6e-ab1e-d435a031bcfd`.
+
+The exact uploaded IPA passed strict deep distribution-signature verification,
+with bundle `ai.ashler.crew.staging`, version **1.0 (32)**, team `825LYXGJR6`, and
+matching production APNs entitlements in its signature and profile. Its SHA-256 is
+`27cfd1c9db98fee950da4b44167366209ba998f753005e5acac38b26b3cd155a`.
+Export/upload required no local compilation or typechecks. Existing automatic
+internal distribution was reused; production, tester groups, account permissions
+and public App Store submission were unchanged. Physical-phone installation and
+cross-client convergence remain unverified.
 
 ### Crew Staging 1.0 (31): catalog recovery
 
