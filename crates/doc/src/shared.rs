@@ -187,10 +187,13 @@ impl SharedDocument {
         // An authenticated older checkpoint must not roll back accepted local history.
         // The normalized workspace cache is an isolated fork; persistence stays atomic.
         // Retained deletions still conflict with unobserved remote resurrections.
+        // A rebased intent can differ from its accepted cache; later imports still need reconciliation.
         let preserve_cached = expected_chat.is_none()
             && !cached.is_detached() && cached.state_vv() == cached.oplog_vv()
             && cached_version.includes_vv(&candidate_version)
-            && pending.iter().all(|record| row_value(&cached, &record.container, &record.key) == record.value);
+            && pending.iter().all(|record| (!record.version.is_empty()
+                && loro::VersionVector::decode(&record.version).is_ok_and(|version| cached_version == version))
+                || row_value(&cached, &record.container, &record.key) == record.value);
         let candidate = if preserve_cached { cached.clone() } else { candidate };
         reconcile(&candidate, &pending, &cached, expected_chat.is_some(),
             if preserve_cached { &cached_version } else { &candidate_version }, &cached_version)?;
@@ -999,6 +1002,39 @@ mod tests {
         assert!(restored.adopt_snapshot(&foreign.export(ExportMode::Snapshot).unwrap(), None).is_err());
         assert_eq!(restored.export(ExportMode::Snapshot).unwrap(), snapshot);
         assert_eq!(serde_json::to_vec(&restored.pending_records()).unwrap(), retained);
+    }
+
+    #[test]
+    fn recovered_activity_survives_cold_older_checkpoint() {
+        for shallow in [false, true] {
+            let local = WorkspaceDoc::new(); let remote = WorkspaceDoc::new();
+            let binding = local.binding(); journal(&binding);
+            for (doc, at, preview) in [(&local, 1_000i64, "older"), (&remote, 2_000i64, "newer")] {
+                let row = doc.doc().get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+                row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner").unwrap();
+                row.insert("lastMessageAt", at).unwrap(); row.insert("lastMessagePreview", preview).unwrap();
+                if at == 1_000 { row.insert("title", "local title").unwrap(); }
+                else { row.insert("lastSeenAt", 2_500i64).unwrap(); }
+                doc.doc().commit();
+            }
+            let checkpoint = remote.export_snapshot().unwrap();
+            binding.adopt_snapshot(&checkpoint, None).unwrap();
+            let records = binding.pending_records();
+            assert_eq!(records[0].value.as_ref().unwrap()["lastMessageAt"], 1_000);
+            let snapshot = if shallow { binding.export(ExportMode::shallow_snapshot(&binding.raw().state_frontiers())).unwrap() }
+                else { local.export_snapshot().unwrap() };
+            let raw = LoroDoc::new(); raw.import(&snapshot).unwrap();
+            let cold = SharedDocument::new(raw);
+            cold.install_journal(records.clone(), Arc::new(|_, _| Ok(())));
+            cold.adopt_snapshot(&checkpoint, None).unwrap();
+            let chat = row_value(&cold.raw(), "chats", "chat").unwrap();
+            assert_eq!(chat["lastMessageAt"], 2_000);
+            assert_eq!(chat["lastMessagePreview"], "newer");
+            assert_eq!(chat["lastSeenAt"], 2_500);
+            assert_eq!(chat["title"], "local title");
+            assert_eq!(cold.pending_records()[0].before, records[0].before);
+            assert_eq!(cold.pending_records()[0].value, records[0].value);
+        }
     }
 
     #[test]
