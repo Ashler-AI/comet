@@ -254,10 +254,21 @@ or unknown ancestry retain their original evidence and remain blocked.
 
 An authenticated workspace checkpoint that is already covered by the complete
 local cache cannot roll back newer accepted edits. Recovery keeps that isolated
-cache only when it still matches every retained intent, preserving archived
-sessions and field tombstones without blocking new-session metadata commits.
+cache when each retained intent either matches its row or was rebased onto
+exactly that cache version. This preserves merged owner activity across a cold
+reopen without treating later imports as reconciled. Archived sessions and field
+tombstones remain intact without blocking new-session metadata commits.
 Unseen competing edits and remote resurrections still retain their original
 evidence and fail closed; no automatic reset or cache deletion is performed.
+
+The cold-reopen regression passes with all 26 shared-document checks. An offline
+replay of the retained Devbox capture preserved all 1,594 original intents and
+merged activity across cold adoption; the rebuilt headed demo rendered a complete
+mock reply. The live 0.1.149 Devbox recovered through the approved metadata choices,
+completed a new real OMP turn visible on the Mac, and kept both restored processes
+and native bindings unchanged. Its five approved archived chats retained their
+worktrees; the four scheduled cleanup stages were cancelled and acknowledged by a
+fresh room reader. These live repairs do not deploy this additional cold-reopen fix.
 
 Same-owner session memberships can learn their first environment route. Recovery
 preserves that route across restarts and refuses changes to known scopes or
