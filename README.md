@@ -2,6 +2,35 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.148: retained catalog convergence
+
+Native workspace recovery now selects `lastMessageAt` and its preview together,
+including a newer cached observation, instead of rejecting the preview after
+merging its clock. Independently seeded chat and membership rows retain missing
+metadata only when it was never deleted; owner/scope, conflicting user edits,
+explicit unread markers and membership removals remain guarded.
+
+Recreated rows use the insertion's own causal ancestry to prove that an earlier
+tombstone was observed. Unrelated room traffic no longer blocks a legitimate
+recreation; a later cache import cannot authorize a concurrent resurrection.
+
+Isolated replay of the captured server snapshot and two accepted updates recovered
+all **142** retained records, passed repeated adoption and cold reopen, and kept
+every original intent's before/value. The capture contained **1,749** local chat
+rows versus **1,738** on the server, plus **1,630** versus **1,619** memberships.
+This verifies recovery on private copies, not publication of that backlog or the
+installed phone's convergence. Mobile still requires its own principal's membership;
+the repair does not expose other project users' sessions or bypass cleanup safeguards.
+
+New local sessions persist their catalog row before checkout and agent admission,
+so the same retained recovery error also blocked first send. The shared repair
+restores that path without bypassing the commit guard. A private `WorkspaceHost`
+replay retained all 142 originals and recovered both a partial-creation retry and
+a fresh chat plus principal membership across cold reopen. A separate isolated
+native instance passed fresh creation, typed Local start, and mock-agent response.
+The real Edge/native 24-turn smoke preserved 1,600 history rows across outages,
+lost receipts and restarts, with 4,001 ms catch-up and 80,336 KiB peak observed RSS.
+
 ## Crew 0.1.147: lossless workspace recovery
 
 Loro's immutable causal-vector merges used mutable lookups for unchanged
