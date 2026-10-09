@@ -41,6 +41,9 @@ try {
     execFileSync(bindgen, ["--weak-refs", "--target", target, "--out-name", "loro_wasm", "--out-dir", destination, wasm], {
       stdio: "inherit",
     });
+    // Raw WASM imports are host-defined, not wasm-bindgen's instantiated ABI.
+    // Let the consumer declare its compiled-module import (e.g. Workers).
+    rmSync(join(destination, "loro_wasm_bg.wasm.d.ts"));
     // Keep published wrapper classes/helpers and their sourcemaps byte-for-byte.
     for (const file of ["index.js", "index.js.map", "index.d.ts"]) {
       copyFileSync(join(published, target, file), join(destination, file));

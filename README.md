@@ -20,17 +20,44 @@ regression fails the old runtime at **240.06 MiB** and passes at **11.75 MiB**.
 Run it with `node edge/scripts/workspace-replay-memory-smoke.mjs`; private
 baseline/delta paths remain supported and are never committed.
 
-Local verification also passed all **217 Edge**, **111 document** and **56 sync**
-tests, the 24-turn real two-device/Worker smoke with **1,600** retained rows,
-and quiet-owner freshness beyond the 45-second lease. The rebuilt headed demo
-rendered a new mock command's completed response, with an authoritative `applied`
-outcome. These are isolated checks, not proof that installed clients updated or
-that hosted rollout completed.
+Snapshot admission also avoids merging two hot workspace replicas at the same
+retained boundary: it imports only the candidate's new operations into accepted
+state. The captured native recovery snapshot preserved **309,686 operations**
+and cold-restart state at **80.63 MiB**, down from **147.44 MiB**. The permanent
+memory smoke now exercises actual Durable Object admission, duplicate delivery
+and durable cold replay, not only the Loro library.
+
+Local verification passed **217 Edge**, **111 document**, **315 engine**,
+**21 RPC**, **57 sync** and **578 UI** tests, plus subprocess cancellation and
+startup-negotiation regressions. The 24-turn real two-device/Worker smoke retained
+**1,600** history rows through crash/reconnect and converged in **4.13 seconds**.
+The isolated headed demo rendered the populated model picker and completed mock
+response. These checks do not establish installed-client or hosted-rollout status.
 
 Native recovery includes guarded complete-cache adoption and clears the cold
 repair latch only after the matching authenticated repair ACK. Unknown ACKs,
 foreign histories, genuine competing edits and resurrections remain blocked.
 The original intents are preserved; recovery does not reset a live workspace.
+
+Directory projection streams native and legacy tool text in UTF-8-safe 64 KiB
+chunks instead of rejecting large transcript rows. Snapshot adoption atomically
+requeues the canonical directory job, including arrivals after missing-source
+failures; it preserves deletion fences, retry backoff and causal checks. Truly
+absent snapshots remain pending rather than publishing invented history.
+
+Same-device chat switches retain harness/model catalogs. Discovery is cancellable
+and bounded at the UI, engine and subprocess; startup negotiation fails explicitly
+after 15 seconds without publishing readiness. Credentials, device, connection,
+harness updates and explicit retry/wake invalidate the relevant catalog.
+Cancellation owns the unreaped subprocess group even after its leader exits;
+macOS returns `ESRCH` from `getpgid` in that state despite surviving descendants.
+
+A stalled RPC subscription no longer blocks the shared reader. Its bounded
+ordered prefix is followed by an explicit overflow error and upstream cancellation;
+transcript/snapshot watches resubscribe, while terminal replay retains its sequence
+cursor. Forwarded streams preserve errors; durable command admission is unchanged.
+At most 256 active or queued-for-cancellation subscriptions are admitted per
+connection, plus one cancellation being sent.
 
 The private Edge runtime is built from Loro
 `45708d059d8620fb53066c9f86cefa1601e0e1c6` with

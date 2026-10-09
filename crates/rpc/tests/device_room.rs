@@ -382,7 +382,7 @@ async fn relay_serves_multiple_clients_end_to_end() {
         .expect("count");
     let mut seen = Vec::new();
     while let Some(v) = items.recv().await {
-        seen.push(v);
+        seen.push(v.unwrap());
     }
     assert_eq!(
         seen,
@@ -462,7 +462,8 @@ async fn legacy_scope_denial_closes_link_and_all_pending_requests() {
         );
         assert!(matches!(first, Err(RpcError::Closed)));
         assert!(matches!(second, Err(RpcError::Closed)));
-        assert_eq!(items.recv().await, None);
+        assert!(matches!(items.recv().await, Some(Err(RpcError::Closed))));
+        assert!(items.recv().await.is_none());
         assert!(link.is_closed());
         assert_eq!(
             link.closed().borrow().as_deref(),

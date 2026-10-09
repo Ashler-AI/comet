@@ -106,6 +106,13 @@ impl RpcModeClient {
         fields.insert("type".into(), Value::String(kind.into()));
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().insert(id.clone(), tx);
+        struct RemovePending<'a>(&'a Pending, String);
+        impl Drop for RemovePending<'_> {
+            fn drop(&mut self) {
+                self.0.lock().remove(&self.1);
+            }
+        }
+        let _pending = RemovePending(&self.pending, id.clone());
         if self.writer.send(Value::Object(fields).to_string()).is_err() {
             self.pending.lock().remove(&id);
             return Err(HarnessError::Protocol(
@@ -917,53 +924,73 @@ pub(crate) async fn run_rpc(
         ))
     };
 
-    // Stage 1: the ready frame (always the first stdout object).
-    let ready = tokio::time::timeout(super::RPC_STARTUP_DEADLINE, async {
-        loop {
-            match frames.recv().await {
-                Some(RpcFrame::Frame(frame))
-                    if frame.get("type").and_then(Value::as_str) == Some("ready") =>
-                {
-                    return Ok(frame);
-                }
-                Some(RpcFrame::Frame(_)) => continue,
-                Some(RpcFrame::Eof) | None => Err::<Value, ()>(()),
-            }?;
-        }
-    })
-    .await
-    .map_err(|_| {
-        HarnessError::Protocol(format!(
-            "{} ready frame timed out after {}s",
-            options.process_label,
-            super::RPC_STARTUP_DEADLINE.as_secs()
-        ))
-    })?
-    .map_err(|()| crash(&mut child, options.process_label))?;
-
-    // Stage 2: negotiate lossless framing when the server advertises v2.
-    let supports_v2 = ready
-        .get("supportedProtocolVersions")
-        .and_then(Value::as_array)
-        .is_some_and(|versions| versions.iter().any(|v| v.as_u64() == Some(2)));
-    if supports_v2 {
-        let mut fields = Map::new();
-        fields.insert("protocolVersion".into(), json!(2));
-        if let Err(error) = client.request("negotiate_protocol", fields).await {
-            tracing::warn!(target: "comet_harness::omp", %error, "protocol v2 negotiation failed; staying on v1");
-        }
-    }
-
-    // Stage 3: session identity (and resume validation) from get_state.
-    let state = tokio::time::timeout(STATE_DEADLINE, client.request("get_state", Map::new()))
+    // All startup waits honor interruption before any readiness is published.
+    let startup = async {
+        // Stage 1: the ready frame (always the first stdout object).
+        let ready = tokio::time::timeout(super::RPC_STARTUP_DEADLINE, async {
+            loop {
+                match frames.recv().await {
+                    Some(RpcFrame::Frame(frame))
+                        if frame.get("type").and_then(Value::as_str) == Some("ready") =>
+                    {
+                        return Ok(frame);
+                    }
+                    Some(RpcFrame::Frame(_)) => continue,
+                    Some(RpcFrame::Eof) | None => Err::<Value, ()>(()),
+                }?;
+            }
+        })
         .await
         .map_err(|_| {
             HarnessError::Protocol(format!(
-                "{} get_state timed out after {}s",
+                "{} ready frame timed out after {}s",
                 options.process_label,
-                STATE_DEADLINE.as_secs()
+                super::RPC_STARTUP_DEADLINE.as_secs()
             ))
-        })??;
+        })?
+        .map_err(|()| crash(&mut child, options.process_label))?;
+
+        // Stage 2: fail closed if the advertised v2 negotiation is uncertain.
+        let supports_v2 = ready
+            .get("supportedProtocolVersions")
+            .and_then(Value::as_array)
+            .is_some_and(|versions| versions.iter().any(|v| v.as_u64() == Some(2)));
+        if supports_v2 {
+            let mut fields = Map::new();
+            fields.insert("protocolVersion".into(), json!(2));
+            tokio::time::timeout(STATE_DEADLINE, client.request("negotiate_protocol", fields))
+                .await
+                .map_err(|_| HarnessError::Protocol(format!(
+                    "{} protocol negotiation timed out after {}s; retry the session",
+                    options.process_label, STATE_DEADLINE.as_secs()
+                )))??;
+        }
+
+        // Stage 3: session identity (and resume validation) from get_state.
+        tokio::time::timeout(STATE_DEADLINE, client.request("get_state", Map::new()))
+            .await
+            .map_err(|_| {
+                HarnessError::Protocol(format!(
+                    "{} get_state timed out after {}s",
+                    options.process_label,
+                    STATE_DEADLINE.as_secs()
+                ))
+            })?
+    };
+    let state = tokio::select! {
+        biased;
+        _ = interrupt.cancelled() => {
+            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+            return Ok(());
+        }
+        result = startup => match result {
+            Ok(state) => state,
+            Err(error) => {
+                kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                return Err(error);
+            }
+        },
+    };
     let session_id = state
         .get("sessionId")
         .and_then(Value::as_str)
@@ -1456,6 +1483,64 @@ pub(crate) async fn command_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn stalled_negotiation_times_out_or_cancels_without_readiness() {
+        for cancel in [false, true] {
+            let child = tokio::process::Command::new("/bin/sleep")
+                .arg("600").kill_on_drop(true).spawn().unwrap();
+            let pid = child.id().unwrap();
+            let (writer, mut requests) = mpsc::unbounded_channel();
+            let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+            let client = RpcModeClient {
+                writer, pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
+            };
+            let (frames_tx, frames) = mpsc::channel(1);
+            frames_tx.send(RpcFrame::Frame(json!({
+                "type": "ready", "supportedProtocolVersions": [1, 2]
+            }))).await.unwrap();
+            let interrupt = crate::CancellationToken::new();
+            let (_steer, steering) = mpsc::channel(1);
+            let (events, mut received) = mpsc::channel(8);
+            let task = tokio::spawn(run_rpc(
+                RpcModeProcess {
+                    child, client, frames, process_group: None,
+                    process_group_guard: ProcessGroupGuard::new(None, false),
+                    stderr_tail: crate::StderrTail::default(), run_config: None,
+                },
+                comet_proto::RunRequest {
+                    prompt: "hello".into(), model: None, agent_account_id: None,
+                    reasoning: None, model_options: Map::new(), cwd: String::new(),
+                    sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                    auto_approve: false, resume: None, attachments: Vec::new(),
+                },
+                RunControls {
+                    request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+                    steering, interrupt: interrupt.clone(), context: None,
+                },
+                events, Duration::ZERO,
+                RpcRunOptions { process_label: "test OMP", expected_resume: None },
+            ));
+            let request: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+            assert_eq!(request["type"], "negotiate_protocol");
+            if cancel {
+                interrupt.cancel();
+            } else {
+                tokio::time::advance(STATE_DEADLINE).await;
+            }
+            let result = task.await.unwrap();
+            if cancel {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("protocol negotiation timed out"));
+            }
+            assert!(pending.lock().is_empty(), "cancelled request retained in pending map");
+            assert!(received.recv().await.is_none(), "startup falsely published readiness");
+            assert!(requests.try_recv().is_err(), "uncertain negotiation fell back to v1");
+            assert!(super::super::process_birth(pid).is_none(), "startup child survived");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

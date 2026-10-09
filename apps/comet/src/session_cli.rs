@@ -186,7 +186,7 @@ pub async fn run(command: SessionCommand, ipc_port: u16) -> anyhow::Result<()> {
             let snapshot = snapshots
                 .recv()
                 .await
-                .ok_or_else(|| anyhow!("WatchDocMessages ended before returning a transcript"))?;
+                .ok_or_else(|| anyhow!("WatchDocMessages ended before returning a transcript"))??;
             print_json(&snapshot)?;
         }
         SessionCommand::Send {

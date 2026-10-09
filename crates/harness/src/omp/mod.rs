@@ -51,6 +51,7 @@ const ACP_PROMPT_INACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(300);
 // Cold project capability discovery can legitimately exceed the old 15-second
 // boundary in large repositories. Warm launches still return as soon as ready.
 const RPC_STARTUP_DEADLINE: Duration = Duration::from_secs(60);
+const MODEL_CATALOG_DEADLINE: Duration = Duration::from_secs(30);
 // Includes the startup boundary plus the command stream's two-second settle.
 const RPC_COMMAND_CATALOG_DEADLINE: Duration = Duration::from_secs(65);
 const SCAFFOLD_PROFILE: &str = "scaffold-host";
@@ -2234,6 +2235,58 @@ fn desktop_models(mut local: Vec<Model>) -> Vec<Model> {
     local
 }
 
+/// Catalog subprocesses own their process group until output and exit complete.
+pub(crate) async fn model_catalog_output(
+    command: &mut Command,
+    label: &str,
+    supervised: bool,
+) -> Result<std::process::Output, HarnessError> {
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .kill_on_drop(!supervised);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    // Keep the unreaped child with its guard: even an exited leader can have
+    // descendants holding its pipes open. Its PID cannot be reused until wait.
+    struct CatalogChild {
+        child: Child,
+        supervised: bool,
+    }
+    impl Drop for CatalogChild {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            if let Some(pid) = self.child.id() {
+                let group = pid as i32;
+                // SAFETY: this is our still-unreaped child, launched with group 0.
+                // macOS getpgid returns ESRCH for an exited unreaped leader,
+                // even while its descendants still occupy our owned group.
+                unsafe {
+                    if group > 1 && libc::getpgrp() != group {
+                        libc::kill(-group, if self.supervised { libc::SIGTERM } else { libc::SIGKILL });
+                    }
+                }
+            }
+        }
+    }
+    let mut process = CatalogChild { child: command.spawn()?, supervised };
+    let mut stdout = process.child.stdout.take().expect("model catalog stdout is piped");
+    let mut stderr = process.child.stderr.take().expect("model catalog stderr is piped");
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    let status = tokio::time::timeout(MODEL_CATALOG_DEADLINE, async {
+        use tokio::io::AsyncReadExt as _;
+        tokio::try_join!(stdout.read_to_end(&mut output), stderr.read_to_end(&mut errors))?;
+        process.child.wait().await
+    })
+    .await
+    .map_err(|_| HarnessError::Protocol(format!(
+        "{label} model discovery timed out after 30s. Check agent credentials and retry."
+    )))??;
+    Ok(std::process::Output { status, stdout: output, stderr: errors })
+}
+
 #[async_trait]
 impl Harness for OmpHarness {
     fn id(&self) -> HarnessId {
@@ -2286,15 +2339,12 @@ impl Harness for OmpHarness {
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
-        let mut command = self.base_command(&executable, "", false, false);
+        let mut command = self.base_command(&executable, "", false, true);
         if self.scaffold_host {
             command.args(["--profile", SCAFFOLD_PROFILE]);
         }
-        let output = command
-            .args(["models", "--json"])
-            .stdin(Stdio::null())
-            .output()
-            .await?;
+        command.args(["models", "--json"]).stdin(Stdio::null());
+        let output = model_catalog_output(&mut command, "OMP", self.supervisor_executable.is_some()).await?;
         if !output.status.success() {
             let tail = crate::StderrTail::default();
             for line in String::from_utf8_lossy(&output.stderr).lines() {
@@ -3658,6 +3708,47 @@ fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn model_discovery_timeout_and_drop_kill_the_process_group() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (timeout, exit_parent) in [(false, false), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let executable = dir.path().join("catalog");
+            let pids = dir.path().join("pids");
+            std::fs::write(&executable, format!(
+                "#!/bin/sh\nsleep 600 &\nprintf '%s\\n%s\\n' $$ $! > '{}'\n{}\n",
+                pids.display(), if exit_parent { "exit 0" } else { "wait" }
+            )).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let harness = OmpHarness::new().with_executable(executable);
+            let mut discovery = Box::pin(harness.models());
+            assert!(futures::poll!(discovery.as_mut()).is_pending());
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let ids = loop {
+                let ids = std::fs::read_to_string(&pids).unwrap_or_default()
+                    .lines().filter_map(|line| line.parse::<u32>().ok()).collect::<Vec<_>>();
+                if ids.len() == 2 { break ids; }
+                assert!(std::time::Instant::now() < deadline, "catalog did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            if timeout {
+                tokio::time::advance(MODEL_CATALOG_DEADLINE).await;
+                assert!(discovery.await.unwrap_err().to_string().contains("model discovery timed out"));
+            } else {
+                drop(discovery);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while ids.iter().any(|pid| process_birth(*pid).is_some()) {
+                assert!(std::time::Instant::now() < deadline,
+                    "catalog process group survived cancellation: timeout={timeout}, exit_parent={exit_parent}, alive={:?}",
+                    ids.iter().filter(|pid| process_birth(**pid).is_some()).collect::<Vec<_>>());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 
     #[test]
     fn lsof_probe_ignores_readers_and_requires_access_fields() {

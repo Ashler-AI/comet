@@ -1260,15 +1260,19 @@ impl EngineRpc {
                     return Err(err);
                 }
             };
-            // Pipe remote items; the held client keeps the link's RpcClient alive for
-            // the stream's lifetime. A remote error just ends the stream (the relay
-            // link-down path fails pending calls; stream receivers close).
+            // Preserve upstream failure, including overflow, across the relay.
+            // The held client keeps the link alive for the stream's lifetime.
             let stream = futures::stream::unfold((rx, client), |(mut rx, client)| async move {
                 rx.recv().await.map(|item| (item, (rx, client)))
             });
-            return Ok(RpcReply::Stream(stream.boxed()));
+            return Ok(RpcReply::FallibleStream(stream.boxed()));
         }
-        match client.call(method, params).await {
+        let result = if matches!(method, methods::LIST_MODELS | methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS) {
+            client.call_cancellable(method, params).await
+        } else {
+            client.call(method, params).await
+        };
+        match result {
             Ok(value) => Ok(RpcReply::Value(value)),
             Err(err) => {
                 if matches!(err, RpcError::Closed | RpcError::Transport(_)) {
@@ -2172,9 +2176,9 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = harness
-                    .models()
+                let models = tokio::time::timeout(std::time::Duration::from_secs(35), harness.models())
                     .await
+                    .map_err(|_| RpcError::Failed("Model discovery timed out. Check the agent credentials and retry.".into()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
@@ -2259,9 +2263,9 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(HarnessId::Omp)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
-                let models = harness
-                    .models()
+                let models = tokio::time::timeout(std::time::Duration::from_secs(35), harness.models())
                     .await
+                    .map_err(|_| RpcError::Failed("Model discovery timed out. Check the agent credentials and retry.".into()))?
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let models = session_viewport_models(models);
                 RpcReply::value(&models)

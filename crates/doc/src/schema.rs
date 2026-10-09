@@ -109,6 +109,15 @@ pub struct SessionEntryWindow {
     pub before: Option<usize>,
 }
 
+/// Directory identity and completion metadata, without transcript payloads.
+pub struct DirectoryEntry {
+    pub id: String,
+    pub role: MessageRole,
+    pub status: Option<MessageStatus>,
+    pub peer_message: Option<PeerMessageProvenance>,
+    pub has_error: bool,
+}
+
 /// The doc-resident flat part map (`DocMessagePart` in TS). Distinct from the app-layer
 /// [`MessagePart`]: input parts key on their request id, error parts store `message`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -434,21 +443,22 @@ impl SessionDoc {
         self.doc.get_list("messages").len()
     }
 
-    /// Bounded title projection; link extraction uses directory_visit_text so
-    /// oversized text is scanned fully rather than silently omitted.
-    pub fn directory_entry(&self, index: usize) -> Result<Option<SessionMessageEntry>, DocError> {
+    /// Read only metadata; directory_visit_text scans relevant content separately.
+    pub fn directory_entry(&self, index: usize) -> Result<Option<DirectoryEntry>, DocError> {
         let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = self.doc.get_list("messages").get(index) else {
             return Err(DocError::Schema("malformed directory transcript row".into()));
         };
         if optional_string(&row, "role").as_deref() == Some("system") { return Ok(None); }
-        let mut budget = 256 * 1024;
-        let entry = entry_from_map_window(&row, &mut budget)?;
-        if entry.parts.iter().filter(|part| !matches!(part, MessagePart::TextWindow { .. } | MessagePart::Text { .. }))
-            .map(MessagePart::byte_len).sum::<usize>() > 256 * 1024
-        {
-            return Err(DocError::Schema("directory transcript row exceeds scan budget".into()));
-        }
-        Ok(Some(entry))
+        let entry = entry_metadata(&row)?;
+        let has_error = match row.get("parts") {
+            Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => (0..parts.len()).any(|index| {
+                matches!(parts.get(index), Some(loro::ValueOrContainer::Container(loro::Container::Map(part)))
+                    if optional_string(&part, "kind").as_deref() == Some("error"))
+            }),
+            _ => false,
+        };
+        Ok(Some(DirectoryEntry { id: entry.id, role: entry.role, status: entry.status,
+            peer_message: entry.peer_message, has_error }))
     }
 
     pub fn directory_visit_text(&self, index: usize, mut visit: impl FnMut(&str, bool) -> Result<(), DocError>) -> Result<(), DocError> {
@@ -459,25 +469,12 @@ impl SessionDoc {
         let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) = row.get("parts") else { return Ok(()) };
         for index in 0..parts.len() {
             let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) = parts.get(index) else { continue };
-            if optional_string(&part, "kind").as_deref() != Some("text") { continue; }
-            let Some(loro::ValueOrContainer::Container(loro::Container::Text(text))) = part.get("text") else { continue };
-            let total = text.len_utf8();
-            let mut start = 0;
-            while start < total {
-                let mut end = (start + 64 * 1024).min(total);
-                let delta = loop {
-                    match text.slice_delta(start, end, PosType::Bytes) {
-                        Ok(delta) => break delta,
-                        Err(_) if end > start + 1 => { end -= 1; },
-                        Err(_) => return Err(DocError::Schema("invalid directory text boundary".into())),
-                    }
-                };
-                for delta in delta {
-                    if let TextDelta::Insert { insert, .. } = delta { visit(&insert, false)?; }
-                }
-                start = end;
-            }
-            visit("", true)?;
+            let field = match optional_string(&part, "kind").as_deref() {
+                Some("text") => "text",
+                Some("tool") => "call",
+                _ => continue,
+            };
+            if let Some(value) = part.get(field) { directory_visit_value(value, &mut visit)?; }
         }
         Ok(())
     }
@@ -1341,6 +1338,17 @@ fn entry_from_map_window(
     map: &LoroMap,
     text_budget: &mut usize,
 ) -> Result<SessionMessageEntry, DocError> {
+    let mut entry = entry_metadata(map)?;
+    entry.parts = match map.get("parts") {
+        Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => {
+            read_parts_window(&parts, text_budget)?
+        }
+        _ => Vec::new(),
+    };
+    Ok(entry)
+}
+
+fn entry_metadata(map: &LoroMap) -> Result<SessionMessageEntry, DocError> {
     let role = match scalar_string(map, "role")?.as_str() {
         "user" => MessageRole::User,
         "assistant" => MessageRole::Assistant,
@@ -1356,16 +1364,10 @@ fn entry_from_map_window(
         Some(other) => return Err(DocError::Schema(format!("unknown message status {other}"))),
         None => None,
     };
-    let parts = match map.get("parts") {
-        Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => {
-            read_parts_window(&parts, text_budget)?
-        }
-        _ => Vec::new(),
-    };
     Ok(SessionMessageEntry {
         id: scalar_string(map, "id")?,
         role,
-        parts,
+        parts: Vec::new(),
         created_at: scalar_i64(map, "createdAt")?,
         device_id: scalar_string(map, "deviceId")?,
         status,
@@ -1374,6 +1376,77 @@ fn entry_from_map_window(
             .get("peerMessage")
             .and_then(|value| serde_json::from_value(value.get_deep_value().to_json_value()).ok()),
     })
+}
+
+// Visit native containers and legacy scalar JSON without deep-value/JSON copies.
+// Only one 64KiB text chunk is materialized, even for multi-megabyte tool output.
+fn directory_visit_value(value: loro::ValueOrContainer, visit: &mut impl FnMut(&str, bool) -> Result<(), DocError>) -> Result<(), DocError> {
+    use loro::{Container, ValueOrContainer};
+    match value {
+        ValueOrContainer::Value(value) => directory_visit_scalar(&value, visit)?,
+        ValueOrContainer::Container(Container::Map(map)) => {
+            for key in map.keys() {
+                if directory_text_key(key.as_str()) {
+                    if let Some(value) = map.get(key.as_str()) { directory_visit_value(value, visit)?; }
+                }
+            }
+        }
+        ValueOrContainer::Container(Container::List(list)) => {
+            for index in 0..list.len() {
+                if let Some(value) = list.get(index) { directory_visit_value(value, visit)?; }
+            }
+        }
+        ValueOrContainer::Container(Container::Text(text)) => {
+            let total = text.len_utf8();
+            let mut start = 0;
+            while start < total {
+                let mut end = (start + 64 * 1024).min(total);
+                let delta = loop {
+                    match text.slice_delta(start, end, PosType::Bytes) {
+                        Ok(delta) => break delta,
+                        Err(_) if end > start + 1 => { end -= 1; }
+                        Err(_) => return Err(DocError::Schema("invalid directory text boundary".into())),
+                    }
+                };
+                for delta in delta {
+                    if let TextDelta::Insert { insert, .. } = delta { visit(&insert, false)?; }
+                }
+                start = end;
+            }
+            visit("", true)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn directory_text_key(key: &str) -> bool {
+    !matches!(key, "reasoning" | "thinking" | "system" | "systemPrompt")
+}
+
+fn directory_visit_scalar(value: &LoroValue, visit: &mut impl FnMut(&str, bool) -> Result<(), DocError>) -> Result<(), DocError> {
+    match value {
+        LoroValue::String(value) => {
+            let mut remaining: &str = value.as_ref();
+            while !remaining.is_empty() {
+                let mut end = remaining.len().min(64 * 1024);
+                while !remaining.is_char_boundary(end) { end -= 1; }
+                visit(&remaining[..end], false)?;
+                remaining = &remaining[end..];
+            }
+            visit("", true)?;
+        }
+        LoroValue::Map(fields) => {
+            for (key, value) in fields.iter() {
+                if directory_text_key(key.as_str()) { directory_visit_scalar(value, visit)?; }
+            }
+        }
+        LoroValue::List(values) => {
+            for value in values.iter() { directory_visit_scalar(value, visit)?; }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn text_tail(text: &LoroText, budget: usize) -> Result<(String, usize), DocError> {

@@ -3779,6 +3779,7 @@ impl AppState {
 /// on the first frame when nothing is selected yet (manual selection wins).
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
+        'resubscribe: loop {
         let mut rx = match handle
             .client()
             .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
@@ -3795,6 +3796,14 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             }
         };
         while let Some(value) = rx.recv().await {
+            let value = match value {
+                Ok(value) => value,
+                Err(RpcError::StreamOverflow) => continue 'resubscribe,
+                Err(error) => {
+                    tracing::debug!(%error, "chats stream interrupted");
+                    break;
+                }
+            };
             let parsed: Vec<Chat> = match serde_json::from_value(value) {
                 Ok(parsed) => parsed,
                 Err(err) => {
@@ -3835,6 +3844,8 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
         ) {
             AppState::engine_connection_lost(&this, cx);
         }
+        return;
+        }
     })
 }
 
@@ -3845,6 +3856,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     apply: fn(&mut AppState, T),
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
+        'resubscribe: loop {
         let mut rx = match handle
             .client()
             .subscribe(method, serde_json::json!({}))
@@ -3862,6 +3874,14 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
         };
         let mut first_frame = true;
         while let Some(value) = rx.recv().await {
+            let value = match value {
+                Ok(value) => value,
+                Err(RpcError::StreamOverflow) => continue 'resubscribe,
+                Err(error) => {
+                    tracing::debug!(method, %error, "watch interrupted");
+                    break;
+                }
+            };
             let parsed: T = match serde_json::from_value(value) {
                 Ok(parsed) => parsed,
                 Err(err) => {
@@ -3894,6 +3914,8 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
             Err(RpcError::Closed)
         ) {
             AppState::engine_connection_lost(&this, cx);
+        }
+        return;
         }
     })
 }
@@ -3962,6 +3984,7 @@ fn spawn_omp_recovery_watch(
     room_projection: Option<SessionRoomProjection>,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
+        'resubscribe: loop {
         let result = handle.client().subscribe(methods::WATCH_OMP_RECOVERY, serde_json::json!({
             "chatId": chat_id,
             "targetDeviceId": target_device_id,
@@ -3970,7 +3993,9 @@ fn spawn_omp_recovery_watch(
         let error = match result {
             Ok(mut rx) => loop {
                 match rx.recv().await {
-                    Some(value) => match serde_json::from_value::<OmpRecoveryState>(value) {
+                    Some(Err(RpcError::StreamOverflow)) => continue 'resubscribe,
+                    Some(Err(error)) => break format!("Recovery updates interrupted: {error}. Retry status."),
+                    Some(Ok(value)) => match serde_json::from_value::<OmpRecoveryState>(value) {
                         Ok(snapshot) => {
                             if this.update(cx, |state, cx| {
                                 if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -3998,6 +4023,8 @@ fn spawn_omp_recovery_watch(
         // handing transport recovery to the existing supervisor, never polling.
         if matches!(handle.client().call(methods::LOCAL_DEVICE, serde_json::json!({})).await, Err(RpcError::Closed)) {
             AppState::engine_connection_lost(&this, cx);
+        }
+        return;
         }
     })
 }
@@ -4046,6 +4073,18 @@ fn spawn_transcript_watch(
                 }
             };
             while let Some(value) = rx.recv().await {
+                let value = match value {
+                    Ok(value) => value,
+                    Err(RpcError::StreamOverflow) => continue 'resubscribe,
+                    Err(RpcError::Closed) => {
+                        AppState::engine_connection_lost(&this, cx);
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%chat_id, %error, "transcript stream failed; resubscribing");
+                        break;
+                    }
+                };
                 // The opening bounded tail can still contain large text parts.
                 // Decode off the UI executor, preserving stream order and the
                 // selection guard below when the result returns.
@@ -4128,6 +4167,13 @@ fn spawn_collaboration_watch(
                 }
             };
             while let Some(value) = rx.recv().await {
+                let value = match value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::debug!(%chat_id, %error, "collaboration stream interrupted");
+                        break;
+                    }
+                };
                 let snapshot: CollaborationSnapshot = match serde_json::from_value(value) {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
@@ -6156,6 +6202,55 @@ mod tests {
             continuation_of: None,
             peer_message: None,
         }
+    }
+
+    #[gpui::test]
+    async fn transcript_overflow_resubscribes_and_replaces_the_stale_prefix(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct OverflowTranscript(AtomicUsize);
+        #[async_trait::async_trait]
+        impl RpcService for OverflowTranscript {
+            async fn handle(&self, method: &str, _: serde_json::Value) -> Result<RpcReply, RpcError> {
+                assert_eq!(method, methods::WATCH_DOC_MESSAGES);
+                let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+                let reset = serde_json::to_value(TranscriptFrame::reset(
+                    &[transcript_entry(if attempt == 0 { "stale" } else { "healed" })],
+                    None,
+                )).unwrap();
+                if attempt == 0 {
+                    Ok(RpcReply::FallibleStream(futures::stream::iter([
+                        Ok(reset), Err(RpcError::StreamOverflow),
+                    ]).boxed()))
+                } else {
+                    Ok(RpcReply::Stream(futures::stream::once(async move { reset })
+                        .chain(futures::stream::pending()).boxed()))
+                }
+            }
+        }
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let service = Arc::new(OverflowTranscript(AtomicUsize::new(0)));
+        let handle = EngineHandle {
+            inner: Arc::new(RemoteEngine {
+                client: memory_client(service.clone()),
+                url: "memory://transcript-overflow".into(),
+            }),
+        };
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("chat".into());
+            state.transcript_task = Some(spawn_transcript_watch(cx, handle, "chat".into(), None));
+        });
+        cx.condition(&state, |state, _| {
+            state.transcript.len() == 1 && state.transcript[0].id == "healed"
+        }).await;
+        assert_eq!(service.0.load(Ordering::SeqCst), 2);
     }
 
     #[test]

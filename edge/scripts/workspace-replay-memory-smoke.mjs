@@ -10,16 +10,94 @@ import { fileURLToPath } from "node:url";
 // No arguments: deterministic CI fixture. Or: BASELINE.loro DELTA.loro [...]
 // Preparation and probing use separate WASM heaps; only the probe has a budget.
 const args = process.argv.slice(2);
-const internal = args[0] === "--prepare" || args[0] === "--probe";
+const internal = ["--prepare", "--probe", "--admission"].includes(args[0]);
 if (!internal) {
   assert.ok(args.length === 0 || args.length >= 2, "Provide a baseline and at least one delta, or no arguments");
   const directory = mkdtempSync(join(tmpdir(), "crew-workspace-memory-"));
   try {
-    for (const mode of ["--prepare", "--probe"]) {
+    for (const mode of ["--prepare", "--probe", "--admission"]) {
       const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), mode, directory, ...args], { stdio: "inherit" });
       assert.ok(!child.error && child.status === 0, `${mode} failed`);
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
+} else if (args[0] === "--admission") {
+  const directory = args[1];
+  const { files, before, after } = JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8"));
+  const require = createRequire(import.meta.url);
+  const { build } = require("esbuild");
+  const { Miniflare, convertV4MiniflareOptions } = require("miniflare");
+  const source = `
+    import { SessionRoom } from ${JSON.stringify(fileURLToPath(new URL("../src/session-room.ts", import.meta.url)))};
+    import { initSync } from ${JSON.stringify(require.resolve("loro-crdt/web"))};
+    import module from "./loro_wasm_bg.wasm";
+    const { memory } = initSync({ module });
+    const canonical = v => Array.isArray(v) ? v.map(canonical) : v && typeof v === "object"
+      ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canonical(v[k])])) : v;
+    const digest = async v => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",
+      new TextEncoder().encode(JSON.stringify(canonical(v))))), b => b.toString(16).padStart(2, "0")).join("");
+    async function fingerprint(doc) {
+      const version = doc.oplogVersion();
+      try { return { state: await digest(doc.toJSON()), oplogVersion: await digest(Object.fromEntries(version.toJSON())),
+        floorFrontiers: await digest(doc.shallowSinceFrontiers().map(({peer, counter}) => [String(peer), counter]).sort()),
+        operations: doc.opCount() }; }
+      finally { version.free(); }
+    }
+    export class AdmissionProbe extends SessionRoom {
+      async fetch(request) {
+        const input = await request.arrayBuffer(), view = new DataView(input), records = [];
+        for (let offset = 0; offset < input.byteLength;) {
+          const length = view.getUint32(offset, true); offset += 4;
+          records.push(new Uint8Array(input, offset, length)); offset += length;
+        }
+        const publisher = records.pop();
+        this.setMeta("chatId", "ws4/memory-smoke"); this.setMeta("roomKind", "workspace");
+        this.ctx.storage.transactionSync(() => {
+          this.blobs.put("snapshot", records[0]);
+          for (const delta of records.slice(1)) this.ctx.storage.sql.exec(
+            "INSERT INTO updates(bytes,received_at) VALUES (?,?)", delta, Date.now());
+        });
+        let doc = await this.ensureDoc(); const before = await fingerprint(doc);
+        doc = this.importLoroUpdates(doc, [publisher]).doc;
+        const after = await fingerprint(doc);
+        doc = this.importLoroUpdates(doc, [publisher]).doc;
+        const duplicate = await fingerprint(doc);
+        doc.free(); this.doc = undefined;
+        const cold = await fingerprint(await this.ensureDoc());
+        return Response.json({ before, after, duplicate, cold, wasmBytes: memory.buffer.byteLength });
+      }
+    }
+    export default { fetch(request, env) { return env.ROOM.get(env.ROOM.idFromName("admission")).fetch(request); } };`;
+  const compiled = await build({
+    stdin: { contents: source, sourcefile: "admission.mjs", resolveDir: process.cwd() },
+    bundle: true, format: "esm", platform: "browser", write: false, external: ["node:*", "cloudflare:*"],
+    alias: { "loro-crdt": fileURLToPath(new URL("../src/loro-runtime.ts", import.meta.url)) },
+    plugins: [{ name: "compiled-wasm", setup(build) {
+      build.onResolve({ filter: /\.wasm$/ }, () => ({ path: "./loro_wasm_bg.wasm", external: true }));
+    } }]
+  });
+  const mf = new Miniflare(convertV4MiniflareOptions({ workers: [{
+    name: "admission", compatibilityDate: "2026-08-04", compatibilityFlags: ["nodejs_compat"], modulesRoot: directory,
+    bindings: { ENVIRONMENT: "local", AUTH_MODE: "dev" },
+    durableObjects: { ROOM: { className: "AdmissionProbe", useSQLite: true } },
+    modules: [{ type: "ESModule", path: join(directory, "index.mjs"), contents: compiled.outputFiles[0].text },
+      { type: "CompiledWasm", path: join(directory, "loro_wasm_bg.wasm"), contents: readFileSync(require.resolve("loro-crdt/web/loro_wasm_bg.wasm")) }]
+  }] }));
+  try {
+    const body = Buffer.concat([...files, join(directory, "offline.loro")].flatMap(path => {
+      const bytes = readFileSync(path), header = Buffer.alloc(4);
+      header.writeUInt32LE(bytes.length); return [header, bytes];
+    }));
+    const response = await mf.dispatchFetch("http://local/admit", { method: "POST", body });
+    assert.equal(response.status, 200, "Durable Object admission failed");
+    const result = await response.json();
+    const boundary = ({ state, oplogVersion, floorFrontiers, operations }) => ({ state, oplogVersion, floorFrontiers, operations });
+    assert.deepEqual(result.before, boundary(before), "Accepted state changed before admission");
+    for (const stage of ["after", "duplicate", "cold"]) {
+      assert.deepEqual(result[stage], boundary(after), stage + ": admission changed state or retained history");
+    }
+    assert.ok(result.wasmBytes < 112 * 1048576, "Durable Object admission exceeds Worker memory budget");
+    console.log("PASS: Durable Object snapshot admission, duplicate delivery, cold replay; WASM " + (result.wasmBytes / 1048576).toFixed(2) + " MiB");
+  } finally { await mf.dispose(); }
 } else {
   const Instance = WebAssembly.Instance;
   let memory;

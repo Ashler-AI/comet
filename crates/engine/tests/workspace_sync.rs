@@ -503,7 +503,7 @@ async fn imported_session_ref_watches_and_never_claims_host_placement() {
         .subscribe(methods::WATCH_SESSION_REFS, serde_json::Value::Null)
         .await
         .expect("subscribe session refs");
-    assert_eq!(refs.recv().await.unwrap(), serde_json::json!([]));
+    assert_eq!(refs.recv().await.unwrap().unwrap(), serde_json::json!([]));
 
     let added = client
         .call(
@@ -513,7 +513,7 @@ async fn imported_session_ref_watches_and_never_claims_host_placement() {
         .await
         .expect("add session ref");
     assert_eq!(added["chatId"], SESSION_ID);
-    let watched = refs.recv().await.expect("updated session refs");
+    let watched = refs.recv().await.expect("updated session refs").expect("stream item");
     assert_eq!(watched.as_array().map(Vec::len), Some(1));
     assert_eq!(watched[0]["chatId"], SESSION_ID);
 
@@ -547,7 +547,7 @@ async fn imported_session_ref_watches_and_never_claims_host_placement() {
         .await
         .expect("remove session ref");
     assert_eq!(removed, serde_json::json!({ "removed": true }));
-    assert_eq!(refs.recv().await.unwrap(), serde_json::json!([]));
+    assert_eq!(refs.recv().await.unwrap().unwrap(), serde_json::json!([]));
     assert!(
         core.workspace.is_host(SESSION_ID),
         "absence from both maps preserves the local-create fallback"

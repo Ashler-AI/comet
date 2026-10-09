@@ -289,7 +289,8 @@ async fn target_device_id_routes_over_the_relay() {
         let item = tokio::time::timeout_at(deadline, stream.recv())
             .await
             .expect("remote transcript before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         if item.to_string().contains("hello from B") {
             break;
         }
@@ -594,7 +595,8 @@ async fn terminal_stream_proxies_over_the_relay() {
         let item = tokio::time::timeout_at(deadline, stream.recv())
             .await
             .expect("proxied terminal output before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         if item["type"] == "data" {
             let bytes = BASE64
                 .decode(item["data"].as_str().expect("data"))

@@ -74,13 +74,16 @@ jobs:
           cargo test --locked -p comet-engine --lib workspace_host:: 2>&1 | tee native-evidence/workspace.log
           cargo test --locked -p comet-engine --lib session_activity:: 2>&1 | tee native-evidence/activity.log
           cargo test --locked -p comet-rpc --lib 2>&1 | tee native-evidence/rpc.log
+          cargo test --locked -p comet-rpc --test device_room 2>&1 | tee native-evidence/rpc-device-room.log
+          cargo test --locked -p comet-engine --lib titles::tests 2>&1 | tee native-evidence/directory.log
+          cargo test --locked -p comet-harness --lib 2>&1 | tee native-evidence/harness-recovery.log
+          cargo test --locked -p comet-harness --test omp --test prime_agent 2>&1 | tee native-evidence/harness-discovery.log
           cargo test --locked -p comet-engine --lib rpc::scaffold_session::tests 2>&1 | tee native-evidence/handoff.log
           cargo test --locked -p comet-engine --lib scaffold::tests 2>&1 | tee native-evidence/scaffold.log
           cargo test --locked -p comet-engine --lib doc_host:: 2>&1 | tee native-evidence/doc-host.log
           python3 -c 'import re; from pathlib import Path; text = Path("native-evidence/doc-host.log").read_text(); assert re.search(r"(?m)^test result: ok\. [1-9][0-9]* passed; 0 failed;", text), "required doc-host suite did not execute passing tests"'
           cargo test --locked -p comet-engine --lib historical_attachments 2>&1 | tee native-evidence/attachments.log
-          cargo test --locked -p comet-engine --test peer_messages --test restart_resume --test workspace_sync --test remote_sync 2>&1 | tee native-evidence/native-integration.log
-          cargo test --locked -p comet-engine --test e2e queued_run_command_executes_end_to_end 2>&1 | tee native-evidence/queued-run.log
+          cargo test --locked -p comet-engine --test peer_messages --test restart_resume --test workspace_sync --test remote_sync --test device_routing --test e2e --test m5_repos_diffs_terminals 2>&1 | tee native-evidence/native-integration.log
           cargo test --locked -p comet --bin comet session 2>&1 | tee native-evidence/cli.log
       - name: Exercise paced large-tool memory bound
         timeout-minutes: 10
