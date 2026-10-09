@@ -45,8 +45,10 @@ nil/null config encoding and creation clocks. Mobile staging build **32** remove
 that second writer for Local and Scaffold creation, waits for principal-scoped
 catalog readiness, and retains the creation ID across retries. Older equivalent
 creation intents recover without discarding real config edits or ownership guards.
-Build **31** remains the latest published TestFlight release until build 32 is
-separately signed and uploaded. Production and both Scaffold image pins remain
+Mobile staging **1.0 (32)** is now **Testing** in the existing **Ashler Internal**
+TestFlight group, with source and distribution-signature verification recorded in
+[the mobile release evidence](apps/ios/README.md#crew-staging-10-32-host-owned-creation-candidate).
+Production and both Scaffold image pins remain
 gated on captain verification of the restarted staging desktop. Physical-phone
 convergence is not yet verified.
 
