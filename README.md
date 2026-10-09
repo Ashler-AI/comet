@@ -1018,6 +1018,32 @@ The isolated installed-runtime regression can be run without provider credential
 node scripts/omp-gateway-revival-smoke.mjs ~/.local/bin/omp --compare-explicit
 ```
 
+## Native supervision lifetime
+
+Steerable runs normally retire after 30 minutes idle. A supervising extension
+with outstanding worker or wake obligations can explicitly retain its own live
+run by spawning an attached child:
+
+```bash
+"$COMET_EXECUTABLE" session supervise
+```
+
+Preserve `COMET_SESSION_ID`, `COMET_IPC_PORT`, and the engine-minted
+`COMET_SUPERVISION_TOKEN`. The token is a secret capability for one run
+generation; never put it in argv, prompts, logs, or durable state. The child
+prints one JSON receipt with `chatId`, `runId`, and `retained: true` after native
+RPC admission, then remains silent. Keep it only while obligations exist;
+terminate and reap it to release. The last subscription closing restores the
+original idle deadline, so an already-overdue run retires immediately.
+
+Cancellation, stream failure, engine shutdown, and process-group cleanup still
+end the run. A replaced run gets a new capability; an old subscriber cannot
+retain or release its replacement. Observe unexpected child exit as lost
+supervision, not success, and reacquire only from a fresh run's launch context.
+There is no heartbeat prompt, detached watcher, or retention after Crew closes.
+Older engines/runs without the capability fail closed; updating source alone
+does not change an already-running installed application.
+
 ## Native OMP handoff to Scaffold
 
 For an explicitly requested remote task, local OMP runs inside Crew use the
