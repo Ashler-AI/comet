@@ -301,7 +301,10 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 page.busy_account = None;
                 match result {
-                    Ok(_) => page.load(cx),
+                    Ok(_) => {
+                        crate::pickers::invalidate_catalogs(&page.state, cx);
+                        page.load(cx);
+                    }
                     Err(err) => page.error = Some(format!("{err}").into()),
                 }
                 cx.notify();
@@ -414,6 +417,7 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 match result {
                     Ok(_) => {
+                        crate::pickers::invalidate_catalogs(&page.state, cx);
                         page.login = None;
                         page.load(cx);
                     }
@@ -462,6 +466,7 @@ impl AccountsPage {
                     }) {
                         Some(poll) => match poll.status {
                             AgentLoginStatus::Done => {
+                                crate::pickers::invalidate_catalogs(&page.state, cx);
                                 page.login = None;
                                 page.load(cx);
                                 cx.notify();
@@ -546,6 +551,7 @@ impl AccountsPage {
             let result = engine.client().call(methods::UPDATE_HARNESS, params).await;
             this.update(cx, |page, cx| {
                 page.updating_harnesses.remove(&task_id);
+                crate::pickers::invalidate_catalogs(&page.state, cx);
                 if let Err(err) = result {
                     page.harness_errors
                         .insert(task_id.clone(), format!("{err}").into());

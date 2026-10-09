@@ -3917,7 +3917,7 @@ fn mention_error_message(err: &RpcError) -> SharedString {
             "The session's device runs an older comet — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) | RpcError::ScaffoldAuthUnavailable => {
+        RpcError::BadParams(_) | RpcError::Failed(_) | RpcError::ScaffoldAuthUnavailable | RpcError::StreamOverflow => {
             "File search failed".into()
         }
     }

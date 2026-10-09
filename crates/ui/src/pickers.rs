@@ -38,6 +38,65 @@ use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
+static CATALOG_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn invalidate_catalogs(state: &Entity<AppState>, cx: &mut App) {
+    CATALOG_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.update(cx, |_, cx| cx.notify());
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct CatalogScope {
+    auth: Option<comet_proto::AuthState>,
+    local_device: Option<String>,
+    target: Option<String>,
+    version: Option<String>,
+    engine: Option<usize>,
+    connected: bool,
+    sessions_epoch: u64,
+    harnesses: Vec<comet_update::HarnessStatus>,
+    revision: u64,
+}
+
+impl CatalogScope {
+    pub(crate) fn new(state: &AppState, target: Option<String>) -> Self {
+        let device = target.as_ref().or(state.local_device_id.as_ref());
+        Self {
+            auth: state.auth.clone(),
+            version: state.devices.iter().find(|row| Some(&row.id) == device)
+                .and_then(|row| row.version.clone()),
+            connected: matches!(state.connection, crate::state::ConnectionStatus::Ready),
+            sessions_epoch: state.sessions_epoch,
+            harnesses: if target.is_none() {
+                state.update.as_ref().map(|update| update.harnesses.clone()).unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            local_device: state.local_device_id.clone(),
+            target,
+            engine: state.engine().map(|engine| engine.client() as *const _ as usize),
+            revision: CATALOG_REVISION.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) async fn catalog_call(
+    engine: &EngineHandle,
+    executor: &gpui::BackgroundExecutor,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, comet_rpc::RpcError> {
+    let call = engine.client().call_cancellable(method, params);
+    let timer = executor.timer(Duration::from_secs(75));
+    futures::pin_mut!(call);
+    match futures::future::select(call, timer).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => Err(comet_rpc::RpcError::Failed(format!(
+            "{method} timed out. Check the target device and agent credentials, then retry."
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
 // ---------------------------------------------------------------------------
@@ -510,6 +569,9 @@ pub struct Pickers {
     /// repository/device-specific OMP catalog is still loading.
     omp_command_fallback: HarnessCommand,
     catalog_generation: u64,
+    catalog_scope: CatalogScope,
+    model_tasks: HashMap<HarnessId, Task<()>>,
+    command_tasks: HashMap<CommandCatalogKey, Task<()>>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -581,12 +643,7 @@ impl Pickers {
             let pending_scaffold =
                 is_pending_scaffold_selection(selected.as_deref(), pending_scaffold_chat);
             if selected != this.draft_owner {
-                this.catalog_generation = this.catalog_generation.wrapping_add(1);
-                this.load_task = None;
                 this.refs_task = None;
-                this.harnesses = Loadable::Idle;
-                this.models.clear();
-                this.commands.clear();
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
                 this.draft_owner = selected.clone();
@@ -614,19 +671,17 @@ impl Pickers {
             // (and possibly the device) changed under them.
             let space = state.selected_space.clone();
             if space != this.space_owner {
-                this.catalog_generation = this.catalog_generation.wrapping_add(1);
-                this.load_task = None;
                 this.refs_task = None;
                 this.space_owner = space;
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::remembered(this.defaults.new_worktree);
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
-                // Catalogs are per-DEVICE (fetched from the space's host):
-                // a space switch may land on another device, so refetch.
-                this.harnesses = Loadable::Idle;
-                this.models.clear();
-                this.commands.clear();
+            }
+            let scope = CatalogScope::new(state, this.space_target(cx));
+            if scope != this.catalog_scope {
+                this.catalog_scope = scope;
+                this.invalidate_catalogs();
             }
             cx.notify();
         });
@@ -654,6 +709,9 @@ impl Pickers {
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
         Self {
+            catalog_scope: CatalogScope::new(state.read(cx), None),
+            model_tasks: HashMap::new(),
+            command_tasks: HashMap::new(),
             state,
             space_owner,
             config,
@@ -1013,14 +1071,20 @@ impl Pickers {
 
     // ---- loads ----
 
-    /// Explicit wake completion invalidates failed/in-flight loads, not draft picks.
-    pub(crate) fn reload_after_wake(&mut self, cx: &mut Context<Self>) {
+    fn invalidate_catalogs(&mut self) {
         self.catalog_generation = self.catalog_generation.wrapping_add(1);
         self.load_task = None;
-        self.refs_task = None;
+        self.model_tasks.clear();
+        self.command_tasks.clear();
         self.harnesses = Loadable::Idle;
         self.models.clear();
         self.commands.clear();
+    }
+
+    /// Explicit wake completion invalidates failed/in-flight loads, not draft picks.
+    pub(crate) fn reload_after_wake(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_catalogs();
+        self.refs_task = None;
         self.refs = Loadable::Idle;
         self.refs_space = None;
         self.ensure_harnesses(cx);
@@ -1078,6 +1142,11 @@ impl Pickers {
     }
 
     fn ensure_harnesses(&mut self, cx: &mut Context<Self>) {
+        let scope = CatalogScope::new(self.state.read(cx), self.space_target(cx));
+        if scope != self.catalog_scope {
+            self.catalog_scope = scope;
+            self.invalidate_catalogs();
+        }
         // Only load from Idle: `render` re-runs this every frame, so an Error
         // that could re-trigger a load would flip back to Loading before the
         // retry row ever painted (and spam the engine). Retry resets to Idle.
@@ -1085,6 +1154,7 @@ impl Pickers {
             return;
         }
         let Some(engine) = self.engine(cx) else {
+            self.harnesses = Loadable::Error("Engine not connected. Reconnect and retry.".into());
             return;
         };
         let target = self.space_target(cx);
@@ -1098,12 +1168,10 @@ impl Pickers {
                     serde_json::Value::String(target.clone()),
                 );
             }
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::Value::Object(params))
-                .await;
+            let result = catalog_call(&engine, cx.background_executor(),
+                methods::LIST_HARNESSES, serde_json::Value::Object(params)).await;
             this.update(cx, |pickers, cx| {
-                if generation != pickers.catalog_generation || target != pickers.space_target(cx) {
+                if generation != pickers.catalog_generation || pickers.catalog_scope != CatalogScope::new(pickers.state.read(cx), pickers.space_target(cx)) {
                     return;
                 }
                 pickers.harnesses = match result {
@@ -1134,12 +1202,13 @@ impl Pickers {
             return;
         }
         let Some(engine) = self.engine(cx) else {
+            self.models.insert(harness, Loadable::Error("Engine not connected. Reconnect and retry.".into()));
             return;
         };
         let target = self.space_target(cx);
         let generation = self.catalog_generation;
         self.models.insert(harness, Loadable::Loading);
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert(
@@ -1147,9 +1216,9 @@ impl Pickers {
                     serde_json::Value::String(target.clone()),
                 );
             }
-            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            let result = catalog_call(&engine, cx.background_executor(), methods::LIST_MODELS, params).await;
             this.update(cx, |pickers, cx| {
-                if generation != pickers.catalog_generation || target != pickers.space_target(cx) {
+                if generation != pickers.catalog_generation || pickers.catalog_scope != CatalogScope::new(pickers.state.read(cx), pickers.space_target(cx)) {
                     return;
                 }
                 let loaded = match result {
@@ -1171,8 +1240,8 @@ impl Pickers {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        self.model_tasks.insert(harness, task);
     }
 
     fn command_cwd(&self, cx: &App) -> String {
@@ -1207,6 +1276,7 @@ impl Pickers {
             return;
         }
         let Some(engine) = self.engine(cx) else {
+            self.commands.insert(key, Loadable::Error("Engine not connected. Reconnect and retry.".into()));
             return;
         };
         let mut params = serde_json::json!({ "harness": key.harness, "cwd": key.cwd });
@@ -1217,12 +1287,14 @@ impl Pickers {
             );
         }
         self.commands.insert(key.clone(), Loadable::Loading);
-        cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESS_COMMANDS, params)
-                .await;
+        let generation = self.catalog_generation;
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = catalog_call(&engine, cx.background_executor(), methods::LIST_HARNESS_COMMANDS, params).await;
             this.update(cx, |pickers, cx| {
+                if generation != pickers.catalog_generation || pickers.catalog_scope != CatalogScope::new(pickers.state.read(cx), pickers.space_target(cx)) {
+                    return;
+                }
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessCommand>>(value) {
                         Ok(commands) => {
@@ -1236,8 +1308,8 @@ impl Pickers {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
+        self.command_tasks.insert(task_key, task);
     }
 
     pub fn prepare_harness_commands(&mut self, cx: &mut Context<Self>) {
@@ -2315,8 +2387,7 @@ impl Pickers {
                     .on_click(cx.listener(move |this, _, _, cx| match kind {
                         PickerKind::Branch | PickerKind::Checkout => this.ensure_refs(true, cx),
                         PickerKind::HarnessModel | PickerKind::Traits => {
-                            this.harnesses = Loadable::Idle;
-                            this.models.clear();
+                            this.invalidate_catalogs();
                             this.ensure_harnesses(cx);
                         }
                     }))
@@ -3402,6 +3473,35 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn catalog_survives_chat_switch_but_not_authority_changes(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, _| {
+            pickers.harnesses = Loadable::Ready(Vec::new());
+            pickers.models.insert(HarnessId::Omp, Loadable::Ready(Vec::new()));
+        });
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("another-chat".into());
+            cx.notify();
+        });
+        pickers.update(cx, |pickers, _| {
+            assert!(matches!(pickers.harnesses, Loadable::Ready(_)));
+            assert!(matches!(pickers.models.get(&HarnessId::Omp), Some(Loadable::Ready(_))));
+        });
+        state.update(cx, |state, cx| {
+            state.auth = Some(comet_proto::AuthState::SignedOut);
+            cx.notify();
+        });
+        pickers.update(cx, |pickers, _| {
+            assert!(matches!(pickers.harnesses, Loadable::Idle));
+            assert!(pickers.models.is_empty());
+        });
+        let state_value = AppState::new();
+        assert!(CatalogScope::new(&state_value, Some("device-a".into()))
+            != CatalogScope::new(&state_value, Some("device-b".into())));
+    }
 
     #[gpui::test]
     fn scaffold_source_ignores_local_checkout_and_can_return_to_published(

@@ -304,6 +304,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         }
         AgentEvent::SessionTitleChanged { .. }
         | AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::ModelRetry { .. }
         | AgentEvent::Usage { .. } => {}
     }
 }

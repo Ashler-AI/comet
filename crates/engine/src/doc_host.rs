@@ -1639,6 +1639,7 @@ impl DocHost {
                 }
             }
             session.status = Some(comet_proto::SessionStatus::Idle);
+            session.model_retry = None;
             session.updated_at = Some(now);
             handle.doc.append_publication(&PublicationRecord {
                 id: new_id(),
@@ -1703,6 +1704,7 @@ impl DocHost {
                     model: workspace.chat_config(&handle.chat_id).and_then(|config| config.model),
                     harness_session_id: None,
                     status: None,
+                    model_retry: None,
                     started_at: None,
                     updated_at: None,
                     created_at: status.started_at.unwrap_or(status.updated_at).timestamp_millis(),
@@ -1733,17 +1735,19 @@ impl DocHost {
         if session.status == Some(status.status)
             && session.updated_at == Some(updated_at)
             && session.started_at == started_at
+            && session.model_retry == status.model_retry
         {
             return Ok(());
         }
         let phase_changed = session.status != Some(status.status);
         session.status = Some(status.status);
         session.updated_at = Some(updated_at);
+        session.model_retry = status.model_retry;
         session.started_at = started_at;
         let publication = PublicationRecord {
             id: format!(
-                "session/{session_id}/status/{}/{:?}",
-                status.updated_at, status.status
+                "session/{session_id}/status/{}/{:?}/{:?}",
+                status.updated_at, status.status, status.model_retry
             ),
             schema_version: COLLABORATION_SCHEMA_VERSION,
             published_at: updated_at,
@@ -2965,6 +2969,7 @@ impl DocHost {
                                 .as_ref()
                                 .and_then(|session| session.harness_session_id.clone()),
                             status: Some(comet_proto::SessionStatus::Working),
+                            model_retry: None,
                             started_at: Some(at),
                             updated_at: Some(at),
                             created_at: previous.as_ref().map_or(at, |session| session.created_at),
@@ -3956,6 +3961,7 @@ mod authority_tests {
             host.record_agent_session(&comet_proto::Session {
                 chat_id: "chat-a".into(), device_id: "device-a".into(),
                 status: SessionStatus::Working, started_at: None, updated_at: chrono::Utc::now(),
+                model_retry: None,
             }).unwrap();
             let request: comet_proto::RunRequest = serde_json::from_value(serde_json::json!({
                 "prompt": "original request", "cwd": "/tmp", "sandbox": "workspace-write", "autoApprove": true,
@@ -4028,6 +4034,7 @@ mod authority_tests {
                         model: None,
                         harness_session_id: None,
                         status: Some(SessionStatus::Working),
+                        model_retry: None,
                         started_at: None,
                         updated_at: Some(1),
                         created_at: 1,
@@ -4041,20 +4048,25 @@ mod authority_tests {
             chat_id: execution_key,
             device_id: "device-a".into(),
             status: SessionStatus::Working,
+            model_retry: None,
             started_at: None,
             updated_at: chrono::DateTime::from_timestamp_millis(1).unwrap(),
         };
-        for (status, at, publication_count) in [
-            (SessionStatus::Working, 10_001, 2),
-            (SessionStatus::Working, 20_001, 2),
-            (SessionStatus::AwaitingInput, 20_002, 3),
-            (SessionStatus::Working, 20_003, 4),
-            (SessionStatus::Idle, 20_004, 5),
-            (SessionStatus::Idle, 20_005, 5),
-            (SessionStatus::Working, 20_006, 6),
-            (SessionStatus::Errored, 20_007, 7),
+        let retry = Some(comet_proto::ModelRetry { attempt: 2, max_attempts: 4 });
+        for (status, at, model_retry, publication_count) in [
+            (SessionStatus::Working, 10_001, None, 2),
+            (SessionStatus::Working, 10_001, retry, 2),
+            (SessionStatus::Working, 20_001, retry, 2),
+            (SessionStatus::Working, 20_001, None, 2),
+            (SessionStatus::AwaitingInput, 20_002, None, 3),
+            (SessionStatus::Working, 20_003, retry, 4),
+            (SessionStatus::Idle, 20_004, None, 5),
+            (SessionStatus::Idle, 20_005, None, 5),
+            (SessionStatus::Working, 20_006, retry, 6),
+            (SessionStatus::Errored, 20_007, None, 7),
         ] {
             source.status = status;
+            source.model_retry = model_retry;
             if at == 10_001 || at == 20_006 {
                 source.started_at = chrono::DateTime::from_timestamp_millis(at);
             }
@@ -4070,6 +4082,7 @@ mod authority_tests {
                 (assigned.status, assigned.updated_at),
                 (Some(status), Some(at))
             );
+            assert_eq!(assigned.model_retry, model_retry);
             assert_eq!(
                 assigned.started_at,
                 Some(if at < 20_006 { 10_001 } else { 20_006 })
@@ -4863,6 +4876,7 @@ mod authority_tests {
                 owner_subject: "owner-a".into(), owner_device_id: "device-a".into(),
                 source: AgentSessionSource::Local, environment: None,
                 harness: Some(HarnessId::Mock), model: None, harness_session_id: None,
+                model_retry: None,
                 started_at: None,
                 status: Some(SessionStatus::Idle), updated_at: Some(1), created_at: 1,
                 unknown: Default::default(),

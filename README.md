@@ -2,6 +2,74 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.147: lossless workspace recovery
+
+Loro's immutable causal-vector merges used mutable lookups for unchanged
+counters, copying shared tree nodes. Rebuilding the same shallow-root vector
+amplified that cost. A tiny accepted update could exhaust the shared Worker's
+128 MiB limit, disconnecting catalog readers and rejecting subsequent writes.
+Both native and Edge now preserve that structural sharing. Snapshot folds also
+reuse the encoded history at the existing retained boundary instead of decoding
+and copying every operation; no history boundary or permission is changed.
+
+Exact-byte replay of the captured snapshot and 27 accepted records, lossless
+folding, cold reopen and a returning offline edit used **80.94 MiB** of WASM,
+versus **174.13 MiB** before. All **299,330 operations**, complete state, version
+vector and retained frontier matched. The synthetic 450-peer concurrent-history
+regression fails the old runtime at **240.06 MiB** and passes at **11.75 MiB**.
+Run it with `node edge/scripts/workspace-replay-memory-smoke.mjs`; private
+baseline/delta paths remain supported and are never committed.
+
+Snapshot admission also avoids merging two hot workspace replicas at the same
+retained boundary: it imports only the candidate's new operations into accepted
+state. The captured native recovery snapshot preserved **309,686 operations**
+and cold-restart state at **80.63 MiB**, down from **147.44 MiB**. The permanent
+memory smoke now exercises actual Durable Object admission, duplicate delivery
+and durable cold replay, not only the Loro library.
+
+Local verification passed **217 Edge**, **111 document**, **315 engine**,
+**21 RPC**, **57 sync** and **578 UI** tests, plus subprocess cancellation and
+startup-negotiation regressions. The 24-turn real two-device/Worker smoke retained
+**1,600** history rows through crash/reconnect and converged in **4.13 seconds**.
+The isolated headed demo rendered the populated model picker and completed mock
+response. These checks do not establish installed-client or hosted-rollout status.
+
+Native recovery includes guarded complete-cache adoption and clears the cold
+repair latch only after the matching authenticated repair ACK. Unknown ACKs,
+foreign histories, genuine competing edits and resurrections remain blocked.
+The original intents are preserved; recovery does not reset a live workspace.
+
+Directory projection streams native and legacy tool text in UTF-8-safe 64 KiB
+chunks instead of rejecting large transcript rows. Snapshot adoption atomically
+requeues the canonical directory job, including arrivals after missing-source
+failures; it preserves deletion fences, retry backoff and causal checks. Truly
+absent snapshots remain pending rather than publishing invented history.
+
+Same-device chat switches retain harness/model catalogs. Discovery is cancellable
+and bounded at the UI, engine and subprocess; startup negotiation fails explicitly
+after 15 seconds without publishing readiness. Credentials, device, connection,
+harness updates and explicit retry/wake invalidate the relevant catalog.
+Cancellation owns the unreaped subprocess group even after its leader exits;
+macOS returns `ESRCH` from `getpgid` in that state despite surviving descendants.
+
+A stalled RPC subscription no longer blocks the shared reader. Its bounded
+ordered prefix is followed by an explicit overflow error and upstream cancellation;
+transcript/snapshot watches resubscribe, while terminal replay retains its sequence
+cursor. Forwarded streams preserve errors; durable command admission is unchanged.
+At most 256 active or queued-for-cancellation subscriptions are admitted per
+connection, plus one cancellation being sent.
+
+The private Edge runtime is built from Loro
+`45708d059d8620fb53066c9f86cefa1601e0e1c6` with
+`edge/vendor/loro-1.16.4-crew.1.patch`. Apply that patch to the pinned checkout,
+then build `loro-wasm` for `wasm32-unknown-unknown` through
+`python3 scripts/local-cargo.py build --locked --release --manifest-path
+UPSTREAM/Cargo.toml -p loro-wasm --target wasm32-unknown-unknown`.
+Use `edge/scripts/build-loro-runtime.mjs WASM_PATH WASM_BINDGEN_PATH OUTPUT_TGZ
+UPSTREAM_SOURCE` with wasm-bindgen **0.2.100**; it verifies the published wrapper
+archive's SHA-512 and packages only fresh Node/web bindings. It never runs a
+local TypeScript check. Local typechecks remain intentionally disabled.
+
 ## Crew 0.1.146: published Scaffold source by default
 
 New Scaffold drafts select **Published source**, omitting a source override so
@@ -104,6 +172,13 @@ Legacy workspace rows and retained journals normalize repeated self-session
 aliases together, preserving canonical ownership, tombstones and completed
 outcomes. Covered bootstrap observations can coalesce; conflicting user edits
 or unknown ancestry retain their original evidence and remain blocked.
+
+An authenticated workspace checkpoint that is already covered by the complete
+local cache cannot roll back newer accepted edits. Recovery keeps that isolated
+cache only when it still matches every retained intent, preserving archived
+sessions and field tombstones without blocking new-session metadata commits.
+Unseen competing edits and remote resurrections still retain their original
+evidence and fail closed; no automatic reset or cache deletion is performed.
 
 Same-owner session memberships can learn their first environment route. Recovery
 preserves that route across restarts and refuses changes to known scopes or
@@ -845,6 +920,21 @@ sh install.sh --install-omp
 This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-pi/releases/tag/v17.2.9) artifact to `~/.local/bin/omp` after SHA-256 verification against the per-platform pins in `install.sh` (darwin arm64/x64, linux glibc and musl arm64/x64). App updates can be started at any time from **Settings → Crew update**. The engine also tracks agent CLI versions on its release-check cadence; **Settings → Agents** offers per-agent updates through each CLI's own self-updater (`omp update`, `claude update`, `codex update`), and by default the first boot of a new Crew version refreshes installed agents automatically (**Settings** toggle or `COMET_UPDATE_HARNESSES=0` to opt out).
 
 To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
+
+### Model-stream recovery
+
+Crew-owned OMP runs allow three model-level retries with OMP's bounded backoff;
+provider/SDK HTTP retries remain disabled. Completed tools and the user task are
+not replayed by Crew. Existing OMP replay-safe stream repair remains unchanged.
+Desktop, iOS, and web show **Reconnecting to model — attempt 2/4** during recovery
+and clear the indicator on resumed progress, interruption, or terminal completion.
+Retry counters are live session metadata, not transcript errors or reasoning text.
+
+Inference diagnostics join Crew's `request_id` to the server's `requestId` using
+`x-agent-auth-request-id`, separately from OpenAI's `x-request-id`. IDs are bounded
+and credential-like values are omitted; transport causes are classified without
+logging raw exception messages, prompts, or credentials. Partial HTTP 200 streams
+remain errors, and inference timeout behavior is unchanged.
 
 ### Desktop gateway extension discovery
 

@@ -20,7 +20,11 @@ async fn main() {
         let mut rx = client.subscribe(method, params).await.expect("subscribe");
         for _ in 0..count {
             match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
-                Ok(Some(item)) => println!("{item}"),
+                Ok(Some(Ok(item))) => println!("{item}"),
+                Ok(Some(Err(error))) => {
+                    eprintln!("stream failed: {error}");
+                    std::process::exit(1);
+                }
                 Ok(None) => {
                     eprintln!("stream ended");
                     break;

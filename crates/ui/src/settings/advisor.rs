@@ -14,6 +14,7 @@ use crate::icons::{self, icon};
 use crate::popover::{self, Loadable};
 use crate::settings::widgets;
 use crate::state::AppState;
+use crate::pickers::{CatalogScope, catalog_call};
 use crate::theme::Theme;
 
 fn configured_model<'a>(selector: &str, models: &'a [Model]) -> Option<&'a Model> {
@@ -47,11 +48,21 @@ pub struct AdvisorPage {
     error: Option<SharedString>,
     load_task: Option<Task<()>>,
     save_task: Option<Task<()>>,
+    scope: (CatalogScope, String),
+    _state_observe: gpui::Subscription,
 }
 
 impl AdvisorPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let observe = cx.observe(&state, |page: &mut Self, _, cx| {
+            let scope = (CatalogScope::new(page.state.read(cx), None), page.cwd(cx));
+            if scope != page.scope {
+                page.load(cx);
+            }
+        });
         let mut page = Self {
+            scope: (CatalogScope::new(state.read(cx), None), String::new()),
+            _state_observe: observe,
             state,
             config: Loadable::Idle,
             models: Loadable::Idle,
@@ -82,6 +93,8 @@ impl AdvisorPage {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
+        self.scope = (CatalogScope::new(self.state.read(cx), None), self.cwd(cx));
+        self.load_task = None;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.config = Loadable::Error("Engine not connected".into());
             self.models = Loadable::Error("Engine not connected".into());
@@ -93,30 +106,27 @@ impl AdvisorPage {
         self.model_menu_open = false;
         self.error = None;
         let cwd = self.cwd(cx);
+        let scope = self.scope.clone();
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let config_result = engine
-                .client()
-                .call(
-                    methods::GET_OMP_ADVISOR_CONFIG,
-                    serde_json::json!({ "cwd": cwd }),
-                )
-                .await
-                .and_then(|value| {
-                    serde_json::from_value::<OmpAdvisorConfig>(value)
-                        .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
-                });
-            let models_result = engine
-                .client()
-                .call(
-                    methods::LIST_MODELS,
-                    serde_json::json!({ "harness": HarnessId::Omp }),
-                )
-                .await
+            let (config_result, models_result) = futures::join!(
+                catalog_call(&engine, cx.background_executor(),
+                    methods::GET_OMP_ADVISOR_CONFIG, serde_json::json!({ "cwd": cwd })),
+                catalog_call(&engine, cx.background_executor(),
+                    methods::LIST_MODELS, serde_json::json!({ "harness": HarnessId::Omp })),
+            );
+            let config_result = config_result.and_then(|value| {
+                serde_json::from_value::<OmpAdvisorConfig>(value)
+                    .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
+            });
+            let models_result = models_result
                 .and_then(|value| {
                     serde_json::from_value::<Vec<Model>>(value)
                         .map_err(|error| comet_rpc::RpcError::Failed(error.to_string()))
                 });
             this.update(cx, |page, cx| {
+                if scope != (CatalogScope::new(page.state.read(cx), None), page.cwd(cx)) {
+                    return;
+                }
                 match config_result {
                     Ok(config) => page.install_config(config, cx),
                     Err(error) => {

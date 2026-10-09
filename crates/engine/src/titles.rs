@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionDoc};
+use comet_doc::{MessageRole, MessageStatus, SessionDoc};
 use comet_sync::DocsStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -133,6 +133,8 @@ impl TitleGenerator {
             }
             loop {
                 let Some(inner) = weak.upgrade() else { return };
+                // Observe before querying, so an enqueue racing an empty claim is not lost.
+                changed.borrow_and_update();
                 match inner.store.claim_directory() {
                     Ok(Some((id, generation, state, deleted))) => {
                         let this = Self { inner };
@@ -156,7 +158,6 @@ impl TitleGenerator {
                         }
                     }
                     Ok(None) => {
-                        changed.borrow_and_update();
                         let delay = inner.store.directory_retry_delay().ok().flatten();
                         drop(inner);
                         match delay {
@@ -547,27 +548,10 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
             scan_chunk(&mut carry, chunk, finished, &mut links).map_err(|_| {
                 comet_doc::DocError::Schema("directory link scan exceeded bounds".into())
             })?;
-            if entry.role == MessageRole::User {
-                append_bounded(&mut text, chunk, 6000);
-            }
+            append_chunk(&mut text, chunk, 6000);
+            if finished { append_bounded(&mut text, "", 6000); }
             Ok(())
         })?;
-        for part in &entry.parts {
-            match part {
-                MessagePart::Text { text: value, .. }
-                | MessagePart::TextWindow { text: value, .. } => {
-                    if entry.role != MessageRole::User {
-                        append_bounded(&mut text, value, 6000);
-                    }
-                }
-                MessagePart::Tool { call, .. } => {
-                    let value =
-                        serde_json::to_value(call).map_err(|_| failure("invalid tool content"))?;
-                    tool_text(&value, &mut links, &mut text)?;
-                }
-                _ => {}
-            }
-        }
         if initial.is_empty() && entry.role == MessageRole::User && entry.peer_message.is_none() {
             append_bounded(&mut initial, &text, 6000);
         }
@@ -591,10 +575,7 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
         }
         let clean_completion = entry.role == MessageRole::Assistant
             && entry.status == Some(MessageStatus::Complete)
-            && !entry
-                .parts
-                .iter()
-                .any(|part| matches!(part, MessagePart::Error { .. }));
+            && !entry.has_error;
         if entry.role == MessageRole::Assistant {
             turn_completed = clean_completion;
         }
@@ -620,45 +601,16 @@ fn project(bytes: &[u8]) -> Result<Projection, EngineError> {
 }
 
 fn append_bounded(out: &mut String, text: &str, budget: usize) {
-    for ch in text.chars() {
-        if out.len() + ch.len_utf8() > budget {
-            break;
-        }
-        out.push(ch);
-    }
+    append_chunk(out, text, budget);
     if out.len() < budget {
         out.push('\n');
     }
 }
 
-fn tool_text(
-    value: &Value,
-    links: &mut BTreeSet<String>,
-    text: &mut String,
-) -> Result<(), EngineError> {
-    match value {
-        Value::String(value) => {
-            extract_links(value, links)?;
-            append_bounded(text, value, 6000);
-        }
-        Value::Array(items) => {
-            for item in items {
-                tool_text(item, links, text)?;
-            }
-        }
-        Value::Object(fields) => {
-            for (key, item) in fields {
-                if !matches!(
-                    key.as_str(),
-                    "reasoning" | "thinking" | "system" | "systemPrompt"
-                ) {
-                    tool_text(item, links, text)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+fn append_chunk(out: &mut String, text: &str, budget: usize) {
+    let mut end = text.len().min(budget.saturating_sub(out.len()));
+    while !text.is_char_boundary(end) { end -= 1; }
+    out.push_str(&text[..end]);
 }
 
 fn url_separator(ch: char) -> bool {
@@ -734,6 +686,52 @@ fn extract_links(text: &str, links: &mut BTreeSet<String>) -> Result<(), EngineE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use comet_doc::MessagePart;
+    #[test]
+    fn directory_projects_large_tools_without_copying_or_truncating_history() {
+        for legacy in [false, true] {
+            let doc = SessionDoc::init("10000000-0000-4000-8000-000000000001").unwrap();
+            let link = "https://team.slack.com/archives/C123/p1234567890123456";
+            // Cross the old row limit and a UTF-8 chunk boundary; the link is
+            // beyond the title budget but must still be indexed.
+            let command = format!("Inspect the deployment {} {link}", "界".repeat(100_000));
+            let entry = comet_doc::SessionMessageEntry {
+                id: "assistant-1".into(), role: MessageRole::Assistant,
+                parts: vec![MessagePart::Tool { id: "tool".into(),
+                    call: comet_proto::ToolCall::Exec { command: command.clone() },
+                    is_error: false, resolved: true }],
+                created_at: 1, device_id: "device-a".into(),
+                status: Some(MessageStatus::Complete), continuation_of: None, peer_message: None,
+            };
+            doc.push_message(&entry).unwrap();
+            doc.set_completed_turn(&entry.id).unwrap();
+            let loro::ValueOrContainer::Container(loro::Container::Map(row)) = doc.doc().get_list("messages").get(0).unwrap() else { panic!("row") };
+            let loro::ValueOrContainer::Container(loro::Container::List(parts)) = row.get("parts").unwrap() else { panic!("parts") };
+            let loro::ValueOrContainer::Container(loro::Container::Map(part)) = parts.get(0).unwrap() else { panic!("part") };
+            if legacy {
+                part.insert("call", part.get("call").unwrap().get_deep_value()).unwrap();
+            }
+            doc.doc().commit();
+            let mut largest_chunk = 0;
+            doc.directory_visit_text(0, |chunk, _| {
+                largest_chunk = largest_chunk.max(chunk.len());
+                Ok(())
+            }).unwrap();
+            assert!(largest_chunk <= 64 * 1024);
+            let before = doc.doc().oplog_vv();
+            let projected = project(&doc.export_snapshot().unwrap()).unwrap();
+            assert_eq!(projected.completed.as_deref(), Some("assistant-1"));
+            assert!(projected.completed_is_first);
+            assert!(projected.input.contains("Inspect the deployment"));
+            assert!(projected.input.len() < 13_000);
+            assert_eq!(projected.links, vec![link.to_string()]);
+            assert_eq!(doc.read_entry("assistant-1").unwrap(), Some(entry));
+            assert_eq!(doc.doc().oplog_vv(), before);
+            part.insert("kind", "error").unwrap();
+            assert!(project(&doc.export_snapshot().unwrap()).unwrap().completed.is_none());
+        }
+    }
+
     #[test]
     fn source_versions_reject_stale_and_concurrent_sources() {
         let old = BTreeMap::from([("1".into(), 3)]);

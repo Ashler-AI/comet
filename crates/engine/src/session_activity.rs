@@ -24,6 +24,7 @@ pub(crate) fn aggregate_owner_thread(
     Some(Session {
         chat_id: canonical.chat_id.clone(), device_id: canonical.owner_device_id.clone(),
         status: writer.status?, started_at: writer.started_at.and_then(DateTime::<Utc>::from_timestamp_millis), updated_at,
+        model_retry: if writer.status == Some(SessionStatus::Working) { writer.model_retry } else { None },
     })
 }
 
@@ -237,6 +238,7 @@ mod tests {
                 source_ref: None, last_activity_at: None, database_environment: None, unknown: Default::default(),
             }),
             harness: None, model: None, harness_session_id: None,
+            model_retry: None,
             started_at: None,
             status: Some(SessionStatus::Idle), updated_at: Some(100_100), created_at: 1,
             unknown: Default::default(),
@@ -326,6 +328,7 @@ mod tests {
         let mut active = Session {
             chat_id: "chat-0000".into(), device_id: "comet-scaffold-sandbox-e1".into(),
             status: SessionStatus::Working, started_at: None,
+            model_retry: None,
             updated_at: DateTime::from_timestamp_millis(100_000).unwrap(),
         };
         let awake = projected_rooms(&refs, &[], std::slice::from_ref(&active), "project", "local", 100_000);
@@ -378,6 +381,7 @@ mod tests {
                 session_id: CHAT.into(), chat_id: CHAT.into(), owner_subject: "owner".into(),
                 owner_device_id: "remote".into(), source: AgentSessionSource::Local,
                 environment: None, harness: None, model: None, harness_session_id: None,
+                model_retry: None,
                 started_at: None,
                 status: Some(status), updated_at: Some(at), created_at: at,
                 unknown: Default::default(),
@@ -456,6 +460,7 @@ mod tests {
         let mut current = Session {
             chat_id: REMOTE_CHAT.into(), device_id: "remote".into(),
             status: SessionStatus::Working, started_at: None,
+            model_retry: None,
             updated_at: stale_at,
         };
         // Existing bare-chat agents acquire the canonical record on their next
@@ -474,6 +479,7 @@ mod tests {
         let mut local = Session {
             chat_id: LOCAL_CHAT.into(), device_id: "desktop".into(),
             status: SessionStatus::Working, started_at: None,
+            model_retry: None,
             updated_at: Utc::now(),
         };
         let abandoned = Session { device_id: "desktop".into(), status: SessionStatus::Idle, ..current.clone() };
@@ -634,6 +640,7 @@ mod tests {
                         model: None,
                         harness_session_id: None,
                         status: Some(status),
+                        model_retry: None,
                         started_at: None,
                         updated_at: Some(at),
                         created_at: started_at,
@@ -665,6 +672,7 @@ mod tests {
             chat_id: CHAT.into(),
             device_id: "local".into(),
             status: SessionStatus::Idle,
+            model_retry: None,
             started_at: None,
             updated_at: DateTime::from_timestamp_millis(crate::now_ms()).unwrap(),
         };

@@ -50,7 +50,8 @@ const terminalCommandStatuses = new Set(['rejected', 'expired', 'superseded', 'c
 function renderActivity() {
   const statuses = { working: 'Composing…', awaitingInput: 'Awaiting your answer', errored: 'Session encountered an error', idle: '' };
   const pending = pendingCommands.values().next().value;
-  ui.activity.textContent = pending || (statuses[state?.session.status] ?? state?.session.status ?? '');
+  const retry = connected && state?.connection === 'connected' && state.session.status === 'working' ? state.session.modelRetry : null;
+  ui.activity.textContent = retry ? `Reconnecting to model — attempt ${retry.attempt}/${retry.maxAttempts}` : pending || (statuses[state?.session.status] ?? state?.session.status ?? '');
 }
 
 function element(tag, className, text) {
@@ -140,6 +141,7 @@ function connection(value) {
   ui.connection.dataset.state = live ? 'connected' : 'disconnected';
   ui.connection.textContent = live ? 'Connected' : state ? 'Reconnecting…' : 'Connecting…';
   updateControls();
+  renderActivity();
 }
 
 // Markdown is constructed entirely from DOM text nodes. Raw HTML and remote images

@@ -1100,7 +1100,8 @@ async fn rpc_dispatch_for_m5_methods() {
         let frame = tokio::time::timeout_at(deadline, diffs_stream.recv())
             .await
             .expect("diff summary before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         if let Some(summary) = frame
             .as_array()
             .and_then(|summaries| summaries.first())
@@ -1196,7 +1197,8 @@ async fn rpc_dispatch_for_m5_methods() {
         let item = tokio::time::timeout_at(deadline, stream.recv())
             .await
             .expect("terminal output before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         if item["type"] == "data" {
             let bytes = BASE64
                 .decode(item["data"].as_str().expect("data"))

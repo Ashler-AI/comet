@@ -794,6 +794,10 @@ impl WorkspaceDoc {
         row.insert("chatId", session.chat_id.as_str())?;
         row.insert("deviceId", session.device_id.as_str())?;
         row.insert("status", status_str(session.status))?;
+        match session.model_retry {
+            Some(retry) => row.insert("modelRetry", LoroValue::from(serde_json::to_value(retry)?))?,
+            None => row.delete("modelRetry")?,
+        }
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         self.doc.commit()?;
@@ -1256,6 +1260,8 @@ struct RawSession {
     device_id: String,
     status: SessionStatus,
     #[serde(default)]
+    model_retry: Option<comet_proto::ModelRetry>,
+    #[serde(default)]
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
@@ -1267,6 +1273,7 @@ impl From<RawSession> for Session {
             chat_id: raw.chat_id,
             device_id: raw.device_id,
             status: raw.status,
+            model_retry: raw.model_retry,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
         }
@@ -1489,6 +1496,7 @@ mod tests {
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status,
+            model_retry: None,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
         }
@@ -1658,6 +1666,12 @@ mod tests {
             state.sessions,
             vec![session("chat-1", "dev-a", SessionStatus::Working)]
         );
+        let mut retrying = session("chat-1", "dev-a", SessionStatus::Working);
+        retrying.model_retry = Some(comet_proto::ModelRetry { attempt: 2, max_attempts: 4 });
+        ws.upsert_session(&retrying).unwrap();
+        assert_eq!(ws.read_all().unwrap().sessions, vec![retrying]);
+        ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle)).unwrap();
+        assert!(ws.read_all().unwrap().sessions[0].model_retry.is_none());
 
         // Upsert refreshes in place — no duplicate rows, cleared options removed.
         let mut updated = chat("chat-1", "dev-a");

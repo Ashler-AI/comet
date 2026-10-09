@@ -1096,9 +1096,7 @@ impl AppDag {
 
                 let mut ans_vv = ImVersionVector::default();
                 if top_node.deps == self.shallow_root_frontiers_deps {
-                    for (&p, &c) in self.shallow_since_vv.iter() {
-                        ans_vv.insert(p, c);
-                    }
+                    ans_vv = self.shallow_since_vv.clone();
                 } else {
                     let mut all_deps_processed = true;
                     for id in top_node.deps.iter() {
