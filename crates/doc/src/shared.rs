@@ -596,24 +596,25 @@ fn reconcile(
                         let before = match before { Some(value) => Some(value.as_object().ok_or_else(conflict)?), None => None };
                         let (Some(local),Some(remote)) = (local.as_object(),remote.as_object()) else { return Err(conflict()) };
                         let mut merged = remote.clone();
-                        let clock = |row: &serde_json::Map<String, serde_json::Value>| row.get("lastMessageAt").and_then(serde_json::Value::as_i64)
+                        let cached_value = std::cell::LazyCell::new(|| row_value(cached, name, &record.key));
+                        let clock = |row: &serde_json::Map<String, serde_json::Value>, field: &str| row.get(field).and_then(serde_json::Value::as_i64)
                             .filter(|at| chrono::DateTime::from_timestamp_millis(*at).is_some());
                         let mut activity_merged = false;
-                        if name == "chats"
+                        let chat_identity = name == "chats"
                             && local.get("id").and_then(serde_json::Value::as_str) == Some(record.key.as_str())
                             && remote.get("id") == local.get("id") && before.and_then(|row| row.get("deviceId")) == local.get("deviceId")
-                            && local.get("deviceId").and_then(serde_json::Value::as_str).is_some_and(|owner| !owner.is_empty() && remote.get("deviceId").and_then(serde_json::Value::as_str) == Some(owner))
-                            && let (Some(local_at), Some(remote_at)) = (clock(local), clock(remote))
-                            && before.and_then(clock).is_none_or(|at| local_at >= at && remote_at >= at)
+                            && local.get("deviceId").and_then(serde_json::Value::as_str).is_some_and(|owner| !owner.is_empty() && remote.get("deviceId").and_then(serde_json::Value::as_str) == Some(owner));
+                        if chat_identity
+                            && let (Some(local_at), Some(remote_at)) = (clock(local, "lastMessageAt"), clock(remote, "lastMessageAt"))
+                            && before.and_then(|row| clock(row, "lastMessageAt")).is_none_or(|at| local_at >= at && remote_at >= at)
                         {
                             let local_wins_tie = local_follows_remote || before.is_some_and(|row|
                                 ["lastMessageAt", "lastMessagePreview"].iter().all(|field| row.get(*field) == remote.get(*field)));
                             let mut winner = if local_at > remote_at || (local_at == remote_at && local_wins_tie) { local } else { remote };
-                            let cached_value = row_value(cached, name, &record.key);
                             if let Some(row) = cached_value.as_ref().and_then(serde_json::Value::as_object)
                                 && crate::workspace::WORKSPACE_IDENTITY_FIELDS.iter().all(|field| row.get(*field) == local.get(*field))
                                 && crate::workspace::workspace_routes_compatible(name, [local, row])
-                                && clock(row).is_some_and(|at| at > local_at.max(remote_at)) { winner = row; }
+                                && clock(row, "lastMessageAt").is_some_and(|at| at > local_at.max(remote_at)) { winner = row; }
                             // The preview and its owner clock are one observation, not competing user edits.
                             for field in ["lastMessageAt", "lastMessagePreview"] {
                                 if let Some(value) = winner.get(field) { merged.insert(field.into(), value.clone()); } else { merged.remove(field); }
@@ -623,6 +624,20 @@ fn reconcile(
                         for field in before.into_iter().flat_map(|row| row.keys()).chain(local.keys()).collect::<BTreeSet<_>>() {
                             if owner_publication.is_some() && matches!(field.as_str(), "status" | "startedAt" | "updatedAt" | "modelRetry") { continue }
                             if activity_merged && matches!(field.as_str(), "lastMessageAt" | "lastMessagePreview") { continue }
+                            if chat_identity && field == "lastSeenAt"
+                                && let (Some(local_at), Some(remote_at)) = (clock(local, field), clock(remote, field))
+                                && before.is_none_or(|row| !row.contains_key(field) || clock(row, field).is_some_and(|at| local_at >= at && remote_at >= at))
+                                && let Some(row) = cached_value.as_ref().and_then(serde_json::Value::as_object)
+                                && crate::workspace::WORKSPACE_IDENTITY_FIELDS.iter().all(|field| row.get(*field) == local.get(*field))
+                                && crate::workspace::workspace_routes_compatible(name, [local, row])
+                                && let Some(cached_at) = clock(row, field)
+                                && before.and_then(|row| clock(row, field)).is_none_or(|at| cached_at >= at)
+                            {
+                                // Concurrent reads advance one observation. Absence, deletion and
+                                // a backwards clock may encode an explicit unread/read transition.
+                                merged.insert(field.clone(), serde_json::json!(local_at.max(remote_at).max(cached_at)));
+                                continue;
+                            }
                             if before.and_then(|row| row.get(field)) == local.get(field) { continue }
                             if !local_follows_remote && remote.get(field) != before.and_then(|row| row.get(field)) && remote.get(field) != local.get(field) {
                                 return Err(DocError::Schema(format!("Crew recovery conflict in {}/{} field={field}; original intent retained", record.container, record.key)));
@@ -1223,6 +1238,54 @@ mod tests {
             let changed_owner = remote.doc().export(ExportMode::shallow_snapshot(&remote.doc().state_frontiers())).unwrap();
             assert!(binding.adopt_snapshot(&changed_owner, None).is_err());
             assert_eq!(binding.get_map("chats").get("chat").unwrap().get_deep_value().to_json_value(), row);
+        }
+    }
+
+    #[test]
+    fn seen_recovery_merges_observations_but_preserves_explicit_unread() {
+        let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap();
+        for (local_at, remote_at) in [(3_000, 2_000), (2_000, 3_000), (2_000, 2_000)] {
+            let remote = WorkspaceDoc::new();
+            let row = remote.doc().get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+            row.insert("id", "chat").unwrap(); row.insert("deviceId", "owner").unwrap();
+            remote.doc().commit(); remote.set_chat_seen("chat", at(1_000)).unwrap();
+            let raw = LoroDoc::new(); raw.import(&remote.export_snapshot().unwrap()).unwrap();
+            let local = WorkspaceDoc::from_doc(raw); let binding = local.binding(); journal(&binding);
+            local.set_chat_seen("chat", at(local_at)).unwrap();
+            let original = binding.pending_records()[0].clone();
+            remote.set_chat_seen("chat", at(remote_at)).unwrap();
+            remote.rename_chat("chat", "remote title").unwrap();
+            let incoming = remote.doc().export(ExportMode::shallow_snapshot(&remote.doc().state_frontiers())).unwrap();
+            binding.fail_recovery("retained seen-marker conflict".into());
+            for _ in 0..2 {
+                binding.adopt_snapshot(&incoming, None).unwrap();
+                assert_eq!(local.chat("chat").unwrap().unwrap().last_seen_at, Some(at(local_at.max(remote_at))));
+                assert_eq!(local.chat("chat").unwrap().unwrap().title.as_deref(), Some("remote title"));
+            }
+            remote.set_chat_seen("chat", at(4_000)).unwrap();
+            binding.adopt_snapshot(&remote.export_snapshot().unwrap(), None).unwrap();
+            let raw = LoroDoc::new(); raw.import(&local.export_snapshot().unwrap()).unwrap();
+            let restarted = WorkspaceDoc::from_doc(raw); let rebound = restarted.binding();
+            rebound.install_journal(binding.pending_records(), Arc::new(|_, _| Ok(())));
+            rebound.adopt_snapshot(&incoming, None).unwrap();
+            assert_eq!(restarted.chat("chat").unwrap().unwrap().last_seen_at, Some(at(4_000)));
+            assert_eq!(rebound.pending_records()[0].before, original.before);
+            assert_eq!(rebound.pending_records()[0].value, original.value);
+            restarted.rename_chat("chat", "writes admitted after recovery").unwrap();
+
+            for local_unread in [false, true] {
+                let raw = LoroDoc::new(); raw.import(&incoming).unwrap();
+                let left = WorkspaceDoc::from_doc(raw); journal(&left.binding());
+                let raw = LoroDoc::new(); raw.import(&incoming).unwrap();
+                let right = WorkspaceDoc::from_doc(raw);
+                if local_unread { left.set_chat_unread("chat").unwrap(); right.set_chat_seen("chat", at(5_000)).unwrap(); }
+                else { left.set_chat_seen("chat", at(5_000)).unwrap(); right.set_chat_unread("chat").unwrap(); }
+                let preserved = left.export_snapshot().unwrap();
+                let retained = serde_json::to_vec(&left.binding().pending_records()).unwrap();
+                assert!(left.binding().adopt_snapshot(&right.export_snapshot().unwrap(), None).is_err());
+                assert_eq!(left.export_snapshot().unwrap(), preserved);
+                assert_eq!(serde_json::to_vec(&left.binding().pending_records()).unwrap(), retained);
+            }
         }
     }
 

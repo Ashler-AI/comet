@@ -2,6 +2,36 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.149: concurrent read-marker recovery
+
+The installed 0.1.148 client still rejected new-session creation when retained
+`lastSeenAt` observations advanced independently on two clients. Shared workspace
+reconciliation now keeps the latest valid, nondecreasing read observation,
+including the cached value. Explicit unread/deletion, backwards transitions,
+ownership changes and genuine competing edits keep their existing safeguards.
+The metadata warning and creation failure share this cause; neither is suppressed.
+
+Private replay against a fresh read-only server capture recovered all **156**
+retained records, preserving every original before/value, and passed new-chat
+creation, principal membership and cold reopen. All **115** document tests passed,
+including concurrent reads and explicit unread conflicts. This is isolated
+verification, not installed-client or phone acceptance. No live cache was reset.
+
+The same capture passed actual `WorkspaceHost` creation, principal membership
+and cold reopen, with only the normal local device boot clock/version restamp.
+The isolated headed client displayed the new session; typed Local start completed
+with mock-agent output and no metadata error. **315** engine and **57** sync tests
+also passed. The real native/Edge 24-turn smoke preserved **1,600** history rows
+through outages, crashes and lost acknowledgements, catching up in **2,190 ms**
+with **88,400 KiB** peak observed RSS. Local typechecks were intentionally skipped.
+
+Desktop and Devbox engines require independent native updates. Mobile has its
+own TestFlight distribution; [staging build 31](apps/ios/README.md#crew-staging-10-31-catalog-recovery)
+contains the mobile recovery fixes, and its read-marker replay already merges
+concurrent reads. No new iOS source change is needed for this native correction.
+Production and both Scaffold image pins remain gated on captain verification of
+the restarted staging desktop. Physical-phone convergence is not yet verified.
+
 ## Crew 0.1.148: retained catalog convergence
 
 Native workspace recovery now selects `lastMessageAt` and its preview together,
