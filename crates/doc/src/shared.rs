@@ -427,6 +427,32 @@ fn reconcile(
                         let Some(loro::ValueOrContainer::Container(loro::Container::Map(cached_row))) = cached.get_map(name).get(&record.key) else { return None };
                         if remote.keys().any(|field| matches!(remote_row.get(field), Some(loro::ValueOrContainer::Container(_))))
                             || local.keys().chain(cached_fields.keys()).any(|field| matches!(cached_row.get(field), Some(loro::ValueOrContainer::Container(_)))) { return None }
+                        let remote_seed = std::cell::LazyCell::new(|| {
+                            let inserted = doc.get_map(name).to_handler().get_last_edit_idlp(&record.key)?;
+                            let id = doc.with_oplog(|log| log.idlp_to_id(inserted))?;
+                            let before = doc.with_oplog(|log| log.get_deps_of(id))?;
+                            let change = doc.get_change(id)?;
+                            let end = change.id.counter.checked_add(i32::try_from(change.len).ok()?)?;
+                            // ponytail: history forks only for conflicting independent seeds; retained history must prove the baseline.
+                            let prior = doc.fork();
+                            prior.checkout(&before).ok()?;
+                            let root = prior.get_map(name);
+                            if root.get(&record.key).is_some() || root.to_handler().get_last_edit_idlp(&record.key).is_some() { return None }
+                            // Loro may coalesce bootstrap and later owner edits into one change.
+                            // Only the first operation for each field is its creation baseline.
+                            let mut fields = BTreeMap::new();
+                            let row_id = remote_row.id();
+                            for change in doc.export_json_in_id_span(loro::IdSpan::new(id.peer, id.counter, end)) {
+                                for op in change.ops.into_iter().filter(|op| op.container == row_id) {
+                                    match op.content {
+                                        loro::JsonOpContent::Map(loro::JsonMapOp::Insert { key, value }) => { fields.entry(key).or_insert_with(|| Some(value.to_json_value())); }
+                                        loro::JsonOpContent::Map(loro::JsonMapOp::Delete { key }) => { fields.entry(key).or_insert(None); }
+                                        _ => return None,
+                                    }
+                                }
+                            }
+                            Some(fields)
+                        });
                         let mut merged = remote.clone();
                         for (field, value) in local {
                             if activity_fields.contains(&field.as_str()) || remote.get(field) == Some(value) { continue }
@@ -454,6 +480,23 @@ fn reconcile(
                                 let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = prior.get_map(name).get(&record.key) else { return None };
                                 if row.id() != remote_row.id() || row.get(field).is_some() || row.to_handler().get_last_edit_idlp(field).is_some() { return None }
                                 merged.insert(field.clone(), value.clone());
+                            } else if remote.contains_key(field) && cached_fields.get(field) == Some(value)
+                                && remote_seed.as_ref().and_then(|fields| fields.get(field)).and_then(Option::as_ref) == Some(value)
+                            {
+                                // The owner advanced a shared bootstrap value, not a later local edit.
+                                let inserted = cached.get_map(name).to_handler().get_last_edit_idlp(&record.key)?;
+                                let stamped = cached_row.to_handler().get_last_edit_idlp(field)?;
+                                let (before_insert, before_stamp) = cached.with_oplog(|log| Some((
+                                    log.get_deps_of(log.idlp_to_id(inserted)?)?,
+                                    log.get_deps_of(log.idlp_to_id(stamped)?)?,
+                                )))?;
+                                let prior = cached.fork();
+                                prior.checkout(&before_insert).ok()?;
+                                let root = prior.get_map(name);
+                                if root.get(&record.key).is_some() || root.to_handler().get_last_edit_idlp(&record.key).is_some() { return None }
+                                prior.checkout(&before_stamp).ok()?;
+                                let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = root.get(&record.key) else { return None };
+                                if row.id() != cached_row.id() || row.get(field).is_some() || row.to_handler().get_last_edit_idlp(field).is_some() { return None }
                             } else {
                                 // Independent seeds may add metadata, but a tombstone is not an absent field.
                                 if remote.contains_key(field) || remote_row.to_handler().get_last_edit_idlp(field).is_some() { return None }
@@ -1694,5 +1737,62 @@ mod tests {
         assert_eq!(entries.len(),101); assert_eq!(ids.len(),101);
         for index in 0..100 { assert!(ids.contains(format!("local-{index}").as_str())); }
         assert!(ids.contains("remote"));
+    }
+
+    #[test]
+    fn unchanged_bootstrap_field_accepts_owner_evolution_without_hiding_competing_edits() {
+        for scenario in ["unchanged", "coalesced", "local edit", "different seed", "resurrection", "missing history"] {
+            let seed = |doc: &LoroDoc, branch: &str| {
+                let row = doc.get_map("chats").insert_container("chat", LoroMap::new()).unwrap();
+                for (key, value) in [("id", "chat"), ("deviceId", "owner"), ("branch", branch)] { row.insert(key, value).unwrap(); }
+                row.insert("archived", false).unwrap();
+                row.insert("createdAt", 1_000i64).unwrap(); doc.commit(); row
+            };
+            let local = WorkspaceDoc::new();
+            let binding = local.binding(); journal(&binding);
+            let local_row = seed(&local.doc(), "comet/draft");
+            if scenario == "local edit" {
+                local_row.insert("branch", "comet/explicit-edit").unwrap(); binding.commit().unwrap();
+                local_row.insert("branch", "comet/draft").unwrap(); binding.commit().unwrap();
+            }
+            local_row.insert("lastSeenAt", 4_000i64).unwrap(); binding.commit().unwrap();
+            let remote = LoroDoc::new(); remote.set_peer_id(1).unwrap();
+            let mut remote_row = seed(&remote, if scenario == "different seed" { "comet/other" } else { "comet/draft" });
+            if scenario == "resurrection" {
+                remote.get_map("chats").delete("chat").unwrap(); remote.commit();
+                remote_row = seed(&remote, "comet/draft");
+            }
+            let remote = if scenario == "missing history" {
+                let copy = LoroDoc::new();
+                copy.import(&remote.export(ExportMode::shallow_snapshot(&remote.state_frontiers())).unwrap()).unwrap();
+                remote_row = match copy.get_map("chats").get("chat").unwrap() {
+                    loro::ValueOrContainer::Container(loro::Container::Map(row)) => row, _ => panic!("missing row"),
+                };
+                copy
+            } else { remote };
+            if scenario != "coalesced" { remote.set_peer_id(2).unwrap(); }
+            remote_row.insert("branch", "comet/owner-renamed").unwrap();
+            remote_row.insert("harnessSessionId", "owner-native-session").unwrap(); remote.commit();
+            let snapshot = local.export_snapshot().unwrap();
+            let intents = binding.pending_records();
+            binding.fail_recovery("previous workspace recovery failure".into());
+            let result = binding.adopt_snapshot(&remote.export(ExportMode::Snapshot).unwrap(), None);
+            if matches!(scenario, "unchanged" | "coalesced") {
+                result.unwrap();
+                let row = row_value(&binding.raw(), "chats", "chat").unwrap();
+                assert_eq!(row["branch"], "comet/owner-renamed");
+                assert_eq!(row["harnessSessionId"], "owner-native-session");
+                assert_eq!(row["lastSeenAt"], 4_000);
+                assert_eq!(binding.pending_records()[0].before, intents[0].before);
+                assert_eq!(binding.pending_records()[0].value, intents[0].value);
+                assert!(binding.recovery_error().is_none());
+                local.set_chat_seen("chat", chrono::DateTime::from_timestamp_millis(5_000).unwrap()).unwrap();
+            } else {
+                assert!(result.is_err(), "{scenario} must retain the conflict");
+                assert_eq!(local.export_snapshot().unwrap(), snapshot);
+                assert_eq!(serde_json::to_vec(&binding.pending_records()).unwrap(), serde_json::to_vec(&intents).unwrap());
+                assert!(binding.recovery_error().is_some());
+            }
+        }
     }
 }
