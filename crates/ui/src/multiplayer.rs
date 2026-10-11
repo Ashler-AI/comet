@@ -58,7 +58,7 @@ pub const fn source_label(
 ) -> &'static str {
     match (source, environment) {
         (AgentSessionSource::Scaffold, _) => "Scaffold",
-        (AgentSessionSource::Local, Some(comet_proto::DeviceEnvironment::Namespace)) => "Devbox",
+        (AgentSessionSource::Local, Some(_)) => "Devbox",
         (AgentSessionSource::Local, None) => "Local",
     }
 }

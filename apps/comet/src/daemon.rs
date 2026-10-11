@@ -40,7 +40,13 @@ const CAPTURED_ENV: &[&str] = &[
     "COMET_CALLBACK_PORT",
     "COMET_HARNESS",
     "COMET_DEVICE_NAME",
-    "NAMESPACE_DEVBOX_ID",
+    "COMET_DEVBOX_PROVIDER",
+    "COMET_DEVBOX_ID",
+    "COMET_DEFAULT_FOLDER",
+    "CHROME_PATH",
+    "PUPPETEER_EXECUTABLE_PATH",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "BROWSER",
     "RUST_LOG",
 ];
 
@@ -67,6 +73,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
             plist.display()
         );
     } else if cfg!(target_os = "linux") {
+        import_boat_identity()?;
         let unit = systemd_unit_path()?;
         std::fs::create_dir_all(unit.parent().expect("systemd user dir"))?;
         std::fs::write(&unit, render_systemd_unit(&exe, &env))?;
@@ -134,6 +141,7 @@ pub fn start() -> anyhow::Result<()> {
         );
         run("launchctl", &["kickstart", &launchd_service_target()?])?;
     } else if cfg!(target_os = "linux") {
+        import_boat_identity()?;
         run("systemctl", &["--user", "start", SYSTEMD_UNIT])?;
     } else {
         bail!("comet daemon is only supported on macOS (launchd) and Linux (systemd)");
@@ -169,6 +177,7 @@ pub fn restart() -> anyhow::Result<()> {
         println!("Restarted.");
         Ok(())
     } else if cfg!(target_os = "linux") {
+        import_boat_identity()?;
         run("systemctl", &["--user", "restart", SYSTEMD_UNIT])?;
         println!("Restarted.");
         Ok(())
@@ -232,6 +241,25 @@ fn captured_env() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Runtime evidence is imported into the live manager, never copied into a unit.
+fn import_boat_identity() -> anyhow::Result<()> {
+    if std::env::var("COMET_DEVBOX_PROVIDER").ok().as_deref() != Some("boat") { return Ok(()) }
+    let configured = std::env::var("COMET_DEVBOX_ID").ok();
+    let native = std::env::var("BOAT_ID").ok();
+    if !cfg!(target_os = "linux") || configured != native
+        || !configured.as_deref().is_some_and(|id| comet_proto::DeviceEnvironment::Boat.valid_devbox_id(id)) {
+        bail!("Boat host identity could not be verified: BOAT_ID must match the valid configured COMET_DEVBOX_ID.");
+    }
+    run("systemctl", &["--user", "import-environment", "BOAT_ID"])
+}
+
+fn rendered_env(env: &[(String, String)]) -> impl Iterator<Item = (&str, &str)> {
+    env.iter()
+        .filter(|(key, _)| CAPTURED_ENV.contains(&key.as_str()))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .chain(std::iter::once(("ASHLER_INCREMENTAL_TSC_CHECKS", "false")))
+}
+
 fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
     // The start limit must actually trip on the "run `comet login` first"
     // fail-fast exit (5 × RestartSec=5 lands inside the 60s window) — otherwise
@@ -240,9 +268,10 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         "[Unit]\nDescription=Crew headless engine\nAfter=network-online.target\n\
          StartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
-    for (key, value) in env {
+    for (key, value) in rendered_env(env) {
         // systemd unquotes the value; escape the characters it treats specially.
-        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        let value = value.replace('\\', "\\\\").replace('"', "\\\"")
+            .replace('\n', "\\n").replace('\r', "\\r").replace('%', "%%");
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
@@ -273,7 +302,7 @@ fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
 
 fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> String {
     let mut env_dict = String::new();
-    for (key, value) in env {
+    for (key, value) in rendered_env(env) {
         env_dict.push_str(&format!(
             "      <key>{}</key><string>{}</string>\n",
             xml_escape(key),
@@ -388,6 +417,32 @@ fn run_quiet(program: &str, args: &[&str]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_rendering_preserves_devbox_runtime_without_secret_tokens() {
+        let env = vec![
+            ("COMET_DEVBOX_PROVIDER".into(), "boat".into()),
+            ("COMET_DEVBOX_ID".into(), "bx_234abcxy".into()),
+            ("COMET_DEFAULT_FOLDER".into(), "/workspaces".into()),
+            ("CHROME_PATH".into(), "/opt/chromium".into()),
+            ("PUPPETEER_EXECUTABLE_PATH".into(), "/opt/chromium".into()),
+            ("PLAYWRIGHT_BROWSERS_PATH".into(), "/opt/browsers".into()),
+            ("PATH".into(), "/usr/bin:/home/u/.local/bin".into()),
+            ("ASHLER_INCREMENTAL_TSC_CHECKS".into(), "true".into()),
+            ("BOAT_TOKEN".into(), "secret-boat-token".into()),
+            ("COMET_RELEASES_AUTHORIZATION".into(), "secret-release-token".into()),
+            ("BOAT_ID".into(), "copied-runtime-id".into()),
+        ];
+        let unit = render_systemd_unit(Path::new("/usr/bin/comet"), &env);
+        let plist = render_launchd_plist(Path::new("/usr/bin/comet"), &env, Path::new("/tmp/daemon.log"));
+        for output in [&unit, &plist] {
+            for value in ["boat", "bx_234abcxy", "/workspaces", "/opt/chromium", "/opt/browsers", "/usr/bin:/home/u/.local/bin"] { assert!(output.contains(value)); }
+            for value in ["secret-boat-token", "secret-release-token", "copied-runtime-id"] { assert!(!output.contains(value)); }
+        }
+        assert!(unit.contains("Environment=\"ASHLER_INCREMENTAL_TSC_CHECKS=false\""));
+        assert!(plist.contains("<key>ASHLER_INCREMENTAL_TSC_CHECKS</key><string>false</string>"));
+        assert!(!unit.contains("ASHLER_INCREMENTAL_TSC_CHECKS=true"));
+    }
 
     #[test]
     fn systemd_unit_shape() {

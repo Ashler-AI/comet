@@ -1,10 +1,11 @@
-//! Explicit Namespace wake, shared across local RPC connections. No background wake.
+//! Explicit provider-bound Devbox wake, shared across local RPC connections.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use comet_proto::{Device, DeviceEnvironment};
@@ -35,21 +36,21 @@ impl DeviceWake {
     pub(crate) async fn wake(
         &self,
         device_id: &str,
+        provider: DeviceEnvironment,
         provider_id: String,
         project_scope: &str,
         links: Arc<LinkCache>,
     ) -> Result<(), String> {
         let target = device_id.to_owned();
         let command = bootstrap_command(project_scope)?;
-        let executable = devbox_executable().ok_or_else(|| {
-            "Namespace CLI not found. Install devbox (including ~/.local/bin/devbox), then run devbox login on this controller.".to_string()
-        })?;
+        let executable = provider_executable(provider)?;
         let boot_executable = executable.clone();
-        let forwards = self.prepare_forwards(executable, &provider_id);
+        let forwards = self.prepare_forwards(executable, provider, &provider_id);
+        let key = format!("{}:{provider_id}:{device_id}", provider_name(provider));
         self.coalesce(
-            device_id,
+            &key,
             async move {
-                run_bootstrap(boot_executable, &provider_id, command).await?;
+                run_bootstrap(boot_executable, provider, &provider_id, command).await?;
                 await_peer(&links, &target).await?;
                 let _ = await_forwards(forwards).await;
                 Ok(())
@@ -59,30 +60,31 @@ impl DeviceWake {
         .await
     }
 
-    pub(crate) async fn ensure_callback_forward(&self, provider_id: String) -> Result<(), String> {
-        let executable = devbox_executable().ok_or_else(|| {
-            "Namespace CLI not found. Install devbox (including ~/.local/bin/devbox), then run devbox login on this controller.".to_string()
-        })?;
-        await_forwards(self.prepare_forwards(executable, &provider_id)).await
+    pub(crate) async fn ensure_callback_forward(&self, provider: DeviceEnvironment, provider_id: String) -> Result<(), String> {
+        let executable = provider_executable(provider)?;
+        await_forwards(self.prepare_forwards(executable, provider, &provider_id)).await
     }
 
-    pub(crate) fn auth_forward_active(&self, provider_id: &str) -> bool {
+    pub(crate) fn auth_forward_active(&self, provider: DeviceEnvironment, provider_id: &str) -> bool {
         self.auth_forward
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_deref()
-            == Some(provider_id)
+            .and_then(|key| key.split_once(':'))
+            == Some((provider_name(provider), provider_id))
     }
     fn prepare_forwards(
         &self,
         executable: PathBuf,
+        provider: DeviceEnvironment,
         provider_id: &str,
     ) -> (Shared<WakeFuture>, Option<Shared<WakeFuture>>) {
-        let auth_key = format!("auth:{provider_id}");
+        let key = provider_key(provider, provider_id);
+        let auth_key = format!("auth:{key}");
         let auth = self.coalesce_forward(
             &auth_key,
             ensure_auth_forward(
                 executable.clone(),
+                provider,
                 provider_id.to_owned(),
                 AUTH_FORWARD_PORTS.to_vec(),
                 AUTH_FORWARD_READY_TIMEOUT,
@@ -95,12 +97,13 @@ impl DeviceWake {
         let services = if service_ports.is_empty() {
             None
         } else {
-            let service_key = format!("services:{provider_id}");
+            let service_key = format!("services:{key}");
             Some(
                 self.coalesce_forward(
                     &service_key,
                     ensure_auth_forward(
                         executable,
+                        provider,
                         provider_id.to_owned(),
                         service_ports,
                         AUTH_FORWARD_READY_TIMEOUT,
@@ -117,8 +120,7 @@ impl DeviceWake {
     fn coalesce(&self, device_id: &str, operation: WakeFuture) -> Shared<WakeFuture> {
         let mut operations = self
             .operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         if let Some(pending) = operations.get(device_id).and_then(WeakShared::upgrade) {
             return pending;
         }
@@ -136,8 +138,7 @@ impl DeviceWake {
     fn coalesce_forward(&self, provider_id: &str, operation: WakeFuture) -> Shared<WakeFuture> {
         let mut operations = self
             .forward_operations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         if let Some(pending) = operations.get(provider_id).and_then(WeakShared::upgrade) {
             return pending;
         }
@@ -163,7 +164,7 @@ async fn await_forwards(
     };
     let (auth, service) = tokio::join!(auth, service);
     if let Err(error) = service {
-        tracing::warn!(error, "Namespace app/Tilt forward unavailable");
+        tracing::warn!(error, "Devbox app/Tilt forward unavailable");
     }
     auth
 }
@@ -179,7 +180,7 @@ fn available_service_ports(ports: &[(u16, u16)]) -> Vec<(u16, u16)> {
         .filter(|(local, remote)| {
             let available = local_port_available(*local);
             if !available {
-                tracing::warn!(local, remote, "Skipping occupied Namespace service forward");
+                tracing::warn!(local, remote, "Skipping occupied Devbox service forward");
             }
             available
         })
@@ -199,8 +200,7 @@ fn forward_port_spec(ports: &[(u16, u16)]) -> String {
 
 fn release_auth_forward(active: &Mutex<Option<String>>, provider_id: &str) {
     let mut forward = active
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock();
     if forward.as_deref() == Some(provider_id) {
         *forward = None;
     }
@@ -221,11 +221,24 @@ struct ForwardProcessGroup {
     child: tokio::process::Child,
     #[cfg(unix)]
     group: Option<u32>,
-    // Release the reservation only after group cleanup, including cancellation.
-    _lease: AuthForwardLease,
 }
 
 impl ForwardProcessGroup {
+    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        command.kill_on_drop(!cfg!(unix));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.as_std_mut().process_group(0);
+        }
+        let child = command.spawn()?;
+        Ok(Self {
+            #[cfg(unix)]
+            group: child.id(),
+            child,
+        })
+    }
+
     fn kill_group(&mut self) {
         #[cfg(unix)]
         if let Some(group) = self.group.take() {
@@ -294,120 +307,128 @@ impl Drop for ForwardProcessGroup {
 
 async fn ensure_auth_forward(
     executable: PathBuf,
+    provider: DeviceEnvironment,
     provider_id: String,
     ports: Vec<(u16, u16)>,
     ready_timeout: Duration,
     lease_duration: Duration,
     active: Arc<Mutex<Option<String>>>,
 ) -> Result<(), String> {
+    if !provider.valid_devbox_id(&provider_id) { return Err("Invalid Devbox ID".into()); }
+    if ports.is_empty() {
+        return Ok(());
+    }
+    let key = provider_key(provider, &provider_id);
     {
         let mut forward = active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock();
         match forward.as_deref() {
-            Some(current) if current == provider_id => return Ok(()),
-            Some(_) => return Err("Another Namespace port forward is already active".into()),
+            Some(current) if current == key => return Ok(()),
+            Some(_) => return Err("Another Devbox port forward is already active".into()),
             None => {}
         }
         if let Some((port, _)) = ports.iter().find(|(port, _)| !local_port_available(*port)) {
-            return Err(format!("Namespace forward port {port} is already in use"));
+            return Err(format!("Devbox forward port {port} is already in use"));
         }
-        *forward = Some(provider_id.clone());
+        *forward = Some(key.clone());
     }
     let lease = AuthForwardLease {
         active: active.clone(),
-        provider_id: provider_id.clone(),
+        provider_id: key,
     };
-    let port_spec = forward_port_spec(&ports);
-    let mut command = Command::new(executable);
-    command
-        .args(["port-forward", &provider_id, "--ports", &port_spec])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(!cfg!(unix));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().process_group(0);
+    let mapping_size = if provider == DeviceEnvironment::Boat { 1 } else { ports.len() };
+    let mut processes = Vec::with_capacity(ports.len() / mapping_size);
+    for mapping in ports.chunks(mapping_size) {
+        let mut command = Command::new(&executable);
+        if provider == DeviceEnvironment::Boat {
+            let (local, remote) = mapping[0];
+            command.args(["--no-update", "--json", "forward", &provider_id, "--remote", &remote.to_string(), "--local", &local.to_string(), "--bind", "127.0.0.1"]);
+        } else {
+            command.args(["port-forward", &provider_id, "--ports", &forward_port_spec(mapping)]);
+        }
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        processes.push(ForwardProcessGroup::spawn(&mut command)
+            .map_err(|_| "Could not start Devbox port forward".to_string())?);
     }
-    let child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Namespace port forward: {error}"))?;
-    let mut process = ForwardProcessGroup {
-        #[cfg(unix)]
-        group: child.id(),
-        child,
-        _lease: lease,
-    };
     let ready = tokio::time::timeout(ready_timeout, async {
         loop {
-            if process.has_exited().map_err(|error| error.to_string())? {
-                return Err("Namespace port forward exited early".into());
+            for process in &mut processes {
+                if process.has_exited().map_err(|_| "Could not observe Devbox port forward".to_string())? {
+                    return Err("Devbox port forward exited early".into());
+                }
             }
-            if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, ports[0].0))
-                .await
-                .is_ok()
-            {
-                return Ok(());
+            let mut ready = true;
+            for (local, _) in &ports {
+                ready &= tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, *local)).await.is_ok();
             }
+            if ready { return Ok(()); }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .unwrap_or_else(|_| {
-        Err("Namespace port forward did not become ready within 10 seconds".to_string())
+        Err("Devbox port forward did not become ready within 10 seconds".to_string())
     });
     if let Err(error) = ready {
-        process.stop().await;
+        for process in &mut processes { process.stop().await; }
         return Err(error);
     }
     let expires_at = tokio::time::Instant::now() + lease_duration;
     tokio::spawn(async move {
-        tokio::select! {
-            _ = tokio::time::sleep_until(expires_at) => {}
-            _ = process.wait_for_exit() => {}
-        }
-        process.stop().await;
+        let _lease = lease;
+        let _ = tokio::time::timeout_at(expires_at, async {
+            loop {
+                if processes.iter_mut().any(|process| process.has_exited().unwrap_or(true)) { break; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }).await;
+        for process in &mut processes { process.stop().await; }
     });
     Ok(())
 }
-pub(crate) fn valid_devbox_id(id: &str) -> bool {
-    // Namespace immutable IDs are 13 lowercase alphanumeric characters, not names.
-    id.len() == 13
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+fn provider_name(provider: DeviceEnvironment) -> &'static str {
+    match provider {
+        DeviceEnvironment::Namespace => "namespace",
+        DeviceEnvironment::Boat => "boat",
+    }
 }
 
-pub(crate) fn bound_devbox_id<'a>(device: &'a Device, local_id: &str) -> Result<&'a str, String> {
-    if device.id == local_id || device.environment != Some(DeviceEnvironment::Namespace) {
-        return Err("Only a remote Namespace Devbox can be controlled".into());
+fn provider_key(provider: DeviceEnvironment, id: &str) -> String {
+    format!("{}:{id}", provider_name(provider))
+}
+
+pub(crate) fn bound_devbox_id<'a>(device: &'a Device, local_id: &str) -> Result<(DeviceEnvironment, &'a str), String> {
+    if device.id == local_id {
+        return Err("Only a remote Devbox can be controlled".into());
     }
-    device.namespace_devbox_id.as_deref().filter(|id| valid_devbox_id(id)).ok_or_else(|| {
-        "This device has no valid Namespace Devbox ID. Reconfigure its Crew launcher with NAMESPACE_DEVBOX_ID and register it again; the display name cannot be used.".into()
+    device.devbox_binding().ok_or_else(|| {
+        "This device has no valid Devbox binding. Reconfigure its Crew launcher with COMET_DEVBOX_PROVIDER and COMET_DEVBOX_ID and register it again; the display name cannot be used.".into()
     })
 }
 
-fn devbox_executable() -> Option<PathBuf> {
-    let executable = if cfg!(windows) {
-        "devbox.exe"
-    } else {
-        "devbox"
+fn provider_executable(provider: DeviceEnvironment) -> Result<PathBuf, String> {
+    let name = match provider {
+        DeviceEnvironment::Namespace => "devbox",
+        DeviceEnvironment::Boat => "boat",
     };
+    cli_executable(name).ok_or_else(|| format!("{name} CLI not found. Install it (including ~/.local/bin/{name}) and run {name} login on this controller."))
+}
+
+fn cli_executable(name: &str) -> Option<PathBuf> {
+    let executable = if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() };
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
                 .filter(|dir| dir.is_absolute())
-                .map(|dir| dir.join(executable))
+                .map(|dir| dir.join(&executable))
                 .collect()
         })
         .unwrap_or_default();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local/bin").join(executable));
+        candidates.push(home.join(".local/bin").join(&executable));
     }
     candidates.extend(
-        ["/opt/homebrew/bin", "/usr/local/bin"].map(|dir| PathBuf::from(dir).join(executable)),
+        ["/opt/homebrew/bin", "/usr/local/bin"].map(|dir| PathBuf::from(dir).join(&executable)),
     );
     candidates.into_iter().find(|path| {
         let Ok(metadata) = path.metadata() else {
@@ -451,26 +472,103 @@ fn bootstrap_command(project_scope: &str) -> Result<&'static str, String> {
     }
 }
 
+async fn run_cli(executable: &std::path::Path, args: &[&str]) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    let mut command = Command::new(executable);
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut process = ForwardProcessGroup::spawn(&mut command)
+        .map_err(|_| "Could not start Devbox CLI".to_string())?;
+    let stdout = process.child.stdout.take().expect("piped stdout");
+    let stderr = process.child.stderr.take().expect("piped stderr");
+    tokio::try_join!(async {
+        process.wait_for_exit().await?;
+        process.kill_group();
+        process.child.wait().await
+    }, capture_bounded(stdout), capture_bounded(stderr))
+        .map_err(|_| "Could not read Devbox CLI result".to_string())
+}
+
+fn boat_wake_action(output: &[u8], id: &str) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|_| "Boat returned an invalid machine status".to_string())?;
+    let sandbox = value.get("sandbox").unwrap_or(&value);
+    if value.get("ok") == Some(&serde_json::Value::Bool(false)) || sandbox.get("id").and_then(serde_json::Value::as_str) != Some(id) {
+        return Err("Boat did not confirm the registered immutable Devbox ID; Crew will not control another machine".into());
+    }
+    match sandbox.get("state").and_then(serde_json::Value::as_str) {
+        Some("stopped" | "archived") => Ok(true),
+        Some("ready" | "idle" | "running" | "restoring" | "provisioning" | "provisioned" | "cloning" | "init") => Ok(false),
+        Some("archiving" | "stopping") => Err("Boat is still saving this Devbox. Wait until it is archived, then retry Wake Device; Crew will not interrupt its snapshot".into()),
+        _ => Err("Boat cannot start this Devbox in its current state. Inspect it with boat info; Crew will not recover, replace, or recreate it".into()),
+    }
+}
+
+fn boat_starting(output: &[u8]) -> bool {
+    let Some(line) = output.split(|byte| *byte == b'\n').rfind(|line| !line.iter().all(u8::is_ascii_whitespace)) else { return false; };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else { return false; };
+    if value.get("event").and_then(serde_json::Value::as_str) != Some("error") { return false; }
+    match value.get("code").and_then(serde_json::Value::as_str) {
+        Some("boat_starting" | "sandbox_starting") => true,
+        Some("sandbox_direct_failed") => {
+            value.get("error").and_then(serde_json::Value::as_str) == Some("sandbox_restoring") ||
+            (value.pointer("/error/details/retryable").and_then(serde_json::Value::as_bool) == Some(true) &&
+             value.pointer("/error/details/message").and_then(serde_json::Value::as_str) == Some("sandbox_restoring"))
+        }
+        _ => false,
+    }
+}
+
+fn boat_failure(stdout: &[u8], stderr: &[u8]) -> String {
+    // Never return provider output: auth URLs, environment values and command logs
+    // are private to this controller, including structured JSON error messages.
+    let output = format!("{}\n{}", String::from_utf8_lossy(stdout), String::from_utf8_lossy(stderr)).to_ascii_lowercase();
+    if ["unauthorized", "unauthenticated", "login", "credential", "permission denied"].iter().any(|word| output.contains(word)) {
+        "Boat authentication failed. Run boat login on this controller and verify access to this Devbox.".into()
+    } else if ["billing_required", "limit_reached", "rate_limited", "trial_machine_class_not_allowed", "org_suspended"].iter().any(|word| output.contains(word)) {
+        "Boat refused this operation because of billing, usage limits, or account permissions. Check the controller's Boat account before retrying.".into()
+    } else if ["not_found", "not found", "does not exist"].iter().any(|word| output.contains(word)) && !output.contains("crew-devbox-autostart") {
+        "Boat could not find this Devbox. Verify its registered immutable ID; Crew will not create a replacement.".into()
+    } else {
+        "Boat could not start Crew. Check boat info and the existing ~/.local/bin/crew-devbox-autostart helper; Crew will not power-cycle or replace this machine.".into()
+    }
+}
+
+pub(crate) async fn run_boat_extend(id: &str, cancel: &tokio_util::sync::CancellationToken) -> Result<(), String> {
+    if !DeviceEnvironment::Boat.valid_devbox_id(id) { return Err("Invalid Boat Devbox ID".into()); }
+    let executable = provider_executable(DeviceEnvironment::Boat)?;
+    let args = ["--no-update", "--json", "extend", id, "--ttl", "3600"];
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("Boat lease renewal cancelled".into()),
+        result = tokio::time::timeout(Duration::from_secs(30), run_cli(&executable, &args)) => {
+            let (status, stdout, stderr) = result.map_err(|_| "Boat lease renewal timed out after 30 seconds".to_string())??;
+            if status.success() { Ok(()) } else { Err(boat_failure(&stdout, &stderr)) }
+        }
+    }
+}
+
 async fn run_bootstrap(
     executable: PathBuf,
+    provider: DeviceEnvironment,
     provider_id: &str,
     command: &'static str,
 ) -> Result<(), String> {
-    let mut child = Command::new(executable)
-        .args(["exec", provider_id, "--", "sh", "-c", command])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("Could not start Namespace devbox CLI: {error}"))?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (status, stdout, stderr) = tokio::time::timeout(BOOT_TIMEOUT, async {
-        tokio::try_join!(child.wait(), capture_bounded(stdout), capture_bounded(stderr))
-    }).await.map_err(|_| {
-        "Namespace startup timed out after 110 seconds. Check devbox login and the machine's status, then retry.".to_string()
-    })?.map_err(|error| format!("Could not read Namespace startup result: {error}"))?;
+    tokio::time::timeout(BOOT_TIMEOUT, async {
+        if !provider.valid_devbox_id(provider_id) { return Err("Invalid Devbox ID".into()); }
+        if provider == DeviceEnvironment::Boat {
+            let (status, stdout, stderr) = run_cli(&executable, &["--no-update", "--json", "info", provider_id]).await?;
+            if !status.success() { return Err(boat_failure(&stdout, &stderr)); }
+            if boat_wake_action(&stdout, provider_id)? {
+                let (status, stdout, stderr) = run_cli(&executable, &["--no-update", "--json", "resume", provider_id, "--ttl", "3600"]).await?;
+                if !status.success() { return Err(boat_failure(&stdout, &stderr)); }
+            }
+            loop {
+                let (status, stdout, stderr) = run_cli(&executable, &["--no-update", "--json", "exec", provider_id, command]).await?;
+                if status.success() { return Ok(()); }
+                if !boat_starting(&stdout) { return Err(boat_failure(&stdout, &stderr)); }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        let (status, stdout, stderr) = run_cli(&executable, &["exec", provider_id, "--", "sh", "-c", command]).await?;
     if status.success() {
         return Ok(());
     }
@@ -508,7 +606,8 @@ async fn run_bootstrap(
     } else {
         "Namespace could not boot Crew. Check the Devbox in Namespace and run its existing crew-devbox-autostart helper to inspect the failure."
     };
-    Err(format!("{action} (CLI {status})"))
+        Err(format!("{action} (CLI {status})"))
+    }).await.map_err(|_| "Devbox startup timed out after 110 seconds. Check provider login and this machine's status, then retry; Crew will not create a replacement.".to_string())?
 }
 
 async fn await_peer(links: &Arc<LinkCache>, device_id: &str) -> Result<(), String> {
@@ -534,6 +633,157 @@ async fn await_peer(links: &Arc<LinkCache>, device_id: &str) -> Result<(), Strin
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ponytail: serialize OS listener fixtures; inherit bound sockets if parallel startup matters.
+    static LISTENER_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn boat_state_requires_exact_identity_and_known_lifecycle() {
+        let id = "bx_f7k2q9hd";
+        for state in ["ready", "idle", "running", "restoring", "provisioning", "provisioned", "cloning"] {
+            let output = serde_json::to_vec(&serde_json::json!({"ok": true, "sandbox": {"id": id, "state": state}})).unwrap();
+            assert!(!boat_wake_action(&output, id).unwrap());
+        }
+        for state in ["stopped", "archived"] {
+            let output = serde_json::to_vec(&serde_json::json!({"ok": true, "sandbox": {"id": id, "state": state}})).unwrap();
+            assert!(boat_wake_action(&output, id).unwrap());
+        }
+        for state in ["archiving", "stopping", "error", "deleted", "unknown"] {
+            let output = serde_json::to_vec(&serde_json::json!({"ok": true, "sandbox": {"id": id, "state": state}})).unwrap();
+            assert!(boat_wake_action(&output, id).is_err());
+        }
+        for output in [br#"{"id":"bx_22222222","state":"archived"}"#.as_slice(), br#"{"state":"ready"}"#, b"not json"] {
+            assert!(boat_wake_action(output, id).is_err());
+        }
+    }
+
+    #[test]
+    fn boat_exec_retries_only_when_command_did_not_run() {
+        assert!(boat_starting(br#"{"event":"error","code":"sandbox_starting"}"#));
+        assert!(boat_starting(br#"{"event":"error","code":"sandbox_direct_failed","error":"sandbox_restoring"}"#));
+        assert!(boat_starting(br#"{"event":"error","code":"sandbox_direct_failed","error":{"details":{"retryable":true,"message":"sandbox_restoring"}}}"#));
+        assert!(!boat_starting(b"{\"event\":\"error\",\"code\":\"sandbox_starting\"}\n{\"event\":\"error\",\"code\":\"unauthorized\"}\n"));
+        assert!(!boat_starting(br#"{"event":"error","code":"sandbox_direct_failed","error":{"details":{"retryable":false,"message":"sandbox_restoring"}}}"#));
+        for output in [br#"{"event":"error","code":"sandbox_direct_failed","error":"command timed out"}"#.as_slice(), br#"{"event":"error","code":"unauthorized","error":"sandbox_starting https://secret"}"#, b"sandbox_starting"] {
+            assert!(!boat_starting(output));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_keys_do_not_coalesce_same_opaque_id() {
+        let wake = DeviceWake::default();
+        let namespace = provider_key(DeviceEnvironment::Namespace, "same");
+        let boat = provider_key(DeviceEnvironment::Boat, "same");
+        let first = wake.coalesce(&namespace, async { Err("namespace".into()) }.boxed());
+        let second = wake.coalesce(&boat, async { Err("boat".into()) }.boxed());
+        assert_eq!(first.await, Err("namespace".into()));
+        assert_eq!(second.await, Err("boat".into()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn last_boot_waiter_cancellation_kills_descendant_listener() {
+        let _fixture = LISTENER_FIXTURES.lock().await;
+        let port = unused_port();
+        let temp = tempfile::tempdir().unwrap();
+        let executable = write_forward_executable(temp.path(), &format!(
+            "#!/bin/sh\nCOMET_TEST_AUTH_FORWARD_PORT='{port}' '{}' --exact device_wake::tests::auth_forward_child --nocapture &\nwait\n",
+            std::env::current_exe().unwrap().display()
+        ));
+        let wake = DeviceWake::default();
+        let mut first = wake.coalesce("boat:boot", async move {
+            run_cli(&executable, &[]).await.map(|_| ())
+        }.boxed());
+        let second = wake.coalesce("boat:boot", async { panic!("duplicate boot") }.boxed());
+        let ports = [port];
+        tokio::select! {
+            result = &mut first => panic!("boot exited before cancellation: {result:?}"),
+            _ = wait_for_listener_ports(&ports, true) => {}
+        }
+        drop(first);
+        wait_for_listener_ports(&[port], true).await;
+        drop(second);
+        wait_for_listener_ports(&[port], false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boat_forward_mappings_are_separate_and_all_expire() {
+        let _fixture = LISTENER_FIXTURES.lock().await;
+        let reserved = [
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        ];
+        let ports = reserved.each_ref().map(|listener| listener.local_addr().unwrap().port());
+        drop(reserved);
+        let temp = tempfile::tempdir().unwrap();
+        // Each invocation holds only its own --local listener. A combined-mapping
+        // invocation cannot satisfy both readiness checks.
+        let executable = write_forward_executable(temp.path(), &format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n if [ \"$1\" = --local ]; then shift; port=$1; fi\n shift\ndone\nCOMET_TEST_AUTH_FORWARD_PORT=\"$port\" exec '{}' --exact device_wake::tests::auth_forward_child --nocapture\n",
+            std::env::current_exe().unwrap().display()
+        ));
+        let active = Arc::new(Mutex::new(None));
+        ensure_auth_forward(executable, DeviceEnvironment::Boat, "bx_f7k2q9hd".into(),
+            vec![(ports[0], 3000), (ports[1], 10_350)], Duration::from_secs(2), AUTH_FORWARD_TIMEOUT, active.clone()).await.unwrap();
+        wait_for_listener_ports(&ports, true).await;
+        assert_eq!(active.lock().as_deref(), Some("boat:bx_f7k2q9hd"));
+        tokio::time::pause();
+        tokio::time::advance(AUTH_FORWARD_TIMEOUT).await;
+        tokio::time::resume();
+        wait_for_listener_ports(&ports, false).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if active.lock().is_none() { return; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("forward reservation was not released");
+    }
+
+    #[tokio::test]
+    async fn occupied_boat_auth_port_fails_closed_without_provider_cli() {
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let active = Arc::new(Mutex::new(None));
+        let error = ensure_auth_forward(PathBuf::from("/missing/boat"), DeviceEnvironment::Boat,
+            "bx_f7k2q9hd".into(), vec![(occupied.local_addr().unwrap().port(), 8085)],
+            Duration::from_secs(1), AUTH_FORWARD_TIMEOUT, active.clone()).await.unwrap_err();
+        assert!(error.contains("already in use"));
+        assert!(active.lock().is_none());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_listener_ports(ports: &[u16], active: bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut ready = true;
+                for port in ports {
+                    ready &= tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, *port)).await.is_ok() == active;
+                }
+                if ready { return; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("listener lifecycle did not converge");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boat_wake_resumes_only_archived_machine_and_checks_existing_helper() {
+        for state in ["running", "archived", "archiving", "error"] {
+            let temp = tempfile::tempdir().unwrap();
+            let resumed = temp.path().join("resumed");
+            let helper = temp.path().join("helper");
+            let info = serde_json::json!({"ok":true,"sandbox":{"id":"bx_f7k2q9hd","state":state}});
+            let executable = write_forward_executable(temp.path(), &format!(
+                "#!/bin/sh\ncase \"$3\" in\ninfo) printf '%s' '{info}';;\nresume) [ '{state}' = archived ] || exit 91; touch '{}';;\nexec) if [ '{state}' = archived ]; then [ -f '{}' ] || exit 92; fi; touch '{}';;\n*) exit 93;;\nesac\n",
+                resumed.display(), resumed.display(), helper.display()
+            ));
+            let result = run_bootstrap(executable, DeviceEnvironment::Boat, "bx_f7k2q9hd",
+                bootstrap_command("ashler-staging").unwrap()).await;
+            assert_eq!(result.is_ok(), matches!(state, "running" | "archived"));
+            assert_eq!(resumed.exists(), state == "archived");
+            assert_eq!(helper.exists(), matches!(state, "running" | "archived"));
+        }
+    }
 
     fn unused_port() -> u16 {
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -564,7 +814,7 @@ mod tests {
     ) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let mut matches = wake.auth_forward_active(provider_id) == active;
+                let mut matches = wake.auth_forward_active(DeviceEnvironment::Namespace, provider_id) == active;
                 for port in ports {
                     matches &= tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, *port))
                         .await
@@ -641,15 +891,15 @@ mod tests {
     }
 
     #[test]
-    fn wake_requires_bound_remote_namespace_id() {
+    fn wake_requires_bound_remote_provider_id() {
         let mut device: Device = serde_json::from_value(serde_json::json!({
             "id": "remote", "name": "Owner Devbox", "platform": "linux", "lastSeenAt": null
         }))
         .unwrap();
-        device.namespace_devbox_id = Some("ofpf7g22n4412".into());
+        device.devbox_id = Some("ofpf7g22n4412".into());
         assert!(bound_devbox_id(&device, "local").is_err());
-        device.environment = Some(DeviceEnvironment::Namespace);
-        assert_eq!(bound_devbox_id(&device, "local").unwrap(), "ofpf7g22n4412");
+        device.devbox_provider = Some(DeviceEnvironment::Namespace);
+        assert_eq!(bound_devbox_id(&device, "local").unwrap(), (DeviceEnvironment::Namespace, "ofpf7g22n4412"));
         assert!(bound_devbox_id(&device, "remote").is_err());
         for invalid in [
             None,
@@ -660,9 +910,16 @@ mod tests {
             Some("/ofpf7g22n4412"),
             Some(" ofpf7g22n4412"),
         ] {
-            device.namespace_devbox_id = invalid.map(str::to_owned);
+            device.devbox_id = invalid.map(str::to_owned);
             assert!(bound_devbox_id(&device, "local").is_err());
         }
+        device.devbox_provider = Some(DeviceEnvironment::Boat);
+        device.devbox_id = Some("bx_f7k2q9hd".into());
+        assert_eq!(bound_devbox_id(&device, "local").unwrap(), (DeviceEnvironment::Boat, "bx_f7k2q9hd"));
+        assert!(bound_devbox_id(&device, "remote").is_err());
+        device.devbox_id = Some("ofpf7g22n4412".into());
+        assert!(bound_devbox_id(&device, "local").is_err());
+
     }
 
     #[test]
@@ -680,14 +937,6 @@ mod tests {
         assert!(bootstrap_command("other").is_err());
     }
 
-    #[test]
-    fn default_forward_ports_are_split_by_lifecycle() {
-        assert_eq!(forward_port_spec(AUTH_FORWARD_PORTS), "8085:8085");
-        assert_eq!(
-            forward_port_spec(SERVICE_FORWARD_PORTS),
-            "13000:3000,20350:10350"
-        );
-    }
 
     #[tokio::test]
     async fn failed_callback_tunnel_can_retry() {
@@ -695,6 +944,7 @@ mod tests {
         let provider_id = "ofpf7g22n4412";
         let result = ensure_auth_forward(
             PathBuf::from("/definitely/missing/devbox"),
+            DeviceEnvironment::Namespace,
             provider_id.into(),
             vec![(unused_port(), 8085)],
             Duration::from_millis(100),
@@ -703,7 +953,7 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert!(!wake.auth_forward_active(provider_id));
+        assert!(!wake.auth_forward_active(DeviceEnvironment::Namespace, provider_id));
     }
 
     #[tokio::test]
@@ -712,6 +962,7 @@ mod tests {
         let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let result = ensure_auth_forward(
             PathBuf::from("/definitely/missing/devbox"),
+            DeviceEnvironment::Namespace,
             "ofpf7g22n4412".into(),
             vec![(occupied.local_addr().unwrap().port(), 8085)],
             Duration::from_millis(100),
@@ -720,11 +971,12 @@ mod tests {
         )
         .await;
         assert!(result.unwrap_err().contains("already in use"));
-        assert!(!wake.auth_forward_active("ofpf7g22n4412"));
+        assert!(!wake.auth_forward_active(DeviceEnvironment::Namespace, "ofpf7g22n4412"));
 
-        *wake.auth_forward.lock().unwrap() = Some("another-device".into());
+        *wake.auth_forward.lock() = Some("another-device".into());
         let result = ensure_auth_forward(
             PathBuf::from("/definitely/missing/devbox"),
+            DeviceEnvironment::Namespace,
             "ofpf7g22n4412".into(),
             vec![(unused_port(), 8085)],
             Duration::from_millis(100),
@@ -732,9 +984,9 @@ mod tests {
             wake.auth_forward.clone(),
         )
         .await;
-        assert!(result.unwrap_err().contains("Another Namespace"));
+        assert!(result.unwrap_err().contains("Another Devbox"));
         assert_eq!(
-            wake.auth_forward.lock().unwrap().as_deref(),
+            wake.auth_forward.lock().as_deref(),
             Some("another-device")
         );
     }
@@ -755,6 +1007,7 @@ mod tests {
         let port = unused_port();
         let result = ensure_auth_forward(
             executable,
+            DeviceEnvironment::Namespace,
             provider_id.into(),
             vec![(port, 8085)],
             Duration::from_millis(100),
@@ -763,12 +1016,13 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert!(!wake.auth_forward_active(provider_id));
+        assert!(!wake.auth_forward_active(DeviceEnvironment::Namespace, provider_id));
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelling_readiness_releases_callback_lease() {
+        let _fixture = LISTENER_FIXTURES.lock().await;
         let callback_port = unused_port();
         let temp = tempfile::tempdir().unwrap();
         let executable = write_forward_executable(
@@ -784,6 +1038,7 @@ mod tests {
             provider_id,
             ensure_auth_forward(
                 executable,
+                DeviceEnvironment::Namespace,
                 provider_id.into(),
                 // Keep readiness pending while a descendant holds a listener.
                 vec![(0, 8085)],
@@ -830,6 +1085,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn callback_tunnel_becomes_ready_and_is_coalesced() {
+        let _fixture = LISTENER_FIXTURES.lock().await;
         let callback_port = unused_port();
         let temp = tempfile::tempdir().unwrap();
         let executable = write_forward_executable(
@@ -844,6 +1100,7 @@ mod tests {
         let provider_id = "ofpf7g22n4412";
         ensure_auth_forward(
             executable.clone(),
+            DeviceEnvironment::Namespace,
             provider_id.into(),
             vec![(callback_port, 8085)],
             Duration::from_secs(2),
@@ -854,9 +1111,10 @@ mod tests {
         .unwrap();
         // Real subprocess startup cannot use paused time; control only expiry.
         tokio::time::pause();
-        assert!(wake.auth_forward_active(provider_id));
+        assert!(wake.auth_forward_active(DeviceEnvironment::Namespace, provider_id));
         ensure_auth_forward(
             executable,
+            DeviceEnvironment::Namespace,
             provider_id.into(),
             vec![(callback_port, 8085)],
             Duration::from_secs(2),
@@ -873,6 +1131,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn callback_tunnel_lease_kills_spawned_process_group() {
+        let _fixture = LISTENER_FIXTURES.lock().await;
         let reserved = [
             std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
             std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap(),
@@ -893,6 +1152,7 @@ mod tests {
         let provider_id = "ofpf7g22n4412";
         ensure_auth_forward(
             executable,
+            DeviceEnvironment::Namespace,
             provider_id.into(),
             vec![(ports[0], 8085), (ports[1], 8086)],
             Duration::from_secs(2),
@@ -911,6 +1171,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn callback_tunnel_leader_exit_kills_spawned_process_group() {
+        let _fixture = LISTENER_FIXTURES.lock().await;
         let callback_port = unused_port();
         let temp = tempfile::tempdir().unwrap();
         let exit_marker = temp.path().join("exit");
@@ -925,6 +1186,7 @@ mod tests {
         let provider_id = "ofpf7g22n4412";
         ensure_auth_forward(
             executable,
+            DeviceEnvironment::Namespace,
             provider_id.into(),
             vec![(callback_port, 8085)],
             Duration::from_secs(2),

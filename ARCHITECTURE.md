@@ -130,7 +130,7 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    device+folder pair, the app's unit of organization; the owning device's SpacesSync stamps git
    presence so branch pickers / the diff sidebar gate on a synced bool, no RPC), chats index
    (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt,
-   lastMessagePreview/At, config), devices registry (id, name, platform, environment?, lastSeenAt), session
+   lastMessagePreview/At, config), devices registry (id, name, platform, devboxProvider?, devboxId?, lastSeenAt), session
    status rows (Working indicator; staleness-checked client-side so a crashed backend never shows
    eternal "Working"), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
    behind the "completed (unseen)" indicator. Lives in its own DO room (same SessionRoom DO
@@ -139,9 +139,12 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    writes only its own device/session/chat rows and the git stamps of spaces it owns;
    creates/renames/archives/seen-marks are LWW map sets from any device. `deleteSpace` cascades:
    the space row and every chat/session row in it tombstone in one commit.
-   Optional device `environment: "namespace"` identifies a Namespace Devbox for presentation;
-   the host detects Linux `/.namespace/tasks`. Missing metadata remains Local, OS `platform`
-   stays unchanged, and this field never grants execution authority.
+   Optional `devboxProvider: "namespace" | "boat"` and immutable `devboxId` identify
+   a devbox independently of OS and execution authority. Namespace uses its Linux
+   task directory; Boat must match the configured ID to current native `BOAT_ID`.
+   Legacy Namespace fields migrate once; neutral fields keep older readers compatible.
+   Missing provider data remains Local. Only the local authenticated controller may
+   dispatch a provider wake, and the exact Crew peer must confirm readiness.
    If workspace heartbeats stop, the engine verifies stale devices against their device-relay
    status in parallel. Each positive result immediately refreshes the device watch; historical
    devices with slow or failed status requests cannot delay an active host's online badge.

@@ -236,6 +236,7 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
         context: AssemblyContext<'_>,
     ) -> Result<Self, EngineError> {
+        verified_devbox_environment()?;
         std::fs::create_dir_all(data_dir)?;
         // Single-instance guard: two engines on one data dir would race the
         // SQLite snapshots + journals. Taken before any store opens or the IPC
@@ -906,6 +907,40 @@ pub(crate) fn namespace_devbox() -> bool {
     cfg!(target_os = "linux") && std::path::Path::new("/.namespace/tasks").is_dir()
 }
 
+pub(crate) fn devbox_environment() -> Option<comet_proto::DeviceEnvironment> {
+    verified_devbox_environment().ok().flatten()
+}
+
+pub(crate) fn verified_devbox_environment() -> Result<Option<comet_proto::DeviceEnvironment>, EngineError> {
+    detect_devbox_environment(
+        cfg!(target_os = "linux"), namespace_devbox(),
+        std::env::var("COMET_DEVBOX_PROVIDER").ok().as_deref(),
+        std::env::var("COMET_DEVBOX_ID").ok().as_deref(),
+        std::env::var("BOAT_ID").ok().as_deref(),
+    )
+}
+
+fn detect_devbox_environment(
+    linux: bool, namespace_marker: bool, provider: Option<&str>,
+    configured_id: Option<&str>, boat_id: Option<&str>,
+) -> Result<Option<comet_proto::DeviceEnvironment>, EngineError> {
+    use comet_proto::DeviceEnvironment::{Boat, Namespace};
+    if linux && boat_id.is_some() && provider != Some("boat") {
+        return Err(EngineError::Other("Configure this Boat with COMET_DEVBOX_PROVIDER=boat and its current COMET_DEVBOX_ID before starting Crew.".into()));
+    }
+    match provider {
+        Some("namespace") if linux && namespace_marker
+            && configured_id.is_some_and(|id| Namespace.valid_devbox_id(id)) => Ok(Some(Namespace)),
+        Some("namespace") => Err(EngineError::Other("Namespace host identity could not be verified: use its Linux task directory and valid configured COMET_DEVBOX_ID.".into())),
+        None if linux && namespace_marker => Ok(Some(Namespace)),
+        Some("boat") if linux && configured_id == boat_id
+            && configured_id.is_some_and(|id| Boat.valid_devbox_id(id)) => Ok(Some(Boat)),
+        Some("boat") => Err(EngineError::Other("Boat host identity could not be verified: Linux BOAT_ID must match the valid configured COMET_DEVBOX_ID; launch Crew from this Boat's native runtime.".into())),
+        Some(_) => Err(EngineError::Other("COMET_DEVBOX_PROVIDER must be namespace or boat.".into())),
+        None => Ok(None),
+    }
+}
+
 /// Best-effort human name for this device's registry row (hostname).
 fn local_device_name() -> String {
     std::env::var("COMET_DEVICE_NAME")
@@ -1033,6 +1068,33 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devbox_detection_requires_native_provider_identity() {
+        use comet_proto::DeviceEnvironment::{Boat, Namespace};
+        assert_eq!(detect_devbox_environment(true, true, Some("namespace"), Some("ofpf7g22n4412"), None).unwrap(), Some(Namespace));
+        assert_eq!(detect_devbox_environment(true, true, None, None, None).unwrap(), Some(Namespace));
+        assert_eq!(detect_devbox_environment(true, false, Some("boat"), Some("bx_234abcxy"), Some("bx_234abcxy")).unwrap(), Some(Boat));
+        for (linux, configured, actual) in [
+            (false, Some("bx_234abcxy"), Some("bx_234abcxy")),
+            (true, Some("bx_234abcxy"), None),
+            (true, Some("bx_234abcxy"), Some("bx_234abcxz")),
+            (true, Some("bx_234abcx0"), Some("bx_234abcx0")),
+            (true, None, Some("bx_234abcxy")),
+        ] {
+            assert!(detect_devbox_environment(linux, false, Some("boat"), configured, actual).is_err());
+        }
+        assert_eq!(detect_devbox_environment(true, false, None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_or_unconfigured_devbox_cannot_disable_sleep_protection() {
+        let boat = Some("bx_234abcxy");
+        assert!(detect_devbox_environment(true, false, None, boat, boat).is_err());
+        assert!(detect_devbox_environment(true, false, Some("boatl"), boat, boat).is_err());
+        assert!(detect_devbox_environment(true, false, Some("namespace"), Some("ofpf7g22n4412"), boat).is_err());
+        assert!(detect_devbox_environment(true, true, Some("namespace"), Some("invalid"), None).is_err());
+    }
 
     fn bootstrap(sandbox_id: &str, lifecycle_epoch: u64) -> DeviceBootstrapConfig {
         DeviceBootstrapConfig {

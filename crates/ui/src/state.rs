@@ -2670,7 +2670,7 @@ impl AppState {
         self.devices
             .iter()
             .find(|d| d.id == device_id)
-            .and_then(|d| d.environment)
+            .and_then(|d| d.devbox_provider)
     }
 
     /// Host-presence check: is this device's 15s presence heartbeat fresh?

@@ -5415,11 +5415,7 @@ impl Composer {
             })?;
         let device = state.devices.iter().find(|device| device.id == device_id)?;
         if state.local_device_id.as_deref() == Some(device_id.as_str())
-            || device.environment != Some(comet_proto::DeviceEnvironment::Namespace)
-            || !device
-                .namespace_devbox_id
-                .as_deref()
-                .is_some_and(|id| !id.trim().is_empty())
+            || device.devbox_binding().is_none()
         {
             return None;
         }
@@ -8275,8 +8271,8 @@ mod tests {
             state.local_device_id = Some("local".into());
             state.devices = vec![comet_proto::Device {
                 id: "devbox".into(), name: "Devbox".into(), platform: "linux".into(),
-                environment: Some(comet_proto::DeviceEnvironment::Namespace),
-                namespace_devbox_id: Some("immutable-id".into()), last_seen_at: None,
+                devbox_provider: Some(comet_proto::DeviceEnvironment::Namespace),
+                devbox_id: Some("ofpf7g22n4412".into()), last_seen_at: None,
                 created_at: None, version: None,
             }];
             state.apply_chats(vec![serde_json::from_value(serde_json::json!({
@@ -8292,6 +8288,31 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn composer_wake_rejects_unbound_invalid_and_local_devices(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::Ordering::SeqCst;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (composer, state, rpc) = wake_composer(cx);
+        for (environment, id, local) in [
+            (Some(comet_proto::DeviceEnvironment::Boat), Some("bx_234abcxy"), "devbox"),
+            (Some(comet_proto::DeviceEnvironment::Boat), Some("ofpf7g22n4412"), "local"),
+            (Some(comet_proto::DeviceEnvironment::Namespace), Some("invalid"), "local"),
+            (Some(comet_proto::DeviceEnvironment::Namespace), None, "local"),
+            (None, Some("bx_234abcxy"), "local"),
+        ] {
+            state.update(cx, |state, _| {
+                state.devices[0].devbox_provider = environment;
+                state.devices[0].devbox_id = id.map(str::to_owned);
+                state.local_device_id = Some(local.into());
+            });
+            composer.update(cx, |composer, cx| assert!(composer.wake_target(cx).is_none()));
+        }
+        cx.run_until_parked();
+        assert_eq!(rpc.wakes.load(SeqCst), 0);
+    }
+
+    #[gpui::test]
     async fn devbox_send_waits_for_wake_and_models_then_submits_once(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -8300,6 +8321,10 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
         let (composer, state, rpc) = wake_composer(cx);
+        state.update(cx, |state, _| {
+            state.devices[0].devbox_provider = Some(comet_proto::DeviceEnvironment::Boat);
+            state.devices[0].devbox_id = Some("bx_234abcxy".into());
+        });
         cx.run_until_parked();
         assert_eq!(rpc.wakes.load(SeqCst), 0, "passive setup must not wake");
         composer.update(cx, |composer, cx| {

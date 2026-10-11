@@ -2,6 +2,29 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.151: Namespace and Boat devboxes
+
+Namespace and Boat use the same Crew peer sessions, validated immutable provider
+bindings, explicit wake controls and private callback/app/Tilt forwarding. The
+new `devboxProvider` and `devboxId` fields replace Namespace-only fields through
+persisted-row/journal migration. Older clients can still read the registry; update
+controller and host for the new wake controls. Provider metadata never grants
+session execution authority.
+
+Namespace keeps owned active-turn markers. Boat confirms a finite one-hour TTL
+before work, renews it while turns run and resets its idle deadline after final
+completion. Failed protection interrupts work without discarding recovery; idle
+harnesses do not keep the machine running. Host identity must match the current
+native Boat sandbox, including after resume or template copying.
+
+The [shared devbox skill](skills/devbox/SKILL.md) targets 16 CPU / 32 GB machines
+with one canonical host bootstrap, pinned Chromium, interactive forwarded sign-in,
+tmux on Namespace and native systemd on Boat. Independent work uses the bounded
+`crew-devbox-keepalive` helper. Boat `xlarge` requires its paid $100+ plan. Complete
+setup requires real wake, turn, browser, sleep and Ashler runtime proof; installation
+or unit tests alone are not that proof. Stage this release and obtain restarted
+client acceptance before production promotion. Scaffold pins are unchanged.
+
 ## Crew 0.1.150: cold-checkpoint recovery
 
 Packages the verified cold-reopen repair from [PR #93](https://github.com/Ashler-AI/comet/pull/93):
@@ -595,9 +618,9 @@ machine crash, restart Crew to clean confirmed stale Crew markers; never delete 
 task markers indiscriminately. Independent background jobs that outlive a turn need
 their own marker and cleanup trap.
 
-Use the [Namespace Devbox setup skill](skills/namespace-devbox/SKILL.md) for an
-owner-named 16-CPU/64-GiB machine, Chromium by default, the Ashler kind/Tilt stack,
-and one supervised callback forward for all initial browser logins. After setup,
+Use the [shared devbox setup skill](skills/devbox/SKILL.md) for an
+owner-named 16-CPU/32-GB machine, pinned Chromium, the Ashler kind/Tilt stack,
+and private setup forwarding for initial browser logins. After setup,
 Crew wakes the machine and runs coding sessions through its device relay; no local
 coordinating agent or credential copying is required.
 
