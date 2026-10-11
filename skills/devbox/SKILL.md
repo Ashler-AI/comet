@@ -80,7 +80,7 @@ Ordinary desktop turns automatically prepare bounded private gcloud/app/Tilt for
 
 ## Ashler runtime and proof
 
-Read the checkout's `docs/agents/localdev.md` and `infra/localdev/README.md`; use maintained Linux installation paths for Docker, kubectl, kind, ctlptl, Tilt, just, gcloud and Infisical. Follow `just bootstrap`, `just env`, and `just dev`, not a competing stack. Set `NEXT_DEV_HOSTNAME=127.0.0.1` in the supported local host override before starting the web process. Keep Tilt/CDP private. Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false`; never run local typechecks.
+Read the checkout's `docs/agents/localdev.md` and `infra/localdev/README.md`; use maintained Linux installation paths for Docker, kubectl, kind, ctlptl, Tilt, just, gcloud and Infisical. Follow `just bootstrap`, `just env`, and `just dev`, not a competing stack. Retain the maintained Next.js binding (`0.0.0.0` by default): Docker/kind must reach `http://host.docker.internal:3000` for callbacks. Deny public inbound app traffic through provider private access or the host firewall while allowing required Docker bridge traffic. Keep Tilt/CDP and credential callbacks loopback-only; never publish them through provider hosting. Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false`; never run local typechecks.
 
 Seed only the confirmed host-local database. After stop/resume, verify app and Tilt separately from Crew readiness. Reconcile stale kind networking with the maintained `just env` path; this may recreate only the ephemeral local cluster/database. Never apply recovery to shared or snapshot databases.
 
@@ -89,7 +89,7 @@ Record actual owner, provider ID, CPU/memory/disk, Crew version/channel, and the
 1. Both Mac and host visible, owner-qualified Devbox label, same stopped device retained in Devices/folder picker.
 2. Mac-initiated real selected-model turn returns `hostname`/`pwd` through Crew Agent Auth.
 3. Active turn remains protected, including a turn exceeding one hour; overlapping completion/cancellation preserves other work; idle sleep follows final completion.
-4. Headless Chromium renders a page; private app/Tilt endpoints respond before and after resume.
+4. Headless Chromium renders a page; private app/Tilt endpoints and pod-to-web callback reachability work before and after resume. Forwarded health alone does not prove document generation/search/research callbacks.
 5. Explicit stop/wake returns the same device ID, reloads refs/models, submits the draft once, and passive viewing leaves a stopped machine stopped.
 6. Measure 32 GB peak memory during cold bootstrap, rebuild, browser and concurrent turns. Container limits are not measured use; leave optional data/observability stacks opt-in.
 

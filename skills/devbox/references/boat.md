@@ -25,7 +25,7 @@ boat --no-update forward "$DEVBOX_ID" --remote 3000 --local "$WEB_LOCAL_PORT" --
 boat --no-update forward "$DEVBOX_ID" --remote 10350 --local "$TILT_LOCAL_PORT" --bind 127.0.0.1
 ```
 
-Do not expose callback, Tilt or CDP through `boat host`, even a token-gated URL. Keep app listeners loopback-only and verify the host firewall. SSH host keys/IPs change on resume; use Boat's authenticated pinning, never disable strict checking. Stop setup forwards before testing ordinary Crew turns.
+Do not expose app, callback, Tilt or CDP through `boat host`, even a token-gated URL. Retain the maintained Docker-reachable web binding, not loopback-only: pods call `host.docker.internal:3000`. Verify the host firewall denies public inbound app traffic and permits only the required Docker/kind bridge path and owner SSH forwards. Tilt/CDP and credential callbacks stay loopback-only. SSH host keys/IPs change on resume; use Boat's authenticated pinning, never disable strict checking. Stop setup forwards before testing ordinary Crew turns.
 
 Resume keeps the same sandbox ID but starts a new machine. It restores files, named Docker volumes and enabled systemd units, not running processes or memory. Docker build cache and `~/.cache` are not captured; the shared Playwright location under `~/.local/share` survives. A stop does not signal ordinary processes, so cleanup must not depend on shutdown hooks. Enable one Crew systemd supervisor and verify current native identity after every resume.
 
