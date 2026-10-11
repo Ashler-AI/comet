@@ -11,12 +11,13 @@ struct DeviceRow: Identifiable, Hashable {
     var id: String
     var name: String
     var platform: String
-    var environment: String? = nil
+    var devboxProvider: String? = nil
+    var devboxId: String? = nil
     var lastSeenAt: Int64?
     var createdAt: Int64?
 
     var displayName: String {
-        environment == "namespace" ? "\(name) · Devbox" : name
+        devboxProvider == "namespace" || devboxProvider == "boat" ? "\(name) · Devbox" : name
     }
 }
 

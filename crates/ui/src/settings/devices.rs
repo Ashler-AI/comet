@@ -263,7 +263,7 @@ impl Render for DevicesPage {
                         ))
                         .into_any_element(),
                 ];
-                if device.environment == Some(comet_proto::DeviceEnvironment::Namespace) {
+                if device.devbox_provider.is_some() {
                     meta.push(div().child("Devbox").into_any_element());
                 }
                 if let Some(version) = device.version.as_deref().filter(|v| !v.is_empty()) {

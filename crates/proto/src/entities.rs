@@ -13,6 +13,18 @@ use crate::{HarnessId, ReasoningLevel, SandboxLevel, SessionEnvironment};
 #[serde(rename_all = "camelCase")]
 pub enum DeviceEnvironment {
     Namespace,
+    Boat,
+}
+
+impl DeviceEnvironment {
+    pub fn valid_devbox_id(&self, id: &str) -> bool {
+        match self {
+            Self::Namespace => id.len() == 13
+                && id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            Self::Boat => id.strip_prefix("bx_").is_some_and(|suffix| suffix.len() == 8
+                && suffix.bytes().all(|byte| b"23456789abcdefghjkmnpqrstuvwxyz".contains(&byte))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,10 +35,10 @@ pub struct Device {
     pub platform: String,
     /// Absent on ordinary hosts and older registry rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment: Option<DeviceEnvironment>,
-    /// Immutable Namespace Devbox ID, never the machine's display name.
+    pub devbox_provider: Option<DeviceEnvironment>,
+    /// Immutable provider Devbox ID, never the machine's display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace_devbox_id: Option<String>,
+    pub devbox_id: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
     /// First registration time (comet devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
@@ -36,6 +48,15 @@ pub struct Device {
     /// glance (Devices page). Optional so pre-existing docs stay readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+impl Device {
+    /// Presentation metadata alone never authorizes provider execution.
+    pub fn devbox_binding(&self) -> Option<(DeviceEnvironment, &str)> {
+        let environment = self.devbox_provider?;
+        let id = self.devbox_id.as_deref()?;
+        environment.valid_devbox_id(id).then_some((environment, id))
+    }
 }
 
 /// A synced (device, folder) pair — the unit of organization in the sidebar.
@@ -588,6 +609,55 @@ pub enum TerminalEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devbox_binding_requires_a_provider_valid_immutable_id() {
+        let mut device: Device = serde_json::from_value(serde_json::json!({
+            "id": "remote", "name": "Owner's workstation", "platform": "linux",
+            "lastSeenAt": null, "devboxProvider": "namespace", "devboxId": "ofpf7g22n4412"
+        })).unwrap();
+        assert_eq!(device.devbox_binding(), Some((DeviceEnvironment::Namespace, "ofpf7g22n4412")));
+        device.devbox_provider = Some(DeviceEnvironment::Boat);
+        assert_eq!(device.devbox_binding(), None);
+        device.devbox_id = Some("bx_234abcxy".into());
+        assert_eq!(device.devbox_binding(), Some((DeviceEnvironment::Boat, "bx_234abcxy")));
+        let wire = serde_json::to_value(&device).unwrap();
+        assert_eq!(serde_json::from_value::<Device>(wire).unwrap(), device);
+        for id in ["", "bx_234abcx", "bx_234abcx0", "bx_234abcx1", "bx_234abcxi", "bx_234abcxl", "bx_234abcxo", "bx_234abcxA", " bx_234abcxy"] {
+            device.devbox_id = Some(id.into());
+            assert_eq!(device.devbox_binding(), None, "{id}");
+        }
+        device.devbox_provider = Some(DeviceEnvironment::Namespace);
+        for id in ["", "ofpf7g22n441", "ofpf7g22n44122", "Ofpf7g22n4412", "ofpf7g22n441/"] {
+            device.devbox_id = Some(id.into());
+            assert_eq!(device.devbox_binding(), None, "{id}");
+        }
+        device.devbox_id = Some("ofpf7g22n4412".into());
+        device.devbox_provider = None;
+        assert_eq!(device.devbox_binding(), None);
+    }
+
+    #[test]
+    fn boat_metadata_is_readable_by_a_namespace_only_device_reader() {
+        // Frozen legacy reader: unknown fields are ignored, but known enum values are strict.
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        enum LegacyEnvironment { Namespace }
+        #[derive(Deserialize)]
+        struct LegacyDevice { id: String, environment: Option<LegacyEnvironment> }
+        let boat: Device = serde_json::from_value(serde_json::json!({
+            "id": "boat", "name": "Owner", "platform": "linux", "lastSeenAt": null,
+            "devboxProvider": "boat", "devboxId": "bx_234abcxy"
+        })).unwrap();
+        let wire = serde_json::to_value(&boat).unwrap();
+        let legacy: LegacyDevice = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(legacy.id, "boat");
+        assert!(legacy.environment.is_none());
+        assert_eq!(serde_json::from_value::<Device>(wire.clone()).unwrap().devbox_binding(), Some((DeviceEnvironment::Boat, "bx_234abcxy")));
+        let mut incompatible = wire;
+        incompatible["environment"] = "boat".into();
+        assert!(serde_json::from_value::<LegacyDevice>(incompatible).is_err());
+    }
 
     #[test]
     fn chat_config_agent_account_is_optional_and_camel_case() {

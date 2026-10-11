@@ -43,8 +43,10 @@ use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
 
 mod namespace_tasks;
+mod boat_lease;
 
 use namespace_tasks::NamespaceTasks;
+use boat_lease::BoatLease;
 
 /// [`SessionsEngine::tool_call_detail`]'s reduction of one tool id's journal
 /// events.
@@ -330,6 +332,7 @@ impl Drop for RunTaskGuard {
     fn drop(&mut self) {
         self.interrupt.cancel();
         self.inner.namespace_tasks.finish_turn(&self.run_id);
+        self.inner.boat_lease.finish_turn(&self.run_id);
         self.inner.remove_run(&self.chat_id, &self.run_id);
     }
 }
@@ -344,6 +347,7 @@ struct Inner {
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
     namespace_tasks: NamespaceTasks,
+    boat_lease: BoatLease,
     /// One automatic route-lifecycle restart may remain pending until the
     /// replacement run proves inference progress.
     route_restarts: Mutex<HashMap<String, RouteRestartState>>,
@@ -413,6 +417,7 @@ impl SessionsEngine {
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
                 namespace_tasks: NamespaceTasks::detect(),
+                boat_lease: BoatLease::detect(),
                 route_restarts: Mutex::new(HashMap::new()),
                 dispatch_locks: Mutex::new(HashMap::new()),
                 preparations: Mutex::new(HashMap::new()),
@@ -1018,6 +1023,7 @@ impl SessionsEngine {
     ) -> Result<String, EngineError> {
         let _admission = self.inner.admission.read().await;
         self.require_running()?;
+        self.inner.boat_lease.protect().await.map_err(EngineError::Other)?;
         enum ExistingRunDecision {
             None,
             Routed {
@@ -1052,7 +1058,7 @@ impl SessionsEngine {
                         let sender = handle.steer_tx.clone();
                         if let Ok(permit) = sender.try_reserve() {
                             self.save_pending(chat_id, harness_id, &request, &user_id, None)?;
-                            self.inner.start_turn(chat_id, &handle.run_id)?;
+                            self.inner.start_turn(chat_id, &handle.run_id, handle)?;
                             permit.send(message.clone());
                             handle.turn_active = true;
                             if !was_turn_active {
@@ -1265,9 +1271,12 @@ impl SessionsEngine {
         // command executor so it can write Rejected + an audit reason instead
         // of first reporting Applied and failing moments later.
         let stream = match async {
-            self.inner
-                .start_turn(chat_id, &run_id)
-                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            {
+                let runs = lock(&self.inner.runs);
+                let handle = runs.get(chat_id).ok_or_else(|| HarnessError::Protocol("Crew turn disappeared during startup".into()))?;
+                self.inner.start_turn(chat_id, &run_id, handle)
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            }
             tokio::select! {
                 result = harness.run(harness_run_request(&request, harness_id), controls) => result,
                 _ = self.inner.shutting_down.cancelled() => {
@@ -1386,6 +1395,10 @@ impl SessionsEngine {
     ) -> Result<SteerOutcome, EngineError> {
         let _admission = self.inner.admission.read().await;
         self.require_running()?;
+        let needs_protection = { lock(&self.inner.runs).get(chat_id).is_some_and(|handle| handle.steerable) };
+        if needs_protection {
+            self.inner.boat_lease.protect().await.map_err(EngineError::Other)?;
+        }
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: prompt.to_string(),
@@ -1402,7 +1415,7 @@ impl SessionsEngine {
                 return Ok(SteerOutcome::NotSteerable);
             };
             self.inner.save_followup(chat_id, &message)?;
-            self.inner.start_turn(chat_id, &handle.run_id)?;
+            self.inner.start_turn(chat_id, &handle.run_id, handle)?;
             permit.send(message.clone());
             handle.user_message_id = user_id.clone();
             handle.turn_active = true;
@@ -1434,6 +1447,10 @@ impl SessionsEngine {
     ) -> Result<QueueOutcome, EngineError> {
         let _admission = self.inner.admission.read().await;
         self.require_running()?;
+        let needs_protection = { lock(&self.inner.runs).get(chat_id).is_some_and(|handle| !handle.turn_active && handle.steerable) };
+        if needs_protection {
+            self.inner.boat_lease.protect().await.map_err(EngineError::Other)?;
+        }
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: prompt.to_string(),
@@ -1450,7 +1467,7 @@ impl SessionsEngine {
                     return Ok(QueueOutcome::NotRunning);
                 };
                 self.inner.save_followup(chat_id, &message)?;
-                self.inner.start_turn(chat_id, &handle.run_id)?;
+                self.inner.start_turn(chat_id, &handle.run_id, handle)?;
                 permit.send(message.clone());
                 handle.user_message_id = user_id.clone();
                 handle.turn_active = true;
@@ -2078,9 +2095,11 @@ impl SessionsEngine {
     pub(crate) fn shutdown_now(&self) {
         self.begin_shutdown();
         self.inner.namespace_tasks.shutdown();
+        self.inner.boat_lease.shutdown_now();
     }
 
     fn begin_shutdown(&self) {
+        self.inner.boat_lease.shutdown_now();
         self.inner.shutting_down.cancel();
         for preparation in lock(&self.inner.preparations).values() {
             preparation.cancel.cancel();
@@ -2130,6 +2149,7 @@ impl SessionsEngine {
             }
         }
         self.inner.namespace_tasks.shutdown();
+        self.inner.boat_lease.shutdown().await;
     }
 
     fn is_live(&self, chat_id: &str, run_id: &str) -> bool {
@@ -2183,13 +2203,20 @@ impl Inner {
         lock(&self.run_tasks).retain(|task| !task.is_finished());
     }
 
-    fn start_turn(&self, chat_id: &str, run_id: &str) -> Result<(), EngineError> {
+    fn start_turn(&self, chat_id: &str, run_id: &str, handle: &RunHandle) -> Result<(), EngineError> {
         self.namespace_tasks.start_turn(chat_id, run_id).map_err(|error| {
             tracing::error!(chat = %chat_id, %error, "could not create Crew Namespace task marker");
             EngineError::Other(format!(
                 "Crew could not protect this turn from Namespace Devbox auto-stop: {error}"
             ))
-        })
+        })?;
+        if let Err(error) = self.boat_lease.start_turn(
+            run_id, &handle.interrupt_token, &handle.cancel, &handle.engine_tx,
+        ) {
+            self.namespace_tasks.finish_turn(run_id);
+            return Err(EngineError::Other(error));
+        }
+        Ok(())
     }
 
     fn save_followup(&self, chat_id: &str, message: &SteerMessage) -> Result<(), EngineError> {
@@ -2836,7 +2863,7 @@ async fn drive_run(
         if !matches!(&event, AgentEvent::Done { .. }) {
             let mut runs = lock(&inner.runs);
             if let Some(handle) = runs.get_mut(&chat_id).filter(|h| h.run_id == run_id) {
-                match inner.start_turn(&chat_id, &run_id) {
+                match inner.start_turn(&chat_id, &run_id, handle) {
                     Ok(()) => handle.turn_active = true,
                     Err(error) => {
                         handle.interrupt_token.cancel();
@@ -2850,6 +2877,14 @@ async fn drive_run(
                     }
                 }
             }
+        }
+        if inner.boat_lease.failed(&run_id)
+            && let AgentEvent::Done { status, error, .. } = &mut event
+        {
+            interrupted = true;
+            *status = DoneStatus::Interrupted;
+            *error = Some("Crew lost Boat TTL protection; this turn remains recoverable.".into());
+            inner.set_recovery(&chat_id, "failed", error.clone());
         }
 
         // First event after parking idle = the next turn beginning (a routed
@@ -3122,8 +3157,9 @@ async fn drive_run(
                                         .map_or(1, |(seq, _)| seq + 1);
                                     inner.journal.save_recovery(&chat_id, &pending)?;
                                 }
-                            } else if !inner.shutting_down.is_cancelled()
-                                || *status == DoneStatus::Completed
+                            } else if !inner.boat_lease.failed(&run_id)
+                                && (!inner.shutting_down.is_cancelled()
+                                    || *status == DoneStatus::Completed)
                             {
                                 inner.journal.retire_recovery(&chat_id)?;
                             }
@@ -3160,7 +3196,7 @@ async fn drive_run(
                             && (!handle.queued_followups.is_empty()
                                 || !handle.pending_turn_boundary_steers.is_empty())
                         {
-                            match inner.start_turn(&chat_id, &run_id) {
+                            match inner.start_turn(&chat_id, &run_id, handle) {
                                 Ok(()) => handle.turn_active = true,
                                 Err(error) => {
                                     inner.publish(
@@ -3214,6 +3250,11 @@ async fn drive_run(
                     }
                 }
             };
+            // Unlike Namespace's per-turn markers, Boat coverage is continuous
+            // across already-admitted queued/boundary work on this same harness.
+            if boundary_failed || !lock(&inner.runs).get(&chat_id).is_some_and(|handle| handle.turn_active) {
+                inner.boat_lease.finish_turn(&run_id);
+            }
             if boundary_failed {
                 interrupted = true;
                 if let Some(handle) = lock(&inner.runs).get(&chat_id) {

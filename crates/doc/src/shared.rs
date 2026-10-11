@@ -612,9 +612,11 @@ fn reconcile(
                         && remote.get("id") == local.get("id") => {
                         let Some(mut merged) = remote.as_object().cloned() else { return Err(conflict()) };
                         // Boot owns runtime identity/liveness, not a remote user's device name.
-                        for field in ["platform", "environment", "namespaceDevboxId", "version", "lastSeenAt"] {
+                        for field in ["platform", "devboxProvider", "devboxId", "version", "lastSeenAt"] {
                             if let Some(value) = local.get(field) {
                                 if field != "lastSeenAt" || value.as_i64() > remote.get(field).and_then(|value| value.as_i64()) { merged.insert(field.into(),value.clone()); }
+                            } else if matches!(field, "devboxProvider" | "devboxId") {
+                                merged.remove(field);
                             }
                         }
                         Some(serde_json::Value::Object(merged))
@@ -707,6 +709,29 @@ mod tests {
             parts: vec![MessagePart::Text { id: "text".into(), text: "accepted offline".into() }],
             created_at: 100, device_id: "device".into(), status: Some(MessageStatus::Complete),
             continuation_of: None, peer_message: None }
+    }
+
+    #[test]
+    fn legacy_devbox_journal_rebases_owner_rename_onto_neutral_binding() {
+        let remote = LoroDoc::new();
+        let before = serde_json::json!({"id": "offline", "name": "Before", "platform": "linux", "environment": "namespace", "namespaceDevboxId": "ofpf7g22n4412"});
+        let row = remote.get_map("devices").insert_container("offline", LoroMap::new()).unwrap();
+        for (field, value) in before.as_object().unwrap() { row.insert(field, LoroValue::from(value.clone())).unwrap(); }
+        remote.commit();
+        let mut after = before.clone(); after["name"] = "Owner rename".into();
+        let binding = SharedDocument::new(remote.fork());
+        binding.install_journal(vec![PendingRecord { container: "devices".into(), key: "offline".into(), before: Some(before), value: Some(after), version: Vec::new(), acknowledged: false }], Arc::new(|_,_| Ok(())));
+        binding.adopt_snapshot(&remote.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        let row = binding.get_map("devices").get_deep_value().to_json_value()["offline"].clone();
+        assert_eq!(row["name"], "Owner rename");
+        assert_eq!(row["devboxId"], "ofpf7g22n4412");
+        assert!(row.get("namespaceDevboxId").is_none());
+        assert!(row.get("environment").is_none());
+        assert_eq!(row["devboxProvider"], "namespace");
+        let restarted = SharedDocument::new(LoroDoc::new());
+        restarted.install_journal(binding.pending_records(), Arc::new(|_,_| Ok(())));
+        restarted.adopt_snapshot(&binding.export(ExportMode::Snapshot).unwrap(), None).unwrap();
+        assert_eq!(restarted.get_deep_value(), binding.get_deep_value());
     }
 
     #[test]

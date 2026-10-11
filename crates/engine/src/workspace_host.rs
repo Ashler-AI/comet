@@ -302,6 +302,7 @@ impl WorkspaceHost {
         config: WorkspaceHostConfig,
         journal_session_ids: std::collections::HashSet<String>,
     ) -> Result<Self, EngineError> {
+        let environment = crate::verified_devbox_environment()?;
         let doc = match store.load_snapshot(WORKSPACE_DOC_ID)? {
             Some(bytes) => {
                 let doc = loro::LoroDoc::new();
@@ -346,12 +347,9 @@ impl WorkspaceHost {
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| config.device_name.clone()),
             platform: config.platform.clone(),
-            environment: crate::namespace_devbox()
-                .then_some(comet_proto::DeviceEnvironment::Namespace),
-            namespace_devbox_id: crate::namespace_devbox()
-                .then(|| std::env::var("NAMESPACE_DEVBOX_ID").ok())
-                .flatten()
-                .filter(|id| crate::device_wake::valid_devbox_id(id)),
+            devbox_provider: environment,
+            devbox_id: environment.and_then(|provider| std::env::var("COMET_DEVBOX_ID").ok()
+                .filter(|id| provider.valid_devbox_id(id))),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
             // (the Devices page "Added …" fragment).
@@ -2674,7 +2672,7 @@ mod tests {
         for id in ["a-blocked", "b-ready", "c-blocked"] {
             seed.upsert_device(&comet_proto::Device {
                 id: id.into(), name: id.into(), platform: "test".into(),
-                environment: None, namespace_devbox_id: None, last_seen_at: None,
+                devbox_provider: None, devbox_id: None, last_seen_at: None,
                 created_at: None, version: None,
             }).unwrap();
         }

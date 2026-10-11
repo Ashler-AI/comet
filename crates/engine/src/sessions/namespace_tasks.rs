@@ -646,6 +646,94 @@ mod tests {
         sessions.shutdown().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn boat_admission_boundaries_and_failed_renewal_preserve_recovery() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (mut sessions, mut started) = engine(root.path(), directory.path(), Startup::Ready, SteeringMode::TurnBoundary);
+        let denied = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let denied_cli = denied.clone();
+        let calls_cli = calls.clone();
+        Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = super::super::boat_lease::BoatLease::new(
+            Ok(Some("bx_23456789".into())),
+            Arc::new(move |_, _| {
+                calls_cli.fetch_add(1, Ordering::SeqCst);
+                let denied = denied_cli.load(Ordering::SeqCst);
+                Box::pin(async move { if denied { Err("denied".into()) } else { Ok(()) } })
+            }),
+        );
+        assert!(sessions.dispatch("chat", HarnessId::Mock, request(), None).await.is_err());
+        assert!(started.try_recv().is_err(), "protection must precede harness side effects");
+        denied.store(false, Ordering::SeqCst);
+        sessions.dispatch("chat", HarnessId::Mock, request(), None).await.unwrap();
+        let mut run = started.recv().await.unwrap();
+        assert_eq!(sessions.queue("chat", "queued", None).await.unwrap(), QueueOutcome::Queued);
+        let before_boundary = calls.load(Ordering::SeqCst);
+        run.events.send(done(DoneStatus::Completed)).unwrap();
+        run.controls.steering.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), before_boundary, "queued boundary retains continuous coverage, no idle reset");
+        run.events.send(done(DoneStatus::Completed)).unwrap();
+        idle(&sessions, "chat").await;
+        tokio::task::yield_now().await;
+        let idle_calls = calls.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), idle_calls, "parked child must not renew");
+        sessions.steer("chat", "resumed", None).await.unwrap();
+        run.controls.steering.recv().await.unwrap();
+        denied.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert!(run.controls.interrupt.is_cancelled());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert!(sessions.pending_run("chat").unwrap().is_some(), "provider failure must remain recoverable");
+        denied.store(false, Ordering::SeqCst);
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boat_failed_starts_and_aborted_tasks_release_only_active_leases() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for startup in [Startup::Fail, Startup::Wait, Startup::Ready] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut sessions, mut started) = engine(root.path(), directory.path(), startup, SteeringMode::StepBoundary);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let cli_calls = calls.clone();
+            Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = super::super::boat_lease::BoatLease::new(
+                Ok(Some("bx_23456789".into())),
+                Arc::new(move |_, _| {
+                    cli_calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                }),
+            );
+            let dispatch = sessions.clone();
+            let task = tokio::spawn(async move { dispatch.dispatch("chat", HarnessId::Mock, request(), None).await });
+            let run = started.recv().await.unwrap();
+            match startup {
+                Startup::Fail => { assert!(task.await.unwrap().is_err()); }
+                Startup::Wait => { task.abort(); assert!(task.await.unwrap_err().is_cancelled()); }
+                Startup::Ready => {
+                    task.await.unwrap().unwrap();
+                    let tasks = std::mem::take(&mut *lock(&sessions.inner.run_tasks));
+                    for task in tasks { task.abort(); assert!(task.await.unwrap_err().is_cancelled()); }
+                }
+            }
+            tokio::task::yield_now().await;
+            assert!(run.controls.interrupt.is_cancelled());
+            assert!(lock(&sessions.inner.runs).is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "confirmed admission plus one final idle reset");
+            tokio::time::advance(Duration::from_secs(600)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            sessions.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn namespace_unavailable_marker_directory_prevents_unprotected_execution() {
         let root = tempfile::tempdir().unwrap();
