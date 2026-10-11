@@ -2,6 +2,24 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.152: first-send workspace recovery
+
+An unchanged bootstrap branch on one client could conflict with a later owner
+rename on an independently created row, blocking new-session creation and causing
+metadata warnings on accepted messages. Recovery now proves both initial values
+from retained operation history, including coalesced creation/rename changes,
+before accepting the owner's newer value. Later local edits, different initial
+values, row recreation, missing history and ownership conflicts still fail closed.
+
+All **122** document tests passed. Private replay of the captured workspace kept
+all **127** original intents and survived a cold reopen. An isolated real engine
+then created a principal-visible chat through RPC and completed two mock-agent
+turns with no metadata, preparation or delivery errors. The isolated headed
+0.1.152 client also created a new session from a typed prompt and displayed its
+completed mock-agent output without a metadata warning. No live cache was reset
+or existing session restarted. Installed-client acceptance remains required;
+this release changes neither mobile build numbers nor Scaffold image pins.
+
 ## Crew 0.1.151: Namespace and Boat devboxes
 
 Namespace and Boat use the same Crew peer sessions, validated immutable provider
