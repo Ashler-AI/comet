@@ -5,7 +5,7 @@ use crate::span::{HasId, HasLamport};
 use crate::sync::Mutex;
 use crate::version::{shrink_frontiers, Frontiers, ImVersionVector, VersionVector};
 use loro_common::{HasCounter, HasCounterSpan, HasIdSpan, HasLamportSpan, PeerID};
-use once_cell::sync::OnceCell;
+use quick_cache::sync::Cache;
 use rle::{HasIndex, HasLength, Mergable, Sliceable};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
@@ -34,6 +34,7 @@ pub struct AppDag {
     frontiers: Frontiers,
     /// The latest known version vector
     vv: VersionVector,
+    vv_cache: Cache<ID, ImVersionVector>,
     /// The earliest known frontiers
     shallow_since_frontiers: Frontiers,
     /// The deps of the shallow frontiers
@@ -101,7 +102,6 @@ pub struct AppDagNodeInner {
     pub(crate) cnt: Counter,
     pub(crate) lamport: Lamport,
     pub(crate) deps: Frontiers,
-    pub(crate) vv: OnceCell<ImVersionVector>,
     /// A flag indicating whether any other nodes from a different peer depend on this node.
     /// The calculation of frontiers is based on the property that a node does not depend
     /// on the middle of other nodes.
@@ -124,6 +124,8 @@ impl AppDag {
             map: Mutex::new(BTreeMap::new()),
             frontiers: Frontiers::default(),
             vv: VersionVector::default(),
+            // ponytail: 128 vectors; use byte-weighted eviction if peer width becomes the limit.
+            vv_cache: Cache::new(128),
             unparsed_vv: Mutex::new(VersionVector::default()),
             unhandled_dep_points: Mutex::new(BTreeSet::new()),
             shallow_since_frontiers: Default::default(),
@@ -182,6 +184,7 @@ impl AppDag {
         let Some(checkpoint) = self.import_rollback.lock().take() else {
             return;
         };
+        self.vv_cache.clear();
 
         let imported_spans = self.vv.sub_iter(&checkpoint.vv).collect::<Vec<_>>();
         let mut map = self.map.lock();
@@ -350,7 +353,6 @@ impl AppDag {
 
         if !inserted {
             let node: AppDagNode = AppDagNodeInner {
-                vv: OnceCell::new(),
                 peer: change.id.peer,
                 cnt: change.id.counter,
                 lamport: change.lamport,
@@ -630,6 +632,7 @@ impl AppDag {
 
     pub(crate) fn set_version_by_fast_snapshot_import(&mut self, v: BatchDecodeInfo) {
         assert!(self.vv.is_empty());
+        self.vv_cache.clear();
         *self.unparsed_vv.lock() = v.vv.clone();
         self.vv = v.vv;
         self.frontiers = v.frontiers;
@@ -725,8 +728,7 @@ impl AppDag {
                     }
 
                     let (_, dep_node) = map.range(..=dep).next_back().unwrap();
-                    self.ensure_vv_for(dep_node);
-                    expected_vv.extend_to_include_vv(dep_node.vv.get().unwrap().iter());
+                    expected_vv.extend_to_include_vv(self.ensure_vv_for(dep_node).iter());
                     expected_vv.extend_to_include_last_id(dep);
                 }
 
@@ -901,7 +903,6 @@ impl AppDag {
                         cnt: start_id.counter,
                         lamport: start_lamport,
                         deps: deps.clone(),
-                        vv: OnceCell::new(),
                         has_succ: false,
                         len,
                     }),
@@ -952,13 +953,6 @@ impl Sliceable for AppDagNode {
                 Frontiers::from_id(self.id_start().inc(from as Counter - 1))
             } else {
                 self.deps.clone()
-            },
-            vv: if let Some(vv) = self.vv.get() {
-                let mut new = vv.clone();
-                new.insert(self.peer, self.cnt + from as Counter);
-                OnceCell::with_value(new)
-            } else {
-                OnceCell::new()
             },
             has_succ: if to == self.len { self.has_succ } else { true },
             len: to - from,
@@ -1081,74 +1075,48 @@ impl AppDag {
     }
 
     pub(crate) fn ensure_vv_for(&self, target_node: &AppDagNode) -> ImVersionVector {
-        if target_node.vv.get().is_none() {
-            // Iterative DFS. When the DAG contains a diamond, a dep can end
-            // up on the stack multiple times (once for each ancestor that
-            // re-queued the current node before its deps were ready). We
-            // skip nodes whose vv has already been computed — the original
-            // code eagerly called `OnceCell::set(..).unwrap()` on every pop
-            // and panicked on the second visit (see loro-dev/loro#929).
-            let mut stack: SmallVec<[AppDagNode; 4]> = smallvec::smallvec![target_node.clone()];
-            while let Some(top_node) = stack.pop() {
-                if top_node.vv.get().is_some() {
-                    continue;
+        if let Some(vv) = self.vv_cache.get(&target_node.id_start()) {
+            return vv;
+        }
+
+        // Fold ancestors into one vector, not a full vector for every DAG node.
+        let mut ans_vv = ImVersionVector::default();
+        let mut visited = FxHashSet::default();
+        let mut stack: SmallVec<[AppDagNode; 4]> = smallvec::smallvec![target_node.clone()];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node.id_start()) {
+                continue;
+            }
+
+            let base = if node.deps == self.shallow_root_frontiers_deps {
+                Some(self.shallow_since_vv.clone())
+            } else {
+                self.vv_cache.get(&node.id_start())
+            };
+            if let Some(mut base) = base {
+                if base.len() > ans_vv.len() {
+                    std::mem::swap(&mut ans_vv, &mut base);
                 }
+                ans_vv.merge(&base);
+                continue;
+            }
 
-                let mut ans_vv = ImVersionVector::default();
-                if top_node.deps == self.shallow_root_frontiers_deps {
-                    ans_vv = self.shallow_since_vv.clone();
-                } else {
-                    let mut all_deps_processed = true;
-                    for id in top_node.deps.iter() {
-                        let Some(node) = self.get(id) else {
-                            if self.shallow_since_vv.includes_id(id) {
-                                continue;
-                            }
-
-                            panic!("deps should be in the dag");
-                        };
-                        if node.vv.get().is_none() {
-                            if all_deps_processed {
-                                stack.push(top_node.clone());
-                            }
-                            all_deps_processed = false;
-                            stack.push(node);
-                            continue;
-                        };
-                    }
-
-                    if !all_deps_processed {
+            for id in node.deps.iter() {
+                let Some(dep) = self.get(id) else {
+                    if self.shallow_since_vv.includes_id(id) {
+                        ans_vv.merge(&self.shallow_since_vv);
                         continue;
                     }
 
-                    for id in top_node.deps.iter() {
-                        let Some(node) = self.get(id) else {
-                            if self.shallow_since_vv.includes_id(id) {
-                                ans_vv.extend_to_include_vv(self.shallow_since_vv.iter());
-                                continue;
-                            }
-
-                            panic!("deps should be in the dag");
-                        };
-                        let dep_vv = node.vv.get().unwrap();
-                        if ans_vv.is_empty() {
-                            ans_vv = dep_vv.clone();
-                        } else {
-                            ans_vv.extend_to_include_vv(dep_vv.iter());
-                        }
-
-                        ans_vv.insert(node.peer, node.ctr_end());
-                    }
-                }
-
-                // Tolerate a racing set from the diamond case above: if
-                // another path already initialized this cell, trust that
-                // value (it was computed from the same DAG) and move on.
-                let _ = top_node.vv.set(ans_vv);
+                    panic!("deps should be in the dag");
+                };
+                ans_vv.extend_to_include_last_id(dep.id_last());
+                stack.push(dep);
             }
         }
 
-        target_node.vv.get().unwrap().clone()
+        self.vv_cache.insert(target_node.id_start(), ans_vv.clone());
+        ans_vv
     }
 
     /// Compare the causal order of two versions.
@@ -1369,7 +1337,6 @@ mod ensure_vv_for_tests {
 
     fn make_dag_node(peer: PeerID, cnt: Counter, len: usize, deps: Frontiers) -> AppDagNode {
         AppDagNodeInner {
-            vv: OnceCell::new(),
             peer,
             cnt,
             lamport: cnt as Lamport,
@@ -1469,5 +1436,59 @@ mod ensure_vv_for_tests {
 
         assert!(dag.frontiers_to_vv(&deps).is_none());
         assert!(!dag.import_deps_before_shallow_root(&deps));
+    }
+
+    #[test]
+    fn retained_branch_ancestry_preserves_import_boundary_checks() {
+        let dag = make_shallow_dag_for_import_deps();
+        let branch = make_dag_node(2, 0, 2, Frontiers::from_id(ID::new(1, 2)));
+        let concurrent = make_dag_node(3, 0, 1, Frontiers::default());
+        {
+            let mut map = dag.map.lock();
+            map.insert(branch.id_start(), branch);
+            map.insert(concurrent.id_start(), concurrent);
+        }
+
+        let retained = Frontiers::from_id(ID::new(2, 0));
+        let before = Frontiers::from_id(ID::new(3, 0));
+        assert!(dag.import_deps_before_shallow_root(&before));
+        assert!(!dag.import_deps_before_shallow_root(&retained));
+        assert!(!dag.import_deps_before_shallow_root(&Frontiers::from_id(ID::new(2, 1))));
+        let mut mixed = retained.clone();
+        mixed.push(ID::new(1, 0));
+        assert!(dag.import_deps_before_shallow_root(&mixed));
+        mixed = retained;
+        mixed.push(ID::new(4, 0));
+        assert!(!dag.import_deps_before_shallow_root(&mixed));
+        assert!(dag.import_deps_before_shallow_root(&before));
+    }
+
+    #[test]
+    fn causal_vectors_survive_eviction_and_import_rollback() {
+        let change_store = ChangeStore::new_mem(&SharedArena::new(), Arc::new(AtomicI64::new(0)));
+        let mut dag = AppDag::new(change_store);
+        let root = make_dag_node(1, 0, 1, Frontiers::default());
+        dag.map.lock().insert(root.id_start(), root);
+        dag.vv.insert(1, 1);
+        for peer in 3..300 {
+            let node = make_dag_node(peer, 0, 1, Frontiers::from_id(ID::new(1, 0)));
+            dag.map.lock().insert(node.id_start(), node);
+            dag.vv.insert(peer, 1);
+            assert_eq!(dag.get_vv(ID::new(peer, 0)).unwrap().get(&1), Some(&1));
+        }
+        assert_eq!(dag.get_vv(ID::new(3, 0)).unwrap().get(&1), Some(&1));
+
+        dag.begin_import_rollback();
+        let candidate = make_dag_node(2, 0, 1, Frontiers::from_id(ID::new(1, 0)));
+        dag.map.lock().insert(candidate.id_start(), candidate);
+        dag.vv.insert(2, 1);
+        assert_eq!(dag.get_vv(ID::new(2, 0)).unwrap().get(&1), Some(&1));
+        dag.rollback_import();
+        let replacement = make_dag_node(2, 0, 1, Frontiers::default());
+        dag.map.lock().insert(replacement.id_start(), replacement);
+        dag.vv.insert(2, 1);
+        let vv = dag.get_vv(ID::new(2, 0)).unwrap();
+        assert_eq!(vv.get(&1), None);
+        assert_eq!(vv.get(&2), Some(&1));
     }
 }

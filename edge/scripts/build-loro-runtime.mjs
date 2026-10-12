@@ -74,7 +74,7 @@ try {
   // scripts: only these two entry families contain the newly generated WASM.
   const manifest = {
     name: "loro-crdt",
-    version: "1.16.4+crew.1",
+    version: "1.16.4+crew.2",
     private: true,
     license: "MIT",
     description: original.description,

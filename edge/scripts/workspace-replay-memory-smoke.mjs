@@ -184,6 +184,16 @@ if (!internal) {
           const b = edit(right, "right-owner", { deviceId: "device-2", generation: round });
           replay(left, b); replay(right, a);
         }
+        // A cold import must not cache one wide causal vector per retained node.
+        const metadata = left.getMap("metadata");
+        try {
+          for (let round = 0; round < 200000; round++) {
+            left.setPeerId(round % 450 + 1);
+            metadata.set("retained-history", round);
+            left.setNextCommitTimestamp(0);
+            left.commit();
+          }
+        } finally { metadata.free(); }
         writeFileSync(file("baseline.loro"), left.export({ mode: "snapshot" }));
         writeFileSync(file("left.loro"), edit(left, "left-owner", { deviceId: "device-1", generation: 1200 }));
         writeFileSync(file("right.loro"), edit(right, "right-owner", { deviceId: "device-2", generation: 1200 }));
