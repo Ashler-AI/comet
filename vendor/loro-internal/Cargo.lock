@@ -755,6 +755,7 @@ dependencies = [
  "pest_derive",
  "postcard",
  "pretty_assertions",
+ "quick_cache",
  "rand",
  "rustc-hash",
  "serde",

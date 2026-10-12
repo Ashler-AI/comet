@@ -2,6 +2,23 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.153: bounded workspace replay
+
+A 371-byte accepted update could materialize a causal vector for every retained
+DAG node and exhaust the Worker's 128 MiB limit. Native and Worker Loro now
+calculate only requested vectors, retain them in a bounded 128-entry cache, and
+reuse the larger immutable vector when merging. Import rollback, snapshot
+replacement and discarded Worker transactions invalidate cached causal answers.
+Accepted operations, values, permissions and the retained history boundary are
+unchanged; only derived caches are evicted.
+
+The replay smoke also covers 200,000 retained changes, lossless folds, cold
+reopen, duplicate delivery, offline catch-up and actual Durable Object admission.
+Its 112 MiB WASM guard is unchanged. Run
+`node edge/scripts/workspace-replay-memory-smoke.mjs`; private corpus arguments
+remain supported. Staging publication and restarted-client acceptance are separate
+gates; this change does not promote production or move Scaffold image pins.
+
 ## Crew 0.1.152: first-send workspace recovery
 
 An unchanged bootstrap branch on one client could conflict with a later owner
@@ -189,7 +206,7 @@ connection, plus one cancellation being sent.
 
 The private Edge runtime is built from Loro
 `45708d059d8620fb53066c9f86cefa1601e0e1c6` with
-`edge/vendor/loro-1.16.4-crew.1.patch`. Apply that patch to the pinned checkout,
+`edge/vendor/loro-1.16.4-crew.2.patch`. Apply that patch to the pinned checkout,
 then build `loro-wasm` for `wasm32-unknown-unknown` through
 `python3 scripts/local-cargo.py build --locked --release --manifest-path
 UPSTREAM/Cargo.toml -p loro-wasm --target wasm32-unknown-unknown`.

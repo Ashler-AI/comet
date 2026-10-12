@@ -1811,7 +1811,6 @@ impl ChangesBlockContent {
                         cnt: change.id.counter,
                         lamport: change.lamport,
                         deps: change.deps.clone(),
-                        vv: OnceCell::new(),
                         has_succ: false,
                         len: change.atom_len(),
                     }
@@ -1830,7 +1829,6 @@ impl ChangesBlockContent {
                         cnt: header.counters[i],
                         lamport: header.lamports[i],
                         deps: header.deps_groups[i].clone(),
-                        vv: OnceCell::new(),
                         has_succ: false,
                         len: (header.counters[i + 1] - header.counters[i]) as usize,
                     }
