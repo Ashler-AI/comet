@@ -557,7 +557,7 @@ actor RoomClient {
                 } else {
                     let status = try? doc.importWith(bytes: bytes, origin: "remote")
                     let complete = status.map { ($0.pending?.isEmpty ?? true) } ?? false
-                    if complete, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
+                    if complete, !doc.isDetached(), doc.stateFrontiers() == doc.oplogFrontiers() {
                         imported = imported || !(status?.success.isEmpty ?? true)
                         await resubmitMissingUpdates()
                         finishRecoveryIfCaughtUp()
@@ -638,10 +638,10 @@ actor RoomClient {
     }
 
     private func hasMaterializedRemoteVersion(_ replica: LoroDoc) -> Bool {
-        guard let serverVersion, !replica.isDetached() else { return false }
-        let state = replica.stateVv()
-        return state == replica.oplogVv() && state.includesVv(other: serverVersion)
-            && state.includesVv(other: requiredRemoteVersion)
+        guard let serverVersion, !replica.isDetached(),
+              replica.stateFrontiers() == replica.oplogFrontiers() else { return false }
+        let version = replica.oplogVv()
+        return version.includesVv(other: serverVersion) && version.includesVv(other: requiredRemoteVersion)
     }
 
     private func resubmitMissingUpdates() async {
@@ -702,8 +702,8 @@ actor RoomClient {
         if !recovering { events(.disconnected) }
         recovering = true
         guard !historyRepairAttempted, !doc.isDetached(),
-              !doc.oplogVv().isEmpty(), doc.stateVv() == doc.oplogVv(),
-              doc.stateVv().includesVv(other: requiredRemoteVersion),
+              !doc.oplogVv().isEmpty(), doc.stateFrontiers() == doc.oplogFrontiers(),
+              doc.oplogVv().includesVv(other: requiredRemoteVersion),
               let snapshot = try? doc.export(mode: .snapshot) else {
             onSocketError(gen: generation)
             return

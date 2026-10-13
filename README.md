@@ -2,6 +2,20 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: mobile warm-load allocation
+
+The physical phone still closed during build 33 list loading. A private matched
+simulator replay exposed a **1,320.77 MiB** peak: Loro's state-vector equality guard
+reconstructed retained ancestry and copied immutable maps. Build 34 uses canonical
+frontier equality for materialization and oplog vectors for remote coverage,
+preserving detached/pending-import guards and historical rebase proofs.
+
+Workspace cold hydration now runs off-main, list metadata avoids whole-transcript
+forks, and off-screen document eviction no longer waits for scrolling to stop.
+The same replay peaked at **381.98 MiB** (**71.1% lower**) and all 31 simulator
+markers passed. Exact phone termination still needs its OS report; build 34 is
+not yet published. See [the candidate evidence](apps/ios/README.md#crew-staging-10-34-warm-load-allocation-candidate).
+
 ## Crew Staging mobile 1.0 (33): catalog loading
 
 Mobile build 33 recovers an `InvalidUpdate` upload reply through bounded
