@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (32)** and production **1.0 (20)** are available
+Mobile staging **1.0 (33)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -126,11 +126,28 @@ the local read marker, and loaded the same null-field cache without termination.
 All 31 regression markers passed, including repeated successful heals, bounded
 rejection, permission/conflict retention and valid optional-object decoding.
 
-This is local simulator evidence, not TestFlight publication or physical-phone
-acceptance. The hosted staging catalog served the new session to a read-only cold
-observer; the phone's cache, sync logs and crash report were unavailable, so its
-exact trigger remains unconfirmed. No live cache reset or account changes were
-performed. Local typechecks were intentionally skipped.
+Merged source `84a356889b408439ca3749a439a9ae5a12505892` passed simulator,
+live mobile/native/Edge transport and device archiving in
+[run 38427448877](https://github.com/Ashler-AI/comet/actions/runs/38427448877).
+All nine downloaded checksums and source provenance matched. Existing Xcode
+cloud-managed signing exported and uploaded it without local compilation.
+
+Apple accepted one internal-only upload at **16:25 UTC on 2026-10-13**.
+Authenticated readback returned upload **COMPLETE**, processing **VALID** and
+**BETA_INTERNAL_TESTING**; the UI shows **Testing** in the existing **Ashler
+Internal** group with one tester. Apple build ID:
+`b9265652-df58-46bd-a6ea-34ead1b20f94`.
+The exact uploaded IPA passed strict deep signature verification with bundle
+`ai.ashler.crew.staging`, version **1.0 (33)**, team `825LYXGJR6`, and matching
+production APNs signature/profile. Uploaded IPA SHA-256:
+`bed62010ad984249bd0c06918be3d6b7bd2c9c41b44c248d09aece0ddc5e06bf`.
+
+Physical-phone acceptance and exact trigger attribution remain unconfirmed.
+The hosted catalog served the new session to a read-only cold observer; the
+phone's cache and sync logs remain unavailable, and Apple has no build 32 crash
+feedback for this report. No live cache reset, production release, tester/group
+or account-permission changes were performed. Local typechecks were intentionally
+skipped. Update and reopen Crew Staging before checking new-session discovery.
 
 ### Crew Staging 1.0 (32): host-owned creation candidate
 
