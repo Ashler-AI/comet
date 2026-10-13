@@ -34,7 +34,8 @@ struct Inner {
     pending: Mutex<BTreeMap<(String, String), Arc<PendingRecord>>>,
     baseline: Mutex<BTreeMap<(String, String), serde_json::Value>>,
     persist: Mutex<Option<Persist>>,
-    error: Mutex<Option<String>>,
+    fatal_error: Mutex<Option<String>>,
+    workspace_snapshot_error: Mutex<Option<String>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     scope_generation: std::sync::atomic::AtomicU64,
 }
@@ -50,7 +51,8 @@ impl SharedDocument {
         Self(Arc::new(Inner {
             state: Mutex::new(State { raw, observers: BTreeMap::new(), next_observer: 0, journal: None }),
             gate: Mutex::new(()), pending: Mutex::new(BTreeMap::new()), baseline: Mutex::new(BTreeMap::new()),
-            persist: Mutex::new(None), error: Mutex::new(None),
+            persist: Mutex::new(None), fatal_error: Mutex::new(None),
+            workspace_snapshot_error: Mutex::new(None),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             scope_generation: std::sync::atomic::AtomicU64::new(0),
         }))
@@ -69,8 +71,11 @@ impl SharedDocument {
     pub fn get_deep_value(&self) -> loro::LoroValue { self.raw().get_deep_value() }
     pub fn shallow_since_vv(&self) -> loro::ImVersionVector { self.raw().shallow_since_vv() }
     pub fn is_detached(&self) -> bool { self.raw().is_detached() }
-    pub fn recovery_error(&self) -> Option<String> { lock(&self.0.error).clone() }
-    pub fn fail_recovery(&self, error: String) { *lock(&self.0.error) = Some(error); }
+    pub fn recovery_error(&self) -> Option<String> { lock(&self.0.fatal_error).clone().or_else(|| lock(&self.0.workspace_snapshot_error).clone()) }
+    pub fn fail_recovery(&self, error: String) { *lock(&self.0.fatal_error) = Some(error); }
+    /// A rejected workspace checkpoint leaves the trusted cache and journal writable.
+    /// Persistence failures and room authorization denials still use fail_recovery.
+    pub fn reject_workspace_snapshot(&self, error: String) { *lock(&self.0.workspace_snapshot_error) = Some(error); }
     pub fn has_journal(&self) -> bool { lock(&self.0.persist).is_some() }
     pub fn import(&self, bytes: &[u8]) -> Result<loro::ImportStatus, loro::LoroError> {
         let _operation = self.operation();
@@ -87,7 +92,7 @@ impl SharedDocument {
     pub fn export(&self, mode: ExportMode<'_>) -> Result<Vec<u8>, loro::LoroEncodeError> { self.raw().export(mode) }
     pub fn commit(&self) -> Result<(), DocError> {
         self.raw().commit();
-        if let Some(error) = lock(&self.0.error).as_ref() { return Err(DocError::Schema(error.clone())); }
+        if let Some(error) = lock(&self.0.fatal_error).as_ref() { return Err(DocError::Schema(error.clone())); }
         Ok(())
     }
     pub fn subscribe_root(&self, callback: RootCallback) -> DocumentSubscription {
@@ -130,7 +135,7 @@ impl SharedDocument {
                 .is_ok_and(|vv| version.includes_vv(&vv))
         }).map(|record| { let mut record = record.as_ref().clone(); record.acknowledged = true; Arc::new(record) }).collect();
         if acknowledged.is_empty() { return Ok(()) }
-        if let Some(persist) = lock(&self.0.persist).as_ref() { persist(&acknowledged, None).map_err(DocError::Schema)?; }
+        if let Some(persist) = lock(&self.0.persist).as_ref() { persist(&acknowledged, None).map_err(|error| { self.fail_recovery(error.clone()); DocError::Schema(error) })?; }
         let mut pending = lock(&self.0.pending);
         for record in acknowledged { pending.remove(&(record.container.clone(), record.key.clone())); }
         Ok(())
@@ -208,7 +213,7 @@ impl SharedDocument {
         let snapshot = candidate.export(ExportMode::Snapshot).map_err(|e| DocError::Schema(e.to_string()))?;
         if let Some(persist) = lock(&self.0.persist).as_ref() {
             retired.extend(pending.iter().cloned());
-            persist(&retired, Some(&snapshot)).map_err(DocError::Schema)?;
+            persist(&retired, Some(&snapshot)).map_err(|error| { self.fail_recovery(error.clone()); DocError::Schema(error) })?;
         }
         let journal = journal_subscription(&self.0, &candidate);
         let baseline = map_rows(&candidate);
@@ -225,7 +230,8 @@ impl SharedDocument {
         state.journal = Some(journal);
         self.0.generation.fetch_add(1,std::sync::atomic::Ordering::Release);
         *lock(&self.0.baseline) = baseline;
-        *lock(&self.0.error) = None;
+        *lock(&self.0.fatal_error) = None;
+        *lock(&self.0.workspace_snapshot_error) = None;
         let callbacks: Vec<_> = state.observers.values().filter_map(|observer| observer.root.clone()).collect();
         drop(state);
         *lock(&self.0.pending) = pending.into_iter().map(|record| ((record.container.clone(),record.key.clone()),record)).collect();
@@ -306,7 +312,7 @@ fn journal_subscription(inner: &Arc<Inner>, raw: &LoroDoc) -> loro::Subscription
             if let Some(value) = baseline_value { baseline.insert(identity,value); } else { baseline.remove(&identity); }
         }
         if !updates.is_empty() { if let Some(persist) = lock(&inner.persist).as_ref() {
-            if let Err(error) = persist(&updates,None) { *lock(&inner.error) = Some(format!("Crew could not persist accepted records: {error}")); }
+            if let Err(error) = persist(&updates,None) { *lock(&inner.fatal_error) = Some(format!("Crew could not persist accepted records: {error}")); }
         } }
     }))
 }
@@ -1049,7 +1055,7 @@ mod tests {
         let raw = LoroDoc::new(); raw.import(&compacted).unwrap();
         let restored = SharedDocument::new(raw);
         restored.install_journal(records.clone(), Arc::new(|_, _| Ok(())));
-        restored.fail_recovery("prior checkpoint conflict".into());
+        restored.reject_workspace_snapshot("prior checkpoint conflict".into());
         let checkpoint = remote.export(ExportMode::shallow_snapshot(&remote.state_frontiers())).unwrap();
         restored.adopt_snapshot(&checkpoint, None).unwrap();
         assert!(restored.recovery_error().is_none());
@@ -1430,7 +1436,7 @@ mod tests {
             remote.set_chat_seen("chat", at(remote_at)).unwrap();
             remote.rename_chat("chat", "remote title").unwrap();
             let incoming = remote.doc().export(ExportMode::shallow_snapshot(&remote.doc().state_frontiers())).unwrap();
-            binding.fail_recovery("retained seen-marker conflict".into());
+            binding.reject_workspace_snapshot("retained seen-marker conflict".into());
             for _ in 0..2 {
                 binding.adopt_snapshot(&incoming, None).unwrap();
                 assert_eq!(local.chat("chat").unwrap().unwrap().last_seen_at, Some(at(local_at.max(remote_at))));
@@ -1479,8 +1485,7 @@ mod tests {
             remote.set_chat_last_message("chat", "remote preview", chrono::DateTime::from_timestamp_millis(remote_at).unwrap()).unwrap();
             remote.rename_chat("chat", "concurrent title").unwrap();
             let snapshot = remote.doc().export(ExportMode::shallow_snapshot(&remote.doc().state_frontiers())).unwrap();
-            binding.fail_recovery("retained preview conflict".into());
-            assert!(binding.commit().is_err());
+            binding.reject_workspace_snapshot("retained preview conflict".into());
             for _ in 0..2 {
                 binding.adopt_snapshot(&snapshot, None).unwrap();
                 let row = row_value(&binding.raw(), "chats", "chat").unwrap();
@@ -1775,7 +1780,7 @@ mod tests {
             remote_row.insert("harnessSessionId", "owner-native-session").unwrap(); remote.commit();
             let snapshot = local.export_snapshot().unwrap();
             let intents = binding.pending_records();
-            binding.fail_recovery("previous workspace recovery failure".into());
+            binding.reject_workspace_snapshot("previous workspace recovery failure".into());
             let result = binding.adopt_snapshot(&remote.export(ExportMode::Snapshot).unwrap(), None);
             if matches!(scenario, "unchanged" | "coalesced") {
                 result.unwrap();

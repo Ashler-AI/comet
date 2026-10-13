@@ -2,6 +2,16 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: workspace recovery conflict isolation
+
+A rejected workspace checkpoint retains its original cache and intents and stays
+visible in `SyncStatus.workspaceRecoveryError`. It no longer blocks unrelated
+journal-backed chat creation or message admission. Transcript recovery conflicts,
+room permission denials, and journal, snapshot or acknowledgement persistence
+failures remain fatal; no conflicting record is discarded or falsely acknowledged.
+Successful snapshot adoption clears the diagnostic. Divergent installed stores
+still require data-preserving reconciliation of genuine competing user edits.
+
 ## Crew 0.1.156: staging desktop release
 
 Crew Staging desktop **0.1.156** is available through **Settings → Crew update**

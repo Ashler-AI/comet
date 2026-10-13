@@ -644,6 +644,103 @@ fn entry_contains(entry: &comet_doc::SessionMessageEntry, text: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_snapshot_conflict_keeps_fresh_chat_commands_writable_after_restart() {
+    use comet_doc::{SessionCommandStatus, SessionDoc};
+    use comet_sync::DocsStore;
+    const CONFLICT: &str = "00000000-0000-4000-8000-000000000111";
+    const FRESH: &str = "00000000-0000-4000-8000-000000000112";
+    let dirs = tempfile::tempdir().unwrap();
+    let data = dirs.path().join("engine");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("device-id"), "device-a").unwrap();
+    let offline = EngineCore::assemble_with_identity(&data, registry(), HarnessId::Mock, None,
+        PROJECT, USER, RuntimeProfile::Mock).unwrap();
+    offline.workspace.claim_chat(CONFLICT, Some("/tmp")).unwrap();
+    let loro::ValueOrContainer::Container(loro::Container::Map(row)) =
+        offline.workspace.doc().doc().get_map("chats").get(CONFLICT).unwrap() else { panic!("missing retained chat") };
+    row.insert("branch", "comet/retained").unwrap();
+    offline.workspace.doc().binding().commit().unwrap();
+    let retained = offline.workspace.doc().binding().pending_records().into_iter()
+        .find(|record| record.container == "chats" && record.key == CONFLICT).unwrap();
+    let mut competing = retained.value.clone().unwrap();
+    competing["branch"] = "comet/competing".into();
+    offline.shutdown().await;
+    drop(offline);
+
+    let (edge_url, relay, relay_task) = start_relay(None).await;
+    // Independent histories really compete for the same retained bootstrap row.
+    let server = LoroDoc::new();
+    let row = server.get_map("chats").insert_container(CONFLICT, loro::LoroMap::new()).unwrap();
+    for (field, value) in competing.as_object().unwrap() {
+        row.insert(field, loro::LoroValue::from(value.clone())).unwrap();
+    }
+    server.commit();
+    relay.state.lock().expect("relay state").rooms.insert(format!("ws4/{PROJECT}"), RelayRoom {
+        doc: server, peers: HashMap::new(),
+    });
+    let core = assemble_remote(&data, "device-a", &edge_url, None);
+    wait_for(|| core.workspace.recovery_error().is_some(), "real workspace snapshot conflict").await;
+    assert!(!core.workspace.connected());
+    assert_eq!(core.workspace.doc().chat(CONFLICT).unwrap().unwrap().branch.as_deref(), Some("comet/retained"));
+    let diagnostic = core.workspace.recovery_error().unwrap();
+    assert!(diagnostic.contains(CONFLICT));
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let status = client.call(comet_rpc::methods::SYNC_STATUS, serde_json::json!({})).await.unwrap();
+    assert_eq!(status["workspaceRecoveryError"], diagnostic);
+    relay.set_blocked("device-a", true);
+    let stale_workspace = core.workspace.doc().export_snapshot().unwrap();
+    let empty_session = SessionDoc::init(FRESH).unwrap().export_snapshot().unwrap();
+    let space = core.workspace.doc().read_spaces().unwrap().into_iter()
+        .find(|space| space.device_id == core.device_id && space.path == "/tmp").unwrap();
+    client.call(comet_rpc::methods::MUTATE, serde_json::json!({
+        "op":"createChat", "chatId":FRESH, "spaceId":space.id,
+    })).await.expect("workspace conflict must not reject an unrelated fresh chat");
+    let receipt = client.call(comet_rpc::methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId":FRESH, "command":{"kind":"run", "request":run_request("independent fresh chat"), "messageId":"fresh-user"},
+    })).await.expect("workspace conflict must not reject an unrelated command");
+    assert_eq!(receipt["admission"], "accepted");
+    let command = receipt["commandId"].as_str().unwrap().to_string();
+    drop(client);
+    let handle = core.doc_host.open(FRESH).unwrap();
+    wait_for(|| handle.doc().read_command(&command).unwrap().is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
+        && handle.doc().read_entries().unwrap_or_default().iter().any(|entry| entry.role == MessageRole::Assistant
+            && entry.status == Some(MessageStatus::Complete) && entry_contains(entry, "streamed reply")),
+        "fresh command and assistant completion during workspace conflict").await;
+    assert!(core.workspace.doc().session_ref(USER, FRESH).unwrap().is_some());
+    assert_eq!(core.workspace.recovery_error().as_deref(), Some(diagnostic.as_str()));
+    let store = DocsStore::open(data.join("projects").join(PROJECT).join(USER)).unwrap();
+    let workspace_scope = store.document_scope("workspace3").unwrap().unwrap();
+    let preserved = store.load_pending_records(&workspace_scope).unwrap().into_iter()
+        .find(|record| record.container == "chats" && record.key == CONFLICT).unwrap();
+    assert_eq!(preserved.before, retained.before);
+    assert_eq!(preserved.value, retained.value);
+    let completed = handle.doc().read_entries().unwrap();
+    core.shutdown().await;
+    drop(handle);
+    drop(core);
+    // Force real semantic-journal reload, not merely a warm snapshot round trip.
+    store.save_snapshot("workspace3", &stale_workspace).unwrap();
+    store.save_snapshot(FRESH, &empty_session).unwrap();
+    drop(store);
+    let restarted = assemble_remote(&data, "device-a", &edge_url, None);
+    let restored = restarted.doc_host.open(FRESH).unwrap();
+    assert_eq!(restored.doc().read_command(&command).unwrap().unwrap().status, SessionCommandStatus::Applied);
+    assert_eq!(restored.doc().read_entries().unwrap().len(), completed.len());
+    for entry in &completed { assert_eq!(restored.doc().read_entry(&entry.id).unwrap().as_ref(), Some(entry)); }
+    assert!(restarted.workspace.doc().session_ref(USER, FRESH).unwrap().is_some());
+    assert_eq!(restarted.workspace.doc().chat(CONFLICT).unwrap().unwrap().branch.as_deref(), Some("comet/retained"));
+    relay.set_blocked("device-a", false);
+    wait_for(|| restarted.workspace.recovery_error().is_some(), "retained conflict diagnostic after reload").await;
+    let store = DocsStore::open(data.join("projects").join(PROJECT).join(USER)).unwrap();
+    let preserved = store.load_pending_records(&workspace_scope).unwrap().into_iter()
+        .find(|record| record.container == "chats" && record.key == CONFLICT).unwrap();
+    assert_eq!(preserved.before, retained.before);
+    assert_eq!(preserved.value, retained.value);
+    restarted.shutdown().await;
+    relay_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_authenticated_engines_sync_workspace_streams_and_reconnect_backfill() {
     let (edge_url, relay, relay_task) = start_relay(None).await;
     let dirs = tempfile::tempdir().expect("tempdir");

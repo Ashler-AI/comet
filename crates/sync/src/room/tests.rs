@@ -1214,6 +1214,109 @@ fn readiness_session(doc: LoroDoc) -> (Session, mpsc::Receiver<Vec<u8>>) {
     )
 }
 
+fn durable_journal(binding: &comet_doc::SharedDocument, path: &std::path::Path, scope: &str) -> Arc<crate::DocsStore> {
+    let store = Arc::new(crate::DocsStore::open(path).unwrap());
+    let writer = store.clone();
+    let scope = scope.to_owned();
+    binding.install_journal(Vec::new(), Arc::new(move |records, snapshot| {
+        writer.save_pending_records_for_snapshot(&scope, &scope, records.iter().map(Arc::as_ref), snapshot)
+            .map_err(|error| error.to_string())
+    }));
+    store
+}
+
+#[tokio::test]
+async fn fatal_recovery_and_permission_denial_still_block_command_admission() {
+    use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
+        SessionCommandStatus, SessionDoc, SessionMessageEntry};
+    for failure in ["transcript conflict", "missing chat identity", "permission denied", "journal persistence"] {
+        let temp = tempfile::tempdir().unwrap();
+        let chat = "00000000-0000-4000-8000-000000000112";
+        let local = SessionDoc::init(chat).unwrap();
+        let binding = local.binding();
+        let _store = durable_journal(&binding, temp.path(), chat);
+        let message = |text: &str| SessionMessageEntry {
+            id: "retained".into(), role: MessageRole::User,
+            parts: vec![MessagePart::Text { id: "text".into(), text: text.into() }],
+            created_at: 1, device_id: "owner".into(), status: Some(MessageStatus::Complete),
+            continuation_of: None, peer_message: None,
+        };
+        if failure == "journal persistence" {
+            let db = rusqlite::Connection::open(temp.path().join("docs.sqlite3")).unwrap();
+            db.execute_batch("CREATE TRIGGER fail_write BEFORE INSERT ON semantic_intents BEGIN SELECT RAISE(ABORT, 'journal persistence failed'); END;").unwrap();
+            assert!(local.push_message(&message("retained after disk failure")).is_err());
+            db.execute_batch("DROP TRIGGER fail_write").unwrap();
+        } else { local.push_message(&message("accepted locally")).unwrap(); }
+        if failure == "missing chat identity" { binding.get_map("meta").delete("chatId").unwrap(); binding.commit().unwrap(); }
+        let original = binding.export(ExportMode::Snapshot).unwrap();
+        let intents = serde_json::to_value(binding.pending_records()).unwrap();
+        let (mut session, mut wire) = readiness_session(LoroDoc::new());
+        session.doc = binding.clone();
+        session.room_id = chat.into();
+        if failure == "permission denied" {
+            session.send_loro_updates(vec![original.clone()]).await.unwrap();
+            let ProtocolMessage::DocUpdate { batch_id, .. } = decode(&wire.try_recv().unwrap()).unwrap() else { panic!("expected upload") };
+            assert!(session.on_ack(CrdtType::Loro, batch_id, UpdateStatusCode::PermissionDenied).await.is_err());
+        } else if failure != "journal persistence" {
+            let remote = SessionDoc::init(chat).unwrap();
+            remote.push_message(&message("competing transcript")).unwrap();
+            assert!(session.apply_remote(CrdtType::Loro, vec![remote.export_snapshot().unwrap()]).await.is_err());
+        }
+        assert_eq!(binding.export(ExportMode::Snapshot).unwrap(), original);
+        assert_eq!(serde_json::to_value(binding.pending_records()).unwrap(), intents);
+        assert!(binding.recovery_error().is_some());
+        let command = SessionCommandEntry { id: "must-not-admit".into(), payload: SessionCommandPayload::Interrupt {},
+            issued_by: "owner".into(), issued_at: 1, based_on: None, expires_at: None,
+            status: SessionCommandStatus::Pending, resolution: None };
+        assert!(local.queue_command(&command).is_err(), "{failure} must remain fatal");
+        assert!(local.read_command(&command.id).unwrap().is_none());
+        assert!(binding.commit().is_err());
+    }
+}
+
+#[tokio::test]
+async fn workspace_durability_and_permission_failures_remain_fatal() {
+    for failure in ["snapshot", "acknowledgement", "permission"] {
+        let temp = tempfile::tempdir().unwrap();
+        let local = comet_doc::WorkspaceDoc::new();
+        let binding = local.binding();
+        let store = durable_journal(&binding, temp.path(), "ws4/project");
+        let row = binding.get_map("devices").insert_container("owner", loro::LoroMap::new()).unwrap();
+        row.insert("id", "owner").unwrap();
+        binding.commit().unwrap();
+        let original = binding.export(ExportMode::Snapshot).unwrap();
+        let intents = serde_json::to_value(binding.pending_records()).unwrap();
+        let db = rusqlite::Connection::open(temp.path().join("docs.sqlite3")).unwrap();
+        if failure != "permission" {
+            db.execute_batch(if failure == "snapshot" {
+                "CREATE TRIGGER fail_write BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT, 'snapshot persistence failed'); END;"
+            } else {
+                "CREATE TRIGGER fail_write BEFORE INSERT ON semantic_intents BEGIN SELECT RAISE(ABORT, 'ack persistence failed'); END;"
+            }).unwrap();
+        }
+        let (mut session, mut wire) = readiness_session(LoroDoc::new());
+        session.doc = binding.clone();
+        session.room_id = "ws4/project".into();
+        if failure == "snapshot" {
+            assert!(session.apply_remote(CrdtType::Loro, vec![original.clone()]).await.is_err());
+        } else {
+            session.send_loro_updates(vec![original.clone()]).await.unwrap();
+            let ProtocolMessage::DocUpdate { batch_id, .. } = decode(&wire.try_recv().unwrap()).unwrap() else { panic!("expected upload") };
+            let status = if failure == "permission" { UpdateStatusCode::PermissionDenied } else { UpdateStatusCode::Ok };
+            assert!(session.on_ack(CrdtType::Loro, batch_id, status).await.is_err());
+        }
+        assert_eq!(binding.export(ExportMode::Snapshot).unwrap(), original);
+        assert_eq!(serde_json::to_value(binding.pending_records()).unwrap(), intents);
+        assert_eq!(serde_json::to_value(store.load_pending_records("ws4/project").unwrap()).unwrap(), intents);
+        if failure != "permission" { db.execute_batch("DROP TRIGGER fail_write").unwrap(); }
+        assert!(binding.recovery_error().is_some());
+        assert!(binding.commit().is_err(), "{failure} failure must remain fatal");
+        binding.adopt_snapshot(&original, None).unwrap();
+        assert!(binding.recovery_error().is_none());
+        binding.commit().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn journal_only_full_backfill_finishes_durable_binding_recovery() {
     let source = LoroDoc::new();
