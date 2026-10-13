@@ -22,7 +22,7 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
-Mobile staging **1.0 (33)** and production **1.0 (20)** are available
+Mobile staging **1.0 (34)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -103,7 +103,7 @@ produce these build candidates.
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
 
-### Crew Staging 1.0 (34): warm-load allocation candidate
+### Crew Staging 1.0 (34): liveness crash and warm-load release
 
 The build 33 report submitted on **2026-10-13** confirms a separate timer crash,
 not jetsam: **EXC_BREAKPOINT / SIGTRAP**, Swift arithmetic overflow in
@@ -144,9 +144,28 @@ repair, not the cause of the fetched SIGTRAP. After the timer correction, all
 **32** local simulator markers passed, including the queued-clock boundaries,
 asynchronous hydration, cancellation, retained edits, pending imports, recovery,
 viewport eviction and metadata isolation. No private data was committed, no phone
-cache was cleared, and no library upgrade was required. Build 34 remains an
-unpublished candidate; physical-phone acceptance is still manual. Local typechecks
-were intentionally skipped.
+cache was cleared, and no library upgrade was required. Local typechecks were
+intentionally skipped; physical-phone acceptance remains manual.
+
+Merged source `599fedfd122ab74ea58c93225118071fa2206b27` passed native,
+simulator/live mobile–Edge transport and device archiving alongside desktop
+**0.1.156** in [release run 38472406507](https://github.com/Ashler-AI/comet/actions/runs/38472406507).
+All nine downloaded artifact checksums and main-source provenance matched.
+Existing Xcode cloud-managed signing exported and uploaded it without local
+compilation for publication.
+
+Apple accepted one internal-only staging upload at **22:19 UTC on 2026-10-13**.
+Authenticated readback returned upload **COMPLETE**, processing **VALID** and
+**IN_BETA_TESTING**; the UI shows **Testing** in the existing **Ashler Internal**
+group with one tester, using its existing automatic distribution. Apple build ID:
+`280c960f-cc4f-409a-ab2e-459d85e53f8f`.
+The exact uploaded IPA passed strict deep signature verification with bundle
+`ai.ashler.crew.staging`, version **1.0 (34)**, team `825LYXGJR6`, and matching
+production APNs signature/profile. Uploaded IPA SHA-256:
+`065be3159db95539975b2eb1fd38a28dc2c36ad1894e0c89bee5252966c70a43`.
+Production, tester memberships, account permissions and Scaffold image pins are
+unchanged. Update/reopen build 34 and verify new-session discovery and load stability
+on the phone; the release checks are not physical-device acceptance.
 
 For the actual phone report, use **Settings → Privacy & Security → Analytics &
 Improvements → Analytics Data** and share the `Comet-… .ips` or `JetsamEvent-… .ips`

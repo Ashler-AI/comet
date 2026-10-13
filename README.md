@@ -2,16 +2,23 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Crew 0.1.156: staging refresh candidate
+## Crew 0.1.156: staging desktop release
 
-Packages the current merged native controller, including owner-activity
-reprojection after membership settlement, alongside the mobile build 34 timer
-and load fixes. The timer overflow is iOS-specific; desktop uses its native
-sync implementation. The Scaffold runtime contract is unchanged. Publish staging
-only and verify restarted clients before any production promotion or image-pin
-changes.
+Crew Staging desktop **0.1.156** is available through **Settings → Crew update**
+from merged source `599fedfd122ab74ea58c93225118071fa2206b27` in
+[release run 38472406507](https://github.com/Ashler-AI/comet/actions/runs/38472406507).
+It packages current native owner-activity reprojection after membership settlement.
+Both macOS variants passed signature, notarization, Gatekeeper and DMG/updater
+archive checks. Staging channel readback matched, and the installed staging CLI
+reported **0.1.155 → 0.1.156 available** without installing or restarting it.
 
-## Unreleased: mobile liveness crash and warm-load allocation
+Mobile **1.0 (34)** from the same source is **Testing** in the existing internal
+TestFlight group. The Scaffold runtime contract is unchanged; no production
+promotion, image-pin or tester/account-permission changes occurred. Preserve this
+run ID for exact-candidate promotion only after captain verification of restarted
+staging clients.
+
+## Crew Staging mobile 1.0 (34): liveness crash and warm-load release
 
 The fetched build 33 phone report confirms a Swift arithmetic-overflow **SIGTRAP**
 in `RoomClient.livenessTick`, not a memory-pressure termination. Its default clock
@@ -27,8 +34,10 @@ remote coverage, preserving detached/pending-import and historical rebase proofs
 Workspace cold hydration now runs off-main, list metadata avoids whole-transcript
 forks, and off-screen document eviction no longer waits for scrolling to stop.
 The allocation replay peaked at **381.98 MiB** (**71.1% lower**). All **32** local
-simulator markers passed after the confirmed timer correction. Build 34 is not
-yet published; see [the candidate evidence](apps/ios/README.md#crew-staging-10-34-warm-load-allocation-candidate).
+and merged-source simulator markers passed after the confirmed timer correction.
+Build **1.0 (34)** is now **Testing**; its exact uploaded IPA passed distribution
+signature/profile checks. Physical-phone acceptance remains manual. See
+[the release evidence](apps/ios/README.md#crew-staging-10-34-liveness-crash-and-warm-load-release).
 
 ## Crew Staging mobile 1.0 (33): catalog loading
 
