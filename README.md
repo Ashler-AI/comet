@@ -536,6 +536,14 @@ boundaries remain exact; private execution keys never become discovery rows.
 Legacy output migration checks provenance before publishing recovered messages.
 Cold execution aliases accept authenticated OMP, Codex and Claude Code contexts.
 
+Scaffold disk resumes rotate the host device's lifecycle epoch while retaining
+the native conversation. Saved contexts and pending recovery accept an older
+device epoch only for the same sandbox and room, with unchanged principal and
+project identity and a live, exact deployment-bound grant for the current host.
+That grant must retain read, chat and control capabilities. Revoked, expired,
+foreign-device and future-epoch contexts remain fenced; no journal is rewritten
+and no completed request is replayed merely to make the viewport available.
+
 Mobile browse links retain their exact scope without attaching or resuming a
 sandbox. Conflicting links fail before navigation or sends. Shared attachment
 identities use consistent outbox accounting; terminal controls retain durable

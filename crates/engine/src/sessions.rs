@@ -212,6 +212,45 @@ impl From<&crate::AuthState> for RunAuthIdentity {
     }
 }
 
+fn scaffold_recovery_grant_allows(
+    authority: &crate::auth::DeviceGrantAuthority,
+    grant: &comet_proto::CapabilityGrant,
+    execution_key: &str,
+    previous_device: &str,
+) -> bool {
+    let Some(session_id) = authority.scope.session_id.as_deref().filter(|id| !id.is_empty()) else { return false; };
+    if authority.sandbox_id.is_empty() || authority.scope.project_id.is_empty()
+        || !authority.scope.deployment_id.as_deref().is_some_and(|id| !id.is_empty())
+        || (execution_key != session_id && execution_key.strip_prefix(session_id)
+            .and_then(|suffix| suffix.strip_prefix("::session::")) != Some(session_id))
+    { return false; }
+    let epoch = |device: &str| -> Option<u64> {
+        let value = device.strip_prefix("comet-scaffold-")?
+            .strip_prefix(authority.sandbox_id.as_str())?.strip_prefix("-e")?;
+        if value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
+        value.parse().ok()
+    };
+    let Some(previous_epoch) = epoch(previous_device) else { return false; };
+    let now = crate::now_ms();
+    previous_epoch < authority.lifecycle_epoch
+        && epoch(&authority.device_id) == Some(authority.lifecycle_epoch)
+        && authority.expires_at > now
+        && grant.id == authority.grant_id
+        && grant.principal_subject == authority.principal_subject
+        && grant.scope.project_id == authority.scope.project_id
+        && grant.scope.deployment_id == authority.scope.deployment_id
+        && grant.scope.session_id == authority.scope.session_id
+        && grant.sandbox_id.as_deref() == Some(authority.sandbox_id.as_str())
+        && grant.device_id.as_deref() == Some(authority.device_id.as_str())
+        && grant.lifecycle_epoch == Some(authority.lifecycle_epoch)
+        && grant.granted_at <= now && grant.expires_at.is_some_and(|expires| expires > now)
+        && grant.revoked_at.is_none()
+        && ["session.read", "session.chat", "session.control"].into_iter().all(|required| {
+            authority.capabilities.iter().any(|cap| cap == required)
+                && grant.capabilities.iter().any(|cap| cap == required)
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunRoute {
     harness: HarnessId,
@@ -526,6 +565,19 @@ impl SessionsEngine {
             .unwrap_or(RunAuthIdentity::Unattached)
     }
 
+    fn recovery_binding_matches(&self, key: &str, identity: &RunAuthIdentity, device: &str) -> bool {
+        if identity != &self.auth_identity() { return false; }
+        if device == self.inner.device_id { return true; }
+        // A resumed Scaffold host rotates its device ID, not the owner or room.
+        // Only a live, exact relay grant may adopt that sandbox's earlier epoch.
+        let Some(authority) = self.inner.auth.get().and_then(|auth| auth.device_grant_authority()) else { return false; };
+        if authority.device_id != self.inner.device_id { return false; }
+        let Some(host) = self.inner.doc_host.get() else { return false; };
+        let Some(session_id) = authority.scope.session_id.as_ref() else { return false; };
+        host.collaboration_grants(&authority.principal_subject, std::slice::from_ref(session_id))
+            .iter().any(|grant| scaffold_recovery_grant_allows(&authority, grant, key, device))
+    }
+
     fn dispatch_lock(&self, chat_id: &str) -> Arc<AsyncMutex<()>> {
         self.inner.prune_inactive_state();
         let mut locks = lock(&self.inner.dispatch_locks);
@@ -661,7 +713,7 @@ impl SessionsEngine {
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         match self.inner.journal.read_context::<(RunAuthIdentity, String, HarnessId, RunRequest)>(chat_id) {
             Ok(Some((identity, device_id, _, request)))
-                if identity == self.auth_identity() && device_id == self.inner.device_id => Some(request),
+                if self.recovery_binding_matches(chat_id, &identity, &device_id) => Some(request),
             Ok(_) => None,
             Err(error) => {
                 tracing::warn!(chat = %chat_id, %error, "last request recovery failed");
@@ -685,9 +737,7 @@ impl SessionsEngine {
         let Some((identity, device_id, _, request)) = context else {
             return Ok(None);
         };
-        if identity != self.auth_identity()
-            || device_id != self.inner.device_id
-            || request.cwd.is_empty()
+        if !self.recovery_binding_matches(execution_key, &identity, &device_id) || request.cwd.is_empty()
         {
             return Err(EngineError::Other(
                 "session_context_binding_mismatch".into(),
@@ -866,7 +916,7 @@ impl SessionsEngine {
         if self.inner.auth.get().is_none() && pending.identity != RunAuthIdentity::Unattached {
             return Ok(false);
         }
-        if pending.identity != self.auth_identity() || pending.device_id != self.inner.device_id || pending.request.cwd.is_empty() {
+        if !self.recovery_binding_matches(chat_id, &pending.identity, &pending.device_id) || pending.request.cwd.is_empty() {
             return Err(EngineError::Other("session_recovery_binding_mismatch".into()));
         }
         Ok(true)
@@ -923,8 +973,7 @@ impl SessionsEngine {
             }
         }
         if let Some(pending) = pending.as_ref()
-            && (pending.identity != self.auth_identity()
-                || pending.device_id != self.inner.device_id
+            && (!self.recovery_binding_matches(chat_id, &pending.identity, &pending.device_id)
                 || pending.request.cwd.is_empty())
         {
             return Err(EngineError::Other(
@@ -1730,9 +1779,7 @@ impl SessionsEngine {
                 if context
                     .as_ref()
                     .is_some_and(|(identity, device, _, request)| {
-                        *identity != self.auth_identity()
-                            || device != &self.inner.device_id
-                            || request.cwd.is_empty()
+                        !self.recovery_binding_matches(&chat_id, identity, device) || request.cwd.is_empty()
                     })
                 {
                     return Err(EngineError::Other(
@@ -1819,8 +1866,7 @@ impl SessionsEngine {
                         let host = self.inner.doc_host.get().expect("doc handle requires host");
                         let request = match context {
                             Some((identity, device, harness, request))
-                                if identity == self.auth_identity()
-                                    && device == self.inner.device_id =>
+                                if self.recovery_binding_matches(&chat_id, &identity, &device) =>
                             {
                                 Some((harness, request))
                             }
@@ -3836,6 +3882,74 @@ mod tests {
                 .recovered_context("other::session::other")
                 .is_err()
         );
+    }
+
+    // Failure modes: a resumed host loses its saved context; a different sandbox,
+    // room, owner, revoked grant, or stale/future epoch inherits that context.
+    #[test]
+    fn scaffold_resume_requires_the_same_live_host_scope_and_an_older_device_epoch() {
+        use crate::auth::DeviceGrantAuthority;
+        use comet_proto::{CapabilityGrant, CollaborationScope};
+        let mut authority = DeviceGrantAuthority {
+            grant_id: "grant-a".into(), expires_at: i64::MAX,
+            principal_subject: "owner-a".into(),
+            scope: CollaborationScope { project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()), session_id: Some("session-a".into()),
+                unknown: Default::default() },
+            sandbox_id: "sandbox-a".into(), device_id: "comet-scaffold-sandbox-a-e3".into(),
+            lifecycle_epoch: 3,
+            capabilities: vec!["session.read".into(), "session.chat".into(), "session.control".into()],
+        };
+        let grant = CapabilityGrant {
+            id: authority.grant_id.clone(), principal_subject: authority.principal_subject.clone(),
+            scope: authority.scope.clone(), capabilities: authority.capabilities.clone(),
+            sandbox_id: Some(authority.sandbox_id.clone()), device_id: Some(authority.device_id.clone()),
+            lifecycle_epoch: Some(3), granted_by: "scaffold".into(), granted_at: 0,
+            expires_at: Some(i64::MAX), revoked_at: None, unknown: Default::default(),
+        };
+        let key = "session-a::session::session-a";
+        let previous = "comet-scaffold-sandbox-a-e1";
+        assert!(scaffold_recovery_grant_allows(&authority, &grant, key, previous));
+        assert!(scaffold_recovery_grant_allows(&authority, &grant, "session-a", previous));
+        for invalid in ["desktop-a", "comet-scaffold-sandbox-b-e1", "comet-scaffold-sandbox-a-e0",
+            "comet-scaffold-sandbox-a-e01", "comet-scaffold-sandbox-a-e+1",
+            "comet-scaffold-sandbox-a-e3", "comet-scaffold-sandbox-a-e4",
+            "comet-scaffold-sandbox-a-e18446744073709551616"] {
+            assert!(!scaffold_recovery_grant_allows(&authority, &grant, key, invalid), "{invalid}");
+        }
+        for invalid in ["session-b", "session-a::session::session-b", "session-a::session::session-a::other"] {
+            assert!(!scaffold_recovery_grant_allows(&authority, &grant, invalid, previous), "{invalid}");
+        }
+        let invalidations: &[fn(&mut CapabilityGrant)] = &[
+            |g| g.id = "other-grant".into(),
+            |g| g.principal_subject = "other-owner".into(),
+            |g| g.scope.project_id = "other-project".into(),
+            |g| g.scope.deployment_id = Some("other-deployment".into()),
+            |g| g.scope.session_id = Some("other-session".into()),
+            |g| g.sandbox_id = Some("other-sandbox".into()),
+            |g| g.device_id = Some("comet-scaffold-sandbox-a-e1".into()),
+            |g| g.lifecycle_epoch = Some(1),
+            |g| g.expires_at = Some(0),
+            |g| g.expires_at = None,
+            |g| g.revoked_at = Some(0),
+            |g| g.granted_at = i64::MAX,
+            |g| g.capabilities.retain(|cap| cap != "session.read"),
+            |g| g.capabilities.retain(|cap| cap != "session.chat"),
+            |g| g.capabilities.retain(|cap| cap != "session.control"),
+        ];
+        for (index, invalidate) in invalidations.iter().enumerate() {
+            let mut invalid = grant.clone();
+            invalidate(&mut invalid);
+            assert!(!scaffold_recovery_grant_allows(&authority, &invalid, key, previous), "boundary {index}");
+        }
+        authority.lifecycle_epoch = 4;
+        assert!(!scaffold_recovery_grant_allows(&authority, &grant, key, previous));
+        authority.lifecycle_epoch = 3;
+        authority.expires_at = 0;
+        assert!(!scaffold_recovery_grant_allows(&authority, &grant, key, previous));
+        authority.expires_at = i64::MAX;
+        authority.capabilities.retain(|cap| cap != "session.control");
+        assert!(!scaffold_recovery_grant_allows(&authority, &grant, key, previous));
     }
 
     #[test]
