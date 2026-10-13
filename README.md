@@ -2,6 +2,15 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.156: staging refresh candidate
+
+Packages the current merged native controller, including owner-activity
+reprojection after membership settlement, alongside the mobile build 34 timer
+and load fixes. The timer overflow is iOS-specific; desktop uses its native
+sync implementation. The Scaffold runtime contract is unchanged. Publish staging
+only and verify restarted clients before any production promotion or image-pin
+changes.
+
 ## Unreleased: mobile liveness crash and warm-load allocation
 
 The fetched build 33 phone report confirms a Swift arithmetic-overflow **SIGTRAP**
