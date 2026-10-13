@@ -4040,7 +4040,7 @@ impl Shell {
         let rest_text = if selected { text } else { text.opacity(0.8) };
         // Top-right status slot (reference shot): Working spins the thin arc,
         // finished-unseen / awaiting-input / errored raise the attention dot,
-        // Idle keeps the plain recency label.
+        // Devbox idle rows keep their status visible alongside recency.
         let status_slot: AnyElement = match status {
             // 9px ring nudged 1px down: its top edge lands 3px into the 13px
             // band — the same inset as the attention dot — instead of hugging
@@ -4074,7 +4074,11 @@ impl Shell {
                 .text_size(px(10.5))
                 .line_height(px(13.0))
                 .text_color(subline)
-                .child(time_ago)
+                .child(if meta.environment.is_some() {
+                    format!("Idle · {time_ago}").into()
+                } else {
+                    time_ago
+                })
                 .into_any_element(),
         };
         // Hover reveal without a `group-hover` (gpui has none): the row's own
