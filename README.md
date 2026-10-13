@@ -720,6 +720,11 @@ composer indicators aligned when workspace synchronization is stalled. Local
 engine status still wins for locally hosted sessions. Membership and owner checks
 fence remote activity; static streaming snapshots do not count as fresh heartbeats.
 
+Controllers also use verified owner-session heartbeat timestamps for device
+presence. A live Devbox stays online when workspace presence or relay-status
+probes are unavailable; cached transcripts cannot extend the online lease.
+Sidebar badges, device settings, and the send/wake gate share this signal.
+
 Canonical session controls keep an existing bare-chat writer's live execution key,
 so publishing its room record does not strand Stop, steering, or input answers.
 Upgrade both controller and host; already-running older binaries do not acquire

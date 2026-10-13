@@ -140,7 +140,7 @@ struct WorkspaceHostInner {
     /// applies only to legacy ownership recovery, not subsequent membership writes.
     journal_session_ids: std::collections::HashSet<String>,
     session_refs_checked: Mutex<std::collections::HashSet<String>>,
-    /// Freshest presence heartbeat (ms) we have EVER observed per device. The
+    /// Freshest workspace or owner-session heartbeat (ms) observed per device. The
     /// ephemeral store forgets entries after its 30s TTL and starts empty on a
     /// room (re)join, so without this cache a receive-side hiccup snaps a
     /// device's overlay back to its boot-time doc `lastSeenAt` — an instant
@@ -915,7 +915,7 @@ impl WorkspaceHost {
         }
     }
 
-    /// Project session-room activity without rewriting chat metadata or seen state.
+    /// Project owned session-room activity into session and device presence watches.
     /// The membership lock also fences a watcher racing an unpin or route change.
     pub(crate) fn record_session_activity(
         &self,
@@ -952,6 +952,27 @@ impl WorkspaceHost {
                     return Ok(());
                 }
             }
+        }
+        // The owning runtime's heartbeat also proves device liveness when the
+        // workspace or relay-status probe is unavailable. Never renew on receipt:
+        // replayed room snapshots retain the original host timestamp.
+        let heartbeat = session.updated_at.timestamp_millis();
+        let advanced = {
+            let mut seen = lock(&self.inner.presence_seen);
+            match seen.get_mut(&session.device_id) {
+                Some(previous) if *previous >= heartbeat => false,
+                Some(previous) => {
+                    *previous = heartbeat;
+                    true
+                }
+                None => {
+                    seen.insert(session.device_id.clone(), heartbeat);
+                    true
+                }
+            }
+        };
+        if advanced {
+            self.inner.publish_presence();
         }
         // Consumers read this watch directly; a workspace import may remain pending
         // forever when peers have incompatible shallow frontiers.
@@ -1518,7 +1539,7 @@ impl WorkspaceHostInner {
         }
     }
 
-    /// Fold the 15s ephemeral presence heartbeats into the device rows'
+    /// Fold workspace and owned session heartbeats into the device rows'
     /// `lastSeenAt` before publishing. The doc row is written on boot/shutdown
     /// ONLY (oplog hygiene), so without this overlay every device looks offline
     /// ~70s after its boot — and a genuinely dead host is indistinguishable
@@ -1713,10 +1734,8 @@ fn merge_sessions(
 /// for each known device whose merged heartbeat freshness has gone stale, ask
 /// its DeviceRoom whether the host socket is live (`/device/{id}/status`); a
 /// positive answer refreshes the presence cache so the overlay keeps the badge
-/// online. The DeviceRoom shares no machinery with the workspace room, so a
-/// false "offline" now requires BOTH independent paths to be down — at which
-/// point the device is, for every purpose the app has, genuinely offline.
-/// Steady state (healthy room, fresh heartbeats) probes nothing.
+/// online independently of workspace and session-room delivery. Stale device
+/// heartbeats trigger probes; healthy rooms send no extra traffic.
 async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
