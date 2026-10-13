@@ -48,6 +48,7 @@ const markers = [
   "OK Crew durable intents",
   "OK Crew transcript freshness",
   "OK Crew foreground and blocked recovery",
+  "OK Crew liveness clock",
   "OK Crew owner publication register",
   "OK Crew mixed nested tool calls",
   "OK Crew deployment retarget",

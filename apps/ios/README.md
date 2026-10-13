@@ -105,9 +105,19 @@ or `verify/native-startup-*`; it neither creates nor signs mobile archives.
 
 ### Crew Staging 1.0 (34): warm-load allocation candidate
 
-Build 33 still closed while loading on the physical phone. TestFlight exposed no
-matching crash feedback, and the phone was unavailable to local device tooling;
-the actual termination reason remains unconfirmed.
+The build 33 report submitted on **2026-10-13** confirms a separate timer crash,
+not jetsam: **EXC_BREAKPOINT / SIGTRAP**, Swift arithmetic overflow in
+`RoomClient.livenessTick(gen:at:)` at line 352, about **11.1 seconds** after launch
+on iOS **27.0.1**. Incident `1C81648B-BA51-4C58-8561-75743E95840A` was fetched
+through authenticated TestFlight readback. The released archive's matching dSYM
+UUID and local `atos` readback verified the crashing frame.
+
+The tick's default clock was sampled at its caller, before the actor hop. Newer
+room traffic could update the backfill clock before the queued tick executed;
+unsigned `now - base` then trapped. Build 34 samples real time inside the actor
+and checks clock ordering before join/backfill/probe subtraction. The existing
+foreground regression covers older queued ticks without spurious reconnects,
+and verifies expired backfill still redials. CI requires its liveness marker.
 
 A matched iPhone 13 Pro simulator replay used a private 5.94 MB staging workspace,
 12 cached session snapshots totaling 17.16 MB, and full backfill to the nine visible
@@ -128,13 +138,15 @@ forks an entire transcript, and a changed frontier rejects a raced metadata read
 The first off-screen release deadline is bounded during scrolling; displaced
 transcript stores are released after their final list reader leaves.
 
-The same replay then peaked at **381.98 MiB RSS**, a **71.1%** reduction, and settled
-at **101.02 MiB** versus **297.64 MiB**. All 31 simulator markers passed, including
-asynchronous hydration, cancellation, intervening edits, pending imports, repeated
-recovery, viewport eviction and metadata isolation. No private data was committed,
-no phone cache was cleared, and no library/dependency upgrade was required.
-This is a verified candidate, not TestFlight publication or phone acceptance.
-Local typechecks were intentionally skipped.
+The same allocation replay peaked at **381.98 MiB RSS**, a **71.1%** reduction, and
+settled at **101.02 MiB** versus **297.64 MiB**. This is an independent allocation
+repair, not the cause of the fetched SIGTRAP. After the timer correction, all
+**32** local simulator markers passed, including the queued-clock boundaries,
+asynchronous hydration, cancellation, retained edits, pending imports, recovery,
+viewport eviction and metadata isolation. No private data was committed, no phone
+cache was cleared, and no library upgrade was required. Build 34 remains an
+unpublished candidate; physical-phone acceptance is still manual. Local typechecks
+were intentionally skipped.
 
 For the actual phone report, use **Settings → Privacy & Security → Analytics &
 Improvements → Analytics Data** and share the `Comet-… .ips` or `JetsamEvent-… .ips`

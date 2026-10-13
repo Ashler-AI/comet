@@ -326,9 +326,10 @@ actor RoomClient {
     /// hibernating-but-healthy DO is simply woken by the probe and answers —
     /// hibernation is NOT death, which is why probes run in minutes while
     /// the transport lease runs in seconds.
-    private func livenessTick(gen: Int, at instant: DispatchTime = .now()) async {
+    private func livenessTick(gen: Int, at instant: DispatchTime? = nil) async {
         guard gen == generation, !closed else { return }
-        let now = instant.uptimeNanoseconds
+        // Sample after entering the actor; a queued call can follow newer traffic.
+        let now = (instant ?? .now()).uptimeNanoseconds
         if pending.values.contains(where: {
             now >= $0.sent.uptimeNanoseconds && now - $0.sent.uptimeNanoseconds >= Self.ackDeadlineNs
         }) {
@@ -338,7 +339,7 @@ actor RoomClient {
         }
         if let sent = joinSentAt {
             let base = max(sent.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
-            if now - base > RoomClient.joinDeadlineNs {
+            if now >= base, now - base > RoomClient.joinDeadlineNs {
                 // The 2026-07-30 hang: a room that accepted the socket but
                 // never answered the join. Redial via the backoff loop — one
                 // fresh dial re-instantiates a wedged DO.
@@ -349,13 +350,14 @@ actor RoomClient {
         }
         if let started = backfillStartedAt {
             let base = max(started.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
-            if now - base > RoomClient.joinDeadlineNs {
+            if now >= base, now - base > RoomClient.joinDeadlineNs {
                 roomLog.warning("room \(self.roomId, privacy: .public): joined but backfill did not complete; redialing")
                 onSocketError(gen: gen)
             }
             return
         }
-        if joinedLor, now - lastPushedRx.uptimeNanoseconds > probeIntervalNs {
+        if joinedLor, now >= lastPushedRx.uptimeNanoseconds,
+           now - lastPushedRx.uptimeNanoseconds > probeIntervalNs {
             probeIntervalNs = min(probeIntervalNs * 2, RoomClient.roomProbeMaxNs)
             await sendProbe()
         }
@@ -1551,13 +1553,43 @@ actor RoomClient {
             }, adoptSnapshot: { _, _ in false })
         let ackClient = RoomClient(roomId: "ws4/lost-ack", doc: LoroDoc(),
             urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
+        let queuedClient = RoomClient(roomId: "ws4/queued-tick", doc: LoroDoc(),
+            urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
         guard await client.exerciseBroadcastProbe(),
               await ackClient.exerciseLostLiveAcknowledgement(),
+              await queuedClient.exerciseQueuedLivenessTick(),
               await blockedClient.exerciseBlockedSnapshot(blocked) else {
             await E2ERunner.log("FAIL Crew foreground and blocked recovery")
             return false
         }
         await E2ERunner.log("OK Crew foreground and blocked recovery: stale broadcast probe, ACK isolation, conflict visible, no automatic blocked retry")
+        return true
+    }
+
+    private func exerciseQueuedLivenessTick() async -> Bool {
+        var probes = 0
+        regressionSend = { message in
+            if case .joinRequest(.loro, _, _, _) = message { probes += 1 }
+        }
+        defer { regressionSend = nil; stop() }
+        let sampled = DispatchTime.now()
+        let newer = DispatchTime(uptimeNanoseconds: sampled.uptimeNanoseconds + 1)
+        let gen = generation
+        lastLorRx = newer; lastPushedRx = newer
+        joinSentAt = newer
+        await livenessTick(gen: gen, at: sampled)
+        guard generation == gen, reconnectTask == nil, !closed else { return false }
+        joinSentAt = nil; backfillStartedAt = newer
+        await livenessTick(gen: gen, at: sampled)
+        guard generation == gen, reconnectTask == nil, !closed else { return false }
+        backfillStartedAt = nil; joinedLor = true
+        await livenessTick(gen: gen, at: sampled)
+        guard generation == gen, reconnectTask == nil, probes == 0, joinedLor else { return false }
+        backfillStartedAt = newer
+        await livenessTick(gen: gen, at: DispatchTime(
+            uptimeNanoseconds: newer.uptimeNanoseconds + RoomClient.joinDeadlineNs + 1))
+        guard generation != gen, reconnectTask != nil, !joinedLor else { return false }
+        await E2ERunner.log("OK Crew liveness clock: queued ticks tolerate newer join/backfill/push clocks; expired backfill still redials")
         return true
     }
 
