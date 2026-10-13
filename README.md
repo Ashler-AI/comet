@@ -37,7 +37,7 @@ completed mock-agent output without a metadata warning. No live cache was reset
 or existing session restarted. Installed-client acceptance remains required;
 this release changes neither mobile build numbers nor Scaffold image pins.
 
-## Unreleased: explicit devbox idle status
+## Crew 0.1.154: explicit devbox idle status
 
 Namespace and Boat session cards show `Idle · age` instead of an age alone.
 Working, input, error and completion indicators are unchanged; local Mac sessions
