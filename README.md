@@ -2,6 +2,25 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: mobile liveness crash and warm-load allocation
+
+The fetched build 33 phone report confirms a Swift arithmetic-overflow **SIGTRAP**
+in `RoomClient.livenessTick`, not a memory-pressure termination. Its default clock
+was sampled before the actor hop; newer room traffic could advance the deadline
+base before the tick ran. Build 34 samples inside the actor and guards unsigned
+clock subtraction while preserving expired-lease reconnects.
+
+A private matched simulator replay independently exposed a **1,320.77 MiB** peak:
+Loro's state-vector equality guard reconstructed ancestry and copied immutable
+maps. Build 34 uses frontier equality for materialization and oplog vectors for
+remote coverage, preserving detached/pending-import and historical rebase proofs.
+
+Workspace cold hydration now runs off-main, list metadata avoids whole-transcript
+forks, and off-screen document eviction no longer waits for scrolling to stop.
+The allocation replay peaked at **381.98 MiB** (**71.1% lower**). All **32** local
+simulator markers passed after the confirmed timer correction. Build 34 is not
+yet published; see [the candidate evidence](apps/ios/README.md#crew-staging-10-34-warm-load-allocation-candidate).
+
 ## Crew Staging mobile 1.0 (33): catalog loading
 
 Mobile build 33 recovers an `InvalidUpdate` upload reply through bounded

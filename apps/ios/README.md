@@ -35,7 +35,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 33
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 34
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -76,7 +76,7 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-33-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-33-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-34-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-34-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
@@ -102,6 +102,57 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew Staging 1.0 (34): warm-load allocation candidate
+
+The build 33 report submitted on **2026-10-13** confirms a separate timer crash,
+not jetsam: **EXC_BREAKPOINT / SIGTRAP**, Swift arithmetic overflow in
+`RoomClient.livenessTick(gen:at:)` at line 352, about **11.1 seconds** after launch
+on iOS **27.0.1**. Incident `1C81648B-BA51-4C58-8561-75743E95840A` was fetched
+through authenticated TestFlight readback. The released archive's matching dSYM
+UUID and local `atos` readback verified the crashing frame.
+
+The tick's default clock was sampled at its caller, before the actor hop. Newer
+room traffic could update the backfill clock before the queued tick executed;
+unsigned `now - base` then trapped. Build 34 samples real time inside the actor
+and checks clock ordering before join/backfill/probe subtraction. The existing
+foreground regression covers older queued ticks without spurious reconnects,
+and verifies expired backfill still redials. CI requires its liveness marker.
+
+A matched iPhone 13 Pro simulator replay used a private 5.94 MB staging workspace,
+12 cached session snapshots totaling 17.16 MB, and full backfill to the nine visible
+session rooms. Build 33 peaked at **1,320.77 MiB RSS**. Sampling identified the
+workspace cache's `stateVv()` materialization check rebuilding causal vectors
+through `AppDag.ensure_vv_for`, immutable-map `get_mut` and `Arc.make_mut`.
+
+Build 34 compares canonical state/oplog frontiers for complete materialization,
+then uses the existing oplog vector for required-server-version coverage. This
+avoids reconstructing ancestry without relaxing pending-import, detached-state
+or remote-coverage checks. Session projection keys also retain frontiers instead
+of reconstructed state vectors. Historical rebase proofs are unchanged.
+
+Cold workspace import, migration, retained-goal replay and projection run off the
+UI actor with epoch/document/version fences; stopped or superseded work cannot
+replace the cache. Warm restart keeps its live replica. List metadata no longer
+forks an entire transcript, and a changed frontier rejects a raced metadata read.
+The first off-screen release deadline is bounded during scrolling; displaced
+transcript stores are released after their final list reader leaves.
+
+The same allocation replay peaked at **381.98 MiB RSS**, a **71.1%** reduction, and
+settled at **101.02 MiB** versus **297.64 MiB**. This is an independent allocation
+repair, not the cause of the fetched SIGTRAP. After the timer correction, all
+**32** local simulator markers passed, including the queued-clock boundaries,
+asynchronous hydration, cancellation, retained edits, pending imports, recovery,
+viewport eviction and metadata isolation. No private data was committed, no phone
+cache was cleared, and no library upgrade was required. Build 34 remains an
+unpublished candidate; physical-phone acceptance is still manual. Local typechecks
+were intentionally skipped.
+
+For the actual phone report, use **Settings → Privacy & Security → Analytics &
+Improvements → Analytics Data** and share the `Comet-… .ips` or `JetsamEvent-… .ips`
+matching the closure time. [Apple's collection guidance](https://developer.apple.com/documentation/xcode/acquiring-crash-reports-and-diagnostic-logs)
+includes this route for watchdog and memory-termination reports unavailable in
+the Crashes organizer. Do not reinstall or clear retained data to collect it.
 
 ### Crew Staging 1.0 (33): rejected-upload recovery and safe list decoding
 
@@ -491,8 +542,9 @@ entire line prefix.
 The September 8 mobile performance pass moves remote workspace projection and
 session-cache imports off the UI actor. Workspace lists and row-context lookups
 use equality-gated retained arrays/indexes instead of repeated filtering/sorting.
-Only visible rows lease metadata rooms; disposal waits for 300 ms of viewport
-quiet and yields between stores. Snapshot flushes remain synchronous to preserve
+Only visible rows lease metadata rooms; the first off-screen row gets a bounded
+300 ms grace period, even during scrolling, and disposal yields between stores.
+Snapshot flushes remain synchronous to preserve
 background/sign-out durability and replica-adoption ordering.
 
 Workspace readiness waits for the server's advertised document version to be
