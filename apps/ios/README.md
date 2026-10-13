@@ -35,7 +35,7 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 xcodebuild -project Comet.xcodeproj -scheme Comet \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 32
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 33
 xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
   -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
 ```
@@ -76,7 +76,7 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-32-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-32-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-33-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-33-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
@@ -102,6 +102,35 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew Staging 1.0 (33): rejected-upload recovery and safe list decoding
+
+Build 32 stops its workspace room on an `InvalidUpdate` acknowledgement. A
+legacy warm cache with an unacknowledged read marker then cannot discover a
+session added afterward, even while independent session rooms remain usable.
+Build 33 requests isolated authoritative backfill and reconciles the original
+local records through the existing snapshot-adoption path. Three unsuccessful
+heals remain bounded; permission denial, oversized payloads and genuine local
+conflicts still stop with their original data retained. Verified admission and
+convergence reset the heal allowance.
+
+Workspace membership `environment`/`startup` and workspace/session-publication
+`modelRetry` now require object-shaped values before Foundation serialization.
+Null/scalar top-level values raised `NSInvalidArgumentException`, which Swift
+`try?` cannot catch. Invalid optional values no longer terminate list projection
+or discard an otherwise valid membership/status row.
+
+The shipped build 32 simulator reproduced both failures. The build 33 simulator
+displayed the newly discovered session after a rejected upload while preserving
+the local read marker, and loaded the same null-field cache without termination.
+All 31 regression markers passed, including repeated successful heals, bounded
+rejection, permission/conflict retention and valid optional-object decoding.
+
+This is local simulator evidence, not TestFlight publication or physical-phone
+acceptance. The hosted staging catalog served the new session to a read-only cold
+observer; the phone's cache, sync logs and crash report were unavailable, so its
+exact trigger remains unconfirmed. No live cache reset or account changes were
+performed. Local typechecks were intentionally skipped.
 
 ### Crew Staging 1.0 (32): host-owned creation candidate
 

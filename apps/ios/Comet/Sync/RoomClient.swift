@@ -70,6 +70,7 @@ actor RoomClient {
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
     private var fullResyncs = 0
+    private var rejectedUpdates = 0
     private var snapshotRecovery: LoroDoc?
     private var serverVersion: VersionVector?
     // Join advertisements and pending imports may not advance either local VV.
@@ -630,6 +631,7 @@ actor RoomClient {
         deferredFullResync = false
         backfillStartedAt = nil
         fullResyncs = 0
+        rejectedUpdates = 0
         backoffMs = RoomClient.backoffBaseMs
         if joinedLor { events(.connected) }
         if let serverVersion { events(.localChangesAcknowledged(serverVersion.encode())) }
@@ -744,12 +746,17 @@ actor RoomClient {
             catchupBatches.remove(refId)
             finishRecoveryIfCaughtUp()
         } else {
-            // Every rejected operation remains in the durable document. Retry
-            // through bounded socket backoff, never a lifetime counter that
-            // leaves a permanently rejected upload showing as connected.
-            roomLog.error("room \(self.roomId, privacy: .public): update rejected (\(String(describing: status), privacy: .public)); redialing")
-            recovering = true
-            if status == .permissionDenied || status == .invalidUpdate || status == .payloadTooLarge {
+            // Retained ancestry may need authoritative reconciliation, not a
+            // permanently stopped workspace. Permission/size failures stay blocked.
+            roomLog.error("room \(self.roomId, privacy: .public): update rejected (\(String(describing: status), privacy: .public))")
+            if status == .invalidUpdate, rejectedUpdates < RoomClient.maxFullResyncs {
+                rejectedUpdates += 1
+                pending.removeAll()
+                catchupBatches.removeAll()
+                recoverApplicationIntents = true
+                await requestFullSnapshot()
+            } else if status == .permissionDenied || status == .invalidUpdate || status == .payloadTooLarge {
+                recovering = true
                 blockRecovery("Crew could not publish retained records (\(String(describing: status))). The original intents are retained; resolve the permission or record conflict before retrying.")
             } else { onSocketError(gen: generation) }
         }
@@ -1073,6 +1080,14 @@ actor RoomClient {
                 return false
             }
         }
+        let rejectedClient = RoomClient(roomId: "ws4/rejected-regression", doc: LoroDoc(),
+            urlProvider: { nil }, events: { _ in }, adoptSnapshot: { previous, replacement in
+                DocDisk.preserveLocalOperations(from: previous, in: replacement)
+            })
+        guard await rejectedClient.exerciseRejectedUploadRecovery() else {
+            await E2ERunner.log("FAIL Crew rejected catalog recovery")
+            return false
+        }
         let recoveryClient = RoomClient(roomId: "regression", doc: LoroDoc(),
                                         urlProvider: { nil }, events: { _ in },
                                         adoptSnapshot: { _, _ in false })
@@ -1081,6 +1096,58 @@ actor RoomClient {
             return false
         }
         return true
+    }
+
+    private func exerciseRejectedUploadRecovery() async -> Bool {
+        var uploads: [([[UInt8]], BatchId)] = []
+        var fullJoins = 0
+        regressionSend = { message in
+            if case .docUpdate(.loro, _, let bytes, let batch) = message { uploads.append((bytes, batch)) }
+            if case .joinRequest(.loro, _, _, let version) = message, version.isEmpty { fullJoins += 1 }
+        }
+        defer { regressionSend = nil; stop() }
+        do {
+            let source = LoroDoc()
+            let old = try source.getMap(id: "chats").getOrCreateContainer(key: "old", child: LoroMap())
+            try old.insert(key: "id", v: "old"); try old.insert(key: "deviceId", v: "host")
+            try old.insert(key: "title", v: "Cached session")
+            _ = try doc.importWith(bytes: source.export(mode: .snapshot), origin: "fixture")
+            // Successful heals reset the allowance; it is not a lifetime cap.
+            for turn in 1...4 {
+                uploads.removeAll()
+                let seen = Int64(turn)
+                try doc.getMap(id: "chats").getOrCreateContainer(key: "old", child: LoroMap())
+                    .insert(key: "lastSeenAt", v: seen)
+                doc.commit()
+                await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                guard let rejected = uploads.first else { return false }
+                await onAck(crdt: .loro, refId: rejected.1, status: .invalidUpdate)
+                guard !closed, recovering, recoverApplicationIntents, fullJoins == turn else { return false }
+                let id = "new-\(turn)"
+                let row = try source.getMap(id: "chats").getOrCreateContainer(key: id, child: LoroMap())
+                try row.insert(key: "id", v: id); try row.insert(key: "deviceId", v: "host")
+                try row.insert(key: "title", v: "New desktop session \(turn)")
+                try row.insert(key: "createdAt", v: seen)
+                let ref = try source.getMap(id: "sessionRefs").getOrCreateContainer(key: id, child: LoroMap())
+                try ref.insert(key: "userId", v: "reader"); try ref.insert(key: "chatId", v: id)
+                try ref.insert(key: "addedAt", v: seen)
+                source.commit()
+                uploads.removeAll()
+                await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                await applyRemote(crdt: .loro, updates: [[UInt8](try source.export(mode: .snapshot))])
+                guard !uploads.isEmpty, recovering else { return false }
+                for (bytes, batch) in uploads {
+                    for update in bytes { _ = try source.importWith(bytes: Data(update), origin: "phone") }
+                    await onAck(crdt: .loro, refId: batch, status: .ok)
+                }
+                guard !recovering, !closed, rejectedUpdates == 0,
+                      WorkspaceStore.decodeProjection(from: doc, userId: "reader")?.lists.overviewChats.first?.id == id,
+                      doc.getMap(id: "chats").get(key: "old")?.asLoroMap()?.get(key: "lastSeenAt")?.asValue()?.i64Value == seen
+                else { return false }
+            }
+            await E2ERunner.log("OK Crew rejected catalog recovery: authoritative backfill discovers new sessions, retains local reads and resets the bounded heal allowance")
+            return true
+        } catch { return false }
     }
 
     private func exerciseWarmShallowRecovery(serverSeen: Int64) async -> Bool {
@@ -1248,12 +1315,18 @@ actor RoomClient {
                       connectionEvents.withLock({ $0 == [false, true] }) else { return false }
                 await onAck(crdt: .loro, refId: batches[1], status: .permissionDenied)
                 guard connectionEvents.withLock({ $0 == [false, true, false] }) else { return false }
+            } else if status == .invalidUpdate {
+                guard !closed, recovering, recoverApplicationIntents else { return false }
+                for _ in 0..<RoomClient.maxFullResyncs {
+                    await onJoinOk(crdt: .loro, version: [])
+                    guard let batch = batches.last else { return false }
+                    await onAck(crdt: .loro, refId: batch, status: .invalidUpdate)
+                }
             } else {
                 guard connectionEvents.withLock({ $0 == [false, false] }) else { return false }
             }
             finishRecoveryIfCaughtUp()
-            let permanent = status == .ok || status == .permissionDenied || status == .invalidUpdate || status == .payloadTooLarge
-            return recovering && !joinedLor && (permanent ? closed && reconnectTask == nil : reconnectTask != nil)
+            return recovering && !joinedLor && closed && reconnectTask == nil
                 && doc.getMap(id: "meta").get(key: "offline")?.asValue()?.stringValue == "retained"
         } catch { return false }
     }

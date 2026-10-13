@@ -2,6 +2,21 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: Crew Staging mobile catalog loading
+
+Mobile build 33 recovers an `InvalidUpdate` upload reply through bounded
+authoritative backfill instead of permanently stopping session discovery.
+Original local records survive reconciliation; permission, payload-size and
+genuine record conflicts remain blocked. Optional membership and retry objects
+are shape-checked before Foundation JSON serialization, preventing its uncaught
+null/scalar exception without hiding valid session rows.
+
+Both failure mechanisms reproduced in shipped build 32. The build 33 simulator
+then displayed a new session after rejection, retained its local read marker,
+loaded the formerly crashing cache and passed all 31 regression markers.
+Exact physical-phone attribution and TestFlight publication remain separate;
+see [the mobile candidate evidence](apps/ios/README.md#crew-staging-10-33-rejected-upload-recovery-and-safe-list-decoding).
+
 ## Crew 0.1.153: bounded workspace replay
 
 A 371-byte accepted update could materialize a causal vector for every retained

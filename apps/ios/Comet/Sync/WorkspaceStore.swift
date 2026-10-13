@@ -650,13 +650,15 @@ final class WorkspaceStore {
                   let chatId = row["chatId"]?.stringValue,
                   let addedAt = row["addedAt"]?.i64Value else { return nil }
             let environment: SessionEnvironment? = row["environment"].flatMap { value in
-                guard let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else {
+                guard value.mapValue != nil,
+                      let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else {
                     return nil
                 }
                 return try? JSONDecoder().decode(SessionEnvironment.self, from: data)
             }
             let startup: SessionStartup? = row["startup"].flatMap { value in
-                guard let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else { return nil }
+                guard value.mapValue != nil,
+                      let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else { return nil }
                 return try? JSONDecoder().decode(SessionStartup.self, from: data)
             }
             return SessionRef(chatId: chatId, addedAt: addedAt,
@@ -682,7 +684,7 @@ final class WorkspaceStore {
             rows[chatId] = SessionRow(chatId: chatId, deviceId: deviceId, status: status,
                                       startedAt: m["startedAt"]?.i64Value,
                                       updatedAt: m["updatedAt"]?.i64Value ?? 0)
-            if let value = m["modelRetry"],
+            if let value = m["modelRetry"], value.mapValue != nil,
                let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
                 rows[chatId]?.modelRetry = try? JSONDecoder().decode(ModelRetry.self, from: data)
             }
