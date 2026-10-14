@@ -1536,6 +1536,7 @@ async fn rpc_surface_over_in_memory_transport() {
     let first_sessions = tokio::time::timeout(Duration::from_secs(5), sessions_stream.recv())
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
     assert_eq!(first_sessions, serde_json::json!([]));
 
@@ -1548,6 +1549,7 @@ async fn rpc_surface_over_in_memory_transport() {
         .unwrap();
     let initial = tokio::time::timeout(Duration::from_secs(5), messages_stream.recv())
         .await
+        .unwrap()
         .unwrap()
         .unwrap();
     // Delta protocol: the stream opens with a full reset frame.
@@ -1580,7 +1582,8 @@ async fn rpc_surface_over_in_memory_transport() {
         let item = tokio::time::timeout_at(deadline, messages_stream.recv())
             .await
             .expect("doc messages before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         let frame: comet_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
         comet_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
         if materialized.len() == 2 && materialized[1].status == Some(MessageStatus::Complete) {
@@ -1600,7 +1603,8 @@ async fn rpc_surface_over_in_memory_transport() {
         let item = tokio::time::timeout_at(deadline, sessions_stream.recv())
             .await
             .expect("session update before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         let list: Vec<serde_json::Value> = serde_json::from_value(item).unwrap();
         if list.first().and_then(|s| s["status"].as_str()) == Some("idle") {
             break;

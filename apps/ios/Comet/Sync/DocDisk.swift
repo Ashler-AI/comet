@@ -159,6 +159,19 @@ enum DocDisk {
         return true
     }
 
+    /// Validate with the migration's own rules before deciding whether a fork is needed.
+    static func workspaceRowsNeedMigration(in doc: LoroDoc) throws -> Bool {
+        for root in ["chats", "sessions", "sessionRefs", "worktreeDeletions"] {
+            for (key, value) in doc.getMap(id: root).getDeepValue().mapValue ?? [:] {
+                var original = RecordIntent(root: root, key: key, before: nil)
+                original.after = try recordData(value)
+                let normalized = try normalizeWorkspaceIntent(original)
+                if normalized.key != key || normalized.after != original.after { return true }
+            }
+        }
+        return false
+    }
+
     /// Work on a fork before binding it: failures leave the cache and its evidence intact.
     static func migrateWorkspaceRows(in doc: LoroDoc) throws -> Bool {
         var changed = false
@@ -228,6 +241,26 @@ enum DocDisk {
                 throw MobileSessionError.unavailable("Crew recovery cannot replace a known record owner or deployment route.")
             }
         }
+        let independentCreation = root == "chats" && before == nil
+            && after?.mapValue?["id"]?.stringValue == key && server?.mapValue?["id"]?.stringValue == key
+        func same(_ field: String, _ left: LoroValue?, _ right: LoroValue?) -> Bool {
+            if left == right { return true }
+            guard root == "chats" else { return false }
+            if independentCreation && field == "createdAt", left?.i64Value != nil, right?.i64Value != nil { return true }
+            guard field == "config", let left = left?.mapValue, let right = right?.mapValue else { return false }
+            // Swift omits nil optionals; native serialization writes null.
+            // Unknown fields and non-null changes remain genuine conflicts.
+            func matches(_ row: [String: LoroValue], _ other: [String: LoroValue]) -> Bool {
+                row.allSatisfy { field, value in
+                    if other[field] == value { return true }
+                    switch field {
+                    case "model", "reasoning", "sandbox": return value == .null && other[field] == nil
+                    default: return false
+                    }
+                }
+            }
+            return matches(left, right) && matches(right, left)
+        }
         if server == after { return }
         var before = before
         if let desired = after?.mapValue, let remote = server?.mapValue, !alternatives.isEmpty {
@@ -235,7 +268,7 @@ enum DocDisk {
             guard let match = bases.firstIndex(where: { value in
                 let base = value?.mapValue ?? [:]
                 return Set(base.keys).union(desired.keys).allSatisfy { field in
-                    base[field] == desired[field] || remote[field] == desired[field] || remote[field] == base[field] ||
+                    same(field, base[field], desired[field]) || same(field, remote[field], desired[field]) || same(field, remote[field], base[field]) ||
                     (root == "chats" && field == "lastSeenAt" && desired[field]?.i64Value != nil && remote[field]?.i64Value != nil)
                 }
             }) else { throw MobileSessionError.unavailable("Crew recovery conflicts with retained intermediate edits on \(root)/\(key). Original intents are retained.") }
@@ -259,14 +292,14 @@ enum DocDisk {
             if row.getDeepValue().mapValue?.isEmpty == true, !remote.isEmpty {
                 for (field, value) in remote { try row.insert(key: field, v: value) }
             }
-            for field in Set(base.keys).union(desired.keys) where base[field] != desired[field] {
-                if remote[field] == desired[field] { continue }
+            for field in Set(base.keys).union(desired.keys) where !same(field, base[field], desired[field]) {
+                if same(field, remote[field], desired[field]) { continue }
                 if root == "chats", field == "lastSeenAt", let value = desired[field],
                    let desiredAt = value.i64Value, let serverAt = remote[field]?.i64Value {
                     if desiredAt > serverAt { try row.insert(key: field, v: value) }
                     continue
                 }
-                guard remote[field] == base[field], isRecoveryValue(desired[field]) else {
+                guard same(field, remote[field], base[field]), isRecoveryValue(desired[field]) else {
                     throw MobileSessionError.unavailable("Crew recovery conflicts on \(root)/\(key)/\(field). Both the original intent and authoritative record are retained.")
                 }
                 if let value = desired[field] { try row.insert(key: field, v: value) }
@@ -338,7 +371,7 @@ enum DocDisk {
         guard let data = try? Data(contentsOf: url(for: id)), !data.isEmpty else { return false }
         guard let status = try? doc.importWith(bytes: data, origin: "disk") else { return false }
         return (status.pending?.isEmpty ?? true)
-            && !doc.isDetached() && doc.stateVv() == doc.oplogVv()
+            && !doc.isDetached() && doc.stateFrontiers() == doc.oplogFrontiers()
     }
 
     /// Load into an isolated replica so cancellation or a failed import cannot
@@ -366,22 +399,20 @@ enum DocDisk {
         guard let status = try? replacement.importWith(bytes: bytes, origin: "remote"),
               status.pending?.isEmpty ?? true,
               !replacement.isDetached(),
-              replacement.stateVv() == replacement.oplogVv(),
+              replacement.stateFrontiers() == replacement.oplogFrontiers(),
               replacement.oplogVv().includesVv(other: metadata.partialEndVv)
         else { return nil }
         return replacement
     }
 
-    /// The store calls this in the SAME main-actor turn as its binding swap.
-    /// Commit/export here, not on the room actor: local edits may have landed
-    /// while the validated server replica was waiting for the main actor.
+    /// Live stores call this in the SAME main-actor turn as their binding swap.
+    /// Isolated hydration replicas may merge off-main; never mutate a live replica there.
     /// Prefer retaining operation identities. Across a shallow-history gap,
     /// reissue only a safely reconstructible local state delta as new operations.
-    @MainActor
     static func preserveLocalOperations(from previous: LoroDoc, in replacement: LoroDoc) -> Bool {
         previous.commit()
-        guard !previous.isDetached(), previous.stateVv() == previous.oplogVv(),
-              !replacement.isDetached(), replacement.stateVv() == replacement.oplogVv()
+        guard !previous.isDetached(), previous.stateFrontiers() == previous.oplogFrontiers(),
+              !replacement.isDetached(), replacement.stateFrontiers() == replacement.oplogFrontiers()
         else { return false }
         let required = previous.oplogVv()
         let snapshotVersion = replacement.oplogVv()
@@ -394,7 +425,7 @@ enum DocDisk {
             let missing = try previous.export(mode: .updates(from: snapshotVersion))
             let status = try merged.importWith(bytes: missing, origin: "recovery")
             if status.pending?.isEmpty ?? true,
-               !merged.isDetached(), merged.stateVv() == merged.oplogVv(),
+               !merged.isDetached(), merged.stateFrontiers() == merged.oplogFrontiers(),
                merged.oplogVv().includesVv(other: required) {
                 return try importRecovery(from: merged, into: replacement, since: snapshotVersion)
             }
@@ -416,14 +447,14 @@ enum DocDisk {
     private static func importRecovery(
         from candidate: LoroDoc, into replacement: LoroDoc, since snapshotVersion: VersionVector
     ) throws -> Bool {
-        guard !candidate.isDetached(), candidate.stateVv() == candidate.oplogVv(),
+        guard !candidate.isDetached(), candidate.stateFrontiers() == candidate.oplogFrontiers(),
               candidate.oplogVv().includesVv(other: snapshotVersion)
         else { return false }
         let updates = try candidate.export(mode: .updates(from: snapshotVersion))
         let status = try replacement.importWith(bytes: updates, origin: "recovery")
         return (status.pending?.isEmpty ?? true)
             && !replacement.isDetached()
-            && replacement.stateVv() == replacement.oplogVv()
+            && replacement.stateFrontiers() == replacement.oplogFrontiers()
             && replacement.oplogVv() == candidate.oplogVv()
     }
 
@@ -493,7 +524,7 @@ enum DocDisk {
 
     static func saveReplacement(doc: LoroDoc, id: String) throws {
         let bytes = try doc.export(mode: .snapshot)
-        guard !doc.isDetached(), doc.stateVv() == doc.oplogVv() else {
+        guard !doc.isDetached(), doc.stateFrontiers() == doc.oplogFrontiers() else {
             throw MobileSessionError.unavailable("Crew recovery snapshot did not materialize completely.")
         }
         try bytes.write(to: url(for: id), options: .atomic)
@@ -637,6 +668,29 @@ extension DocDisk {
             try lateAlias.insert(key: "id", v: alias); try lateAlias.insert(key: "deviceId", v: "owner")
             aliasDoc.commit()
             guard try migrateWorkspaceRows(in: aliasDoc), aliasDoc.getMap(id: "chats").get(key: publicId) == nil else { return false }
+            let creation = LoroDoc()
+            let native = try creation.getMap(id: "chats").getOrCreateContainer(key: "created", child: LoroMap())
+            try native.insert(key: "id", v: "created"); try native.insert(key: "deviceId", v: "owner")
+            try native.insert(key: "createdAt", v: Int64(100))
+            try native.insert(key: "config", v: LoroValue.fromJSON([
+                "harness": "mock", "model": NSNull(), "reasoning": NSNull(), "sandbox": "workspace-write"
+            ] as [String: Any]))
+            creation.commit()
+            let authoritativeCreation = creation.getDeepValue()
+            let creationVersion = creation.oplogVv()
+            let mobileConfig: [String: LoroValue] = ["harness": .string(value: "mock"), "sandbox": .string(value: "workspace-write")]
+            var mobileCreation: [String: LoroValue] = ["id": .string(value: "created"), "deviceId": .string(value: "owner"),
+                "createdAt": .i64(value: 200), "config": .map(value: mobileConfig)]
+            try applyRecordChange(root: "chats", key: "created", before: nil, after: .map(value: mobileCreation), in: creation)
+            guard creation.getDeepValue() == authoritativeCreation, creation.oplogVv() == creationVersion else { return false }
+            for field in ["model", "unknownOption"] {
+                var changed = mobileConfig
+                changed[field] = .string(value: "retained user choice")
+                mobileCreation["config"] = .map(value: changed)
+                do { try applyRecordChange(root: "chats", key: "created", before: nil, after: .map(value: mobileCreation), in: creation); return false }
+                catch MobileSessionError.unavailable(_) {}
+                guard creation.getDeepValue() == authoritativeCreation else { return false }
+            }
             let source = LoroDoc()
             let row = try source.getMap(id: "chats").getOrCreateContainer(key: "existing", child: LoroMap())
             try row.insert(key: "id", v: "existing")

@@ -4,8 +4,8 @@
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
 //! map-of-maps means concurrent writers to *different* rows never conflict while writes
 //! to the *same* row settle field-by-field LWW (exactly right for renames/archives):
-//! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, environment?,
-//!   namespaceDevboxId?, lastSeenAt}
+//! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, devboxProvider?,
+//!   devboxId?, lastSeenAt}
 //! - `spaces`: LoroMap keyed by spaceId → row map {id, deviceId, path, name?,
 //!   gitDetected, gitCheckedAt?, checkoutId?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
@@ -109,6 +109,21 @@ pub(crate) fn workspace_routes_compatible<'a>(container: &str, rows: impl IntoIt
 /// A public row alias is recoverable only when key, every retained identity,
 /// and ownership all describe the same UUID self-session, never a child session.
 pub fn normalize_workspace_record(record: &crate::PendingRecord) -> Result<crate::PendingRecord, DocError> {
+    if record.container == "devices" {
+        let mut normalized = record.clone();
+        for value in normalized.before.iter_mut().chain(normalized.value.iter_mut()) {
+            if let Some(row) = value.as_object_mut() {
+                let legacy_provider = row.remove("environment");
+                let legacy_id = row.remove("namespaceDevboxId");
+                if legacy_provider.as_ref().and_then(|value| value.as_str()) == Some("namespace")
+                    && !row.contains_key("devboxProvider") { row.insert("devboxProvider".into(), "namespace".into()); }
+                if row.get("devboxProvider").and_then(|value| value.as_str()) == Some("namespace")
+                    && !row.contains_key("devboxId")
+                    && let Some(value) = legacy_id { row.insert("devboxId".into(), value); }
+            }
+        }
+        return Ok(normalized);
+    }
     let identity = match record.container.as_str() {
         "chats" => "id",
         "sessions" | "sessionRefs" | "worktreeDeletions" => "chatId",
@@ -268,18 +283,20 @@ impl WorkspaceDoc {
         row.insert("id", device.id.as_str())?;
         row.insert("name", device.name.as_str())?;
         row.insert("platform", device.platform.as_str())?;
-        match device.environment {
-            Some(environment) => row.insert(
-                "environment",
-                LoroValue::from(serde_json::to_value(environment)?),
+        match device.devbox_provider {
+            Some(provider) => row.insert(
+                "devboxProvider",
+                LoroValue::from(serde_json::to_value(provider)?),
             )?,
-            None => row.delete("environment")?,
+            None => row.delete("devboxProvider")?,
         }
         set_opt_str(
             &row,
-            "namespaceDevboxId",
-            device.namespace_devbox_id.as_deref(),
+            "devboxId",
+            device.devbox_id.as_deref(),
         )?;
+        row.delete("namespaceDevboxId")?;
+        row.delete("environment")?;
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
         set_opt_str(&row, "version", device.version.as_deref())?;
@@ -315,6 +332,7 @@ impl WorkspaceDoc {
     }
 
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
+        self.migrate_devbox_rows()?;
         let mut devices: Vec<Device> = self
             .read_rows::<RawDevice>("devices")?
             .into_iter()
@@ -794,6 +812,10 @@ impl WorkspaceDoc {
         row.insert("chatId", session.chat_id.as_str())?;
         row.insert("deviceId", session.device_id.as_str())?;
         row.insert("status", status_str(session.status))?;
+        match session.model_retry {
+            Some(retry) => row.insert("modelRetry", LoroValue::from(serde_json::to_value(retry)?))?,
+            None => row.delete("modelRetry")?,
+        }
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         self.doc.commit()?;
@@ -949,10 +971,37 @@ impl WorkspaceDoc {
         }
     }
 
+    /// Cut over persisted Namespace rows without reviving a cleared neutral binding.
+    pub fn migrate_devbox_rows(&self) -> Result<usize, DocError> {
+        let _operation = self.doc.operation();
+        let parent = self.doc.get_map("devices");
+        let keys: Vec<_> = parent.keys().collect();
+        let mut migrated = 0;
+        for key in keys {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = parent.get(&key) else { continue };
+            if row.get("namespaceDevboxId").is_none() && row.get("environment").is_none() { continue }
+            migrated += 1;
+            if matches!(row.get("environment"), Some(loro::ValueOrContainer::Value(LoroValue::String(value))) if value.as_str() == "namespace")
+                && row.get("devboxProvider").is_none() && row.get_last_editor("devboxProvider").is_none() {
+                row.insert("devboxProvider", "namespace")?;
+            }
+            if matches!(row.get("devboxProvider"), Some(loro::ValueOrContainer::Value(LoroValue::String(value))) if value.as_str() == "namespace")
+                && row.get("devboxId").is_none() && row.get_last_editor("devboxId").is_none()
+                && let Some(loro::ValueOrContainer::Value(value)) = row.get("namespaceDevboxId") {
+                row.insert("devboxId", value)?;
+            }
+            row.delete("namespaceDevboxId")?;
+            row.delete("environment")?;
+        }
+        if migrated != 0 { self.doc.commit()?; }
+        Ok(migrated)
+    }
+
     /// Repair only self-session UUID aliases in the public index. Existing public
     /// fields and explicit public tombstones win. Private transcripts and execution
     /// journals are not part of this doc and are never renamed or discarded.
     pub fn migrate_execution_rows(&self) -> Result<usize, DocError> {
+        self.migrate_devbox_rows()?;
         let _operation = self.doc.operation();
         let mut plans = Vec::new();
         for container in ["chats", "sessions", "sessionRefs", "worktreeDeletions"] {
@@ -1110,9 +1159,9 @@ struct RawDevice {
     name: String,
     platform: String,
     #[serde(default)]
-    environment: Option<comet_proto::DeviceEnvironment>,
+    devbox_provider: Option<comet_proto::DeviceEnvironment>,
     #[serde(default)]
-    namespace_devbox_id: Option<String>,
+    devbox_id: Option<String>,
     #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
@@ -1127,8 +1176,8 @@ impl From<RawDevice> for Device {
             id: raw.id,
             name: raw.name,
             platform: raw.platform,
-            environment: raw.environment,
-            namespace_devbox_id: raw.namespace_devbox_id,
+            devbox_provider: raw.devbox_provider,
+            devbox_id: raw.devbox_id,
             last_seen_at: raw.last_seen_at.map(dt),
             created_at: raw.created_at.map(dt),
             version: raw.version,
@@ -1256,6 +1305,8 @@ struct RawSession {
     device_id: String,
     status: SessionStatus,
     #[serde(default)]
+    model_retry: Option<comet_proto::ModelRetry>,
+    #[serde(default)]
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
@@ -1267,6 +1318,7 @@ impl From<RawSession> for Session {
             chat_id: raw.chat_id,
             device_id: raw.device_id,
             status: raw.status,
+            model_retry: raw.model_retry,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
         }
@@ -1435,8 +1487,8 @@ mod tests {
             id: id.into(),
             name: name.into(),
             platform: "linux".into(),
-            environment: None,
-            namespace_devbox_id: None,
+            devbox_provider: None,
+            devbox_id: None,
             last_seen_at: Some(ts(1_000)),
             created_at: Some(ts(500)),
             version: Some("0.1.0".into()),
@@ -1489,6 +1541,7 @@ mod tests {
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status,
+            model_retry: None,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
         }
@@ -1517,12 +1570,86 @@ mod tests {
     }
 
     #[test]
+    fn offline_namespace_binding_migrates_without_losing_owner_edits() {
+        let ws = WorkspaceDoc::new();
+        insert_legacy_row(&ws, "devices", "offline", serde_json::json!({
+            "id": "offline", "name": "Owner rename", "platform": "linux",
+            "environment": "namespace", "namespaceDevboxId": "ofpf7g22n4412", "lastSeenAt": 1000
+        }));
+        let offline = ws.read_devices().unwrap().remove(0);
+        assert_eq!(offline.id, "offline");
+        assert_eq!(offline.name, "Owner rename");
+        assert_eq!(offline.last_seen_at, Some(ts(1000)));
+        assert_eq!(offline.devbox_binding(), Some((comet_proto::DeviceEnvironment::Namespace, "ofpf7g22n4412")));
+        let row = ws.doc().get_map("devices").get_deep_value().to_json_value();
+        assert!(row["offline"].get("namespaceDevboxId").is_none());
+        assert!(row["offline"].get("environment").is_none());
+        assert_eq!(row["offline"]["devboxProvider"], "namespace");
+        let before = ws.doc().oplog_vv();
+        ws.read_devices().unwrap();
+        assert_eq!(ws.doc().oplog_vv(), before);
+        let peer = WorkspaceDoc::new();
+        cross_sync(&ws, &peer);
+        assert_eq!(peer.read_devices().unwrap(), vec![offline.clone()]);
+        let restored = WorkspaceDoc::new();
+        restored.binding().adopt_snapshot(&ws.export_snapshot().unwrap(), None).unwrap();
+        assert_eq!(restored.read_devices().unwrap(), vec![offline]);
+
+        // A cleared or newly rebound neutral field must not resurrect a stale binding.
+        let row = ws.existing_row("devices", "offline").unwrap();
+        row.delete("devboxId").unwrap();
+        row.insert("namespaceDevboxId", "ofpf7g22n4412").unwrap();
+        ws.doc().commit();
+        assert_eq!(ws.read_devices().unwrap()[0].devbox_binding(), None);
+        assert!(row.get("namespaceDevboxId").is_none());
+        row.delete("devboxProvider").unwrap();
+        row.insert("environment", "namespace").unwrap();
+        row.insert("namespaceDevboxId", "ofpf7g22n4412").unwrap();
+        ws.doc().commit();
+        assert_eq!(ws.read_devices().unwrap()[0].devbox_binding(), None);
+        assert!(row.get("environment").is_none());
+        assert!(row.get("devboxProvider").is_none());
+    }
+
+    #[test]
+    fn legacy_provider_metadata_migrates_even_without_a_binding() {
+        let ws = WorkspaceDoc::new();
+        insert_legacy_row(&ws, "devices", "unbound", serde_json::json!({
+            "id": "unbound", "name": "Owner", "platform": "linux", "environment": "namespace"
+        }));
+        let device = ws.read_devices().unwrap().remove(0);
+        assert_eq!(device.devbox_provider, Some(comet_proto::DeviceEnvironment::Namespace));
+        assert!(device.devbox_binding().is_none());
+        let row = ws.doc().get_map("devices").get_deep_value().to_json_value();
+        assert!(row["unbound"].get("environment").is_none());
+        assert_eq!(row["unbound"]["devboxProvider"], "namespace");
+    }
+
+    #[test]
+    fn boat_metadata_survives_sync_snapshot_and_owner_rename() {
+        let a = WorkspaceDoc::new();
+        let b = WorkspaceDoc::new();
+        let mut boat = device("boat", "First name");
+        boat.devbox_provider = Some(comet_proto::DeviceEnvironment::Boat);
+        boat.devbox_id = Some("bx_234abcxy".into());
+        a.upsert_device(&boat).unwrap();
+        cross_sync(&a, &b);
+        b.rename_device("boat", "Owner rename").unwrap();
+        cross_sync(&a, &b);
+        boat.name = "Owner rename".into();
+        assert_eq!(a.read_devices().unwrap(), vec![boat.clone()]);
+        let restored = WorkspaceDoc::new();
+        restored.binding().adopt_snapshot(&a.export_snapshot().unwrap(), None).unwrap();
+        assert_eq!(restored.read_devices().unwrap(), vec![boat]);
+    }
+
+    #[test]
     fn namespace_device_metadata_survives_sync_and_old_rows() {
         let a = WorkspaceDoc::new();
         let b = WorkspaceDoc::new();
         let mut namespace = device("devbox", "Owner's workstation");
-        namespace.environment = Some(comet_proto::DeviceEnvironment::Namespace);
-        namespace.namespace_devbox_id = Some("ofpf7g22n4412".into());
+        namespace.devbox_provider = Some(comet_proto::DeviceEnvironment::Namespace);
+        namespace.devbox_id = Some("ofpf7g22n4412".into());
         a.upsert_device(&namespace).unwrap();
         cross_sync(&a, &b);
         assert_eq!(b.read_devices().unwrap(), vec![namespace.clone()]);
@@ -1533,7 +1660,7 @@ mod tests {
             vec![namespace.clone()]
         );
 
-        // Older writers have no environment field; neither the name nor Linux
+        // Older writers have no provider metadata; neither the name nor Linux
         // alone identifies a Namespace host.
         let legacy = a.row("devices", "legacy").unwrap();
         legacy.insert("id", "legacy").unwrap();
@@ -1547,34 +1674,34 @@ mod tests {
             .into_iter()
             .find(|d| d.id == "legacy")
             .unwrap();
-        assert_eq!(legacy.environment, None);
-        assert_eq!(legacy.namespace_devbox_id, None);
+        assert_eq!(legacy.devbox_provider, None);
+        assert_eq!(legacy.devbox_id, None);
         assert_eq!(legacy.platform, "linux");
         let wire = serde_json::to_value(&namespace).unwrap();
-        assert_eq!(wire["environment"], "namespace");
-        assert_eq!(wire["namespaceDevboxId"], "ofpf7g22n4412");
+        assert_eq!(wire["devboxProvider"], "namespace");
+        assert_eq!(wire["devboxId"], "ofpf7g22n4412");
         assert_eq!(serde_json::from_value::<Device>(wire).unwrap(), namespace);
         let mut legacy_wire = serde_json::to_value(&legacy).unwrap();
-        legacy_wire.as_object_mut().unwrap().remove("environment");
+        legacy_wire.as_object_mut().unwrap().remove("devboxProvider");
         legacy_wire
             .as_object_mut()
             .unwrap()
-            .remove("namespaceDevboxId");
+            .remove("devboxId");
         assert_eq!(
             serde_json::from_value::<Device>(legacy_wire.clone())
                 .unwrap()
-                .namespace_devbox_id,
+                .devbox_id,
             None
         );
         assert_eq!(
             serde_json::from_value::<Device>(legacy_wire)
                 .unwrap()
-                .environment,
+                .devbox_provider,
             None
         );
 
-        namespace.environment = None;
-        namespace.namespace_devbox_id = None;
+        namespace.devbox_provider = None;
+        namespace.devbox_id = None;
         a.upsert_device(&namespace).unwrap();
         cross_sync(&a, &b);
         assert_eq!(
@@ -1658,6 +1785,12 @@ mod tests {
             state.sessions,
             vec![session("chat-1", "dev-a", SessionStatus::Working)]
         );
+        let mut retrying = session("chat-1", "dev-a", SessionStatus::Working);
+        retrying.model_retry = Some(comet_proto::ModelRetry { attempt: 2, max_attempts: 4 });
+        ws.upsert_session(&retrying).unwrap();
+        assert_eq!(ws.read_all().unwrap().sessions, vec![retrying]);
+        ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle)).unwrap();
+        assert!(ws.read_all().unwrap().sessions[0].model_retry.is_none());
 
         // Upsert refreshes in place — no duplicate rows, cleared options removed.
         let mut updated = chat("chat-1", "dev-a");

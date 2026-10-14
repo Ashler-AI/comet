@@ -1402,9 +1402,10 @@ export class SessionRoom implements DurableObject {
             const retainedFloor = doc.shallowSinceVV();
             try {
               const floorCoverage = incomingFloor.compare(retainedFloor);
-              if (floorCoverage === undefined || floorCoverage > 0) {
-                // A newer-looking shallow snapshot can omit retained causal
-                // history. Merge only its available delta into the old replica.
+              if (floorCoverage === undefined || floorCoverage >= 0) {
+                // Same/newer floors add no older history. Import only their new
+                // operations into the retained replica; merging two hot replicas
+                // can exhaust the Worker before the validated union is persisted.
                 const available = previousVersion.compare(incomingFloor);
                 if (available === undefined || available < 0) {
                   throw new Error("snapshot advances beyond retained-history boundary");

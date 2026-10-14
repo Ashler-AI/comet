@@ -99,16 +99,17 @@ enum E2ERunner {
             return
         }
         let chatId: String
+        let chat: Chat
         do {
             chatId = try await workspace.createChat(
-                space: space,
+                id: UUID().uuidString.lowercased(), space: space,
                 config: ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"))
+            chat = try await workspace.waitForCreatedChat(id: chatId)
         } catch {
             log("FAIL create chat: \(error.localizedDescription)")
             return
         }
-        guard let chat = workspace.chats.first(where: { $0.id == chatId }),
-              let store = model.sessionStore(for: chat) else {
+        guard let store = model.sessionStore(for: chat) else {
             log("FAIL chat/session store")
             return
         }
@@ -193,13 +194,18 @@ enum E2ERunner {
                 try row.insert(key: "createdAt", v: chat.createdAt)
                 if let spaceId = chat.spaceId { try row.insert(key: "spaceId", v: spaceId) }
             }
+            // Optional object fields can be null or malformed in synced records.
+            // They must not crash Foundation serialization or hide membership.
+            let malformedObjects: [LoroValue] = [.null, .string(value: "invalid"), .bool(value: true),
+                .i64(value: 1), .double(value: 1.5), .list(value: []), .map(value: [:])]
             let statuses = source.getMap(id: "sessions")
-            for chat in rows + unrelated {
+            for (index, chat) in (rows + unrelated).enumerated() {
                 let row = try statuses.getOrCreateContainer(key: chat.id, child: LoroMap())
                 try row.insert(key: "chatId", v: chat.id)
                 try row.insert(key: "deviceId", v: chat.deviceId)
                 try row.insert(key: "status", v: "working")
                 try row.insert(key: "updatedAt", v: Int64(100))
+                try row.insert(key: "modelRetry", v: malformedObjects[index % malformedObjects.count])
             }
             let refs = source.getMap(id: "sessionRefs")
             for (index, id) in (refIds + ["other-principal-only"]).enumerated() {
@@ -209,6 +215,8 @@ enum E2ERunner {
                 try row.insert(key: "userId", v: owner)
                 try row.insert(key: "chatId", v: id)
                 try row.insert(key: "addedAt", v: Int64(index))
+                try row.insert(key: "environment", v: malformedObjects[index % malformedObjects.count])
+                try row.insert(key: "startup", v: malformedObjects[index % malformedObjects.count])
             }
             source.commit()
             let workspace = WorkspaceStore(config: config)
@@ -218,6 +226,7 @@ enum E2ERunner {
                   Set(workspace.sessionRefs.map(\.chatId)) == Set(refIds),
                   workspace.sessionRefs.count == refIds.count,
                   Set(workspace.sessions.keys) == Set(rows.map(\.id)),
+                  workspace.sessions.values.allSatisfy({ $0.modelRetry == nil }),
                   workspace.overviewChats.map(\.id) == probe.overviewChats.map(\.id),
                   workspace.settledChats.map(\.id) == probe.settledChats.map(\.id),
                   Set(workspace.sharedSessionRefs.map(\.chatId)) == Set(foreignIds),
@@ -259,6 +268,42 @@ enum E2ERunner {
                 log("FAIL Crew workspace membership: environment routing lost during opaque-ID upsert or projection")
                 return false
             }
+            let validRetry = LoroValue.map(value: ["attempt": .i64(value: 2), "maxAttempts": .i64(value: 4)])
+            let routed = try workspace.doc.getMap(id: "sessionRefs").getOrCreateContainer(
+                key: "\(userId.utf8.count):\(userId):\(routedId)", child: LoroMap())
+            try routed.insert(key: "startup", v: LoroValue.fromJSON([
+                "generation": "fixture", "status": "attentionNeeded", "updatedAt": "2026-10-13T00:00:00Z"
+            ]))
+            let status = try workspace.doc.getMap(id: "sessions").getOrCreateContainer(key: detached.id, child: LoroMap())
+            try status.insert(key: "modelRetry", v: validRetry)
+            workspace.doc.commit()
+            guard workspace.addSessionRef(chatId: routedId) != nil,
+                  workspace.sharedSessionRefs.first(where: { $0.chatId == routedId })?.startup?.status == "attentionNeeded",
+                  workspace.sessions[detached.id]?.modelRetry == ModelRetry(attempt: 2, maxAttempts: 4) else {
+                log("FAIL Crew workspace optional objects: valid startup or model retry lost")
+                return false
+            }
+            // List-row metadata also reads retry state from owner publications.
+            let publicationId = UUID().uuidString.lowercased()
+            for retry in malformedObjects + [validRetry] {
+                let publication = LoroDoc()
+                let anchor = try publication.getList(id: "publications").pushContainer(child: LoroMap())
+                try anchor.insert(key: "record", v: LoroValue.map(value: [
+                    "kind": .string(value: "agentSession"), "publishedBy": .string(value: userId),
+                    "value": .map(value: ["chatId": .string(value: publicationId), "sessionId": .string(value: publicationId),
+                        "ownerSubject": .string(value: userId), "ownerDeviceId": .string(value: "host"),
+                        "createdAt": .i64(value: 1), "updatedAt": .i64(value: 2),
+                        "status": .string(value: "idle"), "modelRetry": retry])
+                ]))
+                publication.commit()
+                let decoded = SessionStore.decodeProjection(from: publication, chatId: publicationId, observedAt: nil)
+                guard decoded.session?.status == .idle,
+                      decoded.session?.modelRetry == (retry == validRetry ? ModelRetry(attempt: 2, maxAttempts: 4) : nil) else {
+                    log("FAIL Crew list metadata optional objects: status hidden or model retry misdecoded")
+                    return false
+                }
+            }
+            log("OK Crew list optional objects: null/scalar/malformed fields retain rows; valid environment, startup and retry survive")
         } catch {
             log("FAIL Crew workspace snapshot projection: \(error)")
             return false
@@ -651,7 +696,8 @@ enum E2ERunner {
             if !passed { log("FAIL Crew reliability recovery: \(scenario)") }
             return passed
         }
-        guard check("workspace record intents", WorkspaceStore.runRecordIntentRegression()),
+        guard check("workspace record intents", await WorkspaceStore.runRecordIntentRegression()),
+              check("host-created catalog", await WorkspaceStore.runCreatedChatRegression()),
               check("disk record recovery", DocDisk.runRecordRecoveryRegression()),
               check("nested tool calls", runNestedToolCallRecovery()),
               check("deployment retarget", SessionStore.runDeploymentRetargetRegression()),

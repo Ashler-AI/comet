@@ -177,58 +177,114 @@ final class WorkspaceStore {
     }
 
     @ObservationIgnored private var saver: DocSaver?
+    private struct Hydration {
+        var document: LoroDoc
+        var projection: Projection?
+        var original: Data?
+        var replacement: Data?
+    }
+    @ObservationIgnored private var hydrationTask: Task<Result<Hydration, Error>?, Never>?
+    @ObservationIgnored private var hydrationComplete = false
+    #if DEBUG
+    @ObservationIgnored private var hydrationReadDidFinish: (() -> Void)?
+    #endif
 
     func start() {
-        guard room == nil else { return }
+        guard room == nil, hydrationTask == nil else { return }
         roomEpoch &+= 1
         let epoch = roomEpoch
-        let roomId = "ws4/\(config.projectScope)"
-        let cacheId = config.documentCacheId(roomId: roomId)
-        guard !recordJournalBlocked else { project(); return }
-        // Hydrate locally before joining; materialize the sidebar off-main.
-        if doc.oplogVv() == VersionVector() {
-            if let cached = DocDisk.loadReplica(id: cacheId) { doc = cached }
-            else if cacheId.hasPrefix("workspace-") {
-                let legacyId = String(cacheId.dropFirst("workspace-".count))
-                if let legacy = DocDisk.loadReplica(id: legacyId) {
-                    do { try DocDisk.saveReplacement(doc: legacy, id: cacheId); doc = legacy }
-                    catch { recoveryFailure = "Crew could not migrate the scoped workspace cache: \(error.localizedDescription)" }
-                }
-            }
-        }
-        // Project accepted goals even when the debounced cache predates them.
-        // Replay in isolation before subscribing/joining; original journal IDs
-        // and versions remain untouched for authoritative reconciliation.
-        do {
-            let migrated = doc.fork()
-            if try DocDisk.migrateWorkspaceRows(in: migrated) {
-                try DocDisk.retainRecoveryOriginal(doc: doc, id: cacheId)
-                try DocDisk.saveReplacement(doc: migrated, id: cacheId)
-                doc = migrated
-            }
-        } catch {
-            recordJournalBlocked = true
-            blockRecordRecovery(error)
-            project()
-            return
-        }
-        if !recordIntents.isEmpty {
+        let cacheId = recordCacheId
+        guard !recordJournalBlocked else { scheduleProjection(); return }
+        // A restart retains its live replica, never imports an older disk cache.
+        guard !hydrationComplete else { joinRoom(cacheId: cacheId, epoch: epoch); return }
+        let previous = doc
+        let version = doc.oplogVv()
+        let localGeneration = localProjectionGeneration
+        let intents = Array(recordIntents.values)
+        let userId = config.userId
+        let load = Task.detached(priority: .userInitiated) { () -> Result<Hydration, Error>? in
             do {
-                let local = doc.fork()
-                for intent in recordIntents.values {
+                guard !Task.isCancelled else { return nil }
+                let hasLocalOperations = version != VersionVector()
+                // Only fork a nonempty live replica on the worker. It is never
+                // mutated here; the binding/version fence below rejects races.
+                let local = hasLocalOperations ? previous.fork() : LoroDoc()
+                var candidate = DocDisk.loadReplica(id: cacheId)
+                var migratedLegacy = false
+                if candidate == nil, cacheId.hasPrefix("workspace-") {
+                    candidate = DocDisk.loadReplica(id: String(cacheId.dropFirst("workspace-".count)))
+                    migratedLegacy = candidate != nil
+                }
+                if let cached = candidate, hasLocalOperations,
+                   !DocDisk.preserveLocalOperations(from: local, in: cached) {
+                    throw MobileSessionError.unavailable("Crew cannot merge cached workspace records with local edits. Original records are retained.")
+                }
+                var document = candidate ?? local
+                guard !Task.isCancelled else { return nil }
+                var original: Data?
+                var replacement: Data?
+                if try DocDisk.workspaceRowsNeedMigration(in: document) {
+                    original = try document.export(mode: .snapshot)
+                    // A failed/conflicting migration must not alter its original.
+                    let migrated = document.fork()
+                    if try DocDisk.migrateWorkspaceRows(in: migrated) {
+                        document = migrated
+                        replacement = try document.export(mode: .snapshot)
+                    }
+                }
+                if migratedLegacy, replacement == nil { replacement = try document.export(mode: .snapshot) }
+                for intent in intents {
                     try DocDisk.applyRecordChange(root: intent.root, key: intent.key,
-                        before: try DocDisk.recordValue(intent.before), after: try DocDisk.recordValue(intent.after), in: local,
+                        before: try DocDisk.recordValue(intent.before), after: try DocDisk.recordValue(intent.after), in: document,
                         alternatives: try intent.intermediates.map { try DocDisk.recordValue($0) })
                 }
-                local.commit()
-                doc = local
-            } catch {
-                recordJournalBlocked = true
-                blockRecordRecovery(error)
-                project()
+                if !intents.isEmpty { document.commit() }
+                guard !Task.isCancelled else { return nil }
+                let projection = Self.decodeProjection(from: document, userId: userId, previous: nil)
+                guard !Task.isCancelled else { return nil }
+                return .success(Hydration(document: document, projection: projection,
+                    original: original, replacement: replacement))
+            } catch { return Task.isCancelled ? nil : .failure(error) }
+        }
+        hydrationTask = load
+        Task { @MainActor [weak self] in
+            let result = await load.value
+            #if DEBUG
+            self?.hydrationReadDidFinish?()
+            #endif
+            guard let self, self.roomEpoch == epoch, self.doc === previous, !load.isCancelled else { return }
+            self.hydrationTask = nil
+            // Local writes keep synchronous visibility. Retry with their latest
+            // replica/goals instead of overwriting them with an older hydrate.
+            guard self.localProjectionGeneration == localGeneration, self.doc.oplogVv() == version else {
+                self.start()
                 return
             }
+            guard let result else { return }
+            do {
+                let hydrated = try result.get()
+                // Detached workers never write disk: stop/restart must also
+                // fence migration replacement, not merely visible publication.
+                if let original = hydrated.original {
+                    let evidence = DocDisk.url(for: cacheId).appendingPathExtension("recovery")
+                    if !FileManager.default.fileExists(atPath: evidence.path) { try original.write(to: evidence, options: .atomic) }
+                }
+                if let replacement = hydrated.replacement { try replacement.write(to: DocDisk.url(for: cacheId), options: .atomic) }
+                self.doc = hydrated.document
+                self.hydrationComplete = true
+                if let projection = hydrated.projection { self.applyProjection(projection) }
+                self.joinRoom(cacheId: cacheId, epoch: epoch)
+            } catch {
+                self.recordJournalBlocked = true
+                self.blockRecordRecovery(error)
+                self.scheduleProjection()
+            }
         }
+    }
+
+    private func joinRoom(cacheId: String, epoch: UInt64) {
+        guard roomEpoch == epoch, room == nil else { return }
+        let roomId = "ws4/\(config.projectScope)"
         saver = DocSaver(docId: cacheId, doc: doc)
         let client = RoomClient(roomId: roomId, doc: doc, recoverApplicationIntents: !recordIntents.isEmpty) { [config] in
             await config.workspaceSocketURL()
@@ -245,19 +301,28 @@ final class WorkspaceStore {
 
         subscribeLocalUpdates(client: client)
 
-        Task { await client.start() }
-        project()
+        Task { @MainActor [weak self] in
+            guard let self, self.roomEpoch == epoch else { return }
+            await client.start()
+        }
+        // Hydration/local writes already projected this replica. Connection
+        // readiness still waits for the fresh projection requested by .connected.
     }
 
     private func subscribeLocalUpdates(client: RoomClient) {
         // Local commits → room. The subscription fires synchronously inside
         // commit; hop to the actor to send.
         let subscribedDoc = doc
+        let epoch = roomEpoch
         subscriptions.append(doc.subscribeLocalUpdate { [weak client, weak self, weak subscribedDoc] update in
             guard let client, let subscribedDoc else { return }
             let bytes = [UInt8](update)
             Task { await client.sendLocalUpdate(bytes, from: subscribedDoc) }
-            Task { @MainActor [weak self] in self?.saver?.poke() }
+            Task { @MainActor [weak self, weak subscribedDoc] in
+                guard let self, let subscribedDoc, self.roomEpoch == epoch,
+                      self.doc === subscribedDoc else { return }
+                self.saver?.poke()
+            }
         })
     }
 
@@ -327,11 +392,14 @@ final class WorkspaceStore {
     func stop() {
         do { try persistRecordIntents() } catch { recoveryFailure = error.localizedDescription }
         roomEpoch &+= 1
+        hydrationTask?.cancel()
+        hydrationTask = nil
         projectionGeneration &+= 1
         projectionTask?.cancel()
         projectionTask = nil
         subscriptions.removeAll()
         saver?.flush()
+        saver = nil
         if let room {
             Task { await room.stop() }
         }
@@ -544,6 +612,50 @@ final class WorkspaceStore {
                 && store.overviewChats.first?.title == "Local edit"
         } catch { return false }
     }
+
+    static func runCreatedChatRegression() async -> Bool {
+        let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+            userId: "creation-\(UUID().uuidString)", projectScope: "creation-regression",
+            deviceId: "viewer", deviceName: "Crew regression")
+        let store = WorkspaceStore(config: config)
+        defer {
+            store.stop()
+            try? FileManager.default.removeItem(at: DocDisk.intentURL(for: store.recordCacheId))
+        }
+        do {
+            let row = try store.doc.getMap(id: "chats").getOrCreateContainer(key: "created", child: LoroMap())
+            try row.insert(key: "id", v: "created"); try row.insert(key: "deviceId", v: "host")
+            try row.insert(key: "createdAt", v: Int64(1234))
+            try row.insert(key: "config", v: LoroValue.fromJSON([
+                "harness": "mock", "model": NSNull(), "reasoning": NSNull(), "sandbox": "workspace-write"
+            ] as [String: Any]))
+            let member = try store.doc.getMap(id: "sessionRefs").getOrCreateContainer(key: "membership", child: LoroMap())
+            try member.insert(key: "chatId", v: "created"); try member.insert(key: "userId", v: "other-user")
+            try member.insert(key: "addedAt", v: Int64(1234))
+            store.doc.commit(); store.project()
+            var entered = false
+            let waiting = Task { @MainActor in
+                entered = true
+                return try await store.waitForCreatedChat(id: "created")
+            }
+            defer { waiting.cancel() }
+            guard await E2ERunner.poll(timeout: 1, label: "creation membership wait", { entered ? true : nil }) != nil else { return false }
+            waiting.cancel()
+            do { _ = try await waiting.value; return false } catch is CancellationError {}
+            try member.insert(key: "userId", v: config.userId)
+            store.doc.commit(); store.project()
+            let version = store.doc.oplogVv()
+            let created = try await store.waitForCreatedChat(id: "created")
+            guard created.createdAt == 1234,
+                  created.config == ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"),
+                  store.doc.oplogVv() == version, store.recordIntents.isEmpty else { return false }
+            store.blockRecordRecovery(MobileSessionError.unavailable("Retained user-edit conflict"))
+            do { _ = try await store.waitForCreatedChat(id: "created"); return false }
+            catch MobileSessionError.unavailable(_) {}
+            E2ERunner.log("OK Crew host-created catalog: principal membership, cancellation, authoritative config/clock, no duplicate creation intent and visible recovery failure")
+            return true
+        } catch { return false }
+    }
     #endif
 
     nonisolated static func decodeProjection(from doc: LoroDoc, userId: String,
@@ -557,7 +669,8 @@ final class WorkspaceStore {
             return DeviceRow(id: id,
                             name: m["name"]?.stringValue ?? id,
                             platform: m["platform"]?.stringValue ?? "",
-                            environment: m["environment"]?.stringValue,
+                            devboxProvider: m["devboxProvider"]?.stringValue,
+                            devboxId: m["devboxId"]?.stringValue,
                             lastSeenAt: m["lastSeenAt"]?.i64Value,
                             createdAt: m["createdAt"]?.i64Value)
         }.sorted { ($0.name, $0.id) < ($1.name, $1.id) }
@@ -605,13 +718,15 @@ final class WorkspaceStore {
                   let chatId = row["chatId"]?.stringValue,
                   let addedAt = row["addedAt"]?.i64Value else { return nil }
             let environment: SessionEnvironment? = row["environment"].flatMap { value in
-                guard let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else {
+                guard value.mapValue != nil,
+                      let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else {
                     return nil
                 }
                 return try? JSONDecoder().decode(SessionEnvironment.self, from: data)
             }
             let startup: SessionStartup? = row["startup"].flatMap { value in
-                guard let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else { return nil }
+                guard value.mapValue != nil,
+                      let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) else { return nil }
                 return try? JSONDecoder().decode(SessionStartup.self, from: data)
             }
             return SessionRef(chatId: chatId, addedAt: addedAt,
@@ -637,6 +752,10 @@ final class WorkspaceStore {
             rows[chatId] = SessionRow(chatId: chatId, deviceId: deviceId, status: status,
                                       startedAt: m["startedAt"]?.i64Value,
                                       updatedAt: m["updatedAt"]?.i64Value ?? 0)
+            if let value = m["modelRetry"], value.mapValue != nil,
+               let data = try? JSONSerialization.data(withJSONObject: value.jsonObject) {
+                rows[chatId]?.modelRetry = try? JSONDecoder().decode(ModelRetry.self, from: data)
+            }
         }
         let orderedChats = chats.sorted { $0.id < $1.id }
         let reusableLists = previous.flatMap { previous in
@@ -871,8 +990,7 @@ final class WorkspaceStore {
                 "config": encodableDictionary(chatConfig),
             ]
         )
-        try putChat(chatId: chatId, space: space, config: chatConfig,
-                    branch: launch.sourceRef, cwd: ".")
+        _ = try await waitForCreatedChat(id: chatId)
         _ = addSessionRef(chatId: chatId, environment: attachment.environment)
 
         let route = ScaffoldControlRoute(
@@ -1153,12 +1271,11 @@ final class WorkspaceStore {
     /// Create through the actual host so its verified principal membership is
     /// installed before the first QueueCommand can reach command draining.
     @discardableResult
-    func createChat(space: Space, config chatConfig: ChatConfig,
+    func createChat(id chatId: String, space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) async throws -> String {
         guard !space.deviceId.isEmpty else {
             throw MobileSessionError.unavailable("This space has no desktop host")
         }
-        let chatId = UUID().uuidString.lowercased()
         var params: [String: Any] = [
             "op": "createChat",
             "chatId": chatId,
@@ -1172,29 +1289,24 @@ final class WorkspaceStore {
         guard reply.ok else {
             throw MobileSessionError.unavailable("The desktop did not create this session")
         }
-        try putChat(chatId: chatId, space: space, config: chatConfig,
-                    branch: branch, cwd: cwd ?? space.path)
         return chatId
     }
 
-    private func putChat(chatId: String, space: Space, config chatConfig: ChatConfig,
-                         branch: String?, cwd: String) throws {
-        try mutateRecord(root: "chats", key: chatId) { row in
-            try row.insert(key: "id", v: chatId)
-            try row.insert(key: "deviceId", v: space.deviceId)
-            try row.insert(key: "archived", v: false)
-            try row.insert(key: "cwd", v: cwd)
-            try row.insert(key: "spaceId", v: space.id)
-            let createdAt = row.get(key: "createdAt")?.asValue()?.i64Value ?? nowMs()
-            try row.insert(key: "createdAt", v: createdAt)
-            if let branch { try row.insert(key: "branch", v: branch) }
-            if let value = LoroValue.fromEncodable(chatConfig) {
-                try row.insert(key: "config", v: value)
+    /// The host already committed the chat and principal membership. Recreating
+    /// them here races its publication with different config encoding and clocks.
+    func waitForCreatedChat(id: String) async throws -> Chat {
+        let epoch = roomEpoch
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            guard epoch == roomEpoch else {
+                throw MobileSessionError.unavailable("The workspace connection changed while waiting for the created session.")
             }
+            if let recoveryFailure { throw MobileSessionError.unavailable(recoveryFailure) }
+            if let chat = chat(id: id), sessionRef(id: id) != nil { return chat }
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
-        guard addSessionRef(chatId: chatId) != nil else {
-            throw MobileSessionError.unavailable("Couldn’t save this session’s membership")
-        }
+        throw MobileSessionError.unavailable("The desktop created this session, but its catalog has not synced yet. Retry to continue the same session.")
     }
 
     /// Create a space. Preferred path: `Mutate {op:createSpace}` straight to
@@ -1310,7 +1422,7 @@ struct WorkspaceLists: Equatable {
 
 #if DEBUG
 extension WorkspaceStore {
-    static func runRecordIntentRegression() -> Bool {
+    static func runRecordIntentRegression() async -> Bool {
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
             userId: "workspace-intents-\(UUID().uuidString)", projectScope: "workspace-intents",
             deviceId: "viewer", deviceName: "Crew regression")
@@ -1321,6 +1433,11 @@ extension WorkspaceStore {
             if let files = try? FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil) {
                 for file in files where file.lastPathComponent.hasPrefix(cacheId) { try? FileManager.default.removeItem(at: file) }
             }
+        }
+        var checkpoint = "alias journal normalization"
+        var completed = false
+        defer {
+            if !completed { E2ERunner.log("FAIL Crew workspace intents checkpoint: \(checkpoint); recovery: \(stores.last?.recoveryFailure ?? "none")") }
         }
         do {
             let publicId = "018eeb58-6508-78e8-a544-44682ab94c50"
@@ -1335,6 +1452,7 @@ extension WorkspaceStore {
                   FileManager.default.fileExists(atPath: DocDisk.intentURL(for: cacheId).appendingPathExtension("recovery").path) else { return false }
             try DocDisk.retainOutcome(legacy, id: cacheId, commandId: legacy.id)
             guard WorkspaceStore(config: config).recordIntents.isEmpty else { return false }
+            checkpoint = "migration preflight and canonical alias coverage"
             let bootstrap = LoroDoc()
             for (key, clock) in [(publicId, Int64(200)), (alias, Int64(100))] {
                 let row = try bootstrap.getMap(id: "chats").getOrCreateContainer(key: key, child: LoroMap())
@@ -1343,6 +1461,7 @@ extension WorkspaceStore {
                 try row.insert(key: "lastMessageAt", v: clock)
             }
             bootstrap.commit()
+            guard try DocDisk.workspaceRowsNeedMigration(in: bootstrap) else { return false }
             var canonicalGoal = DocDisk.RecordIntent(root: "chats", key: publicId, before: nil)
             canonicalGoal.after = try DocDisk.recordData(DocDisk.recordValue(in: bootstrap, root: "chats", key: publicId))
             canonicalGoal.version = bootstrap.oplogVv().encode()
@@ -1354,6 +1473,7 @@ extension WorkspaceStore {
             let coalesced = WorkspaceStore(config: config)
             guard coalesced.recordIntents.count == 1, coalesced.recordIntents["chats:" + publicId]?.id == canonicalGoal.id,
                   WorkspaceStore(config: config).recordIntents["chats:" + publicId]?.id == canonicalGoal.id else { return false }
+            checkpoint = "conflicting alias journals retained"
             var unknown = aliasGoal; unknown.id = UUID().uuidString.lowercased(); unknown.version = nil
             try DocDisk.saveIntents([canonicalGoal, unknown], id: cacheId)
             guard WorkspaceStore(config: config).recordJournalBlocked else { return false }
@@ -1365,6 +1485,7 @@ extension WorkspaceStore {
             try DocDisk.saveIntents([canonicalGoal, unknown], id: cacheId)
             guard WorkspaceStore(config: config).recordJournalBlocked else { return false }
             try DocDisk.saveIntents([DocDisk.RecordIntent](), id: cacheId)
+            checkpoint = "canonical cache preflight and offline local goals"
             let existing = UUID().uuidString.lowercased()
             let created = UUID().uuidString.lowercased()
             let source = LoroDoc()
@@ -1381,6 +1502,7 @@ extension WorkspaceStore {
             try removedSpace.insert(key: "deviceId", v: "host")
             try removedSpace.insert(key: "path", v: "/removed")
             source.commit()
+            guard !(try DocDisk.workspaceRowsNeedMigration(in: source)) else { return false }
             DocDisk.save(doc: source, id: cacheId)
             let offline = WorkspaceStore(config: config)
             stores.append(offline)
@@ -1410,13 +1532,54 @@ extension WorkspaceStore {
                   offline.recoveryFailure == nil else { return false }
             // Restart before the debounced snapshot ever ran. The only cache
             // still has the original title; accepted goals are independent.
+            checkpoint = "six retained goals before asynchronous start"
             let restarted = WorkspaceStore(config: config)
             stores.append(restarted)
             guard restarted.recordIntents.count == 6,
                   let cached = DocDisk.loadReplica(id: cacheId),
                   try DocDisk.recordValue(in: cached, root: "chats", key: existing)?.mapValue?["title"]?.stringValue == "Original" else { return false }
-            let journal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+            var journal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+            let cacheBytes = try Data(contentsOf: DocDisk.url(for: cacheId))
+            var cancelledReads = 0
+            restarted.hydrationReadDidFinish = { cancelledReads += 1 }
+            let empty = restarted.doc
+            checkpoint = "cold hydration returns before consumer publication"
             restarted.start()
+            guard restarted.hydrationTask != nil, restarted.doc === empty,
+                  restarted.chat(id: existing) == nil else { return false }
+            checkpoint = "stop rejects cached hydration without disk replacement"
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            let priorGoals = try encoder.encode(restarted.recordIntents.values.sorted { $0.index < $1.index })
+            restarted.stop()
+            // stop intentionally persists goals; JSON field/record ordering is
+            // not an identity change. Fence worker writes from the post-stop bytes.
+            let stoppedGoals = try DocDisk.loadIntents([DocDisk.RecordIntent].self, id: cacheId) ?? []
+            guard try encoder.encode(stoppedGoals.sorted { $0.index < $1.index }) == priorGoals else { return false }
+            journal = try Data(contentsOf: DocDisk.intentURL(for: cacheId))
+            guard await E2ERunner.poll(timeout: 5, label: "stopped workspace hydration", {
+                cancelledReads == 1 ? true : nil
+            }) != nil, restarted.doc === empty, restarted.room == nil,
+                  restarted.chats.isEmpty, !restarted.hydrationComplete,
+                  try Data(contentsOf: DocDisk.url(for: cacheId)) == cacheBytes,
+                  try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == journal else { return false }
+
+            checkpoint = "local edit during hydration survives trailing preparation"
+            // An actual local membership edit between worker decode and bind
+            // must be visible immediately and survive the trailing hydration.
+            let duringHydration = UUID().uuidString.lowercased()
+            var localWriteVisible = false
+            restarted.hydrationReadDidFinish = {
+                restarted.hydrationReadDidFinish = nil
+                localWriteVisible = restarted.addSessionRef(chatId: duringHydration) != nil
+                    && restarted.sessionRef(id: duringHydration) != nil
+                if let bytes = try? Data(contentsOf: DocDisk.intentURL(for: cacheId)) { journal = bytes }
+                else { localWriteVisible = false }
+            }
+            restarted.start()
+            guard await E2ERunner.poll(timeout: 5, label: "workspace goals hydration", {
+                restarted.hydrationComplete && restarted.hydrationTask == nil ? true : nil
+            }) != nil, localWriteVisible, restarted.sessionRef(id: duringHydration) != nil else { return false }
+            checkpoint = "consumer goals and unchanged hydrate journal"
             let local = restarted.doc
             guard !restarted.connected, restarted.recoveryFailure == nil,
                   restarted.chat(id: existing)?.title == "Final offline title",
@@ -1426,6 +1589,15 @@ extension WorkspaceStore {
                   restarted.space(id: "created-space")?.name == "Accepted offline space",
                   restarted.space(id: "removed") == nil,
                   try Data(contentsOf: DocDisk.intentURL(for: cacheId)) == journal else { return false }
+            checkpoint = "post-stop local edit survives warm restart"
+            restarted.stop()
+            let afterStop = UUID().uuidString.lowercased()
+            guard restarted.addSessionRef(chatId: afterStop) != nil,
+                  restarted.sessionRef(id: afterStop) != nil else { return false }
+            restarted.start()
+            guard restarted.doc === local, restarted.hydrationTask == nil,
+                  restarted.sessionRef(id: afterStop) != nil else { return false }
+            checkpoint = "shallow replacement rebases retained goals"
             // An earlier edit was admitted under another operation identity.
             // Its successor must rebase, not overwrite a remote disjoint field.
             try row.insert(key: "title", v: "Intermediate offline title")
@@ -1440,6 +1612,7 @@ extension WorkspaceStore {
                   records[existing]?.mapValue?["archived"]?.boolValue == true,
                   records[created]?.mapValue?["config"]?.mapValue?["nested"]?.mapValue?["sandbox"]?.stringValue == "workspace-write",
                   try DocDisk.recordValue(in: replacement, root: "sessionRefs", key: restarted.sessionRefKey(chatId: created))?.mapValue?["userId"]?.stringValue == config.userId else { return false }
+            checkpoint = "durable acknowledgement and retained membership route"
             restarted.acknowledgeRecordIntents(replacement.oplogVv().encode())
             let afterAck = WorkspaceStore(config: config)
             stores.append(afterAck)
@@ -1448,6 +1621,7 @@ extension WorkspaceStore {
             let membershipKey = restarted.sessionRefKey(chatId: existing)
             guard let retainedMembership = try DocDisk.recordValue(in: DocDisk.loadReplica(id: cacheId)!, root: "sessionRefs", key: membershipKey),
                   retainedMembership.mapValue?["environment"] == LoroValue.fromEncodable(routedEnvironment) else { return false }
+            checkpoint = "foreign membership identity denied"
             for field in ["projectId", "deploymentId", "ownerPrincipal", "userId"] {
                 var changed = retainedMembership.mapValue!
                 if field == "userId" { changed[field] = .string(value: "foreign") }
@@ -1465,6 +1639,7 @@ extension WorkspaceStore {
                     return false
                 } catch MobileSessionError.unavailable(_) {}
             }
+            checkpoint = "conflicting authoritative rename preserves original"
             restarted.rename(chatId: existing, title: "Retained conflicting title")
             try row.insert(key: "title", v: "Authoritative conflicting title"); source.commit()
             guard let conflict = DocDisk.replacementSnapshot(bytes: try source.export(mode: .shallowSnapshot(frontiers: source.stateFrontiers()))),
@@ -1472,7 +1647,8 @@ extension WorkspaceStore {
                   restarted.doc === replacement, restarted.recoveryFailure != nil,
                   let retained = try DocDisk.loadIntents([DocDisk.RecordIntent].self, id: cacheId),
                   retained.contains(where: { (try? DocDisk.recordValue($0.after))?.mapValue?["title"]?.stringValue == "Retained conflicting title" }) else { return false }
-            E2ERunner.log("OK Crew workspace intents: offline start projects stale-cache rename, space creation, membership and deletion without rewriting the journal; shallow recovery, durable ACK, conflict originals retained")
+            E2ERunner.log("OK Crew workspace intents: asynchronous cold hydrate, stopped-worker rejection, synchronous local edits during hydrate/after stop and warm restart; journal goals, shallow recovery, durable ACK and conflict originals retained")
+            completed = true
             return true
         } catch { E2ERunner.log("FAIL Crew workspace intents: \(error)"); return false }
     }

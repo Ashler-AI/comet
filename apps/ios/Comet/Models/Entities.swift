@@ -11,12 +11,13 @@ struct DeviceRow: Identifiable, Hashable {
     var id: String
     var name: String
     var platform: String
-    var environment: String? = nil
+    var devboxProvider: String? = nil
+    var devboxId: String? = nil
     var lastSeenAt: Int64?
     var createdAt: Int64?
 
     var displayName: String {
-        environment == "namespace" ? "\(name) · Devbox" : name
+        devboxProvider == "namespace" || devboxProvider == "boat" ? "\(name) · Devbox" : name
     }
 }
 
@@ -236,12 +237,18 @@ enum SessionStatus: String {
     case idle, working, awaitingInput, errored
 }
 
+struct ModelRetry: Decodable, Hashable {
+    var attempt: UInt32
+    var maxAttempts: UInt32
+}
+
 struct SessionRow: Hashable {
     var chatId: String
     var deviceId: String
     var status: SessionStatus
     var startedAt: Int64?
     var updatedAt: Int64
+    var modelRetry: ModelRetry? = nil
 }
 
 // MARK: - Derived display status (entities.rs / state.rs ports)

@@ -755,10 +755,10 @@ final class AppModel {
     }
 
     @discardableResult
-    func createChat(space: Space, config chatConfig: ChatConfig,
+    func createChat(id: String, space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) async throws -> String {
         if let demo {
-            let id = "chat-\(UUID().uuidString.lowercased().prefix(8))"
+            if demo.lists.chatsById[id] != nil { return id }
             demo.chats.append(Chat(id: id, deviceId: space.deviceId, title: nil, archived: false,
                                    cwd: cwd ?? space.path, branch: branch, checkoutId: nil,
                                    config: chatConfig, lastMessagePreview: nil, lastMessageAt: nil,
@@ -767,7 +767,13 @@ final class AppModel {
             return id
         }
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
-        return try await workspace.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        return try await workspace.createChat(id: id, space: space, config: chatConfig, branch: branch, cwd: cwd)
+    }
+
+    func waitForCreatedChat(id: String) async throws -> Chat {
+        if let demo, let chat = demo.lists.chatsById[id] { return chat }
+        guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
+        return try await workspace.waitForCreatedChat(id: id)
     }
 
     var launchesScaffoldSessions: Bool {
@@ -1305,11 +1311,12 @@ final class AppModel {
         }
         metadataReaders.removeValue(forKey: chatId)
         if metadataOnlyStores.contains(chatId) { pendingMetadataReleases.insert(chatId) }
+        else { releaseSessionStore(chatId: chatId) }
         scheduleMetadataRelease()
     }
 
-    /// Wait for viewport movement to settle before synchronously persisting a
-    /// metadata document. One sleeper handles the whole viewport, not each row.
+    /// Give the oldest off-screen row a bounded grace period, even while
+    /// scrolling continues. One sleeper handles the whole viewport, not each row.
     private func scheduleMetadataRelease() {
         guard !pendingMetadataReleases.isEmpty else {
             metadataReleaseTask?.cancel()
@@ -1317,8 +1324,8 @@ final class AppModel {
             metadataReleaseDeadline = nil
             return
         }
-        metadataReleaseDeadline = DispatchTime.now().uptimeNanoseconds + 300_000_000
         guard metadataReleaseTask == nil else { return }
+        metadataReleaseDeadline = DispatchTime.now().uptimeNanoseconds + 300_000_000
         metadataReleaseTask = Task { @MainActor [weak self] in
             while !Task.isCancelled, let deadline = self?.metadataReleaseDeadline {
                 let now = DispatchTime.now().uptimeNanoseconds
@@ -1474,6 +1481,50 @@ extension AppModel {
             E2ERunner.log("FAIL Crew store eviction: inactive nonmembers leaked or legitimate member was evicted")
             return false
         }
+        probe.notifications.visibleChatId = oldVisibleChatId
+        // Viewport churn must not extend the first off-screen row's deadline.
+        // Otherwise continuous scrolling keeps every encountered doc alive.
+        let metadata = SessionStore(chatId: "eviction-metadata", config: config, offline: true,
+                                    metadataOnly: true)
+        probe.sessionStores[metadata.chatId] = metadata
+        probe.metadataOnlyStores.formUnion([member.chatId, metadata.chatId])
+        defer { metadata.stop() }
+        probe.retainListMetadata(chatId: member.chatId)
+        probe.releaseListMetadata(chatId: member.chatId)
+        guard let deadline = probe.metadataReleaseDeadline else { return false }
+        probe.retainListMetadata(chatId: metadata.chatId)
+        probe.releaseListMetadata(chatId: metadata.chatId)
+        guard probe.metadataReleaseDeadline == deadline else {
+            E2ERunner.log("FAIL Crew store eviction: viewport churn deferred off-screen document release")
+            return false
+        }
+        // A returning row remains protected while the other row is released.
+        probe.retainListMetadata(chatId: member.chatId)
+        guard await E2ERunner.poll(timeout: 5, label: "metadata viewport eviction", {
+            probe.sessionStores[metadata.chatId] == nil ? true : nil
+        }) != nil, probe.sessionStores[member.chatId] === member else { return false }
+        // A transcript displaced from the three-recent cache while its list
+        // row is visible must leave once that last reader disappears.
+        probe.metadataOnlyStores.remove(member.chatId)
+        let recent = (0..<3).map {
+            SessionStore(chatId: "eviction-recent-\($0)", config: config, offline: true)
+        }
+        defer { for store in recent { store.stop() } }
+        probe.retainTranscriptBuilder(chatId: member.chatId)
+        for store in recent {
+            probe.sessionStores[store.chatId] = store
+            probe.retainTranscriptBuilder(chatId: store.chatId)
+        }
+        guard !probe.recentTranscriptIds.contains(member.chatId),
+              probe.sessionStores[member.chatId] === member else { return false }
+        probe.retainListMetadata(chatId: recent[0].chatId)
+        probe.releaseListMetadata(chatId: recent[0].chatId)
+        guard probe.sessionStores[recent[0].chatId] === recent[0] else { return false }
+        probe.releaseListMetadata(chatId: member.chatId)
+        guard probe.sessionStores[member.chatId] == nil else {
+            E2ERunner.log("FAIL Crew store eviction: displaced transcript survived its last list reader")
+            return false
+        }
         return true
     }
 }
@@ -1536,7 +1587,9 @@ extension AppModel {
             let workspace = WorkspaceStore(config: config)
             restarted.config = config; restarted.workspace = workspace; restarted.phase = .ready
             workspace.start()
-            guard let ref = workspace.sessionRef(id: id), ref.environment == nil,
+            guard let ref = await E2ERunner.poll(timeout: 5, label: "browse restored membership", {
+                workspace.sessionRef(id: id)
+            }), ref.environment == nil,
                   let store = restarted.sessionStore(for: ref), store.deploymentId == "deployment-a",
                   try restarted.browsePointer(chatId: id) == pointer,
                   restarted.scaffoldRoutes.isEmpty else { return false }

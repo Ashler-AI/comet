@@ -24,6 +24,7 @@ pub(crate) fn aggregate_owner_thread(
     Some(Session {
         chat_id: canonical.chat_id.clone(), device_id: canonical.owner_device_id.clone(),
         status: writer.status?, started_at: writer.started_at.and_then(DateTime::<Utc>::from_timestamp_millis), updated_at,
+        model_retry: if writer.status == Some(SessionStatus::Working) { writer.model_retry } else { None },
     })
 }
 
@@ -237,6 +238,7 @@ mod tests {
                 source_ref: None, last_activity_at: None, database_environment: None, unknown: Default::default(),
             }),
             harness: None, model: None, harness_session_id: None,
+            model_retry: None,
             started_at: None,
             status: Some(SessionStatus::Idle), updated_at: Some(100_100), created_at: 1,
             unknown: Default::default(),
@@ -326,6 +328,7 @@ mod tests {
         let mut active = Session {
             chat_id: "chat-0000".into(), device_id: "comet-scaffold-sandbox-e1".into(),
             status: SessionStatus::Working, started_at: None,
+            model_retry: None,
             updated_at: DateTime::from_timestamp_millis(100_000).unwrap(),
         };
         let awake = projected_rooms(&refs, &[], std::slice::from_ref(&active), "project", "local", 100_000);
@@ -378,6 +381,7 @@ mod tests {
                 session_id: CHAT.into(), chat_id: CHAT.into(), owner_subject: "owner".into(),
                 owner_device_id: "remote".into(), source: AgentSessionSource::Local,
                 environment: None, harness: None, model: None, harness_session_id: None,
+                model_retry: None,
                 started_at: None,
                 status: Some(status), updated_at: Some(at), created_at: at,
                 unknown: Default::default(),
@@ -452,10 +456,17 @@ mod tests {
         workspace.create_chat(LOCAL_CHAT, "local-space", None, None).unwrap();
         let remote_room = remote.open(REMOTE_CHAT).unwrap();
         let desktop_room = desktop.open(REMOTE_CHAT).unwrap();
-        let stale_at = DateTime::from_timestamp_millis(crate::now_ms() - comet_proto::view::SESSION_STALE_MS - 1_000).unwrap();
+        let stale_at = DateTime::from_timestamp_millis(crate::now_ms() - 90_000).unwrap();
+        let mut remote_device = remote_workspace.doc().read_devices().unwrap().into_iter()
+            .find(|device| device.id == "remote").unwrap();
+        remote_device.last_seen_at = Some(stale_at);
+        remote_workspace.doc().upsert_device(&remote_device).unwrap();
+        workspace.doc().upsert_device(&remote_device).unwrap();
+        let mut devices = workspace.watch_devices();
         let mut current = Session {
             chat_id: REMOTE_CHAT.into(), device_id: "remote".into(),
             status: SessionStatus::Working, started_at: None,
+            model_retry: None,
             updated_at: stale_at,
         };
         // Existing bare-chat agents acquire the canonical record on their next
@@ -474,6 +485,7 @@ mod tests {
         let mut local = Session {
             chat_id: LOCAL_CHAT.into(), device_id: "desktop".into(),
             status: SessionStatus::Working, started_at: None,
+            model_retry: None,
             updated_at: Utc::now(),
         };
         let abandoned = Session { device_id: "desktop".into(), status: SessionStatus::Idle, ..current.clone() };
@@ -489,6 +501,9 @@ mod tests {
         assert_eq!(comet_proto::view::effective_indicator(Some(old),
             Utc::now()), comet_proto::view::Indicator::Unreachable,
             "a static streaming snapshot is not a current heartbeat");
+        receive_for(&mut devices, "static streaming snapshot leaves device offline", |rows| {
+            rows.iter().any(|device| device.id == "remote" && device.last_seen_at == Some(stale_at))
+        }).await;
 
         for (status, sidebar) in [
             (SessionStatus::Working, ChatIndicator::Working),
@@ -506,6 +521,9 @@ mod tests {
             sync_room();
             receive_for(&mut sessions, &format!("fresh owner {status:?} before stale import"),
                 |rows| rows.iter().any(|row| row == &current)).await;
+            receive_for(&mut devices, "owner heartbeat refreshes device presence", |rows| {
+                rows.iter().any(|device| device.id == "remote" && device.last_seen_at == Some(current.updated_at))
+            }).await;
             let stale = Session { status: SessionStatus::Idle,
                 updated_at: stale_at - chrono::Duration::milliseconds(1), ..current.clone() };
             // A real owner publishes its stale cached index, received as a
@@ -539,17 +557,23 @@ mod tests {
                 rows.iter().find(|row| row.chat_id == REMOTE_CHAT), Utc::now()), sidebar);
         }
         let before = workspace.doc().read_sessions().unwrap();
+        let presence_before = devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at;
+        let newer = Session { updated_at: current.updated_at + chrono::Duration::seconds(1), ..current.clone() };
         let foreign = Session { device_id: "foreign".into(), status: SessionStatus::Working, ..current.clone() };
         workspace.record_session_activity(None, "owner", &foreign, Some(crate::now_ms())).unwrap();
-        workspace.record_session_activity(None, "foreign-principal", &current, Some(crate::now_ms())).unwrap();
+        workspace.record_session_activity(None, "foreign-principal", &newer, Some(crate::now_ms())).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
         assert_eq!(sessions.borrow().iter().find(|row| row.chat_id == REMOTE_CHAT), Some(&current));
+        assert_eq!(devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at, presence_before,
+            "foreign activity cannot renew device presence");
         local_tx.send_replace(vec![local]);
         workspace.remove_session_ref(REMOTE_CHAT).unwrap();
         receive_for(&mut chats, "unpinned chat removal", |rows| rows.iter().all(|row| row.id != REMOTE_CHAT)).await;
         receive_for(&mut sessions, "unpinned session removal", |rows| rows.iter().all(|row| row.chat_id != REMOTE_CHAT)).await;
-        workspace.record_session_activity(None, "owner", &current, Some(crate::now_ms())).unwrap();
+        workspace.record_session_activity(None, "owner", &newer, Some(crate::now_ms())).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
+        assert_eq!(devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at, presence_before,
+            "removed membership cannot renew device presence");
         drop(bridge);
     }
 
@@ -634,6 +658,7 @@ mod tests {
                         model: None,
                         harness_session_id: None,
                         status: Some(status),
+                        model_retry: None,
                         started_at: None,
                         updated_at: Some(at),
                         created_at: started_at,
@@ -665,6 +690,7 @@ mod tests {
             chat_id: CHAT.into(),
             device_id: "local".into(),
             status: SessionStatus::Idle,
+            model_retry: None,
             started_at: None,
             updated_at: DateTime::from_timestamp_millis(crate::now_ms()).unwrap(),
         };

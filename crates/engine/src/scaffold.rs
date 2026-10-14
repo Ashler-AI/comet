@@ -137,22 +137,27 @@ impl fmt::Display for ScaffoldTransportCause {
     }
 }
 
-fn classify_transport_error(error: &reqwest::Error) -> ScaffoldTransportCause {
-    if error.is_timeout() {
-        return ScaffoldTransportCause::RequestTimeout;
-    }
-    let mut source: &(dyn std::error::Error + 'static) = error;
+pub(crate) fn classify_transport_error(error: &(dyn std::error::Error + 'static)) -> ScaffoldTransportCause {
+    let mut source = error;
+    let mut connect_failure = false;
     loop {
-        if let Some(io_error) = source.downcast_ref::<std::io::Error>()
-            && matches!(
-                io_error.kind(),
+        if let Some(request_error) = source.downcast_ref::<reqwest::Error>() {
+            if request_error.is_timeout() {
+                return ScaffoldTransportCause::RequestTimeout;
+            }
+            connect_failure |= request_error.is_connect();
+        }
+        if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
+            match io_error.kind() {
+                std::io::ErrorKind::TimedOut => return ScaffoldTransportCause::RequestTimeout,
                 std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-        {
-            return ScaffoldTransportCause::ConnectionResetOrClosed;
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => {
+                    return ScaffoldTransportCause::ConnectionResetOrClosed;
+                }
+                _ => {}
+            }
         }
         if let Some(hyper_error) = source.downcast_ref::<hyper::Error>()
             && (hyper_error.is_closed() || hyper_error.is_incomplete_message())
@@ -164,7 +169,7 @@ fn classify_transport_error(error: &reqwest::Error) -> ScaffoldTransportCause {
         };
         source = next;
     }
-    if error.is_connect() {
+    if connect_failure {
         ScaffoldTransportCause::ConnectFailure
     } else {
         ScaffoldTransportCause::SendFailure

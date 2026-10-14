@@ -22,7 +22,7 @@ mod client;
 pub mod device_room;
 mod server;
 
-pub use client::{RpcClient, connect_ws};
+pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, GRANT_KIND, GrantHandler, GrantResetHandler, HostRelay,
     HostRelayConfig, LinkCache, LinkCacheConfig, NUDGE_ACK_KIND, Nudge, NudgeHandler, StaticToken,
@@ -45,6 +45,8 @@ pub mod methods {
     pub const TAKE_OVER_OMP_SESSION: &str = "TakeOverOmpSession";
     /// Current OMP recovery phase followed by event-driven updates for one chat.
     pub const WATCH_OMP_RECOVERY: &str = "WatchOmpRecovery";
+    /// Hold one exact live run while this authenticated subscription remains open.
+    pub const RETAIN_SESSION_SUPERVISION: &str = "RetainSessionSupervision";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Read one older transcript page before an opaque raw-list cursor.
     pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";
@@ -207,6 +209,14 @@ pub struct ReadCheckoutDiffResult {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRefParams {
     pub chat_id: String,
+}
+
+/// Run capability is supplied only by the engine's child environment, never a prompt.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainSessionSupervisionParams {
+    pub chat_id: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +405,9 @@ pub struct PeerWaitResult {
     pub reply: Option<PeerReplyResult>,
 }
 
+pub(crate) const STREAM_OVERFLOW_ERROR: &str =
+    "rpc_stream_overflow: resubscribe for a fresh snapshot or replay";
+
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     #[error("unknown method: {0}")]
@@ -410,6 +423,8 @@ pub enum RpcError {
     Transport(String),
     #[error("connection closed")]
     Closed,
+    #[error("{}", STREAM_OVERFLOW_ERROR)]
+    StreamOverflow,
 }
 
 /// A client-originated frame.
@@ -444,6 +459,9 @@ pub enum RpcReply {
     Value(serde_json::Value),
     /// Stream — each item sent as `{id, item}`, then `{id, done: true}` when it ends.
     Stream(BoxStream<'static, serde_json::Value>),
+    /// Fallible stream (e.g. a forwarded subscription). An error emits `{id, err}`,
+    /// never a successful `{done}`; queued items retain their original order.
+    FallibleStream(BoxStream<'static, Result<serde_json::Value, RpcError>>),
 }
 
 impl RpcReply {
@@ -523,6 +541,10 @@ mod tests {
                     ))
                 }
                 "Never" => Ok(RpcReply::Stream(futures::stream::pending().boxed())),
+                "Overflow" => Ok(RpcReply::FallibleStream(futures::stream::iter([
+                    Ok(serde_json::json!("queued prefix")),
+                    Err(RpcError::StreamOverflow),
+                ]).boxed())),
                 "Boom" => Err(RpcError::Failed("boom".into())),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
@@ -545,7 +567,7 @@ mod tests {
             .unwrap();
         let mut seen = Vec::new();
         while let Some(v) = items.recv().await {
-            seen.push(v);
+            seen.push(v.unwrap());
         }
         assert_eq!(
             seen,
@@ -580,9 +602,29 @@ mod tests {
             .subscribe("Count", serde_json::json!({"n": 2}))
             .await
             .unwrap();
-        assert_eq!(items.recv().await, Some(serde_json::json!(0)));
-        assert_eq!(items.recv().await, Some(serde_json::json!(1)));
-        assert_eq!(items.recv().await, None);
+        assert_eq!(items.recv().await.unwrap().unwrap(), serde_json::json!(0));
+        assert_eq!(items.recv().await.unwrap().unwrap(), serde_json::json!(1));
+        assert!(items.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn forwarded_stream_failure_is_not_successful_completion() {
+        struct Forward(Arc<RpcClient>);
+        #[async_trait]
+        impl RpcService for Forward {
+            async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+                let rx = self.0.subscribe(method, params).await?;
+                Ok(RpcReply::FallibleStream(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }).boxed()))
+            }
+        }
+        let source = Arc::new(memory_client(Arc::new(TestService)));
+        let forwarded = memory_client(Arc::new(Forward(source)));
+        let mut stream = forwarded.subscribe("Overflow", serde_json::Value::Null).await.unwrap();
+        assert_eq!(stream.recv().await.unwrap().unwrap(), serde_json::json!("queued prefix"));
+        assert!(matches!(stream.recv().await, Some(Err(RpcError::StreamOverflow))));
+        assert!(stream.recv().await.is_none());
     }
 
     #[tokio::test]

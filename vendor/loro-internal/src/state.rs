@@ -1190,7 +1190,7 @@ impl DocState {
                 vv,
                 &frontiers,
                 Some(&|idx| !idx.is_unknown() && unknown_containers.contains(&idx)),
-            );
+            )?;
             self.apply_diff(
                 InternalDocDiff {
                     origin: origin.clone(),

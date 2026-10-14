@@ -68,6 +68,26 @@ async function fixture(t) {
 
 const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
 
+test('model retry progress follows live or peer state and clears on terminal or stale rows', async t => {
+  const f = await fixture(t);
+  await f.viewport.readAuthority();
+  const retry = { attempt: 2, maxAttempts: 4 };
+  f.viewport.collaboration = { sessions: [{ sessionId: 'session-a', status: 'working', updatedAt: Date.now(), modelRetry: retry }] };
+  assert.deepEqual(f.viewport.state().session.modelRetry, retry);
+  f.viewport.live = { chatId: 'session-a', status: 'working', updatedAt: new Date().toISOString(), modelRetry: retry };
+  assert.deepEqual(f.viewport.state().session.modelRetry, retry);
+  f.viewport.live.modelRetry = null;
+  assert.equal(f.viewport.state().session.modelRetry, null);
+  for (const status of ['idle', 'errored', 'awaitingInput']) {
+    f.viewport.live.status = status;
+    f.viewport.live.modelRetry = retry;
+    assert.equal(f.viewport.state().session.modelRetry, null);
+  }
+  f.viewport.live.status = 'working';
+  f.viewport.live.updatedAt = new Date(Date.now() - 45_001).toISOString();
+  assert.equal(f.viewport.state().session.modelRetry, null);
+});
+
 test('native opening rechecks authority and binds the installed deployment without credentials', async t => {
   const f = await fixture(t);
   const original = f.rpc.call;

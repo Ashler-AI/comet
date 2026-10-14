@@ -150,6 +150,10 @@ default-features = false
 [dependencies.pretty_assertions]
 version = "1.4.1"
 
+[dependencies.quick_cache]
+version = "0.6.2"
+default-features = false
+
 [dependencies.rand]
 version = "0.8.5"
 

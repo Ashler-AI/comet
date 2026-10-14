@@ -70,6 +70,7 @@ actor RoomClient {
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
     private var fullResyncs = 0
+    private var rejectedUpdates = 0
     private var snapshotRecovery: LoroDoc?
     private var serverVersion: VersionVector?
     // Join advertisements and pending imports may not advance either local VV.
@@ -325,9 +326,10 @@ actor RoomClient {
     /// hibernating-but-healthy DO is simply woken by the probe and answers —
     /// hibernation is NOT death, which is why probes run in minutes while
     /// the transport lease runs in seconds.
-    private func livenessTick(gen: Int, at instant: DispatchTime = .now()) async {
+    private func livenessTick(gen: Int, at instant: DispatchTime? = nil) async {
         guard gen == generation, !closed else { return }
-        let now = instant.uptimeNanoseconds
+        // Sample after entering the actor; a queued call can follow newer traffic.
+        let now = (instant ?? .now()).uptimeNanoseconds
         if pending.values.contains(where: {
             now >= $0.sent.uptimeNanoseconds && now - $0.sent.uptimeNanoseconds >= Self.ackDeadlineNs
         }) {
@@ -337,7 +339,7 @@ actor RoomClient {
         }
         if let sent = joinSentAt {
             let base = max(sent.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
-            if now - base > RoomClient.joinDeadlineNs {
+            if now >= base, now - base > RoomClient.joinDeadlineNs {
                 // The 2026-07-30 hang: a room that accepted the socket but
                 // never answered the join. Redial via the backoff loop — one
                 // fresh dial re-instantiates a wedged DO.
@@ -348,13 +350,14 @@ actor RoomClient {
         }
         if let started = backfillStartedAt {
             let base = max(started.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
-            if now - base > RoomClient.joinDeadlineNs {
+            if now >= base, now - base > RoomClient.joinDeadlineNs {
                 roomLog.warning("room \(self.roomId, privacy: .public): joined but backfill did not complete; redialing")
                 onSocketError(gen: gen)
             }
             return
         }
-        if joinedLor, now - lastPushedRx.uptimeNanoseconds > probeIntervalNs {
+        if joinedLor, now >= lastPushedRx.uptimeNanoseconds,
+           now - lastPushedRx.uptimeNanoseconds > probeIntervalNs {
             probeIntervalNs = min(probeIntervalNs * 2, RoomClient.roomProbeMaxNs)
             await sendProbe()
         }
@@ -556,7 +559,7 @@ actor RoomClient {
                 } else {
                     let status = try? doc.importWith(bytes: bytes, origin: "remote")
                     let complete = status.map { ($0.pending?.isEmpty ?? true) } ?? false
-                    if complete, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
+                    if complete, !doc.isDetached(), doc.stateFrontiers() == doc.oplogFrontiers() {
                         imported = imported || !(status?.success.isEmpty ?? true)
                         await resubmitMissingUpdates()
                         finishRecoveryIfCaughtUp()
@@ -630,16 +633,17 @@ actor RoomClient {
         deferredFullResync = false
         backfillStartedAt = nil
         fullResyncs = 0
+        rejectedUpdates = 0
         backoffMs = RoomClient.backoffBaseMs
         if joinedLor { events(.connected) }
         if let serverVersion { events(.localChangesAcknowledged(serverVersion.encode())) }
     }
 
     private func hasMaterializedRemoteVersion(_ replica: LoroDoc) -> Bool {
-        guard let serverVersion, !replica.isDetached() else { return false }
-        let state = replica.stateVv()
-        return state == replica.oplogVv() && state.includesVv(other: serverVersion)
-            && state.includesVv(other: requiredRemoteVersion)
+        guard let serverVersion, !replica.isDetached(),
+              replica.stateFrontiers() == replica.oplogFrontiers() else { return false }
+        let version = replica.oplogVv()
+        return version.includesVv(other: serverVersion) && version.includesVv(other: requiredRemoteVersion)
     }
 
     private func resubmitMissingUpdates() async {
@@ -700,8 +704,8 @@ actor RoomClient {
         if !recovering { events(.disconnected) }
         recovering = true
         guard !historyRepairAttempted, !doc.isDetached(),
-              !doc.oplogVv().isEmpty(), doc.stateVv() == doc.oplogVv(),
-              doc.stateVv().includesVv(other: requiredRemoteVersion),
+              !doc.oplogVv().isEmpty(), doc.stateFrontiers() == doc.oplogFrontiers(),
+              doc.oplogVv().includesVv(other: requiredRemoteVersion),
               let snapshot = try? doc.export(mode: .snapshot) else {
             onSocketError(gen: generation)
             return
@@ -744,12 +748,17 @@ actor RoomClient {
             catchupBatches.remove(refId)
             finishRecoveryIfCaughtUp()
         } else {
-            // Every rejected operation remains in the durable document. Retry
-            // through bounded socket backoff, never a lifetime counter that
-            // leaves a permanently rejected upload showing as connected.
-            roomLog.error("room \(self.roomId, privacy: .public): update rejected (\(String(describing: status), privacy: .public)); redialing")
-            recovering = true
-            if status == .permissionDenied || status == .invalidUpdate || status == .payloadTooLarge {
+            // Retained ancestry may need authoritative reconciliation, not a
+            // permanently stopped workspace. Permission/size failures stay blocked.
+            roomLog.error("room \(self.roomId, privacy: .public): update rejected (\(String(describing: status), privacy: .public))")
+            if status == .invalidUpdate, rejectedUpdates < RoomClient.maxFullResyncs {
+                rejectedUpdates += 1
+                pending.removeAll()
+                catchupBatches.removeAll()
+                recoverApplicationIntents = true
+                await requestFullSnapshot()
+            } else if status == .permissionDenied || status == .invalidUpdate || status == .payloadTooLarge {
+                recovering = true
                 blockRecovery("Crew could not publish retained records (\(String(describing: status))). The original intents are retained; resolve the permission or record conflict before retrying.")
             } else { onSocketError(gen: generation) }
         }
@@ -1073,6 +1082,14 @@ actor RoomClient {
                 return false
             }
         }
+        let rejectedClient = RoomClient(roomId: "ws4/rejected-regression", doc: LoroDoc(),
+            urlProvider: { nil }, events: { _ in }, adoptSnapshot: { previous, replacement in
+                DocDisk.preserveLocalOperations(from: previous, in: replacement)
+            })
+        guard await rejectedClient.exerciseRejectedUploadRecovery() else {
+            await E2ERunner.log("FAIL Crew rejected catalog recovery")
+            return false
+        }
         let recoveryClient = RoomClient(roomId: "regression", doc: LoroDoc(),
                                         urlProvider: { nil }, events: { _ in },
                                         adoptSnapshot: { _, _ in false })
@@ -1081,6 +1098,58 @@ actor RoomClient {
             return false
         }
         return true
+    }
+
+    private func exerciseRejectedUploadRecovery() async -> Bool {
+        var uploads: [([[UInt8]], BatchId)] = []
+        var fullJoins = 0
+        regressionSend = { message in
+            if case .docUpdate(.loro, _, let bytes, let batch) = message { uploads.append((bytes, batch)) }
+            if case .joinRequest(.loro, _, _, let version) = message, version.isEmpty { fullJoins += 1 }
+        }
+        defer { regressionSend = nil; stop() }
+        do {
+            let source = LoroDoc()
+            let old = try source.getMap(id: "chats").getOrCreateContainer(key: "old", child: LoroMap())
+            try old.insert(key: "id", v: "old"); try old.insert(key: "deviceId", v: "host")
+            try old.insert(key: "title", v: "Cached session")
+            _ = try doc.importWith(bytes: source.export(mode: .snapshot), origin: "fixture")
+            // Successful heals reset the allowance; it is not a lifetime cap.
+            for turn in 1...4 {
+                uploads.removeAll()
+                let seen = Int64(turn)
+                try doc.getMap(id: "chats").getOrCreateContainer(key: "old", child: LoroMap())
+                    .insert(key: "lastSeenAt", v: seen)
+                doc.commit()
+                await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                guard let rejected = uploads.first else { return false }
+                await onAck(crdt: .loro, refId: rejected.1, status: .invalidUpdate)
+                guard !closed, recovering, recoverApplicationIntents, fullJoins == turn else { return false }
+                let id = "new-\(turn)"
+                let row = try source.getMap(id: "chats").getOrCreateContainer(key: id, child: LoroMap())
+                try row.insert(key: "id", v: id); try row.insert(key: "deviceId", v: "host")
+                try row.insert(key: "title", v: "New desktop session \(turn)")
+                try row.insert(key: "createdAt", v: seen)
+                let ref = try source.getMap(id: "sessionRefs").getOrCreateContainer(key: id, child: LoroMap())
+                try ref.insert(key: "userId", v: "reader"); try ref.insert(key: "chatId", v: id)
+                try ref.insert(key: "addedAt", v: seen)
+                source.commit()
+                uploads.removeAll()
+                await onJoinOk(crdt: .loro, version: [UInt8](source.oplogVv().encode()))
+                await applyRemote(crdt: .loro, updates: [[UInt8](try source.export(mode: .snapshot))])
+                guard !uploads.isEmpty, recovering else { return false }
+                for (bytes, batch) in uploads {
+                    for update in bytes { _ = try source.importWith(bytes: Data(update), origin: "phone") }
+                    await onAck(crdt: .loro, refId: batch, status: .ok)
+                }
+                guard !recovering, !closed, rejectedUpdates == 0,
+                      WorkspaceStore.decodeProjection(from: doc, userId: "reader")?.lists.overviewChats.first?.id == id,
+                      doc.getMap(id: "chats").get(key: "old")?.asLoroMap()?.get(key: "lastSeenAt")?.asValue()?.i64Value == seen
+                else { return false }
+            }
+            await E2ERunner.log("OK Crew rejected catalog recovery: authoritative backfill discovers new sessions, retains local reads and resets the bounded heal allowance")
+            return true
+        } catch { return false }
     }
 
     private func exerciseWarmShallowRecovery(serverSeen: Int64) async -> Bool {
@@ -1248,12 +1317,18 @@ actor RoomClient {
                       connectionEvents.withLock({ $0 == [false, true] }) else { return false }
                 await onAck(crdt: .loro, refId: batches[1], status: .permissionDenied)
                 guard connectionEvents.withLock({ $0 == [false, true, false] }) else { return false }
+            } else if status == .invalidUpdate {
+                guard !closed, recovering, recoverApplicationIntents else { return false }
+                for _ in 0..<RoomClient.maxFullResyncs {
+                    await onJoinOk(crdt: .loro, version: [])
+                    guard let batch = batches.last else { return false }
+                    await onAck(crdt: .loro, refId: batch, status: .invalidUpdate)
+                }
             } else {
                 guard connectionEvents.withLock({ $0 == [false, false] }) else { return false }
             }
             finishRecoveryIfCaughtUp()
-            let permanent = status == .ok || status == .permissionDenied || status == .invalidUpdate || status == .payloadTooLarge
-            return recovering && !joinedLor && (permanent ? closed && reconnectTask == nil : reconnectTask != nil)
+            return recovering && !joinedLor && closed && reconnectTask == nil
                 && doc.getMap(id: "meta").get(key: "offline")?.asValue()?.stringValue == "retained"
         } catch { return false }
     }
@@ -1478,13 +1553,43 @@ actor RoomClient {
             }, adoptSnapshot: { _, _ in false })
         let ackClient = RoomClient(roomId: "ws4/lost-ack", doc: LoroDoc(),
             urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
+        let queuedClient = RoomClient(roomId: "ws4/queued-tick", doc: LoroDoc(),
+            urlProvider: { nil }, events: { _ in }, adoptSnapshot: { _, _ in false })
         guard await client.exerciseBroadcastProbe(),
               await ackClient.exerciseLostLiveAcknowledgement(),
+              await queuedClient.exerciseQueuedLivenessTick(),
               await blockedClient.exerciseBlockedSnapshot(blocked) else {
             await E2ERunner.log("FAIL Crew foreground and blocked recovery")
             return false
         }
         await E2ERunner.log("OK Crew foreground and blocked recovery: stale broadcast probe, ACK isolation, conflict visible, no automatic blocked retry")
+        return true
+    }
+
+    private func exerciseQueuedLivenessTick() async -> Bool {
+        var probes = 0
+        regressionSend = { message in
+            if case .joinRequest(.loro, _, _, _) = message { probes += 1 }
+        }
+        defer { regressionSend = nil; stop() }
+        let sampled = DispatchTime.now()
+        let newer = DispatchTime(uptimeNanoseconds: sampled.uptimeNanoseconds + 1)
+        let gen = generation
+        lastLorRx = newer; lastPushedRx = newer
+        joinSentAt = newer
+        await livenessTick(gen: gen, at: sampled)
+        guard generation == gen, reconnectTask == nil, !closed else { return false }
+        joinSentAt = nil; backfillStartedAt = newer
+        await livenessTick(gen: gen, at: sampled)
+        guard generation == gen, reconnectTask == nil, !closed else { return false }
+        backfillStartedAt = nil; joinedLor = true
+        await livenessTick(gen: gen, at: sampled)
+        guard generation == gen, reconnectTask == nil, probes == 0, joinedLor else { return false }
+        backfillStartedAt = newer
+        await livenessTick(gen: gen, at: DispatchTime(
+            uptimeNanoseconds: newer.uptimeNanoseconds + RoomClient.joinDeadlineNs + 1))
+        guard generation != gen, reconnectTask != nil, !joinedLor else { return false }
+        await E2ERunner.log("OK Crew liveness clock: queued ticks tolerate newer join/backfill/push clocks; expired backfill still redials")
         return true
     }
 

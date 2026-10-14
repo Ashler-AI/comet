@@ -4040,7 +4040,7 @@ impl Shell {
         let rest_text = if selected { text } else { text.opacity(0.8) };
         // Top-right status slot (reference shot): Working spins the thin arc,
         // finished-unseen / awaiting-input / errored raise the attention dot,
-        // Idle keeps the plain recency label.
+        // Devbox idle rows keep their status visible alongside recency.
         let status_slot: AnyElement = match status {
             // 9px ring nudged 1px down: its top edge lands 3px into the 13px
             // band — the same inset as the attention dot — instead of hugging
@@ -4074,7 +4074,11 @@ impl Shell {
                 .text_size(px(10.5))
                 .line_height(px(13.0))
                 .text_color(subline)
-                .child(time_ago)
+                .child(if meta.environment.is_some() {
+                    format!("Idle · {time_ago}").into()
+                } else {
+                    time_ago
+                })
                 .into_any_element(),
         };
         // Hover reveal without a `group-hover` (gpui has none): the row's own
@@ -7951,14 +7955,33 @@ impl Shell {
                 )
                 .into_any_element();
         }
-        let local_indicator = state.indicator_for(&chat_id, now);
+        let selected_agent = state.selected_agent_session().filter(|session| session.chat_id == chat_id);
+        let local_session = selected_agent
+            .and_then(|agent| {
+                state.sessions.iter().find(|session| {
+                    session.chat_id.strip_prefix(chat_id.as_str())
+                        .and_then(|suffix| suffix.strip_prefix("::session::"))
+                        == Some(agent.session_id.as_str())
+                })
+            })
+            .or_else(|| match selected_agent {
+                Some(agent) if agent.session_id != chat_id => None,
+                _ => state.session_for(&chat_id),
+            });
+        let local_indicator = comet_proto::view::effective_indicator(local_session, now);
         let indicator = if local_indicator == Indicator::None {
             state.selected_agent_indicator(now)
         } else {
             local_indicator
         };
-        let elapsed_secs = state
-            .session_for(&chat_id)
+        let retry = if local_indicator == Indicator::Working {
+            local_session.and_then(|session| session.model_retry)
+        } else if comet_proto::view::effective_agent_indicator(selected_agent, now) == Indicator::Working {
+            selected_agent.and_then(|session| session.model_retry)
+        } else {
+            None
+        };
+        let elapsed_secs = local_session
             .and_then(|s| s.started_at)
             .map(|t| now.signed_duration_since(t).num_seconds())
             .or_else(|| {
@@ -7975,8 +7998,10 @@ impl Shell {
 
         match indicator {
             Indicator::Working => {
-                let word =
-                    transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
+                let label = retry.map_or_else(
+                    || format!("{}…", transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs)),
+                    |retry| format!("Reconnecting to model — attempt {}/{}", retry.attempt, retry.max_attempts),
+                );
                 let delta = motion::pulse_delta(&COMET_PULSE, cx.entity_id(), cx);
                 strip
                     .child(
@@ -7984,7 +8009,7 @@ impl Shell {
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
                             .opacity(0.6 + 0.35 * delta)
-                            .child(SharedString::from(format!("{word}…"))),
+                            .child(SharedString::from(label)),
                     )
                     .child(
                         div()

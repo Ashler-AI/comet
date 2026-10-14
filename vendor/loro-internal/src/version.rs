@@ -240,12 +240,8 @@ impl ImVersionVector {
                 continue;
             }
 
-            if let Some(my_counter) = self.0.get_mut(&client_id) {
-                *my_counter = normalize_vv_counter(*my_counter);
-                if *my_counter < counter {
-                    *my_counter = counter;
-                }
-            } else {
+            // A mutable lookup clones shared HAMT nodes even when the counter is unchanged.
+            if self.0.get(&client_id).copied().unwrap_or(0) < counter {
                 self.0.insert(client_id, counter);
             }
         }
@@ -277,12 +273,7 @@ impl ImVersionVector {
             return;
         }
 
-        if let Some(counter) = self.0.get_mut(&id.peer) {
-            *counter = normalize_vv_counter(*counter);
-            if *counter < end {
-                *counter = end;
-            }
-        } else {
+        if self.0.get(&id.peer).copied().unwrap_or(0) < end {
             self.0.insert(id.peer, end);
         }
     }

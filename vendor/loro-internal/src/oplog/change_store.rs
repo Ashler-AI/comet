@@ -6,9 +6,10 @@ use crate::sync::Mutex;
 use crate::{
     arena::SharedArena,
     change::Change,
+    delta::MapValue,
     estimated_size::EstimatedSize,
     kv_store::KvStore,
-    op::Op,
+    op::{InnerContent, Op},
     parent::register_container_and_parent_link,
     version::{Frontiers, ImVersionVector},
     InternalString, VersionVector,
@@ -18,13 +19,13 @@ use bytes::Bytes;
 use itertools::Itertools;
 use loro_common::{
     ContainerID, Counter, HasCounterSpan, HasId, HasIdSpan, HasLamportSpan, IdLp, IdSpan, Lamport,
-    LoroError, LoroResult, PeerID, ID,
+    LoroError, LoroResult, LoroValue, PeerID, ID,
 };
 use loro_kv_store::{mem_store::MemKvConfig, MemKvStore};
 use once_cell::sync::OnceCell;
 use rle::{HasLength, Mergable, RlePush, RleVec, Sliceable};
-use rustc_hash::FxHashSet;
-use std::sync::atomic::AtomicI64;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::atomic::{AtomicBool, AtomicI64};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
@@ -76,6 +77,7 @@ pub struct ChangeStore {
     external_vv: Arc<Mutex<VersionVector>>,
     merge_interval: Arc<AtomicI64>,
     root_history_names: Arc<Mutex<RootHistoryNamesState>>,
+    history_corrupted: Arc<AtomicBool>,
     #[cfg(test)]
     root_history_scan_count: Arc<AtomicUsize>,
 }
@@ -198,6 +200,7 @@ impl ChangeStore {
             // external_kv: Arc::new(Mutex::new(BTreeMap::default())),
             merge_interval,
             root_history_names: Arc::new(Mutex::new(RootHistoryNamesState::Uninitialized)),
+            history_corrupted: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             root_history_scan_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -386,6 +389,97 @@ impl ChangeStore {
             for c in block.content.try_changes().unwrap() {
                 f(c);
             }
+        }
+    }
+
+    /// Scan only requested map keys without retaining decoded blocks or growing the shared arena.
+    pub(crate) fn visit_map_ops_for_keys<F>(
+        &self,
+        container: &ContainerID,
+        keys: &mut FxHashMap<InternalString, Option<MapValue>>,
+        f: &mut F,
+    ) -> LoroResult<()>
+    where
+        F: FnMut(&InternalString, &mut Option<MapValue>, &Option<LoroValue>, Counter, Lamport, PeerID),
+    {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let visit_changes = |changes: &[Change], arena: &SharedArena,
+                             keys: &mut FxHashMap<InternalString, Option<MapValue>>, f: &mut F| {
+            let Some(idx) = arena.id_to_idx(container) else {
+                return;
+            };
+            for change in changes {
+                for op in change.ops.iter() {
+                    if op.container != idx {
+                        continue;
+                    }
+                    if let InnerContent::Map(map) = &op.content {
+                        if let Some(target) = keys.get_mut(&map.key) {
+                            let lamport = change.lamport
+                                + (op.counter - change.id.counter) as Lamport;
+                            f(&map.key, target, &map.value, op.counter, lamport, change.id.peer);
+                        }
+                    }
+                }
+            }
+        };
+        let visit_bytes = |bytes: &[u8], header: Option<ChangesBlockHeader>,
+                           keys: &mut FxHashMap<InternalString, Option<MapValue>>, f: &mut F|
+         -> LoroResult<()> {
+            let header = decode_cids(bytes, header)?;
+            let cids = header.cids.get().ok_or(LoroError::DecodeDataCorruptionError)?;
+            let block_keys = header.keys.get().ok_or(LoroError::DecodeDataCorruptionError)?;
+            if !cids.contains(container) || !block_keys.iter().any(|key| keys.contains_key(key)) {
+                return Ok(());
+            }
+
+            let arena = SharedArena::new();
+            let changes = decode_block(bytes, &arena, Some(&header))?;
+            visit_changes(&changes, &arena, keys, f);
+            Ok(())
+        };
+
+        let result = (|| -> LoroResult<()> {
+            // Keep the same lock order as the store's ordinary block readers.
+            let inner = self.inner.lock();
+            let external = self.external_kv.lock();
+            for (key, bytes) in external.scan(Bound::Unbounded, Bound::Unbounded) {
+                if key.len() != 12 || inner.mem_parsed_kv.contains_key(&ID::from_bytes(&key)) {
+                    continue;
+                }
+                visit_bytes(&bytes, None, keys, f)?;
+            }
+            for block in inner.mem_parsed_kv.values() {
+                match &block.content {
+                    ChangesBlockContent::Changes(changes) | ChangesBlockContent::Both(changes, _) => {
+                        visit_changes(changes, &self.arena, keys, f);
+                    }
+                    ChangesBlockContent::Bytes(bytes) => {
+                        visit_bytes(
+                            &bytes.bytes,
+                            bytes.header.get().map(|h| h.as_ref().clone()),
+                            keys,
+                            f,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.history_corrupted.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub(crate) fn check_history_parsable(&self) -> LoroResult<()> {
+        if self.history_corrupted.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(LoroError::DecodeDataCorruptionError)
+        } else {
+            Ok(())
         }
     }
 
@@ -702,6 +796,9 @@ impl ChangeStore {
             external_kv: self.external_kv.lock().clone_store(),
             merge_interval,
             root_history_names: Arc::new(Mutex::new(RootHistoryNamesState::Uninitialized)),
+            history_corrupted: Arc::new(AtomicBool::new(
+                self.history_corrupted.load(std::sync::atomic::Ordering::Relaxed),
+            )),
             #[cfg(test)]
             root_history_scan_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -1811,7 +1908,6 @@ impl ChangesBlockContent {
                         cnt: change.id.counter,
                         lamport: change.lamport,
                         deps: change.deps.clone(),
-                        vv: OnceCell::new(),
                         has_succ: false,
                         len: change.atom_len(),
                     }
@@ -1830,7 +1926,6 @@ impl ChangesBlockContent {
                         cnt: header.counters[i],
                         lamport: header.lamports[i],
                         deps: header.deps_groups[i].clone(),
-                        vv: OnceCell::new(),
                         has_succ: false,
                         len: (header.counters[i + 1] - header.counters[i]) as usize,
                     }
@@ -1966,6 +2061,68 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn map_scan_memory_blocks_override_stale_kv_without_caching_byte_blocks() {
+        let doc = LoroDoc::new_auto_commit();
+        doc.set_peer_id(7).unwrap();
+        doc.get_map("map").insert("wanted", 1).unwrap();
+        doc.commit_then_renew();
+        doc.get_map("map").insert("wanted", 2).unwrap();
+        doc.commit_then_renew();
+        let oplog = doc.oplog().lock();
+        let store = oplog.change_store();
+        let cid = ContainerID::new_root("map", loro_common::ContainerType::Map);
+        let mut encoded = Vec::new();
+        {
+            let inner = store.inner.lock();
+            let mut external = store.external_kv.lock();
+            for (id, block) in &inner.mem_parsed_kv {
+                let changes = block.content.try_changes().unwrap();
+                encoded.push((*id, encode_block(changes, &store.arena)));
+                // A stale, even corrupt, disk copy must not supersede current memory content.
+                external.set(&id.to_bytes(), Bytes::from_static(b"stale"));
+            }
+        }
+        let mut keys = FxHashMap::from_iter([("wanted".into(), None)]);
+        let mut seen = Vec::new();
+        store.visit_map_ops_for_keys(&cid, &mut keys, &mut |_, _, value, counter, lamport, peer| {
+            seen.push((value.clone(), counter, lamport, peer));
+        }).unwrap();
+        assert_eq!(seen, vec![(Some(1.into()), 0, 0, 7), (Some(2.into()), 1, 1, 7)]);
+        assert!(store.check_history_parsable().is_ok());
+
+        {
+            let mut inner = store.inner.lock();
+            for (id, bytes) in &encoded {
+                let block = inner.mem_parsed_kv.get_mut(id).unwrap();
+                Arc::make_mut(block).content = ChangesBlockContent::Bytes(
+                    ChangesBlockBytes::new(bytes.clone().into()),
+                );
+            }
+        }
+        let mut byte_seen = Vec::new();
+        store.visit_map_ops_for_keys(&cid, &mut keys, &mut |_, _, value, counter, lamport, peer| {
+            byte_seen.push((value.clone(), counter, lamport, peer));
+        }).unwrap();
+        assert_eq!(byte_seen, seen);
+        assert!(store.inner.lock().mem_parsed_kv.values().all(|block| {
+            matches!(&block.content, ChangesBlockContent::Bytes(_))
+        }));
+
+        let cold = ChangeStore::new_for_test();
+        for (id, bytes) in encoded {
+            cold.external_kv.lock().set(&id.to_bytes(), bytes.into());
+        }
+        let mut cold_seen = Vec::new();
+        cold.visit_map_ops_for_keys(&cid, &mut keys, &mut |_, _, value, counter, lamport, peer| {
+            cold_seen.push((value.clone(), counter, lamport, peer));
+        }).unwrap();
+        assert_eq!(cold_seen, seen);
+        assert!(cold.inner.lock().mem_parsed_kv.is_empty());
+        assert!(cold.arena.id_to_idx(&cid).is_none());
+        assert_eq!(cold.arena.utf16_len(), 0);
+    }
 
 
     fn test_encode_decode(doc: LoroDoc) {

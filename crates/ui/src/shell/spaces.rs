@@ -121,7 +121,7 @@ fn folder_device_name(
         .map(str::trim)
         .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("unknown-device"))
         .unwrap_or("Remote device");
-    if environment == Some(comet_proto::DeviceEnvironment::Namespace) {
+    if environment.is_some() {
         "Devbox".to_string()
     } else {
         name.to_string()
@@ -383,16 +383,12 @@ fn wakeable_add_space_device(device: Option<&Device>, local_device_id: Option<&s
         return false;
     };
     local_device_id != Some(device.id.as_str())
-        && device.environment == Some(comet_proto::DeviceEnvironment::Namespace)
-        && device
-            .namespace_devbox_id
-            .as_deref()
-            .is_some_and(|id| !id.trim().is_empty())
+        && device.devbox_binding().is_some()
 }
 
 fn visible_add_space_device(device: &Device, local_device_id: Option<&str>, online: bool) -> bool {
     local_device_id == Some(device.id.as_str())
-        || device.environment != Some(comet_proto::DeviceEnvironment::Namespace)
+        || device.devbox_provider.is_none()
         || online
         || wakeable_add_space_device(Some(device), local_device_id)
 }
@@ -1594,7 +1590,7 @@ impl Shell {
             )
         };
         let now = Utc::now();
-        // Hide only stale Namespace rows that cannot be woken. Online legacy
+        // Hide only stale Devbox rows that cannot be woken. Online legacy
         // hosts remain browsable; bound offline Devboxes expose explicit wake.
         let (devices, device_presence): (Vec<Device>, Vec<bool>) = {
             let state = self.state.read(cx);
@@ -2369,8 +2365,8 @@ mod tests {
             id: id.into(),
             name: id.into(),
             platform: "linux".into(),
-            environment,
-            namespace_devbox_id: provider_id.map(str::to_owned),
+            devbox_provider: environment,
+            devbox_id: provider_id.map(str::to_owned),
             last_seen_at: None,
             created_at: None,
             version: None,
@@ -2394,6 +2390,19 @@ mod tests {
             Some(&device("remote", None, Some("jfoemktp03vp0"))),
             Some("local")
         ));
+        let boat = device("remote", Some(DeviceEnvironment::Boat), Some("bx_234abcxy"));
+        assert!(wakeable_add_space_device(Some(&boat), Some("local")));
+        assert!(!wakeable_add_space_device(Some(&boat), Some("remote")));
+        for (environment, id) in [
+            (DeviceEnvironment::Namespace, "bx_234abcxy"),
+            (DeviceEnvironment::Namespace, "invalid"),
+            (DeviceEnvironment::Boat, "ofpf7g22n4412"),
+            (DeviceEnvironment::Boat, "bx_234abcx0"),
+        ] {
+            let invalid = device("remote", Some(environment), Some(id));
+            assert!(!wakeable_add_space_device(Some(&invalid), Some("local")));
+            assert!(!visible_add_space_device(&invalid, Some("local"), false));
+        }
     }
 
     #[test]

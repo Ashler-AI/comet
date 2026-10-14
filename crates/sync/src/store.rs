@@ -172,17 +172,7 @@ impl DocsStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         write_snapshot(&tx, doc_id, bytes)?;
-        // Only global room-shaped ids enter discovery; the engine verifies UUID
-        // and authenticated ownership before reading or transmitting their data.
-        if doc_id.len() == 36 {
-            tx.execute(
-                "INSERT INTO crew_directory_jobs(session_id, due_at, completed_turn_pending) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
-                 due_at = MAX(retry_at, MIN(due_at, excluded.due_at)),
-                 completed_turn_pending = MAX(completed_turn_pending, excluded.completed_turn_pending) WHERE deleted = 0",
-                params![doc_id, if completed { 0 } else { now_ms() + 30_000 }, completed],
-            )?;
-        }
+        queue_snapshot_directory(&tx, doc_id, completed)?;
         tx.commit()?;
         self.directory_changed
             .send_modify(|value| *value = value.wrapping_add(1));
@@ -212,7 +202,7 @@ impl DocsStore {
     }
 
     /// Persist intent outcomes and an optional authoritative snapshot in one
-    /// transaction. Adoption is not a new local edit or a directory generation.
+    /// transaction. An adopted source must also invalidate in-flight directory work.
     pub fn save_pending_records(
         &self,
         doc_id: &str,
@@ -238,8 +228,12 @@ impl DocsStore {
         )?;
         if let Some(snapshot) = snapshot {
             write_snapshot(&tx, snapshot_id, snapshot)?;
+            queue_snapshot_directory(&tx, snapshot_id, false)?;
         }
         tx.commit()?;
+        if snapshot.is_some() {
+            self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
+        }
         Ok(())
     }
 
@@ -561,6 +555,21 @@ impl DocsStore {
     }
 }
 
+fn queue_snapshot_directory(tx: &rusqlite::Transaction<'_>, doc_id: &str, completed: bool) -> Result<(), StoreError> {
+    // Only global room-shaped ids enter discovery; the engine verifies UUID
+    // and authenticated ownership before reading or transmitting their data.
+    if doc_id.len() == 36 {
+        tx.execute(
+            "INSERT INTO crew_directory_jobs(session_id, due_at, completed_turn_pending) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
+             due_at = MAX(retry_at, MIN(due_at, excluded.due_at)),
+             completed_turn_pending = MAX(completed_turn_pending, excluded.completed_turn_pending) WHERE deleted = 0",
+            params![doc_id, if completed { 0 } else { now_ms() + 30_000 }, completed],
+        )?;
+    }
+    Ok(())
+}
+
 fn write_snapshot(tx: &rusqlite::Transaction<'_>, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
     use std::io::Write;
     let length = i32::try_from(bytes.len())
@@ -877,6 +886,51 @@ mod tests {
         store.migrate_pending_records("workspace", &records).unwrap();
         assert!(store.has_semantic_journal("workspace").unwrap());
         assert_eq!(serde_json::to_value(store.load_pending_records("workspace").unwrap()).unwrap(), serde_json::to_value(records).unwrap());
+    }
+
+    #[test]
+    fn directory_adoption_wakes_missing_sources_and_preserves_new_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        let id = "10000000-0000-4000-8000-000000000001";
+        let scope = "session/test-deployment/project/owner/10000000-0000-4000-8000-000000000001";
+        store.claim_document_scope(id, scope, None).unwrap();
+        store.queue_directory(id, false).unwrap();
+        let (_, missing_generation, _, _) = store.claim_directory().unwrap().unwrap();
+        assert!(store.load_snapshot(id).unwrap().is_none());
+        store.settle_directory(id, missing_generation, false).unwrap();
+        let mut changed = store.watch_directory();
+        changed.borrow_and_update();
+        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"authoritative")).unwrap();
+        assert!(changed.has_changed().unwrap());
+        assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"authoritative"[..]));
+        assert!(store.load_snapshot(scope).unwrap().is_none());
+        // Source arrival is durable, but does not bypass transport backoff.
+        assert!(store.claim_directory().unwrap().is_none());
+        store.conn().execute("UPDATE crew_directory_jobs SET due_at = 0, retry_at = 0 WHERE session_id = ?1", params![id]).unwrap();
+        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
+        assert!(generation > missing_generation);
+        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"converged")).unwrap();
+        store.settle_directory(id, generation, true).unwrap();
+        // An acknowledgement of the old source cannot retire the adopted source.
+        assert!(store.directory_retry_delay().unwrap().is_some());
+        drop(store);
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.queue_directory(id, false).unwrap();
+        let (_, newer, _, _) = store.claim_directory().unwrap().unwrap();
+        assert!(newer > generation);
+        store.settle_directory(id, newer, true).unwrap();
+        assert!(store.directory_retry_delay().unwrap().is_none());
+        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"next")).unwrap();
+        assert!(store.directory_retry_delay().unwrap().is_some());
+        // A stale scoped binding cannot overwrite the source or enqueue work.
+        assert!(store.save_pending_records_for_snapshot("wrong-scope", id, std::iter::empty(), Some(b"foreign")).is_err());
+        assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"next"[..]));
+        store.queue_directory_deletion(id, "{\"deleted\":true}").unwrap();
+        let (_, deleted_generation, _, _) = store.claim_directory().unwrap().unwrap();
+        store.settle_directory(id, deleted_generation, true).unwrap();
+        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"late")).unwrap();
+        assert!(store.directory_retry_delay().unwrap().is_none());
     }
 
     #[test]

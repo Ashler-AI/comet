@@ -629,6 +629,13 @@ impl Changes {
                 match subscribed {
                     Ok(mut rx) => {
                         while let Some(value) = rx.recv().await {
+                            let value = match value {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    tracing::debug!(%error, "diff stream interrupted; resubscribing");
+                                    break;
+                                }
+                            };
                             let alive = this.update(cx, |changes, cx| {
                                 let cleared_error = changes.error.take().is_some();
                                 let changed = apply_diff_frame(&mut changes.diffs, value);

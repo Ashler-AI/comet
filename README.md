@@ -2,6 +2,310 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: workspace recovery conflict isolation
+
+A rejected workspace checkpoint retains its original cache and intents and stays
+visible in `SyncStatus.workspaceRecoveryError`. It no longer blocks unrelated
+journal-backed chat creation or message admission. Transcript recovery conflicts,
+room permission denials, and journal, snapshot or acknowledgement persistence
+failures remain fatal; no conflicting record is discarded or falsely acknowledged.
+Successful snapshot adoption clears the diagnostic. Divergent installed stores
+still require data-preserving reconciliation of genuine competing user edits.
+
+## Unreleased: bounded concurrent map history
+
+Concurrent map import and historical diff resolve only changed keys instead of
+materializing every retained change into a global map-history cache. Encoded
+container/key metadata selects blocks; one disposable arena decodes each relevant
+block. Native Loro and the pinned `1.16.4+crew.3` Worker runtime preserve causal
+visibility, shallow seeds, tombstones and equal-value winner identity.
+
+Decode failures propagate through existing import rollback. Temporary Undo/diff
+checkouts preflight map history; failed Undo retains its original remote rebase
+row, and local map rollback restores first-before winners without rereading history.
+No public API, encoding, ownership rule or accepted-history boundary changes.
+
+The captured 31-update server replay stayed at **32.06 MiB** during imports;
+real SessionRoom admission, duplicate delivery and cold replay used **54.75 MiB**.
+State/VV/frontier/floor, lossless folds and offline convergence passed. The public
+wide-vector and concurrent-map fixtures retain the **112 MiB** WASM guard.
+This source change does not patch or restart existing clients.
+
+## Crew 0.1.156: staging desktop release
+
+Crew Staging desktop **0.1.156** is available through **Settings → Crew update**
+from merged source `599fedfd122ab74ea58c93225118071fa2206b27` in
+[release run 38472406507](https://github.com/Ashler-AI/comet/actions/runs/38472406507).
+It packages current native owner-activity reprojection after membership settlement.
+Both macOS variants passed signature, notarization, Gatekeeper and DMG/updater
+archive checks. Staging channel readback matched, and the installed staging CLI
+reported **0.1.155 → 0.1.156 available** without installing or restarting it.
+
+Mobile **1.0 (34)** from the same source is **Testing** in the existing internal
+TestFlight group. The Scaffold runtime contract is unchanged; no production
+promotion, image-pin or tester/account-permission changes occurred. Preserve this
+run ID for exact-candidate promotion only after captain verification of restarted
+staging clients.
+
+## Crew Staging mobile 1.0 (34): liveness crash and warm-load release
+
+The fetched build 33 phone report confirms a Swift arithmetic-overflow **SIGTRAP**
+in `RoomClient.livenessTick`, not a memory-pressure termination. Its default clock
+was sampled before the actor hop; newer room traffic could advance the deadline
+base before the tick ran. Build 34 samples inside the actor and guards unsigned
+clock subtraction while preserving expired-lease reconnects.
+
+A private matched simulator replay independently exposed a **1,320.77 MiB** peak:
+Loro's state-vector equality guard reconstructed ancestry and copied immutable
+maps. Build 34 uses frontier equality for materialization and oplog vectors for
+remote coverage, preserving detached/pending-import and historical rebase proofs.
+
+Workspace cold hydration now runs off-main, list metadata avoids whole-transcript
+forks, and off-screen document eviction no longer waits for scrolling to stop.
+The allocation replay peaked at **381.98 MiB** (**71.1% lower**). All **32** local
+and merged-source simulator markers passed after the confirmed timer correction.
+Build **1.0 (34)** is now **Testing**; its exact uploaded IPA passed distribution
+signature/profile checks. Physical-phone acceptance remains manual. See
+[the release evidence](apps/ios/README.md#crew-staging-10-34-liveness-crash-and-warm-load-release).
+
+## Crew Staging mobile 1.0 (33): catalog loading
+
+Mobile build 33 recovers an `InvalidUpdate` upload reply through bounded
+authoritative backfill instead of permanently stopping session discovery.
+Original local records survive reconciliation; permission, payload-size and
+genuine record conflicts remain blocked. Optional membership and retry objects
+are shape-checked before Foundation JSON serialization, preventing its uncaught
+null/scalar exception without hiding valid session rows.
+
+Both failure mechanisms reproduced in shipped build 32. The build 33 simulator
+then displayed a new session after rejection, retained its local read marker,
+loaded the formerly crashing cache and passed all 31 regression markers.
+Build **1.0 (33)** is now **Testing** in the existing internal TestFlight group.
+Merged-source [CI 38427448877](https://github.com/Ashler-AI/comet/actions/runs/38427448877)
+and exact-upload signature/profile checks passed; production remains unchanged.
+Physical-phone acceptance and exact trigger attribution remain unverified; see
+[the mobile release evidence](apps/ios/README.md#crew-staging-10-33-rejected-upload-recovery-and-safe-list-decoding).
+
+## Crew 0.1.153: bounded workspace replay
+
+A 371-byte accepted update could materialize a causal vector for every retained
+DAG node and exhaust the Worker's 128 MiB limit. Native and Worker Loro now
+calculate only requested vectors, retain them in a bounded 128-entry cache, and
+reuse the larger immutable vector when merging. Import rollback, snapshot
+replacement and discarded Worker transactions invalidate cached causal answers.
+Accepted operations, values, permissions and the retained history boundary are
+unchanged; only derived caches are evicted.
+
+The replay smoke also covers 200,000 retained changes, lossless folds, cold
+reopen, duplicate delivery, offline catch-up and actual Durable Object admission.
+Its 112 MiB WASM guard is unchanged. Run
+`node edge/scripts/workspace-replay-memory-smoke.mjs`; private corpus arguments
+remain supported. Staging publication and restarted-client acceptance are separate
+gates; this change does not promote production or move Scaffold image pins.
+
+## Crew 0.1.152: first-send workspace recovery
+
+An unchanged bootstrap branch on one client could conflict with a later owner
+rename on an independently created row, blocking new-session creation and causing
+metadata warnings on accepted messages. Recovery now proves both initial values
+from retained operation history, including coalesced creation/rename changes,
+before accepting the owner's newer value. Later local edits, different initial
+values, row recreation, missing history and ownership conflicts still fail closed.
+
+All **122** document tests passed. Private replay of the captured workspace kept
+all **127** original intents and survived a cold reopen. An isolated real engine
+then created a principal-visible chat through RPC and completed two mock-agent
+turns with no metadata, preparation or delivery errors. The isolated headed
+0.1.152 client also created a new session from a typed prompt and displayed its
+completed mock-agent output without a metadata warning. No live cache was reset
+or existing session restarted. Installed-client acceptance remains required;
+this release changes neither mobile build numbers nor Scaffold image pins.
+
+## Crew 0.1.154: explicit devbox idle status
+
+Namespace and Boat session cards show `Idle · age` instead of an age alone.
+Working, input, error and completion indicators are unchanged; local Mac sessions
+keep their existing recency labels. This is a sidebar-only change, with no provider
+or runtime-contract changes.
+
+## Crew 0.1.151: Namespace and Boat devboxes
+
+Namespace and Boat use the same Crew peer sessions, validated immutable provider
+bindings, explicit wake controls and private callback/app/Tilt forwarding. The
+new `devboxProvider` and `devboxId` fields replace Namespace-only fields through
+persisted-row/journal migration. Older clients can still read the registry; update
+controller and host for the new wake controls. Provider metadata never grants
+session execution authority.
+
+Namespace keeps owned active-turn markers. Boat confirms a finite one-hour TTL
+before work, renews it while turns run and resets its idle deadline after final
+completion. Failed protection interrupts work without discarding recovery; idle
+harnesses do not keep the machine running. Host identity must match the current
+native Boat sandbox, including after resume or template copying.
+
+The [shared devbox skill](skills/devbox/SKILL.md) targets 16 CPU / 32 GB machines
+with one canonical host bootstrap, pinned Chromium, interactive forwarded sign-in,
+tmux on Namespace and native systemd on Boat. Independent work uses the bounded
+`crew-devbox-keepalive` helper. Boat `xlarge` requires its paid $100+ plan. Complete
+setup requires real wake, turn, browser, sleep and Ashler runtime proof; installation
+or unit tests alone are not that proof. Stage this release and obtain restarted
+client acceptance before production promotion. Scaffold pins are unchanged.
+
+## Crew 0.1.150: cold-checkpoint recovery
+
+Packages the verified cold-reopen repair from [PR #93](https://github.com/Ashler-AI/comet/pull/93):
+older workspace checkpoints retain already-reconciled activity without dropping
+original intents or accepting unseen conflicts. The Scaffold runtime contract and
+mobile build numbers are unchanged. Publish staging only; installed-client restart
+and manual acceptance remain required before production promotion.
+
+## Crew 0.1.149: concurrent read-marker recovery
+
+The installed 0.1.148 client still rejected new-session creation when retained
+`lastSeenAt` observations advanced independently on two clients. Shared workspace
+reconciliation now keeps the latest valid, nondecreasing read observation,
+including the cached value. Explicit unread/deletion, backwards transitions,
+ownership changes and genuine competing edits keep their existing safeguards.
+The metadata warning and creation failure share this cause; neither is suppressed.
+
+Private replay against a fresh read-only server capture recovered all **156**
+retained records, preserving every original before/value, and passed new-chat
+creation, principal membership and cold reopen. All **116** document tests passed,
+including concurrent reads and explicit unread conflicts. This is isolated
+verification, not installed-client or phone acceptance. No live cache was reset.
+
+The same capture passed actual `WorkspaceHost` creation, principal membership
+and cold reopen, with only the normal local device boot clock/version restamp.
+The isolated headed client displayed the new session; typed Local start completed
+with mock-agent output and no metadata error. **315** engine and **57** sync tests
+also passed. The real native/Edge 24-turn smoke preserved **1,600** history rows
+through outages, crashes and lost acknowledgements, catching up in **2,494 ms**
+with **89,632 KiB** peak observed RSS. Local typechecks were intentionally skipped.
+
+A later fresh capture exposed a coalesced archive intent against an independently
+created host row. Recovery now distinguishes the host's initial `archived=false`
+from a deliberate restore: retained causal history must prove both the row and
+flag were first insertions. Real restores, row recreations and unavailable proof
+remain blocked. Empty chats no longer require a message clock to reconcile their
+initial metadata. All **176** retained intents then replayed unchanged, preserving
+the archive choice and passing new-chat creation, membership and cold reopen.
+
+Mobile build 32's source-matched simulator and live native/Edge checks passed in
+[run 37954096697](https://github.com/Ashler-AI/comet/actions/runs/37954096697), including
+actual command admission and streamed output. The final native archive correction
+also passed the local **116 document / 315 engine / 57 sync** suite and headed demo.
+
+Desktop and Devbox engines require independent native updates. The first 0.1.149
+release was blocked before publication by a separate live mobile creation failure:
+iOS duplicated the host's accepted row while its publication arrived, with different
+nil/null config encoding and creation clocks. Mobile staging build **32** removes
+that second writer for Local and Scaffold creation, waits for principal-scoped
+catalog readiness, and retains the creation ID across retries. Older equivalent
+creation intents recover without discarding real config edits or ownership guards.
+Mobile staging **1.0 (32)** is now **Testing** in the existing **Ashler Internal**
+TestFlight group, with source and distribution-signature verification recorded in
+[the mobile release evidence](apps/ios/README.md#crew-staging-10-32-host-owned-creation-candidate).
+Production and both Scaffold image pins remain
+gated on captain verification of the restarted staging desktop. Physical-phone
+convergence is not yet verified.
+
+## Crew 0.1.148: retained catalog convergence
+
+Native workspace recovery now selects `lastMessageAt` and its preview together,
+including a newer cached observation, instead of rejecting the preview after
+merging its clock. Independently seeded chat and membership rows retain missing
+metadata only when it was never deleted; owner/scope, conflicting user edits,
+explicit unread markers and membership removals remain guarded.
+
+Recreated rows use the insertion's own causal ancestry to prove that an earlier
+tombstone was observed. Unrelated room traffic no longer blocks a legitimate
+recreation; a later cache import cannot authorize a concurrent resurrection.
+
+Isolated replay of the captured server snapshot and two accepted updates recovered
+all **142** retained records, passed repeated adoption and cold reopen, and kept
+every original intent's before/value. The capture contained **1,749** local chat
+rows versus **1,738** on the server, plus **1,630** versus **1,619** memberships.
+This verifies recovery on private copies, not publication of that backlog or the
+installed phone's convergence. Mobile still requires its own principal's membership;
+the repair does not expose other project users' sessions or bypass cleanup safeguards.
+
+New local sessions persist their catalog row before checkout and agent admission,
+so the same retained recovery error also blocked first send. The shared repair
+restores that path without bypassing the commit guard. A private `WorkspaceHost`
+replay retained all 142 originals and recovered both a partial-creation retry and
+a fresh chat plus principal membership across cold reopen. A separate isolated
+native instance passed fresh creation, typed Local start, and mock-agent response.
+The real Edge/native 24-turn smoke preserved 1,600 history rows across outages,
+lost receipts and restarts, with 4,001 ms catch-up and 80,336 KiB peak observed RSS.
+
+## Crew 0.1.147: lossless workspace recovery
+
+Loro's immutable causal-vector merges used mutable lookups for unchanged
+counters, copying shared tree nodes. Rebuilding the same shallow-root vector
+amplified that cost. A tiny accepted update could exhaust the shared Worker's
+128 MiB limit, disconnecting catalog readers and rejecting subsequent writes.
+Both native and Edge now preserve that structural sharing. Snapshot folds also
+reuse the encoded history at the existing retained boundary instead of decoding
+and copying every operation; no history boundary or permission is changed.
+
+Exact-byte replay of the captured snapshot and 27 accepted records, lossless
+folding, cold reopen and a returning offline edit used **80.94 MiB** of WASM,
+versus **174.13 MiB** before. All **299,330 operations**, complete state, version
+vector and retained frontier matched. The synthetic 450-peer concurrent-history
+regression fails the old runtime at **240.06 MiB** and passes at **11.75 MiB**.
+Run it with `node edge/scripts/workspace-replay-memory-smoke.mjs`; private
+baseline/delta paths remain supported and are never committed.
+
+Snapshot admission also avoids merging two hot workspace replicas at the same
+retained boundary: it imports only the candidate's new operations into accepted
+state. The captured native recovery snapshot preserved **309,686 operations**
+and cold-restart state at **80.63 MiB**, down from **147.44 MiB**. The permanent
+memory smoke now exercises actual Durable Object admission, duplicate delivery
+and durable cold replay, not only the Loro library.
+
+Local verification passed **217 Edge**, **111 document**, **315 engine**,
+**21 RPC**, **57 sync** and **578 UI** tests, plus subprocess cancellation and
+startup-negotiation regressions. The 24-turn real two-device/Worker smoke retained
+**1,600** history rows through crash/reconnect and converged in **4.13 seconds**.
+The isolated headed demo rendered the populated model picker and completed mock
+response. These checks do not establish installed-client or hosted-rollout status.
+
+Native recovery includes guarded complete-cache adoption and clears the cold
+repair latch only after the matching authenticated repair ACK. Unknown ACKs,
+foreign histories, genuine competing edits and resurrections remain blocked.
+The original intents are preserved; recovery does not reset a live workspace.
+
+Directory projection streams native and legacy tool text in UTF-8-safe 64 KiB
+chunks instead of rejecting large transcript rows. Snapshot adoption atomically
+requeues the canonical directory job, including arrivals after missing-source
+failures; it preserves deletion fences, retry backoff and causal checks. Truly
+absent snapshots remain pending rather than publishing invented history.
+
+Same-device chat switches retain harness/model catalogs. Discovery is cancellable
+and bounded at the UI, engine and subprocess; startup negotiation fails explicitly
+after 15 seconds without publishing readiness. Credentials, device, connection,
+harness updates and explicit retry/wake invalidate the relevant catalog.
+Cancellation owns the unreaped subprocess group even after its leader exits;
+macOS returns `ESRCH` from `getpgid` in that state despite surviving descendants.
+
+A stalled RPC subscription no longer blocks the shared reader. Its bounded
+ordered prefix is followed by an explicit overflow error and upstream cancellation;
+transcript/snapshot watches resubscribe, while terminal replay retains its sequence
+cursor. Forwarded streams preserve errors; durable command admission is unchanged.
+At most 256 active or queued-for-cancellation subscriptions are admitted per
+connection, plus one cancellation being sent.
+
+The private Edge runtime is built from Loro
+`45708d059d8620fb53066c9f86cefa1601e0e1c6` with
+`edge/vendor/loro-1.16.4-crew.2.patch`. Apply that patch to the pinned checkout,
+then build `loro-wasm` for `wasm32-unknown-unknown` through
+`python3 scripts/local-cargo.py build --locked --release --manifest-path
+UPSTREAM/Cargo.toml -p loro-wasm --target wasm32-unknown-unknown`.
+Use `edge/scripts/build-loro-runtime.mjs WASM_PATH WASM_BINDGEN_PATH OUTPUT_TGZ
+UPSTREAM_SOURCE` with wasm-bindgen **0.2.100**; it verifies the published wrapper
+archive's SHA-512 and packages only fresh Node/web bindings. It never runs a
+local TypeScript check. Local typechecks remain intentionally disabled.
+
 ## Crew 0.1.146: published Scaffold source by default
 
 New Scaffold drafts select **Published source**, omitting a source override so
@@ -104,6 +408,24 @@ Legacy workspace rows and retained journals normalize repeated self-session
 aliases together, preserving canonical ownership, tombstones and completed
 outcomes. Covered bootstrap observations can coalesce; conflicting user edits
 or unknown ancestry retain their original evidence and remain blocked.
+
+An authenticated workspace checkpoint that is already covered by the complete
+local cache cannot roll back newer accepted edits. Recovery keeps that isolated
+cache when each retained intent either matches its row or was rebased onto
+exactly that cache version. This preserves merged owner activity across a cold
+reopen without treating later imports as reconciled. Archived sessions and field
+tombstones remain intact without blocking new-session metadata commits.
+Unseen competing edits and remote resurrections still retain their original
+evidence and fail closed; no automatic reset or cache deletion is performed.
+
+The cold-reopen regression passes with all 26 shared-document checks. An offline
+replay of the retained Devbox capture preserved all 1,594 original intents and
+merged activity across cold adoption; the rebuilt headed demo rendered a complete
+mock reply. The live 0.1.149 Devbox recovered through the approved metadata choices,
+completed a new real OMP turn visible on the Mac, and kept both restored processes
+and native bindings unchanged. Its five approved archived chats retained their
+worktrees; the four scheduled cleanup stages were cancelled and acknowledged by a
+fresh room reader. These live repairs do not deploy this additional cold-reopen fix.
 
 Same-owner session memberships can learn their first environment route. Recovery
 preserves that route across restarts and refuses changes to known scopes or
@@ -298,6 +620,14 @@ boundaries remain exact; private execution keys never become discovery rows.
 Legacy output migration checks provenance before publishing recovered messages.
 Cold execution aliases accept authenticated OMP, Codex and Claude Code contexts.
 
+Scaffold disk resumes rotate the host device's lifecycle epoch while retaining
+the native conversation. Saved contexts and pending recovery accept an older
+device epoch only for the same sandbox and room, with unchanged principal and
+project identity and a live, exact deployment-bound grant for the current host.
+That grant must retain read, chat and control capabilities. Revoked, expired,
+foreign-device and future-epoch contexts remain fenced; no journal is rewritten
+and no completed request is replayed merely to make the viewport available.
+
 Mobile browse links retain their exact scope without attaching or resuming a
 sandbox. Conflicting links fail before navigation or sends. Shared attachment
 identities use consistent outbox accounting; terminal controls retain durable
@@ -422,9 +752,9 @@ machine crash, restart Crew to clean confirmed stale Crew markers; never delete 
 task markers indiscriminately. Independent background jobs that outlive a turn need
 their own marker and cleanup trap.
 
-Use the [Namespace Devbox setup skill](skills/namespace-devbox/SKILL.md) for an
-owner-named 16-CPU/64-GiB machine, Chromium by default, the Ashler kind/Tilt stack,
-and one supervised callback forward for all initial browser logins. After setup,
+Use the [shared devbox setup skill](skills/devbox/SKILL.md) for an
+owner-named 16-CPU/32-GB machine, pinned Chromium, the Ashler kind/Tilt stack,
+and private setup forwarding for initial browser logins. After setup,
 Crew wakes the machine and runs coding sessions through its device relay; no local
 coordinating agent or credential copying is required.
 
@@ -455,6 +785,11 @@ into `WatchSessions` independently of workspace backfill, keeping sidebar and
 composer indicators aligned when workspace synchronization is stalled. Local
 engine status still wins for locally hosted sessions. Membership and owner checks
 fence remote activity; static streaming snapshots do not count as fresh heartbeats.
+
+Controllers also use verified owner-session heartbeat timestamps for device
+presence. A live Devbox stays online when workspace presence or relay-status
+probes are unavailable; cached transcripts cannot extend the online lease.
+Sidebar badges, device settings, and the send/wake gate share this signal.
 
 Canonical session controls keep an existing bare-chat writer's live execution key,
 so publishing its room record does not strand Stop, steering, or input answers.
@@ -864,6 +1199,21 @@ This installs the official [oh-my-pi v17.2.9](https://github.com/can1357/oh-my-p
 
 To use a remote OMP auth broker, launch Comet with `OMP_AUTH_BROKER_URL` and either `OMP_AUTH_BROKER_TOKEN` or `OMP_AUTH_BROKER_TOKEN_FILE`. The token-file form is preferred for service managers: it must be mode `0600`, is removed before parsing/spawn on every outcome, and Comet passes the bearer only in the OMP child environment, never argv or logs. Do not print or interpolate the token in shell commands. Scaffold-host OMP launches remain isolated with `--profile scaffold-host --no-extensions --no-skills --no-rules`.
 
+### Model-stream recovery
+
+Crew-owned OMP runs allow three model-level retries with OMP's bounded backoff;
+provider/SDK HTTP retries remain disabled. Completed tools and the user task are
+not replayed by Crew. Existing OMP replay-safe stream repair remains unchanged.
+Desktop, iOS, and web show **Reconnecting to model — attempt 2/4** during recovery
+and clear the indicator on resumed progress, interruption, or terminal completion.
+Retry counters are live session metadata, not transcript errors or reasoning text.
+
+Inference diagnostics join Crew's `request_id` to the server's `requestId` using
+`x-agent-auth-request-id`, separately from OpenAI's `x-request-id`. IDs are bounded
+and credential-like values are omitted; transport causes are classified without
+logging raw exception messages, prompts, or credentials. Partial HTTP 200 streams
+remain errors, and inference timeout behavior is unchanged.
+
 ### Desktop gateway extension discovery
 
 Crew 0.1.83 installs a credential-free, Crew-owned discovery adapter at
@@ -886,6 +1236,32 @@ The isolated installed-runtime regression can be run without provider credential
 ```bash
 node scripts/omp-gateway-revival-smoke.mjs ~/.local/bin/omp --compare-explicit
 ```
+
+## Native supervision lifetime
+
+Steerable runs normally retire after 30 minutes idle. A supervising extension
+with outstanding worker or wake obligations can explicitly retain its own live
+run by spawning an attached child:
+
+```bash
+"$COMET_EXECUTABLE" session supervise
+```
+
+Preserve `COMET_SESSION_ID`, `COMET_IPC_PORT`, and the engine-minted
+`COMET_SUPERVISION_TOKEN`. The token is a secret capability for one run
+generation; never put it in argv, prompts, logs, or durable state. The child
+prints one JSON receipt with `chatId`, `runId`, and `retained: true` after native
+RPC admission, then remains silent. Keep it only while obligations exist;
+terminate and reap it to release. The last subscription closing restores the
+original idle deadline, so an already-overdue run retires immediately.
+
+Cancellation, stream failure, engine shutdown, and process-group cleanup still
+end the run. A replaced run gets a new capability; an old subscriber cannot
+retain or release its replacement. Observe unexpected child exit as lost
+supervision, not success, and reacquire only from a fresh run's launch context.
+There is no heartbeat prompt, detached watcher, or retention after Crew closes.
+Older engines/runs without the capability fail closed; updating source alone
+does not change an already-running installed application.
 
 ## Native OMP handoff to Scaffold
 

@@ -497,6 +497,13 @@ impl TerminalPanel {
                 };
 
                 while let Some(value) = rx.recv().await {
+                    let value = match value {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::debug!(%error, "terminal stream interrupted; replaying from last sequence");
+                            break;
+                        }
+                    };
                     let event: TerminalEvent = match serde_json::from_value(value) {
                         Ok(event) => event,
                         Err(err) => {

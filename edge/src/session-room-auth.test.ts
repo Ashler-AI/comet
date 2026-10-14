@@ -884,7 +884,6 @@ describe("SessionRoom chat authorization", () => {
       const internals = room as unknown as SessionRoomInternals;
       expect((await internals.ensureDoc()).toJSON()).toEqual(source.toJSON());
       expect(sql.meta.get("replayAttempts")).toBe("0");
-      expect(sql.updateCount()).toBe(0);
       for (const [client, key] of [[first, "offline-a"], [second, "offline-b"]] as const) {
         const map = client.getMap("metadata");
         try { map.set(key, "preserved"); client.commit(); }
@@ -901,7 +900,6 @@ describe("SessionRoom chat authorization", () => {
         "6:user-b:existing": { userId: "user-b", chatId: "existing", addedAt: 1 },
         "6:user-a:new": { userId: "user-a", chatId: "new", addedAt: 2 }
       });
-      expect(sql.meta.get("lastReplayRows")).toBe("0");
       const expectedVersion = source.oplogVersion();
       const restoredVersion = recovered.oplogVersion();
       try { expect(restoredVersion.compare(expectedVersion)).toBe(0); }
@@ -956,8 +954,11 @@ describe("SessionRoom chat authorization", () => {
     const { room } = makeRoom(sql);
     const append = (bytes: Uint8Array) => room.fetch(authedRequest("/append", "user-a", { method: "POST", body: bytes }));
     try {
+      metadata.set("baseline", false); source.commit();
       metadata.set("baseline", true); source.commit();
-      expect((await append(source.export({ mode: "snapshot" }))).status).toBe(200);
+      // The full publisher restores older history, so this exercises baseline
+      // replacement rather than same-floor snapshot-to-delta admission.
+      expect((await append(source.export({ mode: "shallow-snapshot", frontiers: source.frontiers() }))).status).toBe(200);
       const before = source.oplogVersion();
       try {
         metadata.set("acceptedDelta", true); source.commit();

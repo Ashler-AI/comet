@@ -289,14 +289,15 @@ async fn target_device_id_routes_over_the_relay() {
         let item = tokio::time::timeout_at(deadline, stream.recv())
             .await
             .expect("remote transcript before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         if item.to_string().contains("hello from B") {
             break;
         }
     }
 
-    // QueueCommand ignores caller-carried targetDeviceId. The workspace
-    // owner is A, so this stays local; only an actual remote owner selects the
+    // A stale explicit destination must fail closed, not reroute a command.
+    // The workspace owner is A, so only an actual remote owner selects the
     // separately authenticated peer-command admission path.
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
@@ -324,12 +325,16 @@ async fn target_device_id_routes_over_the_relay() {
             .set_chat_archived("chat-remote", true)
             .expect("archive chat on A")
     );
+    let rejected = client.call(methods::QUEUE_COMMAND, serde_json::json!({
+        "chatId": "chat-remote", "targetDeviceId": "device-b", "command": command,
+    })).await.expect_err("stale destination must not admit a command");
+    assert!(matches!(rejected, comet_rpc::RpcError::Failed(code) if code == "command_destination_changed"));
     let queued = client
         .call(
             methods::QUEUE_COMMAND,
             serde_json::json!({
                 "chatId": "chat-remote",
-                "targetDeviceId": "device-b",
+                "targetDeviceId": "device-a",
                 "command": command,
             }),
         )
@@ -590,7 +595,8 @@ async fn terminal_stream_proxies_over_the_relay() {
         let item = tokio::time::timeout_at(deadline, stream.recv())
             .await
             .expect("proxied terminal output before timeout")
-            .expect("stream alive");
+            .expect("stream alive")
+            .expect("stream item");
         if item["type"] == "data" {
             let bytes = BASE64
                 .decode(item["data"].as_str().expect("data"))

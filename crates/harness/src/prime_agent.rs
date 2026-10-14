@@ -305,12 +305,11 @@ impl Harness for PrimeAgentHarness {
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
-        let output = self
-            .command(&executable, "")
-            .args(["model", "list"])
-            .stdin(Stdio::null())
-            .output()
-            .await?;
+        let output = crate::omp::model_catalog_output(
+            self.command(&executable, "").args(["model", "list"]),
+            "Prime Agent",
+            false,
+        ).await?;
         if !output.status.success() {
             let tail = crate::StderrTail::default();
             for line in String::from_utf8_lossy(&output.stderr).lines() {

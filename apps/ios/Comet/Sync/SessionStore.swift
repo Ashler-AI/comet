@@ -590,7 +590,7 @@ final class SessionStore {
     #endif
 
     private struct ProjectionKey: Equatable {
-        var version: VersionVector
+        var version: Frontiers
         var metadataOnly: Bool
         var observedAt: Int64?
         var pendingMessageIds: Set<String>
@@ -635,19 +635,21 @@ final class SessionStore {
         let previousActivity = transcriptActivity
         let work = Task.detached(priority: .userInitiated) { () -> ProjectionResult? in
             guard !Task.isCancelled else { return nil }
-            var key = ProjectionKey(version: doc.stateVv(), metadataOnly: metadataOnly,
+            var key = ProjectionKey(version: doc.stateFrontiers(), metadataOnly: metadataOnly,
                                     observedAt: metadataOnly ? nil : observedAt,
                                     pendingMessageIds: pendingMessageIds)
             if key == previousKey {
                 return ProjectionResult(key: key, decoded: nil, entriesChanged: false, failures: [:])
             }
-            // Read one coherent replica without making publication wait for a
-            // quiet network. A newer import schedules the trailing projection.
-            let snapshot = doc.fork()
-            key.version = snapshot.stateVv()
+            // Transcript reads keep a coherent replica. List metadata touches
+            // only owner registers and the first user preview; reject a raced
+            // read instead of copying the entire retained transcript.
+            let snapshot = metadataOnly ? doc : doc.fork()
+            key.version = snapshot.stateFrontiers()
             var decoded = metadataOnly
                 ? Self.decodeMetadata(from: snapshot, chatId: chatId, publicationCache: publicationCache)
                 : Self.decodeProjection(from: snapshot, chatId: chatId, observedAt: observedAt, publicationCache: publicationCache)
+            if metadataOnly, doc.stateFrontiers() != key.version { return nil }
             let entriesChanged = !metadataOnly && decoded.entries != previousEntries
             if !entriesChanged, var activity = decoded.activity, activity.status == .working {
                 // A status heartbeat is not transcript activity. Keep the last
@@ -690,7 +692,7 @@ final class SessionStore {
                 self.projectionCount &+= 1
                 self.apply(decoded, metadataOnly: metadataOnly, entriesChanged: result.entriesChanged)
             }
-            if self.connected, doc.stateVv() == result.key.version, !doc.isDetached(), doc.stateVv() == doc.oplogVv() {
+            if self.connected, doc.stateFrontiers() == result.key.version, !doc.isDetached(), doc.stateFrontiers() == doc.oplogFrontiers() {
                 self.hasAuthoritativeProjection = true
             }
             for id in result.completions { self.resolveAcceptedDraft(id) }
@@ -927,7 +929,11 @@ final class SessionStore {
             guard sameGeneration(value, owner), let deviceId = value["ownerDeviceId"]?.stringValue,
                   let status = value["status"]?.stringValue.flatMap(SessionStatus.init(rawValue:)) else { continue }
             let updatedAt = value["updatedAt"]?.i64Value ?? value["createdAt"]?.i64Value ?? 0
-            let row = SessionRow(chatId: chatId, deviceId: deviceId, status: status, startedAt: value["startedAt"]?.i64Value, updatedAt: updatedAt)
+            var row = SessionRow(chatId: chatId, deviceId: deviceId, status: status, startedAt: value["startedAt"]?.i64Value, updatedAt: updatedAt)
+            if let retry = value["modelRetry"], retry.mapValue != nil,
+               let data = try? JSONSerialization.data(withJSONObject: retry.jsonObject) {
+                row.modelRetry = try? JSONDecoder().decode(ModelRetry.self, from: data)
+            }
             if status == .working || status == .awaitingInput {
                 if writer != chatId { hasActiveChildren = true }
                 if effectiveStatus(row, now: now) == nil {

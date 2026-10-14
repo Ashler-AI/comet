@@ -709,7 +709,7 @@ pub struct EngineRpc {
 }
 
 impl EngineRpc {
-    fn devbox_provider_id(&self, device_id: &str) -> Result<String, RpcError> {
+    fn devbox_provider_id(&self, device_id: &str) -> Result<(comet_proto::DeviceEnvironment, String), RpcError> {
         let state = self.auth()?.state();
         if !state.is_signed_in() || state.project_scope() != Some(self.workspace.project_scope()) {
             return Err(RpcError::Failed(
@@ -728,7 +728,7 @@ impl EngineRpc {
                 RpcError::BadParams("Device is not registered in this workspace".into())
             })?;
         crate::device_wake::bound_devbox_id(device, self.doc_host.device_id())
-            .map(str::to_owned)
+            .map(|(provider, id)| (provider, id.to_owned()))
             .map_err(RpcError::BadParams)
     }
 
@@ -1260,15 +1260,19 @@ impl EngineRpc {
                     return Err(err);
                 }
             };
-            // Pipe remote items; the held client keeps the link's RpcClient alive for
-            // the stream's lifetime. A remote error just ends the stream (the relay
-            // link-down path fails pending calls; stream receivers close).
+            // Preserve upstream failure, including overflow, across the relay.
+            // The held client keeps the link alive for the stream's lifetime.
             let stream = futures::stream::unfold((rx, client), |(mut rx, client)| async move {
                 rx.recv().await.map(|item| (item, (rx, client)))
             });
-            return Ok(RpcReply::Stream(stream.boxed()));
+            return Ok(RpcReply::FallibleStream(stream.boxed()));
         }
-        match client.call(method, params).await {
+        let result = if matches!(method, methods::LIST_MODELS | methods::LIST_HARNESSES | methods::LIST_HARNESS_COMMANDS) {
+            client.call_cancellable(method, params).await
+        } else {
+            client.call(method, params).await
+        };
+        match result {
             Ok(value) => Ok(RpcReply::Value(value)),
             Err(err) => {
                 if matches!(err, RpcError::Closed | RpcError::Transport(_)) {
@@ -2111,12 +2115,13 @@ impl RpcService for EngineRpc {
                             "Wake Device is available only on the local controller".into(),
                         )
                     })?;
-                let provider_id = self.devbox_provider_id(&p.device_id)?;
+                let (provider, provider_id) = self.devbox_provider_id(&p.device_id)?;
                 let links = self.links.clone().ok_or_else(|| RpcError::Failed(
                     "Crew relay is unavailable; reconnect the controller before waking the Devbox".into()
                 ))?;
                 wake.wake(
                     &p.device_id,
+                    provider,
                     provider_id.clone(),
                     self.workspace.project_scope(),
                     links,
@@ -2126,7 +2131,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({
                     "deviceId": p.device_id,
                     "ready": true,
-                    "callbackForwardReady": wake.auth_forward_active(&provider_id)
+                    "callbackForwardReady": wake.auth_forward_active(provider, &provider_id)
                 }))
             }
             methods::ENSURE_DEVBOX_CALLBACK_FORWARD => {
@@ -2146,8 +2151,8 @@ impl RpcService for EngineRpc {
                                 .into(),
                         )
                     })?;
-                let provider_id = self.devbox_provider_id(&p.device_id)?;
-                wake.ensure_callback_forward(provider_id)
+                let (provider, provider_id) = self.devbox_provider_id(&p.device_id)?;
+                wake.ensure_callback_forward(provider, provider_id)
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({
@@ -2172,9 +2177,9 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = harness
-                    .models()
+                let models = tokio::time::timeout(std::time::Duration::from_secs(35), harness.models())
                     .await
+                    .map_err(|_| RpcError::Failed("Model discovery timed out. Check the agent credentials and retry.".into()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
@@ -2259,9 +2264,9 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(HarnessId::Omp)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
-                let models = harness
-                    .models()
+                let models = tokio::time::timeout(std::time::Duration::from_secs(35), harness.models())
                     .await
+                    .map_err(|_| RpcError::Failed("Model discovery timed out. Check the agent credentials and retry.".into()))?
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let models = session_viewport_models(models);
                 RpcReply::value(&models)
@@ -2662,6 +2667,30 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "commandId": command_id, "admission": "accepted",
                     "delivery": if delivery_error.is_some() { "pending" } else { "notified" },
                     "metadataError": metadata_error, "preparationError": preparation_error, "deliveryError": delivery_error }))
+            }
+            methods::RETAIN_SESSION_SUPERVISION => {
+                let p: comet_rpc::RetainSessionSupervisionParams = parse_params(params)?;
+                let lease = self
+                    .sessions
+                    .retain_supervision(&p.chat_id, &p.token)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let receipt = serde_json::json!({
+                    "chatId": p.chat_id, "runId": lease.run_id, "retained": true,
+                });
+                Ok(RpcReply::Stream(
+                    futures::stream::unfold(
+                        (lease, Some(receipt)),
+                        |(lease, receipt)| async move {
+                            if let Some(receipt) = receipt {
+                                Some((receipt, (lease, None)))
+                            } else {
+                                lease.interrupt.cancelled().await;
+                                None
+                            }
+                        },
+                    )
+                    .boxed(),
+                ))
             }
             methods::WATCH_OMP_RECOVERY => {
                 let p: ChatParams = parse_params(params)?;
@@ -3674,6 +3703,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn devbox_wake_and_callback_rpc_require_local_controller_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(), std::sync::Arc::new(crate::default_registry(RuntimeProfile::Mock)),
+            HarnessId::Mock, None, "ashler-staging", "owner-a", RuntimeProfile::Mock,
+        ).unwrap();
+        // Even installing the capability on a peer must not authorize provider
+        // operations; the runtime profile is checked before device lookup.
+        let rpc = core.build_rpc_service().with_device_wake(std::sync::Arc::new(crate::device_wake::DeviceWake::default()));
+        for method in [methods::WAKE_DEVICE, methods::ENSURE_DEVBOX_CALLBACK_FORWARD] {
+            let result = rpc.handle(method, serde_json::json!({"deviceId":"registered-remote"})).await;
+            assert!(matches!(result, Err(RpcError::Failed(message)) if message.contains("only on the local controller")));
+        }
+    }
+
+    #[tokio::test]
     async fn public_routes_reject_private_execution_keys() {
         let dir = tempfile::tempdir().unwrap();
         let core = crate::EngineCore::assemble_with_identity(
@@ -4232,6 +4277,7 @@ mod tests {
             model: None,
             harness_session_id: None,
             status: Some(SessionStatus::Idle),
+            model_retry: None,
             started_at: None,
             updated_at: Some(1),
             created_at: 1,
@@ -4348,6 +4394,7 @@ mod tests {
                     model: None,
                     harness_session_id: None,
                     status: Some(comet_proto::SessionStatus::Idle),
+                    model_retry: None,
                     started_at: None,
                     updated_at: Some(now),
                     created_at: now,

@@ -363,3 +363,79 @@ fn snapshot_import_rejects_corrupt_inner_sstable_with_valid_envelope_checksum() 
             .is_some_and(|value| value.is_empty()));
     }
 }
+
+#[test]
+fn concurrent_shallow_map_scan_preserves_winner_identity_and_cold_roundtrip() {
+    let base = LoroDoc::new_auto_commit();
+    base.set_peer_id(1).unwrap();
+    let map = base.get_map("map");
+    map.insert("seed", "retained").unwrap();
+    map.insert("equal", "same").unwrap();
+    map.insert("deleted", "base").unwrap();
+    map.insert("boundary", 0).unwrap();
+    base.commit_then_renew();
+    let base_vv = base.oplog_vv();
+    let base_frontiers = base.oplog_frontiers();
+
+    let left = base.fork();
+    left.set_peer_id(10).unwrap();
+    left.get_map("map").insert("equal", "left-intermediate").unwrap();
+    left.get_map("map").insert("equal", "same").unwrap();
+    left.get_map("map").insert("deleted", "left").unwrap();
+    left.commit_then_renew();
+    assert_eq!(left.get_map("map").get_last_editor("equal"), Some(10));
+    assert_eq!(left.oplog_vv().get(&10).copied(), Some(3));
+    let right = base.fork();
+    right.set_peer_id(20).unwrap();
+    right.get_map("map").insert("equal", "right-intermediate").unwrap();
+    right.get_map("map").insert("equal", "same").unwrap();
+    right.get_map("map").delete("deleted").unwrap();
+    right.commit_then_renew();
+    assert_eq!(right.get_map("map").get_last_editor("equal"), Some(20));
+    assert_eq!(right.oplog_vv().get(&20).copied(), Some(3));
+    let left_update = left.export(ExportMode::updates(&base_vv)).unwrap();
+    let right_update = right.export(ExportMode::updates(&base_vv)).unwrap();
+
+    let target = LoroDoc::new_auto_commit();
+    target.import(&base.export(ExportMode::shallow_snapshot(&base_frontiers)).unwrap()).unwrap();
+    target.import(&left_update).unwrap();
+    target.import(&right_update).unwrap();
+    let merged_frontiers = target.oplog_frontiers();
+    let merged_vv = target.oplog_vv();
+    let merged_value = target.get_deep_value();
+    let map = target.get_map("map");
+    assert_eq!(map.get("seed"), Some("retained".into()));
+    assert_eq!(map.get_last_editor("equal"), Some(20));
+    assert_eq!(map.get_last_editor("deleted"), Some(20));
+    assert!(map.get("deleted").is_none());
+    assert_eq!(target.state_vv(), merged_vv);
+    assert!(!target.oplog().lock().has_history_cache());
+
+    target.checkout(&left.oplog_frontiers()).unwrap();
+    assert_eq!(target.get_deep_value(), left.get_deep_value());
+    assert_eq!(map.get_last_editor("equal"), Some(10));
+    target.checkout(&right.oplog_frontiers()).unwrap();
+    assert_eq!(target.get_deep_value(), right.get_deep_value());
+    assert_eq!(map.get_last_editor("equal"), Some(20));
+    target.checkout(&base_frontiers).unwrap();
+    assert_eq!(target.get_deep_value(), base.get_deep_value());
+    assert_eq!(map.get_last_editor("equal"), Some(1));
+    assert_eq!(map.get_last_editor("deleted"), Some(1));
+    target.checkout(&merged_frontiers).unwrap();
+    assert_eq!(target.get_deep_value(), merged_value);
+    assert_eq!(target.state_vv(), merged_vv);
+
+    let cold = LoroDoc::new_auto_commit();
+    cold.import(&target.export(ExportMode::Snapshot).unwrap()).unwrap();
+    assert_eq!(cold.get_deep_value(), merged_value);
+    assert_eq!(cold.oplog_vv(), merged_vv);
+    assert_eq!(cold.state_vv(), merged_vv);
+    assert_eq!(cold.get_map("map").get_last_editor("equal"), Some(20));
+    assert_eq!(cold.get_map("map").get_last_editor("deleted"), Some(20));
+    cold.checkout(&left.oplog_frontiers()).unwrap();
+    assert_eq!(cold.get_deep_value(), left.get_deep_value());
+    cold.checkout(&merged_frontiers).unwrap();
+    assert_eq!(cold.get_deep_value(), merged_value);
+    assert_eq!(cold.get_map("map").get_last_editor("equal"), Some(20));
+    assert!(!cold.oplog().lock().has_history_cache());
+}

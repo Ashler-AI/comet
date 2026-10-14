@@ -65,11 +65,12 @@ async fn wait_stream<T>(
             ));
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(item)) => {
+            Ok(Some(Ok(item))) => {
                 if let Some(found) = predicate(&item) {
                     return found;
                 }
             }
+            Ok(Some(Err(error))) => fail(&format!("{what}: stream failed: {error}")),
             Ok(None) => fail(&format!("{what}: stream ended early")),
             Err(_) => fail(&format!(
                 "{what}: timed out after {}s",
