@@ -696,7 +696,7 @@ enum E2ERunner {
             if !passed { log("FAIL Crew reliability recovery: \(scenario)") }
             return passed
         }
-        guard check("workspace record intents", WorkspaceStore.runRecordIntentRegression()),
+        guard check("workspace record intents", await WorkspaceStore.runRecordIntentRegression()),
               check("host-created catalog", await WorkspaceStore.runCreatedChatRegression()),
               check("disk record recovery", DocDisk.runRecordRecoveryRegression()),
               check("nested tool calls", runNestedToolCallRecovery()),

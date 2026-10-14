@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use fractional_index::FractionalIndex;
 use itertools::Itertools;
-use loro_common::{ContainerID, IdFull, IdLp, Lamport, PeerID, TreeID, ID};
+use loro_common::{ContainerID, IdFull, IdLp, Lamport, LoroResult, PeerID, TreeID, ID};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -112,8 +112,8 @@ impl DiffCalculatorTrait for TreeDiffCalculator {
         oplog: &OpLog,
         info: DiffCalcVersionInfo,
         mut on_new_container: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode) {
-        match &mut self.mode {
+    ) -> LoroResult<(InternalDiff, DiffMode)> {
+        Ok(match &mut self.mode {
             TreeDiffCalculatorMode::Crdt => {
                 let diff = self.diff(oplog, info);
                 diff.diff.iter().for_each(|d| {
@@ -143,7 +143,7 @@ impl DiffCalculatorTrait for TreeDiffCalculator {
                 });
                 (InternalDiff::Tree(ans), DiffMode::ImportGreaterUpdates)
             }
-        }
+        })
     }
 }
 

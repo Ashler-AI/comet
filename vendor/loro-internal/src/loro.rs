@@ -655,6 +655,7 @@ impl LoroDoc {
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
         let mut oplog = self.oplog.lock();
+        oplog.change_store().check_history_parsable()?;
         oplog.begin_import_rollback();
         if !self.is_detached() {
             let old_vv = oplog.vv().clone();
@@ -662,7 +663,7 @@ impl LoroDoc {
             let result = f(&mut oplog);
             if &old_vv != oplog.vv() {
                 let mut diff = DiffCalculator::new(false);
-                let (diff, diff_mode) = diff.calc_diff_internal(
+                let diff_result = diff.calc_diff_internal(
                     &oplog,
                     &old_vv,
                     &old_frontiers,
@@ -670,6 +671,13 @@ impl LoroDoc {
                     oplog.dag.get_frontiers(),
                     None,
                 );
+                let (diff, diff_mode) = match diff_result {
+                    Ok(diff) => diff,
+                    Err(e) => {
+                        oplog.rollback_import();
+                        return Err(e);
+                    }
+                };
                 let mut state = self.state.lock();
                 if let Err(e) = state.apply_diff(
                     InternalDocDiff {
@@ -723,6 +731,7 @@ impl LoroDoc {
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
         let mut oplog = self.oplog.lock();
+        oplog.change_store().check_history_parsable()?;
         let arena_checkpoint = oplog.arena.checkpoint_for_rollback();
         let changes = match decode_changes(&mut oplog) {
             Ok(changes) => changes,
@@ -797,9 +806,9 @@ impl LoroDoc {
                         *end == old_end.max(component_end)
                     })
             });
-            let (diff, diff_mode) = if let Some((component_vv, _)) = isolated_batch {
+            let diff_result = if let Some((component_vv, _)) = isolated_batch {
                 let component_frontiers = oplog.dag.vv_to_frontiers(&component_vv);
-                let (diff, _) = diff.calc_diff_internal(
+                let diff = diff.calc_diff_internal(
                     &oplog,
                     &VersionVector::default(),
                     &Frontiers::default(),
@@ -807,7 +816,7 @@ impl LoroDoc {
                     &component_frontiers,
                     None,
                 );
-                (diff, DiffMode::Import)
+                diff.map(|(diff, _)| (diff, DiffMode::Import))
             } else {
                 diff.calc_diff_internal(
                     &oplog,
@@ -817,6 +826,15 @@ impl LoroDoc {
                     oplog.dag.get_frontiers(),
                     None,
                 )
+            };
+            let (diff, diff_mode) = match diff_result {
+                Ok(diff) => diff,
+                Err(e) => {
+                    if rollback_enabled {
+                        oplog.rollback_import();
+                    }
+                    return Err(e);
+                }
             };
             let mut state = self.state.lock();
             if let Err(e) = state.apply_diff(
@@ -1141,6 +1159,31 @@ impl LoroDoc {
         exist
     }
 
+    // Scan the map keys needed by a named version without checking out or recording state.
+    fn check_map_history_at(&self, frontiers: &Frontiers) -> LoroResult<()> {
+        let oplog = self.oplog.lock();
+        for id in frontiers.iter() {
+            if !oplog.dag.contains(id) {
+                return Err(LoroError::FrontiersNotFound(id));
+            }
+        }
+        if oplog.dag.is_before_shallow_root(frontiers) {
+            return Err(LoroError::SwitchToVersionBeforeShallowRoot);
+        }
+        let vv = oplog.dag.frontiers_to_vv(frontiers).ok_or_else(|| {
+            LoroError::NotFoundError("Cannot find map history preflight version".into())
+        })?;
+        DiffCalculator::new(true).calc_diff_internal(
+            &oplog,
+            oplog.vv(),
+            oplog.frontiers(),
+            &vv,
+            frontiers,
+            Some(&|idx| idx.get_type() == ContainerType::Map),
+        )?;
+        Ok(())
+    }
+
     /// Undo the operations between the given id_span. It can be used even in a collaborative environment.
     ///
     /// This is an internal API. You should NOT use it directly.
@@ -1168,45 +1211,66 @@ impl LoroDoc {
 
         let (options, txn) = self.implicit_commit_then_stop();
         if !self.oplog().lock().vv().includes_id(id_span.id_last()) {
+            drop(txn);
             self.renew_txn_if_auto_commit(options);
             return Err(LoroError::UndoInvalidIdSpan(id_span.id_last()));
         }
 
-        let (was_recording, latest_frontiers) = {
+        let latest_frontiers = self.state_frontiers();
+        let spans = self.oplog.lock().split_span_based_on_deps(id_span);
+        let preflight = (|| {
+            self.check_map_history_at(&latest_frontiers)?;
+            for (span, deps) in &spans {
+                self.check_map_history_at(&span.id_last().into())?;
+                self.check_map_history_at(deps)?;
+            }
+            Ok::<(), LoroError>(())
+        })();
+        if let Err(error) = preflight {
+            drop(txn);
+            self.renew_txn_if_auto_commit(options);
+            return Err(error);
+        }
+        let was_detached = self.is_detached();
+        let was_recording = {
             let mut state = self.state.lock();
             let was_recording = state.is_recording();
             state.stop_and_clear_recording();
-            (was_recording, state.frontiers.clone())
+            was_recording
         };
-
-        let spans = self.oplog.lock().split_span_based_on_deps(id_span);
-        let diff = crate::undo::undo(
+        let diff_result = crate::undo::undo(
             spans,
             match post_transform_base {
                 Some(d) => Either::Right(d),
                 None => Either::Left(&latest_frontiers),
             },
             |from, to| {
-                self._checkout_without_emitting(from, false, false).unwrap();
+                self._checkout_without_emitting(from, false, false)?;
                 self.state.lock().start_recording();
-                self._checkout_without_emitting(to, false, false).unwrap();
+                self._checkout_without_emitting(to, false, false)?;
                 let mut state = self.state.lock();
                 let e = state.take_events();
                 state.stop_and_clear_recording();
-                DiffBatch::new(e)
+                Ok(DiffBatch::new(e))
             },
             before_diff,
         );
 
-        // println!("\nundo_internal: diff: {:?}", diff);
-        // println!("container remap: {:?}", container_remap);
-
-        self._checkout_without_emitting(&latest_frontiers, false, false)?;
-        self.set_detached(false);
+        self.state.lock().stop_and_clear_recording();
+        let restore_result = self._checkout_without_emitting(&latest_frontiers, false, false);
+        self.set_detached(was_detached);
         if was_recording {
             self.state.lock().start_recording();
         }
         drop(txn);
+        let diff = match diff_result.and_then(|diff| restore_result.map(|_| diff)) {
+            Ok(diff) => diff,
+            Err(error) => {
+                self.renew_txn_if_auto_commit(options);
+                return Err(error);
+            }
+        };
+        self.set_detached(false);
         self.start_auto_commit();
         // Try applying the diff, but ignore the error if it happens.
         // MovableList's undo behavior is too tricky to handle in a collaborative env
@@ -1267,6 +1331,18 @@ impl LoroDoc {
         let (options, txn) = self.implicit_commit_then_stop();
         let was_detached = self.is_detached();
         let old_frontiers = self.state_frontiers();
+        let preflight = (|| {
+            self.check_map_history_at(a)?;
+            self.check_map_history_at(b)?;
+            self.check_map_history_at(&old_frontiers)
+        })();
+        if let Err(error) = preflight {
+            drop(txn);
+            if !was_detached {
+                self.renew_txn_if_auto_commit(options);
+            }
+            return Err(error);
+        }
         let was_recording = {
             let mut state = self.state.lock();
             let is_recording = state.is_recording();
@@ -1284,8 +1360,8 @@ impl LoroDoc {
         })();
 
         // Always restore state regardless of whether diff calculation succeeded
-        self._checkout_without_emitting(&old_frontiers, false, false)
-            .unwrap();
+        self.state.lock().stop_and_clear_recording();
+        let restore_result = self._checkout_without_emitting(&old_frontiers, false, false);
         drop(txn);
         if !was_detached {
             self.set_detached(false);
@@ -1294,7 +1370,7 @@ impl LoroDoc {
         if was_recording {
             self.state.lock().start_recording();
         }
-        result.map(DiffBatch::new)
+        result.and_then(|events| restore_result.map(|_| DiffBatch::new(events)))
     }
 
     /// Apply a diff to the current state.
@@ -1729,9 +1805,9 @@ impl LoroDoc {
             ));
         };
 
-        self.set_detached(true);
         let (diff, diff_mode) =
-            calc.calc_diff_internal(&oplog, &before, &state.frontiers, after, &frontiers, None);
+            calc.calc_diff_internal(&oplog, &before, &state.frontiers, after, &frontiers, None)?;
+        self.set_detached(true);
         state.apply_diff(
             InternalDocDiff {
                 origin,
@@ -1928,7 +2004,7 @@ impl LoroDoc {
                         oplog.vv(),
                         oplog.frontiers(),
                         Some(&|target| idx == target),
-                    );
+                    ).map_err(|_| CannotFindRelativePosition::HistoryCleared)?;
                     // TODO: remove depth info
                     let depth = self.arena.get_depth(idx);
                     let (_, diff_calc) = &mut diff_calc.get_or_create_calc(idx, depth);
@@ -3191,7 +3267,6 @@ mod test {
             target.get_map("isolated").get("value"),
             Some("winner".into())
         );
-        assert!(target.has_history_cache());
     }
 
     #[test]
@@ -3243,7 +3318,6 @@ mod test {
             .unwrap();
 
         assert_eq!(target.get_map("shared").get("value"), Some("remote".into()));
-        assert!(target.has_history_cache());
     }
 
     #[test]
@@ -3267,6 +3341,5 @@ mod test {
             .import(&remote.export(ExportMode::all_updates()).unwrap())
             .unwrap();
 
-        assert!(target.has_history_cache());
     }
 }

@@ -456,7 +456,13 @@ mod tests {
         workspace.create_chat(LOCAL_CHAT, "local-space", None, None).unwrap();
         let remote_room = remote.open(REMOTE_CHAT).unwrap();
         let desktop_room = desktop.open(REMOTE_CHAT).unwrap();
-        let stale_at = DateTime::from_timestamp_millis(crate::now_ms() - comet_proto::view::SESSION_STALE_MS - 1_000).unwrap();
+        let stale_at = DateTime::from_timestamp_millis(crate::now_ms() - 90_000).unwrap();
+        let mut remote_device = remote_workspace.doc().read_devices().unwrap().into_iter()
+            .find(|device| device.id == "remote").unwrap();
+        remote_device.last_seen_at = Some(stale_at);
+        remote_workspace.doc().upsert_device(&remote_device).unwrap();
+        workspace.doc().upsert_device(&remote_device).unwrap();
+        let mut devices = workspace.watch_devices();
         let mut current = Session {
             chat_id: REMOTE_CHAT.into(), device_id: "remote".into(),
             status: SessionStatus::Working, started_at: None,
@@ -495,6 +501,9 @@ mod tests {
         assert_eq!(comet_proto::view::effective_indicator(Some(old),
             Utc::now()), comet_proto::view::Indicator::Unreachable,
             "a static streaming snapshot is not a current heartbeat");
+        receive_for(&mut devices, "static streaming snapshot leaves device offline", |rows| {
+            rows.iter().any(|device| device.id == "remote" && device.last_seen_at == Some(stale_at))
+        }).await;
 
         for (status, sidebar) in [
             (SessionStatus::Working, ChatIndicator::Working),
@@ -512,6 +521,9 @@ mod tests {
             sync_room();
             receive_for(&mut sessions, &format!("fresh owner {status:?} before stale import"),
                 |rows| rows.iter().any(|row| row == &current)).await;
+            receive_for(&mut devices, "owner heartbeat refreshes device presence", |rows| {
+                rows.iter().any(|device| device.id == "remote" && device.last_seen_at == Some(current.updated_at))
+            }).await;
             let stale = Session { status: SessionStatus::Idle,
                 updated_at: stale_at - chrono::Duration::milliseconds(1), ..current.clone() };
             // A real owner publishes its stale cached index, received as a
@@ -545,17 +557,23 @@ mod tests {
                 rows.iter().find(|row| row.chat_id == REMOTE_CHAT), Utc::now()), sidebar);
         }
         let before = workspace.doc().read_sessions().unwrap();
+        let presence_before = devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at;
+        let newer = Session { updated_at: current.updated_at + chrono::Duration::seconds(1), ..current.clone() };
         let foreign = Session { device_id: "foreign".into(), status: SessionStatus::Working, ..current.clone() };
         workspace.record_session_activity(None, "owner", &foreign, Some(crate::now_ms())).unwrap();
-        workspace.record_session_activity(None, "foreign-principal", &current, Some(crate::now_ms())).unwrap();
+        workspace.record_session_activity(None, "foreign-principal", &newer, Some(crate::now_ms())).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
         assert_eq!(sessions.borrow().iter().find(|row| row.chat_id == REMOTE_CHAT), Some(&current));
+        assert_eq!(devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at, presence_before,
+            "foreign activity cannot renew device presence");
         local_tx.send_replace(vec![local]);
         workspace.remove_session_ref(REMOTE_CHAT).unwrap();
         receive_for(&mut chats, "unpinned chat removal", |rows| rows.iter().all(|row| row.id != REMOTE_CHAT)).await;
         receive_for(&mut sessions, "unpinned session removal", |rows| rows.iter().all(|row| row.chat_id != REMOTE_CHAT)).await;
-        workspace.record_session_activity(None, "owner", &current, Some(crate::now_ms())).unwrap();
+        workspace.record_session_activity(None, "owner", &newer, Some(crate::now_ms())).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
+        assert_eq!(devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at, presence_before,
+            "removed membership cannot renew device presence");
         drop(bridge);
     }
 

@@ -13,7 +13,73 @@ The original durable command and message IDs remain unchanged. Cancellation
 interrupts backoff and in-flight requests; terminal command outcomes are never
 reopened, and an already-started agent is never replayed by this retry.
 
-## Unreleased: Crew Staging mobile catalog loading
+## Unreleased: workspace recovery conflict isolation
+
+A rejected workspace checkpoint retains its original cache and intents and stays
+visible in `SyncStatus.workspaceRecoveryError`. It no longer blocks unrelated
+journal-backed chat creation or message admission. Transcript recovery conflicts,
+room permission denials, and journal, snapshot or acknowledgement persistence
+failures remain fatal; no conflicting record is discarded or falsely acknowledged.
+Successful snapshot adoption clears the diagnostic. Divergent installed stores
+still require data-preserving reconciliation of genuine competing user edits.
+
+## Unreleased: bounded concurrent map history
+
+Concurrent map import and historical diff resolve only changed keys instead of
+materializing every retained change into a global map-history cache. Encoded
+container/key metadata selects blocks; one disposable arena decodes each relevant
+block. Native Loro and the pinned `1.16.4+crew.3` Worker runtime preserve causal
+visibility, shallow seeds, tombstones and equal-value winner identity.
+
+Decode failures propagate through existing import rollback. Temporary Undo/diff
+checkouts preflight map history; failed Undo retains its original remote rebase
+row, and local map rollback restores first-before winners without rereading history.
+No public API, encoding, ownership rule or accepted-history boundary changes.
+
+The captured 31-update server replay stayed at **32.06 MiB** during imports;
+real SessionRoom admission, duplicate delivery and cold replay used **54.75 MiB**.
+State/VV/frontier/floor, lossless folds and offline convergence passed. The public
+wide-vector and concurrent-map fixtures retain the **112 MiB** WASM guard.
+This source change does not patch or restart existing clients.
+
+## Crew 0.1.156: staging desktop release
+
+Crew Staging desktop **0.1.156** is available through **Settings → Crew update**
+from merged source `599fedfd122ab74ea58c93225118071fa2206b27` in
+[release run 38472406507](https://github.com/Ashler-AI/comet/actions/runs/38472406507).
+It packages current native owner-activity reprojection after membership settlement.
+Both macOS variants passed signature, notarization, Gatekeeper and DMG/updater
+archive checks. Staging channel readback matched, and the installed staging CLI
+reported **0.1.155 → 0.1.156 available** without installing or restarting it.
+
+Mobile **1.0 (34)** from the same source is **Testing** in the existing internal
+TestFlight group. The Scaffold runtime contract is unchanged; no production
+promotion, image-pin or tester/account-permission changes occurred. Preserve this
+run ID for exact-candidate promotion only after captain verification of restarted
+staging clients.
+
+## Crew Staging mobile 1.0 (34): liveness crash and warm-load release
+
+The fetched build 33 phone report confirms a Swift arithmetic-overflow **SIGTRAP**
+in `RoomClient.livenessTick`, not a memory-pressure termination. Its default clock
+was sampled before the actor hop; newer room traffic could advance the deadline
+base before the tick ran. Build 34 samples inside the actor and guards unsigned
+clock subtraction while preserving expired-lease reconnects.
+
+A private matched simulator replay independently exposed a **1,320.77 MiB** peak:
+Loro's state-vector equality guard reconstructed ancestry and copied immutable
+maps. Build 34 uses frontier equality for materialization and oplog vectors for
+remote coverage, preserving detached/pending-import and historical rebase proofs.
+
+Workspace cold hydration now runs off-main, list metadata avoids whole-transcript
+forks, and off-screen document eviction no longer waits for scrolling to stop.
+The allocation replay peaked at **381.98 MiB** (**71.1% lower**). All **32** local
+and merged-source simulator markers passed after the confirmed timer correction.
+Build **1.0 (34)** is now **Testing**; its exact uploaded IPA passed distribution
+signature/profile checks. Physical-phone acceptance remains manual. See
+[the release evidence](apps/ios/README.md#crew-staging-10-34-liveness-crash-and-warm-load-release).
+
+## Crew Staging mobile 1.0 (33): catalog loading
 
 Mobile build 33 recovers an `InvalidUpdate` upload reply through bounded
 authoritative backfill instead of permanently stopping session discovery.
@@ -25,8 +91,11 @@ null/scalar exception without hiding valid session rows.
 Both failure mechanisms reproduced in shipped build 32. The build 33 simulator
 then displayed a new session after rejection, retained its local read marker,
 loaded the formerly crashing cache and passed all 31 regression markers.
-Exact physical-phone attribution and TestFlight publication remain separate;
-see [the mobile candidate evidence](apps/ios/README.md#crew-staging-10-33-rejected-upload-recovery-and-safe-list-decoding).
+Build **1.0 (33)** is now **Testing** in the existing internal TestFlight group.
+Merged-source [CI 38427448877](https://github.com/Ashler-AI/comet/actions/runs/38427448877)
+and exact-upload signature/profile checks passed; production remains unchanged.
+Physical-phone acceptance and exact trigger attribution remain unverified; see
+[the mobile release evidence](apps/ios/README.md#crew-staging-10-33-rejected-upload-recovery-and-safe-list-decoding).
 
 ## Crew 0.1.153: bounded workspace replay
 
@@ -733,6 +802,11 @@ composer indicators aligned when workspace synchronization is stalled. Local
 engine status still wins for locally hosted sessions. Membership and owner checks
 fence remote activity; static streaming snapshots do not count as fresh heartbeats.
 
+Controllers also use verified owner-session heartbeat timestamps for device
+presence. A live Devbox stays online when workspace presence or relay-status
+probes are unavailable; cached transcripts cannot extend the online lease.
+Sidebar badges, device settings, and the send/wake gate share this signal.
+
 Canonical session controls keep an existing bare-chat writer's live execution key,
 so publishing its room record does not strand Stop, steering, or input answers.
 Upgrade both controller and host; already-running older binaries do not acquire
@@ -1160,6 +1234,32 @@ The isolated installed-runtime regression can be run without provider credential
 ```bash
 node scripts/omp-gateway-revival-smoke.mjs ~/.local/bin/omp --compare-explicit
 ```
+
+## Native supervision lifetime
+
+Steerable runs normally retire after 30 minutes idle. A supervising extension
+with outstanding worker or wake obligations can explicitly retain its own live
+run by spawning an attached child:
+
+```bash
+"$COMET_EXECUTABLE" session supervise
+```
+
+Preserve `COMET_SESSION_ID`, `COMET_IPC_PORT`, and the engine-minted
+`COMET_SUPERVISION_TOKEN`. The token is a secret capability for one run
+generation; never put it in argv, prompts, logs, or durable state. The child
+prints one JSON receipt with `chatId`, `runId`, and `retained: true` after native
+RPC admission, then remains silent. Keep it only while obligations exist;
+terminate and reap it to release. The last subscription closing restores the
+original idle deadline, so an already-overdue run retires immediately.
+
+Cancellation, stream failure, engine shutdown, and process-group cleanup still
+end the run. A replaced run gets a new capability; an old subscriber cannot
+retain or release its replacement. Observe unexpected child exit as lost
+supervision, not success, and reacquire only from a fresh run's launch context.
+There is no heartbeat prompt, detached watcher, or retention after Crew closes.
+Older engines/runs without the capability fail closed; updating source alone
+does not change an already-running installed application.
 
 ## Native OMP handoff to Scaffold
 

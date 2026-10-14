@@ -1,4 +1,4 @@
-use loro_common::ContainerID;
+use loro_common::{ContainerID, LoroResult};
 
 use crate::{container::idx::ContainerIdx, event::InternalDiff, OpLog};
 
@@ -26,7 +26,7 @@ impl DiffCalculatorTrait for UnknownDiffCalculator {
         _oplog: &OpLog,
         _info: DiffCalcVersionInfo,
         _on_new_container: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode) {
-        (InternalDiff::Unknown, DiffMode::Checkout)
+    ) -> LoroResult<(InternalDiff, DiffMode)> {
+        Ok((InternalDiff::Unknown, DiffMode::Checkout))
     }
 }

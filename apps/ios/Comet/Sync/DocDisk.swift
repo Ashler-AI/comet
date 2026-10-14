@@ -159,6 +159,19 @@ enum DocDisk {
         return true
     }
 
+    /// Validate with the migration's own rules before deciding whether a fork is needed.
+    static func workspaceRowsNeedMigration(in doc: LoroDoc) throws -> Bool {
+        for root in ["chats", "sessions", "sessionRefs", "worktreeDeletions"] {
+            for (key, value) in doc.getMap(id: root).getDeepValue().mapValue ?? [:] {
+                var original = RecordIntent(root: root, key: key, before: nil)
+                original.after = try recordData(value)
+                let normalized = try normalizeWorkspaceIntent(original)
+                if normalized.key != key || normalized.after != original.after { return true }
+            }
+        }
+        return false
+    }
+
     /// Work on a fork before binding it: failures leave the cache and its evidence intact.
     static func migrateWorkspaceRows(in doc: LoroDoc) throws -> Bool {
         var changed = false
@@ -358,7 +371,7 @@ enum DocDisk {
         guard let data = try? Data(contentsOf: url(for: id)), !data.isEmpty else { return false }
         guard let status = try? doc.importWith(bytes: data, origin: "disk") else { return false }
         return (status.pending?.isEmpty ?? true)
-            && !doc.isDetached() && doc.stateVv() == doc.oplogVv()
+            && !doc.isDetached() && doc.stateFrontiers() == doc.oplogFrontiers()
     }
 
     /// Load into an isolated replica so cancellation or a failed import cannot
@@ -386,22 +399,20 @@ enum DocDisk {
         guard let status = try? replacement.importWith(bytes: bytes, origin: "remote"),
               status.pending?.isEmpty ?? true,
               !replacement.isDetached(),
-              replacement.stateVv() == replacement.oplogVv(),
+              replacement.stateFrontiers() == replacement.oplogFrontiers(),
               replacement.oplogVv().includesVv(other: metadata.partialEndVv)
         else { return nil }
         return replacement
     }
 
-    /// The store calls this in the SAME main-actor turn as its binding swap.
-    /// Commit/export here, not on the room actor: local edits may have landed
-    /// while the validated server replica was waiting for the main actor.
+    /// Live stores call this in the SAME main-actor turn as their binding swap.
+    /// Isolated hydration replicas may merge off-main; never mutate a live replica there.
     /// Prefer retaining operation identities. Across a shallow-history gap,
     /// reissue only a safely reconstructible local state delta as new operations.
-    @MainActor
     static func preserveLocalOperations(from previous: LoroDoc, in replacement: LoroDoc) -> Bool {
         previous.commit()
-        guard !previous.isDetached(), previous.stateVv() == previous.oplogVv(),
-              !replacement.isDetached(), replacement.stateVv() == replacement.oplogVv()
+        guard !previous.isDetached(), previous.stateFrontiers() == previous.oplogFrontiers(),
+              !replacement.isDetached(), replacement.stateFrontiers() == replacement.oplogFrontiers()
         else { return false }
         let required = previous.oplogVv()
         let snapshotVersion = replacement.oplogVv()
@@ -414,7 +425,7 @@ enum DocDisk {
             let missing = try previous.export(mode: .updates(from: snapshotVersion))
             let status = try merged.importWith(bytes: missing, origin: "recovery")
             if status.pending?.isEmpty ?? true,
-               !merged.isDetached(), merged.stateVv() == merged.oplogVv(),
+               !merged.isDetached(), merged.stateFrontiers() == merged.oplogFrontiers(),
                merged.oplogVv().includesVv(other: required) {
                 return try importRecovery(from: merged, into: replacement, since: snapshotVersion)
             }
@@ -436,14 +447,14 @@ enum DocDisk {
     private static func importRecovery(
         from candidate: LoroDoc, into replacement: LoroDoc, since snapshotVersion: VersionVector
     ) throws -> Bool {
-        guard !candidate.isDetached(), candidate.stateVv() == candidate.oplogVv(),
+        guard !candidate.isDetached(), candidate.stateFrontiers() == candidate.oplogFrontiers(),
               candidate.oplogVv().includesVv(other: snapshotVersion)
         else { return false }
         let updates = try candidate.export(mode: .updates(from: snapshotVersion))
         let status = try replacement.importWith(bytes: updates, origin: "recovery")
         return (status.pending?.isEmpty ?? true)
             && !replacement.isDetached()
-            && replacement.stateVv() == replacement.oplogVv()
+            && replacement.stateFrontiers() == replacement.oplogFrontiers()
             && replacement.oplogVv() == candidate.oplogVv()
     }
 
@@ -513,7 +524,7 @@ enum DocDisk {
 
     static func saveReplacement(doc: LoroDoc, id: String) throws {
         let bytes = try doc.export(mode: .snapshot)
-        guard !doc.isDetached(), doc.stateVv() == doc.oplogVv() else {
+        guard !doc.isDetached(), doc.stateFrontiers() == doc.oplogFrontiers() else {
             throw MobileSessionError.unavailable("Crew recovery snapshot did not materialize completely.")
         }
         try bytes.write(to: url(for: id), options: .atomic)

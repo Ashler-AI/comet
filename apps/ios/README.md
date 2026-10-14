@@ -8,21 +8,24 @@ engine runs on the phone.
 
 ## Build & run
 
-Requires Xcode 26+ (iOS 26 SDK — Liquid Glass APIs).
+Requires Xcode 26+ (iOS 26 SDK — Liquid Glass APIs) and stable Rust.
 
 ```sh
-cd apps/ios
-xcodebuild -project Comet.xcodeproj -scheme Comet \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+# From the repository root; the helper installs the two required Rust targets.
+node scripts/build-mobile-loro-runtime.mjs /tmp/crew-mobile-packages Comet
+LOCAL_BUILD=1 xcodebuild -project apps/ios/Comet.xcodeproj -scheme Comet \
+  -clonedSourcePackagesDirPath /tmp/crew-mobile-packages \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -jobs 2 build
 ```
 
-Or open `Comet.xcodeproj` in Xcode and run. Dependencies (SPM, resolved
-automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
-(matches the engine's loro 1.13), [swift-markdown](https://github.com/swiftlang/swift-markdown)
-(cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
-desktop's pulldown-cmark config).
+The pinned [loro-swift 1.13.3](https://github.com/loro-dev/loro-swift) wrapper and
+UniFFI ABI remain unchanged. Its supported `LOCAL_BUILD` path selects the
+repository's patched native Loro core instead of the upstream prebuilt binary;
+keep the same packages directory and environment for subsequent Xcode builds.
+Other SPM dependencies remain [swift-markdown](https://github.com/swiftlang/swift-markdown)
+and cmark-gfm, matching desktop's Markdown feature set.
 
-Mobile staging **1.0 (32)** and production **1.0 (20)** are available
+Mobile staging **1.0 (34)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
 releases, not public App Store submissions. Upload and verification evidence is
 recorded below.
@@ -32,12 +35,15 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
 # Production candidate: Crew, ai.ashler.crew, version 1.0 build 21
-xcodebuild -project Comet.xcodeproj -scheme Comet \
-  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
+LOCAL_BUILD=1 xcodebuild -project apps/ios/Comet.xcodeproj -scheme Comet \
+  -clonedSourcePackagesDirPath /tmp/crew-mobile-packages \
+  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' -jobs 2 build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 33
-xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
-  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 35
+node scripts/build-mobile-loro-runtime.mjs /tmp/crew-mobile-packages 'Crew Staging'
+LOCAL_BUILD=1 xcodebuild -project apps/ios/Comet.xcodeproj -scheme 'Crew Staging' \
+  -clonedSourcePackagesDirPath /tmp/crew-mobile-packages \
+  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' -jobs 2 build
 ```
 
 | Scheme | Edge | Scaffold | Project scope | Invite scheme |
@@ -76,11 +82,13 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-33-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-33-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-35-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-35-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
-and `archive-signed.entitlements`. Artifacts originate in
+`crew-mobile-loro-runtime.json`, and `archive-signed.entitlements`. The runtime
+receipt records the pinned Swift ABI, Cargo lock digest, and both rebuilt native
+library hashes; the helper verifies SwiftPM selected those exact slices. Artifacts originate in
 `mobile-artifacts/release/` and are retained for 14 days; diagnostics are in
 `crew-mobile-logs-<run ID>-<attempt>`. Extracted archives are named
 `Crew-Staging.xcarchive` and `Crew.xcarchive`, respectively, each containing
@@ -102,6 +110,128 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew Staging 1.0 (35): bounded native workspace import
+
+Published build 34 reproduced a **12.6 GiB physical footprint** while importing a
+private, byte-exact staging workspace baseline (**6,152,039 bytes**) and its
+**31 accepted SQL deltas** in an isolated iOS simulator. Sampling traced
+`RoomClient.applyRemote` through `LoroDoc.importWith` into native causal-vector
+expansion; the UI thread waited on the document mutex. This is separate from the
+previous timer crash. A phone-specific build 34 termination report remains unavailable.
+
+Mobile's upstream prebuilt FFI did not contain the bounded Loro cache already
+used by desktop. `comet-mobile-ffi` reexports the same **loro-ffi 1.13.7 /
+UniFFI 0.31.1** ABI against the workspace's patched **Loro 1.13.9**. The build
+helper uses the SDK's existing local-binary mechanism and rejects stale artifact
+selection. No Swift API, protocol, permission, credential, or retained-intent
+semantics change; no account cache migration or server history reset is required.
+
+The native mobile ABI replay imported every accepted record at **168.09 MiB**
+sampled peak; replay plus snapshot export used **191.44 MiB**. Independent
+readback matched complete state, version vectors, retained floor/frontiers,
+**618,202 operations / 37,163 changes**, and cold reopen. These are native-probe
+measurements, not whole-app iOS peak measurements.
+
+CI also runs `node scripts/mobile-loro-import-smoke.mjs PACKAGES_DIRECTORY` against
+a deterministic public wide-history fixture. It calls the actual mobile UniFFI
+import/export ABI, enforces a 256 MiB native budget (with a 768 MiB safety stop),
+and compares visible state, materialization, retained history/floor, and cold reopen. Its host-native result
+is included in `provenance.json`; no private workspace data enters CI.
+
+[PR #107](https://github.com/Ashler-AI/comet/pull/107) merged as
+`1aa4d095d10379501a45397af11885d7fa632368`. Its main-source
+[mobile run 38513191196](https://github.com/Ashler-AI/comet/actions/runs/38513191196)
+passed all **32** simulator markers, real mobile/native/Edge transport, and device
+archiving. All **10** downloaded artifact checksums matched; runtime provenance
+records the unchanged Swift ABI and both rebuilt iOS library hashes.
+
+The exact merged simulator app loaded the same accepted corpus with **256.7M**
+peak / **238.6M** current physical footprint, as reported by macOS `sample`,
+instead of build 34's **12.6G**. The connecting spinner cleared, a new 570-byte
+catalog update appeared in the list, and that session remained visible after an
+offline warm restart. This is isolated simulator evidence, not physical-phone or
+hosted staging acceptance.
+
+Xcode accepted one **internal-only** build 35 upload on **2026-10-14**. The exact
+uploaded IPA passed strict deep signature verification with bundle
+`ai.ashler.crew.staging`, version **1.0 (35)**, team `825LYXGJR6`, and matching
+production APNs signature/profile. Uploaded IPA SHA-256:
+`0aa714a2af6e5b544f7aabdcfef5a274383a5870ee670974db9b02c8e511182d`.
+Apple processing / Testing availability has not yet been read back because the
+web session requires fresh interactive sign-in; the last verified Testing build
+is 34. Production, tester memberships and customer caches are unchanged.
+
+
+### Crew Staging 1.0 (34): liveness crash and warm-load release
+
+The build 33 report submitted on **2026-10-13** confirms a separate timer crash,
+not jetsam: **EXC_BREAKPOINT / SIGTRAP**, Swift arithmetic overflow in
+`RoomClient.livenessTick(gen:at:)` at line 352, about **11.1 seconds** after launch
+on iOS **27.0.1**. Incident `1C81648B-BA51-4C58-8561-75743E95840A` was fetched
+through authenticated TestFlight readback. The released archive's matching dSYM
+UUID and local `atos` readback verified the crashing frame.
+
+The tick's default clock was sampled at its caller, before the actor hop. Newer
+room traffic could update the backfill clock before the queued tick executed;
+unsigned `now - base` then trapped. Build 34 samples real time inside the actor
+and checks clock ordering before join/backfill/probe subtraction. The existing
+foreground regression covers older queued ticks without spurious reconnects,
+and verifies expired backfill still redials. CI requires its liveness marker.
+
+A matched iPhone 13 Pro simulator replay used a private 5.94 MB staging workspace,
+12 cached session snapshots totaling 17.16 MB, and full backfill to the nine visible
+session rooms. Build 33 peaked at **1,320.77 MiB RSS**. Sampling identified the
+workspace cache's `stateVv()` materialization check rebuilding causal vectors
+through `AppDag.ensure_vv_for`, immutable-map `get_mut` and `Arc.make_mut`.
+
+Build 34 compares canonical state/oplog frontiers for complete materialization,
+then uses the existing oplog vector for required-server-version coverage. This
+avoids reconstructing ancestry without relaxing pending-import, detached-state
+or remote-coverage checks. Session projection keys also retain frontiers instead
+of reconstructed state vectors. Historical rebase proofs are unchanged.
+
+Cold workspace import, migration, retained-goal replay and projection run off the
+UI actor with epoch/document/version fences; stopped or superseded work cannot
+replace the cache. Warm restart keeps its live replica. List metadata no longer
+forks an entire transcript, and a changed frontier rejects a raced metadata read.
+The first off-screen release deadline is bounded during scrolling; displaced
+transcript stores are released after their final list reader leaves.
+
+The same allocation replay peaked at **381.98 MiB RSS**, a **71.1%** reduction, and
+settled at **101.02 MiB** versus **297.64 MiB**. This is an independent allocation
+repair, not the cause of the fetched SIGTRAP. After the timer correction, all
+**32** local simulator markers passed, including the queued-clock boundaries,
+asynchronous hydration, cancellation, retained edits, pending imports, recovery,
+viewport eviction and metadata isolation. No private data was committed, no phone
+cache was cleared, and no library upgrade was required. Local typechecks were
+intentionally skipped; physical-phone acceptance remains manual.
+
+Merged source `599fedfd122ab74ea58c93225118071fa2206b27` passed native,
+simulator/live mobile–Edge transport and device archiving alongside desktop
+**0.1.156** in [release run 38472406507](https://github.com/Ashler-AI/comet/actions/runs/38472406507).
+All nine downloaded artifact checksums and main-source provenance matched.
+Existing Xcode cloud-managed signing exported and uploaded it without local
+compilation for publication.
+
+Apple accepted one internal-only staging upload at **22:19 UTC on 2026-10-13**.
+Authenticated readback returned upload **COMPLETE**, processing **VALID** and
+**IN_BETA_TESTING**; the UI shows **Testing** in the existing **Ashler Internal**
+group with one tester, using its existing automatic distribution. Apple build ID:
+`280c960f-cc4f-409a-ab2e-459d85e53f8f`.
+The exact uploaded IPA passed strict deep signature verification with bundle
+`ai.ashler.crew.staging`, version **1.0 (34)**, team `825LYXGJR6`, and matching
+production APNs signature/profile. Uploaded IPA SHA-256:
+`065be3159db95539975b2eb1fd38a28dc2c36ad1894e0c89bee5252966c70a43`.
+Production, tester memberships, account permissions and Scaffold image pins are
+unchanged. Update/reopen build 34 and verify new-session discovery and load stability
+on the phone; the release checks are not physical-device acceptance.
+
+For the actual phone report, use **Settings → Privacy & Security → Analytics &
+Improvements → Analytics Data** and share the `Comet-… .ips` or `JetsamEvent-… .ips`
+matching the closure time. [Apple's collection guidance](https://developer.apple.com/documentation/xcode/acquiring-crash-reports-and-diagnostic-logs)
+includes this route for watchdog and memory-termination reports unavailable in
+the Crashes organizer. Do not reinstall or clear retained data to collect it.
 
 ### Crew Staging 1.0 (33): rejected-upload recovery and safe list decoding
 
@@ -126,11 +256,28 @@ the local read marker, and loaded the same null-field cache without termination.
 All 31 regression markers passed, including repeated successful heals, bounded
 rejection, permission/conflict retention and valid optional-object decoding.
 
-This is local simulator evidence, not TestFlight publication or physical-phone
-acceptance. The hosted staging catalog served the new session to a read-only cold
-observer; the phone's cache, sync logs and crash report were unavailable, so its
-exact trigger remains unconfirmed. No live cache reset or account changes were
-performed. Local typechecks were intentionally skipped.
+Merged source `84a356889b408439ca3749a439a9ae5a12505892` passed simulator,
+live mobile/native/Edge transport and device archiving in
+[run 38427448877](https://github.com/Ashler-AI/comet/actions/runs/38427448877).
+All nine downloaded checksums and source provenance matched. Existing Xcode
+cloud-managed signing exported and uploaded it without local compilation.
+
+Apple accepted one internal-only upload at **16:25 UTC on 2026-10-13**.
+Authenticated readback returned upload **COMPLETE**, processing **VALID** and
+**BETA_INTERNAL_TESTING**; the UI shows **Testing** in the existing **Ashler
+Internal** group with one tester. Apple build ID:
+`b9265652-df58-46bd-a6ea-34ead1b20f94`.
+The exact uploaded IPA passed strict deep signature verification with bundle
+`ai.ashler.crew.staging`, version **1.0 (33)**, team `825LYXGJR6`, and matching
+production APNs signature/profile. Uploaded IPA SHA-256:
+`bed62010ad984249bd0c06918be3d6b7bd2c9c41b44c248d09aece0ddc5e06bf`.
+
+Physical-phone acceptance and exact trigger attribution remain unconfirmed.
+The hosted catalog served the new session to a read-only cold observer; the
+phone's cache and sync logs remain unavailable, and Apple has no build 32 crash
+feedback for this report. No live cache reset, production release, tester/group
+or account-permission changes were performed. Local typechecks were intentionally
+skipped. Update and reopen Crew Staging before checking new-session discovery.
 
 ### Crew Staging 1.0 (32): host-owned creation candidate
 
@@ -474,8 +621,9 @@ entire line prefix.
 The September 8 mobile performance pass moves remote workspace projection and
 session-cache imports off the UI actor. Workspace lists and row-context lookups
 use equality-gated retained arrays/indexes instead of repeated filtering/sorting.
-Only visible rows lease metadata rooms; disposal waits for 300 ms of viewport
-quiet and yields between stores. Snapshot flushes remain synchronous to preserve
+Only visible rows lease metadata rooms; the first off-screen row gets a bounded
+300 ms grace period, even during scrolling, and disposal yields between stores.
+Snapshot flushes remain synchronous to preserve
 background/sign-out durability and replica-adoption ordering.
 
 Workspace readiness waits for the server's advertised document version to be

@@ -740,6 +740,202 @@ mod test {
     }
 
     #[test]
+    fn map_scan_filters_metadata_before_decoding_corrupt_operations() {
+        use rustc_hash::FxHashMap;
+        use crate::oplog::ChangeStore;
+
+        let doc = LoroDoc::new_auto_commit();
+        doc.set_peer_id(1).unwrap();
+        doc.get_map("map").insert("wanted", 100).unwrap();
+        doc.commit_then_renew();
+        let oplog = doc.oplog.lock();
+        let mut changes = Vec::new();
+        oplog.change_store().visit_all_changes(&mut |change| changes.push(change.clone()));
+        let bytes = encode_block(&changes, &oplog.arena);
+        let mut encoded: EncodedBlock = postcard::from_bytes(&bytes).unwrap();
+        encoded.change_meta = Cow::Owned(vec![0x80]);
+        let corrupt = postcard::to_allocvec(&encoded).unwrap();
+        let store = ChangeStore::new_for_test();
+        store.external_kv.lock().set(&ID::new(1, 0).to_bytes(), corrupt.into());
+        let cid = ContainerID::new_root("map", ContainerType::Map);
+        let mut keys = FxHashMap::from_iter([("other-key".into(), None)]);
+        let mut visit = |_: &InternalString, _: &mut Option<crate::delta::MapValue>,
+                         _: &Option<loro_common::LoroValue>, _: Counter, _: Lamport, _: PeerID| {
+            panic!("irrelevant operations must not be decoded");
+        };
+        store.visit_map_ops_for_keys(&cid, &mut keys, &mut visit).unwrap();
+        keys = FxHashMap::from_iter([("wanted".into(), None)]);
+        let other = ContainerID::new_root("other-container", ContainerType::Map);
+        store.visit_map_ops_for_keys(&other, &mut keys, &mut visit).unwrap();
+        assert!(store.check_history_parsable().is_ok());
+        assert!(store.visit_map_ops_for_keys(&cid, &mut keys, &mut visit).is_err());
+        assert!(store.check_history_parsable().is_err());
+        assert!(store.inner.lock().mem_parsed_kv.is_empty());
+        assert!(store.arena.id_to_idx(&cid).is_none());
+    }
+
+    #[test]
+    fn corrupt_map_scan_import_rolls_back_state_vv_and_pending_without_panic() {
+        let base = LoroDoc::new_auto_commit();
+        base.set_peer_id(1).unwrap();
+        base.get_map("map").insert("key", 0).unwrap();
+        base.commit_then_renew();
+        let base_vv = base.oplog_vv();
+        let left = base.fork();
+        left.set_peer_id(10).unwrap();
+        left.get_map("map").insert("key", 10).unwrap();
+        left.commit_then_renew();
+        let right = base.fork();
+        right.set_peer_id(20).unwrap();
+        right.get_map("map").insert("key", 20).unwrap();
+        right.commit_then_renew();
+
+        let target = LoroDoc::new_auto_commit();
+        target.import(&left.export(ExportMode::Snapshot).unwrap()).unwrap();
+        let future = right.fork();
+        future.set_peer_id(30).unwrap();
+        future.get_map("map").insert("pending", 30).unwrap();
+        future.commit_then_renew();
+        target.import(&future.export(ExportMode::updates(&right.oplog_vv())).unwrap()).unwrap();
+        let old_state = target.get_deep_value();
+        let old_vv = target.oplog_vv();
+        let old_frontiers = target.state_frontiers();
+        let (store, old_pending) = {
+            let oplog = target.oplog.lock();
+            (oplog.change_store().clone(), oplog.pending_changes_len())
+        };
+        assert!(old_pending > 0, "fixture must unlock a pending map during the failed import");
+        let block_id = ID::new(1, 0);
+        let bytes = store.external_kv.lock().get(&block_id.to_bytes()).unwrap();
+        let mut encoded: EncodedBlock = postcard::from_bytes(&bytes).unwrap();
+        encoded.change_meta = Cow::Owned(vec![0x80]);
+        let corrupt = postcard::to_allocvec(&encoded).unwrap();
+        store.external_kv.lock().set(&block_id.to_bytes(), corrupt.into());
+        store.inner.lock().mem_parsed_kv.remove(&block_id);
+        let old_bytes = store.external_kv.lock().export_all();
+
+        let update = right.export(ExportMode::updates(&base_vv)).unwrap();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| target.import(&update)));
+        assert!(result.is_ok(), "a checked map history failure must not panic");
+        assert!(result.unwrap().is_err());
+        assert_eq!(target.get_deep_value(), old_state);
+        assert_eq!(target.oplog_vv(), old_vv);
+        assert_eq!(target.state_vv(), old_vv);
+        assert_eq!(target.state_frontiers(), old_frontiers);
+        assert_eq!(target.oplog.lock().pending_changes_len(), old_pending);
+        assert_eq!(store.external_kv.lock().export_all(), old_bytes);
+        assert!(store.check_history_parsable().is_err());
+        assert!(target.import(&update).is_err(), "sticky corruption must not become success");
+        assert_eq!(target.oplog_vv(), old_vv);
+    }
+
+    #[test]
+    fn corrupt_map_scan_undo_and_diff_preserve_state_versions_and_remote_undo_row() {
+        use crate::undo::UndoManager;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let base = LoroDoc::new_auto_commit();
+        base.set_peer_id(1).unwrap();
+        base.get_map("map").insert("local-key", 0).unwrap();
+        base.get_map("map").insert("key", 0).unwrap();
+        base.get_text("text").insert_unicode(0, "X").unwrap();
+        base.commit_then_renew();
+        let target = LoroDoc::new_auto_commit();
+        target.import(&base.export(ExportMode::Snapshot).unwrap()).unwrap();
+        target.set_peer_id(10).unwrap();
+        let undo = UndoManager::new(&target);
+        target.get_map("map").insert("local-key", 10).unwrap();
+        target.get_text("text").insert_unicode(0, "L").unwrap();
+        target.commit_then_renew();
+        let local_frontiers = target.state_frontiers();
+        let local_vv = target.oplog_vv();
+        let remote = target.fork();
+        remote.set_peer_id(20).unwrap();
+        remote.get_map("map").insert("key", 20).unwrap();
+        remote.get_text("text").insert_unicode(0, "R").unwrap();
+        remote.commit_then_renew();
+        target.import(&remote.export(ExportMode::updates(&local_vv)).unwrap()).unwrap();
+        assert_eq!(target.get_text("text").to_string(), "RLX");
+        let events = Arc::new(AtomicUsize::new(0));
+        let event_count = events.clone();
+        let _events = target.subscribe_root(Arc::new(move |_| {
+            event_count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let updates = Arc::new(AtomicUsize::new(0));
+        let update_count = updates.clone();
+        let _updates = target.subscribe_local_update(Box::new(move |_| {
+            update_count.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let old_state = target.get_deep_value();
+        let old_vv = target.oplog_vv();
+        let old_frontiers = target.state_frontiers();
+        let old_undo_count = undo.undo_count();
+        let old_redo_count = undo.redo_count();
+        let was_recording = target.state.lock().is_recording();
+        assert_eq!(old_undo_count, 1);
+        let store = target.oplog.lock().change_store().clone();
+        let block_id = ID::new(1, 0);
+        let original = store.external_kv.lock().get(&block_id.to_bytes()).unwrap();
+        let header = decode_cids(&original, None).unwrap();
+        assert!(header.keys.get().unwrap().contains(&"local-key".into()));
+        assert!(header.cids.get().unwrap().contains(
+            &ContainerID::new_root("map", ContainerType::Map),
+        ));
+        let mut encoded: EncodedBlock = postcard::from_bytes(&original).unwrap();
+        encoded.change_meta = Cow::Owned(vec![0x80]);
+        let corrupt = postcard::to_allocvec(&encoded).unwrap();
+        store.external_kv.lock().set(&block_id.to_bytes(), corrupt.into());
+        store.inner.lock().mem_parsed_kv.remove(&block_id);
+        let old_bytes = store.external_kv.lock().export_all();
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| undo.undo()));
+        assert!(result.is_ok(), "corrupt map undo must return an error, not panic");
+        assert!(result.unwrap().is_err());
+        assert_eq!(target.get_deep_value(), old_state);
+        assert_eq!(target.oplog_vv(), old_vv);
+        assert_eq!(target.state_vv(), old_vv);
+        assert_eq!(target.state_frontiers(), old_frontiers);
+        assert!(!target.is_detached());
+        assert_eq!(target.state.lock().is_recording(), was_recording);
+        assert_eq!(undo.undo_count(), old_undo_count);
+        assert_eq!(undo.redo_count(), old_redo_count);
+        assert_eq!(store.external_kv.lock().export_all(), old_bytes);
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        assert_eq!(updates.load(Ordering::SeqCst), 0);
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            target.diff(&local_frontiers, &base.oplog_frontiers())
+        }));
+        assert!(result.is_ok(), "corrupt version diff must not panic while restoring state");
+        assert!(result.unwrap().is_err());
+        assert_eq!(target.get_deep_value(), old_state);
+        assert_eq!(target.oplog_vv(), old_vv);
+        assert_eq!(target.state_frontiers(), old_frontiers);
+        assert_eq!(target.state.lock().is_recording(), was_recording);
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        assert_eq!(updates.load(Ordering::SeqCst), 0);
+
+        // Restoring the bytes leaves the recorded flag set. Private undo must use actual scan
+        // results, and the restored popped row must still carry the later remote text delta.
+        store.external_kv.lock().set(&block_id.to_bytes(), original);
+        assert!(store.check_history_parsable().is_err());
+        assert!(undo.undo().unwrap());
+        assert_eq!(target.get_map("map").get("local-key"), Some(0.into()));
+        assert_eq!(target.get_text("text").to_string(), "RX");
+        assert_eq!(target.get_map("map").get("key"), Some(20.into()));
+        target.get_map("map").insert("next", 1).unwrap();
+        target.commit_then_renew();
+        assert!(undo.can_undo(), "undo failure must clear processing_undo");
+        drop(undo);
+        let text_undo = UndoManager::new(&target);
+        let text = target.get_text("text");
+        text.insert_unicode(0, "safe").unwrap();
+        target.commit_then_renew();
+        assert!(text_undo.undo().unwrap(), "a stale flag must not reject intact text undo");
+        assert_eq!(text.to_string(), "RX");
+    }
+
+    #[test]
     fn tree_move_payload_is_rejected_without_panic() {
         let arena = SharedArena::new();
         let value_arena = ValueDecodeArena {

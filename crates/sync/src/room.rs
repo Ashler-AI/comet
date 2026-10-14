@@ -1503,7 +1503,11 @@ impl Session {
                             let expected = self.doc.get_map("meta").get("chatId").and_then(|value| value.get_deep_value().to_json_value().as_str().map(str::to_owned));
                             if let Err(error) = self.doc.adopt_snapshot_scoped(&bytes, expected.as_deref(),self.scope_generation) {
                                 if self.doc.scope_generation() != self.scope_generation { return Err(SyncError::Closed); }
-                                self.doc.fail_recovery(error.to_string());
+                                if self.room_id.starts_with("ws4/") {
+                                    self.doc.reject_workspace_snapshot(error.to_string());
+                                } else {
+                                    self.doc.fail_recovery(error.to_string());
+                                }
                                 return Err(SyncError::Loro(error.to_string()));
                             }
                             self.pending.clear();
