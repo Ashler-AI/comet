@@ -12,6 +12,25 @@ failures remain fatal; no conflicting record is discarded or falsely acknowledge
 Successful snapshot adoption clears the diagnostic. Divergent installed stores
 still require data-preserving reconciliation of genuine competing user edits.
 
+## Unreleased: bounded concurrent map history
+
+Concurrent map import and historical diff resolve only changed keys instead of
+materializing every retained change into a global map-history cache. Encoded
+container/key metadata selects blocks; one disposable arena decodes each relevant
+block. Native Loro and the pinned `1.16.4+crew.3` Worker runtime preserve causal
+visibility, shallow seeds, tombstones and equal-value winner identity.
+
+Decode failures propagate through existing import rollback. Temporary Undo/diff
+checkouts preflight map history; failed Undo retains its original remote rebase
+row, and local map rollback restores first-before winners without rereading history.
+No public API, encoding, ownership rule or accepted-history boundary changes.
+
+The captured 31-update server replay stayed at **32.06 MiB** during imports;
+real SessionRoom admission, duplicate delivery and cold replay used **54.75 MiB**.
+State/VV/frontier/floor, lossless folds and offline convergence passed. The public
+wide-vector and concurrent-map fixtures retain the **112 MiB** WASM guard.
+This source change does not patch or restart existing clients.
+
 ## Crew 0.1.156: staging desktop release
 
 Crew Staging desktop **0.1.156** is available through **Settings → Crew update**

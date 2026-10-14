@@ -267,7 +267,7 @@ impl OpLog {
             if change.ops.iter().any(|op| {
                 matches!(
                     op.container.get_type(),
-                    ContainerType::List | ContainerType::Tree
+                    ContainerType::Map | ContainerType::List | ContainerType::Tree
                 )
             }) {
                 ans.needs_state_apply_rollback = true;
@@ -276,9 +276,8 @@ impl OpLog {
 
         // Any newly applied change can unlock pending changes whose ops are not
         // visible in `changes`, so include pending in the rollback decision.
-        // Keep this narrow: text/map-only pending changes cannot return a
-        // state-apply error, and forcing rollback there adds lock traffic to
-        // small sync/import workloads.
+        // Map winner scans can also report corrupt history before state apply. Pending maps
+        // therefore need the same rollback protection as list/tree state-apply failures.
         if ans.applies_to_dag && pending_needs_state_apply_rollback {
             ans.needs_state_apply_rollback = true;
         }

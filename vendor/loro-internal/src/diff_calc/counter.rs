@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use loro_common::{ContainerID, ID};
+use loro_common::{ContainerID, LoroResult, ID};
 
 use crate::{container::idx::ContainerIdx, event::InternalDiff, OpLog};
 
@@ -43,7 +43,7 @@ impl DiffCalculatorTrait for CounterDiffCalculator {
         _oplog: &OpLog,
         info: DiffCalcVersionInfo,
         _on_new_container: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode) {
+    ) -> LoroResult<(InternalDiff, DiffMode)> {
         let mut diff = 0.;
         let (b, a) = info.from_vv.diff_iter(info.to_vv);
 
@@ -58,6 +58,6 @@ impl DiffCalculatorTrait for CounterDiffCalculator {
             }
         }
 
-        (InternalDiff::Counter(diff), DiffMode::Linear)
+        Ok((InternalDiff::Counter(diff), DiffMode::Linear))
     }
 }
