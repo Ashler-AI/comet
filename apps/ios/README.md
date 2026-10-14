@@ -131,14 +131,37 @@ The native mobile ABI replay imported every accepted record at **168.09 MiB**
 sampled peak; replay plus snapshot export used **191.44 MiB**. Independent
 readback matched complete state, version vectors, retained floor/frontiers,
 **618,202 operations / 37,163 changes**, and cold reopen. These are native-probe
-measurements, not whole-app iOS peak measurements. Build 35 is a candidate, not a
-TestFlight publication; the published build remains 34.
+measurements, not whole-app iOS peak measurements.
 
 CI also runs `node scripts/mobile-loro-import-smoke.mjs PACKAGES_DIRECTORY` against
 a deterministic public wide-history fixture. It calls the actual mobile UniFFI
 import/export ABI, enforces a 256 MiB native budget (with a 768 MiB safety stop),
 and compares visible state, materialization, retained history/floor, and cold reopen. Its host-native result
 is included in `provenance.json`; no private workspace data enters CI.
+
+[PR #107](https://github.com/Ashler-AI/comet/pull/107) merged as
+`1aa4d095d10379501a45397af11885d7fa632368`. Its main-source
+[mobile run 38513191196](https://github.com/Ashler-AI/comet/actions/runs/38513191196)
+passed all **32** simulator markers, real mobile/native/Edge transport, and device
+archiving. All **10** downloaded artifact checksums matched; runtime provenance
+records the unchanged Swift ABI and both rebuilt iOS library hashes.
+
+The exact merged simulator app loaded the same accepted corpus with **256.7M**
+peak / **238.6M** current physical footprint, as reported by macOS `sample`,
+instead of build 34's **12.6G**. The connecting spinner cleared, a new 570-byte
+catalog update appeared in the list, and that session remained visible after an
+offline warm restart. This is isolated simulator evidence, not physical-phone or
+hosted staging acceptance.
+
+Xcode accepted one **internal-only** build 35 upload on **2026-10-14**. The exact
+uploaded IPA passed strict deep signature verification with bundle
+`ai.ashler.crew.staging`, version **1.0 (35)**, team `825LYXGJR6`, and matching
+production APNs signature/profile. Uploaded IPA SHA-256:
+`0aa714a2af6e5b544f7aabdcfef5a274383a5870ee670974db9b02c8e511182d`.
+Apple processing / Testing availability has not yet been read back because the
+web session requires fresh interactive sign-in; the last verified Testing build
+is 34. Production, tester memberships and customer caches are unchanged.
+
 
 ### Crew Staging 1.0 (34): liveness crash and warm-load release
 
