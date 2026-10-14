@@ -157,6 +157,8 @@ fn new_message_id() -> String {
 /// `SessionStarted`.
 pub(crate) struct Normalizer {
     saw_init: bool,
+    /// Local slash commands return assistant text without streaming deltas.
+    streamed_text: bool,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -168,6 +170,7 @@ impl Normalizer {
     pub fn new() -> Self {
         Self {
             saw_init: false,
+            streamed_text: false,
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -210,9 +213,10 @@ impl Normalizer {
                     return Vec::new();
                 }
                 match f.event.delta.kind.as_str() {
-                    "text_delta" => vec![AgentEvent::TextDelta {
-                        text: f.event.delta.text,
-                    }],
+                    "text_delta" => {
+                        self.streamed_text |= !f.event.delta.text.is_empty();
+                        vec![AgentEvent::TextDelta { text: f.event.delta.text }]
+                    }
                     "thinking_delta" => vec![AgentEvent::ReasoningDelta {
                         text: f.event.delta.thinking,
                     }],
@@ -232,13 +236,19 @@ impl Normalizer {
                 if f.parent_tool_use_id.is_some() {
                     return Vec::new();
                 }
+                let streamed_text = std::mem::take(&mut self.streamed_text);
                 let mut out: Vec<AgentEvent> = f
                     .message
                     .blocks()
-                    .filter(|b: &ContentBlock| b.kind == "tool_use")
-                    .map(|b| AgentEvent::ToolCall {
-                        id: b.id.clone(),
-                        call: decode_tool_use(&b.name, &b.input),
+                    .filter_map(|b: ContentBlock| match b.kind.as_str() {
+                        "text" if !streamed_text && !b.text.is_empty() => {
+                            Some(AgentEvent::TextDelta { text: b.text })
+                        }
+                        "tool_use" => Some(AgentEvent::ToolCall {
+                            id: b.id,
+                            call: decode_tool_use(&b.name, &b.input),
+                        }),
+                        _ => None,
                     })
                     .collect();
                 // A failed turn (usage limit, billing, auth, overloaded, …)
@@ -289,6 +299,7 @@ impl Normalizer {
             }
 
             Frame::Result(f) => {
+                self.streamed_text = false;
                 if let Some(id) = &f.session_id {
                     self.session_id = Some(id.clone());
                 }
@@ -414,6 +425,22 @@ mod tests {
             decode_tool_use("Mystery", &json!({})),
             ToolCall::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn local_command_output_is_visible_without_duplicating_streamed_text() {
+        let mut normalizer = Normalizer::new();
+        let mut normalize = |raw| {
+            normalizer.normalize(crate::claude::wire::parse_frame(raw).unwrap(), false)
+        };
+        let streamed = normalize(r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}"#);
+        assert_eq!(streamed, vec![AgentEvent::TextDelta { text: "Hello".into() }]);
+        let complete = normalize(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}"#);
+        assert!(matches!(complete.as_slice(), [AgentEvent::AssistantMessageCompleted { .. }]));
+        let command = normalize(r###"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"## Context Usage"}]}}"###);
+        assert!(matches!(command.as_slice(), [
+            AgentEvent::TextDelta { text }, AgentEvent::AssistantMessageCompleted { .. }
+        ] if text == "## Context Usage"));
     }
 
     fn result_done(raw: &str) -> AgentEvent {

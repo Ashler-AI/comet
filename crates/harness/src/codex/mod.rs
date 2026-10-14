@@ -24,6 +24,7 @@
 //!   always ends with `Done { status: Interrupted }`.
 
 mod catalog;
+mod commands;
 mod normalize;
 mod rpc;
 
@@ -225,6 +226,10 @@ impl Harness for CodexHarness {
         Ok(static_models())
     }
 
+    async fn commands(&self, cwd: &str) -> Result<Vec<comet_proto::HarnessCommand>, HarnessError> {
+        commands::discover(self, cwd).await
+    }
+
     async fn run(
         &self,
         mut request: RunRequest,
@@ -424,8 +429,25 @@ async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEven
 }
 
 /// `turn/start` and return the new turn id from the response.
-async fn start_turn(client: &RpcClient, params: Value) -> Result<String, HarnessError> {
-    let started = client.request("turn/start", params).await?;
+async fn start_turn(client: &RpcClient, mut params: Value) -> Result<String, HarnessError> {
+    let text = params["input"][0]["text"].as_str().unwrap_or_default();
+    let started = if let Some(target) = commands::review_target(text) {
+        client
+            .request("review/start", json!({
+                "threadId": params["threadId"],
+                "delivery": "inline",
+                "target": target,
+            }))
+            .await?
+    } else {
+        params["input"] = commands::input(
+            client,
+            params["cwd"].as_str().unwrap_or_default(),
+            text,
+        )
+        .await?;
+        client.request("turn/start", params).await?
+    };
     Ok(started["turn"]["id"].as_str().unwrap_or("").to_owned())
 }
 
@@ -495,20 +517,7 @@ async fn run_session(session: Session) {
 
     // ---- handshake + thread + first turn (interruptible) ------------------
     let setup = async {
-        client
-            .request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "comet-native",
-                        "title": "Crew",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": { "experimentalApi": true },
-                }),
-            )
-            .await?;
-        client.notify("initialized", None);
+        commands::initialize(&client).await?;
 
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
@@ -583,6 +592,9 @@ async fn run_session(session: Session) {
     let turn_params = |text: &str| -> Value {
         let mut p = serde_json::Map::new();
         p.insert("threadId".into(), Value::String(thread_id.clone()));
+        if !request.cwd.is_empty() {
+            p.insert("cwd".into(), Value::String(request.cwd.clone()));
+        }
         p.insert("input".into(), json!([{ "type": "text", "text": text }]));
         p.insert("approvalPolicy".into(), approval_policy.clone());
         p.insert("approvalsReviewer".into(), "user".into());
@@ -866,10 +878,26 @@ async fn run_session(session: Session) {
                 Some(msg) => {
                     let text = msg.prompt;
                     if let Some(expected) = router.active.clone() {
+                        // Reviews are native turns, never active-turn text injections.
+                        if commands::review_target(&text).is_some() {
+                            queued_steers.push_back(text);
+                            continue 'main;
+                        }
+                        let input = match commands::input(&client, &request.cwd, &text).await {
+                            Ok(input) => input,
+                            Err(error) => {
+                                if !send(&event_tx, AgentEvent::Error {
+                                    message: error.to_string(),
+                                }).await {
+                                    break 'main;
+                                }
+                                continue 'main;
+                            }
+                        };
                         let steer_params = json!({
                             "threadId": thread_id,
                             "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
+                            "input": input,
                         });
                         match client.request("turn/steer", steer_params).await {
                             Ok(_) => {

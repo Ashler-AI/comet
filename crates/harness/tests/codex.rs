@@ -89,6 +89,110 @@ async fn run_to_end(
 }
 
 #[tokio::test]
+async fn commands_respect_project_context_and_disabled_skills() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(".codex-command-project"), "").unwrap();
+    let user_commands = harness()
+        .commands(user.path().to_str().unwrap())
+        .await
+        .expect("user commands");
+    assert_eq!(
+        user_commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>(),
+        vec!["crew-check", "review"],
+    );
+    let project_commands = harness()
+        .commands(project.path().to_str().unwrap())
+        .await
+        .expect("project commands");
+    assert_eq!(
+        project_commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>(),
+        vec!["crew-check", "project-check", "review"],
+    );
+    assert_eq!(project_commands[1].description, "Project skill");
+    assert_eq!(project_commands[1].source.as_deref(), Some("skill"));
+}
+
+#[tokio::test]
+async fn selected_skill_loads_natively_and_preserves_safety_input() {
+    let (controls, _steer, _token) = controls("Continue");
+    let events = run_to_end(&harness(), request("/crew-check Check the project"), controls).await;
+    assert!(matches!(events.last(), Some(AgentEvent::Done {
+        status: DoneStatus::Completed, ..
+    })), "{events:?}");
+}
+
+#[tokio::test]
+async fn selected_project_skill_can_steer_an_active_turn() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(".codex-command-project"), "").unwrap();
+    for (scenario, turns) in [("scenario:skill-steer", 1), ("scenario:skill-steer-race", 2)] {
+        let (controls, steer, _token) = controls("Continue");
+        steer
+            .send(SteerMessage {
+                prompt: "/project-check Check changes".into(),
+                message_id: None,
+            })
+            .await
+            .unwrap();
+        let mut req = request(scenario);
+        req.cwd = project.path().display().to_string();
+        let events = run_to_end(&harness(), req, controls).await;
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::Steered { .. })), "{events:?}");
+        assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::Done {
+            status: DoneStatus::Completed, ..
+        })).count(), turns, "{events:?}");
+    }
+}
+
+#[tokio::test]
+async fn review_runs_as_a_native_review_turn() {
+    let (controls, _steer, _token) = controls("Continue");
+    let events = run_to_end(&harness(), request("/review"), controls).await;
+    assert!(matches!(events.last(), Some(AgentEvent::Done {
+        status: DoneStatus::Completed, ..
+    })), "{events:?}");
+}
+
+#[tokio::test]
+async fn ordinary_slash_prefixed_text_is_not_rewritten_as_a_command() {
+    for prompt in ["/tmp/crew-file", "/reviewer", "/disabled-check", "/not-installed"] {
+        let (controls, _steer, _token) = controls("Continue");
+        let events = run_to_end(&harness(), request(prompt), controls).await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done {
+            status: DoneStatus::Completed, ..
+        })), "{events:?}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn discovery_errors_and_timeouts_reap_the_child() {
+    for (marker, expected) in [
+        (".codex-command-error", "skill discovery failed"),
+        (".codex-command-hang", "timed out"),
+    ] {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join(marker), "").unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            harness().commands(cwd.path().to_str().unwrap()),
+        )
+        .await
+        .expect("discovery is bounded")
+        .expect_err("discovery fails");
+        assert!(error.to_string().contains(expected), "{error}");
+        let pid: i32 = std::fs::read_to_string(cwd.path().join(".codex-command-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero observes process existence without sending a signal.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "discovery child remains alive");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+}
+
+#[tokio::test]
 async fn omitted_model_and_effort_use_released_sol_high() {
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:sol-default");

@@ -14,6 +14,32 @@ fail_turn() { # $1 = request id, $2 = message
   emit "{\"method\":\"turn/failed\",\"params\":{\"turn\":{\"id\":\"t-bad\",\"error\":{\"message\":\"$2\"}}}}"
 }
 
+skills_response() {
+  if test -f .codex-command-hang; then
+    printf '%s' "$$" > .codex-command-pid
+    exec sleep 30
+  fi
+  if test -f .codex-command-error; then
+    printf '%s' "$$" > .codex-command-pid
+    emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32603,\"message\":\"skill discovery failed\"}}"
+    return
+  fi
+  project=''
+  if test -f .codex-command-project; then
+    project=',{"name":"project-check","description":"Project skill","enabled":true,"path":"/native/project-check/SKILL.md","scope":"repo"}'
+  fi
+  emit "{\"id\":$(rid "$line"),\"result\":{\"data\":[{\"cwd\":\"$PWD\",\"errors\":[],\"skills\":[{\"name\":\"crew-check\",\"description\":\"User skill\",\"enabled\":true,\"path\":\"/native/crew-check/SKILL.md\",\"scope\":\"user\"},{\"name\":\"disabled-check\",\"description\":\"Disabled\",\"enabled\":false,\"path\":\"/native/disabled/SKILL.md\",\"scope\":\"user\"}$project] }]}}"
+}
+
+read_input() {
+  read -r line || exit 1
+  while has "$line" '"method":"skills/list"'; do
+    has "$line" '"forceReload":true' || exit 1
+    skills_response
+    read -r line || exit 1
+  done
+}
+
 # ---- handshake -------------------------------------------------------------
 read -r line || exit 1 # initialize
 has "$line" '"method":"initialize"' || exit 1
@@ -25,7 +51,7 @@ read -r line || exit 1 # initialized notification (no reply)
 has "$line" '"method":"initialized"' || exit 1
 
 # ---- thread start / resume -------------------------------------------------
-read -r line || exit 1
+read_input
 thread_line="$line"
 if has "$line" '"method":"thread/resume"'; then
   if has "$line" '"threadId":"resume-fail"'; then
@@ -44,10 +70,61 @@ else
 fi
 
 # ---- first turn ------------------------------------------------------------
-read -r turnline || exit 1
+read_input
+turnline="$line"
 tid=$(rid "$turnline")
 
 case "$turnline" in
+
+*'"text":"/tmp/crew-file"'*|*'"text":"/reviewer"'*|*'"text":"/disabled-check"'*|*'"text":"/not-installed"'*)
+  has "$turnline" '"method":"turn/start"' || { fail_turn "$tid" "literal slash text changed operation"; exit 0; }
+  has "$turnline" '"type":"skill"' && { fail_turn "$tid" "literal slash text became skill input"; exit 0; }
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-literal\"}}}"
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-literal"}}}'
+  ;;
+
+*'"method":"review/start"'*)
+  for want in '"delivery":"inline"' '"threadId":"th-1"' '"type":"uncommittedChanges"'; do
+    has "$turnline" "$want" || { fail_turn "$tid" "invalid native review target"; exit 0; }
+  done
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-review\"},\"reviewThreadId\":\"th-1\"}}"
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-review"}}}'
+  ;;
+
+*'"type":"skill"'*)
+  for want in '"method":"turn/start"' '"name":"crew-check"' '"path":"/native/crew-check/SKILL.md"' '"text":"Check the project"'; do
+    has "$turnline" "$want" || { fail_turn "$tid" "invalid native skill input"; exit 0; }
+  done
+  has "$turnline" '/crew-check ' && { fail_turn "$tid" "unexpanded slash command"; exit 0; }
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-skill\"}}}"
+  emit '{"id":301,"method":"item/tool/requestUserInput","params":{"questions":[{"id":"skill-safety","header":"Safety check","question":"Load skill?","options":[{"label":"Continue"},{"label":"Cancel"}]}]}}'
+  read -r answer || exit 1
+  has "$answer" '"skill-safety":{"answers":["Continue"]}' || { fail_turn "$tid" "skill safety check missing"; exit 0; }
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-skill"}}}'
+  ;;
+
+*scenario:skill-steer*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  read_input
+  sid=$(rid "$line")
+  for want in '"method":"turn/steer"' '"expectedTurnId":"t-1"' '"type":"skill"' '"name":"project-check"' '"path":"/native/project-check/SKILL.md"' '"text":"Check changes"'; do
+    has "$line" "$want" || { fail_turn "$sid" "invalid native skill steer"; exit 0; }
+  done
+  if has "$turnline" 'scenario:skill-steer-race'; then
+    emit "{\"id\":$sid,\"error\":{\"code\":-32602,\"message\":\"turn already completed\"}}"
+    emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+    read_input
+    sid=$(rid "$line")
+    for want in '"method":"turn/start"' '"type":"skill"' '"name":"project-check"' '"path":"/native/project-check/SKILL.md"' '"text":"Check changes"'; do
+      has "$line" "$want" || { fail_turn "$sid" "invalid fallback skill turn"; exit 0; }
+    done
+    emit "{\"id\":$sid,\"result\":{\"turn\":{\"id\":\"t-2\"}}}"
+    emit '{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}'
+  else
+    emit "{\"id\":$sid,\"result\":{}}"
+    emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  fi
+  ;;
 
 *scenario:sol-default*)
   has "$thread_line" '"model":"gpt-6-sol"' ||

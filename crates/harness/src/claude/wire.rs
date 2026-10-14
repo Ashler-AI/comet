@@ -7,6 +7,19 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// `initialize.response.commands`: the CLI's non-interactive command catalog.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CommandMetadata {
+    pub name: String,
+    pub description: String,
+    #[serde(rename = "argumentHint", default)]
+    pub input_hint: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
 /// One parsed stdout line.
 #[derive(Debug)]
 pub(crate) enum Frame {
@@ -95,6 +108,8 @@ impl MessageBody {
 pub(crate) struct ContentBlock {
     #[serde(rename = "type", default)]
     pub kind: String,
+    #[serde(default)]
+    pub text: String,
     #[serde(default)]
     pub id: String,
     #[serde(default)]

@@ -30,8 +30,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessCommand, HarnessId, Model, ReasoningLevel, RunRequest,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -151,7 +151,7 @@ impl ClaudeHarness {
         })
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    fn stream_command(&self, exe: &PathBuf, cwd: &str) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
         cmd.args([
@@ -167,6 +167,18 @@ impl ClaudeHarness {
             "--permission-prompt-tool",
             "stdio",
         ]);
+        if !cwd.is_empty() {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
+    }
+
+    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+        let mut cmd = self.stream_command(exe, &request.cwd);
         // The 1M context window is selected via a model-id suffix
         // (`sonnet[1m]`), exactly how the CLI itself does it; fast mode and
         // always-on thinking are settings overrides.
@@ -208,13 +220,6 @@ impl ClaudeHarness {
             cmd.arg("--settings");
             cmd.arg(Value::Object(settings).to_string());
         }
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
         cmd
     }
 }
@@ -249,6 +254,101 @@ impl Harness for ClaudeHarness {
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
         Ok(static_models())
+    }
+
+    async fn commands(&self, cwd: &str) -> Result<Vec<HarnessCommand>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        // No user turn: initialize returns the CLI's headless command catalog.
+        // Unlike a run, discovery must not bypass permissions or execute hooks.
+        let mut child = self
+            .stream_command(&exe, cwd)
+            .args([
+                "--no-session-persistence",
+                "--permission-mode",
+                "dontAsk",
+                "--settings",
+                r#"{"disableAllHooks":true}"#,
+            ])
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    HarnessError::NotInstalled(exe.display().to_string())
+                } else {
+                    HarnessError::Io(error)
+                }
+            })?;
+        let stderr_tail = crate::StderrTail::default();
+        let stderr = child.stderr.take();
+        let tail = stderr_tail.clone();
+        let stderr_task = tokio::spawn(async move {
+            if let Some(stderr) = stderr {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tail.push(&line);
+                }
+            }
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                HarnessError::Protocol("claude discovery child has no stdin".into())
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                HarnessError::Protocol("claude discovery child has no stdout".into())
+            })?;
+            stdin.write_all(b"{\"type\":\"control_request\",\"request_id\":\"comet-commands\",\"request\":{\"subtype\":\"initialize\"}}\n").await?;
+            stdin.flush().await?;
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await? {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let frame: Value = serde_json::from_str(&line)
+                    .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+                if frame["type"] == "control_request" {
+                    let denial = serde_json::json!({"type": "control_response", "response": {
+                        "subtype": "error", "request_id": frame["request_id"],
+                        "error": "Command discovery cannot approve requests",
+                    }}).to_string();
+                    stdin.write_all(denial.as_bytes()).await?;
+                    stdin.write_all(b"\n").await?;
+                    stdin.flush().await?;
+                    return Err(HarnessError::Protocol(
+                        "Claude command discovery requested approval".into(),
+                    ));
+                }
+                if frame["type"] != "control_response"
+                    || frame["response"]["request_id"] != "comet-commands"
+                {
+                    continue;
+                }
+                let response = &frame["response"];
+                if response["subtype"] != "success" {
+                    return Err(HarnessError::Protocol(
+                        response["error"].as_str().unwrap_or("Claude command discovery failed").into(),
+                    ));
+                }
+                let commands: Vec<wire::CommandMetadata> =
+                    serde_json::from_value(response["response"]["commands"].clone())
+                        .map_err(|error| HarnessError::Protocol(format!("Invalid Claude command catalog: {error}")))?;
+                return Ok(commands.into_iter().map(|command| HarnessCommand {
+                    name: command.name,
+                    description: command.description,
+                    input_hint: command.input_hint.filter(|hint| !hint.is_empty()),
+                    aliases: command.aliases,
+                    subcommands: Vec::new(),
+                    source: command.source,
+                }).collect());
+            }
+            Err(HarnessError::Protocol(format!(
+                "Claude command discovery closed without a response: {}",
+                crate::crash_message("claude", child.try_wait().ok().flatten(), &stderr_tail),
+            )))
+        }).await.unwrap_or_else(|_| Err(HarnessError::Protocol(
+            "Claude command discovery timed out".into(),
+        )));
+        shutdown_child(&mut child, self.kill_grace).await;
+        stderr_task.abort();
+        result
     }
 
     async fn run(

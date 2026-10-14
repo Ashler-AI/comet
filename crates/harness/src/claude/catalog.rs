@@ -11,13 +11,12 @@
 
 use comet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
-/// The ultrathink directive rides every user message as a prompt prefix — that
-/// is how the mode actually works in Claude Code (a prompt convention, not an
-/// effort flag). Applied to the initial prompt AND every steer.
+/// Prefix normal prompts and steers, but leave slash commands verbatim so the
+/// CLI can dispatch them natively instead of treating them as model text.
 pub(crate) const ULTRATHINK_PREFIX: &str = "Ultrathink:\n";
 
 pub(crate) fn apply_ultrathink(reasoning: Option<ReasoningLevel>, text: &str) -> String {
-    if reasoning == Some(ReasoningLevel::Ultrathink) {
+    if reasoning == Some(ReasoningLevel::Ultrathink) && !text.trim_start().starts_with('/') {
         format!("{ULTRATHINK_PREFIX}{text}")
     } else {
         text.to_owned()
@@ -291,5 +290,11 @@ mod tests {
             apply_ultrathink(Some(ReasoningLevel::Max), "do it"),
             "do it"
         );
+        for command in ["/context", "  /plugin:review changes", "/skill\narguments"] {
+            assert_eq!(
+                apply_ultrathink(Some(ReasoningLevel::Ultrathink), command),
+                command,
+            );
+        }
     }
 }
