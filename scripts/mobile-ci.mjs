@@ -20,7 +20,7 @@ const work = path.join(process.env.RUNNER_TEMP, "crew-mobile");
 for (const directory of [logs, release, work]) mkdirSync(directory, { recursive: true });
 const environment = process.env.CREW_MOBILE_ENVIRONMENT ?? "staging";
 const profiles = {
-  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "34", suffix: "-Staging", name: "Crew-Staging" },
+  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "35", suffix: "-Staging", name: "Crew-Staging" },
   production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "21", suffix: "", name: "Crew" },
 };
 if (!Object.hasOwn(profiles, environment)) throw new Error(`Unsupported mobile environment: ${environment}`);
@@ -136,7 +136,6 @@ async function verifySimulator(app) {
   run("cargo", ["build", "--locked", "-p", "comet", "--bin", "comet"], {
     timeout: 2_400_000, log: "native-build.log", env: { ...process.env, CARGO_BUILD_JOBS: "2" },
   });
-  run("npm", ["ci", "--prefix", "edge"], { timeout: 300_000, log: "edge-install.log" });
   simulator = run("xcrun", ["simctl", "create", `Crew CI ${process.env.GITHUB_RUN_ID}`, deviceType, runtime.identifier]);
   run("xcrun", ["simctl", "boot", simulator]);
   run("xcrun", ["simctl", "bootstatus", simulator, "-b"], { timeout: 300_000, log: "simulator.log" });
@@ -253,6 +252,16 @@ try {
   const sdk = run("xcrun", ["--sdk", "iphoneos", "--show-sdk-version"]);
   if (!/^26(?:\.|$)/.test(sdk)) throw new Error(`Expected iOS 26 SDK: ${sdk}`);
   console.log(`${process.env.DEVELOPER_DIR}\n${xcode}\niOS SDK ${sdk}`);
+  run("npm", ["ci", "--prefix", "edge"], { timeout: 300_000, log: "edge-install.log" });
+  run("node", ["scripts/build-mobile-loro-runtime.mjs", path.join(work, "packages"), scheme], {
+    timeout: 1_200_000, log: "mobile-loro-runtime.log",
+  });
+  process.env.LOCAL_BUILD = "1";
+  const nativeImportSmoke = JSON.parse(run("node", ["scripts/mobile-loro-import-smoke.mjs", path.join(work, "packages")], {
+    timeout: 1_200_000,
+  }));
+  writeFileSync(path.join(logs, "mobile-loro-import-smoke.json"), JSON.stringify(nativeImportSmoke, null, 2) + "\n");
+  copyFileSync(path.join(work, "packages/crew-mobile-loro-runtime.json"), path.join(release, "crew-mobile-loro-runtime.json"));
   const base = [
     "-project", project, "-scheme", scheme, "-jobs", "2",
     "-clonedSourcePackagesDirPath", path.join(work, "packages"),
@@ -309,6 +318,7 @@ try {
     simulator: { configuration: simulatorConfiguration, platform: simulatorInfo.DTPlatformName, ...regression },
     archive: { configuration: archiveConfiguration, path: path.basename(archive), signing: "ad-hoc; requires local Apple distribution re-sign/export", apsEnvironment: "production" },
     packageResolvedSha256: await sha256(lockfile),
+    nativeImportSmoke,
   }, null, 2)}\n`);
   const checksums = [];
   for (const name of readdirSync(release).sort()) checksums.push(`${await sha256(path.join(release, name))}  ${name}`);
