@@ -535,7 +535,10 @@ mod tests {
             settled.added_at = workspace.doc().session_ref("owner", REMOTE_CHAT).unwrap().unwrap().added_at
                 + chrono::Duration::milliseconds(1);
             remote_workspace.doc().upsert_session_ref("owner", &settled).unwrap();
-            remote_workspace.record_session(&stale);
+            // Simulate a stale workspace published by an older owner release.
+            let raw = remote_workspace.doc().doc();
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("sessions").get(REMOTE_CHAT) else { panic!("missing owner row") };
+            row.insert("status", "idle").unwrap(); row.insert("updatedAt", stale.updated_at.timestamp_millis()).unwrap(); raw.commit();
             let before = workspace.doc().doc().oplog_vv();
             workspace.doc().binding().import(&remote_workspace.doc().doc().export(loro::ExportMode::updates(&before)).unwrap()).unwrap();
             assert_eq!(workspace.doc().read_sessions().unwrap().iter()
