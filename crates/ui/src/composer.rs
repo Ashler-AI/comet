@@ -41,6 +41,7 @@ use comet_rpc::{RpcError, methods};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::{CheckoutPlan, Pickers, ResolvedRunConfig};
+use crate::popover::Loadable;
 use crate::state::{
     AppState, ChatStartupPhase, EngineHandle, Indicator, RetainedSend, ScaffoldControlTarget,
     ScaffoldReconnectError, latest_active_omp_goal,
@@ -4387,11 +4388,10 @@ impl Composer {
         let Some(token) = self.mention.token.as_ref() else {
             return;
         };
-        let catalog = self.pickers.read(cx).harness_commands(cx).to_vec();
-        self.mention.commands = matching_commands(&catalog, token);
+        self.mention.commands = matching_commands(self.pickers.read(cx).harness_commands(cx), token);
         let count = self.mention.commands.len() + self.mention.results.len();
         self.mention.active =
-            (count > 0).then_some(self.mention.active.unwrap_or(0).min(count - 1));
+            (count > 0).then(|| self.mention.active.unwrap_or(0).min(count - 1));
         if let Some(active) = self.mention.active {
             self.completion_scroll.scroll_to_item(active);
         }
@@ -4631,7 +4631,14 @@ impl Composer {
             .track_scroll(&self.completion_scroll)
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         let empty = self.mention.commands.is_empty() && self.mention.results.is_empty();
-        if self.mention.loading && empty {
+        let catalog = self.pickers.read(cx).harness_command_catalog(cx);
+        let loading = self.mention.loading || catalog.is_some_and(Loadable::is_loading);
+        let error = self
+            .mention
+            .error
+            .as_deref()
+            .or_else(|| catalog.and_then(Loadable::error));
+        if loading && empty {
             card = card.child(crate::popover::skeleton_rows(
                 "completion-loading",
                 theme,
@@ -4640,8 +4647,8 @@ impl Composer {
                 cx,
             ));
         } else if empty {
-            let message: SharedString = if let Some(error) = self.mention.error.clone() {
-                error
+            let message: SharedString = if let Some(error) = error {
+                error.to_owned().into()
             } else {
                 match (token.kind, token.query.is_empty()) {
                     (CompletionKind::Slash, true) => "No commands available".into(),
@@ -4659,7 +4666,7 @@ impl Composer {
                     .px(px(12.0))
                     .py(px(10.0))
                     .text_size(px(12.0))
-                    .text_color(if self.mention.error.is_some() {
+                    .text_color(if error.is_some() {
                         theme.danger_muted
                     } else {
                         theme.text_muted
@@ -8936,6 +8943,29 @@ mod tests {
             Some(CompletionKind::Slash)
         );
         assert!(mention_token("https://example.com", 8).is_none());
+    }
+
+    #[gpui::test]
+    fn empty_slash_catalog_clears_the_active_selection(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|cx| {
+            let mut state = AppState::new();
+            state.apply_chats(vec![serde_json::from_value(serde_json::json!({
+                "id": "chat", "deviceId": "local", "archived": false,
+                "createdAt": chrono::Utc::now(),
+                "config": {"harness": "codex", "model": null, "sandbox": "workspace-write"},
+            })).unwrap()]);
+            state.select_chat(Some("chat".into()), cx);
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            composer.mention.token = mention_token("/", 1);
+            composer.mention.active = Some(2);
+            composer.refresh_completion_commands(cx);
+            assert!(composer.mention.commands.is_empty());
+            assert_eq!(composer.mention.active, None);
+            assert!(composer.mention.token.is_some());
+        });
     }
 
     #[test]

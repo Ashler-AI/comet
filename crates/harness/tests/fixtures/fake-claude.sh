@@ -12,6 +12,48 @@ emit() { printf '%s\n' "$1"; }
 
 case "$first" in
 
+*'"subtype":"initialize"'*)
+  # A discovery session must never use the run path's approval bypass.
+  printf '%s\n' "$$" > claude-discovery-pid
+  for arg in "$@"; do
+    case "$arg" in
+      bypassPermissions|--dangerously-skip-permissions)
+        emit '{"type":"control_response","response":{"subtype":"error","request_id":"comet-commands","error":"discovery bypassed permissions"}}'
+        exit 1
+        ;;
+    esac
+  done
+  read -r mode < claude-discovery-mode || exit 1
+  case "$mode" in
+    closed)
+      printf '%s\n' 'catalog unavailable' >&2
+      exit 7
+      ;;
+    timeout) exec sleep 30 ;;
+    malformed)
+      emit '{"type":"control_response","response":{"subtype":"success","request_id":"comet-commands","response":{"commands":[{"name":42}]}}}'
+      ;;
+    error)
+      emit '{"type":"control_response","response":{"subtype":"error","request_id":"comet-commands","error":"disabled by policy"}}'
+      ;;
+    approval)
+      emit '{"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch unsafe"}}}'
+      read -r response || exit 1
+      case "$response" in
+        *'"behavior":"allow"'*) touch unsafe ;;
+      esac
+      ;;
+    catalog)
+      emit '{"type":"system","subtype":"status","status":"initializing"}'
+      emit '{"type":"control_response","response":{"subtype":"success","request_id":"unrelated","response":{}}}'
+      emit '{"type":"control_response","response":{"subtype":"success","request_id":"comet-commands","response":{"commands":[{"name":"plugin:review","description":"Review changes (plugin:review)","argumentHint":"<target>","aliases":["review"],"source":"plugin"},{"name":"local-skill","description":"Project skill (project)","argumentHint":""}]}}}'
+      ;;
+    *) exit 8 ;;
+  esac
+  # Leave the child alive: the harness must reap it on every return path.
+  exec sleep 30
+  ;;
+
 *scenario:happy*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash","Read"],"cwd":"/tmp","session_id":"sess-1"}'
   # Re-emitted init mid-run (background-task wakeup): must be deduped.

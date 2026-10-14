@@ -532,6 +532,24 @@ not migrate workspace/session sync, rename storage or services, change release
 channels, or deploy a new build. Protocol-fixture and isolated native-UI checks do
 not establish live-provider compatibility or a measured CPU/memory improvement.
 
+## Unreleased: slash commands across harnesses
+
+Composer `/` and `@` completion use the selected harness's native command catalog
+for the current repository and host. Claude Code discovers its non-interactive
+commands, skills, and plugin prompts without a model turn or startup hooks;
+local-command responses render even when the CLI sends no text deltas. Slash
+input stays intact in ultrathink mode.
+
+Codex discovers enabled native skills and offers `/review [instructions]` through
+the app-server's review operation. Skill selections use native skill inputs on
+initial turns and steering, preserving skill safety approvals. Disabled skills,
+deprecated custom prompts absent from the installed app-server, and unsupported
+TUI-only controls are not advertised; Codex `/compact` is not yet exposed.
+OMP, Prime Agent, and ACP agents retain their existing native catalogs.
+
+Loading and discovery failures no longer masquerade as empty command catalogs,
+and empty/no-match menus do not crash debug builds.
+
 ## Scaffold session web view
 
 `apps/web` provides the browser surface for one existing Crew/OMP session in a

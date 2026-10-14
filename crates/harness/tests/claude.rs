@@ -88,6 +88,71 @@ async fn run_to_end(
     .expect("run finished in time")
 }
 
+#[cfg(unix)]
+fn assert_discovery_child_reaped(directory: &std::path::Path) {
+    let pid: i32 = std::fs::read_to_string(directory.join("claude-discovery-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only checks whether the fixture process still exists.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child {pid} survived discovery");
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn commands_preserve_native_metadata_in_the_requested_directory_and_reap_child() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("claude-discovery-mode"), "catalog\n").unwrap();
+    let commands = harness()
+        .commands(directory.path().to_str().unwrap())
+        .await
+        .expect("native initialization catalog");
+    assert_eq!(commands, vec![
+        comet_proto::HarnessCommand {
+            name: "plugin:review".into(),
+            description: "Review changes (plugin:review)".into(),
+            input_hint: Some("<target>".into()),
+            aliases: vec!["review".into()],
+            subcommands: Vec::new(),
+            source: Some("plugin".into()),
+        },
+        comet_proto::HarnessCommand {
+            name: "local-skill".into(),
+            description: "Project skill (project)".into(),
+            input_hint: None,
+            aliases: Vec::new(),
+            subcommands: Vec::new(),
+            source: None,
+        },
+    ]);
+    assert_discovery_child_reaped(directory.path());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_discovery_surfaces_failures_and_reaps_child_without_approval() {
+    for (mode, expected) in [
+        ("malformed", "Invalid Claude command catalog"),
+        ("closed", "closed without a response"),
+        ("error", "disabled by policy"),
+        ("approval", "requested approval"),
+        ("timeout", "timed out"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("claude-discovery-mode"), format!("{mode}\n"))
+            .unwrap();
+        let error = harness()
+            .commands(directory.path().to_str().unwrap())
+            .await
+            .expect_err(mode);
+        assert!(matches!(&error, HarnessError::Protocol(message) if message.contains(expected)), "{mode}: {error}");
+        assert!(!directory.path().join("unsafe").exists());
+        assert_discovery_child_reaped(directory.path());
+    }
+}
+
 #[tokio::test]
 async fn opus_5_5_rejects_unsupported_configuration_before_launch() {
     let harness = ClaudeHarness::new().with_executable("/missing/claude");

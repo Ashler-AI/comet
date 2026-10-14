@@ -1247,6 +1247,11 @@ impl Pickers {
         }
     }
 
+    pub fn harness_command_catalog(&self, cx: &App) -> Option<&Loadable<Vec<HarnessCommand>>> {
+        let harness = self.effective_harness(cx)?;
+        self.commands.get(&self.command_catalog_key(harness, cx))
+    }
+
     pub fn harness_commands<'a>(&'a self, cx: &App) -> &'a [HarnessCommand] {
         let Some(harness) = self.effective_harness(cx) else {
             return &[];
