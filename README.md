@@ -2,6 +2,17 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: local startup authority retry
+
+Crew retries `503 remote_code_token_validation_failed` while acquiring Agent Auth
+authority, before starting the agent. Two retries wait 250 ms and one second,
+sharing the original 30-second request deadline. Credential/permission failures,
+other API errors and inference requests are not retried.
+
+The original durable command and message IDs remain unchanged. Cancellation
+interrupts backoff and in-flight requests; terminal command outcomes are never
+reopened, and an already-started agent is never replayed by this retry.
+
 ## Unreleased: Crew Staging mobile catalog loading
 
 Mobile build 33 recovers an `InvalidUpdate` upload reply through bounded
