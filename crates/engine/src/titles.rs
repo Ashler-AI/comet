@@ -5,12 +5,26 @@ use std::time::Duration;
 
 use comet_doc::{MessageRole, MessageStatus, SessionDoc};
 use comet_sync::DocsStore;
+use loro::ContainerTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{EngineError, scaffold::ScaffoldClient, workspace_host::WorkspaceHost};
 
 type Version = BTreeMap<String, u64>;
+
+enum DirectoryOutcome {
+    Done,
+    RetryAt(i64),
+    WaitingForSource(WorkspaceObservation),
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+struct WorkspaceObservation {
+    metadata: Version,
+    required: Version,
+    observed: Version,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -104,7 +118,12 @@ impl TitleGenerator {
         }
         let weak = Arc::downgrade(&self.inner);
         let mut changed = self.inner.store.watch_directory();
+        let (workspace_changed_tx, mut workspace_changed) = tokio::sync::watch::channel(());
+        let workspace_subscription = self.inner.workspace.doc().binding().subscribe_root(Arc::new(move |_| {
+            workspace_changed_tx.send_replace(());
+        }));
         tokio::spawn(async move {
+            let _workspace_subscription = workspace_subscription;
             // One bounded worker: at most one model call (below the max-two budget).
             // Persistent jobs coalesce every update by session and survive process loss.
             let mut after = String::new();
@@ -123,7 +142,7 @@ impl TitleGenerator {
                 for id in ids {
                     after.clone_from(&id);
                     if eligible(&inner.workspace, &id) {
-                        if let Err(error) = inner.store.queue_directory(&id, false) {
+                        if let Err(error) = inner.store.backfill_directory(&id) {
                             tracing::warn!(%error, "directory backfill enqueue failed");
                         }
                     }
@@ -131,8 +150,17 @@ impl TitleGenerator {
                 drop(inner);
                 tokio::task::yield_now().await;
             }
+            let mut workspace_pending = true;
             loop {
                 let Some(inner) = weak.upgrade() else { return };
+                // Also reconcile on restart: metadata may have converged while offline.
+                if workspace_pending || workspace_changed.has_changed().unwrap_or(false) {
+                    workspace_changed.borrow_and_update();
+                    workspace_pending = false;
+                    if let Err(error) = wake_workspace_sources(&inner) {
+                        tracing::warn!(%error, "directory workspace wake failed");
+                    }
+                }
                 // Observe before querying, so an enqueue racing an empty claim is not lost.
                 changed.borrow_and_update();
                 match inner.store.claim_directory() {
@@ -143,15 +171,21 @@ impl TitleGenerator {
                             tracing::warn!(session = %id, %error, "directory update retained for retry");
                         }
                         let acknowledgement = match result {
-                            Ok(Some(deadline)) => this
-                                .inner
-                                .store
-                                .defer_directory_title(&id, generation, deadline),
-                            result => {
-                                this.inner
-                                    .store
-                                    .settle_directory(&id, generation, result.is_ok())
+                            Ok(DirectoryOutcome::RetryAt(deadline)) => this.inner.store.defer_directory(&id, generation, deadline),
+                            Ok(DirectoryOutcome::WaitingForSource(observed)) => {
+                                match serde_json::to_string(&observed) {
+                                    Ok(observed) => this.inner.store.wait_directory_source(&id, generation, &observed).map(|retained| {
+                                        if retained {
+                                            tracing::warn!(session = %id, generation, "directory update retained awaiting synchronized source; timed retries suspended");
+                                        }
+                                    }),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "directory source-wait persistence failed");
+                                        this.inner.store.settle_directory(&id, generation, false)
+                                    }
+                                }
                             }
+                            result => this.inner.store.settle_directory(&id, generation, result.is_ok()),
                         };
                         if let Err(error) = acknowledgement {
                             tracing::warn!(%error, "directory acknowledgement persistence failed");
@@ -163,11 +197,13 @@ impl TitleGenerator {
                         match delay {
                             Some(delay) => tokio::select! {
                                 _ = tokio::time::sleep(delay) => {},
+                                _ = workspace_changed.changed() => { workspace_pending = true; },
                                 result = changed.changed() => { if result.is_err() { return; } },
                             },
                             None => {
-                                if changed.changed().await.is_err() {
-                                    return;
+                                tokio::select! {
+                                    result = changed.changed() => { if result.is_err() { return; } },
+                                    _ = workspace_changed.changed() => { workspace_pending = true; },
                                 }
                             }
                         }
@@ -196,12 +232,12 @@ impl TitleGenerator {
         id: &str,
         saved: &str,
         deleted: bool,
-    ) -> Result<Option<i64>, EngineError> {
+    ) -> Result<DirectoryOutcome, EngineError> {
         if !deleted && !eligible(&self.inner.workspace, id) {
-            return Ok(None);
+            return Ok(DirectoryOutcome::Done);
         }
         if uuid::Uuid::parse_str(id).is_err() {
-            return Ok(None);
+            return Ok(DirectoryOutcome::Done);
         }
         let client = self
             .inner
@@ -211,13 +247,20 @@ impl TitleGenerator {
         let mut pending: Pending =
             serde_json::from_str(saved).map_err(|_| failure("invalid directory pending state"))?;
         let projection = if deleted {
+            // A pending tombstone still needs a converged source fence, but never
+            // revives the chat or discards its captured deletion metadata.
+            if let Some(bytes) = self.inner.store.load_bounded_snapshot(id, 32 * 1024 * 1024)? {
+                for (peer, counter) in source_version(&bytes)? {
+                    pending.source_version.entry(peer)
+                        .and_modify(|value| *value = (*value).max(counter))
+                        .or_insert(counter);
+                }
+            }
             None
         } else {
-            let bytes = self
-                .inner
-                .store
-                .load_bounded_snapshot(id, 32 * 1024 * 1024)?
-                .ok_or_else(|| failure("directory source snapshot unavailable"))?;
+            let Some(bytes) = self.inner.store.load_bounded_snapshot(id, 32 * 1024 * 1024)? else {
+                return Ok(DirectoryOutcome::WaitingForSource(workspace_observation(&self.inner.workspace, id, &pending.source_version)));
+            };
             Some(
                 tokio::task::spawn_blocking(move || project(&bytes))
                     .await
@@ -234,7 +277,7 @@ impl TitleGenerator {
         let previous =
             if let Some(session) = remote.get("session").filter(|session| !session.is_null()) {
                 if session.get("deleted").and_then(Value::as_bool) == Some(true) {
-                    return Ok(None);
+                    return Ok(DirectoryOutcome::Done);
                 }
                 let version: Version = serde_json::from_value(session["sourceVersion"].clone())
                     .map_err(|_| failure("invalid server source version"))?;
@@ -244,31 +287,36 @@ impl TitleGenerator {
                 pending.revision = None;
                 None
             };
+        // Capture before checking fences, so convergence racing this claim wakes it.
+        let observed = workspace_observation(&self.inner.workspace, id, previous.as_ref().unwrap_or(&pending.source_version));
         let title = if let Some(projection) = &projection {
-            let metadata = title_metadata(
+            let Some(metadata) = title_metadata(
                 &self.inner.workspace,
                 id,
                 projection.source_version.clone(),
                 previous.as_ref(),
-            )?;
+            )? else {
+                return Ok(DirectoryOutcome::WaitingForSource(observed));
+            };
             pending.source_version = metadata.1;
             metadata.0
         } else {
-            pending.source_version = with_workspace_version(
+            let Some(version) = with_workspace_version(
                 &self.inner.workspace,
                 id,
                 pending.source_version.clone(),
                 previous.as_ref(),
-            )?;
+            )? else {
+                return Ok(DirectoryOutcome::WaitingForSource(observed));
+            };
+            pending.source_version = version;
             String::new()
         };
         if previous
             .as_ref()
             .is_some_and(|version| !dominates(&pending.source_version, version))
         {
-            return Err(failure(
-                "directory source is older or concurrent; awaiting synchronized snapshot",
-            ));
+            return Ok(DirectoryOutcome::WaitingForSource(observed));
         }
         self.save(id, &pending, deleted)?;
         let links = projection
@@ -291,20 +339,20 @@ impl TitleGenerator {
         );
         self.save(id, &pending, deleted)?;
         let Some(projection) = projection else {
-            return Ok(None);
+            return Ok(DirectoryOutcome::Done);
         };
         let Some(completed) = projection.completed else {
-            return Ok(None);
+            return Ok(DirectoryOutcome::Done);
         };
         if !projection.completed_is_first {
             // ponytail: transcript order is the intentional once gate; persist a marker
             // only if old one-turn transcripts must remain unnamed.
-            return Ok(None);
+            return Ok(DirectoryOutcome::Done);
         }
         if pending.generated_for.as_deref() == Some(completed.as_str())
             && pending.generated_title.is_none()
         {
-            return Ok(None);
+            return Ok(DirectoryOutcome::Done);
         }
         let generated = if pending.generated_for.as_deref() == Some(completed.as_str()) {
             pending
@@ -314,7 +362,7 @@ impl TitleGenerator {
         } else {
             let now = crate::now_ms();
             if now < pending.next_title_at {
-                return Ok(Some(pending.next_title_at));
+                return Ok(DirectoryOutcome::RetryAt(pending.next_title_at));
             }
             pending.next_title_at = now + 60_000;
             self.save(id, &pending, false)?;
@@ -341,26 +389,28 @@ impl TitleGenerator {
         self.save(id, &pending, false)?;
         // A manual rename during inference wins through the synchronized provenance check.
         // A newer source arriving during inference must be processed instead of published.
-        let latest = self
-            .inner
-            .store
-            .load_bounded_snapshot(id, 32 * 1024 * 1024)?
-            .ok_or_else(|| failure("title source was deleted"))?;
+        let Some(latest) = self.inner.store.load_bounded_snapshot(id, 32 * 1024 * 1024)? else {
+            return Ok(DirectoryOutcome::Done);
+        };
         let current = source_version(&latest)?;
         if current != projection.source_version {
-            return Err(failure("title source changed during inference"));
+            // Snapshot persistence already queued a newer generation.
+            return Ok(DirectoryOutcome::Done);
         }
         if self.inner.workspace.doc().chat(id)?.is_none() {
-            return Ok(None);
+            return Ok(DirectoryOutcome::Done);
         }
         self.inner.workspace.set_generated_title(id, &generated)?;
         self.inner.workspace.flush();
-        let (effective, publication_version) = title_metadata(
+        let observed = workspace_observation(&self.inner.workspace, id, &pending.source_version);
+        let Some((effective, publication_version)) = title_metadata(
             &self.inner.workspace,
             id,
             current,
             Some(&pending.source_version),
-        )?;
+        )? else {
+            return Ok(DirectoryOutcome::WaitingForSource(observed));
+        };
         body["expectedRevision"] = json!(pending.revision);
         body["generatedTitle"] = json!(generated);
         body["title"] = json!(effective.chars().take(140).collect::<String>());
@@ -378,7 +428,7 @@ impl TitleGenerator {
         pending.generated_for = Some(completed);
         pending.generated_title = None;
         self.save(id, &pending, false)?;
-        Ok(None)
+        Ok(DirectoryOutcome::Done)
     }
 
     fn save(&self, id: &str, state: &Pending, deleted: bool) -> Result<(), EngineError> {
@@ -412,7 +462,8 @@ pub(crate) fn queue_deletion(
         None => Version::new(),
     };
     let pending = Pending {
-        source_version: with_workspace_version(workspace, id, source, None)?,
+        source_version: with_workspace_version(workspace, id, source, None)?
+            .ok_or_else(|| failure("unfenced deletion source unavailable"))?,
         deployment_id: workspace.directory_deployment(id),
         ..Pending::default()
     };
@@ -429,27 +480,83 @@ fn dominates(candidate: &Version, previous: &Version) -> bool {
         .all(|(peer, counter)| candidate.get(peer).copied().unwrap_or(0) >= *counter)
 }
 
+// A restart/device heartbeat is not a metadata edit. Track exact chat edit ids,
+// and observation only up to the remote counters needed to unblock publication.
+fn metadata_edits(doc: &loro::LoroDoc, id: &str) -> [Option<loro::ID>; 4] {
+    let chats = doc.get_map("chats");
+    let mut edits = [chats.to_handler().get_last_edit_idlp(id), None, None, None];
+    if let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = chats.get(id) {
+        for (index, field) in ["title", "titleSource", "generatedTitle"].into_iter().enumerate() {
+            edits[index + 1] = row.to_handler().get_last_edit_idlp(field);
+        }
+    }
+    edits.map(|edit| edit.and_then(|edit| doc.with_oplog(|log| log.idlp_to_id(edit))))
+}
+
+fn metadata_version(workspace: &WorkspaceHost, id: &str) -> Version {
+    let mut metadata = Version::new();
+    for edit in metadata_edits(&workspace.doc().doc(), id).into_iter().flatten() {
+        metadata.entry(format!("w:{}", edit.peer))
+            .and_modify(|counter| *counter = (*counter).max(edit.counter as u64 + 1))
+            .or_insert(edit.counter as u64 + 1);
+    }
+    metadata
+}
+
+fn metadata_matches(doc: &loro::LoroDoc, id: &str, metadata: &Version) -> bool {
+    let edits = metadata_edits(doc, id);
+    metadata.iter().all(|(key, counter)| {
+        key.strip_prefix("w:").and_then(|peer| peer.parse::<u64>().ok()).is_some_and(|peer| {
+            edits.iter().flatten().filter(|edit| edit.peer == peer)
+                .map(|edit| edit.counter as u64 + 1).max() == Some(*counter)
+        })
+    }) && edits.iter().flatten().all(|edit| {
+        metadata.keys().any(|key| key.strip_prefix("w:").and_then(|peer| peer.parse::<u64>().ok()) == Some(edit.peer))
+    })
+}
+
+fn workspace_observation(workspace: &WorkspaceHost, id: &str, previous: &Version) -> WorkspaceObservation {
+    let version = workspace.doc().doc().oplog_vv();
+    let required: Version = previous.iter().filter(|(key, _)| key.starts_with("w:"))
+        .map(|(key, counter)| (key.clone(), *counter)).collect();
+    let observed = required.iter().map(|(key, required)| {
+        let counter = key[2..].parse::<u64>().ok().and_then(|peer| version.get(&peer)).copied().unwrap_or(0) as u64;
+        (key.clone(), counter.min(*required))
+    }).collect();
+    WorkspaceObservation { metadata: metadata_version(workspace, id), required, observed }
+}
+
+fn wake_workspace_sources(inner: &Inner) -> Result<(), EngineError> {
+    let waiting = inner.store.waiting_directory_sources()?;
+    if waiting.is_empty() { return Ok(()); }
+    let doc = inner.workspace.doc().doc();
+    let version = doc.oplog_vv();
+    for (id, generation, saved) in waiting {
+        let observed: WorkspaceObservation = serde_json::from_str(&saved)
+            .map_err(|_| failure("invalid directory workspace observation"))?;
+        let fences_match = observed.required.iter().all(|(key, required)| {
+            let counter = key.strip_prefix("w:").and_then(|peer| peer.parse::<u64>().ok())
+                .and_then(|peer| version.get(&peer)).copied().unwrap_or(0) as u64;
+            observed.observed.get(key).copied() == Some(counter.min(*required))
+        });
+        if !fences_match || !metadata_matches(&doc, &id, &observed.metadata) {
+            inner.store.wake_directory_source(&id, generation)?;
+        }
+    }
+    Ok(())
+}
+
 fn with_workspace_version(
     workspace: &WorkspaceHost,
     id: &str,
     mut source: Version,
     previous: Option<&Version>,
-) -> Result<Version, EngineError> {
+) -> Result<Option<Version>, EngineError> {
     let version = workspace.doc().doc().oplog_vv();
-    let chats = workspace.doc().doc().get_map("chats");
-    let mut editors = BTreeSet::new();
-    editors.extend(chats.get_last_editor(id));
-    if let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = chats.get(id) {
-        for field in ["title", "titleSource", "generatedTitle"] {
-            editors.extend(row.get_last_editor(field));
-        }
-    }
     // Fence this chat's metadata, not every peer that ever touched the workspace.
-    for peer in editors {
-        source.insert(
-            format!("w:{peer}"),
-            version.get(&peer).copied().unwrap_or(0) as u64,
-        );
+    for key in metadata_version(workspace, id).keys() {
+        let peer = key[2..].parse::<u64>().expect("metadata peer id");
+        source.insert(key.clone(), version.get(&peer).copied().unwrap_or(0) as u64);
     }
     // Keep acknowledged fences only when our actual workspace has observed them.
     // Copying an unseen server counter would allow stale titles to overwrite renames.
@@ -464,9 +571,7 @@ fn with_workspace_version(
             .copied()
             .unwrap_or(0) as u64;
         if observed < *counter {
-            return Err(failure(
-                "workspace metadata is older or concurrent; awaiting synchronized snapshot",
-            ));
+            return Ok(None);
         }
         source
             .entry(key.clone())
@@ -476,7 +581,7 @@ fn with_workspace_version(
     if source.len() > 128 {
         return Err(failure("directory source version exceeds 128 peers"));
     }
-    Ok(source)
+    Ok(Some(source))
 }
 
 fn title_metadata(
@@ -484,7 +589,7 @@ fn title_metadata(
     id: &str,
     source: Version,
     previous: Option<&Version>,
-) -> Result<(String, Version), EngineError> {
+) -> Result<Option<(String, Version)>, EngineError> {
     for _ in 0..3 {
         let before = workspace.doc().doc().oplog_vv();
         let title = workspace
@@ -492,9 +597,11 @@ fn title_metadata(
             .chat(id)?
             .and_then(|chat| chat.title)
             .unwrap_or_default();
-        let version = with_workspace_version(workspace, id, source.clone(), previous)?;
+        let Some(version) = with_workspace_version(workspace, id, source.clone(), previous)? else {
+            return Ok(None);
+        };
         if workspace.doc().doc().oplog_vv() == before {
-            return Ok((title, version));
+            return Ok(Some((title, version)));
         }
     }
     Err(failure("workspace metadata changed during projection"))
@@ -687,6 +794,154 @@ fn extract_links(text: &str, links: &mut BTreeSet<String>) -> Result<(), EngineE
 mod tests {
     use super::*;
     use comet_doc::MessagePart;
+
+    #[tokio::test]
+    async fn directory_conflicts_wait_through_restart_and_publish_only_after_convergence() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for workspace_conflict in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let id = "10000000-0000-4000-8000-000000000001";
+            let config = || crate::WorkspaceHostConfig {
+                device_id: "device-a".into(), device_name: "test".into(), platform: "test".into(),
+                project_scope: "project-a".into(), user_id: "user-a".into(), edge: None,
+            };
+            let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+            let workspace = WorkspaceHost::open(store.clone(), config()).unwrap();
+            workspace.claim_chat(id, None).unwrap();
+            // Drain the initial chat publication before claiming directory work.
+            let mut chats = workspace.watch_chats();
+            while !chats.borrow_and_update().iter().any(|chat| chat.id == id) {
+                chats.changed().await.unwrap();
+            }
+            let doc = SessionDoc::init(id).unwrap();
+            let initial = doc.export_snapshot().unwrap();
+            store.save_completed_snapshot(id, &initial).unwrap();
+            let remote_source = if workspace_conflict {
+                BTreeMap::from([("w:999".into(), 1)])
+            } else {
+                doc.doc().get_map("meta").insert("sourceAdvance", true).unwrap();
+                doc.doc().commit();
+                source_version(&doc.export_snapshot().unwrap()).unwrap()
+            };
+            workspace.flush();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = ScaffoldClient::new(
+                format!("http://{}", listener.local_addr().unwrap()), "project-a",
+                Arc::new(comet_rpc::StaticToken("test-user".into())),
+            ).unwrap();
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let publications = Arc::new(AtomicUsize::new(0));
+            let outage = Arc::new(AtomicBool::new(false));
+            let server_lookups = lookups.clone();
+            let server_publications = publications.clone();
+            let server_outage = outage.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let (end, size) = loop {
+                        let mut chunk = [0u8; 4096];
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let size: usize = headers.lines().find_map(|line| {
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse().unwrap())
+                            }).unwrap();
+                            break (end + 4, size);
+                        }
+                    };
+                    while bytes.len() < end + size {
+                        let mut chunk = [0u8; 4096];
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let body: Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
+                    let (status, response) = if server_outage.load(Ordering::SeqCst) {
+                        (503, json!({"error": "service unavailable"}))
+                    } else if headers.starts_with("POST /api/crew-directory/get ") {
+                        server_lookups.fetch_add(1, Ordering::SeqCst);
+                        (200, json!({"session": {"revision": 1, "sourceVersion": remote_source, "deleted": false}}))
+                    } else {
+                        assert!(headers.starts_with("POST /api/crew-directory/upsert "));
+                        assert_eq!(body["expectedRevision"], 1);
+                        let published: Version = serde_json::from_value(body["sourceVersion"].clone()).unwrap();
+                        assert!(dominates(&published, &remote_source));
+                        server_publications.fetch_add(1, Ordering::SeqCst);
+                        (200, json!({"revision": 2}))
+                    };
+                    let response = response.to_string();
+                    stream.write_all(format!("HTTP/1.1 {status} response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let titles = TitleGenerator::new(workspace.clone(), store.clone(), crate::Repos::new(dir.path(), "device-a"));
+            assert!(titles.inner.client.set(client.clone()).is_ok());
+            let (_, generation, saved, deleted) = store.claim_directory().unwrap().unwrap();
+            let DirectoryOutcome::WaitingForSource(observed) = titles.process(id, &saved, deleted).await.unwrap() else {
+                panic!("source conflict must be distinct from a transient failure");
+            };
+            store.wait_directory_source(id, generation, &serde_json::to_string(&observed).unwrap()).unwrap();
+            assert_eq!(lookups.load(Ordering::SeqCst), 1);
+            assert_eq!(publications.load(Ordering::SeqCst), 0);
+            assert!(store.directory_retry_delay().unwrap().is_none());
+            assert!(store.claim_directory().unwrap().is_none());
+            drop(titles);
+            drop(workspace);
+            drop(store);
+
+            let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+            let workspace = WorkspaceHost::open(store.clone(), config()).unwrap();
+            let titles = TitleGenerator::new(workspace.clone(), store.clone(), crate::Repos::new(dir.path(), "device-a"));
+            assert!(titles.inner.client.set(client).is_ok());
+            store.backfill_directory(id).unwrap();
+            store.save_pending_records_for_snapshot(id, id, std::iter::empty(), Some(&initial)).unwrap();
+            wake_workspace_sources(&titles.inner).unwrap();
+            assert!(store.claim_directory().unwrap().is_none(), "boot/unchanged adoption cannot wake source conflicts");
+            assert!(store.directory_retry_delay().unwrap().is_none());
+            assert_eq!(lookups.load(Ordering::SeqCst), 1);
+            let raw = workspace.doc().doc();
+            let peer = raw.peer_id();
+            raw.set_peer_id(998).unwrap();
+            raw.get_map("unrelated").insert("not-required", true).unwrap();
+            raw.commit();
+            raw.set_peer_id(peer).unwrap();
+            wake_workspace_sources(&titles.inner).unwrap();
+            assert!(store.claim_directory().unwrap().is_none(), "unrelated workspace peers cannot wake the job");
+            if workspace_conflict {
+                // This observes the missing metadata fence without changing chat.title
+                // or the session transcript, so title/transcript watches are insufficient.
+                let raw = workspace.doc().doc();
+                let peer = raw.peer_id();
+                raw.set_peer_id(999).unwrap();
+                raw.get_map("unrelated").insert("observed", true).unwrap();
+                raw.commit();
+                raw.set_peer_id(peer).unwrap();
+                wake_workspace_sources(&titles.inner).unwrap();
+            } else {
+                store.save_completed_snapshot(id, &doc.export_snapshot().unwrap()).unwrap();
+            }
+            let (_, newer, saved, deleted) = store.claim_directory().unwrap().unwrap();
+            assert!(newer > generation);
+            assert!(matches!(titles.process(id, &saved, deleted).await.unwrap(), DirectoryOutcome::Done));
+            store.settle_directory(id, newer, true).unwrap();
+            assert_eq!(lookups.load(Ordering::SeqCst), 2);
+            assert_eq!(publications.load(Ordering::SeqCst), 1);
+            assert!(store.directory_retry_delay().unwrap().is_none());
+            outage.store(true, Ordering::SeqCst);
+            store.queue_directory(id, false).unwrap();
+            let (_, generation, saved, deleted) = store.claim_directory().unwrap().unwrap();
+            assert!(titles.process(id, &saved, deleted).await.is_err());
+            store.settle_directory(id, generation, false).unwrap();
+            let retry = store.directory_retry_delay().unwrap().unwrap();
+            assert!(retry > Duration::ZERO && retry <= Duration::from_secs(30));
+            server.abort();
+        }
+    }
     #[test]
     fn directory_projects_large_tools_without_copying_or_truncating_history() {
         for legacy in [false, true] {
@@ -829,11 +1084,11 @@ mod tests {
         workspace_doc.set_peer_id(local_peer).unwrap();
         let known_counter = *workspace_doc.oplog_vv().get(&1).unwrap() as u64;
         let legacy = BTreeMap::from([("w:1".into(), known_counter)]);
-        let scoped = with_workspace_version(&workspace, id, Version::new(), Some(&legacy)).unwrap();
+        let scoped = with_workspace_version(&workspace, id, Version::new(), Some(&legacy)).unwrap().unwrap();
         assert!(dominates(&scoped, &legacy));
         assert!(scoped.len() < 128);
         let unseen = BTreeMap::from([("w:1".into(), known_counter + 1)]);
-        assert!(with_workspace_version(&workspace, id, Version::new(), Some(&unseen)).is_err());
+        assert!(with_workspace_version(&workspace, id, Version::new(), Some(&unseen)).unwrap().is_none());
         let doc = SessionDoc::init(id).unwrap();
         let entry = |id: &str, role, text: &str| comet_doc::SessionMessageEntry {
             id: id.into(),

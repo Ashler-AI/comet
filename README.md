@@ -223,6 +223,11 @@ requeues the canonical directory job, including arrivals after missing-source
 failures; it preserves deletion fences, retry backoff and causal checks. Truly
 absent snapshots remain pending rather than publishing invented history.
 
+Unchanged stale or conflicting directory sources now wait durably without timed
+retries. Snapshot advances and the required workspace metadata/fences wake the
+retained job; restart and unchanged adoption leave it asleep. Network/service
+failures keep their existing timed backoff. No user records are deleted or reset.
+
 Same-device chat switches retain harness/model catalogs. Discovery is cancellable
 and bounded at the UI, engine and subprocess; startup negotiation fails explicitly
 after 15 seconds without publishing readiness. Credentials, device, connection,
