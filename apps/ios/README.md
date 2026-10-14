@@ -134,6 +134,12 @@ readback matched complete state, version vectors, retained floor/frontiers,
 measurements, not whole-app iOS peak measurements. Build 35 is a candidate, not a
 TestFlight publication; the published build remains 34.
 
+CI also runs `node scripts/mobile-loro-import-smoke.mjs PACKAGES_DIRECTORY` against
+a deterministic public wide-history fixture. It calls the actual mobile UniFFI
+import/export ABI, enforces a 256 MiB native budget (with a 768 MiB safety stop),
+and compares visible state, materialization, retained history/floor, and cold reopen. Its host-native result
+is included in `provenance.json`; no private workspace data enters CI.
+
 ### Crew Staging 1.0 (34): liveness crash and warm-load release
 
 The build 33 report submitted on **2026-10-13** confirms a separate timer crash,
