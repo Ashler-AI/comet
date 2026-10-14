@@ -86,6 +86,7 @@ fn routed_controls(token: &str) -> RunControls {
     controls.context = Some(RunContext {
         session_id: "comet-session".into(),
         ipc_port: 38117,
+        supervision_token: None,
         inference: Some(InferenceRoute {
             base_url: "http://127.0.0.1:41234".into(),
             token: token.into(),
@@ -279,6 +280,7 @@ async fn prime_fork_uses_native_fork_without_reusing_the_source_identity() {
     fork_controls.context = Some(RunContext {
         session_id: "crew-fork".into(),
         ipc_port: 38117,
+        supervision_token: None,
         inference: None,
         fork_from: Some("native-prime-session".into()),
     });
