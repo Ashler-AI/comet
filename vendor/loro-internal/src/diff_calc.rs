@@ -12,7 +12,7 @@ use itertools::Itertools;
 
 use enum_dispatch::enum_dispatch;
 use loro_common::{
-    CompactIdLp, ContainerID, Counter, HasCounterSpan, IdFull, IdLp, IdSpan, LoroValue, PeerID, ID,
+    CompactIdLp, ContainerID, Counter, HasCounterSpan, IdFull, IdLp, IdSpan, LoroResult, LoroValue, PeerID, ID,
 };
 use loro_delta::DeltaRope;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -182,9 +182,9 @@ impl DiffCalculator {
         after: &crate::VersionVector,
         after_frontiers: &Frontiers,
         container_filter: Option<&dyn Fn(ContainerIdx) -> bool>,
-    ) -> (Vec<InternalContainerDiff>, DiffMode) {
+    ) -> LoroResult<(Vec<InternalContainerDiff>, DiffMode)> {
         if before == after {
-            return (Vec::new(), DiffMode::Linear);
+            return Ok((Vec::new(), DiffMode::Linear));
         }
 
         let s = tracing::span!(tracing::Level::INFO, "DiffCalc", ?before, ?after,);
@@ -355,7 +355,7 @@ impl DiffCalculator {
                         container_id_to_depth
                             .insert(c.clone(), depth.and_then(|d| d.checked_add(1)));
                         oplog.arena.register_container(c);
-                    });
+                    })?;
                     calc.finish_this_round();
                     if !diff.is_empty() || bring_back {
                         ans.insert(
@@ -371,7 +371,8 @@ impl DiffCalculator {
                             ),
                         );
                     }
-                });
+                    Ok::<(), loro_common::LoroError>(())
+                })?;
             }
         }
 
@@ -398,10 +399,10 @@ impl DiffCalculator {
             }
         }
 
-        (
+        Ok((
             ans.into_values().map(|x| x.1).collect_vec(),
             origin_diff_mode,
-        )
+        ))
     }
 
     // TODO: we may remove depth info
@@ -468,7 +469,7 @@ pub(crate) trait DiffCalculatorTrait {
         oplog: &OpLog,
         info: DiffCalcVersionInfo,
         on_new_container: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode);
+    ) -> LoroResult<(InternalDiff, DiffMode)>;
     /// This round of diff calc is finished, we can clear the cache
     fn finish_this_round(&mut self);
 }
@@ -579,12 +580,14 @@ impl DiffCalculatorTrait for MapDiffCalculator {
         op: crate::op::RichOp,
         _vv: Option<&crate::VersionVector>,
     ) {
+        let map = op.raw_op().content.as_map().unwrap();
         if matches!(self.current_mode, DiffMode::Checkout) {
-            // We need to use history cache anyway
+            if !self.changed.contains_key(&map.key) {
+                self.changed.insert(map.key.clone(), None);
+            }
             return;
         }
 
-        let map = op.raw_op().content.as_map().unwrap();
         let new_value = MapValue {
             value: map.value.clone(),
             peer: op.peer,
@@ -609,61 +612,62 @@ impl DiffCalculatorTrait for MapDiffCalculator {
         oplog: &super::oplog::OpLog,
         DiffCalcVersionInfo { from_vv, to_vv, .. }: DiffCalcVersionInfo,
         mut on_new_container: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode) {
-        match self.current_mode {
-            DiffMode::Checkout | DiffMode::Import => oplog.with_history_cache(|h| {
-                let checkout_index = &h.get_checkout_index().map;
-                let mut changed = Vec::new();
-                let from_map = checkout_index.get_container_latest_op_at_vv(
-                    self.container_idx,
-                    from_vv,
-                    Lamport::MAX,
-                    oplog,
-                );
-                let mut to_map = checkout_index.get_container_latest_op_at_vv(
-                    self.container_idx,
-                    to_vv,
-                    Lamport::MAX,
-                    oplog,
-                );
-
-                for (k, peek_from) in from_map.iter() {
-                    let peek_to = to_map.remove(k);
-                    match peek_to {
-                        None => changed.push((k.clone(), None)),
-                        Some(b) => {
-                            if peek_from.value != b.value {
-                                changed.push((k.clone(), Some(b)))
+    ) -> LoroResult<(InternalDiff, DiffMode)> {
+        Ok(match self.current_mode {
+            DiffMode::Checkout | DiffMode::Import => {
+                let mut updated = std::mem::take(&mut self.changed);
+                for target in updated.values_mut() {
+                    *target = None;
+                }
+                let mut before: FxHashMap<InternalString, (Lamport, PeerID)> = FxHashMap::default();
+                oplog.with_history_cache(|h| {
+                    h.visit_shallow_map_entries_for_keys(
+                        self.container_idx,
+                        &mut updated,
+                        |key, target, value| {
+                            before.insert(key.clone(), (value.lamp, value.peer));
+                            *target = Some(value.clone());
+                        },
+                    );
+                });
+                let container = oplog.arena.idx_to_id(self.container_idx).unwrap();
+                oplog.change_store().visit_map_ops_for_keys(
+                    &container,
+                    &mut updated,
+                    &mut |key, target, value, counter, lamport, peer| {
+                        let identity = (lamport, peer);
+                        if from_vv.get(&peer).copied().unwrap_or(0) > counter {
+                            match before.get_mut(key) {
+                                Some(old) => *old = (*old).max(identity),
+                                None => {
+                                    before.insert(key.clone(), identity);
+                                }
                             }
                         }
+                        if to_vv.get(&peer).copied().unwrap_or(0) > counter
+                            && target.as_ref().map_or(true, |old| (old.lamp, old.peer) < identity)
+                        {
+                            *target = Some(MapValue {
+                                value: value.clone(),
+                                lamp: lamport,
+                                peer,
+                            });
+                        }
+                    },
+                )?;
+
+                updated.retain(|key, target| {
+                    // Equal values can still have different winning identities.
+                    if before.get(key).copied() == target.as_ref().map(|v| (v.lamp, v.peer)) {
+                        return false;
                     }
-                }
-
-                for (k, peek_to) in to_map.into_iter() {
-                    changed.push((k, Some(peek_to)));
-                }
-
-                let mut updated =
-                    FxHashMap::with_capacity_and_hasher(changed.len(), Default::default());
-                for (key, value) in changed {
-                    let value = value.map(|v| {
-                        let value = v.value.clone();
-                        if let Some(LoroValue::Container(c)) = &value {
-                            on_new_container(c);
-                        }
-
-                        MapValue {
-                            value,
-                            lamp: v.lamport,
-                            peer: v.peer,
-                        }
-                    });
-
-                    updated.insert(key, value);
-                }
-
+                    if let Some(LoroValue::Container(c)) = target.as_ref().and_then(|v| v.value.as_ref()) {
+                        on_new_container(c);
+                    }
+                    true
+                });
                 (InternalDiff::Map(MapDelta { updated }), DiffMode::Checkout)
-            }),
+            }
             DiffMode::ImportGreaterUpdates | DiffMode::Linear => {
                 let changed = std::mem::take(&mut self.changed);
                 let mode = self.current_mode;
@@ -672,7 +676,7 @@ impl DiffCalculatorTrait for MapDiffCalculator {
                 self.current_mode = DiffMode::Checkout;
                 (InternalDiff::Map(MapDelta { updated: changed }), mode)
             }
-        }
+        })
     }
 }
 
@@ -792,7 +796,7 @@ impl DiffCalculatorTrait for ListDiffCalculator {
         oplog: &OpLog,
         info: DiffCalcVersionInfo,
         mut on_new_container: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode) {
+    ) -> LoroResult<(InternalDiff, DiffMode)> {
         let mut delta = Delta::new();
         let (mut retreat, _) = info.from_vv.diff_iter(info.to_vv);
         let has_retreat = retreat.next().is_some();
@@ -923,7 +927,7 @@ impl DiffCalculatorTrait for ListDiffCalculator {
             delta
         }
 
-        (InternalDiff::ListRaw(delta), DiffMode::Checkout)
+        Ok((InternalDiff::ListRaw(delta), DiffMode::Checkout))
     }
 }
 
@@ -1556,7 +1560,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
         oplog: &OpLog,
         info: DiffCalcVersionInfo,
         _: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode) {
+    ) -> LoroResult<(InternalDiff, DiffMode)> {
         fn push_tracker_chunk(
             delta: &mut DeltaRope<RichtextStateChunk, ()>,
             idx: ContainerIdx,
@@ -1662,7 +1666,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
             }
         }
 
-        match &mut *self.mode {
+        Ok(match &mut *self.mode {
             RichtextCalcMode::Linear { diff, .. } => (
                 InternalDiff::RichtextRaw(std::mem::take(diff)),
                 DiffMode::Linear,
@@ -1701,7 +1705,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     **tracker = full_tracker;
                     *styles = full_styles;
 
-                    return (InternalDiff::RichtextRaw(delta), DiffMode::Checkout);
+                    return Ok((InternalDiff::RichtextRaw(delta), DiffMode::Checkout));
                 }
 
                 let mut delta = DeltaRope::new();
@@ -1711,7 +1715,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
 
                 (InternalDiff::RichtextRaw(delta), DiffMode::Checkout)
             }
-        }
+        })
     }
 
     fn finish_this_round(&mut self) {
@@ -1865,7 +1869,7 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
         oplog: &OpLog,
         info: DiffCalcVersionInfo,
         mut on_new_container: impl FnMut(&ContainerID),
-    ) -> (InternalDiff, DiffMode) {
+    ) -> LoroResult<(InternalDiff, DiffMode)> {
         let (mut retreat, _) = info.from_vv.diff_iter(info.to_vv);
         let has_retreat = retreat.next().is_some();
         if has_retreat || info.replay_base_vv != info.from_vv || self.list.source_not_in_op_context {
@@ -1875,7 +1879,7 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
         }
 
         let (InternalDiff::ListRaw(list_diff), diff_mode) =
-            self.list.calculate_diff(idx, oplog, info, |_| {})
+            self.list.calculate_diff(idx, oplog, info, |_| {})?
         else {
             unreachable!()
         };
@@ -1989,7 +1993,7 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
             elements: element_changes,
         };
 
-        (InternalDiff::MovableList(diff), self.inner.current_mode)
+        Ok((InternalDiff::MovableList(diff), self.inner.current_mode))
     }
 }
 
@@ -2202,7 +2206,7 @@ fn causal_existing_peer_import_uses_current_version_as_replay_base() {
         &after,
         &after_frontiers,
         None,
-    );
+    ).unwrap();
     assert_eq!(calculator.calculators.len(), 1);
     assert!(calculator.get_calc(expected_idx).is_some());
     assert_single_map_value_diff(&diffs, expected_idx, "value", 1.into());
@@ -2252,7 +2256,7 @@ fn conservative_replay_only_builds_calculators_for_changed_containers() {
         &after,
         &after_frontiers,
         None,
-    );
+    ).unwrap();
     assert_eq!(calculator.calculators.len(), 1);
     assert!(calculator.get_calc(expected_idx).is_some());
     assert_single_map_value_diff(&diffs, expected_idx, "value", 1.into());
@@ -2306,7 +2310,7 @@ fn conservative_checkout_replay_filters_to_retreat_changed_containers() {
         &after,
         &after_frontiers,
         None,
-    );
+    ).unwrap();
     assert_eq!(calculator.calculators.len(), 1);
     assert!(calculator.get_calc(expected_idx).is_some());
     // Checking out backward removes the concurrent edit again.

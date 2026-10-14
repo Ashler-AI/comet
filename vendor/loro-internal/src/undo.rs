@@ -836,7 +836,7 @@ impl UndoManager {
                 let inner = self.inner.clone();
                 // We need to clone this because otherwise <transform_delta> will be applied to the same remote diff
                 let remote_change_clone = remote_diff.lock().clone();
-                let commit = doc.undo_internal(
+                let commit_result = doc.undo_internal(
                     IdSpan {
                         peer: self.peer(),
                         counter: span.span,
@@ -850,7 +850,20 @@ impl UndoManager {
                             get_stack(&mut inner.borrow_mut()).transform_based_on_this_delta(diff);
                         });
                     },
-                )?;
+                );
+                let commit = match commit_result {
+                    Ok(commit) => commit,
+                    Err(error) => {
+                        let lock = self.inner.lock();
+                        let mut inner = lock.borrow_mut();
+                        // pop retains this row and its remote diff; restore the original item.
+                        let stack = get_stack(&mut inner);
+                        stack.stack.back_mut().unwrap().0.push_back(span);
+                        stack.size += 1;
+                        inner.processing_undo = false;
+                        return Err(error);
+                    }
+                };
                 drop(commit);
                 let inner = self.inner.lock();
                 let mut is_some = false;
@@ -1002,9 +1015,9 @@ impl UndoManager {
 pub(crate) fn undo(
     spans: Vec<(IdSpan, Frontiers)>,
     last_frontiers_or_last_bi: Either<&Frontiers, &DiffBatch>,
-    calc_diff: impl Fn(&Frontiers, &Frontiers) -> DiffBatch,
+    calc_diff: impl Fn(&Frontiers, &Frontiers) -> LoroResult<DiffBatch>,
     on_last_event_a: &mut dyn FnMut(&DiffBatch),
-) -> DiffBatch {
+) -> LoroResult<DiffBatch> {
     // The process of performing undo is:
     //
     // 0. Split the span into a series of continuous spans. There is no external dep within each continuous span.
@@ -1032,7 +1045,7 @@ pub(crate) fn undo(
             let mut event_a_i = debug_span!("1. Calc event A_i").in_scope(|| {
                 // Checkout to the last id of the id_span
                 calc_diff(&this_id_span.id_last().into(), this_deps)
-            });
+            })?;
 
             // println!("event_a_i: {:?}", event_a_i);
 
@@ -1049,7 +1062,7 @@ pub(crate) fn undo(
                         Either::Right(right) => break 'block right,
                     }
                 };
-                stack_diff_batch = Some(calc_diff(&this_id_span.id_last().into(), &next));
+                stack_diff_batch = Some(calc_diff(&this_id_span.id_last().into(), &next)?);
                 stack_diff_batch.as_ref().unwrap()
             };
 
@@ -1079,8 +1092,9 @@ pub(crate) fn undo(
 
             let c_i = event_a_prime;
             last_ci = Some(c_i);
-        });
+            Ok::<(), LoroError>(())
+        })?;
     }
 
-    last_ci.unwrap()
+    Ok(last_ci.unwrap())
 }

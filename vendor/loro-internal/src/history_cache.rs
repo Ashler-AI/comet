@@ -11,7 +11,7 @@ use enum_as_inner::EnumAsInner;
 use enum_dispatch::enum_dispatch;
 use generic_btree::rle::{HasLength as _, Sliceable};
 use loro_common::{
-    ContainerType, Counter, HasLamport, IdFull, IdLp, InternalString, LoroValue, PeerID, ID,
+    ContainerType, Counter, IdFull, IdLp, InternalString, LoroValue, PeerID, ID,
 };
 use rle::HasLength;
 use rustc_hash::FxHashMap;
@@ -26,7 +26,6 @@ use crate::{
     },
     delta::MapValue,
     diff_calc::tree::{MoveLamportAndID, TreeCacheForDiff},
-    encoding::value_register::ValueRegister,
     op::{InnerContent, RichOp, SliceWithId},
     oplog::ChangeStore,
     state::{ContainerCreationContext, GcStore},
@@ -48,7 +47,6 @@ pub(crate) struct ContainerHistoryCache {
 
 #[derive(Debug, Default)]
 pub(crate) struct ForCheckout {
-    pub(crate) map: MapHistoryCache,
     pub(crate) movable_list: MovableListHistoryCache,
 }
 
@@ -60,7 +58,6 @@ pub(crate) struct HasImportingCacheMark {
 impl HistoryCacheTrait for ForCheckout {
     fn insert(&mut self, op: &RichOp) {
         match op.raw_op().container.get_type() {
-            ContainerType::Map => self.map.insert(op),
             ContainerType::MovableList => self.movable_list.insert(op),
             _ => {}
         }
@@ -89,7 +86,7 @@ impl ContainerHistoryCache {
 
         for op in change.ops.iter() {
             match op.container.get_type() {
-                ContainerType::Map | ContainerType::MovableList
+                ContainerType::MovableList
                     if self.for_checkout.is_some() && for_checkout =>
                 {
                     let rich_op = RichOp::new_by_change(change, op);
@@ -167,7 +164,7 @@ impl ContainerHistoryCache {
         self.change_store.visit_all_changes(&mut |c| {
             for op in c.ops.iter() {
                 match op.container.get_type() {
-                    ContainerType::Map | ContainerType::MovableList
+                    ContainerType::MovableList
                         if self.for_checkout.is_some() && for_checkout =>
                     {
                         let rich_op = RichOp::new_by_change(c, op);
@@ -211,7 +208,7 @@ impl ContainerHistoryCache {
                     }
                     #[cfg(feature = "counter")]
                     ContainerType::Counter => continue,
-                    ContainerType::Map => {}
+                    ContainerType::Map => continue,
                     ContainerType::MovableList => {}
                     ContainerType::Tree => {}
                 }
@@ -219,14 +216,7 @@ impl ContainerHistoryCache {
                 let state = c.get_state_mut(idx, default_ctx);
 
                 match state {
-                    crate::state::State::MapState(m) => {
-                        if for_checkout {
-                            let c = self.for_checkout.as_mut().unwrap();
-                            for (k, v) in m.iter() {
-                                c.map.record_shallow_root_state_entry(idx, k, v);
-                            }
-                        }
-                    }
+                    crate::state::State::MapState(_) => unreachable!(),
                     crate::state::State::MovableListState(l) => {
                         for (idlp, elem) in l.elements() {
                             if for_checkout {
@@ -304,6 +294,33 @@ impl ContainerHistoryCache {
         self.for_importing = None;
     }
 
+
+    pub(crate) fn visit_shallow_map_entries_for_keys(
+        &self,
+        idx: ContainerIdx,
+        keys: &mut FxHashMap<InternalString, Option<MapValue>>,
+        mut f: impl FnMut(&InternalString, &mut Option<MapValue>, &MapValue),
+    ) {
+        let Some(state) = &self.shallow_root_state else {
+            return;
+        };
+        let mut store = state.store.lock();
+        let Some(container) = store.get_mut(idx) else {
+            return;
+        };
+        let ctx = ContainerCreationContext {
+            configure: &Default::default(),
+            peer: 0,
+        };
+        let crate::state::State::MapState(map) = container.get_state_mut(idx, ctx) else {
+            unreachable!();
+        };
+        for (key, value) in map.iter() {
+            if let Some(target) = keys.get_mut(key) {
+                f(key, target, value);
+            }
+        }
+    }
     pub(crate) fn set_shallow_root_store(&mut self, shallow_root_store: Option<Arc<GcStore>>) {
         self.shallow_root_state = shallow_root_store;
     }
@@ -549,159 +566,6 @@ impl<T> Ord for GroupedMapOpInfo<T> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct MapHistoryCacheEntry {
-    container: ContainerIdx,
-    key: u32,
-    lamport: Lamport,
-    peer: PeerID,
-    counter_or_value: Either<Counter, Box<Option<LoroValue>>>,
-}
-
-impl PartialEq for MapHistoryCacheEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.container == other.container
-            && self.key == other.key
-            && self.lamport == other.lamport
-            && self.peer == other.peer
-    }
-}
-
-impl Eq for MapHistoryCacheEntry {}
-
-impl PartialOrd for MapHistoryCacheEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MapHistoryCacheEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.container
-            .cmp(&other.container)
-            .then_with(|| self.key.cmp(&other.key))
-            .then_with(|| self.lamport.cmp(&other.lamport))
-            .then_with(|| self.peer.cmp(&other.peer))
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct MapHistoryCache {
-    keys: ValueRegister<InternalString>,
-    map: BTreeSet<MapHistoryCacheEntry>,
-}
-
-impl HistoryCacheTrait for MapHistoryCache {
-    fn insert(&mut self, op: &RichOp) {
-        let container = op.raw_op().container;
-        let key = match &op.raw_op().content {
-            InnerContent::Map(map) => map.key.clone(),
-            _ => unreachable!(),
-        };
-
-        let key_idx = self.keys.register(&key);
-        self.map.insert(MapHistoryCacheEntry {
-            container,
-            key: key_idx as u32,
-            lamport: op.lamport(),
-            peer: op.peer,
-            counter_or_value: Either::Left(op.counter()),
-        });
-    }
-}
-
-impl MapHistoryCache {
-    fn record_shallow_root_state_entry(
-        &mut self,
-        idx: ContainerIdx,
-        k: &InternalString,
-        v: &MapValue,
-    ) {
-        let key_idx = self.keys.register(k);
-        self.map.insert(MapHistoryCacheEntry {
-            container: idx,
-            key: key_idx as u32,
-            lamport: v.lamport(),
-            peer: v.peer,
-            counter_or_value: Either::Right(Box::new(v.value.clone())),
-        });
-    }
-
-    pub fn get_container_latest_op_at_vv(
-        &self,
-        container: ContainerIdx,
-        vv: &VersionVector,
-        // PERF: utilize this lamport
-        _max_lamport: Lamport,
-        oplog: &OpLog,
-    ) -> FxHashMap<InternalString, GroupedMapOpInfo> {
-        let mut ans = FxHashMap::default();
-        let mut last_key = u32::MAX;
-
-        'outer: loop {
-            let range = (
-                Bound::Included(MapHistoryCacheEntry {
-                    container,
-                    key: 0,
-                    lamport: 0,
-                    peer: 0,
-                    counter_or_value: Either::Left(0),
-                }),
-                Bound::Excluded(MapHistoryCacheEntry {
-                    container,
-                    key: last_key,
-                    lamport: 0,
-                    peer: 0,
-                    counter_or_value: Either::Left(0),
-                }),
-            );
-
-            for entry in self.map.range(range).rev() {
-                match &entry.counter_or_value {
-                    Either::Left(cnt) => {
-                        if vv.get(&entry.peer).copied().unwrap_or(0) > *cnt {
-                            let id = ID::new(entry.peer, *cnt);
-                            let op = oplog.get_op_that_includes(id).unwrap();
-                            debug_assert_eq!(op.atom_len(), 1);
-                            match &op.content {
-                                InnerContent::Map(map) => {
-                                    ans.insert(
-                                        self.keys.get_value(entry.key as usize).unwrap().clone(),
-                                        GroupedMapOpInfo {
-                                            value: map.value.clone(),
-                                            lamport: entry.lamport,
-                                            peer: entry.peer,
-                                        },
-                                    );
-                                }
-                                _ => unreachable!(),
-                            }
-                            last_key = entry.key;
-                            continue 'outer;
-                        }
-                    }
-                    Either::Right(v) => {
-                        let k = self.keys.get_value(entry.key as usize).unwrap().clone();
-                        ans.insert(
-                            k,
-                            GroupedMapOpInfo {
-                                value: (**v).clone(),
-                                lamport: entry.lamport,
-                                peer: entry.peer,
-                            },
-                        );
-                        last_key = entry.key;
-                        continue 'outer;
-                    }
-                }
-            }
-
-            break;
-        }
-
-        ans
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct GroupedTreeOpInfo {

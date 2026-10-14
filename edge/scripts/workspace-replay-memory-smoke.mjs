@@ -7,22 +7,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// No arguments: deterministic CI fixture. Or: BASELINE.loro DELTA.loro [...]
+// No arguments: wide-vector and concurrent-map CI fixtures. Or: BASELINE.loro DELTA.loro [...]
+// --map-fixture runs only the synthetic map check, without the wide-vector baseline.
 // Preparation and probing use separate WASM heaps; only the probe has a budget.
 const args = process.argv.slice(2);
-const internal = ["--prepare", "--probe", "--admission"].includes(args[0]);
+const internal = ["--prepare", "--prepare-map", "--probe", "--admission"].includes(args[0]);
 if (!internal) {
-  assert.ok(args.length === 0 || args.length >= 2, "Provide a baseline and at least one delta, or no arguments");
-  const directory = mkdtempSync(join(tmpdir(), "crew-workspace-memory-"));
-  try {
-    for (const mode of ["--prepare", "--probe", "--admission"]) {
-      const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), mode, directory, ...args], { stdio: "inherit" });
-      assert.ok(!child.error && child.status === 0, `${mode} failed`);
-    }
-  } finally { rmSync(directory, { recursive: true, force: true }); }
+  const mapOnly = args.length === 1 && args[0] === "--map-fixture";
+  assert.ok(mapOnly || args.length === 0 || args.length >= 2, "Provide a baseline and at least one delta, --map-fixture, or no arguments");
+  for (const mapFixture of mapOnly ? [true] : [false, true]) {
+    const directory = mkdtempSync(join(tmpdir(), "crew-workspace-memory-"));
+    try {
+      for (const mode of [mapFixture ? "--prepare-map" : "--prepare", "--probe", "--admission"]) {
+        const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), mode, directory,
+          ...(mapFixture ? [] : args)], { stdio: "inherit" });
+        assert.ok(!child.error && child.status === 0, `${mode} failed`);
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  }
 } else if (args[0] === "--admission") {
   const directory = args[1];
-  const { files, before, after } = JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8"));
+  const { files, before, after, mapFixture } = JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8"));
   const require = createRequire(import.meta.url);
   const { build } = require("esbuild");
   const { Miniflare, convertV4MiniflareOptions } = require("miniflare");
@@ -37,10 +42,12 @@ if (!internal) {
       new TextEncoder().encode(JSON.stringify(canonical(v))))), b => b.toString(16).padStart(2, "0")).join("");
     async function fingerprint(doc) {
       const version = doc.oplogVersion();
+      const metadata = ${mapFixture} ? doc.getMap("metadata") : undefined;
       try { return { state: await digest(doc.toJSON()), oplogVersion: await digest(Object.fromEntries(version.toJSON())),
         floorFrontiers: await digest(doc.shallowSinceFrontiers().map(({peer, counter}) => [String(peer), counter]).sort()),
-        operations: doc.opCount() }; }
-      finally { version.free(); }
+        operations: doc.opCount(), ...(metadata ? { mapEditors: await digest(
+          ["same-value", "seeded", "deleted"].map(key => metadata.getLastEditor(key) ?? null)) } : {}) }; }
+      finally { version.free(); metadata?.free(); }
     }
     export class AdmissionProbe extends SessionRoom {
       async fetch(request) {
@@ -90,7 +97,8 @@ if (!internal) {
     const response = await mf.dispatchFetch("http://local/admit", { method: "POST", body });
     assert.equal(response.status, 200, "Durable Object admission failed");
     const result = await response.json();
-    const boundary = ({ state, oplogVersion, floorFrontiers, operations }) => ({ state, oplogVersion, floorFrontiers, operations });
+    const boundary = ({ state, oplogVersion, floorFrontiers, operations, mapEditors }) => ({
+      state, oplogVersion, floorFrontiers, operations, ...(mapFixture ? { mapEditors } : {}) });
     assert.deepEqual(result.before, boundary(before), "Accepted state changed before admission");
     for (const stage of ["after", "duplicate", "cold"]) {
       assert.deepEqual(result[stage], boundary(after), stage + ": admission changed state or retained history");
@@ -115,6 +123,7 @@ if (!internal) {
   const directory = args[1];
   const file = (name) => join(directory, name);
   const budget = 112 * 1024 * 1024;
+  let mapFixture = args[0] === "--prepare-map";
   function checkMemory(stage) {
     assert.ok(memory instanceof WebAssembly.Memory, "Expected the Loro WASM memory export");
     const mib = (memory.buffer.byteLength / 1048576).toFixed(2);
@@ -146,9 +155,22 @@ if (!internal) {
       return {
         state: digest(doc.toJSON()), stateVersion, oplogVersion, retainedFloor,
         frontiers: heads(doc.frontiers()), floorFrontiers: heads(doc.shallowSinceFrontiers()),
-        operations: doc.opCount(), changes: doc.changeCount()
+        operations: doc.opCount(), changes: doc.changeCount(), ...(mapFixture ? { mapEditors: mapEditors(doc) } : {})
       };
     } finally { for (const vv of vectors) vv.free(); }
+  }
+  function mapEditors(doc) {
+    const metadata = doc.getMap("metadata");
+    try { return digest(["same-value", "seeded", "deleted"].map(key => metadata.getLastEditor(key) ?? null)); }
+    finally { metadata.free(); }
+  }
+  function checkMap(doc, expected, stage) {
+    const metadata = doc.getMap("metadata");
+    try {
+      assert.equal(digest([metadata.get("same-value"), metadata.get("seeded"), metadata.get("deleted") ?? null]),
+        digest(["visible", expected.seeded, expected.deleted]), `${stage}: concurrent map winners changed`);
+      assert.equal(metadata.getLastEditor("same-value"), String(expected.editor), `${stage}: equal-value winner identity changed`);
+    } finally { metadata.free(); }
   }
   function edit(doc, key, value) {
     const from = doc.oplogVersion();
@@ -161,9 +183,71 @@ if (!internal) {
     } finally { metadata.free(); from.free(); }
   }
 
-  if (args[0] === "--prepare") {
-    let files = args.slice(2);
-    if (!files.length) {
+  if (["--prepare", "--prepare-map"].includes(args[0])) {
+    let files = args.slice(2), mapChecks;
+    if (mapFixture) {
+      const seed = new LoroDoc();
+      try {
+        seed.setPeerId(1);
+        edit(seed, "same-value", "floor");
+        edit(seed, "seeded", "floor");
+        edit(seed, "deleted", "floor");
+        writeFileSync(file("offline-base.loro"), seed.export({ mode: "shallow-snapshot", frontiers: seed.frontiers() }));
+      } finally { seed.free(); }
+      const left = new LoroDoc(), right = new LoroDoc();
+      function growHistory(doc, phase) {
+        const from = doc.oplogVersion(), metadata = doc.getMap("metadata"), unrelated = doc.getMap("unrequested-map");
+        const before = doc.opCount();
+        try {
+          doc.setPeerId(10);
+          // Two retained-history sizes exercise key/container filtering without widening the causal vector.
+          for (let round = 0; round < 8000; round++) {
+            const value = `${phase}:${round}:${"x".repeat(512)}`;
+            metadata.set("retained-history", value);
+            unrelated.set("noise", value);
+            doc.setNextCommitTimestamp(0); doc.commit();
+          }
+          assert.equal(doc.opCount() - before, 16000, "Map history growth lost operations");
+          return doc.export({ mode: "update", from });
+        } finally { from.free(); metadata.free(); unrelated.free(); }
+      }
+      function branch(doc, peer, winner) {
+        const from = doc.oplogVersion(), metadata = doc.getMap("metadata");
+        try {
+          doc.setPeerId(peer);
+          metadata.set("same-value", "intermediate"); metadata.set("same-value", "visible");
+          metadata.set("deleted", "temporary");
+          if (winner) metadata.delete("deleted"); else metadata.set("deleted", "survives");
+          if (winner) metadata.set("seeded", "updated"); else metadata.set("left-only", peer);
+          doc.setNextCommitTimestamp(0); doc.commit();
+          return doc.export({ mode: "update", from });
+        } finally { from.free(); metadata.free(); }
+      }
+      try {
+        replay(left, readFileSync(file("offline-base.loro")));
+        growHistory(left, 0);
+        replay(right, left.export({ mode: "snapshot" }));
+        branch(left, 21, false);
+        writeFileSync(file("baseline.loro"), left.export({ mode: "snapshot" }));
+        const first = branch(right, 22, true);
+        writeFileSync(file("winner.loro"), first);
+        replay(left, first);
+        const growth = growHistory(left, 1);
+        writeFileSync(file("growth.loro"), growth);
+        // Join both branches before the second diamond; retained history has doubled.
+        replay(right, left.export({ mode: "snapshot" }));
+        writeFileSync(file("left.loro"), branch(left, 31, false));
+        writeFileSync(file("right.loro"), branch(right, 32, true));
+        files = ["baseline.loro", "winner.loro", "growth.loro", "left.loro", "right.loro"].map(file);
+        mapChecks = [
+          { editor: 21, seeded: "floor", deleted: "survives" },
+          { editor: 22, seeded: "updated", deleted: null },
+          { editor: 22, seeded: "updated", deleted: null },
+          { editor: 31, seeded: "updated", deleted: "survives" },
+          { editor: 32, seeded: "updated", deleted: null },
+        ];
+      } finally { left.free(); right.free(); }
+    } else if (!files.length) {
       const seed = new LoroDoc();
       try {
         // A wide retained floor makes equal persistent-vector merges expensive.
@@ -228,16 +312,21 @@ if (!internal) {
 
     const reference = new LoroDoc();
     try {
-      for (const path of files) replay(reference, readFileSync(path));
+      for (let index = 0; index < files.length; index++) {
+        replay(reference, readFileSync(files[index]));
+        if (mapChecks) checkMap(reference, mapChecks[index], `Reference ${index}`);
+      }
       const before = fingerprint(reference);
       replay(reference, readFileSync(file("offline-delta.loro")));
       const after = fingerprint(reference);
       assert.notEqual(before.state, after.state, "Offline edit must affect visible state");
       assert.notEqual(before.oplogVersion, after.oplogVersion, "Offline edit must advance causal history");
-      writeFileSync(file("manifest.json"), JSON.stringify({ files, before, after, offlineVersion }));
+      writeFileSync(file("manifest.json"), JSON.stringify({ files, before, after, offlineVersion, mapFixture, mapChecks }));
     } finally { reference.free(); }
   } else {
-    const { files, before, after, offlineVersion } = JSON.parse(readFileSync(file("manifest.json"), "utf8"));
+    const manifest = JSON.parse(readFileSync(file("manifest.json"), "utf8"));
+    const { files, before, after, offlineVersion, mapChecks } = manifest;
+    mapFixture = manifest.mapFixture;
     let doc = new LoroDoc();
     function equivalent(expected, stage) {
       assert.deepEqual(fingerprint(doc), expected, `${stage}: state or retained causal history changed`);
@@ -253,6 +342,7 @@ if (!internal) {
     try {
       for (let index = 0; index < files.length; index++) {
         replay(doc, readFileSync(files[index]));
+        if (mapChecks) checkMap(doc, mapChecks[index], `Import ${index}`);
         checkMemory(`Import ${index}`);
       }
       equivalent(before, "Complete replay");
@@ -271,7 +361,7 @@ if (!internal) {
       replay(doc, readFileSync(file("offline.loro")));
       replay(doc, catchup);
       equivalent(after, "Offline writer convergence");
-      console.log("PASS: lossless workspace replay, snapshot folds, cold reopen, and offline round trip");
+      console.log(`PASS: ${mapFixture ? "concurrent map winners, shallow seeds, tombstones, retained-history growth; " : ""}lossless workspace replay, snapshot folds, cold reopen, and offline round trip`);
     } finally { doc.free(); }
   }
 }
