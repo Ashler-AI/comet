@@ -12,6 +12,15 @@ failures remain fatal; no conflicting record is discarded or falsely acknowledge
 Successful snapshot adoption clears the diagnostic. Divergent installed stores
 still require data-preserving reconciliation of genuine competing user edits.
 
+Owner-status recovery keeps the newest coherent publication across the retained
+baseline, local intent, cached status and incoming checkpoint, including when an
+older incoming row already matches the retained intent. Stale same-owner writes
+cannot backdate the workspace index or room activity watch. Status, run identity
+and retry state stay together; ownership changes, invalid clocks and genuinely
+ambiguous equal-clock publications remain conflicts. Original intents and native
+session histories are unchanged. Installed-client publication and acceptance are
+separate from local verification.
+
 ## Unreleased: bounded concurrent map history
 
 Concurrent map import and historical diff resolve only changed keys instead of

@@ -165,12 +165,16 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    `lastMessageAt`, including tool-only turns; heartbeats and repeated idle teardown do not
    manufacture unread activity. Ordinary hosts also publish their canonical room status,
    without rekeying existing bare-chat writers. Controllers observe pinned remote rooms
-   through existing DocHost handles and merge a principal-local activity watch ahead of
-   stale workspace status; locally hosted runs keep direct live-status precedence.
+   through existing DocHost handles and merge a principal-local activity watch with
+   workspace status using the newest original same-owner publication. Older observations
+   cannot backdate status; locally hosted runs keep direct live-status precedence.
    The selected desktop thread also compares its direct room projection against
    the workspace watch: a newer same-device owner heartbeat/outcome wins. Engine
    and viewport share the principal/environment/lifecycle-aware child selector;
    metadata, unrelated writers and expired heartbeats cannot refresh liveness.
+   Snapshot recovery also compares the retained baseline, pending observation and
+   cached owner status before accepting an incoming checkpoint. Status, run identity
+   and retry state form one clocked publication; original semantic intents remain durable.
    Observers cover recent remote rooms plus fresh active sessions. Ordinary imported
    memberships without a chat row may consume canonical same-owner Local status,
    but do not invent a workspace placement; an arriving chat row fences device

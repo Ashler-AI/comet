@@ -978,7 +978,8 @@ impl WorkspaceHost {
         // forever when peers have incompatible shallow frontiers.
         self.inner.room_sessions_tx.send_if_modified(|rows| {
             if let Some(row) = rows.iter_mut().find(|(_, row)| row.chat_id == session.chat_id) {
-                if row.0.added_at == reference.added_at && row.0.environment == reference.environment && row.1 == *session {
+                if row.0.added_at == reference.added_at && row.0.environment == reference.environment
+                    && row.1.device_id == session.device_id && (row.1.updated_at > session.updated_at || row.1 == *session) {
                     return false;
                 }
                 *row = (reference.clone(), session.clone());
@@ -1673,7 +1674,7 @@ impl WorkspaceHostInner {
     }
 }
 
-/// Owned remote-room status wins over workspace snapshots and abandoned local runs.
+/// Newer same-owner status wins; remote ownership fences abandoned local runs.
 /// Locally hosted sessions keep live status precedence. Sorted by chat id.
 fn merge_sessions(
     device_id: &str,
@@ -1703,6 +1704,7 @@ fn merge_sessions(
         .collect();
     for session in projected {
         if session.device_id != device_id {
+            if merged.get(&session.chat_id).is_some_and(|row| row.device_id == session.device_id && row.updated_at > session.updated_at) { continue }
             merged.insert(session.chat_id.clone(), session.clone());
         }
     }
@@ -2025,7 +2027,10 @@ mod tests {
                 let stale = Session { status: SessionStatus::Idle,
                     updated_at: current.updated_at - chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS + 1_000),
                     ..current.clone() };
-                remote.record_session(&stale);
+                // Simulate an older owner release, bypassing the new monotonic writer.
+                let raw = remote.doc().doc();
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("sessions").get("remote-chat") else { panic!("missing owner row") };
+                row.insert("status", "idle").unwrap(); row.insert("updatedAt", stale.updated_at.timestamp_millis()).unwrap(); raw.commit();
                 let before = desktop.doc().doc().oplog_vv();
                 desktop.doc().binding().import(&remote.doc().doc().export(loro::ExportMode::updates(&before)).unwrap()).unwrap();
                 assert_eq!(desktop.doc().read_sessions().unwrap(), vec![stale.clone()]);
@@ -2056,6 +2061,26 @@ mod tests {
                     "both raw-index orderings must expose the genuine room owner, not the abandoned local run");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn older_room_observations_cannot_regress_the_owner_watch_or_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let host = WorkspaceHost::open(store, WorkspaceHostConfig { device_id: "desktop".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project".into(), user_id: "owner".into(), edge: None }).unwrap();
+        host.create_space("space", "remote", "/tmp", None, false).unwrap();
+        host.create_chat("chat", "space", None, None).unwrap();
+        let current = Session { updated_at: Utc.timestamp_millis_opt(3_000).unwrap(), ..session("chat", "remote") };
+        host.record_session_activity(None, "owner", &current, None).unwrap();
+        let stale = Session { status: SessionStatus::Working, updated_at: Utc.timestamp_millis_opt(2_000).unwrap(), ..current.clone() };
+        host.record_session_activity(None, "owner", &stale, None).unwrap();
+        assert_eq!(host.doc().read_sessions().unwrap(), vec![current.clone()]);
+        let rooms = host.inner.room_sessions_tx.borrow();
+        assert_eq!(rooms[0].1, current);
+        let newer = Session { status: SessionStatus::AwaitingInput, updated_at: Utc.timestamp_millis_opt(4_000).unwrap(), ..current };
+        let refs = host.doc().read_session_refs_for("owner").unwrap();
+        assert_eq!(merge_sessions("desktop", std::slice::from_ref(&newer), &[], &refs, &rooms), vec![newer]);
     }
 
     #[tokio::test]

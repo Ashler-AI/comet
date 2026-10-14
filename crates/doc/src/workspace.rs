@@ -804,11 +804,18 @@ impl WorkspaceDoc {
 
     // ── sessions ────────────────────────────────────────────────────────────
 
-    /// Upsert a session-status row (writer discipline: each device writes only its
-    /// own runs' rows). Staleness is checked client-side against `updatedAt`.
+    /// Upsert a session-status row; older same-owner observations are no-ops.
+    /// Equal-clock causal transitions remain valid. Each device writes only its own runs.
     pub fn upsert_session(&self, session: &Session) -> Result<(), DocError> {
         let _operation = self.doc.operation();
         let row = self.row("sessions", &session.chat_id)?;
+        let updated_at = session.updated_at.timestamp_millis();
+        if matches!(row.get("chatId"), Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == session.chat_id)
+            && matches!(row.get("deviceId"), Some(loro::ValueOrContainer::Value(LoroValue::String(owner))) if owner.as_str() == session.device_id)
+            && matches!(row.get("updatedAt"), Some(loro::ValueOrContainer::Value(LoroValue::I64(current))) if current > updated_at)
+        {
+            return self.doc.commit();
+        }
         row.insert("chatId", session.chat_id.as_str())?;
         row.insert("deviceId", session.device_id.as_str())?;
         row.insert("status", status_str(session.status))?;
@@ -817,7 +824,7 @@ impl WorkspaceDoc {
             None => row.delete("modelRetry")?,
         }
         set_opt_ms(&row, "startedAt", session.started_at)?;
-        row.insert("updatedAt", session.updated_at.timestamp_millis())?;
+        row.insert("updatedAt", updated_at)?;
         self.doc.commit()?;
         Ok(())
     }
@@ -2084,6 +2091,22 @@ mod tests {
         let again = b.delete_space("sp-1").unwrap();
         assert!(!again.existed);
         assert!(again.chat_ids.is_empty());
+    }
+
+    #[test]
+    fn stale_session_status_cannot_revive_an_old_run() {
+        let ws = WorkspaceDoc::new();
+        let current = session("chat", "owner", SessionStatus::Idle);
+        ws.upsert_session(&current).unwrap();
+        let before = ws.doc().oplog_vv();
+        let stale = Session { status: SessionStatus::Working, model_retry: Some(comet_proto::ModelRetry { attempt: 1, max_attempts: 3 }),
+            started_at: Some(ts(1_000)), updated_at: ts(2_000), ..current.clone() };
+        ws.upsert_session(&stale).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![current.clone()]);
+        assert_eq!(ws.doc().oplog_vv(), before);
+        let transition = Session { status: SessionStatus::AwaitingInput, ..current };
+        ws.upsert_session(&transition).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![transition]);
     }
 
     #[test]

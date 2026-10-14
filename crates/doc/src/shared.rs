@@ -356,7 +356,8 @@ fn reconcile(
                         .chain(record.value.as_ref().and_then(serde_json::Value::as_object))) { return Err(conflict()) }
             }
         }
-        if covered || remote == record.value { continue }
+        let owner_observation = record.container == "sessions" && remote.is_some() && record.value.is_some();
+        if !owner_observation && (covered || remote == record.value) { continue }
         match record.container.as_str() {
             "meta" if record.key == "directoryCompletedTurn" => {
                 let Some(local) = record.value.as_ref().and_then(|value| value.as_str()) else { return Err(conflict()) };
@@ -610,7 +611,7 @@ fn reconcile(
                 let local_follows_remote = creation_merge.as_ref().is_some_and(|(_, follows)| *follows)
                     || recreated_after_deletion || local_version.as_ref().is_some_and(|version| version.includes_vv(candidate_version));
                 let cached_session = if name == "sessions" { row_value(cached, name, &record.key) } else { None };
-                let owner_publication = if name == "sessions" && remote.is_some() && record.value.is_some() {
+                let owner_publication = if owner_observation {
                     let local = record.value.as_ref().and_then(serde_json::Value::as_object).ok_or_else(conflict)?;
                     let remote = remote.as_ref().and_then(serde_json::Value::as_object).ok_or_else(conflict)?;
                     let before = match &record.before { Some(value) => Some(value.as_object().ok_or_else(conflict)?), None => None };
@@ -624,17 +625,21 @@ fn reconcile(
                             || row.get("startedAt").is_some_and(|value| value.as_i64().and_then(chrono::DateTime::from_timestamp_millis).is_none())
                         { return Err(conflict()) }
                     }
-                    let local_at = local["updatedAt"].as_i64().expect("validated owner clock");
+                    let mut local_publication = local;
+                    let mut local_at = local["updatedAt"].as_i64().expect("validated owner clock");
+                    if let Some(before) = before {
+                        let before_at = before["updatedAt"].as_i64().expect("validated owner clock");
+                        if before_at > local_at { local_publication = before; local_at = before_at; }
+                    }
                     let remote_at = remote["updatedAt"].as_i64().expect("validated owner clock");
                     // An unchanged incoming publication is the three-way baseline,
                     // even when millisecond encoding ties a genuine local transition.
                     let local_publication_wins_tie = local_follows_remote || before.is_some_and(|row|
                         ["status", "startedAt", "updatedAt", "modelRetry"].iter().all(|field| row.get(*field) == remote.get(*field)));
-                    if before.is_some_and(|row| row["updatedAt"].as_i64().is_some_and(|at| local_at < at || remote_at < at))
-                        || (!local_publication_wins_tie && local_at == remote_at && ["status", "startedAt", "modelRetry"].iter().any(|field| local.get(*field) != remote.get(*field)))
+                    if !local_publication_wins_tie && local_at == remote_at && ["status", "startedAt", "modelRetry"].iter().any(|field| local_publication.get(*field) != remote.get(*field))
                     { return Err(conflict()) }
                     // Status and run identity belong to the clocked publication, never to separate field winners.
-                    let mut publication = if local_at > remote_at || (local_at == remote_at && local_publication_wins_tie) { local } else { remote };
+                    let mut publication = if local_at > remote_at || (local_at == remote_at && local_publication_wins_tie) { local_publication } else { remote };
                     if let Some(cached) = cached {
                         let cached_at = cached["updatedAt"].as_i64().expect("validated owner clock");
                         let at = publication["updatedAt"].as_i64().expect("validated owner clock");
@@ -643,6 +648,8 @@ fn reconcile(
                     }
                     Some(publication)
                 } else { None };
+                if (covered || remote == record.value) && owner_publication.is_some_and(|publication|
+                    remote.as_ref().and_then(serde_json::Value::as_object) == Some(publication)) { continue }
                 let mut merged = if let Some(value) = seed_merge {
                     Some(value)
                 } else if let Some((value, _)) = creation_merge {
@@ -1529,6 +1536,38 @@ mod tests {
     }
 
     #[test]
+    fn stale_owner_observations_recover_without_losing_the_newer_baseline() {
+        use comet_proto::{Session, SessionStatus};
+        let publication = |at, status| Session {
+            chat_id: "chat".into(), device_id: "owner-device".into(), status, model_retry: None,
+            started_at: chrono::DateTime::from_timestamp_millis(at - 100),
+            updated_at: chrono::DateTime::from_timestamp_millis(at).unwrap(),
+        };
+        for (local_at, remote_at) in [(2_000, 4_000), (4_000, 2_000), (2_000, 2_000)] {
+            let baseline = publication(3_000, SessionStatus::Idle);
+            let cached = WorkspaceDoc::new(); cached.upsert_session(&baseline).unwrap();
+            let local = WorkspaceDoc::from_doc(cached.doc().fork());
+            let binding = local.binding(); journal(&binding);
+            // Older clients could persist a regressed observation after a newer baseline.
+            let loro::ValueOrContainer::Container(loro::Container::Map(row)) = binding.get_map("sessions").get("chat").unwrap() else { panic!("missing owner row") };
+            row.insert("status", "working").unwrap(); row.insert("startedAt", local_at - 100).unwrap();
+            row.insert("updatedAt", local_at).unwrap(); binding.commit().unwrap();
+            let original = binding.pending_records();
+            let remote = WorkspaceDoc::new();
+            let incoming = publication(remote_at, SessionStatus::Working);
+            remote.upsert_session(&incoming).unwrap();
+            let snapshot = remote.export_snapshot().unwrap();
+            let expected = if remote_at > 3_000 { incoming } else if local_at > 3_000 { publication(local_at, SessionStatus::Working) } else { baseline };
+            for _ in 0..2 {
+                binding.adopt_snapshot(&snapshot, None).unwrap();
+                assert_eq!(local.read_sessions().unwrap(), vec![expected.clone()]);
+                assert_eq!(binding.pending_records()[0].before, original[0].before);
+                assert_eq!(binding.pending_records()[0].value, original[0].value);
+            }
+        }
+    }
+
+    #[test]
     fn restarted_session_publications_keep_latest_owner_status_and_retain_conflicting_originals() {
         use comet_proto::{Session, SessionStatus};
         let publication = |at, status| Session {
@@ -1580,12 +1619,10 @@ mod tests {
                     ("deviceId", serde_json::json!("foreign-owner")),
                     ("chatId", serde_json::json!("foreign-chat")),
                     ("updatedAt", serde_json::json!("corrupt-clock")),
-                    ("updatedAt", serde_json::json!(999)),
                     ("updatedAt", serde_json::json!(local_at)),
                     ("status", serde_json::json!("corrupt-status")),
                     ("label", serde_json::json!("divergent intent")),
                 ] {
-                    if field == "updatedAt" && value == serde_json::json!(999) && !existing { continue }
                     // Start every boundary case from the same accepted owner publication.
                     let candidate = LoroDoc::new(); candidate.import(&snapshot).unwrap();
                     let loro::ValueOrContainer::Container(loro::Container::Map(row)) = candidate.get_map("sessions").get("chat").unwrap() else { panic!("session row missing"); };
