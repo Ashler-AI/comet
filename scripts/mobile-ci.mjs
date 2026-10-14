@@ -258,8 +258,9 @@ try {
   });
   process.env.LOCAL_BUILD = "1";
   const nativeImportSmoke = JSON.parse(run("node", ["scripts/mobile-loro-import-smoke.mjs", path.join(work, "packages")], {
-    timeout: 1_200_000, log: "mobile-loro-import-smoke.log",
+    timeout: 1_200_000,
   }));
+  writeFileSync(path.join(logs, "mobile-loro-import-smoke.json"), JSON.stringify(nativeImportSmoke, null, 2) + "\n");
   copyFileSync(path.join(work, "packages/crew-mobile-loro-runtime.json"), path.join(release, "crew-mobile-loro-runtime.json"));
   const base = [
     "-project", project, "-scheme", scheme, "-jobs", "2",
