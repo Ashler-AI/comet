@@ -8,19 +8,22 @@ engine runs on the phone.
 
 ## Build & run
 
-Requires Xcode 26+ (iOS 26 SDK — Liquid Glass APIs).
+Requires Xcode 26+ (iOS 26 SDK — Liquid Glass APIs) and stable Rust.
 
 ```sh
-cd apps/ios
-xcodebuild -project Comet.xcodeproj -scheme Comet \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+# From the repository root; the helper installs the two required Rust targets.
+node scripts/build-mobile-loro-runtime.mjs /tmp/crew-mobile-packages Comet
+LOCAL_BUILD=1 xcodebuild -project apps/ios/Comet.xcodeproj -scheme Comet \
+  -clonedSourcePackagesDirPath /tmp/crew-mobile-packages \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -jobs 2 build
 ```
 
-Or open `Comet.xcodeproj` in Xcode and run. Dependencies (SPM, resolved
-automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
-(matches the engine's loro 1.13), [swift-markdown](https://github.com/swiftlang/swift-markdown)
-(cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
-desktop's pulldown-cmark config).
+The pinned [loro-swift 1.13.3](https://github.com/loro-dev/loro-swift) wrapper and
+UniFFI ABI remain unchanged. Its supported `LOCAL_BUILD` path selects the
+repository's patched native Loro core instead of the upstream prebuilt binary;
+keep the same packages directory and environment for subsequent Xcode builds.
+Other SPM dependencies remain [swift-markdown](https://github.com/swiftlang/swift-markdown)
+and cmark-gfm, matching desktop's Markdown feature set.
 
 Mobile staging **1.0 (34)** and production **1.0 (20)** are available
 through their existing **Ashler Internal** TestFlight groups. Both are internal-only
@@ -32,12 +35,15 @@ bundle IDs, persisted state, credentials, invite schemes, and cloud endpoints:
 
 ```sh
 # Production candidate: Crew, ai.ashler.crew, version 1.0 build 21
-xcodebuild -project Comet.xcodeproj -scheme Comet \
-  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
+LOCAL_BUILD=1 xcodebuild -project apps/ios/Comet.xcodeproj -scheme Comet \
+  -clonedSourcePackagesDirPath /tmp/crew-mobile-packages \
+  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' -jobs 2 build
 
-# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 34
-xcodebuild -project Comet.xcodeproj -scheme 'Crew Staging' \
-  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' build
+# Staging candidate: Crew Staging, ai.ashler.crew.staging, version 1.0 build 35
+node scripts/build-mobile-loro-runtime.mjs /tmp/crew-mobile-packages 'Crew Staging'
+LOCAL_BUILD=1 xcodebuild -project apps/ios/Comet.xcodeproj -scheme 'Crew Staging' \
+  -clonedSourcePackagesDirPath /tmp/crew-mobile-packages \
+  -destination 'platform=iOS Simulator,name=Crew Mobile Parity' -jobs 2 build
 ```
 
 | Scheme | Edge | Scaffold | Project scope | Invite scheme |
@@ -76,11 +82,13 @@ The artifact `crew-mobile-<environment>-<source SHA>` contains:
 
 | Environment | Device archive | Simulator app package |
 | --- | --- | --- |
-| staging | `Crew-Staging-1.0-34-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-34-simulator-arm64.tar.gz` |
+| staging | `Crew-Staging-1.0-35-unsigned.xcarchive.tar.gz` | `Crew-Staging-1.0-35-simulator-arm64.tar.gz` |
 | production | `Crew-1.0-21-unsigned.xcarchive.tar.gz` | `Crew-1.0-21-simulator-arm64.tar.gz` |
 
 Both also include `SHA256SUMS`, `source-sha.txt`, `provenance.json`, `e2e.log`,
-and `archive-signed.entitlements`. Artifacts originate in
+`crew-mobile-loro-runtime.json`, and `archive-signed.entitlements`. The runtime
+receipt records the pinned Swift ABI, Cargo lock digest, and both rebuilt native
+library hashes; the helper verifies SwiftPM selected those exact slices. Artifacts originate in
 `mobile-artifacts/release/` and are retained for 14 days; diagnostics are in
 `crew-mobile-logs-<run ID>-<attempt>`. Extracted archives are named
 `Crew-Staging.xcarchive` and `Crew.xcarchive`, respectively, each containing
@@ -102,6 +110,29 @@ produce these build candidates.
 `native-verification.yml` is a separate Rust/desktop verification workflow. It
 has no dispatch inputs and runs only on pushes to `verify/native-lifecycle-*`
 or `verify/native-startup-*`; it neither creates nor signs mobile archives.
+
+### Crew Staging 1.0 (35): bounded native workspace import
+
+Published build 34 reproduced a **12.6 GiB physical footprint** while importing a
+private, byte-exact staging workspace baseline (**6,152,039 bytes**) and its
+**31 accepted SQL deltas** in an isolated iOS simulator. Sampling traced
+`RoomClient.applyRemote` through `LoroDoc.importWith` into native causal-vector
+expansion; the UI thread waited on the document mutex. This is separate from the
+previous timer crash. A phone-specific build 34 termination report remains unavailable.
+
+Mobile's upstream prebuilt FFI did not contain the bounded Loro cache already
+used by desktop. `comet-mobile-ffi` reexports the same **loro-ffi 1.13.7 /
+UniFFI 0.31.1** ABI against the workspace's patched **Loro 1.13.9**. The build
+helper uses the SDK's existing local-binary mechanism and rejects stale artifact
+selection. No Swift API, protocol, permission, credential, or retained-intent
+semantics change; no account cache migration or server history reset is required.
+
+The native mobile ABI replay imported every accepted record at **168.09 MiB**
+sampled peak; replay plus snapshot export used **191.44 MiB**. Independent
+readback matched complete state, version vectors, retained floor/frontiers,
+**618,202 operations / 37,163 changes**, and cold reopen. These are native-probe
+measurements, not whole-app iOS peak measurements. Build 35 is a candidate, not a
+TestFlight publication; the published build remains 34.
 
 ### Crew Staging 1.0 (34): liveness crash and warm-load release
 

@@ -20,7 +20,7 @@ const work = path.join(process.env.RUNNER_TEMP, "crew-mobile");
 for (const directory of [logs, release, work]) mkdirSync(directory, { recursive: true });
 const environment = process.env.CREW_MOBILE_ENVIRONMENT ?? "staging";
 const profiles = {
-  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "34", suffix: "-Staging", name: "Crew-Staging" },
+  staging: { scheme: "Crew Staging", bundleId: "ai.ashler.crew.staging", build: "35", suffix: "-Staging", name: "Crew-Staging" },
   production: { scheme: "Comet", bundleId: "ai.ashler.crew", build: "21", suffix: "", name: "Crew" },
 };
 if (!Object.hasOwn(profiles, environment)) throw new Error(`Unsupported mobile environment: ${environment}`);
@@ -253,6 +253,11 @@ try {
   const sdk = run("xcrun", ["--sdk", "iphoneos", "--show-sdk-version"]);
   if (!/^26(?:\.|$)/.test(sdk)) throw new Error(`Expected iOS 26 SDK: ${sdk}`);
   console.log(`${process.env.DEVELOPER_DIR}\n${xcode}\niOS SDK ${sdk}`);
+  run("node", ["scripts/build-mobile-loro-runtime.mjs", path.join(work, "packages"), scheme], {
+    timeout: 1_200_000, log: "mobile-loro-runtime.log",
+  });
+  process.env.LOCAL_BUILD = "1";
+  copyFileSync(path.join(work, "packages/crew-mobile-loro-runtime.json"), path.join(release, "crew-mobile-loro-runtime.json"));
   const base = [
     "-project", project, "-scheme", scheme, "-jobs", "2",
     "-clonedSourcePackagesDirPath", path.join(work, "packages"),
