@@ -2,6 +2,17 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: local startup authority retry
+
+Crew retries `503 remote_code_token_validation_failed` while acquiring Agent Auth
+authority, before starting the agent. Two retries wait 250 ms and one second,
+sharing the original 30-second request deadline. Credential/permission failures,
+other API errors and inference requests are not retried.
+
+The original durable command and message IDs remain unchanged. Cancellation
+interrupts backoff and in-flight requests; terminal command outcomes are never
+reopened, and an already-started agent is never replayed by this retry.
+
 ## Unreleased: workspace recovery conflict isolation
 
 A rejected workspace checkpoint retains its original cache and intents and stays
@@ -280,6 +291,11 @@ chunks instead of rejecting large transcript rows. Snapshot adoption atomically
 requeues the canonical directory job, including arrivals after missing-source
 failures; it preserves deletion fences, retry backoff and causal checks. Truly
 absent snapshots remain pending rather than publishing invented history.
+
+Unchanged stale or conflicting directory sources now wait durably without timed
+retries. Snapshot advances and the required workspace metadata/fences wake the
+retained job; restart and unchanged adoption leave it asleep. Network/service
+failures keep their existing timed backoff. No user records are deleted or reset.
 
 Same-device chat switches retain harness/model catalogs. Discovery is cancellable
 and bounded at the UI, engine and subprocess; startup negotiation fails explicitly

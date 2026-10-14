@@ -509,13 +509,53 @@ impl ScaffoldClient {
         &self,
         cancellation: &CancellationToken,
     ) -> Result<AgentInferenceAuthority, ScaffoldError> {
+        let authority_path = "/api/agent-auth/v2/authority";
         let url = self
             .origin
-            .join("/api/agent-auth/v2/authority")
+            .join(authority_path)
             .expect("static Agent Auth authority path");
         let body = serde_json::json!({});
-        self.request(Method::POST, url, Some(&body), cancellation, None)
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let mut error = match self
+            .request(Method::POST, url, Some(&body), cancellation, None)
             .await
+        {
+            Ok(authority) => return Ok(authority),
+            Err(error) => error,
+        };
+        for (retry, delay) in [Duration::from_millis(250), Duration::from_secs(1)]
+            .into_iter()
+            .enumerate()
+        {
+            if !error.api_error().is_some_and(|error| {
+                error.status == 503 && error.code == "remote_code_token_validation_failed"
+            }) || deadline.saturating_duration_since(tokio::time::Instant::now()) <= delay
+            {
+                return Err(error);
+            }
+            tracing::warn!(attempt = retry + 2, "Agent Auth authority temporarily unavailable; retrying before agent startup");
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+                _ = tokio::time::sleep(delay) => {},
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(error);
+            }
+            let url = self
+                .origin
+                .join(authority_path)
+                .expect("static Agent Auth authority path");
+            match self
+                .request(Method::POST, url, Some(&body), cancellation, Some(remaining))
+                .await
+            {
+                Ok(authority) => return Ok(authority),
+                Err(next) => error = next,
+            }
+        }
+        Err(error)
     }
 
     pub(crate) async fn proxy_agent_inference(
@@ -3656,6 +3696,126 @@ mod tests {
             authority_scope: Some("user:identity:owner-1".into()),
             expires_at: "2099-01-01T00:00:00Z".into(),
         }
+    }
+
+    struct AuthorityRetryHarness(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl comet_harness::Harness for AuthorityRetryHarness {
+        fn id(&self) -> comet_proto::HarnessId { comet_proto::HarnessId::Omp }
+        fn display_name(&self) -> &str { "Authority retry probe" }
+        fn supports_steering(&self) -> bool { false }
+        fn steering_mode(&self) -> comet_proto::SteeringMode { comet_proto::SteeringMode::TurnBoundary }
+        fn reasoning_levels(&self) -> &[comet_proto::ReasoningLevel] { &[] }
+        async fn models(&self) -> Result<Vec<comet_proto::Model>, comet_harness::HarnessError> { Ok(Vec::new()) }
+        async fn run(
+            &self, request: comet_proto::RunRequest, _controls: comet_harness::RunControls,
+        ) -> Result<futures::stream::BoxStream<'static, Result<comet_proto::AgentEvent, comet_harness::HarnessError>>, comet_harness::HarnessError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter([
+                Ok(comet_proto::AgentEvent::SessionStarted {
+                    harness: comet_proto::HarnessId::Omp, model: request.model.unwrap(),
+                    tools: Vec::new(), cwd: request.cwd, session_id: "authority-native".into(),
+                    assistant_message_id: "authority-assistant".into(),
+                }),
+                Ok(comet_proto::AgentEvent::TextDelta { text: "One completed turn".into() }),
+                Ok(comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed, result: None, error: None,
+                    session_id: Some("authority-native".into()),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_retry_executes_the_original_command_once() {
+        use comet_doc::{SessionCommandPayload, SessionCommandStatus};
+        use comet_proto::{AgentEvent, ChatConfig, DoneStatus, HarnessId, RuntimeProfile, SandboxLevel};
+        let grant = test_inference_authority();
+        let body = serde_json::json!({
+            "contractVersion": grant.contract_version, "token": grant.token,
+            "tokenType": grant.token_type, "authorityId": grant.authority_id,
+            "principalId": grant.principal_id, "authorityScope": grant.authority_scope,
+            "expiresAt": grant.expires_at,
+        }).to_string();
+        let (origin, captured) = mock_server_with_status(vec![
+            (503, r#"{"error":"remote_code_token_validation_failed"}"#.into()),
+            (201, body),
+        ]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Arc::new(crate::HarnessRegistry::new());
+        registry.register(Arc::new(AuthorityRetryHarness(runs.clone())));
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(), registry, HarnessId::Omp, None, "project-a", "owner@example.com", RuntimeProfile::LocalController,
+        ).unwrap();
+        let mut auth = crate::AuthConfig::new("http://127.0.0.1:1", dir.path());
+        auth.project_scope = "project-a".into();
+        auth.dev_user_id = "owner@example.com".into();
+        core.set_auth(crate::Auth::new(auth));
+        core.sessions.set_inference_relay(crate::inference_relay::InferenceRelay::start(
+            ScaffoldClient::new(origin, "project-a", Arc::new(StaticToken("fixture-bearer".into()))).unwrap(),
+        ).unwrap());
+        let chat_id = "00000000-0000-4000-8000-000000000063";
+        core.workspace.create_space("space", &core.device_id, "/tmp", None, false).unwrap();
+        core.workspace.create_chat(chat_id, "space", Some(ChatConfig {
+            harness: HarnessId::Omp, model: Some("openai-codex/gpt-6.1-sol".into()),
+            agent_account_id: None, reasoning: None, model_options: Default::default(), sandbox: SandboxLevel::WorkspaceWrite,
+        }), None).unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "prompt": "one original instruction", "model": "openai-codex/gpt-6.1-sol",
+            "cwd": "/tmp", "sandbox": "workspace-write", "autoApprove": true,
+        })).unwrap();
+        let payload = SessionCommandPayload::Run { request, message_id: "original-message".into() };
+        let (_, mut events) = core.sessions.subscribe(chat_id, 0).unwrap();
+        core.doc_host.queue_command_with_id(chat_id, "original-command", payload.clone()).unwrap();
+        let handle = core.doc_host.open(chat_id).unwrap();
+        core.doc_host.drain_commands(&handle).await;
+        assert_eq!(core.doc_host.command_entry(chat_id, "original-command").unwrap().unwrap().status, SessionCommandStatus::Applied);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(events.recv().await.unwrap().event, AgentEvent::Done { status: DoneStatus::Completed, .. }) { break; }
+            }
+        }).await.unwrap();
+        core.doc_host.queue_command_with_id(chat_id, "original-command", payload).unwrap();
+        core.doc_host.drain_commands(&handle).await;
+        core.sessions.shutdown().await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(handle.doc().read_commands().unwrap().len(), 1);
+        assert_eq!(handle.doc().read_entries().unwrap().iter().filter(|entry| entry.id == "original-message").count(), 1);
+        assert_eq!(captured.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn authority_retry_is_bounded_and_preserves_permanent_rejections() {
+        for (status, code, attempts) in [
+            (503, "remote_code_token_validation_failed", 3),
+            (403, "remote_code_token_forbidden", 1),
+            (401, "remote_code_token_required", 1),
+            (503, "agent_auth_v2_unavailable", 1),
+        ] {
+            let body = serde_json::json!({"error": code}).to_string();
+            let (origin, captured) = mock_server_with_status(vec![(status, body); attempts]).await;
+            let client = ScaffoldClient::new(origin, "project-a", Arc::new(StaticToken("fixture-bearer".into()))).unwrap();
+            let error = client.issue_agent_inference_authority(&CancellationToken::new()).await.err().unwrap();
+            assert_eq!(error.api_error().unwrap().status, status);
+            assert_eq!(error.api_error().unwrap().code, code);
+            assert_eq!(captured.await.unwrap().len(), attempts);
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_retry_cancels_before_another_request() {
+        let (origin, captured) = mock_server_with_status(vec![
+            (503, r#"{"error":"remote_code_token_validation_failed"}"#.into()),
+        ]).await;
+        let client = ScaffoldClient::new(origin, "project-a", Arc::new(StaticToken("fixture-bearer".into()))).unwrap();
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let request = tokio::spawn(async move { client.issue_agent_inference_authority(&cancelled).await });
+        assert_eq!(captured.await.unwrap().len(), 1);
+        cancellation.cancel();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(1), request).await.unwrap().unwrap(), Err(ScaffoldError::Cancelled)));
     }
 
     #[tokio::test]

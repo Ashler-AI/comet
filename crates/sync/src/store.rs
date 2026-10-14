@@ -83,6 +83,9 @@ const MIGRATIONS: &[&str] = &[
         SELECT rowid, doc_id, saved_at, bytes FROM snapshots;
      DROP TABLE snapshots;
      ALTER TABLE snapshots_blob_tail RENAME TO snapshots;",
+    // v10 — source conflicts wait durably for transcript/workspace convergence.
+    "ALTER TABLE crew_directory_jobs ADD COLUMN waiting_workspace TEXT;
+     CREATE INDEX crew_directory_jobs_waiting ON crew_directory_jobs(session_id) WHERE waiting_workspace IS NOT NULL;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -171,8 +174,8 @@ impl DocsStore {
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        queue_snapshot_directory(&tx, doc_id, completed, bytes)?;
         write_snapshot(&tx, doc_id, bytes)?;
-        queue_snapshot_directory(&tx, doc_id, completed)?;
         tx.commit()?;
         self.directory_changed
             .send_modify(|value| *value = value.wrapping_add(1));
@@ -227,8 +230,8 @@ impl DocsStore {
             params![format!("semantic/{doc_id}"), now_ms()],
         )?;
         if let Some(snapshot) = snapshot {
+            queue_snapshot_directory(&tx, snapshot_id, false, snapshot)?;
             write_snapshot(&tx, snapshot_id, snapshot)?;
-            queue_snapshot_directory(&tx, snapshot_id, false)?;
         }
         tx.commit()?;
         if snapshot.is_some() {
@@ -457,12 +460,18 @@ impl DocsStore {
         .optional()
         .map_err(Into::into)
     }
+    /// Restart inventory must not turn unchanged source waits into polling.
+    pub fn backfill_directory(&self, id: &str) -> Result<(), StoreError> {
+        self.conn().execute("INSERT OR IGNORE INTO crew_directory_jobs(session_id) VALUES (?1)", params![id])?;
+        Ok(())
+    }
+
 
     pub fn queue_directory(&self, id: &str, deleted: bool) -> Result<(), StoreError> {
         self.conn().execute(
             "INSERT INTO crew_directory_jobs(session_id, deleted) VALUES (?1, ?2)
              ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
-             deleted = MAX(deleted, excluded.deleted), due_at = retry_at",
+             deleted = MAX(deleted, excluded.deleted), due_at = retry_at, waiting_workspace = NULL",
             params![id, deleted],
         )?;
         self.directory_changed
@@ -501,7 +510,7 @@ impl DocsStore {
     pub fn queue_directory_deletion(&self, id: &str, state: &str) -> Result<(), StoreError> {
         self.conn().execute(
             "INSERT INTO crew_directory_jobs(session_id, deleted, state) VALUES (?1, 1, ?2)
-             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1, deleted = 1, due_at = 0, state = excluded.state",
+             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1, deleted = 1, due_at = 0, retry_at = 0, waiting_workspace = NULL, state = excluded.state",
             params![id, state],
         )?;
         self.directory_changed
@@ -531,20 +540,51 @@ impl DocsStore {
     ) -> Result<(), StoreError> {
         self.conn().execute(
             "UPDATE crew_directory_jobs SET
-             due_at = CASE WHEN ?3 THEN CASE WHEN generation = ?2 THEN 9223372036854775807 ELSE due_at END ELSE ?4 END,
-             retry_at = CASE WHEN ?3 THEN 0 ELSE ?4 END WHERE session_id = ?1",
+             due_at = CASE WHEN ?3 THEN 9223372036854775807 ELSE ?4 END,
+             retry_at = CASE WHEN ?3 THEN 0 ELSE ?4 END,
+             waiting_workspace = NULL WHERE session_id = ?1 AND generation = ?2",
             params![id, generation, success, now_ms() + 30_000],
         )?;
         Ok(())
     }
 
-    pub fn defer_directory_title(
+    /// Deferral is claim-scoped, including deletion claims; newer work wins.
+    pub fn defer_directory(
         &self,
         id: &str,
         generation: i64,
         deadline: i64,
     ) -> Result<(), StoreError> {
-        self.conn().execute("UPDATE crew_directory_jobs SET due_at = ?3 WHERE session_id = ?1 AND generation = ?2 AND deleted = 0", params![id, generation, deadline])?;
+        self.conn().execute("UPDATE crew_directory_jobs SET due_at = ?3 WHERE session_id = ?1 AND generation = ?2", params![id, generation, deadline])?;
+        Ok(())
+    }
+
+    /// Retain state/generation without a timer. Only source/workspace changes wake
+    /// this claim, and an older claimant cannot put newer work back to sleep.
+    /// Returns true only for a newly retained wait, allowing a one-time warning.
+    pub fn wait_directory_source(&self, id: &str, generation: i64, workspace: &str) -> Result<bool, StoreError> {
+        let retained = self.conn().execute(
+            "UPDATE crew_directory_jobs SET due_at = 9223372036854775807, retry_at = 0, waiting_workspace = ?3
+             WHERE session_id = ?1 AND generation = ?2 AND waiting_workspace IS NULL",
+            params![id, generation, workspace],
+        )?;
+        Ok(retained != 0)
+    }
+
+    /// The partial index visits blocked work, never settled directory history.
+    pub fn waiting_directory_sources(&self) -> Result<Vec<(String, i64, String)>, StoreError> {
+        let conn = self.conn();
+        let mut query = conn.prepare("SELECT session_id, generation, waiting_workspace FROM crew_directory_jobs WHERE waiting_workspace IS NOT NULL")?;
+        Ok(query.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn wake_directory_source(&self, id: &str, generation: i64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE crew_directory_jobs SET generation = generation + 1, due_at = 0, waiting_workspace = NULL
+             WHERE session_id = ?1 AND generation = ?2 AND waiting_workspace IS NOT NULL",
+            params![id, generation],
+        )?;
+        self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
@@ -555,15 +595,27 @@ impl DocsStore {
     }
 }
 
-fn queue_snapshot_directory(tx: &rusqlite::Transaction<'_>, doc_id: &str, completed: bool) -> Result<(), StoreError> {
+fn queue_snapshot_directory(tx: &rusqlite::Transaction<'_>, doc_id: &str, completed: bool, bytes: &[u8]) -> Result<(), StoreError> {
     // Only global room-shaped ids enter discovery; the engine verifies UUID
     // and authenticated ownership before reading or transmitting their data.
     if doc_id.len() == 36 {
+        // Unchanged persistence/adoption is not a source advance for a blocked job.
+        let waiting: bool = tx.query_row(
+            "SELECT waiting_workspace IS NOT NULL FROM crew_directory_jobs WHERE session_id = ?1",
+            params![doc_id], |row| row.get(0),
+        ).optional()?.unwrap_or(false);
+        if waiting && tx.query_row(
+            "SELECT bytes FROM snapshots WHERE doc_id = ?1", params![doc_id],
+            |row| Ok(matches!(row.get_ref(0)?, rusqlite::types::ValueRef::Blob(stored) if stored == bytes)),
+        ).optional()?.unwrap_or(false) {
+            return Ok(());
+        }
         tx.execute(
             "INSERT INTO crew_directory_jobs(session_id, due_at, completed_turn_pending) VALUES (?1, ?2, ?3)
              ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
              due_at = MAX(retry_at, MIN(due_at, excluded.due_at)),
-             completed_turn_pending = MAX(completed_turn_pending, excluded.completed_turn_pending) WHERE deleted = 0",
+             completed_turn_pending = MAX(completed_turn_pending, excluded.completed_turn_pending), waiting_workspace = NULL
+             WHERE deleted = 0 OR due_at < 9223372036854775807 OR waiting_workspace IS NOT NULL",
             params![doc_id, if completed { 0 } else { now_ms() + 30_000 }, completed],
         )?;
     }
@@ -960,7 +1012,6 @@ mod tests {
         assert_eq!(next_due, first_due);
         store.queue_directory(id, false).unwrap();
         let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-        store.save_snapshot(id, b"raced").unwrap();
         store.settle_directory(id, generation, false).unwrap();
         store.save_snapshot(id, b"later").unwrap();
         store.queue_directory(id, false).unwrap();
@@ -1015,7 +1066,7 @@ mod tests {
             let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
             if deferred {
                 store
-                    .defer_directory_title(id, generation, i64::MAX - 1)
+                    .defer_directory(id, generation, i64::MAX - 1)
                     .unwrap();
             } else {
                 store.settle_directory(id, generation, false).unwrap();
@@ -1039,7 +1090,7 @@ mod tests {
 
     #[test]
     fn completion_during_claim_survives_success_failure_and_title_deferral() {
-        for outcome in ["success", "failure", "deferred"] {
+        for outcome in ["success", "failure", "deferred", "waiting"] {
             let dir = tempfile::tempdir().unwrap();
             let store = DocsStore::open(dir.path()).unwrap();
             let id = "90000000-0000-4000-8000-000000000001";
@@ -1050,16 +1101,13 @@ mod tests {
                 .save_completed_snapshot(id, b"new completion")
                 .unwrap();
             match outcome {
+                "waiting" => { store.wait_directory_source(id, generation, "{}").unwrap(); },
                 "deferred" => store
-                    .defer_directory_title(id, generation, i64::MAX - 1)
+                    .defer_directory(id, generation, i64::MAX - 1)
                     .unwrap(),
                 _ => store
                     .settle_directory(id, generation, outcome == "success")
                     .unwrap(),
-            }
-            if outcome == "failure" {
-                assert!(store.claim_directory().unwrap().is_none());
-                store.conn().execute("UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1", params![id]).unwrap();
             }
             store.queue_directory(backlog, false).unwrap();
             let (claimed, newer, _, _) = store.claim_directory().unwrap().unwrap();
@@ -1070,6 +1118,48 @@ mod tests {
                 Some(&b"new completion"[..])
             );
         }
+    }
+
+    #[test]
+    fn source_wait_survives_restart_and_unchanged_adoption_but_wakes_on_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "10000000-0000-4000-8000-000000000001";
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.save_completed_snapshot(id, b"source").unwrap();
+        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
+        store.save_directory_state(id, "retained inference state", false).unwrap();
+        assert!(store.wait_directory_source(id, generation, "observed metadata").unwrap());
+        assert!(!store.wait_directory_source(id, generation, "duplicate observation").unwrap());
+        assert!(store.claim_directory().unwrap().is_none());
+        assert!(store.directory_retry_delay().unwrap().is_none());
+        drop(store);
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.backfill_directory(id).unwrap();
+        store.save_pending_records_for_snapshot(id, id, std::iter::empty(), Some(b"source")).unwrap();
+        assert!(store.claim_directory().unwrap().is_none());
+        assert!(store.directory_retry_delay().unwrap().is_none());
+        assert_eq!(store.waiting_directory_sources().unwrap(), vec![(id.into(), generation, "observed metadata".into())]);
+        store.save_completed_snapshot(id, b"advanced").unwrap();
+        let (_, newer, saved, deleted) = store.claim_directory().unwrap().unwrap();
+        assert!(newer > generation);
+        assert_eq!(saved, "retained inference state");
+        assert!(!deleted);
+        assert!(!store.wait_directory_source(id, generation, "stale observation").unwrap());
+        store.settle_directory(id, generation, false).unwrap();
+        assert!(store.waiting_directory_sources().unwrap().is_empty());
+        store.queue_directory_deletion(id, "retained deletion source").unwrap();
+        store.defer_directory(id, newer, i64::MAX).unwrap();
+        let (_, deletion_generation, saved, deleted) = store.claim_directory().unwrap().unwrap();
+        assert!(deleted);
+        assert_eq!(saved, "retained deletion source");
+        store.wait_directory_source(id, deletion_generation, "deletion metadata").unwrap();
+        store.save_completed_snapshot(id, b"converged deletion source").unwrap();
+        let (_, deletion_generation, saved, deleted) = store.claim_directory().unwrap().unwrap();
+        assert!(deleted);
+        assert_eq!(saved, "retained deletion source");
+        store.settle_directory(id, deletion_generation, true).unwrap();
+        store.save_completed_snapshot(id, b"late source").unwrap();
+        assert!(store.claim_directory().unwrap().is_none());
     }
 
     #[test]
