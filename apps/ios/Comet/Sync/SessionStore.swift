@@ -22,8 +22,13 @@ struct MobileSessionBootstrap: Codable, Equatable {
     /// Loro projections/journals use milliseconds; native proto entities use RFC3339.
     var wireDictionary: [String: Any] {
         func timestamp(_ value: Int64) -> String {
-            Date(timeIntervalSince1970: Double(value) / 1000)
-                .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+            // Date's floating-point fractions can truncate an integer millisecond.
+            // Format whole seconds, retaining the journal's exact millisecond remainder.
+            let remainder = value % 1000
+            let seconds = value / 1000 - (remainder < 0 ? 1 : 0)
+            let milliseconds = remainder < 0 ? remainder + 1000 : remainder
+            let date = Date(timeIntervalSince1970: Double(seconds)).formatted(Date.ISO8601FormatStyle())
+            return "\(date.dropLast()).\(String(format: "%03lld", milliseconds))Z"
         }
         var chatWire = encodableDictionary(chat)
         var spaceWire = encodableDictionary(space)
@@ -1567,6 +1572,10 @@ final class SessionStore {
 #if DEBUG
 extension SessionStore {
     static func runMetadataAdmissionRegression() async -> Bool {
+        func fail(_ invariant: String) -> Bool {
+            E2ERunner.log("FAIL Crew metadata admission: \(invariant)")
+            return false
+        }
         var stores: [SessionStore] = []
         var cacheIds: [String] = []
         defer {
@@ -1589,14 +1598,19 @@ extension SessionStore {
                     createdAt: 2, spaceId: space.id)
                 let bootstrap = MobileSessionBootstrap(chat: chat, space: space)
                 guard (bootstrap.wireDictionary["chat"] as? [String: Any])?["createdAt"] as? String == "1970-01-01T00:00:00.002Z",
-                      (bootstrap.wireDictionary["space"] as? [String: Any])?["createdAt"] as? String == "1970-01-01T00:00:00.001Z" else { return false }
+                      (bootstrap.wireDictionary["space"] as? [String: Any])?["createdAt"] as? String == "1970-01-01T00:00:00.001Z" else { return fail("exact bootstrap RFC3339 milliseconds") }
+                if !scaffold {
+                    var historical = bootstrap
+                    historical.chat.createdAt = -1
+                    guard (historical.wireDictionary["chat"] as? [String: Any])?["createdAt"] as? String == "1969-12-31T23:59:59.999Z" else { return fail("pre-epoch bootstrap milliseconds") }
+                }
                 let scope = CollaborationScope(projectId: config.projectScope, deploymentId: deployment, sessionId: chatId)
                 let route = ScaffoldControlRoute(controllerDeviceId: "host", ownerDeviceId: "sandbox-device", actorSubject: config.userId,
                     grantId: "original-grant", projection: SessionRoomProjection(projectId: config.projectScope, deploymentId: "deployment", sessionId: chatId),
                     environment: SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "original-sandbox", lifecycleEpoch: 7),
                         ownerPrincipal: config.userId, scope: scope), preparationGeneration: "original-generation")
                 let failures = ["command_authority_pending", "command_persistence_failed: disk unavailable", "command_authority_rejected: original grant revoked", ""]
-                let statuses = ["Waiting for authorization", "Not admitted · persistence failed", "Not admitted · authorization rejected"]
+                let blocks = ["command_authority_pending", "command_persistence_failed", "rejected"]
                 var attempts: [MobileCommandAdmission] = []
                 var readbacks = 0
                 let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
@@ -1643,19 +1657,23 @@ extension SessionStore {
                         await store.retryPendingAuthorization()
                     } else {
                         let accepted = await store.sendRun(prompt: "original instruction", chat: changed.chat)
-                        guard accepted == failure.isEmpty else { return false }
+                        guard accepted == failure.isEmpty else { return fail("scaffold=\(scaffold) stage=\(stage): admission result; \(store.sendFailure ?? store.recoveryFailure ?? "no failure detail")") }
                     }
-                    guard attempts.count == stage + 1, readbacks == 0,
-                          try attempts.allSatisfy({ try encoder.encode($0) == encoder.encode(attempts[0]) }) else { return false }
+                    guard attempts.count == stage + 1 else { return fail("scaffold=\(scaffold) stage=\(stage): original command retried exactly once") }
+                    guard readbacks == 0 else { return fail("scaffold=\(scaffold) stage=\(stage): explicit non-admission outranks in-memory readback") }
+                    guard try attempts.allSatisfy({ try encoder.encode($0) == encoder.encode(attempts[0]) }) else { return fail("scaffold=\(scaffold) stage=\(stage): original identity, bootstrap and authority retained") }
                     if stage < 3 {
-                        guard store.deliveryStatus == statuses[stage],
-                              store.submittedDrafts[attempts[0].commandId]?.admitted == false else { return false }
+                        guard store.submittedDrafts[attempts[0].commandId]?.admissionBlock == blocks[stage],
+                              store.hasPendingAuthorization == (stage == 0),
+                              store.submittedDrafts[attempts[0].commandId]?.admitted == false else { return fail("scaffold=\(scaffold) stage=\(stage): distinct non-admission state retained") }
                     } else {
                         guard store.submittedDrafts[attempts[0].commandId]?.admitted == true,
-                              store.recoveryFailure?.contains("metadata syncing") == true else { return false }
+                              store.submittedDrafts[attempts[0].commandId]?.admissionBlock == nil,
+                              !store.hasPendingAuthorization, store.sendFailure == nil,
+                              store.recoveryFailure != nil else { return fail("scaffold=\(scaffold): accepted receipt retains metadata catch-up") }
                         store.setEntries([MessageEntry(id: attempts[0].commandId, role: .user,
                             parts: [.text(id: "original-text", text: "original instruction")], createdAt: nowMs(), deviceId: "host")])
-                        guard await store.sendRun(prompt: "original instruction", chat: changed.chat), attempts.count == 4 else { return false }
+                        guard await store.sendRun(prompt: "original instruction", chat: changed.chat), attempts.count == 4 else { return fail("scaffold=\(scaffold): completed message not resubmitted") }
                     }
                 }
                 let workspace = WorkspaceStore(config: config)
@@ -1670,18 +1688,18 @@ extension SessionStore {
                         do {
                             _ = try await workspace.sendScaffoldCommand(environment: environment,
                                 payload: .interrupt, admission: attempts[0])
-                            return false
+                            return fail("changed Scaffold \(field) authority rejected before dispatch")
                         } catch RelayError.rpc(let detail) {
-                            guard detail.contains("authority changed") else { return false }
+                            guard detail.hasPrefix("command_authority_rejected:") else { return fail("changed Scaffold \(field) authority rejection: \(detail)") }
                         }
                     }
                 } else {
                     _ = try workspace.prepareChat(id: chatId, space: space, config: chat.config!)
                     cacheIds.append(config.documentCacheId(roomId: "ws4/\(config.projectScope)"))
                     var wrongHost = attempts[0]; wrongHost.hostDeviceId = "other-host"
-                    do { _ = try await workspace.sendSessionCommand(chatId: chatId, payload: .interrupt, admission: wrongHost); return false }
+                    do { _ = try await workspace.sendSessionCommand(chatId: chatId, payload: .interrupt, admission: wrongHost); return fail("changed desktop host rejected before dispatch") }
                     catch RelayError.rpc(let detail) {
-                        guard detail.contains("owner changed") else { return false }
+                        guard detail.hasPrefix("command_authority_rejected:") else { return fail("changed desktop host rejection: \(detail)") }
                     }
                 }
             }

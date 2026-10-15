@@ -10,9 +10,9 @@ engine runs on the phone.
 
 New sessions prepare their presentation locally and retain the chosen Chat/Space
 bootstrap with the original command journal. Ordinary host admission and scoped
-Scaffold admission send that same snapshot; native wire timestamps use RFC3339,
-while the mobile journal keeps milliseconds. Scope, grant, owner, model, account,
-checkout and attachments cannot change on a same-ID retry.
+Scaffold admission send that same snapshot; native RFC3339 wire timestamps preserve
+the journal's exact integer milliseconds without floating-point truncation. Scope,
+grant, owner, model, account, checkout and attachments cannot change on a same-ID retry.
 
 Only a matching `admission: accepted` receipt or durable owner outcome establishes
 admission. Missing authority remains pending; explicit persistence failure cannot
