@@ -21,6 +21,8 @@ Before the full Tilt stack, ensure `fs.inotify.max_user_instances` is at least
 the host's sysctl configuration. Boat's default 128 was exhausted by the running
 stack: a new kind node's systemd failed with `Too many open files`. This does not
 require raising the watch-count limit or deleting retained nodes.
+Restored sysctl files may arrive after the OS applies boot settings; reapply the
+minimum in the owned app-startup preflight before `just bootstrap`.
 
 Each setup mapping has its own supervised foreground forward:
 
@@ -41,8 +43,15 @@ in snapshots and out of `.boxignore`. The variable is Boat-only opt-in; unset
 retains the original localdev locations. Existing stores require a verified
 backup and explicit migration before changing their Pod storage.
 
+Saved application data is not proof that kind itself can resume. Boat recreates
+registry-image containers from their image/settings; the idle-resume proof lost
+kind's `/etc/kubernetes` certificates, manifests and kubeconfig while its `/var`
+etcd data remained. Preserve node configuration or use an explicitly approved,
+backed-up cluster rebuild before claiming app recovery. Never delete retained
+nodes merely to make bootstrap pass.
+
 Only pre-authentication images are templates. Forking a configured disk copies Crew device IDs, sessions and manually installed credentials. A new box needs fresh identity and sign-in; resume retains the existing identity. Never use a copied authenticated image as a shortcut.
 
 Wake inspects provider state, resumes only stopped/archived boxes and starts/checks the existing host helper. A snapshot still stopping/archiving must finish before retrying wake. Unknown states, missing snapshots, auth/plan errors and mismatched IDs fail closed; no forced stop, recovery power-cycle or replacement create.
 
-Sources: https://docs.boat.dev/machines, https://docs.boat.dev/long-running-tasks, https://docs.boat.dev/snapshots, https://docs.boat.dev/ssh-access, https://docs.boat.dev/organizations, https://docs.boat.dev/api-keys/scopes.
+Sources: https://docs.boat.dev/machines, https://docs.boat.dev/long-running-tasks, https://docs.boat.dev/snapshots, https://docs.boat.dev/snapshots/whats-saved, https://docs.boat.dev/readiness, https://docs.boat.dev/ssh-access, https://docs.boat.dev/organizations, https://docs.boat.dev/api-keys/scopes.
