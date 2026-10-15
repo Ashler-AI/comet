@@ -29,6 +29,12 @@ Do not expose app, callback, Tilt or CDP through `boat host`, even a token-gated
 
 Resume keeps the same sandbox ID but starts a new machine. It restores files, named Docker volumes and enabled systemd units, not running processes or memory. Docker build cache and `~/.cache` are not captured; the shared Playwright location under `~/.local/share` survives. A stop does not signal ordinary processes, so cleanup must not depend on shutdown hooks. Enable one Crew systemd supervisor and verify current native identity after every resume.
 
+Keep PostgreSQL/GCS outside kind's disposable storage with the configured
+`ASHLER_LOCALDEV_DATA_DIR=$HOME/.local/share/ashler-localdev`. Leave that directory
+in snapshots and out of `.boxignore`. The variable is Boat-only opt-in; unset
+retains the original localdev locations. Existing stores require a verified
+backup and explicit migration before changing their Pod storage.
+
 Only pre-authentication images are templates. Forking a configured disk copies Crew device IDs, sessions and manually installed credentials. A new box needs fresh identity and sign-in; resume retains the existing identity. Never use a copied authenticated image as a shortcut.
 
 Wake inspects provider state, resumes only stopped/archived boxes and starts/checks the existing host helper. A snapshot still stopping/archiving must finish before retrying wake. Unknown states, missing snapshots, auth/plan errors and mismatched IDs fail closed; no forced stop, recovery power-cycle or replacement create.
