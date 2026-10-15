@@ -686,28 +686,39 @@ impl WorkspaceHost {
         let mut refs = self.watch_session_refs();
         let mut room_rows = self.inner.room_sessions_tx.subscribe();
         let device_id = self.inner.config.device_id.clone();
-        let (tx, rx) = watch::channel(merge_sessions(
-            &device_id,
-            &rows.borrow(),
-            &local.borrow(),
-            &refs.borrow(),
-            &room_rows.borrow(),
-        ));
+        // A queued writer can deadlock a second read of the same watch channel.
+        let local_is_workspace = rows.same_channel(&local);
+        let initial = {
+            let rows = rows.borrow();
+            let local = (!local_is_workspace).then(|| local.borrow());
+            merge_sessions(
+                &device_id,
+                &rows,
+                local.as_deref().unwrap_or(&rows),
+                &refs.borrow(),
+                &room_rows.borrow(),
+            )
+        };
+        let (tx, rx) = watch::channel(initial);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     changed = rows.changed() => if changed.is_err() { break },
-                    changed = local.changed() => if changed.is_err() { break },
+                    changed = local.changed(), if !local_is_workspace => if changed.is_err() { break },
                     changed = refs.changed() => if changed.is_err() { break },
                     changed = room_rows.changed() => if changed.is_err() { break },
                 }
-                let merged = merge_sessions(
-                    &device_id,
-                    &rows.borrow_and_update(),
-                    &local.borrow_and_update(),
-                    &refs.borrow_and_update(),
-                    &room_rows.borrow_and_update(),
-                );
+                let merged = {
+                    let rows = rows.borrow_and_update();
+                    let local = (!local_is_workspace).then(|| local.borrow_and_update());
+                    merge_sessions(
+                        &device_id,
+                        &rows,
+                        local.as_deref().unwrap_or(&rows),
+                        &refs.borrow_and_update(),
+                        &room_rows.borrow_and_update(),
+                    )
+                };
                 if tx.send(merged).is_err() {
                     break; // no receivers left
                 }
@@ -2012,6 +2023,7 @@ mod tests {
         let mut local = session("local-chat", "desktop");
         let (local_tx, local_rx) = tokio::sync::watch::channel(vec![local.clone()]);
         let mut merged = host.merged_sessions_watch(local_rx);
+        let mut aliased = host.merged_sessions_watch(host.watch_session_rows());
         host.record_session_activity(&reference, "owner", &observed, None).unwrap();
         for (index, expected) in [(None, &observed), (Some(&fresh), &fresh), (Some(&stale), &fresh),
             (None, &stale), (Some(&older_index), &stale)] {
@@ -2055,6 +2067,13 @@ mod tests {
                     merged.changed().await.unwrap();
                 }
             }).await.unwrap_or_else(|_| panic!("expected {expected:?}; got {:?}", *merged.borrow()));
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let ready = aliased.borrow_and_update().iter().any(|row| row == expected);
+                    if ready { break; }
+                    aliased.changed().await.unwrap();
+                }
+            }).await.unwrap_or_else(|_| panic!("aliased watch expected {expected:?}; got {:?}", *aliased.borrow()));
             if index.is_some() {
                 assert_eq!(host.doc().read_sessions().unwrap(), vec![index.unwrap().clone()],
                     "retaining a presentation candidate must not repair the raw workspace index");
