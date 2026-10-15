@@ -82,7 +82,7 @@ Ordinary desktop turns automatically prepare bounded private gcloud/app/Tilt for
 
 Read the checkout's `docs/agents/localdev.md` and `infra/localdev/README.md`; use maintained Linux installation paths for Docker, kubectl, kind, ctlptl, Tilt, just, gcloud and Infisical. Follow `just bootstrap`, `just env`, and `just dev`, not a competing stack. Retain the maintained Next.js binding (`0.0.0.0` by default): Docker/kind must reach `http://host.docker.internal:3000` for callbacks. Deny public inbound app traffic through provider private access or the host firewall while allowing required Docker bridge traffic. Keep Tilt/CDP and credential callbacks loopback-only; never publish them through provider hosting. Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false`; never run local typechecks.
 
-Seed only the confirmed host-local database. After stop/resume, verify app and Tilt separately from Crew readiness. Reconcile stale kind networking with the maintained `just env` path; this may recreate only the ephemeral local cluster/database. Never apply recovery to shared or snapshot databases.
+Seed only the confirmed host-local database. Boat setup exports `ASHLER_LOCALDEV_DATA_DIR=$HOME/.local/share/ashler-localdev` into the channel config, noninteractive shell and systemd engine; Namespace and ordinary local defaults remain unchanged. Back up and verify existing stores before an explicit migration; never reseed on wake. After stop/resume, verify app and Tilt separately from Crew readiness. Never apply local recovery to shared or managed snapshot databases.
 
 Record actual owner, provider ID, CPU/memory/disk, Crew version/channel, and these observations:
 

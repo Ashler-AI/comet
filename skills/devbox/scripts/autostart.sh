@@ -30,6 +30,9 @@ case "${COMET_DEVBOX_PROVIDER:-}" in
   boat)
     [[ "$(uname -s)" == Linux && "$COMET_DEVBOX_ID" =~ ^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$ && "${BOAT_ID:-}" == "$COMET_DEVBOX_ID" ]] || { echo 'The configured Boat ID does not match this machine.' >&2; exit 1; }
     systemctl --user import-environment BOAT_ID
+    if [[ -n "${ASHLER_LOCALDEV_DATA_DIR:-}" ]]; then
+      systemctl --user import-environment ASHLER_LOCALDEV_DATA_DIR
+    fi
     if port_listening "$port"; then exit 0; fi
     sudo -n loginctl enable-linger "$(id -un)"
     systemctl --user reset-failed comet-native.service 2>/dev/null || true

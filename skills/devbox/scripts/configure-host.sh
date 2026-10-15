@@ -16,6 +16,8 @@ case "$COMET_DEVBOX_PROVIDER" in
   boat)
     [[ "$COMET_DEVBOX_ID" =~ ^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$ && "${BOAT_ID:-}" == "$COMET_DEVBOX_ID" ]] || { echo 'The configured Boat ID must match this machine.' >&2; exit 1; }
     CREW_FOLDER_ROOT="${CREW_FOLDER_ROOT:-$HOME}"
+    export ASHLER_LOCALDEV_DATA_DIR="${ASHLER_LOCALDEV_DATA_DIR:-$HOME/.local/share/ashler-localdev}"
+    [[ "$ASHLER_LOCALDEV_DATA_DIR" == /* ]] || { echo 'ASHLER_LOCALDEV_DATA_DIR must be an absolute path.' >&2; exit 1; }
     command -v boat >/dev/null || { echo 'boat is required for sleep protection.' >&2; exit 1; }
     ;;
   *) echo 'COMET_DEVBOX_PROVIDER must be namespace or boat.' >&2; exit 1 ;;
@@ -62,6 +64,9 @@ config="$HOME/.config/crew-devbox/$CREW_CHANNEL.env"
   printf 'export PLAYWRIGHT_BROWSERS_PATH=%q\n' "$PLAYWRIGHT_BROWSERS_PATH"
   printf 'export COMET_DEVBOX_PROVIDER=%q\n' "$COMET_DEVBOX_PROVIDER"
   printf 'export COMET_DEVBOX_ID=%q\n' "$COMET_DEVBOX_ID"
+  if [[ "$COMET_DEVBOX_PROVIDER" == boat ]]; then
+    printf 'export ASHLER_LOCALDEV_DATA_DIR=%q\n' "$ASHLER_LOCALDEV_DATA_DIR"
+  fi
 ) > "$config"
 chmod 600 "$config"
 printf '#!/usr/bin/env bash\nset -euo pipefail\nsource %q\nexec %q "$@"\n' "$config" "$CREW_BINARY" > "$HOME/.local/bin/crew-devbox-$CREW_CHANNEL"
@@ -79,10 +84,11 @@ SH
 chmod 755 "$HOME/.local/bin/crew-devbox-gcloud-login"
 
 # Preserve personal guidance; migrate only this setup's bounded managed block.
-python3 - "$CREW_DEVBOX_NAME" "$CREW_CHANNEL" "$COMET_DEVBOX_PROVIDER" <<'PY'
+python3 - "$CREW_DEVBOX_NAME" "$CREW_CHANNEL" "$COMET_DEVBOX_PROVIDER" "${ASHLER_LOCALDEV_DATA_DIR:-}" <<'PY'
 from pathlib import Path
+from shlex import quote
 import sys
-name, channel, provider = sys.argv[1:]
+name, channel, provider, datastore_dir = sys.argv[1:]
 start, end = '<!-- crew-devbox:start -->', '<!-- crew-devbox:end -->'
 blocks = [(start, end), ('<!-- crew-namespace-devbox:start -->', '<!-- crew-namespace-devbox:end -->')]
 block = f'''{start}
@@ -127,6 +133,9 @@ for first, last in managed:
 if provider == 'namespace':
     first, last = f'# >>> Crew Devbox {channel} autostart >>>', f'# <<< Crew Devbox {channel} autostart <<<'
     old = old.rstrip() + f'\n\n{first}\n"$HOME/.local/bin/crew-devbox-autostart" {channel}\n{last}\n'
+elif provider == 'boat':
+    first, last = f'# >>> Crew Devbox {channel} autostart >>>', f'# <<< Crew Devbox {channel} autostart <<<'
+    old = f'{first}\nexport ASHLER_LOCALDEV_DATA_DIR={quote(datastore_dir)}\n{last}\n\n' + old
 path.write_text(old)
 PY
 "$HOME/.local/bin/crew-chromium" --version
