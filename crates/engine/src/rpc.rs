@@ -3097,13 +3097,13 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&snapshot)
             }
-            methods::HANDOFF_SESSION_TO_SCAFFOLD => {
+            methods::HANDOFF_SESSION_TO_SCAFFOLD | methods::HANDOFF_SESSION_ONLY_TO_SCAFFOLD => {
                 let p = parse_params(params)?;
-                RpcReply::value(&self.handoff_session_to_scaffold(p).await?)
+                RpcReply::value(&self.handoff_session_to_scaffold(p, method == methods::HANDOFF_SESSION_ONLY_TO_SCAFFOLD).await?)
             }
-            methods::RECOVER_SESSION_HANDOFF_TO_SCAFFOLD => {
+            methods::RECOVER_SESSION_HANDOFF_TO_SCAFFOLD | methods::RECOVER_SESSION_ONLY_HANDOFF_TO_SCAFFOLD => {
                 let p = parse_params(params)?;
-                RpcReply::value(&self.recover_session_handoff_to_scaffold(p).await?)
+                RpcReply::value(&self.recover_session_handoff_to_scaffold(p, method == methods::RECOVER_SESSION_ONLY_HANDOFF_TO_SCAFFOLD).await?)
             }
             methods::PREPARE_SCAFFOLD_SESSION => {
                 let p = parse_params(params)?;

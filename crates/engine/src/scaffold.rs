@@ -1807,7 +1807,7 @@ MAX_TOTAL = 256 * 1024 * 1024
 MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024
 MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024
 MAX_OBJECTS = 250000
-MAX_FILES = 25000
+MAX_FILES = 50000
 # Bound directory traversal independently of the regular-file/symlink budget.
 MAX_DIRECTORIES = 25000
 MAX_MEMORY = 512 * 1024 * 1024
@@ -2128,14 +2128,15 @@ finally:
 
 const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, shutil, stat, sys, tempfile, uuid
 probe_only = sys.argv[1] == "--probe"
+platform_root = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
 if not probe_only:
     staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
-    workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
+    workspace = platform_root
     if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
         raise SystemExit(20)
 handoff_root = pathlib.Path("/workspace/crew-handoff")
 workspace = pathlib.Path(sys.argv[7])
-if workspace != workspace.resolve(strict=not probe_only) or (not probe_only and not workspace.is_dir()) or (workspace != handoff_root and handoff_root not in workspace.parents):
+if workspace != workspace.resolve(strict=not probe_only) or (not probe_only and not workspace.is_dir()) or (workspace != platform_root and workspace != handoff_root and handoff_root not in workspace.parents):
     raise SystemExit(29)
 rel = pathlib.PurePosixPath(sys.argv[2])
 if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
@@ -2833,6 +2834,7 @@ impl ScaffoldRuntime {
                 scope,
                 native_session_id,
                 cwd,
+                session_only,
             } => {
                 let environment = self
                     .inner
@@ -2854,39 +2856,42 @@ impl ScaffoldRuntime {
                         permit.map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?
                     }
                 };
-                // Read the sandbox's actual checkout, not a mutable source-ref label.
-                // Capture uses this only when it can prove a local shared ancestor.
-                let base_argv = vec![
-                    "git".to_string(),
-                    "-C".to_string(),
-                    "/workspace/ashler-platform".to_string(),
-                    "rev-parse".to_string(),
-                    "--verify".to_string(),
-                    "HEAD^{commit}".to_string(),
-                ];
-                let remote_base = self
-                    .inner
-                    .client
-                    .exec(
-                        &sandbox_id,
-                        &ExecBody {
-                            argv: &base_argv,
-                            mode: "inline",
-                            timeout_ms: 10_000,
-                        },
-                        cancellation,
-                    )
-                    .await?;
-                if !remote_base.ok || remote_base.exit_code != Some(0) {
-                    return Err(ScaffoldError::HandoffStage("source_repository_base"));
-                }
-                let remote_base = remote_base.stdout.as_deref().unwrap_or_default().trim();
-                if !(remote_base.len() == 40 || remote_base.len() == 64)
-                    || !remote_base.bytes().all(|byte| byte.is_ascii_hexdigit())
-                {
-                    return Err(ScaffoldError::HandoffStage("source_repository_base"));
-                }
-                let remote_base = remote_base.to_ascii_lowercase();
+                let remote_base = if session_only {
+                    None
+                } else {
+                    // Capture against the actual immutable checkout, not a source-ref label.
+                    let base_argv = vec![
+                        "git".to_string(),
+                        "-C".to_string(),
+                        "/workspace/ashler-platform".to_string(),
+                        "rev-parse".to_string(),
+                        "--verify".to_string(),
+                        "HEAD^{commit}".to_string(),
+                    ];
+                    let remote_base = self
+                        .inner
+                        .client
+                        .exec(
+                            &sandbox_id,
+                            &ExecBody {
+                                argv: &base_argv,
+                                mode: "inline",
+                                timeout_ms: 10_000,
+                            },
+                            cancellation,
+                        )
+                        .await?;
+                    if !remote_base.ok || remote_base.exit_code != Some(0) {
+                        return Err(ScaffoldError::HandoffStage("source_repository_base"));
+                    }
+                    let remote_base = remote_base.stdout.as_deref().unwrap_or_default().trim();
+                    if !(remote_base.len() == 40 || remote_base.len() == 64)
+                        || !remote_base.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    {
+                        return Err(ScaffoldError::HandoffStage("source_repository_base"));
+                    }
+                    Some(remote_base.to_ascii_lowercase())
+                };
                 let capture_native_session_id = native_session_id.clone();
                 let capture_cwd = cwd.clone();
                 let capture_cancellation = cancellation.clone();
@@ -2905,19 +2910,23 @@ impl ScaffoldRuntime {
                         }
                     })?;
                     let artifact = prepare_omp_handoff_archive(captured, &capture_cancellation)?;
-                    let worktree = crate::worktree_handoff::capture_worktree_handoff_cancellable(
-                        std::path::Path::new(&capture_cwd),
-                        Some(&remote_base),
-                        &capture_cancellation,
-                    )
-                    .map_err(|error| {
-                        tracing::warn!(error = %error, "Scaffold worktree handoff capture failed");
-                        if capture_cancellation.is_cancelled() {
-                            ScaffoldError::Cancelled
-                        } else {
-                            ScaffoldError::HandoffStage("source_repository_capture")
-                        }
-                    })?;
+                    let worktree = remote_base
+                        .map(|remote_base| {
+                            crate::worktree_handoff::capture_worktree_handoff_cancellable(
+                                std::path::Path::new(&capture_cwd),
+                                Some(&remote_base),
+                                &capture_cancellation,
+                            )
+                            .map_err(|error| {
+                                tracing::warn!(error = %error, "Scaffold worktree handoff capture failed");
+                                if capture_cancellation.is_cancelled() {
+                                    ScaffoldError::Cancelled
+                                } else {
+                                    ScaffoldError::HandoffStage("source_repository_capture")
+                                }
+                            })
+                        })
+                        .transpose()?;
                     Ok::<_, ScaffoldError>((handoff_permit, artifact, worktree))
                 })
                 .await
@@ -2926,10 +2935,10 @@ impl ScaffoldRuntime {
                     ScaffoldError::OmpSessionHandoffFailed
                 })??;
                 let _handoff_permit = handoff_permit;
-                let prospective_cwd = if worktree.cwd_relative_path.is_empty() {
-                    SCAFFOLD_HANDOFF_CWD.to_string()
-                } else {
-                    format!("{SCAFFOLD_HANDOFF_CWD}/{}", worktree.cwd_relative_path)
+                let prospective_cwd = match worktree.as_ref() {
+                    Some(worktree) if worktree.cwd_relative_path.is_empty() => SCAFFOLD_HANDOFF_CWD.to_string(),
+                    Some(worktree) => format!("{SCAFFOLD_HANDOFF_CWD}/{}", worktree.cwd_relative_path),
+                    None => "/workspace/ashler-platform".to_string(),
                 };
                 self.inner
                     .client
@@ -2940,14 +2949,17 @@ impl ScaffoldRuntime {
                         cancellation,
                     )
                     .await?;
-                let remote_cwd = self
-                    .inner
-                    .client
-                    .handoff_worktree(&sandbox_id, &worktree, prospective_cwd, cancellation)
-                    .await
-                    .inspect_err(|error| {
-                        tracing::warn!(error = %error, "Scaffold worktree handoff upload failed");
-                    })?;
+                let remote_cwd = if let Some(worktree) = worktree {
+                    self.inner
+                        .client
+                        .handoff_worktree(&sandbox_id, &worktree, prospective_cwd, cancellation)
+                        .await
+                        .inspect_err(|error| {
+                            tracing::warn!(error = %error, "Scaffold worktree handoff upload failed");
+                        })?
+                } else {
+                    prospective_cwd
+                };
                 let remote_cwd = self
                     .inner
                     .client
@@ -5510,6 +5522,107 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn worktree_materializer_imports_base_checkout_with_more_than_25000_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let platform = root.join("platform");
+        let remote = root.join("remote");
+        std::fs::create_dir_all(source.join("files")).unwrap();
+        std::fs::create_dir(&platform).unwrap();
+        std::fs::write(platform.join("sentinel"), "platform\n").unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "crew@example.com"]);
+        git(&source, &["config", "user.name", "Crew"]);
+        for index in 0..25_001 {
+            std::fs::write(source.join(format!("files/file-{index}")), "base\n").unwrap();
+        }
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "large base checkout"]);
+        let snapshot = crate::worktree_handoff::capture_worktree_handoff(&source).unwrap();
+        assert_eq!(snapshot.entry_count, 0, "the files belong to the Git base");
+        let staging = platform.join(".scaffold/crew-handoff-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        std::io::copy(
+            &mut snapshot.reopen().unwrap(),
+            &mut archive.reopen().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("tar")
+                .args([
+                    "-xf",
+                    archive.path().to_str().unwrap(),
+                    "-C",
+                    staging.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let script = VERIFY_WORKTREE_HANDOFF_PYTHON
+            .replace("/workspace/ashler-platform", platform.to_str().unwrap())
+            .replace("/workspace/crew-handoff", remote.to_str().unwrap());
+        let result = std::process::Command::new("python3")
+            .args([
+                "-c",
+                &script,
+                staging.to_str().unwrap(),
+                &snapshot.manifest_sha256,
+                &snapshot.base_sha,
+                &snapshot.entry_count.to_string(),
+                &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "status={} stderr={}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).trim(),
+            format!("verified:{}:{}", snapshot.manifest_sha256, remote.display())
+        );
+        assert_eq!(
+            git(&remote, &["rev-parse", "HEAD"]),
+            git(&source, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            std::fs::read_dir(remote.join("files")).unwrap().count(),
+            25_001
+        );
+        for index in [0, 25_000] {
+            assert_eq!(
+                std::fs::read(remote.join(format!("files/file-{index}"))).unwrap(),
+                b"base\n"
+            );
+        }
+        assert_eq!(
+            std::fs::read(platform.join("sentinel")).unwrap(),
+            b"platform\n"
+        );
+        assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn worktree_materializer_enforces_containment_and_separate_expansion_budgets() {
         use std::os::unix::fs::symlink;
         for scenario in [
@@ -5657,7 +5770,7 @@ mod tests {
                     "MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024",
                     "MAX_CHECKOUT_BYTES = 1024 * 1024",
                 )
-                .replace("MAX_FILES = 25000", "MAX_FILES = 12")
+                .replace("MAX_FILES = 50000", "MAX_FILES = 12")
                 .replace("MAX_DIRECTORIES = 25000", "MAX_DIRECTORIES = 3");
             let script = if scenario == "import_expansion" {
                 script.replace(
@@ -5800,6 +5913,11 @@ mod tests {
     }
     #[test]
     fn materializer_process_is_exact_idempotent_and_rejects_mismatch() {
+        materializer_process_for_cwd("crew-handoff/nested");
+        materializer_process_for_cwd("ashler-platform");
+    }
+
+    fn materializer_process_for_cwd(relative_cwd: &str) {
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Command;
         let temp = tempfile::tempdir().unwrap();
@@ -5807,8 +5925,9 @@ mod tests {
         let workspace = root.join("ashler-platform");
         let staging = workspace.join(".scaffold/omp-handoff-staging/by-cwd");
         std::fs::create_dir_all(&staging).unwrap();
-        let remote_cwd = root.join("crew-handoff/nested");
+        let remote_cwd = root.join(relative_cwd);
         std::fs::create_dir_all(&remote_cwd).unwrap();
+        std::fs::write(workspace.join("checked-out-source"), b"branch source\n").unwrap();
         let staged = staging.join("native-1.jsonl");
         let bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"native-1\",\"timestamp\":\"2026-08-16T00:00:00.000Z\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"id\":\"message-1\"}\n";
         let sha = format!("{:x}", sha2::Sha256::digest(bytes));
@@ -5896,9 +6015,10 @@ mod tests {
                 & 0o777,
             0o755
         );
-        let prospective = remote_cwd.join("not-created");
+        let prospective = root.join("crew-handoff/not-created");
         assert_eq!(probe(&prospective).stdout, b"absent\n");
         assert!(!prospective.exists());
+        assert_eq!(probe(&root.join("outside")).status.code(), Some(29));
         std::fs::write(&staged, bytes).unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
         let first = run(&script);
@@ -5908,6 +6028,7 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert!(!staged.exists(), "staged file must be consumed");
+        assert_eq!(std::fs::read(workspace.join("checked-out-source")).unwrap(), b"branch source\n");
         let sessions = profile_agent_dir.join("sessions");
         let target = std::fs::read_dir(&sessions)
             .unwrap()

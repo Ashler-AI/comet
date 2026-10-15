@@ -63,6 +63,10 @@ pub mod methods {
     pub const HANDOFF_SESSION_TO_SCAFFOLD: &str = "HandoffSessionToScaffold";
     /// Recover only an explicitly accepted native handoff target; never create.
     pub const RECOVER_SESSION_HANDOFF_TO_SCAFFOLD: &str = "RecoverSessionHandoffToScaffold";
+    /// Transfer native context without copying the checkout; older engines must reject.
+    pub const HANDOFF_SESSION_ONLY_TO_SCAFFOLD: &str = "HandoffSessionOnlyToScaffold";
+    /// Recover native context only in an accepted target; never create or copy a checkout.
+    pub const RECOVER_SESSION_ONLY_HANDOFF_TO_SCAFFOLD: &str = "RecoverSessionOnlyHandoffToScaffold";
     /// Create and attach a Scaffold environment, transferring native session context.
     pub const PREPARE_SCAFFOLD_SESSION: &str = "PrepareScaffoldSession";
     /// Retain an interrupted preparation without changing newer attempts or admission.

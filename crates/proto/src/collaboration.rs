@@ -682,11 +682,10 @@ pub enum ScaffoldEnvironmentControl {
         #[serde(rename = "agentRoute")]
         agent_route: AgentRoute,
     },
-    /// Transfer an authenticated native OMP session and its Git-visible
-    /// worktree delta into a ready Scaffold host. The controller resolves the
-    /// durable native id/cwd pair to a discovered file; callers cannot provide
-    /// paths. Scaffold resolves its own immutable checkout commit before the
-    /// bounded delta is captured and applied.
+    /// Transfer an authenticated native OMP session into a ready Scaffold host.
+    /// Unless session_only is set, also capture and apply its bounded Git-visible
+    /// worktree delta. The controller resolves the durable native id/cwd pair to
+    /// a discovered file; callers cannot provide paths.
     HandoffOmpSession {
         #[serde(rename = "sandboxId")]
         sandbox_id: String,
@@ -694,6 +693,8 @@ pub enum ScaffoldEnvironmentControl {
         #[serde(rename = "nativeSessionId")]
         native_session_id: String,
         cwd: String,
+        #[serde(default, rename = "sessionOnly")]
+        session_only: bool,
     },
 }
 
@@ -1059,26 +1060,6 @@ mod tests {
         parse_scaffold_device_id,
     };
 
-    #[test]
-    fn omp_handoff_control_uses_additive_camel_case_wire_shape() {
-        let control = ScaffoldEnvironmentControl::HandoffOmpSession {
-            sandbox_id: "sandbox-a".into(),
-            scope: CollaborationScope {
-                project_id: "project-a".into(),
-                deployment_id: Some("deployment-a".into()),
-                session_id: Some("session-a".into()),
-                unknown: Default::default(),
-            },
-            native_session_id: "omp-native-a".into(),
-            cwd: "/repo".into(),
-        };
-        let value = serde_json::to_value(control).unwrap();
-        assert_eq!(value["operation"], "handoffOmpSession");
-        assert_eq!(value["sandboxId"], "sandbox-a");
-        assert_eq!(value["nativeSessionId"], "omp-native-a");
-        assert_eq!(value["cwd"], "/repo");
-        assert_eq!(value["scope"]["sessionId"], "session-a");
-    }
     #[test]
     fn agent_route_update_control_uses_camel_case_wire_shape() {
         let control = ScaffoldEnvironmentControl::UpdateAgentRoute {
