@@ -16,6 +16,12 @@ Before long setup, confirm a sandbox-scoped credential can run `boat --no-update
 
 The machine is Ubuntu x86_64 with Docker and systemd. Authenticate GitHub on the host and clone into `/home/user/ashler-platform`; set `CHECKOUT_PARENT=/home/user`. Use `boat scp` for verified artifacts/scripts. `COMET_DEVBOX_ID` must equal the provider's current `BOAT_ID` before configuration or engine startup.
 
+Before the full Tilt stack, ensure `fs.inotify.max_user_instances` is at least
+512, preserving any higher host value, and persist the measured capacity through
+the host's sysctl configuration. Boat's default 128 was exhausted by the running
+stack: a new kind node's systemd failed with `Too many open files`. This does not
+require raising the watch-count limit or deleting retained nodes.
+
 Each setup mapping has its own supervised foreground forward:
 
 ```bash
