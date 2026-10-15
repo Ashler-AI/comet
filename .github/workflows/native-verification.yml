@@ -55,6 +55,9 @@ jobs:
           git rev-parse HEAD | tee native-evidence/source-sha.txt
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           rustc --version | tee native-evidence/rust-version.txt
+      - name: Verify fixed-session web viewport
+        if: runner.os == 'Linux'
+        run: node --test apps/web/*.test.mjs
       - name: Verify OMP restart and takeover recovery
         if: startsWith(github.ref_name, 'verify/native-recovery-')
         timeout-minutes: 15
@@ -115,6 +118,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p comet-ui --lib 2>&1 | tee native-evidence/desktop.log
+          cargo test --locked -p comet-update --lib 2>&1 | tee native-evidence/updater-production.log
+          COMET_PACKAGE_ENVIRONMENT=staging cargo test --locked -p comet-update --lib 2>&1 | tee native-evidence/updater-staging.log
       - name: Build exact source native executable
         timeout-minutes: 15
         run: cargo build --locked -p comet --bin comet
