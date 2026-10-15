@@ -1311,6 +1311,24 @@ distinct Crew chat. The receipt contains `chatId`, `sandboxId`, `commandId`, and
 `environment`; it confirms command admission, not remote task completion.
 Monitor the returned chat in Crew, not standalone `handoff.*` lifecycle tools.
 
+Starting with **0.1.159**, transfer only native history for a pushed branch with `--session-only`:
+
+```bash
+"$COMET_EXECUTABLE" session handoff "$COMET_SESSION_ID" \
+  --prompt-file "$PROMPT_FILE" --database-environment local --session-only
+```
+
+This mode rebases native history to `/workspace/ashler-platform` without capturing
+or replacing a checkout. Commit and push every required local change first, then
+have the remote task fetch the branch and check out its exact commit before
+testing. Dirty and untracked local files are deliberately not transferred.
+The default mode still imports the exact local checkout and its working changes.
+Session-only creation and recovery use dedicated RPC commands, so an older
+controller rejects the mode instead of silently copying files or creating a
+replacement target. Combine `--session-only` with both recovery flags below to
+continue an accepted, unadmitted target without copying the repository.
+
+
 Starting with **0.1.137**, recover a failed import into its preserved target:
 
 ```bash
@@ -1357,8 +1375,9 @@ The worktree and native-context verifiers run from temporary sandbox files rathe
 than exceeding the runtime's 16 KiB exec-argument limit with inline program text.
 The reconstructed checkout has a separate 1 GiB byte budget; compressed Git
 objects and archive bytes are checked independently before checkout publication.
-Files and symlinks have a 25,000-item budget; real directories have a separate
-25,000-item budget. Paths, symlinks, object expansion and history remain bounded.
+Files and symlinks in the reconstructed checkout have a 50,000-item budget.
+Changed/untracked archive entries and real directories retain separate
+25,000-item budgets. Paths, symlinks, object expansion and history remain bounded.
 Recovery's read-only journal scan checks at most 4,096 entries, 64 KiB per header
 and 16 MiB aggregate header bytes within a 10-second exec deadline.
 

@@ -16,6 +16,7 @@ fn params() -> PrepareScaffoldSessionParams {
         omp_handoff: Some(OmpHandoff {
             native_session_id: "native-source".into(),
             cwd: "/source".into(),
+            session_only: false,
         }),
     }
 }
@@ -296,7 +297,7 @@ async fn recovery_route_mismatch_never_attaches_imports_creates_or_commands() {
         .unwrap();
     let rpc = core.rpc_service();
     let (result, ()) = tokio::join!(
-        rpc.recover_session_handoff_to_scaffold(recovery_request()),
+        rpc.recover_session_handoff_to_scaffold(recovery_request(), false),
         async {
             let (connection, _) = listener.accept().await.unwrap();
             respond_to_route_receipt(connection, "different-model").await;
@@ -338,7 +339,7 @@ async fn recovery_reference_disappearing_or_changing_during_validation_never_cre
             .unwrap();
         let rpc = core.rpc_service();
         let first = tokio::spawn(async move {
-            rpc.recover_session_handoff_to_scaffold(recovery_request())
+            rpc.recover_session_handoff_to_scaffold(recovery_request(), false)
                 .await
         });
         let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
@@ -406,7 +407,7 @@ async fn imported_context_without_command_admission_is_persisted_and_not_reimpor
         .unwrap();
     let error = core
         .rpc_service()
-        .recover_session_handoff_to_scaffold(recovery_request())
+        .recover_session_handoff_to_scaffold(recovery_request(), false)
         .await
         .unwrap_err();
     assert!(
@@ -560,7 +561,7 @@ async fn concurrent_recovery_rejects_same_target_before_transfer_and_admission()
         .unwrap();
     let rpc = core.rpc_service();
     let first = tokio::spawn(async move {
-        rpc.recover_session_handoff_to_scaffold(recovery_request())
+        rpc.recover_session_handoff_to_scaffold(recovery_request(), false)
             .await
     });
     let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
@@ -610,7 +611,7 @@ async fn concurrent_recovery_rejects_same_target_before_transfer_and_admission()
         "first recovery must retain its target gate while waiting for attachment"
     );
     assert!(core.rpc_service()
-        .recover_session_handoff_to_scaffold(recovery_request()).await.is_err());
+        .recover_session_handoff_to_scaffold(recovery_request(), false).await.is_err());
     let generation = core
         .workspace
         .session_startup(&recovery_request().recover_chat_id)
@@ -714,7 +715,7 @@ async fn recovery_peer_diagnostic_does_not_duplicate_admission() {
     replay.handoff.database_environment = ScaffoldDatabaseEnvironment::StagingSnapshot;
     assert!(
         core.rpc_service()
-            .recover_session_handoff_to_scaffold(replay)
+            .recover_session_handoff_to_scaffold(replay, false)
             .await
             .unwrap_err()
             .to_string()
@@ -1141,7 +1142,7 @@ async fn nonlocal_and_non_omp_sources_are_rejected_before_sandbox_creation() {
         database_environment: ScaffoldDatabaseEnvironment::Local,
     };
     assert!(
-        rpc.handoff_session_to_scaffold(request())
+        rpc.handoff_session_to_scaffold(request(), false)
             .await
             .unwrap_err()
             .to_string()
@@ -1151,7 +1152,7 @@ async fn nonlocal_and_non_omp_sources_are_rejected_before_sandbox_creation() {
         .set_chat_host(source_id, "different-device")
         .unwrap();
     assert!(
-        rpc.handoff_session_to_scaffold(request())
+        rpc.handoff_session_to_scaffold(request(), false)
             .await
             .unwrap_err()
             .to_string()

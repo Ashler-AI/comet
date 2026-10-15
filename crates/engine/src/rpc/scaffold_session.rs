@@ -28,6 +28,8 @@ pub(super) struct PrepareScaffoldSessionParams {
 struct OmpHandoff {
     native_session_id: String,
     cwd: String,
+    #[serde(default)]
+    session_only: bool,
 }
 
 impl EngineRpc {
@@ -295,13 +297,15 @@ impl EngineRpc {
     pub(super) async fn handoff_session_to_scaffold(
         &self,
         params: HandoffSessionToScaffoldParams,
+        session_only: bool,
     ) -> Result<HandoffSessionToScaffoldResult, RpcError> {
-        self.handoff_session_to_scaffold_with(params, None).await
+        self.handoff_session_to_scaffold_with(params, None, session_only).await
     }
 
     pub(super) async fn recover_session_handoff_to_scaffold(
         &self,
         params: comet_rpc::RecoverSessionHandoffToScaffoldParams,
+        session_only: bool,
     ) -> Result<HandoffSessionToScaffoldResult, RpcError> {
         let chat_id = canonical_session_id(&params.recover_chat_id)
             .ok_or_else(|| recovery_error("--recover-chat-id must be a Crew session UUID"))?;
@@ -313,6 +317,7 @@ impl EngineRpc {
         self.handoff_session_to_scaffold_with(
             params.handoff,
             Some((chat_id, params.recover_sandbox_id)),
+            session_only,
         )
         .await
     }
@@ -321,6 +326,7 @@ impl EngineRpc {
         &self,
         params: HandoffSessionToScaffoldParams,
         recovery: Option<(String, String)>,
+        session_only: bool,
     ) -> Result<HandoffSessionToScaffoldResult, RpcError> {
         self.require_session_import()?;
         if self.runtime_profile != RuntimeProfile::LocalController {
@@ -432,6 +438,7 @@ impl EngineRpc {
                     omp_handoff: Some(OmpHandoff {
                         native_session_id: native_session_id.clone(),
                         cwd: cwd.clone(),
+                        session_only,
                     }),
                 },
                 recovery_sandbox,
@@ -1089,6 +1096,7 @@ where
                 scope: scope.clone(),
                 native_session_id: handoff.native_session_id,
                 cwd: handoff.cwd,
+                session_only: handoff.session_only,
             })
             .await?;
             attached.environment = transferred.environment;
