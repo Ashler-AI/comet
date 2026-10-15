@@ -536,6 +536,9 @@ mod tests {
             settled.added_at = workspace.doc().session_ref("owner", REMOTE_CHAT).unwrap().unwrap().added_at
                 + chrono::Duration::milliseconds(1);
             remote_workspace.doc().upsert_session_ref("owner", &settled).unwrap();
+            // Seed through the owning engine, never through the observer. The
+            // legacy writer below then publishes its genuinely stale cached row.
+            remote_workspace.record_session(&current);
             // Simulate a stale workspace published by an older owner release.
             let raw = remote_workspace.doc().doc();
             let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("sessions").get(REMOTE_CHAT) else { panic!("missing owner row") };

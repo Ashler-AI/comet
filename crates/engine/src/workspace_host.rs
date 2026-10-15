@@ -2017,6 +2017,15 @@ mod tests {
             (None, &stale), (Some(&older_index), &stale)] {
             if let Some(index) = index {
                 owner.upsert_session(index).unwrap();
+                // Older releases could overwrite a newer owner row. Exercise
+                // that imported history without weakening today's monotonic writer.
+                if owner.read_sessions().unwrap().iter().any(|row| row.updated_at > index.updated_at) {
+                    let raw = owner.doc();
+                    let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("sessions").get("remote-chat") else { panic!("missing published owner row") };
+                    row.insert("status", serde_json::to_value(index.status).unwrap().as_str().unwrap()).unwrap();
+                    row.insert("updatedAt", index.updated_at.timestamp_millis()).unwrap();
+                    raw.commit();
+                }
                 host.doc().binding().import(&owner.export_snapshot().unwrap()).unwrap();
                 host.inner.publish();
             } else if expected == &stale {
@@ -2122,6 +2131,9 @@ mod tests {
                 let stale = Session { status: SessionStatus::Idle,
                     updated_at: current.updated_at - chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS + 1_000),
                     ..current.clone() };
+                // Only the owning engine publishes the original durable row;
+                // the observing desktop intentionally has no such local intent.
+                remote.record_session(&current);
                 // Simulate an older owner release, bypassing the new monotonic writer.
                 let raw = remote.doc().doc();
                 let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("sessions").get("remote-chat") else { panic!("missing owner row") };
