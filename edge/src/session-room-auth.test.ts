@@ -1158,11 +1158,12 @@ describe("SessionRoom chat authorization", () => {
   it("cold-trims oversized rooms at the current frontier despite an aged checkpoint", async () => {
     const source = new LoroDoc();
     const metadata = source.getMap("metadata");
+    const payload = oversizedPayload();
     try {
       metadata.set("retained", "before checkpoint");
       source.commit();
       const aged = source.frontiers();
-      metadata.set("payload", oversizedPayload());
+      metadata.set("payload", payload);
       metadata.set("retained", "latest accepted value");
       source.commit();
       const current = source.frontiers();
@@ -1173,7 +1174,11 @@ describe("SessionRoom chat authorization", () => {
       const room = makeRoom(sql).room;
       const recovered = await (room as unknown as SessionRoomInternals).ensureDoc();
       expect(recovered.shallowSinceFrontiers()).toEqual(current);
-      expect(recovered.toJSON()).toEqual(source.toJSON());
+      const restored = recovered.getMap("metadata");
+      try {
+        expect(restored.get("retained")).toBe("latest accepted value");
+        expect(Buffer.compare(restored.get("payload") as Uint8Array, payload)).toBe(0);
+      } finally { restored.free(); }
     } finally { metadata.free(); source.free(); }
   });
 
