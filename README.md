@@ -2,6 +2,18 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: shared status watcher deadlock
+
+Crew borrows aliased workspace/local status receivers only once during initial
+subscription and subsequent merges. A queued publisher can no longer deadlock
+between two reads of the same Tokio watch channel and stall every session's status.
+Owner freshness, membership fences and local/remote precedence are unchanged;
+the merge reuses the existing guard without copying the session list.
+
+The owner-status regression now also exercises aliased receivers. All 27 affected
+engine tests passed; an isolated headed demo completed three turns in each of four
+sessions during 320 concurrent metadata writes. Existing installed apps are unchanged.
+
 ## Unreleased: metadata-independent session admission
 
 Desktop and iOS first sends retain an immutable session bootstrap with the original
