@@ -2,6 +2,17 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Crew 0.1.161: cold-room eviction deadlock
+
+Cold-room eviction resolves ownership outside the document-map mutex, then
+rechecks the same handle and live pins before retiring it. Remote ownership
+lookups no longer reacquire the janitor's lock and freeze local IPC, owner
+heartbeats and session streams when the warm cache exceeds 12 rooms.
+
+Workspace recovery merges valid same-device `lastSeenAt` boot clocks
+monotonically. Retained intents and genuine rename, identity, invalid-clock
+and backwards-clock conflicts remain protected.
+
 ## Unreleased: shared account imports
 
 Crew omits missing optional email, display name, organization, and plan fields
