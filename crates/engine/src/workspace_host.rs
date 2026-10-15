@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use tokio::sync::watch;
 
@@ -119,6 +119,12 @@ pub struct WorkspaceHostConfig {
     pub edge: Option<EdgeConfig>,
 }
 
+struct RoomSessionActivity {
+    reference: SessionRef,
+    session: Session,
+    last_message_at: Option<DateTime<Utc>>,
+}
+
 struct WorkspaceHostInner {
     store: Arc<DocsStore>,
     config: WorkspaceHostConfig,
@@ -126,8 +132,8 @@ struct WorkspaceHostInner {
     chats_tx: watch::Sender<Vec<Chat>>,
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
-    /// Current session-room status, independent of workspace CRDT materialization.
-    room_sessions_tx: watch::Sender<Vec<(SessionRef, Session)>>,
+    /// Freshest admitted owner presentation, independent of workspace materialization.
+    room_sessions_tx: watch::Sender<Vec<RoomSessionActivity>>,
     spaces_tx: watch::Sender<Vec<Space>>,
     session_refs_tx: watch::Sender<Vec<SessionRef>>,
     worktree_deletions_tx: watch::Sender<Vec<WorktreeDeletionStage>>,
@@ -919,7 +925,7 @@ impl WorkspaceHost {
     /// The membership lock also fences a watcher racing an unpin or route change.
     pub(crate) fn record_session_activity(
         &self,
-        projection: Option<&comet_proto::SessionRoomProjection>,
+        observed: &SessionRef,
         owner_subject: &str,
         session: &Session,
         last_message_at: Option<i64>,
@@ -932,8 +938,10 @@ impl WorkspaceHost {
         else {
             return Ok(());
         };
-        if crate::session_activity::room_projection(&reference, self.project_scope())
-            .as_ref().map(Option::as_ref) != Some(projection)
+        if observed.chat_id != reference.chat_id
+            || observed.added_at != reference.added_at
+            || observed.environment != reference.environment
+            || crate::session_activity::room_projection(&reference, self.project_scope()).is_none()
             || owner_subject != self.owner_subject()
             || reference.environment.as_ref().is_some_and(|environment| environment.owner_principal != owner_subject)
         {
@@ -952,6 +960,13 @@ impl WorkspaceHost {
                     return Ok(());
                 }
             }
+        }
+        if self.inner.room_sessions_tx.borrow().iter().any(|row| {
+            row.session.chat_id == session.chat_id && row.session.device_id == session.device_id
+                && row.reference.added_at == reference.added_at && row.reference.environment == reference.environment
+                && row.session.updated_at > session.updated_at
+        }) {
+            return Ok(());
         }
         // The owning runtime's heartbeat also proves device liveness when the
         // workspace or relay-status probe is unavailable. Never renew on receipt:
@@ -976,79 +991,32 @@ impl WorkspaceHost {
         }
         // Consumers read this watch directly; a workspace import may remain pending
         // forever when peers have incompatible shallow frontiers.
-        self.inner.room_sessions_tx.send_if_modified(|rows| {
-            if let Some(row) = rows.iter_mut().find(|(_, row)| row.chat_id == session.chat_id) {
-                if row.0.added_at == reference.added_at && row.0.environment == reference.environment
-                    && row.1.device_id == session.device_id && (row.1.updated_at > session.updated_at || row.1 == *session) {
+        let last_message_at = last_message_at.and_then(DateTime::<Utc>::from_timestamp_millis);
+        let indexed = self.inner.sessions_tx.borrow();
+        let projected = indexed.iter().find(|row| row.chat_id == session.chat_id
+            && row.device_id == session.device_id && row.updated_at > session.updated_at).unwrap_or(session);
+        let changed = self.inner.room_sessions_tx.send_if_modified(|rows| {
+            if let Some(row) = rows.iter_mut().find(|row| row.session.chat_id == session.chat_id) {
+                let same_owner = row.reference.added_at == reference.added_at
+                    && row.reference.environment == reference.environment && row.session.device_id == session.device_id;
+                let projected = if same_owner && row.session.updated_at > projected.updated_at { &row.session } else { projected };
+                let last_message_at = if same_owner { row.last_message_at.max(last_message_at) } else { last_message_at };
+                if same_owner && row.session == *projected && row.last_message_at == last_message_at {
                     return false;
                 }
-                *row = (reference.clone(), session.clone());
+                *row = RoomSessionActivity { reference: reference.clone(), session: projected.clone(), last_message_at };
             } else {
-                rows.push((reference.clone(), session.clone()));
+                rows.push(RoomSessionActivity { reference: reference.clone(), session: projected.clone(), last_message_at });
             }
             true
         });
-        if self
-            .inner
-            .sessions_tx
-            .borrow()
-            .iter()
-            .find(|row| row.chat_id == session.chat_id)
-            != Some(session)
-        {
-            self.inner.doc.upsert_session(session)?;
+        if changed {
+            let mut chats = self.inner.doc.read_chats()?;
+            let refs = self.inner.doc.read_session_refs_for(&self.inner.config.user_id)?;
+            chats.retain(|chat| refs.iter().any(|reference| reference.chat_id == chat.id));
+            self.inner.overlay_room_chats(&mut chats, &refs);
+            send_if_changed(&self.inner.chats_tx, chats);
         }
-        if self.inner.doc.chat(&session.chat_id)?.is_none() {
-            // A bare imported membership is not a claim on this device or a
-            // workspace placement. Keep it in the imported-session UI group;
-            // the canonical owner publication still supplies live status.
-            if projection.is_none() {
-                return Ok(());
-            }
-            self.inner.doc.upsert_chat(&Chat {
-                id: session.chat_id.clone(),
-                device_id: session.device_id.clone(),
-                title: reference
-                    .environment
-                    .as_ref()
-                    .and_then(|environment| environment.name.clone()),
-                archived: false,
-                cwd: None,
-                branch: None,
-                checkout_id: None,
-                config: None,
-                last_message_preview: None,
-                last_message_at: last_message_at
-                    .and_then(chrono::DateTime::<Utc>::from_timestamp_millis),
-                created_at: reference.added_at,
-                harness_session_id: None,
-                harness_session_cwd: None,
-                fork_from: None,
-                space_id: None,
-                last_seen_at: None,
-            })?;
-            return Ok(());
-        }
-        let Some(at) = last_message_at
-            .filter(|at| chrono::DateTime::<Utc>::from_timestamp_millis(*at).is_some())
-        else {
-            return Ok(());
-        };
-        let binding = self.inner.doc.binding();
-        let _operation = binding.operation();
-        let raw = self.inner.doc.doc();
-        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) =
-            raw.get_map("chats").get(&session.chat_id)
-        else {
-            return Ok(());
-        };
-        if matches!(row.get("lastMessageAt"), Some(loro::ValueOrContainer::Value(loro::LoroValue::I64(current))) if current >= at)
-        {
-            return Ok(());
-        }
-        row.insert("lastMessageAt", at)
-            .map_err(comet_doc::DocError::from)?;
-        binding.commit()?;
         Ok(())
     }
 
@@ -1471,10 +1439,10 @@ impl WorkspaceHost {
 
 impl WorkspaceHostInner {
     fn publish(&self) {
+        let _updates = lock(&self.session_ref_updates);
         match (|| -> Result<_, EngineError> {
             self.doc.migrate_execution_rows()?;
             let mut state = self.doc.read_all()?;
-            let _updates = lock(&self.session_ref_updates);
             backfill_local_session_refs(
                 &self.store,
                 &self.doc,
@@ -1486,14 +1454,27 @@ impl WorkspaceHostInner {
             state.session_refs = self.doc.read_session_refs_for(&self.config.user_id)?;
             retain_visible_sessions(&mut state.chats, &mut state.sessions, &state.session_refs);
             self.room_sessions_tx.send_if_modified(|rows| {
+                let mut changed = false;
                 let before = rows.len();
-                rows.retain(|(observed, session)| state.session_refs.iter().any(|reference| {
-                    reference.chat_id == session.chat_id && reference.added_at == observed.added_at
-                        && reference.environment == observed.environment
+                rows.retain(|row| state.session_refs.iter().any(|reference| {
+                    reference.chat_id == row.session.chat_id && reference.added_at == row.reference.added_at
+                        && reference.environment == row.reference.environment
                         && (crate::session_activity::projection(reference, &self.config.project_scope).is_some()
-                            || state.chats.iter().find(|chat| chat.id == session.chat_id).is_none_or(|chat| chat.device_id == session.device_id))
+                            || state.chats.iter().find(|chat| chat.id == row.session.chat_id).is_none_or(|chat| chat.device_id == row.session.device_id))
                 }));
-                before != rows.len()
+                changed |= before != rows.len();
+                // A newer same-owner index is also a presentation observation.
+                // Retain it across stale imports without writing it back to the doc.
+                for row in rows.iter_mut() {
+                    if let Some(newer) = state.sessions.iter().find(|session| {
+                        session.chat_id == row.session.chat_id && session.device_id == row.session.device_id
+                            && session.updated_at > row.session.updated_at
+                    }) {
+                        row.session = newer.clone();
+                        changed = true;
+                    }
+                }
+                changed
             });
             Ok(state)
         })() {
@@ -1514,6 +1495,7 @@ impl WorkspaceHostInner {
                 }
                 drop(titles);
                 drop(previous);
+                self.overlay_room_chats(&mut state.chats, &state.session_refs);
                 send_if_changed(&self.chats_tx, state.chats);
                 send_if_changed(&self.devices_tx, state.devices);
                 send_if_changed(&self.sessions_tx, state.sessions);
@@ -1523,6 +1505,31 @@ impl WorkspaceHostInner {
             }
             Err(err) => {
                 tracing::warn!(error = %err, "workspace read failed");
+            }
+        }
+    }
+
+    /// Borrowed owner activity is presentation state, never a workspace edit.
+    fn overlay_room_chats(&self, chats: &mut Vec<Chat>, refs: &[SessionRef]) {
+        for row in self.room_sessions_tx.borrow().iter().filter(|row| {
+            refs.iter().any(|reference| reference.chat_id == row.session.chat_id
+                && reference.added_at == row.reference.added_at && reference.environment == row.reference.environment)
+        }) {
+            if let Some(chat) = chats.iter_mut().find(|chat| chat.id == row.session.chat_id) {
+                if crate::session_activity::projection(&row.reference, &self.config.project_scope).is_some()
+                    || chat.device_id == row.session.device_id
+                {
+                    chat.last_message_at = chat.last_message_at.max(row.last_message_at);
+                }
+            } else if crate::session_activity::projection(&row.reference, &self.config.project_scope).is_some() {
+                chats.push(Chat {
+                    id: row.session.chat_id.clone(), device_id: row.session.device_id.clone(),
+                    title: row.reference.environment.as_ref().and_then(|environment| environment.name.clone()),
+                    archived: false, cwd: None, branch: None, checkout_id: None, config: None,
+                    last_message_preview: None, last_message_at: row.last_message_at,
+                    created_at: row.reference.added_at, harness_session_id: None, harness_session_cwd: None,
+                    fork_from: None, space_id: None, last_seen_at: None,
+                });
             }
         }
     }
@@ -1681,12 +1688,12 @@ fn merge_sessions(
     rows: &[Session],
     local: &[Session],
     refs: &[SessionRef],
-    room_rows: &[(SessionRef, Session)],
+    room_rows: &[RoomSessionActivity],
 ) -> Vec<Session> {
-    let projected = room_rows.iter().filter(|(observed, session)| {
-        refs.iter().any(|reference| reference.chat_id == session.chat_id
-            && reference.added_at == observed.added_at && reference.environment == observed.environment)
-    }).map(|(_, session)| session);
+    let projected = room_rows.iter().filter(|row| {
+        refs.iter().any(|reference| reference.chat_id == row.session.chat_id
+            && reference.added_at == row.reference.added_at && reference.environment == row.reference.environment)
+    }).map(|row| &row.session);
     let remote: std::collections::HashSet<&str> = projected.clone()
         .filter(|session| session.device_id != device_id)
         .map(|session| session.chat_id.as_str())
@@ -1970,6 +1977,92 @@ mod tests {
     }
 
     #[test]
+    fn delayed_room_status_cannot_replace_a_newer_same_owner_index_status() {
+        let reference=SessionRef {chat_id:"remote-chat".into(),added_at:Utc.timestamp_millis_opt(1).unwrap(),environment:None,startup:None};
+        let mut observed=session("remote-chat","remote");
+        observed.status=SessionStatus::Working;
+        observed.updated_at=Utc.timestamp_millis_opt(2_000).unwrap();
+        let mut current=observed.clone();
+        current.status=SessionStatus::Idle;
+        current.updated_at=Utc.timestamp_millis_opt(3_000).unwrap();
+        let room=super::RoomSessionActivity {reference:reference.clone(),session:observed,last_message_at:None};
+        assert_eq!(merge_sessions("desktop",&[current.clone()],&[],&[reference],&[room]),vec![current]);
+    }
+
+    #[tokio::test]
+    async fn newer_owner_index_survives_stale_import_until_membership_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let host = WorkspaceHost::open(store, WorkspaceHostConfig {
+            device_id: "desktop".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project".into(), user_id: "owner".into(), edge: None,
+        }).unwrap();
+        host.create_space("remote-space", "remote", "/tmp", None, false).unwrap();
+        host.create_chat("remote-chat", "remote-space", None, None).unwrap();
+        host.inner.publish();
+        let reference = host.doc().session_ref("owner", "remote-chat").unwrap().unwrap();
+        let owner = comet_doc::WorkspaceDoc::from_doc(host.doc().doc().fork());
+        let observed = Session { status: SessionStatus::Working,
+            updated_at: Utc.timestamp_millis_opt(5_000).unwrap(), ..session("remote-chat", "remote") };
+        let fresh = Session { status: SessionStatus::AwaitingInput,
+            updated_at: Utc.timestamp_millis_opt(20_000).unwrap(), ..observed.clone() };
+        let stale = Session { status: SessionStatus::Idle,
+            updated_at: Utc.timestamp_millis_opt(10_000).unwrap(), ..observed.clone() };
+        let older_index = Session { updated_at: Utc.timestamp_millis_opt(7_000).unwrap(), ..observed.clone() };
+        let mut local = session("local-chat", "desktop");
+        let (local_tx, local_rx) = tokio::sync::watch::channel(vec![local.clone()]);
+        let mut merged = host.merged_sessions_watch(local_rx);
+        host.record_session_activity(&reference, "owner", &observed, None).unwrap();
+        for (index, expected) in [(None, &observed), (Some(&fresh), &fresh), (Some(&stale), &fresh),
+            (None, &stale), (Some(&older_index), &stale)] {
+            if let Some(index) = index {
+                owner.upsert_session(index).unwrap();
+                // Older releases could overwrite a newer owner row. Exercise
+                // that imported history without weakening today's monotonic writer.
+                if owner.read_sessions().unwrap().iter().any(|row| row.updated_at > index.updated_at) {
+                    let raw = owner.doc();
+                    let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("sessions").get("remote-chat") else { panic!("missing published owner row") };
+                    row.insert("status", serde_json::to_value(index.status).unwrap().as_str().unwrap()).unwrap();
+                    row.insert("updatedAt", index.updated_at.timestamp_millis()).unwrap();
+                    raw.commit();
+                }
+                host.doc().binding().import(&owner.export_snapshot().unwrap()).unwrap();
+                host.inner.publish();
+            } else if expected == &stale {
+                let mut rejoined = reference.clone();
+                rejoined.added_at += chrono::Duration::milliseconds(1);
+                host.doc().upsert_session_ref("owner", &rejoined).unwrap();
+                host.inner.publish();
+                assert!(host.inner.room_sessions_tx.borrow().is_empty(),
+                    "membership changes must discard the retained presentation watermark");
+                host.record_session_activity(&reference, "owner", &fresh, None).unwrap();
+                assert!(host.inner.room_sessions_tx.borrow().is_empty(), "obsolete callbacks cannot restore it");
+                // The new membership starts from its own T10 index, not the
+                // previous T20 watermark, even when its first room snapshot is T5.
+                host.record_session_activity(&rejoined, "owner", &observed, None).unwrap();
+            }
+            // Require a new merge after each import instead of accepting the
+            // consumer's previous T20 publication before it sees stale T10.
+            local.updated_at += chrono::Duration::milliseconds(1);
+            local_tx.send_replace(vec![local.clone()]);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let ready = {
+                        let rows = merged.borrow_and_update();
+                        rows.iter().any(|row| row == expected) && rows.iter().any(|row| row == &local)
+                    };
+                    if ready { break; }
+                    merged.changed().await.unwrap();
+                }
+            }).await.unwrap_or_else(|_| panic!("expected {expected:?}; got {:?}", *merged.borrow()));
+            if index.is_some() {
+                assert_eq!(host.doc().read_sessions().unwrap(), vec![index.unwrap().clone()],
+                    "retaining a presentation candidate must not repair the raw workspace index");
+            }
+        }
+    }
+
+    #[test]
     fn merged_statuses_include_native_handoff_without_collapsing_child_sessions() {
         let id = "00000000-0000-4000-8000-000000000217";
         let mut live = session(&format!("{id}::session::{id}"), "device-a");
@@ -2020,13 +2113,27 @@ mod tests {
             for redeliver in [false, true] {
                 current.status = status;
                 current.updated_at += chrono::Duration::milliseconds(1);
-                desktop.record_session_activity(None, "owner", &current, None).unwrap();
-                // Do not materialize sessions_tx yet: this is the actual gap
-                // between a room delivery and the asynchronous workspace publish.
+                let reference = desktop.doc().session_ref("owner", "remote-chat").unwrap().unwrap();
+                desktop.doc().binding().acknowledge(&desktop.doc().binding().oplog_vv()).unwrap();
+                let before_observation = desktop.doc().doc().oplog_vv();
+                desktop.record_session_activity(&reference, "owner", &current, Some(current.updated_at.timestamp_millis())).unwrap();
+                let delayed = Session { status: SessionStatus::Idle,
+                    updated_at: current.updated_at - chrono::Duration::milliseconds(1), ..current.clone() };
+                desktop.record_session_activity(&reference, "owner", &delayed, Some(current.updated_at.timestamp_millis() + 1)).unwrap();
+                assert_eq!(desktop.doc().doc().oplog_vv(), before_observation,
+                    "borrowed status and recency must not commit workspace operations");
+                let scope = desktop.inner.store.document_scope(super::WORKSPACE_DOC_ID).unwrap().unwrap();
+                assert!(desktop.inner.store.load_pending_records(&scope).unwrap().is_empty(),
+                    "remote heartbeats must not become pending semantic recovery edits");
+                assert_eq!(desktop.inner.room_sessions_tx.borrow()[0].session, current,
+                    "a delayed same-owner status must not rewind the current observation");
                 remote.doc().binding().import(&desktop.doc().export_snapshot().unwrap()).unwrap();
                 let stale = Session { status: SessionStatus::Idle,
                     updated_at: current.updated_at - chrono::Duration::milliseconds(comet_proto::view::SESSION_STALE_MS + 1_000),
                     ..current.clone() };
+                // Only the owning engine publishes the original durable row;
+                // the observing desktop intentionally has no such local intent.
+                remote.record_session(&current);
                 // Simulate an older owner release, bypassing the new monotonic writer.
                 let raw = remote.doc().doc();
                 let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = raw.get_map("sessions").get("remote-chat") else { panic!("missing owner row") };
@@ -2040,12 +2147,11 @@ mod tests {
                     let mut reference = desktop.doc().session_ref("owner", "remote-chat").unwrap().unwrap();
                     reference.added_at += chrono::Duration::milliseconds(1);
                     desktop.doc().upsert_session_ref("owner", &reference).unwrap();
-                    desktop.record_session_activity(None, "owner", &current, None).unwrap();
+                    desktop.record_session_activity(&reference, "owner", &current, None).unwrap();
                 }
                 desktop.inner.publish();
-                assert_eq!(*desktop.watch_session_rows().borrow(),
-                    vec![if redeliver { current.clone() } else { stale }],
-                    "queued redelivery determines whether raw stale state is observable");
+                assert_eq!(*desktop.watch_session_rows().borrow(), vec![stale],
+                    "observing or redelivering a room must never rewrite the owner's raw index");
                 live.updated_at += chrono::Duration::milliseconds(1);
                 local_tx.send_replace(vec![live.clone(), abandoned.clone()]);
                 let rows = tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -2058,29 +2164,116 @@ mod tests {
                     }
                 }).await.unwrap_or_else(|_| panic!("owner {status:?}, redelivery={redeliver}: {:?}", *merged.borrow()));
                 assert_eq!(rows.iter().find(|row| row.chat_id == "remote-chat"), Some(&current),
-                    "both raw-index orderings must expose the genuine room owner, not the abandoned local run");
+                    "a stale durable index must not replace the genuine room owner with the abandoned local run");
             }
         }
     }
 
     #[tokio::test]
-    async fn older_room_observations_cannot_regress_the_owner_watch_or_index() {
+    async fn older_room_observations_cannot_regress_the_view_or_write_the_index() {
         let temp = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
         let host = WorkspaceHost::open(store, WorkspaceHostConfig { device_id: "desktop".into(), device_name: "Test".into(), platform: "test".into(),
             project_scope: "project".into(), user_id: "owner".into(), edge: None }).unwrap();
         host.create_space("space", "remote", "/tmp", None, false).unwrap();
         host.create_chat("chat", "space", None, None).unwrap();
+        let reference = host.doc().session_ref("owner", "chat").unwrap().unwrap();
         let current = Session { updated_at: Utc.timestamp_millis_opt(3_000).unwrap(), ..session("chat", "remote") };
-        host.record_session_activity(None, "owner", &current, None).unwrap();
+        host.record_session_activity(&reference, "owner", &current, None).unwrap();
         let stale = Session { status: SessionStatus::Working, updated_at: Utc.timestamp_millis_opt(2_000).unwrap(), ..current.clone() };
-        host.record_session_activity(None, "owner", &stale, None).unwrap();
-        assert_eq!(host.doc().read_sessions().unwrap(), vec![current.clone()]);
+        host.record_session_activity(&reference, "owner", &stale, None).unwrap();
+        assert!(host.doc().read_sessions().unwrap().is_empty());
         let rooms = host.inner.room_sessions_tx.borrow();
-        assert_eq!(rooms[0].1, current);
+        assert_eq!(rooms[0].session, current);
         let newer = Session { status: SessionStatus::AwaitingInput, updated_at: Utc.timestamp_millis_opt(4_000).unwrap(), ..current };
         let refs = host.doc().read_session_refs_for("owner").unwrap();
         assert_eq!(merge_sessions("desktop", std::slice::from_ref(&newer), &[], &refs, &rooms), vec![newer]);
+    }
+
+    #[tokio::test]
+    async fn borrowed_scaffold_activity_is_view_only_and_membership_fenced() {
+        use comet_proto::{CollaborationScope, ScaffoldLifecycle, SessionEnvironment, SessionEnvironmentSource};
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(comet_sync::DocsStore::open(temp.path()).unwrap());
+        let host = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
+            device_id: "desktop".into(), device_name: "Test".into(), platform: "test".into(),
+            project_scope: "project".into(), user_id: "owner".into(), edge: None,
+        }).unwrap();
+        host.upsert_session_ref("remote-chat", Some(SessionEnvironment {
+            source: SessionEnvironmentSource::Scaffold {
+                sandbox_id: "sandbox".into(), region: None, lifecycle: ScaffoldLifecycle::Ready,
+                lifecycle_epoch: Some(1), links: Default::default(),
+            },
+            name: Some("Remote chat".into()), owner_principal: "owner".into(),
+            scope: CollaborationScope { project_id: "project".into(), deployment_id: Some("deployment".into()),
+                session_id: Some("remote-chat".into()), unknown: Default::default() },
+            source_ref: None, last_activity_at: None, database_environment: None, unknown: Default::default(),
+        })).unwrap();
+        // Observers capture the materialized membership clock, whose persisted
+        // precision may differ from the original mutation's wall-clock value.
+        let reference = host.doc().session_ref("owner", "remote-chat").unwrap().unwrap();
+        host.inner.publish();
+        host.doc().binding().acknowledge(&host.doc().binding().oplog_vv()).unwrap();
+        let before = host.doc().doc().oplog_vv();
+        let current = Session { status: SessionStatus::Working,
+            updated_at: Utc.timestamp_millis_opt(2_000).unwrap(),
+            ..session("remote-chat", "comet-scaffold-sandbox-e1") };
+        host.record_session_activity(&reference, "owner", &current, Some(1_500)).unwrap();
+        assert_eq!(host.doc().doc().oplog_vv(), before);
+        assert!(host.doc().chat("remote-chat").unwrap().is_none());
+        assert!(host.doc().read_sessions().unwrap().is_empty());
+        let scope = store.document_scope(super::WORKSPACE_DOC_ID).unwrap().unwrap();
+        assert!(store.load_pending_records(&scope).unwrap().is_empty(),
+            "status, placeholder metadata, and recency must all remain borrowed view state");
+        let chats = host.watch_chats();
+        assert_eq!(chats.borrow()[0].last_message_at, Some(Utc.timestamp_millis_opt(1_500).unwrap()));
+        host.inner.publish();
+        assert_eq!(chats.borrow()[0].title.as_deref(), Some("Remote chat"));
+        assert_eq!(host.inner.room_sessions_tx.borrow()[0].session, current);
+
+        // Even a newer publication cannot cross subject, device lifecycle, or route.
+        let newer = Session { updated_at: Utc.timestamp_millis_opt(3_000).unwrap(), ..current.clone() };
+        host.record_session_activity(&reference, "foreign", &newer, Some(3_000)).unwrap();
+        let foreign = Session { device_id: "comet-scaffold-sandbox-e2".into(), ..newer.clone() };
+        host.record_session_activity(&reference, "owner", &foreign, Some(3_000)).unwrap();
+        let mut wrong_route = reference.clone();
+        wrong_route.environment.as_mut().unwrap().scope.deployment_id = Some("other".into());
+        host.record_session_activity(&wrong_route, "owner", &newer, Some(3_000)).unwrap();
+        assert_eq!(host.inner.room_sessions_tx.borrow()[0].session, current);
+        assert_eq!(host.doc().doc().oplog_vv(), before);
+
+        for change in ["membership", "project", "deployment", "lifecycle", "owner"] {
+            let mut changed = reference.clone();
+            match change {
+                "membership" => changed.added_at += chrono::Duration::milliseconds(1),
+                "project" => changed.environment.as_mut().unwrap().scope.project_id = "other".into(),
+                "deployment" => changed.environment.as_mut().unwrap().scope.deployment_id = Some("other".into()),
+                "lifecycle" => {
+                    if let SessionEnvironmentSource::Scaffold { lifecycle_epoch, .. } = &mut changed.environment.as_mut().unwrap().source {
+                        *lifecycle_epoch = Some(2);
+                    }
+                }
+                "owner" => changed.environment.as_mut().unwrap().owner_principal = "foreign".into(),
+                _ => unreachable!(),
+            }
+            host.doc().upsert_session_ref("owner", &changed).unwrap();
+            // A callback queued before the workspace watch catches up is fenced too.
+            host.record_session_activity(&reference, "owner", &newer, Some(3_000)).unwrap();
+            assert_eq!(host.inner.room_sessions_tx.borrow()[0].session, current);
+            host.inner.publish();
+            assert!(host.inner.room_sessions_tx.borrow().is_empty(), "{change} must invalidate the old observation");
+            assert!(chats.borrow().is_empty(), "{change} must remove borrowed recency and metadata");
+            host.doc().upsert_session_ref("owner", &reference).unwrap();
+            host.record_session_activity(&reference, "owner", &current, Some(1_500)).unwrap();
+        }
+        let mut rejoined = reference.clone();
+        rejoined.added_at += chrono::Duration::milliseconds(1);
+        host.doc().upsert_session_ref("owner", &rejoined).unwrap();
+        let older = Session { status: SessionStatus::Idle, updated_at: Utc.timestamp_millis_opt(1_000).unwrap(), ..current };
+        host.record_session_activity(&rejoined, "owner", &older, Some(900)).unwrap();
+        assert_eq!(host.inner.room_sessions_tx.borrow()[0].session, older,
+            "a different membership has its own clock; never manufacture a fresh heartbeat");
+        assert_eq!(chats.borrow()[0].last_message_at, Some(Utc.timestamp_millis_opt(900).unwrap()));
     }
 
     #[tokio::test]

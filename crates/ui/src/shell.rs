@@ -48,7 +48,7 @@ use crate::settings::{
 };
 use crate::state::{
     ActiveHarnessGoal, AppState, ChatStartupPhase, ConnectionStatus, EngineBootConfig, GatePhase,
-    Indicator, TranscriptEntriesChange, format_time_ago, latest_active_omp_goal,
+    Indicator, RetainedSend, RetainedSendRecoveryScope, TranscriptEntriesChange, format_time_ago, latest_active_omp_goal,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -1552,6 +1552,8 @@ pub struct Shell {
     space_boot_applied: bool,
     /// `settings.last_room_id` applied once after the first chat frame.
     room_boot_applied: bool,
+    retained_bootstrap_scope: Option<RetainedSendRecoveryScope>,
+    retained_bootstrap_ready: bool,
     user_menu_open: bool,
     /// Session-scoped multiplayer surfaces.
     command_palette_open: bool,
@@ -1788,6 +1790,8 @@ impl Shell {
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             room_boot_applied: false,
+            retained_bootstrap_scope: None,
+            retained_bootstrap_ready: true,
             user_menu_open: false,
             command_palette_open: false,
             activity_open: false,
@@ -1859,6 +1863,8 @@ impl Shell {
         shell.sync_splash(&initial_connection, cx);
         shell.refresh_account_usage(cx);
         shell.refresh_active_agent_account(cx);
+        let recovery_state = shell.state.clone();
+        shell.recover_retained_bootstraps(&recovery_state, cx);
         shell
     }
 
@@ -1925,7 +1931,34 @@ impl Shell {
         }
     }
 
+    fn recover_retained_bootstraps(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        if self.retained_bootstrap_scope.as_ref().is_some_and(|scope| state.read(cx).retained_send_recovery_scope_matches(scope)) { return }
+        let scope = state.read(cx).retained_send_recovery_scope();
+        if self.retained_bootstrap_scope == scope { return }
+        self.retained_bootstrap_scope = scope.clone();
+        self.retained_bootstrap_ready = scope.is_none();
+        self.room_boot_applied = false;
+        let Some(scope) = scope else { return };
+        let state = state.clone();
+        cx.spawn(async move |this, cx| {
+            let scan_scope = scope.clone();
+            let result = cx.background_executor().spawn(async move { RetainedSend::recover_bootstraps(scan_scope) }).await;
+            this.update(cx, |shell, cx| {
+                if shell.retained_bootstrap_scope.as_ref() != Some(&scope)
+                    || !state.read(cx).retained_send_recovery_scope_matches(&scope) { return }
+                shell.retained_bootstrap_ready = true;
+                match result {
+                    Ok(bootstraps) => state.update(cx, |state, cx| { state.restore_retained_bootstraps(bootstraps); cx.notify(); }),
+                    Err(error) => tracing::warn!(%error, "could not restore retained Crew session presentation"),
+                }
+                shell.on_state_changed(&state, cx);
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        self.recover_retained_bootstraps(state, cx);
         if self.account_usage.is_none()
             && self.account_usage_error.is_none()
             && !self.account_usage_loading
@@ -1982,9 +2015,9 @@ impl Shell {
                 state.update(cx, |s, cx| s.select_space(Some(last), cx));
             }
         }
-        // Restore the last shared thread after the first chat frame. A missing
-        // room is ignored; the normal auto-selection remains visible.
-        if !self.room_boot_applied && !state.read(cx).chats.is_empty() {
+        // Retained first sends may have no catalog row yet. Recover their scoped
+        // presentation before deciding whether the saved selection is missing.
+        if self.retained_bootstrap_ready && !self.room_boot_applied && !state.read(cx).chats.is_empty() {
             self.room_boot_applied = true;
             if let Some(last) = self.settings.last_room_id.clone()
                 && state.read(cx).chats.iter().any(|chat| chat.id == last)
@@ -2004,7 +2037,7 @@ impl Shell {
                     chat_space,
                 )
             };
-            if selected_chat != self.settings.last_room_id {
+            if self.room_boot_applied && selected_chat != self.settings.last_room_id {
                 self.settings.last_room_id = selected_chat.clone();
                 self.schedule_save(cx);
             }
@@ -7939,7 +7972,6 @@ impl Shell {
         }
         if let Some(phase) = state.chat_startup_phase(&chat_id) {
             let label = match phase {
-                ChatStartupPhase::Persisting => "Saving session…",
                 ChatStartupPhase::PreparingCheckout => "Creating worktree…",
                 ChatStartupPhase::UploadingAttachments => "Uploading attachments…",
                 ChatStartupPhase::Admitting => "Starting agent…",
@@ -8862,6 +8894,68 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+    #[gpui::test]
+    async fn restart_restores_authenticated_bootstrap_without_catalog_metadata(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let mut seed = AppState::new();
+        seed.data_dir = Some(dir.path().into());
+        seed.local_device_id = Some("local".into());
+        seed.auth = Some(comet_proto::AuthState::SignedIn {
+            user:comet_proto::UserProfile { id:"user".into(), email:"user@example.com".into(), name:None }, project_scope:"project".into(),
+        });
+        let chat = serde_json::json!({"id":"unprojected", "deviceId":"local", "spaceId":"folder", "cwd":"/prepared", "archived":false, "createdAt":Utc::now()});
+        let space = serde_json::json!({"id":"folder", "deviceId":"local", "path":"/repo", "gitDetected":true, "createdAt":Utc::now()});
+        let id = uuid::Uuid::new_v4().to_string();
+        let issued = Utc::now().timestamp_millis();
+        let send = RetainedSend { prompt:"original instruction".into(), message_id:id.clone(), accepted:false, applied:false, terminal:false,
+            failure:None, cancelled:false, admission_error:Some("command_persistence_failed: disk full".into()),
+            params:serde_json::json!({"chatId":"unprojected", "commandId":uuid::Uuid::new_v4().to_string(), "issuedAt":issued, "expiresAt":issued+60_000,
+                "command":{"kind":"run", "messageId":id, "request":{"prompt":"original instruction", "cwd":"/prepared", "sandbox":"workspaceWrite", "autoApprove":true, "attachments":[]}}, "targetDeviceId":null,
+                "roomProjection":null, "bootstrap":{"chat":chat, "space":space}}),
+        };
+        let path = seed.send_journal_path("unprojected").unwrap();
+        RetainedSend::save(path.clone(), "unprojected", send.clone()).unwrap();
+        // Another authenticated user's bootstrap is not browse metadata for this user.
+        seed.auth = Some(comet_proto::AuthState::SignedIn {
+            user:comet_proto::UserProfile { id:"other-user".into(), email:"other@example.com".into(), name:None }, project_scope:"project".into(),
+        });
+        let mut other = send.clone();
+        other.message_id = uuid::Uuid::new_v4().to_string();
+        other.params["chatId"] = "other-user-chat".into();
+        other.params["bootstrap"]["chat"]["id"] = "other-user-chat".into();
+        other.params["commandId"] = uuid::Uuid::new_v4().to_string().into();
+        other.params["command"]["messageId"] = other.message_id.clone().into();
+        RetainedSend::save(seed.send_journal_path("other-user-chat").unwrap(), "other-user-chat", other).unwrap();
+        seed.auth = Some(comet_proto::AuthState::SignedIn {
+            user:comet_proto::UserProfile { id:"user".into(), email:"user@example.com".into(), name:None }, project_scope:"project".into(),
+        });
+        let settings = UiSettings { last_room_id:Some("unprojected".into()), ..Default::default() };
+        settings.save(dir.path()).unwrap();
+        let state = cx.new(|_| seed);
+        let shell = cx.new(|cx| Shell::new(state.clone(), EngineBootConfig {
+            data_dir:dir.path().into(), ipc_port:0, edge_url:"http://127.0.0.1:0".into(), edge_token:None,
+            project_scope:"project".into(), deployment_id:None, scaffold_url:None,
+            default_harness:comet_proto::HarnessId::Mock, runtime_profile:comet_proto::RuntimeProfile::LocalController,
+        }, cx));
+        cx.condition(&shell, |shell, cx| shell.retained_bootstrap_ready && shell.room_boot_applied
+            && state.read(cx).selected_chat.as_deref() == Some("unprojected")).await;
+        state.update(cx, |state, _| {
+            assert_eq!(state.chats.len(), 1);
+            assert_eq!(state.selected_chat_row().unwrap().cwd.as_deref(), Some("/prepared"));
+            assert!(state.chat_is_pending("unprojected"));
+            assert_eq!(state.space_row("folder").unwrap().path, "/repo");
+            assert_eq!(state.chat_startup_phase("unprojected"), None);
+            state.apply_chats(Vec::new());
+            state.apply_spaces(Vec::new());
+            assert_eq!(state.space_row("folder").unwrap().path, "/repo");
+            assert_eq!(state.selected_chat.as_deref(), Some("unprojected"));
+            assert!(state.chat_is_pending("unprojected"));
+        });
+        assert_eq!(RetainedSend::load(path, "unprojected").unwrap()[0].params, send.params);
+        assert_eq!(shell.read_with(cx, |shell, _| shell.settings.last_room_id.clone()).as_deref(), Some("unprojected"));
+    }
+
 
     #[gpui::test]
     fn deleting_first_send_chats_does_not_resurrect_optimistic_rows(cx: &mut gpui::TestAppContext) {

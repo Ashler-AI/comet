@@ -83,6 +83,9 @@ const MIGRATIONS: &[&str] = &[
         SELECT rowid, doc_id, saved_at, bytes FROM snapshots;
      DROP TABLE snapshots;
      ALTER TABLE snapshots_blob_tail RENAME TO snapshots;",
+    // v10 — immutable host setup is committed with its first command, not an index write.
+    "ALTER TABLE semantic_intents ADD COLUMN admission_context BLOB;
+     CREATE TABLE session_startups (chat_id TEXT PRIMARY KEY, worktree_path TEXT, cancelled INTEGER NOT NULL DEFAULT 0 CHECK(cancelled IN (0,1))) STRICT;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -199,6 +202,77 @@ impl DocsStore {
         let Some(bytes) = bytes else { return Ok(None) };
         let record: PendingRecord = serde_json::from_slice(&bytes)?;
         record.value.map(serde_json::from_value).transpose().map_err(StoreError::from)
+    }
+
+    /// Save the exact command, local provenance and optional execution setup together.
+    pub fn save_command_admission(
+        &self, doc_id: &str, snapshot_id: &str, record: &PendingRecord,
+        trust_key: Option<&str>, context: Option<&[u8]>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let scope: Option<String> = tx.query_row("SELECT scope FROM document_scopes WHERE doc_id = ?1", params![snapshot_id], |row| row.get(0)).optional()?;
+        if scope.as_deref() != Some(doc_id) {
+            return Err(StoreError::ScopeConflict("command admission requires its exact claimed room".into()));
+        }
+        if tx.query_row("SELECT 1 FROM session_startups WHERE chat_id=?1 AND cancelled=1", params![snapshot_id], |_| Ok(())).optional()?.is_some() {
+            return Err(StoreError::ScopeConflict("command_startup_cancelled".into()));
+        }
+        if record.container != "commands" || record.value.is_none() || record.acknowledged {
+            return Err(StoreError::ScopeConflict("invalid command admission record".into()));
+        }
+        let existing: Option<Vec<u8>> = tx.query_row(
+            "SELECT value FROM semantic_intents WHERE doc_id=?1 AND container='commands' AND record_id=?2",
+            params![doc_id, record.key], |row| row.get(0),
+        ).optional()?;
+        if existing.is_some() {
+            return Err(StoreError::ScopeConflict("command was already admitted; read its original outcome".into()));
+        }
+        upsert_pending_records(&tx, doc_id, [record], &mut self.record_buffer.lock().unwrap_or_else(PoisonError::into_inner))?;
+        if let Some(context) = context {
+            tx.execute("UPDATE semantic_intents SET admission_context=?3 WHERE doc_id=?1 AND container='commands' AND record_id=?2", params![doc_id, record.key, context])?;
+        }
+        if let Some(key) = trust_key {
+            tx.execute("DELETE FROM trusted_local_commands WHERE created_at < ?1", params![now_ms().saturating_sub(comet_doc::COMMAND_DEFAULT_TTL_MS)])?;
+            tx.execute("INSERT OR IGNORE INTO trusted_local_commands(command_id,created_at) VALUES (?1,?2)", params![key, now_ms()])?;
+        }
+        tx.execute("INSERT INTO pending_nudges(chat_id,nudge_id,accepted_at) VALUES (?1,?2,?3) ON CONFLICT(chat_id) DO UPDATE SET nudge_id=excluded.nudge_id,accepted_at=excluded.accepted_at",
+            params![snapshot_id,record.key,now_ms()])?;
+        tx.execute("INSERT OR IGNORE INTO local_migrations(name,applied_at) VALUES (?1,?2)", params![format!("semantic/{doc_id}"), now_ms()])?;
+        tx.execute("DELETE FROM session_startups WHERE chat_id=?1", params![snapshot_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_command_admission_context(&self, doc_id: &str, command_id: Option<&str>) -> Result<Option<Vec<u8>>, StoreError> {
+        let conn = self.conn();
+        if let Some(command_id) = command_id {
+            Ok(conn.query_row("SELECT admission_context FROM semantic_intents WHERE doc_id=?1 AND container='commands' AND record_id=?2",
+                params![doc_id,command_id], |row| row.get(0)).optional()?.flatten())
+        } else {
+            Ok(conn.query_row("SELECT admission_context FROM semantic_intents WHERE doc_id=?1 AND container='commands' AND admission_context IS NOT NULL ORDER BY json_extract(CAST(value AS TEXT),'$.value.issuedAt') DESC,record_id DESC LIMIT 1",
+                params![doc_id], |row| row.get(0)).optional()?.flatten())
+        }
+    }
+
+    /// Cancellation and checkout registration share the admission store's transaction gate.
+    pub fn cancel_session_startup(&self, chat_id: &str) -> Result<(bool, Option<String>), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let admitted = tx.query_row("SELECT 1 FROM semantic_intents WHERE doc_id=(SELECT scope FROM document_scopes WHERE doc_id=?1) AND container='commands' LIMIT 1", params![chat_id], |_| Ok(())).optional()?.is_some();
+        if admitted { return Ok((false,None)); }
+        tx.execute("INSERT INTO session_startups(chat_id,cancelled) VALUES (?1,1) ON CONFLICT(chat_id) DO UPDATE SET cancelled=1", params![chat_id])?;
+        let path = tx.query_row("SELECT worktree_path FROM session_startups WHERE chat_id=?1", params![chat_id], |row| row.get(0))?;
+        tx.commit()?;
+        Ok((true,path))
+    }
+
+    pub fn register_startup_worktree(&self, chat_id: &str, path: &str) -> Result<bool, StoreError> {
+        Ok(self.conn().execute("INSERT INTO session_startups(chat_id,worktree_path) VALUES (?1,?2) ON CONFLICT(chat_id) DO UPDATE SET worktree_path=excluded.worktree_path WHERE session_startups.cancelled=0", params![chat_id,path])? == 1)
+    }
+
+    pub fn is_session_startup_cancelled(&self, chat_id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn().query_row("SELECT 1 FROM session_startups WHERE chat_id=?1 AND cancelled=1", params![chat_id], |_| Ok(())).optional()?.is_some())
     }
 
     /// Persist intent outcomes and an optional authoritative snapshot in one
@@ -790,6 +864,46 @@ mod tests {
         assert_eq!(store.load_snapshot("recovery-original/metadata-conflict").unwrap().unwrap(), shallow);
         store.normalize_workspace_records("cold-bootstrap", &cold).unwrap();
         assert_eq!(serde_json::to_value(store.load_pending_records("cold-bootstrap").unwrap()).unwrap(), serde_json::to_value([cold_goal]).unwrap());
+    }
+
+    #[test]
+    fn command_admission_atomically_retains_context_authority_and_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.claim_document_scope("chat", "scope", None).unwrap();
+        let command: comet_doc::SessionCommandEntry = serde_json::from_value(serde_json::json!({
+            "id":"original", "payload":{"kind":"interrupt"}, "issuedBy":"owner", "issuedAt":1,
+            "expiresAt":1000, "status":"pending"
+        })).unwrap();
+        let record = PendingRecord { container:"commands".into(), key:command.id.clone(), before:None,
+            value:Some(serde_json::to_value(&command).unwrap()), version:Vec::new(), acknowledged:false };
+        store.conn().execute_batch("CREATE TRIGGER fail_admission BEFORE INSERT ON semantic_intents BEGIN SELECT RAISE(ABORT,'disk full'); END;").unwrap();
+        assert!(store.save_command_admission("scope","chat",&record,Some("authority"),Some(b"exact setup")).is_err());
+        assert!(store.load_command_outcome("scope","original").unwrap().is_none());
+        assert!(!store.is_trusted_local_command("authority").unwrap());
+        assert!(store.pending_nudges().unwrap().is_empty());
+        store.conn().execute_batch("DROP TRIGGER fail_admission").unwrap();
+        store.save_command_admission("scope","chat",&record,Some("authority"),Some(b"exact setup")).unwrap();
+        assert!(!store.cancel_session_startup("chat").unwrap().0);
+        assert!(store.save_command_admission("scope","chat",&record,Some("other authority"),Some(b"changed setup")).is_err());
+        drop(store);
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert_eq!(store.load_command_outcome("scope","original").unwrap(),Some(command));
+        assert_eq!(store.load_command_admission_context("scope",Some("original")).unwrap().as_deref(),Some(&b"exact setup"[..]));
+        assert!(store.is_trusted_local_command("authority").unwrap());
+        assert!(!store.is_trusted_local_command("other authority").unwrap());
+        assert_eq!(store.pending_nudges().unwrap()[0].0,"chat");
+        assert_eq!(store.pending_nudges().unwrap()[0].1,"original");
+        store.claim_document_scope("cancelled-chat","cancelled-scope",None).unwrap();
+        assert!(store.cancel_session_startup("cancelled-chat").unwrap().0);
+        assert!(store.is_session_startup_cancelled("cancelled-chat").unwrap());
+        assert!(store.save_command_admission("cancelled-scope","cancelled-chat",&record,Some("must not trust"),None).is_err());
+        assert!(store.load_command_outcome("cancelled-scope","original").unwrap().is_none());
+        assert!(!store.is_trusted_local_command("must not trust").unwrap());
+        assert!(!store.register_startup_worktree("cancelled-chat","/tmp/created-after-cancel").unwrap());
+        assert!(store.register_startup_worktree("handoff-chat","/tmp/registered-before-cancel").unwrap());
+        assert_eq!(store.cancel_session_startup("handoff-chat").unwrap(),(true,Some("/tmp/registered-before-cancel".into())));
+        assert!(!store.register_startup_worktree("handoff-chat","/tmp/must-not-replace").unwrap());
     }
 
     #[test]

@@ -360,6 +360,43 @@ fn controller_payload(
     }
 }
 
+/// Supply exact first-run setup instead of treating an opened transcript as host authority.
+fn controller_params(
+    core: &EngineCore,
+    alias: &str,
+    payload: SessionCommandPayload,
+) -> serde_json::Value {
+    let command = controller_payload(core, alias, payload);
+    let mut params = serde_json::json!({
+        "chatId": CHAT, "targetDeviceId": core.device_id, "command": command,
+    });
+    if !core.doc_host.is_locally_hosted(CHAT)
+        && let SessionCommandPayload::Control { action, .. } = &command
+        && let SessionControlAction::Start { request, .. } = action.as_ref()
+    {
+        let created = chrono::Utc::now().to_rfc3339();
+        params["bootstrap"] = serde_json::json!({
+            "chat": {
+                "id": CHAT, "deviceId": core.device_id, "archived": false,
+                "cwd": request.cwd, "spaceId": "e2e-space", "createdAt": created,
+                "config": comet_proto::ChatConfig {
+                    harness: HarnessId::Mock,
+                    model: request.model.clone(),
+                    agent_account_id: request.agent_account_id.clone(),
+                    reasoning: request.reasoning,
+                    model_options: request.model_options.clone(),
+                    sandbox: request.sandbox,
+                },
+            },
+            "space": {
+                "id": "e2e-space", "deviceId": core.device_id,
+                "path": request.cwd, "gitDetected": false, "createdAt": created,
+            },
+        });
+    }
+    params
+}
+
 /// Queue through the authenticated local RPC path while targeting one concrete agent session.
 /// The returned id is server-minted and is the command ledger lookup key.
 async fn queue_as_controller(
@@ -367,12 +404,12 @@ async fn queue_as_controller(
     alias: &str,
     payload: SessionCommandPayload,
 ) -> String {
-    let command = controller_payload(core, alias, payload);
+    let params = controller_params(core, alias, payload);
     let client = comet_rpc::memory_client(core.rpc_service());
     let queued = client
         .call(
             comet_rpc::methods::QUEUE_COMMAND,
-            serde_json::json!({"chatId": CHAT, "command": command}),
+            params,
         )
         .await
         .expect("queue authenticated session command");
@@ -433,32 +470,34 @@ async fn blocked_recovery_does_not_materialize_an_unauthorized_command() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
     let handle = core.doc_host.open(CHAT).unwrap();
-    let command = controller_payload(&core, "blocked-recovery", SessionCommandPayload::Run {
+    let mut params = controller_params(&core, "blocked-recovery", SessionCommandPayload::Run {
         request: run_request("continue after recovery"),
         message_id: "recovered-user".into(),
     });
     let issued = chrono::Utc::now().timestamp_millis() - 1;
-    let params = serde_json::json!({
-        "chatId": CHAT,
-        "commandId": "blocked-recovery-command",
-        "command": command,
-        "issuedAt": issued,
-        "expiresAt": issued + 60_000,
-    });
+    params["commandId"] = serde_json::json!("blocked-recovery-command");
+    params["issuedAt"] = serde_json::json!(issued);
+    params["expiresAt"] = serde_json::json!(issued + 60_000);
     let client = comet_rpc::memory_client(core.rpc_service());
     handle.doc().binding().fail_recovery("retained transcript conflicts with recovery snapshot".into());
     assert!(client.call(comet_rpc::methods::QUEUE_COMMAND, params.clone()).await.is_err());
     assert!(handle.doc().read_command("blocked-recovery-command").unwrap().is_none());
     assert!(entries(&core).is_empty());
+    assert!(core.doc_host.command_entry(CHAT, "blocked-recovery-command").unwrap().is_none());
+    assert!(core.workspace.doc().chat(CHAT).unwrap().is_none());
 
     let repaired = SessionDoc::init(CHAT).unwrap().export_snapshot().unwrap();
     handle.doc().binding().adopt_snapshot(&repaired, Some(CHAT)).unwrap();
-    client.call(comet_rpc::methods::QUEUE_COMMAND, params).await.unwrap();
+    client.call(comet_rpc::methods::QUEUE_COMMAND, params.clone()).await.unwrap();
     wait_for(|| command_status(&core, "blocked-recovery-command")
         .is_some_and(|(status, _)| status == SessionCommandStatus::Applied), "recovered command to apply").await;
     wait_for(|| entries(&core).iter().any(|entry| entry.role == MessageRole::Assistant
         && entry.status == Some(MessageStatus::Complete)), "recovered assistant to complete").await;
     assert_eq!(entries(&core)[0].id, "recovered-user");
+    let admitted = core.doc_host.command_entry(CHAT, "blocked-recovery-command").unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&admitted.payload).unwrap(), params["command"]);
+    assert_eq!(admitted.issued_at, issued);
+    assert_eq!(admitted.expires_at, Some(issued + 60_000));
     core.sessions.shutdown().await;
 }
 
@@ -1556,7 +1595,7 @@ async fn rpc_surface_over_in_memory_transport() {
     assert_eq!(initial, serde_json::json!({ "reset": [] }));
 
     // QueueCommand (as this device's composer would over IPC).
-    let command = controller_payload(
+    let params = controller_params(
         &core,
         "rpc-run",
         SessionCommandPayload::Run {
@@ -1567,7 +1606,7 @@ async fn rpc_surface_over_in_memory_transport() {
     let queued = client
         .call(
             comet_rpc::methods::QUEUE_COMMAND,
-            serde_json::json!({"chatId": CHAT, "command": command}),
+            params,
         )
         .await
         .unwrap();

@@ -35,6 +35,7 @@ struct Inner {
     baseline: Mutex<BTreeMap<(String, String), serde_json::Value>>,
     persist: Mutex<Option<Persist>>,
     fatal_error: Mutex<Option<String>>,
+    persistence_failed: std::sync::atomic::AtomicBool,
     workspace_snapshot_error: Mutex<Option<String>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     scope_generation: std::sync::atomic::AtomicU64,
@@ -52,6 +53,7 @@ impl SharedDocument {
             state: Mutex::new(State { raw, observers: BTreeMap::new(), next_observer: 0, journal: None }),
             gate: Mutex::new(()), pending: Mutex::new(BTreeMap::new()), baseline: Mutex::new(BTreeMap::new()),
             persist: Mutex::new(None), fatal_error: Mutex::new(None),
+            persistence_failed: std::sync::atomic::AtomicBool::new(false),
             workspace_snapshot_error: Mutex::new(None),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             scope_generation: std::sync::atomic::AtomicU64::new(0),
@@ -73,6 +75,7 @@ impl SharedDocument {
     pub fn is_detached(&self) -> bool { self.raw().is_detached() }
     pub fn recovery_error(&self) -> Option<String> { lock(&self.0.fatal_error).clone().or_else(|| lock(&self.0.workspace_snapshot_error).clone()) }
     pub fn fail_recovery(&self, error: String) { *lock(&self.0.fatal_error) = Some(error); }
+    pub fn persistence_failed(&self) -> bool { self.0.persistence_failed.load(std::sync::atomic::Ordering::Acquire) }
     /// A rejected workspace checkpoint leaves the trusted cache and journal writable.
     /// Persistence failures and room authorization denials still use fail_recovery.
     pub fn reject_workspace_snapshot(&self, error: String) { *lock(&self.0.workspace_snapshot_error) = Some(error); }
@@ -213,7 +216,10 @@ impl SharedDocument {
         let snapshot = candidate.export(ExportMode::Snapshot).map_err(|e| DocError::Schema(e.to_string()))?;
         if let Some(persist) = lock(&self.0.persist).as_ref() {
             retired.extend(pending.iter().cloned());
-            persist(&retired, Some(&snapshot)).map_err(|error| { self.fail_recovery(error.clone()); DocError::Schema(error) })?;
+            persist(&retired, Some(&snapshot)).map_err(|error| {
+                self.0.persistence_failed.store(true, std::sync::atomic::Ordering::Release);
+                self.fail_recovery(error.clone()); DocError::Schema(error)
+            })?;
         }
         let journal = journal_subscription(&self.0, &candidate);
         let baseline = map_rows(&candidate);
@@ -231,6 +237,7 @@ impl SharedDocument {
         self.0.generation.fetch_add(1,std::sync::atomic::Ordering::Release);
         *lock(&self.0.baseline) = baseline;
         *lock(&self.0.fatal_error) = None;
+        self.0.persistence_failed.store(false, std::sync::atomic::Ordering::Release);
         *lock(&self.0.workspace_snapshot_error) = None;
         let callbacks: Vec<_> = state.observers.values().filter_map(|observer| observer.root.clone()).collect();
         drop(state);
@@ -312,7 +319,10 @@ fn journal_subscription(inner: &Arc<Inner>, raw: &LoroDoc) -> loro::Subscription
             if let Some(value) = baseline_value { baseline.insert(identity,value); } else { baseline.remove(&identity); }
         }
         if !updates.is_empty() { if let Some(persist) = lock(&inner.persist).as_ref() {
-            if let Err(error) = persist(&updates,None) { *lock(&inner.fatal_error) = Some(format!("Crew could not persist accepted records: {error}")); }
+            if let Err(error) = persist(&updates,None) {
+                inner.persistence_failed.store(true, std::sync::atomic::Ordering::Release);
+                *lock(&inner.fatal_error) = Some(format!("Crew could not persist accepted records: {error}"));
+            }
         } }
     }))
 }

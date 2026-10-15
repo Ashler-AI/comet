@@ -1155,6 +1155,33 @@ describe("SessionRoom chat authorization", () => {
     expect(reader.closed).toContainEqual({ code: 4403, reason: "device grant invalid" });
   });
 
+  it("cold-trims oversized rooms at the current frontier despite an aged checkpoint", async () => {
+    const source = new LoroDoc();
+    const metadata = source.getMap("metadata");
+    const payload = oversizedPayload();
+    try {
+      metadata.set("retained", "before checkpoint");
+      source.commit();
+      const aged = source.frontiers();
+      metadata.set("payload", payload);
+      metadata.set("retained", "latest accepted value");
+      source.commit();
+      const current = source.frontiers();
+      const sql = new MemorySql();
+      sql.meta.set("roomKind", "session");
+      sql.meta.set("checkpoints", JSON.stringify([{ at: Date.now() - 4 * 24 * 60 * 60 * 1000, frontiers: aged }]));
+      sql.putBlob("snapshot", source.export({ mode: "snapshot" }));
+      const room = makeRoom(sql).room;
+      const recovered = await (room as unknown as SessionRoomInternals).ensureDoc();
+      expect(recovered.shallowSinceFrontiers()).toEqual(current);
+      const restored = recovered.getMap("metadata");
+      try {
+        expect(restored.get("retained")).toBe("latest accepted value");
+        expect(Buffer.compare(restored.get("payload") as Uint8Array, payload)).toBe(0);
+      } finally { restored.free(); }
+    } finally { metadata.free(); source.free(); }
+  });
+
   it("preserves durable state when four readers cold-start the same room", async () => {
     const source = new LoroDoc();
     const map = source.getMap("metadata");

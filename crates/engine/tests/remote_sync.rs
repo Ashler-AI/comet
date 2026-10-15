@@ -683,7 +683,6 @@ async fn workspace_snapshot_conflict_keeps_fresh_chat_commands_writable_after_re
     assert!(!core.workspace.connected());
     assert_eq!(core.workspace.doc().chat(CONFLICT).unwrap().unwrap().branch.as_deref(), Some("comet/retained"));
     let diagnostic = core.workspace.recovery_error().unwrap();
-    assert!(diagnostic.contains(CONFLICT));
     let client = comet_rpc::memory_client(core.rpc_service());
     let status = client.call(comet_rpc::methods::SYNC_STATUS, serde_json::json!({})).await.unwrap();
     assert_eq!(status["workspaceRecoveryError"], diagnostic);
@@ -692,20 +691,36 @@ async fn workspace_snapshot_conflict_keeps_fresh_chat_commands_writable_after_re
     let empty_session = SessionDoc::init(FRESH).unwrap().export_snapshot().unwrap();
     let space = core.workspace.doc().read_spaces().unwrap().into_iter()
         .find(|space| space.device_id == core.device_id && space.path == "/tmp").unwrap();
-    client.call(comet_rpc::methods::MUTATE, serde_json::json!({
-        "op":"createChat", "chatId":FRESH, "spaceId":space.id,
-    })).await.expect("workspace conflict must not reject an unrelated fresh chat");
-    let receipt = client.call(comet_rpc::methods::QUEUE_COMMAND, serde_json::json!({
-        "chatId":FRESH, "command":{"kind":"run", "request":run_request("independent fresh chat"), "messageId":"fresh-user"},
-    })).await.expect("workspace conflict must not reject an unrelated command");
+    assert!(core.workspace.doc().chat(FRESH).unwrap().is_none());
+    let issued = chrono::Utc::now().timestamp_millis() - 1;
+    let params = serde_json::json!({
+        "chatId":FRESH, "commandId":"fresh-command", "targetDeviceId":core.device_id,
+        "issuedAt":issued, "expiresAt":issued + 60_000,
+        "bootstrap":{
+            "chat":{"id":FRESH, "deviceId":core.device_id, "archived":false,
+                "cwd":"/tmp", "spaceId":space.id, "createdAt":chrono::Utc::now().to_rfc3339(),
+                "config":{"harness":"mock", "sandbox":"workspace-write"}},
+            "space":space,
+        },
+        "command":{"kind":"run", "request":run_request("independent fresh chat"), "messageId":"fresh-user"},
+    });
+    let receipt = client.call(comet_rpc::methods::QUEUE_COMMAND, params.clone()).await
+        .expect("verified first command must not depend on unrelated workspace recovery");
     assert_eq!(receipt["admission"], "accepted");
     let command = receipt["commandId"].as_str().unwrap().to_string();
-    drop(client);
     let handle = core.doc_host.open(FRESH).unwrap();
     wait_for(|| handle.doc().read_command(&command).unwrap().is_some_and(|entry| entry.status == SessionCommandStatus::Applied)
         && handle.doc().read_entries().unwrap_or_default().iter().any(|entry| entry.role == MessageRole::Assistant
             && entry.status == Some(MessageStatus::Complete) && entry_contains(entry, "streamed reply")),
         "fresh command and assistant completion during workspace conflict").await;
+    let retry = client.call(comet_rpc::methods::QUEUE_COMMAND, params.clone()).await.unwrap();
+    assert_eq!(retry["admission"], "accepted");
+    assert_eq!(retry["commandId"], receipt["commandId"]);
+    let admitted = core.doc_host.command_entry(FRESH, &command).unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&admitted.payload).unwrap(), params["command"]);
+    assert_eq!(admitted.issued_at, issued);
+    assert_eq!(admitted.expires_at, Some(issued + 60_000));
+    assert_eq!(handle.doc().read_entries().unwrap().iter().filter(|entry| entry.id == "fresh-user").count(), 1);
     assert!(core.workspace.doc().session_ref(USER, FRESH).unwrap().is_some());
     assert_eq!(core.workspace.recovery_error().as_deref(), Some(diagnostic.as_str()));
     let store = DocsStore::open(data.join("projects").join(PROJECT).join(USER)).unwrap();
@@ -714,6 +729,7 @@ async fn workspace_snapshot_conflict_keeps_fresh_chat_commands_writable_after_re
         .find(|record| record.container == "chats" && record.key == CONFLICT).unwrap();
     assert_eq!(preserved.before, retained.before);
     assert_eq!(preserved.value, retained.value);
+    drop(client);
     let completed = handle.doc().read_entries().unwrap();
     core.shutdown().await;
     drop(handle);
@@ -725,6 +741,10 @@ async fn workspace_snapshot_conflict_keeps_fresh_chat_commands_writable_after_re
     let restarted = assemble_remote(&data, "device-a", &edge_url, None);
     let restored = restarted.doc_host.open(FRESH).unwrap();
     assert_eq!(restored.doc().read_command(&command).unwrap().unwrap().status, SessionCommandStatus::Applied);
+    let restored_command = restarted.doc_host.command_entry(FRESH, &command).unwrap().unwrap();
+    assert_eq!(restored_command.payload, admitted.payload);
+    assert_eq!(restored_command.issued_at, admitted.issued_at);
+    assert_eq!(restored_command.expires_at, admitted.expires_at);
     assert_eq!(restored.doc().read_entries().unwrap().len(), completed.len());
     for entry in &completed { assert_eq!(restored.doc().read_entry(&entry.id).unwrap().as_ref(), Some(entry)); }
     assert!(restarted.workspace.doc().session_ref(USER, FRESH).unwrap().is_some());

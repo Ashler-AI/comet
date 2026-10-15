@@ -6,6 +6,20 @@ doc + per-chat session docs over the edge's Durable Objects), renders the
 mirrors, and drives remote engines through the durable command queue. No
 engine runs on the phone.
 
+## Metadata-independent first admission
+
+New sessions prepare their presentation locally and retain the chosen Chat/Space
+bootstrap with the original command journal. Ordinary host admission and scoped
+Scaffold admission send that same snapshot; native RFC3339 wire timestamps preserve
+the journal's exact integer milliseconds without floating-point truncation. Scope,
+grant, owner, model, account, checkout and attachments cannot change on a same-ID retry.
+
+Only a matching `admission: accepted` receipt or durable owner outcome establishes
+admission. Missing authority remains pending; explicit persistence failure cannot
+be promoted through an in-memory readback. Metadata catch-up is a separate accepted
+state. The existing native admission harness covers restart, same-ID retry, stale
+projections, changed authority, failed persistence and completed-message deduplication.
+
 ## Build & run
 
 Requires Xcode 26+ (iOS 26 SDK — Liquid Glass APIs) and stable Rust.

@@ -95,7 +95,10 @@ pub(crate) fn install_document_journal(
     }));
     if has_pending || expected_chat.is_none() {
         let snapshot = binding.export(loro::ExportMode::Snapshot).map_err(|error| EngineError::Other(error.to_string()))?;
-        binding.adopt_snapshot(&snapshot, expected_chat)?;
+        binding.adopt_snapshot(&snapshot, expected_chat).map_err(|error| {
+            if binding.persistence_failed() { EngineError::Other(format!("command_persistence_failed: {error}")) }
+            else { EngineError::Doc(error) }
+        })?;
     }
     Ok(())
 }
@@ -492,6 +495,8 @@ pub struct ChatDocHandle {
     doc: Arc<SessionDoc>,
     store: Arc<DocsStore>,
     cache_scope: Mutex<CacheScope>,
+    bootstrap_projection_pending: AtomicBool,
+    admitted_bootstrap: Mutex<Option<Arc<crate::rpc::PeerCommandBootstrap>>>,
     messages_tx: watch::Sender<Arc<SessionEntryWindow>>,
     /// True when the doc changed while nobody watched: the bounded tail mirror
     /// is rebuilt on the next `watch_messages` attach.
@@ -772,6 +777,7 @@ impl DocHost {
                     tokio::time::sleep(std::time::Duration::from_millis(EVICT_MIN_IDLE_MS as u64)).await;
                     let Some(inner) = weak.upgrade() else { break; };
                     let host = DocHost { inner };
+                    host.retry_admission_projections();
                     host.process_pending_nudges(None);
                     host.evict_over_budget();
                 }
@@ -1484,6 +1490,15 @@ impl DocHost {
         let selected_projection = cache_scope.projection();
         install_session_journal(&self.inner.store, chat_id, &scope_key, &doc, self.device_id())?;
         self.recover_processed_outcomes(chat_id, &scope_key, &doc)?;
+        let admitted_bootstrap = self.inner.store.load_command_admission_context(&scope_key, None)?
+            .map(|bytes| serde_json::from_slice::<crate::rpc::PeerCommandBootstrap>(&bytes)
+                .map(Arc::new).map_err(|error| EngineError::Other(format!("invalid admitted session setup: {error}"))))
+            .transpose()?;
+        if admitted_bootstrap.as_ref().is_some_and(|bootstrap| bootstrap.chat.id != chat_id
+            || bootstrap.chat.space_id.as_deref() != Some(bootstrap.space.id.as_str())
+            || bootstrap.chat.device_id != bootstrap.space.device_id) {
+            return Err(EngineError::Other("admitted session setup belongs to a different identity".into()));
+        }
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
         let unjournaled_changes = Arc::new(AtomicBool::new(false));
@@ -1525,6 +1540,8 @@ impl DocHost {
             doc: doc.clone(),
             store: self.inner.store.clone(),
             cache_scope: Mutex::new(cache_scope.clone()),
+            bootstrap_projection_pending: AtomicBool::new(admitted_bootstrap.is_some()),
+            admitted_bootstrap: Mutex::new(admitted_bootstrap),
             messages_tx,
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
@@ -1686,7 +1703,7 @@ impl DocHost {
                 && self.workspace().is_none_or(|workspace| workspace.owner_subject() == session.owner_subject) => session,
             Some(_) => return Ok(()),
             None if bare || session_id == handle.chat_id => {
-                let Some(workspace) = self.workspace().filter(|ws| ws.is_host(&handle.chat_id)) else {
+                let Some(workspace) = self.workspace().filter(|_| self.is_host(&handle.chat_id)) else {
                     return Ok(());
                 };
                 AgentSessionRecord {
@@ -1714,7 +1731,7 @@ impl DocHost {
             None => return Ok(()),
         };
         if session_id != handle.chat_id && !snapshot.sessions.iter().any(|record| record.session_id == handle.chat_id)
-            && self.workspace().is_some_and(|workspace| workspace.is_host(&handle.chat_id))
+            && self.workspace().is_some() && self.is_host(&handle.chat_id)
         {
             // A thread can start with an explicitly addressed child rather than
             // a bare-chat run. Anchor its existing host, never another runtime.
@@ -2123,13 +2140,45 @@ impl DocHost {
         &self, chat_id: &str, command_id: &str, payload: SessionCommandPayload,
         issued_at: Option<i64>, expires_at: Option<i64>,
     ) -> Result<SessionCommandEntry, EngineError> {
-        if let Some(existing) = self.command_entry(chat_id, command_id)? {
-            if existing.payload != payload || issued_at.is_some_and(|value| value != existing.issued_at)
-                || expires_at.is_some_and(|value| Some(value) != existing.expires_at)
-            {
-                return Err(EngineError::Other("command id already names a different immutable intent".into()));
-            }
-            return Ok(existing);
+        self.admit_command_with_context(chat_id, command_id, payload, issued_at, expires_at, None)
+    }
+
+    pub(crate) fn admission_error(error: EngineError) -> EngineError {
+        match error {
+            EngineError::Store(comet_sync::StoreError::ScopeConflict(_)) => EngineError::Other("command_deployment_scope_denied".into()),
+            error @ (EngineError::Store(_) | EngineError::Io(_) | EngineError::Journal(_)) =>
+                EngineError::Other(format!("command_persistence_failed: {error}")),
+            error => error,
+        }
+    }
+
+    fn retained_admission(
+        &self, chat_id: &str, command_id: &str, payload: &SessionCommandPayload,
+        issued_at: Option<i64>, expires_at: Option<i64>, bootstrap: Option<&crate::rpc::PeerCommandBootstrap>,
+    ) -> Result<Option<SessionCommandEntry>, EngineError> {
+        let Some(entry) = self.command_entry(chat_id, command_id).map_err(Self::admission_error)? else { return Ok(None) };
+        let scope = match self.inner.store.document_scope(chat_id).map_err(EngineError::from).map_err(Self::admission_error)? {
+            Some(scope) => scope, None => self.cache_scope(chat_id, None).key()?,
+        };
+        let accepted = self.inner.store.load_command_admission_context(&scope, Some(command_id))
+            .map_err(EngineError::from).map_err(Self::admission_error)?;
+        let accepted = accepted.as_deref().map(serde_json::from_slice::<crate::rpc::PeerCommandBootstrap>)
+            .transpose().map_err(|error| EngineError::Other(error.to_string()))?;
+        if accepted.as_ref() != bootstrap || &entry.payload != payload
+            || issued_at.is_some_and(|at| at != entry.issued_at)
+            || expires_at.is_some_and(|at| Some(at) != entry.expires_at) {
+            return Err(EngineError::Other("command_id_conflict".into()));
+        }
+        Ok(Some(entry))
+    }
+
+    pub(crate) fn admit_command_with_context(
+        &self, chat_id: &str, command_id: &str, payload: SessionCommandPayload,
+        issued_at: Option<i64>, expires_at: Option<i64>,
+        bootstrap: Option<Arc<crate::rpc::PeerCommandBootstrap>>,
+    ) -> Result<SessionCommandEntry, EngineError> {
+        if let Some(entry) = self.retained_admission(chat_id,command_id,&payload,issued_at,expires_at,bootstrap.as_deref())? {
+            return Ok(entry);
         }
         let existing = { lock(&self.inner.handles).get(chat_id).cloned() };
         let handle = match existing {
@@ -2137,23 +2186,32 @@ impl DocHost {
                 handle.touch();
                 handle
             }
-            None => self.open(chat_id)?,
+            None => self.open(chat_id).map_err(Self::admission_error)?,
         };
         let _guard = lock(&handle.command_lock);
-        if let Some(existing) = handle
-            .doc
-            .read_commands()?
-            .into_iter()
-            .find(|entry| entry.id == command_id)
-        {
-            if existing.payload != payload || issued_at.is_some_and(|value| value != existing.issued_at)
-                || expires_at.is_some_and(|value| Some(value) != existing.expires_at)
-            {
-                return Err(EngineError::Other("command id already names a different immutable intent".into()));
+        if let Some(entry) = self.retained_admission(chat_id,command_id,&payload,issued_at,expires_at,bootstrap.as_deref())? {
+            return Ok(entry);
+        }
+        if let Some(error) = handle.recovery_error() {
+            if handle.doc.binding().persistence_failed() {
+                return Err(EngineError::Other(format!("command_persistence_failed: {error}")));
             }
-            return Ok(existing);
+            tracing::warn!(chat=%chat_id, %error, "command waits for verified session recovery");
+            return Err(EngineError::Other("command_authority_pending".into()));
+        }
+        let in_memory = handle.doc.read_command(command_id)?;
+        if let Some(existing) = &in_memory {
+            if existing.payload != payload || issued_at.is_some_and(|value| value != existing.issued_at)
+                || expires_at.is_some_and(|value| Some(value) != existing.expires_at) {
+                return Err(EngineError::Other("command_id_conflict".into()));
+            }
         }
         let deployment = lock(&handle.cache_scope).deployment.clone();
+        if let SessionCommandPayload::Control { grant_id, source: comet_proto::AgentSessionSource::Scaffold, .. } = &payload {
+            if !lock(&self.inner.trusted_grants).contains_key(grant_id) {
+                return Err(EngineError::Other("command_authority_pending".into()));
+            }
+        }
         if let Some(deployment) = deployment {
             let authorized = if matches!(&payload,SessionCommandPayload::Control { .. }) {
                 self.control_projection_authorized(chat_id,&deployment,&payload)
@@ -2191,16 +2249,11 @@ impl DocHost {
                 .ok_or_else(|| EngineError::Other("Stop target is no longer active".into()))?;
             sessions.require_turn(&execution_key, expected)?;
         }
-        let entry = SessionCommandEntry {
-            id: command_id.to_string(),
-            payload,
-            issued_by: self.inner.config.device_id.clone(),
-            issued_at,
-            based_on,
-            expires_at: Some(expires_at),
-            status: SessionCommandStatus::Pending,
-            resolution: None,
-        };
+        let entry = in_memory.unwrap_or_else(|| SessionCommandEntry {
+            id: command_id.to_string(), payload,
+            issued_by: self.inner.config.device_id.clone(), issued_at, based_on,
+            expires_at: Some(expires_at), status: SessionCommandStatus::Pending, resolution: None,
+        });
         let projection = lock(&handle.room_projection).clone();
         let nudge_route = self.command_nudge_route(chat_id, projection.as_ref(), &entry);
         let authorized_local_scaffold_command =
@@ -2233,18 +2286,24 @@ impl DocHost {
                 EngineError::Other(format!("local command authority serialize: {error}"))
             })?)
         };
-        if let Some(trust_key) = trust_key.as_deref() {
-            self.inner
-                .store
-                .prune_local_commands(now - COMMAND_DEFAULT_TTL_MS)?;
-            self.inner.store.trust_local_command(trust_key)?;
+        let scope_key = lock(&handle.cache_scope).key()?;
+        let context = bootstrap.as_ref().map(|value| serde_json::to_vec(value.as_ref()))
+            .transpose().map_err(|error| EngineError::Other(error.to_string()))?;
+        let record = legacy_record("commands", entry.id.clone(), serde_json::to_value(&entry)
+            .map_err(|error| EngineError::Other(error.to_string()))?);
+        self.inner.store.save_command_admission(&scope_key, chat_id, &record, trust_key.as_deref(), context.as_deref())
+            .map_err(|error| match error {
+                comet_sync::StoreError::ScopeConflict(message) => EngineError::Other(message),
+                error => EngineError::Other(format!("command_persistence_failed: {error}")),
+            })?;
+        if let Some(bootstrap) = bootstrap {
+            *lock(&handle.admitted_bootstrap) = Some(bootstrap);
+            handle.bootstrap_projection_pending.store(true, Ordering::Release);
         }
-        if let Err(err) = handle.doc.queue_command(&entry) {
-            if let Some(trust_key) = trust_key.as_deref()
-                && matches!(handle.doc.read_command(command_id), Ok(None)) {
-                let _ = self.inner.store.forget_local_command(trust_key);
-            }
-            return Err(err.into());
+        // Admission is already durable. A failed cache projection stays pending,
+        // rather than inviting a second instruction or claiming an unsaved write.
+        if let Err(error) = handle.doc.queue_command(&entry) {
+            tracing::warn!(chat=%chat_id, command=%command_id, %error, "durable command awaits cache recovery");
         }
         Ok(entry)
     }
@@ -2299,9 +2358,7 @@ impl DocHost {
             }
             return Ok(Some(entry));
         }
-        let Some(handle) = handle else { return Ok(None) };
-        let _guard = lock(&handle.command_lock);
-        Ok(handle.doc.read_commands()?.into_iter().find(|entry| entry.id == command_id))
+        Ok(None)
     }
 
     pub fn chat_has_commands(&self, chat_id: &str) -> Result<bool, EngineError> {
@@ -2314,6 +2371,9 @@ impl DocHost {
     /// Failure leaves the immutable instruction and its outcome untouched.
     pub(crate) async fn wake_queued_command(&self, chat_id: &str, command_id: &str) -> Result<(), EngineError> {
         let handle = self.open(chat_id)?;
+        if let Some(error) = handle.recovery_error() {
+            return Err(EngineError::Other(format!("durable command awaits session recovery: {error}")));
+        }
         let entry = handle.doc.read_command(command_id)?
             .ok_or_else(|| EngineError::Other("queued command missing".into()))?;
         if entry.status != SessionCommandStatus::Pending || entry.expires_at.is_some_and(|expires| expires <= now_ms()) {
@@ -2350,27 +2410,81 @@ impl DocHost {
 
     /// Legacy chat ownership for pre-v2 commands.
     fn is_host(&self, chat_id: &str) -> bool {
-        self.workspace().is_none_or(|ws| ws.is_host(chat_id))
+        self.workspace().is_none_or(|workspace| {
+            workspace.is_host(chat_id) || (!self.has_scoped_route(chat_id)
+                && workspace.doc().chat(chat_id).ok().flatten().is_none_or(|chat| chat.device_id == self.device_id())
+                && self.admitted_bootstrap(chat_id).is_some_and(|setup| setup.chat.device_id == self.device_id()))
+        })
     }
 
     /// Strict ownership check for live waits: unlike `is_host`, a missing chat row
     /// is not enough to claim that this engine hosts the source session.
     pub fn is_locally_hosted(&self, chat_id: &str) -> bool {
         self.workspace().is_none_or(|workspace| {
-            workspace
-                .doc()
-                .chat(chat_id)
-                .ok()
-                .flatten()
-                .is_some_and(|chat| chat.device_id == workspace.device_id())
+            match workspace.doc().chat(chat_id).ok().flatten() {
+                Some(chat) => chat.device_id == workspace.device_id(),
+                None => !self.has_scoped_route(chat_id) && self.admitted_bootstrap(chat_id)
+                    .is_some_and(|bootstrap| bootstrap.chat.device_id == workspace.device_id()),
+            }
         })
     }
 
-    /// Chat-config harness when the workspace row carries one, else the default.
+    pub(crate) fn cancel_session_startup(&self, chat_id: &str) -> Result<(bool, Option<String>), EngineError> {
+        Ok(self.inner.store.cancel_session_startup(chat_id)?)
+    }
+
+    pub(crate) fn register_startup_worktree(&self, chat_id: &str, path: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.store.register_startup_worktree(chat_id,path)?)
+    }
+
+    pub(crate) fn is_session_startup_cancelled(&self, chat_id: &str) -> Result<bool, EngineError> {
+        Ok(self.inner.store.is_session_startup_cancelled(chat_id)?)
+    }
+
+    fn admitted_bootstrap(&self, chat_id: &str) -> Option<Arc<crate::rpc::PeerCommandBootstrap>> {
+        if let Some(handle) = lock(&self.inner.handles).get(chat_id).cloned() {
+            return lock(&handle.admitted_bootstrap).clone();
+        }
+        let expected = self.cache_scope(chat_id, None);
+        let saved = self.inner.store.document_scope(chat_id).ok()??;
+        let actual: CacheScope = serde_json::from_str(&saved).ok()?;
+        if actual != expected { return None; }
+        let bytes = self.inner.store.load_command_admission_context(&saved, None).ok()??;
+        let bootstrap: crate::rpc::PeerCommandBootstrap = serde_json::from_slice(&bytes).ok()?;
+        if bootstrap.chat.id != chat_id || bootstrap.chat.device_id != bootstrap.space.device_id
+            || bootstrap.chat.space_id.as_deref() != Some(bootstrap.space.id.as_str()) { return None; }
+        Some(Arc::new(bootstrap))
+    }
+
+    pub(crate) fn project_admission_metadata(&self, chat_id: &str) -> Option<String> {
+        let bootstrap = self.admitted_bootstrap(chat_id)?;
+        let workspace = self.workspace()?;
+        let result = (|| -> Result<(), EngineError> {
+            if workspace.doc().space(&bootstrap.space.id)?.is_none() { workspace.doc().upsert_space(&bootstrap.space)?; }
+            if workspace.doc().chat(chat_id)?.is_none() { workspace.doc().upsert_chat(&bootstrap.chat)?; }
+            workspace.upsert_session_ref(chat_id, None)?;
+            Ok(())
+        })();
+        if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
+            handle.bootstrap_projection_pending.store(result.is_err(), Ordering::Release);
+        }
+        result.err().map(|error| error.to_string())
+    }
+
+    fn retry_admission_projections(&self) {
+        let pending: Vec<_> = lock(&self.inner.handles).values()
+            .filter(|handle| handle.bootstrap_projection_pending.load(Ordering::Acquire)).cloned().collect();
+        for handle in pending {
+            if let Some(error) = self.project_admission_metadata(&handle.chat_id) {
+                tracing::warn!(chat=%handle.chat_id, %error, "admitted session metadata still pending");
+            }
+        }
+    }
+
+    /// A durable first-command setup remains usable while its index catches up.
     pub(crate) fn harness_for(&self, chat_id: &str) -> HarnessId {
-        self.workspace()
-            .and_then(|ws| ws.chat_config(chat_id))
-            .map(|config| config.harness)
+        self.workspace().and_then(|ws| ws.chat_config(chat_id)).map(|config| config.harness)
+            .or_else(|| self.admitted_bootstrap(chat_id).and_then(|setup| setup.chat.config.as_ref().map(|config| config.harness)))
             .unwrap_or(self.inner.config.default_harness)
     }
     fn cache_scope(&self, chat_id: &str, projection: Option<&SessionRoomProjection>) -> CacheScope {
@@ -2416,7 +2530,15 @@ impl DocHost {
     }
 
     pub(crate) fn control_projection_authorized(&self, chat_id: &str, deployment_id: &str, command: &SessionCommandPayload) -> bool {
-        if !self.has_exact_projection(chat_id,deployment_id) { return false }
+        self.has_exact_projection(chat_id,deployment_id) && self.control_scope_authorized(chat_id,deployment_id,command)
+    }
+
+    pub(crate) fn control_authority_pending(&self, command: &SessionCommandPayload) -> bool {
+        let SessionCommandPayload::Control { grant_id, .. } = command else { return false };
+        !lock(&self.inner.trusted_grants).contains_key(grant_id)
+    }
+
+    pub(crate) fn control_scope_authorized(&self, chat_id: &str, deployment_id: &str, command: &SessionCommandPayload) -> bool {
         let Some(workspace) = self.workspace() else { return false };
         let SessionCommandPayload::Control { grant_id,owner_device_id,session_id,source,action,.. } = command else { return false };
         let now = now_ms();
@@ -2787,7 +2909,9 @@ impl DocHost {
                 .chat(chat_id)?
                 .is_some_and(|chat| chat.archived)
         {
-            workspace.set_chat_archived(chat_id, false)?;
+            if let Err(error) = workspace.set_chat_archived(chat_id, false) {
+                tracing::warn!(chat=%chat_id, %error, "accepted command awaits archive projection");
+            }
         }
         match &entry.payload {
             SessionCommandPayload::Run {
@@ -2797,7 +2921,14 @@ impl DocHost {
                 // Claim-on-first-command: a run for a chat with no workspace row
                 // creates the row under our device id (we are about to host it).
                 if let Some(ws) = self.workspace() {
-                    ws.claim_chat(chat_id, Some(&request.cwd))?;
+                    if ws.doc().chat(chat_id)?.is_some_and(|chat| chat.device_id != self.device_id()) {
+                        return Err(EngineError::Other("command_destination_changed".into()));
+                    }
+                    if self.admitted_bootstrap(chat_id).is_none() {
+                        if let Err(error) = ws.claim_chat(chat_id, Some(&request.cwd)) {
+                            tracing::warn!(chat=%chat_id, %error, "accepted command awaits workspace projection");
+                        }
+                    }
                 }
                 let harness = self.harness_for(chat_id);
                 sessions
@@ -3383,30 +3514,19 @@ impl DocHost {
         chat_id: &str,
         prompt: &str,
     ) -> Option<comet_proto::RunRequest> {
-        let workspace = self.workspace()?;
-        let chat = match workspace.doc().chat(chat_id) {
-            Ok(chat) => chat?,
-            Err(err) => {
-                tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");
-                return None;
-            }
-        };
-        let config = chat.config;
+        let bootstrap = self.admitted_bootstrap(chat_id);
+        let chat = self.workspace().and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten());
+        let chat = chat.as_ref().or_else(|| bootstrap.as_ref().map(|setup| &setup.chat))?;
+        let config = chat.config.as_ref();
         Some(comet_proto::RunRequest {
             prompt: prompt.to_string(),
-            model: config.as_ref().and_then(|c| c.model.clone()),
-            agent_account_id: config
-                .as_ref()
-                .and_then(|config| config.agent_account_id.clone()),
-            reasoning: config.as_ref().and_then(|c| c.reasoning),
-            model_options: config
-                .as_ref()
-                .map(|c| c.model_options.clone())
+            model: config.and_then(|c| c.model.clone()),
+            agent_account_id: config.and_then(|config| config.agent_account_id.clone()),
+            reasoning: config.and_then(|c| c.reasoning),
+            model_options: config.map(|c| c.model_options.clone())
                 .unwrap_or_default(),
-            cwd: chat.cwd.unwrap_or_default(),
-            sandbox: config
-                .as_ref()
-                .map(|c| c.sandbox)
+            cwd: chat.cwd.clone().unwrap_or_default(),
+            sandbox: config.map(|c| c.sandbox)
                 .unwrap_or(comet_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: true,
             attachments: Vec::new(),
@@ -3699,7 +3819,25 @@ mod authority_tests {
     }
 
     #[tokio::test]
-    async fn failed_command_commit_keeps_authority_only_for_the_original_intent() {
+    async fn first_open_persistence_failure_never_exposes_an_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = scoped_test_host(store.clone());
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_first_open BEFORE INSERT ON snapshots BEGIN SELECT RAISE(ABORT,'disk full'); END;").unwrap();
+        let chat="00000000-0000-4000-8000-000000000234";
+        let now=now_ms();
+        let error=host.queue_command_with_id_at(chat,"original",SessionCommandPayload::Interrupt {},Some(now),Some(now+60_000)).unwrap_err();
+        assert!(error.to_string().contains("command_persistence_failed"));
+        assert!(host.command_entry(chat,"original").unwrap().is_none());
+        assert!(store.pending_nudges().unwrap().is_empty());
+        db.execute_batch("DROP TRIGGER fail_first_open").unwrap();
+        let admitted=host.queue_command_with_id_at(chat,"original",SessionCommandPayload::Interrupt {},Some(now),Some(now+60_000)).unwrap();
+        assert_eq!(host.command_entry(chat,"original").unwrap(),Some(admitted));
+    }
+
+    #[tokio::test]
+    async fn durable_command_survives_cache_projection_failure_without_changing_authority() {
         let dir = tempfile::tempdir().unwrap();
         let host = scoped_test_host(Arc::new(DocsStore::open(dir.path()).unwrap()));
         let chat = "00000000-0000-4000-8000-000000000233";
@@ -3708,8 +3846,9 @@ mod authority_tests {
         let replacement = handle.doc.export_snapshot().unwrap();
         binding.install_journal(Vec::new(), Arc::new(|_, _| Err("disk unavailable".into())));
         let now = now_ms();
-        assert!(host.queue_command_with_id_at(chat, "failed-commit", SessionCommandPayload::Interrupt {},
-            Some(now - 1), Some(now + 30_000)).is_err());
+        let admitted = host.queue_command_with_id_at(chat, "failed-commit", SessionCommandPayload::Interrupt {},
+            Some(now - 1), Some(now + 30_000)).unwrap();
+        assert_eq!(host.command_entry(chat, "failed-commit").unwrap(), Some(admitted));
         let retained = handle.doc.read_command("failed-commit").unwrap().unwrap();
         assert_eq!(retained.status, SessionCommandStatus::Pending);
         assert!(host.command_grant_authorized(&retained));
@@ -4143,7 +4282,7 @@ mod authority_tests {
             actor_device_id: "device-a".into(),
             actor_subject: "owner".into(),
             grant_id: "grant".into(),
-            source: AgentSessionSource::Scaffold,
+            source: AgentSessionSource::Local,
             action: Box::new(SessionControlAction::Stop {
                 expected_turn_id: Some(
                     serde_json::json!([
@@ -4155,14 +4294,7 @@ mod authority_tests {
                 ),
             }),
         };
-        let error = host
-            .queue_command_with_id("chat", "stop", command)
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Stop target is no longer active")
-        );
+        assert!(host.queue_command_with_id("chat", "stop", command).is_err());
         assert!(host.command_entry("chat", "stop").unwrap().is_none());
     }
 
@@ -4640,6 +4772,7 @@ mod authority_tests {
             .find(|entry| entry.id == exact_id)
             .unwrap();
         assert_eq!(host.command_grant_authorization(&exact_entry), Some(true));
+        let queued_wakes = host.inner.store.pending_nudges().unwrap();
         let nudged_handle = host
             .open_for_nudge("session-a")
             .unwrap()
@@ -4655,7 +4788,7 @@ mod authority_tests {
         );
         host.reset_edge_grants();
         assert!(host.open_for_nudge("session-a").unwrap().is_none(), "a cached handle cannot bypass grant refresh");
-        assert_eq!(host.inner.store.pending_nudges().unwrap()[0].1, "accepted-before-grant");
+        assert_eq!(host.inner.store.pending_nudges().unwrap(), queued_wakes);
         host.ingest_verified_grant("session-a", &serde_json::to_vec(&envelope).unwrap()).unwrap();
         host.open_projection(
             "session-b",

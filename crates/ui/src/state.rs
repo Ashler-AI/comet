@@ -56,9 +56,57 @@ pub(crate) struct RetainedSend {
     pub failure: Option<String>,
     #[serde(default)]
     pub cancelled: bool,
+    /// Explicit admission failure: readback alone cannot replace a successful same-ID retry.
+    #[serde(default)]
+    pub admission_error: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RetainedSendRecoveryScope {
+    data_dir: PathBuf,
+    project_scope: String,
+    user_id: String,
+    local_device_id: Option<String>,
+    scaffold_scope: Option<(String, String)>,
+}
+
+pub(crate) struct RetainedBootstrap {
+    chat: Chat,
+    space: Space,
+    projection: Option<SessionRoomProjection>,
 }
 
 impl AppState {
+    pub(crate) fn retained_send_recovery_scope(&self) -> Option<RetainedSendRecoveryScope> {
+        let AuthState::SignedIn { user, project_scope } = self.auth.as_ref()? else { return None };
+        Some(RetainedSendRecoveryScope {
+            data_dir: self.data_dir.clone()?, project_scope: project_scope.clone(), user_id: user.id.clone(),
+            local_device_id: self.local_device_id.clone(), scaffold_scope: self.scaffold_scope.clone(),
+        })
+    }
+
+    pub(crate) fn retained_send_recovery_scope_matches(&self, scope: &RetainedSendRecoveryScope) -> bool {
+        matches!(self.auth.as_ref(), Some(AuthState::SignedIn { user, project_scope })
+            if user.id == scope.user_id && project_scope == &scope.project_scope)
+            && self.data_dir.as_ref() == Some(&scope.data_dir)
+            && self.local_device_id == scope.local_device_id && self.scaffold_scope == scope.scaffold_scope
+    }
+
+    pub(crate) fn restore_retained_bootstraps(&mut self, bootstraps: Vec<RetainedBootstrap>) {
+        let space_count = self.spaces.len();
+        for bootstrap in bootstraps {
+            if self.chats.iter().find(|chat| chat.id == bootstrap.chat.id).is_some_and(|chat|
+                chat.device_id != bootstrap.chat.device_id || chat.space_id != bootstrap.chat.space_id)
+                || self.room_projections.get(&bootstrap.chat.id).is_some_and(|current| Some(current) != bootstrap.projection.as_ref()) { continue }
+            if !self.spaces.iter().any(|space| space.id == bootstrap.space.id) { self.spaces.push(bootstrap.space); }
+            if let Some(projection) = bootstrap.projection {
+                self.room_projections.insert(bootstrap.chat.id.clone(), projection);
+            }
+            self.stage_pending_chat(bootstrap.chat);
+        }
+        if self.spaces.len() != space_count { sort_spaces(&mut self.spaces); }
+    }
+
     pub(crate) fn send_journal_path(&self, chat_id: &str) -> Result<Option<PathBuf>, String> {
         use base64::Engine as _;
         let Some(data_dir) = &self.data_dir else { return Ok(None) };
@@ -92,6 +140,71 @@ impl AppState {
 // ponytail: serialize small composer journals; shard by path if write contention matters.
 static SEND_JOURNAL_WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 impl RetainedSend {
+    /// Recover presentation only; original command/grant validation still belongs to admission.
+    pub(crate) fn recover_bootstraps(scope: RetainedSendRecoveryScope) -> Result<Vec<RetainedBootstrap>, String> {
+        use base64::Engine as _;
+        // Prune other authenticated owners before entering their journal directories.
+        let mut prefix = serde_json::to_vec(&(&scope.project_scope, &scope.user_id, &scope.local_device_id, &scope.scaffold_scope)).map_err(|error| error.to_string())?;
+        prefix.pop();
+        prefix.push(b',');
+        prefix.truncate(prefix.len() / 3 * 3);
+        let prefix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(prefix);
+        let mut directories = vec![(scope.data_dir.join("composer-sends"), String::new())];
+        let mut recovered = Vec::new();
+        while let Some((directory, encoded)) = directories.pop() {
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Crew retained sends could not be discovered: {error}")),
+            };
+            for entry in entries {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let kind = entry.file_type().map_err(|error| error.to_string())?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if kind.is_dir() && !name.is_empty() && name.len() <= 120
+                    && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                    && encoded.len() + name.len() <= 16_384 {
+                    let next = format!("{encoded}{name}");
+                    if prefix.starts_with(&next) || next.starts_with(&prefix) { directories.push((entry.path(), next)); }
+                    continue;
+                }
+                if !kind.is_file() || name != "sends.json" { continue }
+                let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&encoded) else { continue };
+                let Ok((project, user, device, scaffold, projection, chat_id)) = serde_json::from_slice::<(
+                    String, String, Option<String>, Option<(String, String)>, Option<SessionRoomProjection>, String,
+                )>(&bytes) else { continue };
+                if project != scope.project_scope || user != scope.user_id || device != scope.local_device_id || scaffold != scope.scaffold_scope { continue }
+                if let Some(projection) = &projection {
+                    if projection.session_id != chat_id || scope.scaffold_scope.as_ref().is_none_or(|(project, deployment)|
+                        &projection.project_id != project || &projection.deployment_id != deployment) { continue }
+                }
+                let sends = match Self::load(Some(entry.path()), &chat_id) {
+                    Ok(sends) => sends,
+                    Err(error) => { tracing::warn!(%chat_id, %error, "retained Crew bootstrap journal is unreadable"); continue }
+                };
+                let projection_value = serde_json::to_value(&projection).map_err(|error| error.to_string())?;
+                for send in sends {
+                    if send.terminal || send.applied || send.cancelled || !send.is_message()
+                        || send.params["roomProjection"] != projection_value { continue }
+                    let Ok(chat) = serde_json::from_value::<Chat>(send.params["bootstrap"]["chat"].clone()) else { continue };
+                    let Ok(space) = serde_json::from_value::<Space>(send.params["bootstrap"]["space"].clone()) else { continue };
+                    if chat.id != chat_id || chat.space_id.as_deref() != Some(space.id.as_str()) || chat.device_id != space.device_id { continue }
+                    if send.params["command"]["kind"] == "control" {
+                        if send.params["command"]["source"] != "scaffold" || projection.is_none()
+                            || send.params["command"]["sessionId"] != chat_id
+                            || send.params["command"]["ownerDeviceId"] != send.params["targetDeviceId"] { continue }
+                    } else if send.params["targetDeviceId"].as_str().is_some_and(|target| target != chat.device_id)
+                        || (send.params["targetDeviceId"].is_null() && scope.local_device_id.as_deref() != Some(chat.device_id.as_str())) { continue }
+                    if !recovered.iter().any(|bootstrap: &RetainedBootstrap| bootstrap.chat.id == chat.id) {
+                        recovered.push(RetainedBootstrap { chat, space, projection: projection.clone() });
+                    }
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
     pub(crate) fn is_message(&self) -> bool {
         matches!(self.params["command"]["kind"].as_str(), Some("run" | "steer" | "queue"))
             || matches!(self.params["command"]["action"]["action"].as_str(), Some("start" | "steer" | "queue"))
@@ -167,6 +280,7 @@ impl RetainedSend {
                 send.terminal = completed.terminal || completed.applied;
                 send.failure = completed.failure;
                 send.cancelled = completed.cancelled;
+                send.admission_error = completed.admission_error;
             }
         }
         sends.retain(|send| !send.cancelled);
@@ -188,6 +302,7 @@ impl RetainedSend {
             send.terminal = existing.terminal;
             if existing.failure.is_some() { send.failure = existing.failure.clone(); }
             existing.cancelled |= send.cancelled;
+            existing.admission_error = send.admission_error.clone();
         } else if !send.terminal && !send.cancelled {
             if sends.iter().filter(|record| !record.terminal).count() >= 16 { return Err("Crew retains 16 unresolved sends; resolve them before sending another".into()); }
         }
@@ -593,7 +708,6 @@ pub use comet_proto::view::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatStartupPhase {
-    Persisting,
     PreparingCheckout,
     UploadingAttachments,
     Admitting,
@@ -1758,6 +1872,14 @@ impl AppState {
 
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         spaces.retain(|space| !space.id.starts_with(LEGACY_SCAFFOLD_SPACE_ID_PREFIX));
+        // A retained first send owns presentation until its bootstrap projects;
+        // an unrelated/stale spaces frame must not hide its folder or selection.
+        for space in &self.spaces {
+            if !spaces.iter().any(|incoming| incoming.id == space.id)
+                && self.chats.iter().any(|chat| chat.space_id.as_deref() == Some(space.id.as_str()) && self.chat_is_pending(&chat.id)) {
+                spaces.push(space.clone());
+            }
+        }
         sort_spaces(&mut spaces);
         self.spaces = spaces;
         // Heal a vanished selection (space deleted elsewhere): fall back to the
@@ -2185,18 +2307,18 @@ impl AppState {
         }
     }
 
-    /// Hold a newly minted chat selection across chats-watch frames until its
-    /// create mutation materializes the row.
+    /// Hold a newly minted chat selection until its admitted bootstrap projects.
     pub fn mark_chat_pending(&mut self, chat_id: &str) {
         if !self.chats.iter().any(|chat| chat.id == chat_id) {
             self.pending_local_chat_ids.insert(chat_id.to_string());
         }
     }
 
-    /// Insert the presentation row for a first send before durable setup.
-    /// The workspace watch replaces this row by id after `createChat` lands.
+    /// Stage prepared first-send presentation without replacing a catalog-owned row.
     pub fn stage_pending_chat(&mut self, chat: Chat) {
-        if self.chats.iter().any(|existing| existing.id == chat.id) {
+        let pending = self.chat_is_pending(&chat.id);
+        if let Some(existing) = self.chats.iter_mut().find(|existing| existing.id == chat.id) {
+            if pending { *existing = chat; sort_chats(&mut self.chats); }
             return;
         }
         self.pending_local_chat_ids.insert(chat.id.clone());
@@ -4208,11 +4330,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scoped_bootstrap_recovery_preserves_namespace_without_restoring_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new();
+        state.data_dir = Some(dir.path().into()); state.local_device_id = Some("local".into());
+        state.auth = Some(AuthState::SignedIn { user:comet_proto::UserProfile { id:"user".into(), email:"user@example.com".into(), name:None }, project_scope:"auth-project".into() });
+        state.set_scaffold_scope_for_test("room-project", "staging");
+        let projection = SessionRoomProjection { project_id:"room-project".into(), deployment_id:"staging".into(), session_id:"chat".into() };
+        state.room_projections.insert("chat".into(), projection.clone());
+        let id = uuid::Uuid::new_v4().to_string();
+        let params = serde_json::json!({"chatId":"chat", "commandId":uuid::Uuid::new_v4().to_string(), "issuedAt":100, "expiresAt":1000,
+            "targetDeviceId":"comet-scaffold-sandbox-e1", "roomProjection":projection, "preparationGeneration":"prepared",
+            "command":{"kind":"control", "source":"scaffold", "sessionId":"chat", "ownerDeviceId":"comet-scaffold-sandbox-e1",
+                "actorDeviceId":"local", "actorSubject":"user", "grantId":"original-grant", "action":{"action":"start", "message_id":id,
+                    "request":{"prompt":"original", "cwd":"/remote", "sandbox":"workspaceWrite", "autoApprove":true, "attachments":[]}}},
+            "bootstrap":{
+                "chat":{"id":"chat", "deviceId":"local", "spaceId":"folder", "cwd":"/remote", "archived":false, "createdAt":Utc::now()},
+                "space":{"id":"folder", "deviceId":"local", "path":"/original", "gitDetected":true, "createdAt":Utc::now()}
+            }});
+        let send = RetainedSend { prompt:"original".into(), message_id:id, params:params.clone(), accepted:false, applied:false,
+            terminal:false, failure:None, cancelled:false, admission_error:Some("command_authority_pending".into()) };
+        let path = state.send_journal_path("chat").unwrap();
+        RetainedSend::save(path.clone(), "chat", send).unwrap();
+        let scope = state.retained_send_recovery_scope().unwrap();
+        let mut wrong_user = scope.clone(); wrong_user.user_id = "other-user".into();
+        let mut wrong_project = scope.clone(); wrong_project.project_scope = "other-project".into();
+        let mut wrong_device = scope.clone(); wrong_device.local_device_id = Some("other-device".into());
+        let mut wrong_deployment = scope.clone(); wrong_deployment.scaffold_scope = Some(("room-project".into(), "production".into()));
+        for other in [wrong_user, wrong_project, wrong_device, wrong_deployment] {
+            assert!(RetainedSend::recover_bootstraps(other).unwrap().is_empty());
+        }
+        let recovered = RetainedSend::recover_bootstraps(scope).unwrap();
+        assert_eq!(recovered.len(), 1);
+        state.room_projections.clear();
+        state.restore_retained_bootstraps(recovered);
+        assert!(state.chat_is_pending("chat"));
+        assert_eq!(state.transcript_room_projection("chat"), Some(projection));
+        assert_eq!(state.send_journal_path("chat").unwrap(), path);
+        assert!(state.scaffold_control_grants.is_empty(), "retained presentation must not mint or refresh authority");
+        assert_eq!(RetainedSend::load(path, "chat").unwrap()[0].params, params);
+    }
+
+    #[test]
     fn input_outcome_index_migration_preserves_original_session_and_rejects_conflicts() {
         let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("sends.json");
         let prompt = "Respond to Crew input request";
         let mut send = RetainedSend {
             prompt:prompt.into(), message_id:uuid::Uuid::new_v4().to_string(), accepted:true, applied:true, terminal:true, failure:None, cancelled:false,
+            admission_error: None,
             params:serde_json::json!({"chatId":"chat", "commandId":uuid::Uuid::new_v4().to_string(), "command":{
                 "kind":"control", "sessionId":"agent-a", "source":"local", "action":{"action":"respondInput", "request_id":"request", "answers":[]}
             }}),
