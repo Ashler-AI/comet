@@ -1807,7 +1807,7 @@ MAX_TOTAL = 256 * 1024 * 1024
 MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024
 MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024
 MAX_OBJECTS = 250000
-MAX_FILES = 25000
+MAX_FILES = 50000
 # Bound directory traversal independently of the regular-file/symlink budget.
 MAX_DIRECTORIES = 25000
 MAX_MEMORY = 512 * 1024 * 1024
@@ -5510,6 +5510,107 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn worktree_materializer_imports_base_checkout_with_more_than_25000_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let platform = root.join("platform");
+        let remote = root.join("remote");
+        std::fs::create_dir_all(source.join("files")).unwrap();
+        std::fs::create_dir(&platform).unwrap();
+        std::fs::write(platform.join("sentinel"), "platform\n").unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "crew@example.com"]);
+        git(&source, &["config", "user.name", "Crew"]);
+        for index in 0..25_001 {
+            std::fs::write(source.join(format!("files/file-{index}")), "base\n").unwrap();
+        }
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "large base checkout"]);
+        let snapshot = crate::worktree_handoff::capture_worktree_handoff(&source).unwrap();
+        assert_eq!(snapshot.entry_count, 0, "the files belong to the Git base");
+        let staging = platform.join(".scaffold/crew-handoff-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        std::io::copy(
+            &mut snapshot.reopen().unwrap(),
+            &mut archive.reopen().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("tar")
+                .args([
+                    "-xf",
+                    archive.path().to_str().unwrap(),
+                    "-C",
+                    staging.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let script = VERIFY_WORKTREE_HANDOFF_PYTHON
+            .replace("/workspace/ashler-platform", platform.to_str().unwrap())
+            .replace("/workspace/crew-handoff", remote.to_str().unwrap());
+        let result = std::process::Command::new("python3")
+            .args([
+                "-c",
+                &script,
+                staging.to_str().unwrap(),
+                &snapshot.manifest_sha256,
+                &snapshot.base_sha,
+                &snapshot.entry_count.to_string(),
+                &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "status={} stderr={}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).trim(),
+            format!("verified:{}:{}", snapshot.manifest_sha256, remote.display())
+        );
+        assert_eq!(
+            git(&remote, &["rev-parse", "HEAD"]),
+            git(&source, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            std::fs::read_dir(remote.join("files")).unwrap().count(),
+            25_001
+        );
+        for index in [0, 25_000] {
+            assert_eq!(
+                std::fs::read(remote.join(format!("files/file-{index}"))).unwrap(),
+                b"base\n"
+            );
+        }
+        assert_eq!(
+            std::fs::read(platform.join("sentinel")).unwrap(),
+            b"platform\n"
+        );
+        assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn worktree_materializer_enforces_containment_and_separate_expansion_budgets() {
         use std::os::unix::fs::symlink;
         for scenario in [
@@ -5657,7 +5758,7 @@ mod tests {
                     "MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024",
                     "MAX_CHECKOUT_BYTES = 1024 * 1024",
                 )
-                .replace("MAX_FILES = 25000", "MAX_FILES = 12")
+                .replace("MAX_FILES = 50000", "MAX_FILES = 12")
                 .replace("MAX_DIRECTORIES = 25000", "MAX_DIRECTORIES = 3");
             let script = if scenario == "import_expansion" {
                 script.replace(
