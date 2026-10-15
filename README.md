@@ -2,7 +2,7 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Unreleased: shared status watcher deadlock
+## Crew 0.1.160: shared status watcher deadlock
 
 Crew borrows aliased workspace/local status receivers only once during initial
 subscription and subsequent merges. A queued publisher can no longer deadlock
