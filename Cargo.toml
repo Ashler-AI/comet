@@ -15,7 +15,7 @@ members = [
 exclude = ["vendor/loro-internal", "vendor/loro-kv-store"]
 
 [workspace.package]
-version = "0.1.157"
+version = "0.1.158"
 edition = "2024"
 license = "MIT"
 publish = false
