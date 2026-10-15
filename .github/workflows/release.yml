@@ -132,14 +132,9 @@ jobs:
           echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
 
-  sync-reliability:
-    if: ${{ inputs.candidate_run_id == '' }}
-    needs: version
-    uses: ./.github/workflows/sync-reliability.yml
-
   linux:
     if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
-    needs: [version, sync-reliability]
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -166,11 +161,6 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-      - name: Verify fixed-session web viewport
-        run: node --test apps/web/*.test.mjs
       - name: Package
         run: scripts/package-linux.sh
       - name: Record artifact checksums
@@ -187,7 +177,7 @@ jobs:
 
   macos:
     if: ${{ inputs.candidate_run_id == '' }}
-    needs: [version, sync-reliability]
+    needs: version
     runs-on: macos-14
     env:
       COMET_RELEASE_VERSION: ${{ needs.version.outputs.version }}
@@ -261,36 +251,6 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Verify room catch-up and corruption recovery
-        run: cargo test --locked -p comet-sync --lib
-      - name: Verify desktop session and attachment behavior
-        run: cargo test --locked -p comet-ui --lib
-      - name: Verify production and staging updater identities
-        run: |
-          cargo test --locked -p comet-update --lib
-          COMET_PACKAGE_ENVIRONMENT=staging cargo test --locked -p comet-update --lib
-      - name: Verify OMP restart and takeover recovery
-        run: |
-          cargo test --locked -p comet-harness --lib omp::
-          cargo test --locked -p comet-harness --test omp
-          cargo test --locked -p comet-engine --lib sessions::
-          cargo test --locked -p comet-engine --lib run_journal::
-          cargo test --locked -p comet-engine --test restart_resume
-      - name: Verify large-journal fork behavior
-        run: cargo test --locked -p comet-harness fork_session_file_
-      - name: Verify gateway extension ownership and discovery
-        run: cargo test --locked -p comet-harness auth_gateway::tests
-      - name: Verify desktop and Scaffold gateway launch policies
-        run: cargo test --locked -p comet-harness shared_inference_
-      - name: Verify native handoff preparation and runtime coordinates
-        run: |
-          cargo test --locked -p comet-engine --lib scaffold_session
-          cargo test --locked -p comet-engine --lib worktree
-          cargo test --locked -p comet-engine --lib materializer
-          cargo test --locked -p comet-engine --lib join_grant_rejection
-          cargo test --locked -p comet-engine --lib historical_attachments
-          cargo test --locked -p comet-harness native_handoff_executable_
-          cargo test --locked -p comet --bin comet session
       - name: Package
         run: scripts/package-macos.sh
       - name: Verify packaged native handoff command

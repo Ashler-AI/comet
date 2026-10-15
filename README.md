@@ -13,6 +13,11 @@ Workspace recovery merges valid same-device `lastSeenAt` boot clocks
 monotonically. Retained intents and genuine rename, identity, invalid-clock
 and backwards-clock conflicts remain protected.
 
+Staging **0.1.161** is published from `454b35fe` in
+[release run 38808685417](https://github.com/Ashler-AI/comet/actions/runs/38808685417).
+The installed 0.1.160 updater reports 0.1.161 available; installed engines were
+not restarted. Production and Scaffold image pins remain unchanged.
+
 ## Unreleased: shared account imports
 
 Crew omits missing optional email, display name, organization, and plan fields
@@ -1703,6 +1708,13 @@ Manual releases choose an explicit surface:
 - `desktop-and-scaffold` also builds both Linux archives, emits a `scaffold.comet-runtime.v1` compatibility manifest, and advances `scaffold-manifest.json` plus `scaffold-latest.txt`. Use this whenever headless engine, auth, relay, OMP, or Scaffold-host behavior changed.
 
 Version tags remain complete `desktop-and-scaffold` releases for backward compatibility. CI verifies the tag or dispatch version against both `[workspace.package].version` and Cargo metadata. Every `releases/<version>/…` object and version-named root artifact is create-only; a byte-identical re-publish is a no-op and differing bytes fail. Moving desktop and Scaffold channel aliases are independent. All objects remain private.
+
+Release jobs build Linux and macOS artifacts directly after version validation;
+they do not rerun application tests or wait for native/mobile reliability CI.
+Regression coverage stays in PR/manual CI, including web and updater-identity
+checks. Release packaging retains the packaged CLI launch smoke, signing,
+notarization, exact-candidate provenance/checksums, runtime compatibility,
+immutable publication and channel readback.
 
 `scaffold-runtime-version.txt` is the compatibility boundary between Comet and
 the Scaffold control plane. A breaking runtime change is platform-first:
