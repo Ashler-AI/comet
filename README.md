@@ -2,6 +2,13 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: shared account imports
+
+Crew omits missing optional email, display name, organization, and plan fields
+from Agent Auth imports instead of sending `null`. Missing Claude profile
+metadata no longer blocks account connection. The same serialization applies
+to ChatGPT imports and recovery snapshots; Agent Auth validation is unchanged.
+
 ## Crew 0.1.160: shared status watcher deadlock
 
 Crew borrows aliased workspace/local status receivers only once during initial

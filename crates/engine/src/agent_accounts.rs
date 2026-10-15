@@ -1540,7 +1540,24 @@ mod tests {
                         break;
                     }
                 }
-                requests.push(String::from_utf8(bytes).unwrap());
+                let request = String::from_utf8(bytes).unwrap();
+                let rejects_metadata = request.starts_with("POST /api/agent-accounts/import ") && {
+                    let body: serde_json::Value =
+                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    // Agent Auth accepts omitted optional strings, not null metadata.
+                    ["email", "displayName", "organization", "plan"]
+                        .iter()
+                        .any(|field| body.get(field).is_some_and(serde_json::Value::is_null))
+                };
+                let (status, body) = if rejects_metadata {
+                    (
+                        400,
+                        serde_json::json!({ "error": "agent_account_import_invalid" }).to_string(),
+                    )
+                } else {
+                    (status, body)
+                };
+                requests.push(request);
                 let reason = if status == 200 {
                     "OK"
                 } else {
@@ -1798,6 +1815,38 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn claude_login_completes_when_profile_metadata_is_unavailable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude_origin, claude_requests) =
+            scripted_server(vec![(200, claude_token_response()), (503, "{}".into())]).await;
+        let remote_account = imported_claude_account_response();
+        let list = serde_json::json!({
+            "accounts": [serde_json::from_str::<serde_json::Value>(&remote_account)
+                .unwrap()["account"].clone()]
+        })
+        .to_string();
+        let (remote_origin, remote_requests) =
+            scripted_server(vec![(200, remote_account), (200, list)]).await;
+        let remote =
+            ScaffoldClient::new(&remote_origin, "project-1", Arc::new(StaticToken)).unwrap();
+        let accounts = claude_test_accounts(test_config(tmp.path()), &claude_origin, remote);
+        let login = accounts.start_claude_login();
+
+        let snapshot = accounts
+            .complete_login(&login.login_id, "one-time-code")
+            .await
+            .expect("a valid Claude login does not require optional profile metadata");
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.id == "remote-account-1")
+            .expect("the imported account is in the shared pool");
+        assert_eq!(account.status, AgentAccountStatus::Connected);
+        claude_requests.await.unwrap();
+        remote_requests.await.unwrap();
     }
 
     #[tokio::test]

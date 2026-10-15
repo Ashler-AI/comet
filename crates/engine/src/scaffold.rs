@@ -286,9 +286,13 @@ pub struct ScaffoldClient {
 pub(crate) struct AgentAccountCredentialImport {
     pub provider: String,
     pub provider_account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     pub capabilities: Vec<String>,
     pub credential: AgentAccountOAuthCredential,
