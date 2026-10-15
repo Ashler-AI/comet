@@ -301,6 +301,12 @@ final class AppModel {
             self.preloadSessionMetadata()
             self.drainPendingScaffoldLink()
             self.drainPendingDirectoryLink()
+            if workspace.connected {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for session in self.sessionStores.values { await session.retryPendingAuthorization() }
+                }
+            }
         }
         workspace = store
         store.start()
@@ -755,26 +761,21 @@ final class AppModel {
     }
 
     @discardableResult
-    func createChat(id: String, space: Space, config chatConfig: ChatConfig,
-                    branch: String? = nil, cwd: String? = nil) async throws -> String {
+    func prepareChat(id: String, space: Space, config chatConfig: ChatConfig,
+                     branch: String? = nil, cwd: String? = nil) throws -> Chat {
         if let demo {
-            if demo.lists.chatsById[id] != nil { return id }
+            if let retained = demo.lists.chatsById[id] { return retained }
             demo.chats.append(Chat(id: id, deviceId: space.deviceId, title: nil, archived: false,
                                    cwd: cwd ?? space.path, branch: branch, checkoutId: nil,
                                    config: chatConfig, lastMessagePreview: nil, lastMessageAt: nil,
                                    createdAt: nowMs(), harnessSessionId: nil,
                                    harnessSessionCwd: nil, spaceId: space.id, lastSeenAt: nowMs()))
-            return id
+            return demo.chats.last!
         }
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
-        return try await workspace.createChat(id: id, space: space, config: chatConfig, branch: branch, cwd: cwd)
+        return try workspace.prepareChat(id: id, space: space, config: chatConfig, branch: branch, cwd: cwd)
     }
 
-    func waitForCreatedChat(id: String) async throws -> Chat {
-        if let demo, let chat = demo.lists.chatsById[id] { return chat }
-        guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
-        return try await workspace.waitForCreatedChat(id: id)
-    }
 
     var launchesScaffoldSessions: Bool {
         demo != nil || config?.mode == .scaffold
@@ -851,6 +852,9 @@ final class AppModel {
             return chatId
         }
         guard let workspace else { throw MobileSessionError.unavailable("Not connected") }
+        if scaffoldRoutes[creationId] == nil, let retained = workspace.preparedScaffoldRoute(id: creationId) {
+            scaffoldRoutes[creationId] = retained
+        }
         if scaffoldRoutes[creationId] == nil {
             let (route, receipt) = try await workspace.prepareScaffoldSession(
                 space: space, chatId: creationId, launch: launch
@@ -861,7 +865,7 @@ final class AppModel {
         // The receipt outlives view navigation and every fallible first-send
         // step; only the QueueCommand acknowledgment disarms it.
         let preparation = scaffoldPreparations[creationId]
-        defer { preparation?.reportFailure() }
+        defer { if sessionStores[creationId]?.hasPendingAuthorization != true { preparation?.reportFailure() } }
         try Task.checkCancellation()
         guard let chat = chat(id: creationId), let store = sessionStore(for: chat) else {
             throw MobileSessionError.unavailable("The created session is not available yet")
@@ -889,12 +893,14 @@ final class AppModel {
             guard let controller = scaffoldControllerDeviceId(chatId: chatId) else {
                 throw MobileSessionError.unavailable("This session has no Scaffold controller")
             }
-            var route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
-            // Reattachment may expose another preparation. The first command
-            // must retain the receipt from its own Prepare response.
-            route.preparationGeneration = scaffoldRoutes[chatId]?.preparationGeneration
-            scaffoldRoutes[chatId] = route
-            deviceId = route.ownerDeviceId
+            if let prepared = scaffoldRoutes[chatId], prepared.preparationGeneration != nil {
+                deviceId = prepared.ownerDeviceId
+            } else {
+                var route = try await workspace.scaffoldRoute(controllerDeviceId: controller, environment: environment)
+                route.preparationGeneration = scaffoldRoutes[chatId]?.preparationGeneration
+                scaffoldRoutes[chatId] = route
+                deviceId = route.ownerDeviceId
+            }
         } else {
             guard let host = workspace.chat(id: chatId)?.deviceId
                 ?? workspace.sessions[chatId]?.deviceId, !host.isEmpty else {
@@ -1005,6 +1011,7 @@ final class AppModel {
     func refreshSync() async {
         await workspace?.probeSync()
         for store in sessionStores.values { await store.probeSync() }
+        for store in sessionStores.values { await store.retryPendingAuthorization() }
     }
 
     /// Diagnostics access (live e2e probe).
@@ -1089,6 +1096,7 @@ final class AppModel {
 
     private func scaffoldEnvironment(chatId: String) -> SessionEnvironment? {
         scaffoldRoutes[chatId]?.environment
+            ?? workspace?.preparedScaffoldRoute(id: chatId)?.environment
             ?? workspace?.sessionRef(id: chatId)?.environment
     }
 
@@ -1097,6 +1105,7 @@ final class AppModel {
         return selectScaffoldControllerDeviceId(
             devices: workspace.devices,
             preferred: [scaffoldRoutes[chatId]?.controllerDeviceId,
+                        workspace.preparedScaffoldRoute(id: chatId)?.controllerDeviceId,
                         workspace.chat(id: chatId)?.deviceId].compactMap { $0 },
             isOnline: workspace.deviceOnline
         )
@@ -1106,6 +1115,10 @@ final class AppModel {
                                            environment: SessionEnvironment?) {
         let chatId = store.chatId
         let preparation = scaffoldPreparations[chatId]
+        if scaffoldRoutes[chatId] == nil, let retained = workspace?.preparedScaffoldRoute(id: chatId) {
+            scaffoldRoutes[chatId] = retained
+        }
+        store.commandBootstrap = workspace?.preparedBootstrap(id: chatId)
         store.commandHostDeviceId = workspace?.chat(id: chatId)?.deviceId ?? workspace?.sessions[chatId]?.deviceId
         store.commandScaffoldRoute = scaffoldRoutes[chatId]
         store.commandHostProvider = { [weak self, weak store] in
@@ -1183,13 +1196,17 @@ final class AppModel {
                       pointer.sandboxId == nil || admission.scaffold != nil,
                       admission.scaffold == nil || (admission.scaffold?.projection == pointer.projection &&
                         (pointer.sandboxId == nil || admission.scaffold?.environment.source.sandboxId == pointer.sandboxId)) else {
-                    throw MobileSessionError.unavailable("Crew retained this instruction for a different browse scope; it was not sent.")
+                    throw RelayError.rpc("command_authority_rejected: Crew retained this instruction for a different browse scope; it was not sent.")
                 }
             }
             if let environment, environment.source.kind == "scaffold" {
-                let receipt = try await workspace.sendScaffoldCommand(
-                    environment: environment, payload: payload, admission: admission
-                )
+                let receipt: MobileCommandReceipt
+                do {
+                    receipt = try await workspace.sendScaffoldCommand(environment: environment, payload: payload, admission: admission)
+                } catch {
+                    if (error as? RelayError)?.isAuthorityPending == true { queued = true }
+                    throw error
+                }
                 try store?.recordAdmissionReceipt(receipt, admission: admission)
                 if case .run = payload {
                     preparation?.markAdmitted()
@@ -1201,11 +1218,12 @@ final class AppModel {
             } else {
                 if let currentOwner = store?.publishedSession?.deviceId,
                    let originalOwner = admission.hostDeviceId, currentOwner != originalOwner {
-                    throw MobileSessionError.unavailable("The Crew session owner changed. The original retained instruction was not sent.")
+                    throw RelayError.rpc("command_authority_rejected: The Crew session owner changed. The original retained instruction was not sent.")
                 }
                 let receipt = try await workspace.sendSessionCommand(chatId: chatId, payload: payload, admission: admission)
                 try store?.recordAdmissionReceipt(receipt, admission: admission)
             }
+            if case .run = payload { workspace.markPreparedSessionAdmitted(id: chatId) }
             queued = true
         }
     }

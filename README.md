@@ -2,6 +2,24 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: metadata-independent session admission
+
+Desktop and iOS first sends retain an immutable session bootstrap with the original
+command. Verified identity, execution setup, local provenance and the durable wake
+commit together; workspace/sidebar projections retry afterward through the existing
+outbox maintenance. A metadata conflict cannot acknowledge an unsaved instruction
+or retarget its selected host, project, deployment, checkout, model or account.
+
+Remote room status, recency and imported placeholders are view-only. Only the
+owning runtime writes durable status; older observations and callbacks from retired
+memberships cannot replace current activity. Persistence failures, pending authority,
+actual scope/permission rejection and accepted metadata catch-up remain distinct.
+Same-ID retries and owner outcome reads never admit an in-memory failed write.
+The session search directory and strict capability/grant checks are unchanged.
+
+Cold-restarted oversized session rooms also trim at the current frontier when no
+aged checkpoint is available, preserving durable state and bounding replay size.
+
 ## Unreleased: workspace recovery conflict isolation
 
 A rejected workspace checkpoint retains its original cache and intents and stays

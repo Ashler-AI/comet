@@ -1996,13 +1996,14 @@ export class SessionRoom implements DurableObject {
     // Pending dependencies also mean the materialized state is incomplete.
     if (this.retainsWorkspaceHistory() || this.docPendingEnds?.size) return false;
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
-    const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
+    const retainedBytes = (this.blobs.byteLength("snapshot") ?? 0) +
+      Number(this.getMeta("updateBytes") ?? "0");
+    const cutoff = retainedBytes > TRIM_FORCE_BYTES ? undefined :
+      checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
     let frontiers: { peer: `${number}`; counter: number }[];
     // The durable lastTrimAt marker identifies the cutoff already applied.
     // A cold start or regular snapshot re-export must not re-trim that cutoff,
     // regardless of the materialized document's shallow status.
-    const retainedBytes = (this.blobs.byteLength("snapshot") ?? 0) +
-      Number(this.getMeta("updateBytes") ?? "0");
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
     } else if (retainedBytes > TRIM_FORCE_BYTES) {

@@ -101,10 +101,10 @@ enum E2ERunner {
         let chatId: String
         let chat: Chat
         do {
-            chatId = try await workspace.createChat(
+            chat = try workspace.prepareChat(
                 id: UUID().uuidString.lowercased(), space: space,
                 config: ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"))
-            chat = try await workspace.waitForCreatedChat(id: chatId)
+            chatId = chat.id
         } catch {
             log("FAIL create chat: \(error.localizedDescription)")
             return
@@ -697,7 +697,7 @@ enum E2ERunner {
             return passed
         }
         guard check("workspace record intents", await WorkspaceStore.runRecordIntentRegression()),
-              check("host-created catalog", await WorkspaceStore.runCreatedChatRegression()),
+              check("prepared session admission", await WorkspaceStore.runCreatedChatRegression()),
               check("disk record recovery", DocDisk.runRecordRecoveryRegression()),
               check("nested tool calls", runNestedToolCallRecovery()),
               check("deployment retarget", SessionStore.runDeploymentRetargetRegression()),
@@ -708,6 +708,7 @@ enum E2ERunner {
               check("room reset epoch", await RoomClient.runResetEpochRegression()),
               check("durable intents", await SessionStore.runDurableIntentRegression()),
               check("admission readback", await SessionStore.runAdmissionReadbackRegression()),
+              check("metadata admission isolation", await SessionStore.runMetadataAdmissionRegression()),
               check("transcript activity", await SessionStore.runTranscriptActivityRegression()),
               check("metadata clear", await AppModel.runMetadataClearRegression()),
               check("relay connection generation", await DeviceRelayClient.runConnectionGenerationRegression()),

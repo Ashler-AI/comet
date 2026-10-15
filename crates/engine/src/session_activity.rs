@@ -68,7 +68,7 @@ impl SessionActivity {
     pub(crate) fn start(host: DocHost, workspace: WorkspaceHost) -> Self {
         let mut refs = workspace.watch_session_refs();
         let mut chats = workspace.watch_chats();
-        let mut sessions = workspace.watch_session_rows();
+        let mut sessions = workspace.merged_sessions_watch(workspace.watch_session_rows());
         let task = tokio::spawn(async move {
             // Dropping the set aborts every room observer, including at shutdown.
             let mut tasks = JoinSet::new();
@@ -107,6 +107,7 @@ impl SessionActivity {
                             let target = workspace.clone();
                             let room = scope.clone();
                             let chat_id = id.clone();
+                            let observed = reference.clone();
                             let task = tasks.spawn(async move {
                                 let mut messages = handle.watch_messages();
                                 let mut previous_status = None;
@@ -136,7 +137,7 @@ impl SessionActivity {
 
                                             let last_message_at = tail.entries.iter().map(|entry| entry.created_at)
                                                 .chain(completed.then_some(source_at)).max();
-                                            target.record_session_activity(room.as_ref(), &agent.owner_subject, &activity, last_message_at)
+                                            target.record_session_activity(&observed, &agent.owner_subject, &activity, last_message_at)
                                         })
                                     };
                                     match result {
@@ -372,7 +373,7 @@ mod tests {
             project_scope: "project".into(), user_id: "owner".into(), edge: None,
         }).unwrap();
         // This is exactly AddSessionRef's ordinary UUID write: no chat placement.
-        workspace.upsert_session_ref(CHAT, None).unwrap();
+        let reference = workspace.upsert_session_ref(CHAT, None).unwrap();
         let at = crate::now_ms();
         let publication = |status, at| PublicationRecord {
             id: format!("owner/{at}"), schema_version: COLLABORATION_SCHEMA_VERSION,
@@ -409,7 +410,7 @@ mod tests {
         assert!(!workspace.is_host(CHAT), "membership cannot claim execution ownership");
         let current = rows.iter().find(|row| row.chat_id == CHAT).unwrap();
         let before = workspace.doc().read_sessions().unwrap();
-        workspace.record_session_activity(None, "other-principal", &Session {
+        workspace.record_session_activity(&reference, "other-principal", &Session {
             status: SessionStatus::Working, ..current.clone()
         }, None).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
@@ -418,14 +419,14 @@ mod tests {
         // cannot relocate it or publish over the newly recorded device.
         workspace.create_space("real-space", "new-owner-device", "/tmp", None, false).unwrap();
         workspace.create_chat(CHAT, "real-space", None, None).unwrap();
-        workspace.record_session_activity(None, "owner", &Session {
+        workspace.record_session_activity(&reference, "owner", &Session {
             status: SessionStatus::Working, ..current.clone()
         }, None).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
         assert_eq!(workspace.doc().chat(CHAT).unwrap().unwrap().device_id, "new-owner-device");
         workspace.remove_session_ref(CHAT).unwrap();
         receive_for(&mut sessions, "rowless membership removed", |rows| rows.iter().all(|row| row.chat_id != CHAT)).await;
-        workspace.record_session_activity(None, "owner", current, None).unwrap();
+        workspace.record_session_activity(&reference, "owner", current, None).unwrap();
         assert!(workspace.doc().session_ref("owner", CHAT).unwrap().is_none());
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
         drop(bridge);
@@ -544,9 +545,8 @@ mod tests {
             assert_eq!(workspace.doc().read_sessions().unwrap().iter()
                 .find(|row| row.chat_id == REMOTE_CHAT), Some(&stale),
                 "the real owner's stale index must actually be imported");
-            // A queued room delivery may restore the raw index before its watch
-            // materializes. Only the merged consumer's current owner is promised.
-            // Advance local live state to require a recomputation after the import,
+            // Room observations never rewrite the raw index. Advance local live
+            // state to require a recomputation after the stale workspace import,
             // rather than accepting the consumer's already-observed room value.
             local.updated_at += chrono::Duration::milliseconds(1);
             local_tx.send_replace(vec![local.clone()]);
@@ -555,16 +555,21 @@ mod tests {
             }).await;
             assert_eq!(rows.iter().find(|row| row.chat_id == LOCAL_CHAT), Some(&local),
                 "local live state still wins");
-            let chat = workspace.doc().chat(REMOTE_CHAT).unwrap().unwrap();
-            assert_eq!(comet_proto::view::display_status(&chat,
-                rows.iter().find(|row| row.chat_id == REMOTE_CHAT), Utc::now()), sidebar);
+            let projected_chats = receive_for(&mut chats, "borrowed owner recency after stale import", |chats| {
+                chats.iter().any(|chat| chat.id == REMOTE_CHAT && chat.last_message_at.is_some())
+            }).await;
+            let chat = projected_chats.iter().find(|chat| chat.id == REMOTE_CHAT).unwrap();
+            assert_eq!(comet_proto::view::display_status(chat,
+                rows.iter().find(|row| row.chat_id == REMOTE_CHAT), Utc::now()), sidebar,
+                "the sidebar consumes borrowed activity from the view, not the durable workspace row");
         }
         let before = workspace.doc().read_sessions().unwrap();
+        let reference = workspace.doc().session_ref("owner", REMOTE_CHAT).unwrap().unwrap();
         let presence_before = devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at;
         let newer = Session { updated_at: current.updated_at + chrono::Duration::seconds(1), ..current.clone() };
         let foreign = Session { device_id: "foreign".into(), status: SessionStatus::Working, ..current.clone() };
-        workspace.record_session_activity(None, "owner", &foreign, Some(crate::now_ms())).unwrap();
-        workspace.record_session_activity(None, "foreign-principal", &newer, Some(crate::now_ms())).unwrap();
+        workspace.record_session_activity(&reference, "owner", &foreign, Some(crate::now_ms())).unwrap();
+        workspace.record_session_activity(&reference, "foreign-principal", &newer, Some(crate::now_ms())).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
         assert_eq!(sessions.borrow().iter().find(|row| row.chat_id == REMOTE_CHAT), Some(&current));
         assert_eq!(devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at, presence_before,
@@ -573,7 +578,7 @@ mod tests {
         workspace.remove_session_ref(REMOTE_CHAT).unwrap();
         receive_for(&mut chats, "unpinned chat removal", |rows| rows.iter().all(|row| row.id != REMOTE_CHAT)).await;
         receive_for(&mut sessions, "unpinned session removal", |rows| rows.iter().all(|row| row.chat_id != REMOTE_CHAT)).await;
-        workspace.record_session_activity(None, "owner", &newer, Some(crate::now_ms())).unwrap();
+        workspace.record_session_activity(&reference, "owner", &newer, Some(crate::now_ms())).unwrap();
         assert_eq!(workspace.doc().read_sessions().unwrap(), before);
         assert_eq!(devices.borrow().iter().find(|device| device.id == "remote").unwrap().last_seen_at, presence_before,
             "removed membership cannot renew device presence");
@@ -640,6 +645,13 @@ mod tests {
         mismatched.environment.as_mut().unwrap().scope.session_id = Some(CHAT.into());
         mismatched.environment.as_mut().unwrap().scope.deployment_id = Some(" ".into());
         assert!(projection(&mismatched, "project").is_none());
+        // Canonical chat metadata arrives from the owner, not the activity observer.
+        workspace.doc().upsert_chat(&Chat {
+            id: CHAT.into(), device_id: "comet-scaffold-sandbox-e1".into(), title: Some("Remote chat".into()),
+            archived: false, cwd: None, branch: None, checkout_id: None, config: None,
+            last_message_preview: None, last_message_at: None, created_at: reference.added_at,
+            harness_session_id: None, harness_session_cwd: None, fork_from: None, space_id: None, last_seen_at: None,
+        }).unwrap();
         let handle = host.open_projection(CHAT, Some(&room)).unwrap();
         let started_at = crate::now_ms();
         let publish = |id: &str, status, at| {
@@ -752,10 +764,9 @@ mod tests {
         comet_proto::view::sort_active(&mut order);
         assert_eq!(order[0].1.id, "newer-local");
         workspace.record_session(&stale_local);
-        assert_eq!(
-            workspace.doc().read_sessions().unwrap()[0].status,
-            SessionStatus::Working
-        );
+        assert!(workspace.doc().read_sessions().unwrap().is_empty(),
+            "neither borrowed owner status nor an abandoned local observer may publish a durable session row");
+        assert_eq!(sessions.borrow()[0].status, SessionStatus::Working);
 
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         publish(CHAT, SessionStatus::AwaitingInput, crate::now_ms());
@@ -838,16 +849,10 @@ mod tests {
             rows[0].updated_at.timestamp_millis() == idle_heartbeat_at
         })
         .await;
-        assert_eq!(
-            workspace
-                .doc()
-                .chat(CHAT)
-                .unwrap()
-                .unwrap()
-                .last_message_at,
-            Some(completed_time),
-            "a redundant idle publication is status, not message activity"
-        );
+        let list = receive(&mut chats, |chats| chats[0].last_message_at == Some(completed_time)).await;
+        assert_eq!(list[0].last_message_at, Some(completed_time));
+        assert_eq!(workspace.doc().chat(CHAT).unwrap().unwrap().last_message_at, None,
+            "borrowed completion recency remains view-only, including idle heartbeat replays");
 
         workspace.remove_session_ref(CHAT).unwrap();
         receive(&mut chats, Vec::is_empty).await;
@@ -857,7 +862,7 @@ mod tests {
         // Even a queued observer delivery cannot write after the synchronous unpin.
         workspace
             .record_session_activity(
-                Some(&room),
+                &reference,
                 "owner",
                 &Session {
                     status: SessionStatus::Working,
@@ -867,15 +872,8 @@ mod tests {
                 Some(unpinned_at),
             )
             .unwrap();
-        assert_eq!(
-            workspace
-                .doc()
-                .chat(CHAT)
-                .unwrap()
-                .unwrap()
-                .last_message_at,
-            Some(completed_time)
-        );
+        assert_eq!(workspace.doc().chat(CHAT).unwrap().unwrap().last_message_at, None,
+            "a removed observer cannot create durable activity");
         drop(bridge);
     }
 }

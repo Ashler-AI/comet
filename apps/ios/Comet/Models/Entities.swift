@@ -171,7 +171,7 @@ struct SessionStartup: Decodable, Hashable {
 }
 
 
-struct Space: Identifiable, Hashable {
+struct Space: Identifiable, Hashable, Codable {
     var id: String
     var deviceId: String
     var path: String
@@ -195,7 +195,7 @@ struct ChatConfig: Hashable, Codable {
     var sandbox: String?
 }
 
-struct Chat: Identifiable, Hashable {
+struct Chat: Identifiable, Hashable, Codable {
     var id: String
     var deviceId: String
     var title: String?

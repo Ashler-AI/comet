@@ -10,8 +10,40 @@ import UIKit
 
 struct MobileCommandReceipt: Decodable {
     var commandId: String
+    var admission: String? = nil
     var metadataError: String?
     var preparationError: String?
+}
+
+struct MobileSessionBootstrap: Codable, Equatable {
+    var chat: Chat
+    var space: Space
+
+    /// Loro projections/journals use milliseconds; native proto entities use RFC3339.
+    var wireDictionary: [String: Any] {
+        func timestamp(_ value: Int64) -> String {
+            Date(timeIntervalSince1970: Double(value) / 1000)
+                .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
+        }
+        var chatWire = encodableDictionary(chat)
+        var spaceWire = encodableDictionary(space)
+        chatWire["createdAt"] = timestamp(chat.createdAt)
+        if let value = chat.lastMessageAt { chatWire["lastMessageAt"] = timestamp(value) }
+        if let value = chat.lastSeenAt { chatWire["lastSeenAt"] = timestamp(value) }
+        spaceWire["createdAt"] = timestamp(space.createdAt)
+        if let value = space.gitCheckedAt { spaceWire["gitCheckedAt"] = timestamp(value) }
+        return ["chat": chatWire, "space": spaceWire]
+    }
+
+    func validate(chatId: String, hostDeviceId: String?) throws {
+        guard AppConfig.canonicalSessionId(chatId) == chatId,
+              chat.id == chatId, chat.spaceId == space.id,
+              !space.deviceId.isEmpty, chat.deviceId == space.deviceId,
+              hostDeviceId == chat.deviceId, chat.config != nil,
+              let cwd = chat.cwd, !cwd.isEmpty else {
+            throw MobileSessionError.unavailable("Crew retained a session bootstrap with different identity or host authority.")
+        }
+    }
 }
 
 struct MobileCommandAdmission: Codable {
@@ -21,6 +53,7 @@ struct MobileCommandAdmission: Codable {
     var hostDeviceId: String?
     var scaffold: ScaffoldAuthority?
     var scope: CollaborationScope?
+    var bootstrap: MobileSessionBootstrap? = nil
 
     struct ScaffoldAuthority: Codable {
         var controllerDeviceId: String
@@ -102,6 +135,7 @@ final class SessionStore {
         var admitted = false
         var admissionAttempted = false
         var admission: MobileCommandAdmission?
+        var admissionBlock: String?
         var steerPrompt: String?
         enum Control: Codable {
             case interrupt
@@ -128,7 +162,7 @@ final class SessionStore {
         }
         private struct Image: Codable { var id: UUID; var filename: String; var bytes: Data }
         private enum CodingKeys: String, CodingKey {
-            case messageId, prompt, images, steer, request, prepared, createdAt, expiresAt, failure, terminal, admitted, admissionAttempted, admission, steerPrompt, control
+            case messageId, prompt, images, steer, request, prepared, createdAt, expiresAt, failure, terminal, admitted, admissionAttempted, admission, admissionBlock, steerPrompt, control
         }
         init(messageId: String, prompt: String, images: [MobileImageAttachment], steer: Bool) {
             self.messageId = messageId; self.prompt = prompt; self.images = images; self.steer = steer
@@ -148,6 +182,7 @@ final class SessionStore {
             admitted = try c.decode(Bool.self, forKey: .admitted)
             admissionAttempted = try c.decodeIfPresent(Bool.self, forKey: .admissionAttempted) ?? prepared
             admission = try c.decodeIfPresent(MobileCommandAdmission.self, forKey: .admission)
+            admissionBlock = try c.decodeIfPresent(String.self, forKey: .admissionBlock)
             steerPrompt = try c.decodeIfPresent(String.self, forKey: .steerPrompt)
             control = try c.decodeIfPresent(Control.self, forKey: .control)
             let retainedImages = try c.decode([Image].self, forKey: .images)
@@ -171,6 +206,7 @@ final class SessionStore {
             try c.encode(terminal, forKey: .terminal); try c.encode(admitted, forKey: .admitted)
             try c.encode(admissionAttempted, forKey: .admissionAttempted)
             try c.encodeIfPresent(admission, forKey: .admission)
+            try c.encodeIfPresent(admissionBlock, forKey: .admissionBlock)
             try c.encodeIfPresent(steerPrompt, forKey: .steerPrompt)
             try c.encodeIfPresent(control, forKey: .control)
             try c.encode(images.map { Image(id: $0.id, filename: $0.filename, bytes: $0.bytes) }, forKey: .images)
@@ -198,8 +234,15 @@ final class SessionStore {
         }
     }
 
+    var hasPendingAuthorization: Bool {
+        submittedDrafts.values.contains { $0.admissionBlock == "command_authority_pending" && !$0.terminal }
+    }
+
     var deliveryStatus: String? {
         _ = revision
+        if submittedDrafts.values.contains(where: { $0.admissionBlock == "command_authority_pending" && !$0.terminal }) { return "Waiting for authorization" }
+        if submittedDrafts.values.contains(where: { $0.admissionBlock == "command_persistence_failed" && !$0.terminal }) { return "Not admitted · persistence failed" }
+        if submittedDrafts.values.contains(where: { $0.admissionBlock == "rejected" && !$0.terminal }) { return "Not admitted · authorization rejected" }
         if submittedDrafts.values.contains(where: { $0.admitted && !$0.terminal }) { return "Accepted · delivery pending" }
         if sending || !pendingSends.isEmpty { return "Awaiting Crew admission…" }
         if submittedDrafts.values.contains(where: { $0.admissionAttempted && !$0.terminal }) { return "Admission unknown · retry original instruction" }
@@ -270,6 +313,14 @@ final class SessionStore {
             throw MobileSessionError.unavailable("The retained Crew journal has conflicting or oversized records.")
         }
         try Self.validateAttachments(drafts.map(\.images))
+        for draft in drafts {
+            if let bootstrap = draft.admission?.bootstrap {
+                guard !draft.steer, draft.control == nil else {
+                    throw MobileSessionError.unavailable("Crew retained a bootstrap for a non-start instruction.")
+                }
+                try bootstrap.validate(chatId: chatId, hostDeviceId: draft.admission?.hostDeviceId)
+            }
+        }
     }
 
     private func persistDrafts() throws {
@@ -362,6 +413,7 @@ final class SessionStore {
     @ObservationIgnored var commandHostProvider: (() -> String?)?
     @ObservationIgnored var commandRouteProvider: (() async throws -> ScaffoldControlRoute?)?
     @ObservationIgnored var commandScaffoldRoute: ScaffoldControlRoute?
+    @ObservationIgnored var commandBootstrap: MobileSessionBootstrap?
 
     init(chatId: String, config: AppConfig, deploymentId: String? = nil, offline: Bool = false,
          metadataOnly: Bool = false) {
@@ -562,6 +614,7 @@ final class SessionStore {
             connected = true
             recoveryFailure = nil
             project()
+            Task { @MainActor [weak self] in await self?.retryPendingAuthorization() }
         case .disconnected:
             connected = false
         case .remoteUpdate:
@@ -1112,7 +1165,8 @@ final class SessionStore {
     // MARK: Command plane (authenticated desktop admission)
 
     func recordAdmissionReceipt(_ receipt: MobileCommandReceipt, admission: MobileCommandAdmission) throws {
-        guard receipt.commandId == admission.commandId else {
+        guard receipt.commandId == admission.commandId,
+              receipt.admission == "accepted" else {
             throw MobileSessionError.unavailable("Crew admission response did not identify the original command; its outcome is unknown.")
         }
         if var draft = submittedDrafts[receipt.commandId], !draft.terminal {
@@ -1120,13 +1174,14 @@ final class SessionStore {
                   NSDictionary(dictionary: encodableDictionary(original)).isEqual(to: encodableDictionary(admission)) else {
                 throw MobileSessionError.unavailable("Crew admission receipt belongs to different retained authority; the original instruction is retained.")
             }
-            draft.admitted = true; draft.failure = nil
+            draft.admitted = true; draft.failure = nil; draft.admissionBlock = nil
             submittedDrafts[receipt.commandId] = draft
+            clearSendFailure()
             do { try persistDrafts() }
             catch { recoveryFailure = "Crew accepted this instruction, but could not checkpoint its receipt: \(error.localizedDescription)" }
         }
         if let failure = receipt.metadataError ?? receipt.preparationError {
-            recoveryFailure = "Crew accepted the instruction; metadata recovery needs attention: \(failure)"
+            recoveryFailure = "Crew accepted the instruction · metadata syncing: \(failure)"
         }
         revision &+= 1
     }
@@ -1174,7 +1229,7 @@ final class SessionStore {
             draft.payload = nil
             draft.steer = steer
             draft.createdAt = nowMs(); draft.expiresAt = draft.createdAt + 86_400_000
-            draft.failure = nil; draft.terminal = false; draft.admitted = false; draft.admissionAttempted = false; draft.admission = nil
+            draft.failure = nil; draft.terminal = false; draft.admitted = false; draft.admissionAttempted = false; draft.admission = nil; draft.admissionBlock = nil
             submittedDrafts.removeValue(forKey: retry.messageId)
         }
         draft.failure = nil
@@ -1185,6 +1240,7 @@ final class SessionStore {
                 hostDeviceId: commandHostProvider?() ?? commandHostDeviceId,
                 scaffold: commandScaffoldRoute.map(MobileCommandAdmission.ScaffoldAuthority.init))
             draft.admission?.scope = CollaborationScope(projectId: config.projectScope, deploymentId: deploymentId, sessionId: chatId)
+            if !steer { draft.admission?.bootstrap = commandBootstrap }
             submittedDrafts[draft.messageId] = draft
         }
         // Keep this send's preparation receipt even if navigation/re-attach
@@ -1235,11 +1291,12 @@ final class SessionStore {
             } else if draft.steer {
                 payload = .steer(prompt: content, messageId: draft.messageId)
             } else {
+                let originalChat = draft.admission?.bootstrap?.chat ?? chat
                 var request = RunRequest(prompt: content,
-                                         model: chat?.config?.model,
-                                         reasoning: chat?.config?.reasoning,
-                                         cwd: chat?.cwd ?? "",
-                                         sandbox: chat?.config?.sandbox ?? "workspace-write")
+                                         model: originalChat?.config?.model,
+                                         reasoning: originalChat?.config?.reasoning,
+                                         cwd: originalChat?.cwd ?? "",
+                                         sandbox: originalChat?.config?.sandbox ?? "workspace-write")
                 request.attachments = paths
                 payload = .run(request: request, messageId: draft.messageId)
             }
@@ -1251,7 +1308,7 @@ final class SessionStore {
             guard let admission = draft.admission, admission.expiresAt > nowMs() else {
                 throw MobileSessionError.unavailable("This Crew instruction has expired.")
             }
-            draft.admissionAttempted = true
+            draft.admissionAttempted = true; draft.admissionBlock = nil
             submittedDrafts[draft.messageId] = draft
             try persistDrafts()
             try await commandSender(payload, admission)
@@ -1259,12 +1316,13 @@ final class SessionStore {
             guard retryDraft?.messageId != draft.messageId || sendFailure == nil else { return false }
             retryDraft = nil
             if var accepted = submittedDrafts[draft.messageId] {
-                accepted.admitted = true
+                accepted.admitted = true; accepted.admissionBlock = nil
                 submittedDrafts[draft.messageId] = accepted
             }
             try persistDrafts()
             return true
         } catch {
+            if handleAdmissionFailure(error, draft: &draft) { return false }
             // A lost RPC response must not turn an already materialized send
             // into a second user message on deliberate retry.
             if entries.contains(where: { $0.id == draft.messageId }), submittedDrafts[draft.messageId]?.terminal != true { return true }
@@ -1273,11 +1331,6 @@ final class SessionStore {
             if retryDraft?.messageId == draft.messageId, sendFailure != nil { return false }
             if let accepted = await readAdmission(&draft) { return accepted }
             if submittedDrafts[draft.messageId]?.admitted == true { return true }
-            if let relay = error as? RelayError, case .rpc(let detail) = relay,
-               ["command_id_conflict", "peer_command_scope_denied"].contains(where: { detail.contains($0) }) {
-                reportSendFailure("Crew rejected this admission attempt: \(detail). The original instruction and identity are retained.", messageId: draft.messageId)
-                return false
-            }
             let message = draft.admissionAttempted
                 ? "Crew admission outcome is unknown. Retry checks the original instruction: \(error.localizedDescription)"
                 : error is CancellationError ? "Send cancelled before admission. Your draft is still here." : "Crew did not send this instruction: \(error.localizedDescription)"
@@ -1333,6 +1386,38 @@ final class SessionStore {
         sendFailure = nil
         failedPrompt = nil
         failedImages = []
+    }
+
+    /// Explicit non-admission responses outrank transient in-memory readback.
+    private func handleAdmissionFailure(_ error: Error, draft: inout SubmittedDraft) -> Bool {
+        guard draft.admissionAttempted, let relay = error as? RelayError, case .rpc(let detail) = relay,
+              detail != "unexpected reply" else { return false }
+        let block: String
+        let message: String
+        if relay.isAuthorityPending {
+            block = "command_authority_pending"
+            message = "Waiting for authorization · Crew has not admitted this instruction. Retry keeps its original identity."
+        } else if relay.isCommandPersistenceFailure {
+            block = "command_persistence_failed"
+            message = "Crew did not persist or admit this instruction. Retry keeps its original identity: \(detail)"
+        } else {
+            // A definite RPC rejection is not an unknown transport outcome.
+            block = "rejected"
+            message = "Crew rejected this admission attempt: \(detail). Its original instruction and authority are retained."
+        }
+        draft.admitted = false; draft.admissionBlock = block
+        submittedDrafts[draft.messageId] = draft
+        reportSendFailure(message, messageId: draft.messageId)
+        return true
+    }
+
+    func retryPendingAuthorization() async {
+        guard !sending else { return }
+        let waiting = submittedDrafts.values.filter { $0.admissionBlock == "command_authority_pending" && !$0.terminal }.sorted { $0.createdAt < $1.createdAt }
+        for draft in waiting {
+            if draft.control != nil { await submitControl(draft) }
+            else { _ = await sendMessage(prompt: draft.prompt, chat: draft.admission?.bootstrap?.chat, images: draft.images, steer: draft.steer) }
+        }
     }
 
     func sendInterrupt() {
@@ -1397,6 +1482,7 @@ final class SessionStore {
         // a pending retry. Both send paths must resume with that upgraded copy.
         defer { if let retained = submittedDrafts[draft.messageId] { draft = retained } }
         guard let admission = draft.admission, let commandReader else { return nil }
+        guard draft.admissionBlock == nil else { return nil }
         do {
             let response = try await commandReader(admission)
             guard let command = response["command"] as? [String: Any] else { return nil }
@@ -1415,7 +1501,7 @@ final class SessionStore {
             guard ["pending", "applied"].contains(status) else { return nil }
             if status == "applied" { resolveAcceptedDraft(draft.messageId) }
             else if var retained = submittedDrafts[draft.messageId] {
-                retained.admitted = true; retained.failure = nil
+                retained.admitted = true; retained.failure = nil; retained.admissionBlock = nil
                 submittedDrafts[draft.messageId] = retained
                 retryDraft = nil
                 clearSendFailure()
@@ -1458,24 +1544,21 @@ final class SessionStore {
             }
             guard let commandSender, let payload = draft.payload, let admission = draft.admission,
                   admission.expiresAt > nowMs() else { throw MobileSessionError.unavailable("This Crew instruction has no valid command route or has expired.") }
-            draft.admissionAttempted = true
+            draft.admissionAttempted = true; draft.admissionBlock = nil
             submittedDrafts[draft.messageId] = draft
             try persistDrafts()
             try await commandSender(payload, admission)
             if var accepted = submittedDrafts[draft.messageId], !accepted.terminal {
-                accepted.admitted = true; accepted.failure = nil
+                accepted.admitted = true; accepted.failure = nil; accepted.admissionBlock = nil
                 submittedDrafts[draft.messageId] = accepted
+                clearSendFailure()
                 try persistDrafts()
             }
         } catch {
+            if handleAdmissionFailure(error, draft: &draft) { return }
             if let accepted = await readAdmission(&draft), accepted { return }
             if submittedDrafts[draft.messageId] != nil, submittedDrafts[draft.messageId]?.admitted != true {
-                if let relay = error as? RelayError, case .rpc(let detail) = relay,
-                   ["command_id_conflict", "peer_command_scope_denied"].contains(where: { detail.contains($0) }) {
-                    reportSendFailure("Crew rejected this control admission attempt: \(detail). Its original identity is retained.", messageId: draft.messageId)
-                } else {
-                    reportSendFailure(draft.admissionAttempted ? "Crew control admission outcome is unknown. Retry checks its original identity: \(error.localizedDescription)" : "Crew did not send this control: \(error.localizedDescription)", messageId: draft.messageId)
-                }
+                reportSendFailure(draft.admissionAttempted ? "Crew control admission outcome is unknown. Retry checks its original identity: \(error.localizedDescription)" : "Crew did not send this control: \(error.localizedDescription)", messageId: draft.messageId)
             }
         }
     }
@@ -1483,6 +1566,130 @@ final class SessionStore {
 
 #if DEBUG
 extension SessionStore {
+    static func runMetadataAdmissionRegression() async -> Bool {
+        var stores: [SessionStore] = []
+        var cacheIds: [String] = []
+        defer {
+            stores.forEach { $0.stop() }
+            if let files = try? FileManager.default.contentsOfDirectory(at: DocDisk.directory, includingPropertiesForKeys: nil) {
+                for file in files where cacheIds.contains(where: { file.lastPathComponent.hasPrefix($0.replacingOccurrences(of: "/", with: "_")) }) {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }
+        }
+        do {
+            for scaffold in [false, true] {
+                let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
+                    userId: "metadata-\(UUID().uuidString)", projectScope: "metadata-admission", deviceId: "phone", deviceName: "Crew regression")
+                let chatId = UUID().uuidString.lowercased()
+                let deployment: String? = scaffold ? "deployment" : nil
+                let space = Space(id: "original-space", deviceId: "host", path: "/original", gitDetected: true, createdAt: 1)
+                let chat = Chat(id: chatId, deviceId: "host", archived: false, cwd: "/original/worktree", branch: "original-branch",
+                    config: ChatConfig(harness: scaffold ? "omp" : "mock", model: "original-model", reasoning: "high", sandbox: "workspace-write"),
+                    createdAt: 2, spaceId: space.id)
+                let bootstrap = MobileSessionBootstrap(chat: chat, space: space)
+                guard (bootstrap.wireDictionary["chat"] as? [String: Any])?["createdAt"] as? String == "1970-01-01T00:00:00.002Z",
+                      (bootstrap.wireDictionary["space"] as? [String: Any])?["createdAt"] as? String == "1970-01-01T00:00:00.001Z" else { return false }
+                let scope = CollaborationScope(projectId: config.projectScope, deploymentId: deployment, sessionId: chatId)
+                let route = ScaffoldControlRoute(controllerDeviceId: "host", ownerDeviceId: "sandbox-device", actorSubject: config.userId,
+                    grantId: "original-grant", projection: SessionRoomProjection(projectId: config.projectScope, deploymentId: "deployment", sessionId: chatId),
+                    environment: SessionEnvironment(source: SessionEnvironmentSource(kind: "scaffold", sandboxId: "original-sandbox", lifecycleEpoch: 7),
+                        ownerPrincipal: config.userId, scope: scope), preparationGeneration: "original-generation")
+                let failures = ["command_authority_pending", "command_persistence_failed: disk unavailable", "command_authority_rejected: original grant revoked", ""]
+                let statuses = ["Waiting for authorization", "Not admitted · persistence failed", "Not admitted · authorization rejected"]
+                var attempts: [MobileCommandAdmission] = []
+                var readbacks = 0
+                let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+                for (stage, failure) in failures.enumerated() {
+                    let store = SessionStore(chatId: chatId, config: config, deploymentId: deployment)
+                    stores.append(store); cacheIds.append(store.intentCacheId)
+                    store.commandHostDeviceId = stage == 0 ? "host" : "changed-host"
+                    store.commandScaffoldRoute = scaffold ? route : nil
+                    var changed = bootstrap
+                    if stage > 0 { changed.chat.cwd = "/changed"; changed.chat.config?.model = "changed-model" }
+                    store.commandBootstrap = changed
+                    store.commandSender = { payload, admission in
+                        guard case .run(let request, let messageId) = payload,
+                              messageId == admission.commandId, admission.bootstrap == bootstrap,
+                              request.cwd == chat.cwd, request.model == chat.config?.model,
+                              request.reasoning == chat.config?.reasoning, admission.scope == scope,
+                              admission.scaffold?.grantId == (scaffold ? "original-grant" : nil),
+                              admission.scaffold?.preparationGeneration == (scaffold ? "original-generation" : nil),
+                              let onDisk = try DocDisk.loadIntents([SubmittedDraft].self, id: store.intentCacheId),
+                              let retained = onDisk.first(where: { $0.messageId == admission.commandId }),
+                              retained.admission?.bootstrap == bootstrap, retained.admissionAttempted else {
+                            throw MobileSessionError.unavailable("The original run was not retained before submission")
+                        }
+                        attempts.append(admission)
+                        if !failure.isEmpty { throw RelayError.rpc(failure) }
+                        try store.recordAdmissionReceipt(MobileCommandReceipt(commandId: admission.commandId, admission: "accepted",
+                            metadataError: "unrelated catalog unavailable", preparationError: nil), admission: admission)
+                    }
+                    // Even an exact in-memory pending command cannot override
+                    // an explicit response saying it was not admitted.
+                    store.commandReader = { admission in
+                        readbacks += 1
+                        guard let draft = store.submittedDrafts[admission.commandId], let request = draft.request else { return [:] }
+                        var payload: [String: Any] = ["kind": "run", "request": encodableDictionary(request), "messageId": admission.commandId]
+                        if scaffold {
+                            payload = ["kind": "control", "sessionId": chatId, "ownerDeviceId": route.ownerDeviceId,
+                                "actorDeviceId": route.controllerDeviceId, "actorSubject": route.actorSubject, "grantId": route.grantId,
+                                "source": "scaffold", "action": ["action": "start", "request": encodableDictionary(request), "message_id": admission.commandId]]
+                        }
+                        return ["command": ["commandId": admission.commandId, "issuedAt": admission.issuedAt,
+                            "expiresAt": admission.expiresAt, "status": "pending", "payload": payload]]
+                    }
+                    if stage == 1 {
+                        await store.retryPendingAuthorization()
+                    } else {
+                        let accepted = await store.sendRun(prompt: "original instruction", chat: changed.chat)
+                        guard accepted == failure.isEmpty else { return false }
+                    }
+                    guard attempts.count == stage + 1, readbacks == 0,
+                          try attempts.allSatisfy({ try encoder.encode($0) == encoder.encode(attempts[0]) }) else { return false }
+                    if stage < 3 {
+                        guard store.deliveryStatus == statuses[stage],
+                              store.submittedDrafts[attempts[0].commandId]?.admitted == false else { return false }
+                    } else {
+                        guard store.submittedDrafts[attempts[0].commandId]?.admitted == true,
+                              store.recoveryFailure?.contains("metadata syncing") == true else { return false }
+                        store.setEntries([MessageEntry(id: attempts[0].commandId, role: .user,
+                            parts: [.text(id: "original-text", text: "original instruction")], createdAt: nowMs(), deviceId: "host")])
+                        guard await store.sendRun(prompt: "original instruction", chat: changed.chat), attempts.count == 4 else { return false }
+                    }
+                }
+                let workspace = WorkspaceStore(config: config)
+                defer { workspace.stop() }
+                if scaffold {
+                    for field in ["owner", "sandbox", "epoch", "scope"] {
+                        var environment = route.environment
+                        if field == "owner" { environment.ownerPrincipal = "other-user" }
+                        if field == "sandbox" { environment.source.sandboxId = "other-sandbox" }
+                        if field == "epoch" { environment.source.lifecycleEpoch = 8 }
+                        if field == "scope" { environment.scope.deploymentId = "other-deployment" }
+                        do {
+                            _ = try await workspace.sendScaffoldCommand(environment: environment,
+                                payload: .interrupt, admission: attempts[0])
+                            return false
+                        } catch RelayError.rpc(let detail) {
+                            guard detail.contains("authority changed") else { return false }
+                        }
+                    }
+                } else {
+                    _ = try workspace.prepareChat(id: chatId, space: space, config: chat.config!)
+                    cacheIds.append(config.documentCacheId(roomId: "ws4/\(config.projectScope)"))
+                    var wrongHost = attempts[0]; wrongHost.hostDeviceId = "other-host"
+                    do { _ = try await workspace.sendSessionCommand(chatId: chatId, payload: .interrupt, admission: wrongHost); return false }
+                    catch RelayError.rpc(let detail) {
+                        guard detail.contains("owner changed") else { return false }
+                    }
+                }
+            }
+            E2ERunner.log("OK Crew metadata admission: ordinary Run and scoped Start retain bootstrap/request/authority before send; same-ID restart retry, pending authorization, persistence failure, denial and changed authority, accepted metadata syncing, no completed resend")
+            return true
+        } catch { E2ERunner.log("FAIL Crew metadata admission: \(error)"); return false }
+    }
+
     static func runAdmissionReadbackRegression() async -> Bool {
         let config = AppConfig(edgeURL: URL(string: "http://127.0.0.1:1")!, mode: .dev,
             userId: "admission-\(UUID().uuidString)", projectScope: "admission-regression", deviceId: "phone", deviceName: "Crew regression")
@@ -1515,7 +1722,7 @@ extension SessionStore {
               let retained = initial.submittedDrafts[original.commandId], retained.admitted else { return false }
         do {
             try initial.recordAdmissionReceipt(MobileCommandReceipt(commandId: original.commandId,
-                metadataError: "metadata conflict", preparationError: nil), admission: original)
+                admission: "accepted", metadataError: "metadata conflict", preparationError: nil), admission: original)
         } catch { return false }
         guard initial.recoveryFailure?.contains("Crew accepted") == true,
               initial.recoveryFailure?.contains("metadata conflict") == true, initial.sendFailure == nil else { return false }

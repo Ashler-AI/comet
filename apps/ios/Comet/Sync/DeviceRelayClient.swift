@@ -17,6 +17,16 @@ enum RelayError: LocalizedError {
     case rpc(String)
     case timeout
 
+    var isAuthorityPending: Bool {
+        if case .rpc(let detail) = self { return detail.contains("command_authority_pending") }
+        return false
+    }
+
+    var isCommandPersistenceFailure: Bool {
+        if case .rpc(let detail) = self { return detail.contains("command_persistence_failed") }
+        return false
+    }
+
     var errorDescription: String? {
         switch self {
         case .notConnected: return "Not connected to the device"

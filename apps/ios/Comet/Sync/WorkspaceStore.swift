@@ -55,6 +55,64 @@ final class WorkspaceStore {
     @ObservationIgnored private var recordIntents: [String: DocDisk.RecordIntent] = [:]
     @ObservationIgnored private var recordJournalBlocked = false
     private var recordCacheId: String { config.documentCacheId(roomId: "ws4/\(config.projectScope)") }
+    private struct PreparedSession: Codable {
+        var bootstrap: MobileSessionBootstrap
+        var authority: MobileCommandAdmission.ScaffoldAuthority?
+        var admitted = false
+    }
+    private var preparations: [String: PreparedSession] = [:]
+    private var preparationLoadBlocked = false
+    private var preparationCacheId: String { recordCacheId + "-session-preparations" }
+
+    func preparedBootstrap(id: String) -> MobileSessionBootstrap? { preparations[id]?.bootstrap }
+    func preparedScaffoldRoute(id: String) -> ScaffoldControlRoute? { preparations[id]?.authority?.route }
+
+    private func validatePreparation(_ prepared: PreparedSession) throws {
+        let bootstrap = prepared.bootstrap
+        try bootstrap.validate(chatId: bootstrap.chat.id, hostDeviceId: bootstrap.space.deviceId)
+        if let authority = prepared.authority {
+            guard authority.controllerDeviceId == bootstrap.space.deviceId,
+                  !authority.ownerDeviceId.isEmpty, !authority.grantId.isEmpty,
+                  authority.actorSubject == config.userId,
+                  authority.environment.ownerPrincipal == config.userId,
+                  authority.environment.source.kind == "scaffold",
+                  authority.environment.source.sandboxId != nil,
+                  authority.environment.scope.projectId == config.projectScope,
+                  authority.environment.scope.sessionId == bootstrap.chat.id,
+                  authority.environment.scope.deploymentId == authority.projection.deploymentId,
+                  authority.projection.projectId == config.projectScope,
+                  authority.projection.sessionId == bootstrap.chat.id else {
+                throw MobileSessionError.unavailable("Crew retained a preparation with different Scaffold authority.")
+            }
+        }
+    }
+
+    func markPreparedSessionAdmitted(id: String) {
+        guard var prepared = preparations[id] else { return }
+        prepared.admitted = true
+        var next = preparations; next[id] = prepared
+        do {
+            try DocDisk.saveIntents(Array(next.values), id: preparationCacheId)
+            preparations = next
+        } catch { recoveryFailure = "Crew accepted the instruction; preparation metadata is syncing: \(error.localizedDescription)" }
+    }
+
+    private func retainPreparation(_ prepared: PreparedSession) throws {
+        let bootstrap = prepared.bootstrap
+        guard !preparationLoadBlocked else { throw MobileSessionError.unavailable("Crew preparation recovery is blocked; the original journal is retained.") }
+        try validatePreparation(prepared)
+        if let original = preparations[bootstrap.chat.id] {
+            guard original.bootstrap == bootstrap else {
+                throw MobileSessionError.unavailable("Crew already prepared this session with different configuration; the original is retained.")
+            }
+            return
+        }
+        var next = preparations
+        next[bootstrap.chat.id] = prepared
+        try DocDisk.saveIntents(Array(next.values), id: preparationCacheId)
+        preparations = next
+        project()
+    }
 
     private func loadRecordIntents() {
         do {
@@ -174,6 +232,21 @@ final class WorkspaceStore {
     init(config: AppConfig) {
         self.config = config
         loadRecordIntents()
+        do {
+            let retained = try DocDisk.loadIntents([PreparedSession].self, id: preparationCacheId) ?? []
+            var next: [String: PreparedSession] = [:]
+            for prepared in retained {
+                try validatePreparation(prepared)
+                guard next[prepared.bootstrap.chat.id] == nil else {
+                    throw MobileSessionError.unavailable("Crew retained conflicting session preparations.")
+                }
+                next[prepared.bootstrap.chat.id] = prepared
+            }
+            preparations = next
+        } catch {
+            preparationLoadBlocked = true
+            recoveryFailure = "Crew session preparation recovery is blocked: \(error.localizedDescription). The original journal is retained."
+        }
     }
 
     @ObservationIgnored private var saver: DocSaver?
@@ -618,43 +691,35 @@ final class WorkspaceStore {
             userId: "creation-\(UUID().uuidString)", projectScope: "creation-regression",
             deviceId: "viewer", deviceName: "Crew regression")
         let store = WorkspaceStore(config: config)
+        var restored: WorkspaceStore?
         defer {
-            store.stop()
+            store.stop(); restored?.stop()
             try? FileManager.default.removeItem(at: DocDisk.intentURL(for: store.recordCacheId))
+            try? FileManager.default.removeItem(at: DocDisk.intentURL(for: store.preparationCacheId))
         }
         do {
-            let row = try store.doc.getMap(id: "chats").getOrCreateContainer(key: "created", child: LoroMap())
-            try row.insert(key: "id", v: "created"); try row.insert(key: "deviceId", v: "host")
-            try row.insert(key: "createdAt", v: Int64(1234))
-            try row.insert(key: "config", v: LoroValue.fromJSON([
-                "harness": "mock", "model": NSNull(), "reasoning": NSNull(), "sandbox": "workspace-write"
-            ] as [String: Any]))
-            let member = try store.doc.getMap(id: "sessionRefs").getOrCreateContainer(key: "membership", child: LoroMap())
-            try member.insert(key: "chatId", v: "created"); try member.insert(key: "userId", v: "other-user")
-            try member.insert(key: "addedAt", v: Int64(1234))
-            store.doc.commit(); store.project()
-            var entered = false
-            let waiting = Task { @MainActor in
-                entered = true
-                return try await store.waitForCreatedChat(id: "created")
-            }
-            defer { waiting.cancel() }
-            guard await E2ERunner.poll(timeout: 1, label: "creation membership wait", { entered ? true : nil }) != nil else { return false }
-            waiting.cancel()
-            do { _ = try await waiting.value; return false } catch is CancellationError {}
-            try member.insert(key: "userId", v: config.userId)
-            store.doc.commit(); store.project()
-            let version = store.doc.oplogVv()
-            let created = try await store.waitForCreatedChat(id: "created")
-            guard created.createdAt == 1234,
-                  created.config == ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"),
-                  store.doc.oplogVv() == version, store.recordIntents.isEmpty else { return false }
+            // A real unrelated catalog conflict must not gate a new session.
             store.blockRecordRecovery(MobileSessionError.unavailable("Retained user-edit conflict"))
-            do { _ = try await store.waitForCreatedChat(id: "created"); return false }
-            catch MobileSessionError.unavailable(_) {}
-            E2ERunner.log("OK Crew host-created catalog: principal membership, cancellation, authoritative config/clock, no duplicate creation intent and visible recovery failure")
+            let before = store.doc.oplogVv()
+            let space = Space(id: "space", deviceId: "host", path: "/repo", gitDetected: true, createdAt: 1)
+            let chatId = UUID().uuidString.lowercased()
+            let chat = try store.prepareChat(id: chatId, space: space,
+                config: ChatConfig(harness: "mock", model: "chosen", reasoning: "high", sandbox: "workspace-write"),
+                branch: "chosen-branch", cwd: "/repo/isolated")
+            guard store.chat(id: chatId) == chat, store.sessionRef(id: chatId) != nil,
+                  store.overviewChats.contains(where: { $0.id == chatId }),
+                  store.doc.oplogVv() == before, store.recordIntents.isEmpty,
+                  store.recoveryFailure?.contains("Retained user-edit conflict") == true else { return false }
+            let restarted = WorkspaceStore(config: config); restored = restarted
+            let retry = try restarted.prepareChat(id: chatId, space: space,
+                config: ChatConfig(harness: "changed", model: nil, reasoning: nil, sandbox: nil), cwd: "/different")
+            guard retry == chat, restarted.preparedBootstrap(id: chatId) == store.preparedBootstrap(id: chatId) else { return false }
+            var wrong = restarted.preparedBootstrap(id: chatId)!
+            wrong.space.deviceId = "other-host"
+            do { try wrong.validate(chatId: chatId, hostDeviceId: "host"); return false } catch {}
+            E2ERunner.log("OK Crew prepared session: stale/conflicting catalog is independent, exact config/cwd/branch survive restart and retry, mismatched host denied")
             return true
-        } catch { return false }
+        } catch { E2ERunner.log("FAIL Crew prepared session: \(error)"); return false }
     }
     #endif
 
@@ -771,6 +836,28 @@ final class WorkspaceStore {
 
     func applyProjection(_ decoded: Projection) {
         previousProjection = decoded
+        let projected = preparations.filter { id, prepared in
+            prepared.admitted && decoded.chats.contains(where: { $0.id == id }) && decoded.sessionRefs.contains(where: { $0.chatId == id })
+        }
+        if !projected.isEmpty {
+            let retained = preparations.filter { projected[$0.key] == nil }
+            do {
+                try DocDisk.saveIntents(Array(retained.values), id: preparationCacheId)
+                preparations = retained
+            } catch { recoveryFailure = "Crew accepted the instruction; preparation metadata is syncing: \(error.localizedDescription)" }
+        }
+        let missing = preparations.values.filter { prepared in
+            !decoded.chats.contains(where: { $0.id == prepared.bootstrap.chat.id })
+        }
+        var decoded = decoded
+        decoded.chats += missing.map { $0.bootstrap.chat }
+        for prepared in preparations.values where !decoded.sessionRefs.contains(where: { $0.chatId == prepared.bootstrap.chat.id }) {
+            decoded.sessionRefs.append(SessionRef(chatId: prepared.bootstrap.chat.id, addedAt: prepared.bootstrap.chat.createdAt,
+                environment: prepared.authority?.environment))
+        }
+        if !preparations.isEmpty {
+            decoded.lists = WorkspaceLists(devices: decoded.devices, spaces: decoded.spaces, chats: decoded.chats, refs: decoded.sessionRefs)
+        }
         if devices != decoded.devices { devices = decoded.devices }
         if spaces != decoded.spaces { spaces = decoded.spaces }
         if chats != decoded.chats { chats = decoded.chats }
@@ -809,10 +896,12 @@ final class WorkspaceStore {
 
     func chats(in spaceId: String) -> [Chat] { activeBySpace[spaceId] ?? [] }
     func settledChats(in spaceId: String) -> [Chat] { archivedBySpace[spaceId] ?? [] }
-    func chat(id: String) -> Chat? { chatsById[id] }
+    func chat(id: String) -> Chat? { chatsById[id] ?? preparations[id]?.bootstrap.chat }
     func space(id: String) -> Space? { spacesById[id] }
     func device(id: String) -> DeviceRow? { devicesById[id] }
-    func sessionRef(id: String) -> SessionRef? { refsById[id] }
+    func sessionRef(id: String) -> SessionRef? {
+        refsById[id] ?? preparations[id].map { SessionRef(chatId: id, addedAt: $0.bootstrap.chat.createdAt, environment: $0.authority?.environment) }
+    }
 
 
     // MARK: Device relay (folder browsing / direct host RPCs)
@@ -978,20 +1067,6 @@ final class WorkspaceStore {
 
         let chatConfig = ChatConfig(harness: "omp", model: launch.persistedModel,
                                     reasoning: launch.reasoning, sandbox: "workspace-write")
-        struct OkReply: Decodable { var ok: Bool? }
-        let _: OkReply = try await relay(for: space.deviceId).call(
-            method: "Mutate",
-            params: [
-                "op": "createChat",
-                "chatId": chatId,
-                "spaceId": space.id,
-                "cwd": ".",
-                "branch": launch.sourceRef,
-                "config": encodableDictionary(chatConfig),
-            ]
-        )
-        _ = try await waitForCreatedChat(id: chatId)
-        _ = addSessionRef(chatId: chatId, environment: attachment.environment)
 
         let route = ScaffoldControlRoute(
             controllerDeviceId: space.deviceId,
@@ -1002,6 +1077,10 @@ final class WorkspaceStore {
             environment: attachment.environment,
             preparationGeneration: generation
         )
+        let bootstrap = MobileSessionBootstrap(chat: Chat(id: chatId, deviceId: space.deviceId,
+            archived: false, cwd: ".", branch: launch.sourceRef, config: chatConfig,
+            createdAt: nowMs(), spaceId: space.id), space: space)
+        try retainPreparation(PreparedSession(bootstrap: bootstrap, authority: MobileCommandAdmission.ScaffoldAuthority(route)))
         transferred = true
         return (route, receipt)
     }
@@ -1022,17 +1101,17 @@ final class WorkspaceStore {
         guard admission.expiresAt > nowMs(), admission.scaffold == nil,
               AppConfig.canonicalSessionId(chatId) == chatId,
               let scope = admission.scope, scope.projectId == config.projectScope, scope.sessionId == chatId else {
-            throw MobileSessionError.unavailable("This Crew instruction is expired or has different authority.")
+            throw RelayError.rpc("command_authority_rejected: This Crew instruction is expired or has different authority.")
         }
         guard scope.deploymentId == nil else {
-            throw MobileSessionError.unavailable("This Crew instruction targets an explicit deployment. The legacy desktop command route cannot authorize it; its original draft and scope are retained. Use its scoped Scaffold authority or open it on the owner in Crew.")
+            throw RelayError.rpc("command_authority_rejected: This Crew instruction targets an explicit deployment. The legacy desktop command route cannot authorize it; its original draft and scope are retained. Use its scoped Scaffold authority or open it on the owner in Crew.")
         }
         guard let hostDeviceId = chat(id: chatId)?.deviceId
             ?? sessions[chatId]?.deviceId ?? admission.hostDeviceId, !hostDeviceId.isEmpty else {
             throw MobileSessionError.unavailable("This session has no known desktop host")
         }
         guard admission.hostDeviceId == hostDeviceId else {
-            throw MobileSessionError.unavailable("The Crew session owner changed. The retained instruction was not sent.")
+            throw RelayError.rpc("command_authority_rejected: The Crew session owner changed. The retained instruction was not sent.")
         }
         var command: [String: Any] = ["kind": payload.kind]
         switch payload {
@@ -1050,16 +1129,16 @@ final class WorkspaceStore {
         }
         let commandRelay = DeviceRelayClient(deviceId: hostDeviceId, config: config,
                                              controlSessionId: chatId, controlDeploymentId: scope.deploymentId)
-        return try await commandRelay.call(
-            method: "AdmitPeerCommand",
-            params: [
-                "chatId": chatId,
-                "commandId": admission.commandId,
-                "issuedAt": admission.issuedAt,
-                "expiresAt": admission.expiresAt,
-                "command": command,
-            ]
-        )
+        var params: [String: Any] = [
+            "chatId": chatId, "commandId": admission.commandId,
+            "issuedAt": admission.issuedAt, "expiresAt": admission.expiresAt, "command": command,
+        ]
+        if let bootstrap = admission.bootstrap {
+            guard case .run = payload else { throw MobileSessionError.unavailable("Crew bootstrap requires a start instruction.") }
+            try bootstrap.validate(chatId: chatId, hostDeviceId: hostDeviceId)
+            params["bootstrap"] = bootstrap.wireDictionary
+        }
+        return try await commandRelay.call(method: "AdmitPeerCommand", params: params)
     }
 
     func sendScaffoldCommand(environment: SessionEnvironment,
@@ -1074,7 +1153,7 @@ final class WorkspaceStore {
               authority.projection.projectId == config.projectScope,
               authority.projection.sessionId == environment.scope.sessionId,
               authority.projection.deploymentId == environment.scope.deploymentId else {
-            throw MobileSessionError.unavailable("This retained Crew instruction has expired or its authority changed. Review it before sending a new instruction.")
+            throw RelayError.rpc("command_authority_rejected: This retained Crew instruction has expired or its authority changed. Review it before sending a new instruction.")
         }
         // Revalidate the original grant on admission; never attach/resume merely
         // to retry a send or exchange a revoked grant for fresh authority.
@@ -1213,8 +1292,15 @@ final class WorkspaceStore {
             "expiresAt": admission.expiresAt,
             "command": command,
         ]
-        if case .run = payload, let preparationGeneration {
-            params["preparationGeneration"] = preparationGeneration
+        if case .run = payload {
+            params["roomProjection"] = encodableDictionary(route.projection)
+            params["targetDeviceId"] = route.ownerDeviceId
+            if let preparationGeneration { params["preparationGeneration"] = preparationGeneration }
+        }
+        if let bootstrap = admission.bootstrap {
+            guard case .run = payload else { throw MobileSessionError.unavailable("Crew bootstrap requires a start instruction.") }
+            try bootstrap.validate(chatId: route.projection.sessionId, hostDeviceId: route.controllerDeviceId)
+            params["bootstrap"] = bootstrap.wireDictionary
         }
         try Task.checkCancellation()
         // Once dispatched, admission must finish even if its view disappears.
@@ -1268,46 +1354,19 @@ final class WorkspaceStore {
     }
 
 
-    /// Create through the actual host so its verified principal membership is
-    /// installed before the first QueueCommand can reach command draining.
+    /// Prepare the exact first-run context locally. The command admission owns
+    /// remote creation; catalog publication is never a first-send prerequisite.
     @discardableResult
-    func createChat(id chatId: String, space: Space, config chatConfig: ChatConfig,
-                    branch: String? = nil, cwd: String? = nil) async throws -> String {
-        guard !space.deviceId.isEmpty else {
-            throw MobileSessionError.unavailable("This space has no desktop host")
-        }
-        var params: [String: Any] = [
-            "op": "createChat",
-            "chatId": chatId,
-            "spaceId": space.id,
-            "config": encodableDictionary(chatConfig),
-        ]
-        if let branch { params["branch"] = branch }
-        if let cwd { params["cwd"] = cwd }
-        struct Reply: Decodable { var ok: Bool }
-        let reply: Reply = try await relay(for: space.deviceId).call(method: "Mutate", params: params)
-        guard reply.ok else {
-            throw MobileSessionError.unavailable("The desktop did not create this session")
-        }
-        return chatId
+    func prepareChat(id chatId: String, space: Space, config chatConfig: ChatConfig,
+                     branch: String? = nil, cwd: String? = nil) throws -> Chat {
+        if let retained = preparations[chatId] { return retained.bootstrap.chat }
+        let chat = Chat(id: chatId, deviceId: space.deviceId, archived: false,
+                        cwd: cwd ?? space.path, branch: branch, config: chatConfig,
+                        createdAt: nowMs(), spaceId: space.id)
+        try retainPreparation(PreparedSession(bootstrap: MobileSessionBootstrap(chat: chat, space: space), authority: nil))
+        return chat
     }
 
-    /// The host already committed the chat and principal membership. Recreating
-    /// them here races its publication with different config encoding and clocks.
-    func waitForCreatedChat(id: String) async throws -> Chat {
-        let epoch = roomEpoch
-        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
-        while ContinuousClock.now < deadline {
-            try Task.checkCancellation()
-            guard epoch == roomEpoch else {
-                throw MobileSessionError.unavailable("The workspace connection changed while waiting for the created session.")
-            }
-            if let recoveryFailure { throw MobileSessionError.unavailable(recoveryFailure) }
-            if let chat = chat(id: id), sessionRef(id: id) != nil { return chat }
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-        throw MobileSessionError.unavailable("The desktop created this session, but its catalog has not synced yet. Retry to continue the same session.")
-    }
 
     /// Create a space. Preferred path: `Mutate {op:createSpace}` straight to
     /// the owning host over its relay (it applies the row to its own workspace

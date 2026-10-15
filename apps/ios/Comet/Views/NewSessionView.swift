@@ -479,8 +479,12 @@ struct NewSessionView: View {
                     )
                     finishLaunch(chatId: chatId, submittedImages: submittedImages)
                 } catch {
-                    busy = false
-                    launchError = error.localizedDescription
+                    if let chat = model.chat(id: creationId), let store = model.sessionStore(for: chat), store.hasPendingAuthorization {
+                        finishLaunch(chatId: creationId, submittedImages: submittedImages)
+                    } else {
+                        busy = false
+                        launchError = error.localizedDescription
+                    }
                 }
                 return
             }
@@ -510,15 +514,21 @@ struct NewSessionView: View {
                 if let existing = createdChatId {
                     chatId = existing
                 } else {
-                    chatId = try await model.createChat(id: creationId, space: space, config: config,
-                                                        branch: branch, cwd: cwd)
+                    chatId = try model.prepareChat(id: creationId, space: space, config: config,
+                                                   branch: branch, cwd: cwd).id
                     createdChatId = chatId
                 }
-                let chat = try await model.waitForCreatedChat(id: chatId)
+                guard let chat = model.chat(id: chatId) else {
+                    throw MobileSessionError.unavailable("The prepared session is not available")
+                }
                 guard let store = model.sessionStore(for: chat) else {
                     throw MobileSessionError.unavailable("The created session is not available")
                 }
                 guard await store.sendRun(prompt: prompt, chat: chat, images: submittedImages) else {
+                    if store.hasPendingAuthorization {
+                        finishLaunch(chatId: chatId, submittedImages: submittedImages)
+                        return
+                    }
                     throw MobileSessionError.unavailable(store.sendFailure ?? "Crew couldn’t send this message. Your draft is still here.")
                 }
                 finishLaunch(chatId: chatId, submittedImages: submittedImages)
