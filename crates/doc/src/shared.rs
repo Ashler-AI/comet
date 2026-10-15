@@ -699,6 +699,8 @@ fn reconcile(
                             && local.get("id").and_then(serde_json::Value::as_str) == Some(record.key.as_str())
                             && remote.get("id") == local.get("id") && before.and_then(|row| row.get("deviceId")) == local.get("deviceId")
                             && local.get("deviceId").and_then(serde_json::Value::as_str).is_some_and(|owner| !owner.is_empty() && remote.get("deviceId").and_then(serde_json::Value::as_str) == Some(owner));
+                        let device_identity = name == "devices"
+                            && local.get("id").and_then(serde_json::Value::as_str) == Some(record.key.as_str());
                         if chat_identity
                             && let (Some(local_at), Some(remote_at)) = (clock(local, "lastMessageAt"), clock(remote, "lastMessageAt"))
                             && before.and_then(|row| clock(row, "lastMessageAt")).is_none_or(|at| local_at >= at && remote_at >= at)
@@ -719,7 +721,7 @@ fn reconcile(
                         for field in before.into_iter().flat_map(|row| row.keys()).chain(local.keys()).collect::<BTreeSet<_>>() {
                             if owner_publication.is_some() && matches!(field.as_str(), "status" | "startedAt" | "updatedAt" | "modelRetry") { continue }
                             if activity_merged && matches!(field.as_str(), "lastMessageAt" | "lastMessagePreview") { continue }
-                            if chat_identity && field == "lastSeenAt"
+                            if (chat_identity || device_identity) && field == "lastSeenAt"
                                 && let (Some(local_at), Some(remote_at)) = (clock(local, field), clock(remote, field))
                                 && before.is_none_or(|row| !row.contains_key(field) || clock(row, field).is_some_and(|at| local_at >= at && remote_at >= at))
                                 && let Some(row) = cached_value.as_ref().and_then(serde_json::Value::as_object)
@@ -728,8 +730,8 @@ fn reconcile(
                                 && let Some(cached_at) = clock(row, field)
                                 && before.and_then(|row| clock(row, field)).is_none_or(|at| cached_at >= at)
                             {
-                                // Concurrent reads advance one observation. Absence, deletion and
-                                // a backwards clock may encode an explicit unread/read transition.
+                                // Read/boot observations advance one clock. Absence, deletion and
+                                // backwards clocks retain normal conflict handling.
                                 merged.insert(field.clone(), serde_json::json!(local_at.max(remote_at).max(cached_at)));
                                 continue;
                             }
@@ -798,6 +800,62 @@ mod tests {
         restarted.install_journal(binding.pending_records(), Arc::new(|_,_| Ok(())));
         restarted.adopt_snapshot(&binding.export(ExportMode::Snapshot).unwrap(), None).unwrap();
         assert_eq!(restarted.get_deep_value(), binding.get_deep_value());
+    }
+
+    #[test]
+    fn device_liveness_recovery_merges_clocks_without_losing_renames_or_intents() {
+        for shallow in [false, true] {
+            for remote_at in [1_500i64, 2_500] {
+                let base = LoroDoc::new(); base.set_peer_id(1).unwrap();
+                let row = base.get_map("devices").insert_container("device", LoroMap::new()).unwrap();
+                row.insert("id", "device").unwrap(); row.insert("name", "Original").unwrap();
+                row.insert("platform", "macos").unwrap(); row.insert("lastSeenAt", 1_000i64).unwrap(); base.commit();
+                let local = base.fork(); local.set_peer_id(2).unwrap();
+                let binding = SharedDocument::new(local); journal(&binding);
+                let loro::ValueOrContainer::Container(loro::Container::Map(row)) = binding.get_map("devices").get("device").unwrap() else { panic!("device missing") };
+                row.insert("lastSeenAt", 2_000i64).unwrap(); binding.commit().unwrap();
+                let original = binding.pending_records();
+                let retained = binding.raw().fork();
+                let remote = base.fork(); remote.set_peer_id(3).unwrap();
+                let loro::ValueOrContainer::Container(loro::Container::Map(row)) = remote.get_map("devices").get("device").unwrap() else { panic!("device missing") };
+                row.insert("lastSeenAt", remote_at).unwrap(); row.insert("name", "Renamed remotely").unwrap(); remote.commit();
+                let checkpoint = if shallow { remote.export(ExportMode::shallow_snapshot(&remote.state_frontiers())).unwrap() }
+                    else { remote.export(ExportMode::Snapshot).unwrap() };
+                binding.adopt_snapshot(&checkpoint, None).unwrap();
+                let cold = SharedDocument::new(binding.raw().fork());
+                cold.install_journal(binding.pending_records(), Arc::new(|_, _| Ok(())));
+                cold.adopt_snapshot(&checkpoint, None).unwrap();
+                let recovered = row_value(&cold.raw(), "devices", "device").unwrap();
+                assert_eq!(recovered["lastSeenAt"], 2_000.max(remote_at));
+                assert_eq!(recovered["name"], "Renamed remotely");
+                assert_eq!(cold.pending_records()[0].before, original[0].before);
+                assert_eq!(cold.pending_records()[0].value, original[0].value);
+                assert!(!cold.pending_records()[0].acknowledged);
+                for conflict in ["rename", "deleted clock", "backwards clock", "invalid clock", "identity"] {
+                    let candidate = remote.fork();
+                    let loro::ValueOrContainer::Container(loro::Container::Map(row)) = candidate.get_map("devices").get("device").unwrap() else { panic!("device missing") };
+                    match conflict {
+                        "deleted clock" => row.delete("lastSeenAt").unwrap(),
+                        "backwards clock" => row.insert("lastSeenAt", 900i64).unwrap(),
+                        "invalid clock" => row.insert("lastSeenAt", "invalid").unwrap(),
+                        "identity" => row.insert("id", "foreign-device").unwrap(),
+                        _ => {}
+                    }
+                    candidate.commit();
+                    let check = SharedDocument::new(retained.fork());
+                    check.install_journal(original.clone(), Arc::new(|_, _| Ok(())));
+                    if conflict == "rename" {
+                        let loro::ValueOrContainer::Container(loro::Container::Map(row)) = check.get_map("devices").get("device").unwrap() else { panic!("device missing") };
+                        row.insert("name", "Local rename").unwrap(); check.commit().unwrap();
+                    }
+                    let records = check.pending_records();
+                    let before = check.get_deep_value();
+                    assert!(check.adopt_snapshot(&candidate.export(ExportMode::Snapshot).unwrap(), None).is_err(), "{conflict}");
+                    assert_eq!(check.get_deep_value(), before);
+                    assert_eq!(check.pending_records()[0].value, records[0].value);
+                }
+            }
+        }
     }
 
     #[test]

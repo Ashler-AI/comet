@@ -1885,16 +1885,21 @@ impl DocHost {
             if count <= WARM_DOC_CAP && estimate <= comet_doc::DOC_LRU_BYTE_BUDGET {
                 return;
             }
-            let evicted = {
-                let mut handles = lock(&self.inner.handles);
-                match handles.get(&chat_id) {
-                    Some(handle) if !self.pinned(handle) => {
-                        let handle = handle.clone();
-                        handles.retain(|_, candidate| !Arc::ptr_eq(candidate, &handle));
-                        Some(handle)
+            // Ownership checks can look up this map again; never hold it across pinned().
+            let candidate = lock(&self.inner.handles).get(&chat_id).cloned();
+            let evicted = match candidate {
+                Some(handle) if !self.pinned(&handle) => {
+                    let mut handles = lock(&self.inner.handles);
+                    if !handles.get(&chat_id).is_some_and(|current| Arc::ptr_eq(current, &handle))
+                        || handle.messages_tx.receiver_count() > 0
+                        || Arc::strong_count(&handle.doc) > 1
+                    {
+                        continue;
                     }
-                    _ => None,
+                    handles.retain(|_, candidate| !Arc::ptr_eq(candidate, &handle));
+                    Some(handle)
                 }
+                _ => None,
             };
             if let Some(handle) = evicted {
                 // Final forced flush outside the map lock, including unjournaled edits.
@@ -4019,6 +4024,39 @@ mod authority_tests {
         assert!(lock(&host.inner.handles).contains_key("chat-00"), "watched transcript was evicted");
         assert_eq!(host.open("chat-01").unwrap().doc().chat_id().as_deref(), Some("chat-01"));
         drop(watched);
+    }
+
+    #[test]
+    fn eviction_checks_remote_ownership_without_locking_out_sessions() {
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _entered = runtime.enter();
+            let dir = tempfile::tempdir().unwrap();
+            let host = scoped_test_host(Arc::new(DocsStore::open(dir.path()).unwrap()));
+            let remote_id = uuid::Uuid::new_v4().to_string();
+            let workspace = host.workspace().unwrap();
+            workspace.claim_chat(&remote_id, None).unwrap();
+            let mut chat = workspace.doc().chat(&remote_id).unwrap().unwrap();
+            chat.device_id = "remote-device".into();
+            workspace.doc().upsert_chat(&chat).unwrap();
+            let remote = host.open(&remote_id).unwrap();
+            let retired = Arc::downgrade(&remote);
+            for index in 0..WARM_DOC_CAP {
+                host.open(&format!("chat-{index:02}")).unwrap();
+            }
+            remote.last_access.store(now_ms() - EVICT_MIN_IDLE_MS - 1, Ordering::Relaxed);
+            drop(remote);
+            host.evict_over_budget();
+            assert!(retired.upgrade().is_none(), "cold remote document was not evicted");
+            assert_eq!(lock(&host.inner.handles).len(), WARM_DOC_CAP);
+            assert_eq!(host.open(&remote_id).unwrap().doc().chat_id().as_deref(), Some(remote_id.as_str()));
+            finished.send(()).unwrap();
+        });
+        // A synchronous mutex cycle cannot be timed out by the blocked Tokio runtime.
+        result.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("remote eviction blocked the shared session engine");
+        worker.join().unwrap();
     }
 
     #[tokio::test]
