@@ -8807,6 +8807,16 @@ impl Composer {
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
+        if self.state.read(cx).managed_inference {
+            if !matches!(self.state.read(cx).auth, Some(zeron_proto::AuthState::SignedIn { .. })) {
+                self.show_error("Sign in to Crew before sending in managed mode. Local provider fallback is disabled.", cx);
+                return;
+            }
+            if !matches!(resolved.harness, Some(HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex)) {
+                self.show_error("This harness is unavailable in Crew managed mode. Select OMP, Claude Code or Codex; existing history remains readable.", cx);
+                return;
+            }
+        }
         let existing_cwd = self
             .state
             .read(cx)
@@ -11261,6 +11271,26 @@ impl Render for Composer {
         let strip = self.render_attachment_strip(&theme, cx);
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
+        let quote_selection = crate::settings::widgets::ghost_action(&theme)
+            .id("comment-on-selection").role(gpui::Role::Button)
+            .aria_label("Comment on selected transcript text").tab_index(0)
+            .focus_visible(|style| style.border_2().border_color(theme.accent))
+            .tooltip(crate::settings::widgets::text_tooltip("Add selected text to your next message, then write a note"))
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                let Some(selected) = crate::markdown::selection::selected_text() else {
+                    this.show_error("Select transcript text first, then choose Comment.", cx);
+                    return;
+                };
+                let draft = this.input.read(cx).text().to_owned();
+                let quoted = selected.lines().map(|line| format!("> {line}")).collect::<Vec<_>>().join("\n");
+                this.input.update(cx, |input, cx| input.set_text(format!("{draft}\n\nSelected context:\n{quoted}\n\n"), cx));
+                window.focus(&this.input.focus_handle(cx), cx);
+            }))
+            .child(crate::icons::icon(crate::icons::CHAT_ROUND_LINE).size(px(15.0)));
 
         let pill_border = theme.composer_surface_border();
         // Compensate for the transcript canvas beneath the frosted surface.
@@ -11397,7 +11427,7 @@ impl Render for Composer {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(attach),
+                                .child(attach).child(quote_selection),
                         )
                         .child(model_picker)
                         .child(
@@ -11451,7 +11481,7 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(attach),
+                                .child(attach).child(quote_selection),
                         )
                         .child(
                             div()

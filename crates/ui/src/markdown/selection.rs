@@ -309,6 +309,19 @@ pub fn selected_text() -> Option<String> {
     Some(join_spans(&sel.spans))
 }
 
+/// Only a single transcript message can be a persistent semantic anchor.
+/// Rendered offsets are not source offsets, so the host reanchors by exact text.
+pub fn selected_message_anchor() -> Option<(String, String)> {
+    let guard = state().lock().unwrap();
+    let selection = guard.as_ref()?;
+    let (message, _) = selection.spans.first()?.key.split_once("#text.")?;
+    if selection.spans.iter().any(|span| span.key.split_once("#text.").map(|(id, _)| id) != Some(message)) {
+        return None;
+    }
+    let exact = join_spans(&selection.spans);
+    (!exact.trim().is_empty() && exact.len() <= 4096).then(|| (message.to_owned(), exact))
+}
+
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
@@ -457,6 +470,19 @@ mod tests {
         begin_with_span("p1", "hello world", 6..11);
         assert_eq!(wash_range(0, "p1"), Some(6..11));
         assert_eq!(end_drag("p1").as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn semantic_selection_keeps_message_identity_and_bounds() {
+        let _state = test_state_lock();
+        begin_with_span("message-1#text.0:0", "héllo world", 0..6);
+        assert_eq!(selected_message_anchor(), Some(("message-1".into(), "héllo".into())));
+        begin_with_span("file-preview:0", "file text", 0..4);
+        assert_eq!(selected_message_anchor(), None);
+        let oversized = "x".repeat(4097);
+        begin_with_span("message-1#text.0:0", &oversized, 0..oversized.len());
+        assert_eq!(selected_message_anchor(), None);
+        clear_if_owner("message-1#text.0:0");
     }
 
     #[test]

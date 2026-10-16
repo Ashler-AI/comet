@@ -209,7 +209,7 @@ impl ClaudeHarness {
     /// The configuration arguments a run launches with — everything the
     /// process bakes in at spawn except the session to resume. Two requests
     /// with equal arguments (and cwd) are the same runtime.
-    fn launch_args(request: &RunRequest) -> Vec<String> {
+    fn launch_args(request: &RunRequest, managed: bool) -> Vec<String> {
         let mut args: Vec<String> = [
             "--print",
             "--input-format",
@@ -252,6 +252,10 @@ impl ClaudeHarness {
             args.extend(["--permission-mode".into(), "default".into()]);
         }
         let mut settings = serde_json::Map::new();
+        if managed {
+            settings.insert("apiKeyHelper".into(), Value::String(String::new()));
+            settings.insert("forceLoginMethod".into(), Value::String("console".into()));
+        }
         if option_is_on(&request.model_options, "fastMode") {
             settings.insert("fastMode".into(), Value::Bool(true));
         }
@@ -268,10 +272,10 @@ impl ClaudeHarness {
         args
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    fn build_command(&self, exe: &PathBuf, request: &RunRequest, managed: bool) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
-        cmd.args(Self::launch_args(request));
+        cmd.args(Self::launch_args(request, managed));
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
         }
@@ -462,7 +466,7 @@ impl Harness for ClaudeHarness {
     /// Same launch arguments and cwd. The CLI ignores the sandbox level, and
     /// option spellings that launch the same flags are the same runtime.
     fn same_runtime(&self, live: &RunRequest, next: &RunRequest) -> bool {
-        live.cwd == next.cwd && Self::launch_args(live) == Self::launch_args(next)
+        live.cwd == next.cwd && Self::launch_args(live, false) == Self::launch_args(next, false)
     }
     /// Model, context window, effort, fast mode, thinking and ultracode all
     /// change on the live process (`set_model`, `apply_flag_settings`). Only
@@ -579,12 +583,17 @@ impl Harness for ClaudeHarness {
 impl ClaudeHarness {
     async fn run_with_mode(
         &self,
-        request: RunRequest,
+        mut request: RunRequest,
         controls: RunControls,
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
+        let route = controls.context.as_ref().and_then(|context| context.inference.as_ref());
+        if let Some(route) = route {
+            request.model = Some(route.model.rsplit('/').next().unwrap_or(&route.model).to_owned());
+        }
+        let mut cmd = self.build_command(&exe, &request, route.is_some());
         if title_only {
             cmd.args([
                 "--system-prompt",
@@ -603,6 +612,15 @@ impl ClaudeHarness {
             // config with settings-sourced ones.
             cmd.args(["--mcp-config", &mcp_config_arg(mcp)]);
         }
+        if let Some(context) = controls.context.as_ref() {
+            if let Some(source) = context.fork_from.as_deref() {
+                if request.resume.as_deref() != Some(source) || title_only {
+                    return Err(HarnessError::Protocol("Crew fork source does not match Claude resume".into()));
+                }
+                cmd.arg("--fork-session");
+            }
+        }
+        crate::apply_run_context(&mut cmd, controls.context.as_ref());
         let normalizer = if let Some(session_id) = &request.resume {
             let config = crate::model_context::root(
                 "CLAUDE_CONFIG_DIR",
@@ -833,6 +851,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
+        context: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

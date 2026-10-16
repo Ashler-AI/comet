@@ -1,7 +1,8 @@
 //! Coalesced chat snapshots. Cursor is sampled BEFORE export; snapshot and
 //! cursor commit atomically. Queue/lock waits never occupy a Tokio worker.
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use zeron_doc::SessionDoc;
@@ -140,55 +141,44 @@ impl ChatPersistence {
     }
 
     pub(crate) fn flush_sync(&self) {
+        if let Err(error) = self.flush_checked() {
+            tracing::warn!(chat = %self.chat_id, %error, "chat snapshot failed; retrying");
+        }
+    }
+
+    /// The same serialized writer, with failures propagated to durable command
+    /// admission. Never bypass its cursor/epoch bookkeeping with a raw snapshot.
+    pub(crate) fn flush_checked(&self) -> Result<(), crate::EngineError> {
         let flush = || {
-            let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+            let _write = self.write.lock();
             let generation = self.generation.load(Ordering::Acquire);
             if generation == self.saved.load(Ordering::Acquire) {
-                return;
+                return Ok(());
             }
-            let Some(doc) = self.doc.upgrade() else {
-                return;
-            };
-            // Never read the cursor AFTER exporting: a concurrent import
-            // could then label an older snapshot with a newer cursor.
+            let doc = self.doc.upgrade()
+                .ok_or_else(|| crate::EngineError::Other("chat retired before durable admission".into()))?;
+            // Never label an older snapshot with a cursor sampled after export.
             let cursor = self.cursor.load(Ordering::Acquire);
             #[cfg(test)]
-            if let Some(hook) = self.before_export.lock().unwrap().take() {
+            if let Some(hook) = self.before_export.lock().take() {
                 hook();
             }
-            let result = doc
-                .export_snapshot()
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| {
-                    self.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
-                    self.store
-                        .save_verified_snapshot_with_cursor(
-                            &self.chat_id,
-                            &bytes,
-                            cursor,
-                            super::chat2_host::CHAT2_DOC_EPOCH,
-                        )
-                        .map_err(|e| e.to_string())
-                });
-            match result {
-                Ok(()) => {
-                    #[cfg(test)]
-                    self.writes.fetch_add(1, Ordering::Relaxed);
-                    self.saved.store(generation, Ordering::Release);
-                }
-                Err(error) => {
-                    tracing::warn!(chat = %self.chat_id, %error, "chat snapshot failed; retrying")
-                }
-            }
+            let bytes = doc.export_snapshot()?;
+            self.store.save_verified_snapshot_with_cursor(
+                &self.chat_id, &bytes, cursor, super::chat2_host::CHAT2_DOC_EPOCH,
+            )?;
+            self.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+            #[cfg(test)]
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.saved.store(generation, Ordering::Release);
+            Ok(())
         };
-        // Compatibility for synchronous shutdown/eviction and command APIs.
-        // Async persisters already execute this on the blocking pool.
         if tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         {
-            tokio::task::block_in_place(flush);
+            tokio::task::block_in_place(flush)
         } else {
-            flush();
+            flush()
         }
     }
 }
@@ -278,6 +268,28 @@ mod tests {
         (dir, doc, store, persistence)
     }
 
+    #[test]
+    fn admission_flush_preserves_verified_cursor_and_reports_disk_failure() {
+        let (dir, doc, store, persistence) = fixture();
+        doc.doc().get_map("test").insert("admitted", 1_i64).unwrap();
+        doc.doc().commit();
+        persistence.applied(17, false);
+        persistence.flush_checked().unwrap();
+        assert_eq!(store.snapshot_cursor("whale").unwrap(), 17);
+        assert!(store.snapshot_cursor_verified("whale").unwrap());
+        assert_eq!(store.snapshot_epoch("whale").unwrap(), super::super::chat2_host::CHAT2_DOC_EPOCH);
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(FAIL,'disk unavailable'); END;").unwrap();
+        doc.doc().get_map("test").insert("admitted", 2_i64).unwrap();
+        doc.doc().commit();
+        persistence.applied(18, false);
+        assert!(persistence.flush_checked().is_err());
+        assert_eq!(store.snapshot_cursor("whale").unwrap(), 17);
+        db.execute_batch("DROP TRIGGER fail_snapshot").unwrap();
+        persistence.flush_checked().unwrap();
+        assert_eq!(store.snapshot_cursor("whale").unwrap(), 18);
+    }
+
     #[tokio::test]
     async fn replay_burst_coalesces_and_flush_bypasses_debounce() {
         let (_dir, doc, store, persistence) = fixture();
@@ -340,7 +352,7 @@ mod tests {
         persistence.applied(1, false);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *persistence.before_export.lock().unwrap() = Some(Box::new(move || {
+        *persistence.before_export.lock() = Some(Box::new(move || {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }));

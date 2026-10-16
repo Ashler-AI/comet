@@ -746,6 +746,18 @@ impl ChatDocHandle {
         &self.doc
     }
 
+    pub(crate) fn apply_crew_annotation(
+        &self,
+        command_id: &str,
+        command: &zeron_proto::AnnotationCommand,
+        principal: &zeron_proto::CollaborationPrincipal,
+        grant: Option<&zeron_proto::CapabilityGrant>,
+        metadata: &zeron_proto::CrewChatMetadata,
+    ) -> Result<zeron_proto::SemanticAnnotation, EngineError> {
+        let _owner = lock(&self.transcript_import);
+        Ok(self.doc.apply_annotation_command(command_id, command, principal, grant, metadata, now_ms())?)
+    }
+
     pub fn writer(&self) -> DocWriter {
         self.writers.fetch_add(1, Ordering::AcqRel);
         DocWriter {
@@ -1337,6 +1349,10 @@ impl DocHost {
     /// The workspace host, once wired (tests may assemble a DocHost without one).
     pub fn workspace(&self) -> Option<&WorkspaceHost> {
         self.inner.workspace.get()
+    }
+
+    pub(crate) fn crew_store(&self) -> Arc<DocsStore> {
+        self.inner.store.clone()
     }
 
     pub fn device_id(&self) -> &str {
@@ -3424,8 +3440,33 @@ impl DocHost {
         payload: SessionCommandPayload,
         transfers: Vec<crate::uploads::AttachmentTransfer>,
     ) -> Result<String, EngineError> {
+        self.queue_command_named(chat_id, payload, transfers, None)
+    }
+
+    /// Native handoff retries keep the first admitted command and its outcome.
+    pub(crate) fn queue_command_named(
+        &self,
+        chat_id: &str,
+        payload: SessionCommandPayload,
+        transfers: Vec<crate::uploads::AttachmentTransfer>,
+        command_id: Option<&str>,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
-        let id = new_id();
+        let _owner = lock(&handle.transcript_import);
+        if let Some(id) = command_id {
+            if id.is_empty() || id.len() > 256 {
+                return Err(EngineError::Other("Invalid immutable command ID".into()));
+            }
+            if let Some(existing) = handle.doc.read_commands()?.into_iter().find(|entry| entry.id == id) {
+                if existing.payload != payload || existing.issued_by != self.inner.config.device_id {
+                    return Err(EngineError::Other("Command ID already has a different immutable request".into()));
+                }
+                self.persist_fork(&handle)?;
+                self.nudge_remote_host(chat_id);
+                return Ok(id.to_owned());
+            }
+        }
+        let id = command_id.map(str::to_owned).unwrap_or_else(new_id);
         let now = now_ms();
         let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
             turn_id: Some(m.id.clone()),
@@ -3446,6 +3487,9 @@ impl DocHost {
             resolution: None,
         };
         handle.doc.queue_command(&entry)?;
+        if command_id.is_some() {
+            self.persist_fork(&handle)?;
+        }
         // Sending a message revives an archived chat: the user is acting in it
         // again, so the LWW row flips back to active on every device. Best-
         // effort — the command itself is durable regardless.
@@ -5949,6 +5993,12 @@ impl DocHost {
 
     /// A fork must be durable before publishing its discoverable registry row.
     pub(crate) fn persist_fork(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
+        if let Some(persistence) = &handle.persistence {
+            persistence.dirty(false);
+            persistence.flush_checked()?;
+            handle.snapshot_bytes.store(persistence.snapshot_bytes(), Ordering::Relaxed);
+            return Ok(());
+        }
         let bytes = handle.doc.export_snapshot()?;
         self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
         handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);

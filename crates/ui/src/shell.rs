@@ -556,32 +556,28 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 10] = [
+    /// Settings navigation includes the shared Crew account pool.
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Voice,
         SettingsSection::Shortcuts,
         SettingsSection::Harnesses,
+        SettingsSection::Agents,
         SettingsSection::Devices,
         SettingsSection::Files,
         SettingsSection::Appshots,
         SettingsSection::Archived,
     ];
 
-    /// The former Accounts page is folded into Providers. Keep its route alias
-    /// for old navigation entries and dev links without showing a hidden tab.
+    /// Shared Crew accounts remain distinct from local provider installation settings.
     fn canonical(self) -> Self {
-        if self == Self::Agents {
-            Self::Harnesses
-        } else {
-            self
-        }
+        self
     }
 
     fn visible_in_nav(self) -> bool {
-        self != Self::Agents && (self != Self::Appshots || crate::appshots::is_desktop())
+        self != Self::Appshots || crate::appshots::is_desktop()
     }
 
     /// Where a generic "open Settings" lands for a remembered section: legacy
@@ -2988,7 +2984,7 @@ impl Shell {
                 {
                     let body = match connectivity {
                         zeron_proto::ConnectivityState::Offline => "Your device is offline",
-                        _ => "Zeron is trying to reconnect",
+                        _ => "Crew is trying to reconnect",
                     };
                     crate::notify::post("Connection unavailable", body, None);
                 }
@@ -5222,7 +5218,7 @@ impl Shell {
                 )))
             })
             .child(
-                item("chat-copy-zeron", "Zeron conversation link".into()).on_click(cx.listener(
+                item("chat-copy-zeron", "Crew conversation link".into()).on_click(cx.listener(
                     move |this, _, _, cx| this.copy_zeron_conversation_link(&zeron_id, cx),
                 )),
             )
@@ -5254,16 +5250,17 @@ impl Shell {
     fn copy_zeron_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let link = {
             let state = self.state.read(cx);
-            crate::links::workspace_locator(
-                state.workspace_scope,
-                state.auth.as_ref(),
-                state.local_device_id.as_deref(),
-            )
-            .map(|workspace| crate::links::zeron_conversation_link(chat_id, &workspace))
+            state.chats.iter().find(|chat| chat.id == chat_id)
+                .and_then(crate::links::crew_session_link)
+                .or_else(|| crate::links::workspace_locator(
+                    state.workspace_scope,
+                    state.auth.as_ref(),
+                    state.local_device_id.as_deref(),
+                ).map(|workspace| crate::links::zeron_conversation_link(chat_id, &workspace)))
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.show_notice(crate::toast::ToastKind::Success, "Zeron conversation link copied", cx);
+            self.show_notice(crate::toast::ToastKind::Success, "Crew conversation link copied", cx);
         } else {
             self.show_notice(crate::toast::ToastKind::Error, "Conversation link is not ready yet", cx);
         }
@@ -5694,7 +5691,7 @@ impl Shell {
                     let detail = if !online {
                         "Offline"
                     } else if !compatible {
-                        "Update Zeron to use remote voice"
+                        "Update Crew to use remote voice"
                     } else {
                         "Available"
                     };
@@ -9534,7 +9531,7 @@ impl Shell {
             match update.prompt()? {
                 Prompt::Checking => (
                     "Checking for updates…".into(),
-                    format!("You're on Zeron {current}.").into(),
+                    format!("You're on Crew Canary {current}.").into(),
                     vec![UpdatePromptButton::Close("Cancel")],
                 ),
                 Prompt::CheckFailed(message) => (
@@ -9547,12 +9544,12 @@ impl Shell {
                 ),
                 Prompt::Result => match update.available() {
                     None => (
-                        "Zeron is up to date".into(),
+                        "Crew Canary is up to date".into(),
                         format!("Version {current} is the newest release.").into(),
                         vec![UpdatePromptButton::Close("OK")],
                     ),
                     Some(latest) => {
-                        let title: SharedString = format!("Zeron {latest} is available").into();
+                        let title: SharedString = format!("Crew Canary {latest} is available").into();
                         if let Some(blocker) = update.blocker() {
                             (
                                 title,
@@ -9579,8 +9576,8 @@ impl Shell {
                                     vec![UpdatePromptButton::Close("Hide")],
                                 ),
                                 Flow::Ready { version, .. } => (
-                                    format!("Zeron {version} is ready").into(),
-                                    "Restart to finish updating. If you don't, it installs the next time you quit Zeron."
+                                    format!("Crew Canary {version} is ready").into(),
+                                    "Restart to finish updating. If you don't, it installs the next time you quit Crew Canary."
                                         .into(),
                                     vec![
                                         UpdatePromptButton::Close("Later"),
@@ -9608,7 +9605,7 @@ impl Shell {
                         } else {
                             (
                                 title,
-                                "This copy of Zeron wasn't set up by an installer (for example, a source build), so it can't update itself."
+                                "This copy of Crew Canary was not installed by the Crew installer, so it cannot update itself."
                                     .into(),
                                 vec![
                                     UpdatePromptButton::Close("Later"),
@@ -9893,7 +9890,7 @@ impl Shell {
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Enable sync"))
+                                .child(SharedString::from("Sign in to Crew"))
                                 .into_any_element()
                         }
                         AccountMenuAction::SyncInProgress => {
@@ -9905,7 +9902,7 @@ impl Shell {
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Sync setup in progress"))
+                                .child(SharedString::from("Crew sign-in in progress"))
                                 .into_any_element()
                         }
                         AccountMenuAction::RestartPending => {
@@ -10062,7 +10059,7 @@ impl Shell {
         } else if remote_engine {
             "Stop daemon and quit"
         } else {
-            "Quit Zeron"
+            "Quit Crew Canary"
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
@@ -10083,11 +10080,11 @@ impl Shell {
 
         let card = match self.sync_flow {
             SyncFlow::Enabling => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Enable sync"))
+                .child(popover::dialog_title(&theme, "Sign in to Crew"))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen.",
+                        "Finish signing in to Crew in your browser. Crew keeps this local workspace until you quit and reopen; pending session links continue after login.",
                     )),
                 )
                 .child(
@@ -10131,14 +10128,14 @@ impl Shell {
                     )
                     .into(),
                     (Some(email), None) => format!(
-                        "You're signed in as {email}. Zeron can switch to your synced workspace now."
+                        "You're signed in as {email}. Crew can switch to your same-user synced workspace now."
                     )
                     .into(),
                     (None, Some(phrase)) => format!(
                         "Bring {phrase} from this device into your synced workspace, or start it fresh."
                     )
                     .into(),
-                    (None, None) => "Zeron can switch to your synced workspace now.".into(),
+                    (None, None) => "Crew can switch to your synced workspace now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -10327,9 +10324,9 @@ impl Shell {
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
                         if remote_engine {
-                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Crew is using a background daemon. Stop it and quit Crew, then reopen to start the synced workspace. Existing local sessions stay on this device until explicitly imported."
                         } else {
-                            "Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Quit and reopen Crew to start the synced workspace. Existing local sessions stay on this device until explicitly imported."
                         },
                     )),
                 )
@@ -14073,35 +14070,33 @@ mod tests {
         cwd: Option<&str>,
         source: Option<(&str, &str)>,
     ) -> zeron_proto::Chat {
-        zeron_proto::Chat {
-            id: "chat".into(),
-            device_id: "remote-device".into(),
-            title: None,
-            archived: false,
-            cwd: cwd.map(str::to_owned),
-            branch: None,
-            checkout_id: None,
-            source_context: source.map(|(source_cwd, repo_root)| {
-                zeron_proto::ConversationSourceContext {
-                    checkout_id: "checkout".into(),
-                    repo_root: repo_root.into(),
-                    cwd: source_cwd.into(),
-                    branch: "main".into(),
-                    head_sha: None,
-                    observed_at: chrono::Utc::now(),
-                }
-            }),
-            config: None,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: chrono::Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: None,
-            parent_chat_id: None,
-        }
+        zeron_proto::Chat { crew: None, id: "chat".into(),
+        device_id: "remote-device".into(),
+        title: None,
+        archived: false,
+        cwd: cwd.map(str::to_owned),
+        branch: None,
+        checkout_id: None,
+        source_context: source.map(|(source_cwd, repo_root)| {
+            zeron_proto::ConversationSourceContext {
+                checkout_id: "checkout".into(),
+                repo_root: repo_root.into(),
+                cwd: source_cwd.into(),
+                branch: "main".into(),
+                head_sha: None,
+                observed_at: chrono::Utc::now(),
+            }
+        }),
+        config: None,
+        last_message_preview: None,
+        last_message_at: None,
+        created_at: chrono::Utc::now(),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        space_id: None,
+        last_seen_at: None,
+        room_gen: None,
+        parent_chat_id: None, }
     }
 
     #[test]
@@ -14721,15 +14716,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let boot = EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
-            default_harness: zeron_proto::HarnessId::Mock,
-        };
+        let boot = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+        default_harness: zeron_proto::HarnessId::Mock, };
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())
             .await
             .expect("saved session opens its synced profile");
@@ -15272,15 +15265,13 @@ mod tests {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -15576,15 +15567,13 @@ mod exit_regressions {
             cx.set_global(Theme::default());
             crate::app_menus::init(cx);
         });
-        let boot = EngineBootConfig {
-            data_dir: dir.path().into(),
-            ipc_port: 0,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
-            default_harness: zeron_proto::HarnessId::Mock,
-        };
+        let boot = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+        ipc_port: 0,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: zeron_proto::HarnessId::Mock, };
         for (connection, expected) in [
             (ConnectionStatus::Connecting, SplashPhase::Visible),
             (ConnectionStatus::Ready, SplashPhase::Gone),
@@ -15629,15 +15618,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -15701,15 +15688,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -15810,15 +15795,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -15977,15 +15960,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -16046,15 +16027,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -16120,15 +16099,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -16170,15 +16147,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -16252,15 +16227,13 @@ mod exit_regressions {
                 let state = cx.new(|_| AppState::new());
                 Shell::new(
                     state,
-                    EngineBootConfig {
-                        data_dir: dir.path().into(),
-                        ipc_port: 0,
-                        edge_url: "http://127.0.0.1:1".into(),
-                        edge_token: None,
-                        org_id: None,
-                        workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
-                    },
+                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock, },
                     cx,
                 )
             }))
@@ -16311,15 +16284,13 @@ mod exit_regressions {
                 let state = cx.new(|_| AppState::new());
                 Shell::new(
                     state,
-                    EngineBootConfig {
-                        data_dir: dir.path().into(),
-                        ipc_port: 0,
-                        edge_url: "http://127.0.0.1:1".into(),
-                        edge_token: None,
-                        org_id: None,
-                        workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
-                    },
+                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock, },
                     cx,
                 )
             }))
@@ -16377,15 +16348,13 @@ mod exit_regressions {
             });
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir,
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir,
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -16637,15 +16606,13 @@ mod exit_regressions {
             });
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -16822,15 +16789,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -16923,15 +16888,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17008,15 +16971,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17089,15 +17050,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17161,15 +17120,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17189,6 +17146,7 @@ mod exit_regressions {
                 shell.state.update(cx, |state, cx| {
                     state.apply_spaces(vec![space("mine", "local"), space("other", "remote")]);
                     state.apply_chats(vec![zeron_proto::Chat {
+                        crew: None,
                         id: "elsewhere".into(),
                         device_id: "remote".into(),
                         title: None,
@@ -17242,15 +17200,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17298,15 +17254,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17448,15 +17402,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17567,15 +17519,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17665,15 +17615,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17747,15 +17695,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17825,15 +17771,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -17923,15 +17867,13 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -18101,15 +18043,13 @@ mod right_tab_mouse_regressions {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig {
-                        data_dir: dir.path().into(),
-                        ipc_port: 0,
-                        edge_url: "http://127.0.0.1:1".into(),
-                        edge_token: None,
-                        org_id: None,
-                        workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
-                    },
+                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock, },
                     cx,
                 );
                 shell.active_chat = "parent".into();
@@ -18614,15 +18554,13 @@ mod settings_modal_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });
@@ -18642,7 +18580,7 @@ mod settings_modal_regressions {
                     assert_eq!(shell.route, Route::Settings(section.reopenable()));
                 }
                 shell.open_settings(SettingsSection::Agents, cx);
-                assert_eq!(shell.route, Route::Settings(SettingsSection::Harnesses));
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Agents));
                 shell.close_settings(cx);
                 assert_eq!(shell.route, Route::Chat);
                 assert_eq!(shell.nav.current().clone(), history);
@@ -18680,15 +18618,13 @@ mod settings_modal_regressions {
         let state = cx.new(|_| AppState::new());
         Shell::new(
             state,
-            EngineBootConfig {
-                data_dir: dir.into(),
-                ipc_port: 0,
-                edge_url: "http://127.0.0.1:1".into(),
-                edge_token: None,
-                org_id: None,
-                workos_client_id: None,
-                default_harness: zeron_proto::HarnessId::Mock,
-            },
+            EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.into(),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock, },
             cx,
         )
     }
@@ -18699,10 +18635,10 @@ mod settings_modal_regressions {
             SettingsSection::Shortcuts.reopenable(),
             SettingsSection::Shortcuts
         );
-        // The legacy Accounts alias lands on the page that absorbed it.
+        // Shared accounts have their own accessible settings destination.
         assert_eq!(
             SettingsSection::Agents.reopenable(),
-            SettingsSection::Harnesses
+            SettingsSection::Agents
         );
         // Appshots is hidden off-desktop, so it cannot be reopened there.
         assert_eq!(
@@ -18728,12 +18664,12 @@ mod settings_modal_regressions {
         );
         assert_eq!(
             settings_open_route("settings", SettingsSection::Agents),
-            Some(SettingsSection::Harnesses)
+            Some(SettingsSection::Agents)
         );
         for (route, section) in [
             ("settings/devices", SettingsSection::Devices),
             ("settings/providers", SettingsSection::Harnesses),
-            ("settings/agents", SettingsSection::Harnesses),
+            ("settings/agents", SettingsSection::Agents),
             ("settings/harnesses", SettingsSection::Harnesses),
             ("settings/general", SettingsSection::General),
             ("settings/voice", SettingsSection::Voice),
@@ -18846,19 +18782,19 @@ mod settings_modal_regressions {
                 assert_eq!(shell.route, Route::Settings(SettingsSection::Appearance));
                 shell.close_settings(cx);
 
-                // Legacy aliases are remembered as the page they resolve to.
+                // Shared accounts are remembered independently from Providers.
                 shell.open_settings(SettingsSection::Agents, cx);
-                assert_eq!(shell.settings.settings_section, SettingsSection::Harnesses);
+                assert_eq!(shell.settings.settings_section, SettingsSection::Agents);
                 shell.close_settings(cx);
                 shell.toggle_settings(cx);
-                assert_eq!(shell.route, Route::Settings(SettingsSection::Harnesses));
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Agents));
                 settings::flush(cx);
             })
             .unwrap();
         // It survives a restart.
         assert_eq!(
             settings::UiSettings::load(dir.path()).settings_section,
-            SettingsSection::Harnesses
+            SettingsSection::Agents
         );
     }
 

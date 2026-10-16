@@ -24,6 +24,11 @@ fn config(
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
+        scaffold: None,
+        device: None,
+        managed_inference: false,
+        device_bootstrap_file: None,
+        scaffold_runtime_artifact: None,
     }
 }
 
@@ -532,7 +537,7 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
     assert_eq!(scope, WorkspaceScope::Local);
     assert!(runtime.core().links().is_none());
 
-    let sign_in_url = auth.start_headless_sign_in();
+    let sign_in_url = auth.start_headless_sign_in().await.expect("start headless sign-in");
     let state = query_param(&sign_in_url, "state").expect("sign-in state");
     auth.complete_sign_in(&format!("{state}.authorization-code"))
         .await

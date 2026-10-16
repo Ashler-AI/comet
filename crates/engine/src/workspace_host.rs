@@ -675,6 +675,34 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.chat(chat_id))?)
     }
 
+    pub(crate) fn acknowledged_chat(&self, id: &str) -> Option<zeron_doc::registry::RegistryRow> {
+        self.read(|doc| doc.acknowledged_row(zeron_doc::registry::KIND_CHATS, id).cloned())
+    }
+
+    pub(crate) fn acknowledged_chats_after(&self, after: &str) -> Vec<zeron_doc::registry::RegistryRow> {
+        self.read(|doc| doc.acknowledged_rows_after(zeron_doc::registry::KIND_CHATS, after, 64))
+    }
+
+    pub(crate) fn directory_reconciliation_required(&self) -> bool {
+        self.read(|doc| doc.directory_reconciliation_required())
+    }
+
+    /// Includes server ACKs even when the optimistic sidebar did not change.
+    pub(crate) fn watch_registry(&self) -> watch::Receiver<u64> {
+        self.inner.changed_tx.subscribe()
+    }
+
+    /// Publish a verified session reference before acknowledging its lifecycle
+    /// operation. Call from a blocking worker, like explicit migration commits.
+    pub(crate) fn publish_crew_chat(&self, chat: &Chat, device: Option<&Device>) -> Result<(), EngineError> {
+        self.mutate(|doc| {
+            if let Some(device) = device { doc.upsert_device(device)?; }
+            doc.upsert_chat(chat)
+        })?;
+        self.inner.persist_snapshot()?;
+        Ok(())
+    }
+
     /// The space row as currently known (overlay view).
     pub fn space(&self, space_id: &str) -> Result<Option<Space>, EngineError> {
         Ok(self.read(|doc| doc.space(space_id))?)
@@ -1006,6 +1034,7 @@ impl WorkspaceHost {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
+                crew: None,
             })
         })?;
         Ok(())

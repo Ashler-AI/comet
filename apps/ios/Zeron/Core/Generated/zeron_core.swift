@@ -1235,6 +1235,18 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
      */
     func workspaceRevision()  -> UInt64
     
+    func crewCachedLink(url: String, deployment: String) throws  -> String?
+    
+    func crewControl(deviceId: String, commandId: String, controlJson: String, deployment: String) async throws  -> String
+    
+    func crewImportLegacyBackup(sourcePath: String) async throws  -> String
+    
+    func crewReconcile(deviceId: String, commandId: String) async throws  -> String
+    
+    func crewRefresh(deviceId: String, deployment: String) async throws  -> String
+    
+    func crewResolveLink(deviceId: String, url: String, deployment: String) async throws  -> String
+    
     /**
      * Returns immediately. Callbacks are dispatched on the core runtime; the
      * platform must hop to its media/UI executor and call complete_media.
@@ -2042,6 +2054,97 @@ open func workspaceRevision() -> UInt64  {
 })
 }
     
+open func crewCachedLink(url: String, deployment: String)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_coreclient_crew_cached_link(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(deployment),uniffiCallStatus
+    )
+})
+}
+    
+open func crewControl(deviceId: String, commandId: String, controlJson: String, deployment: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_crew_control(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(deviceId),FfiConverterString.lower(commandId),FfiConverterString.lower(controlJson),FfiConverterString.lower(deployment)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func crewImportLegacyBackup(sourcePath: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_crew_import_legacy_backup(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(sourcePath)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func crewReconcile(deviceId: String, commandId: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_crew_reconcile(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(deviceId),FfiConverterString.lower(commandId)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func crewRefresh(deviceId: String, deployment: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_crew_refresh(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(deviceId),FfiConverterString.lower(deployment)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func crewResolveLink(deviceId: String, url: String, deployment: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_crew_resolve_link(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(deviceId),FfiConverterString.lower(url),FfiConverterString.lower(deployment)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Returns immediately. Callbacks are dispatched on the core runtime; the
      * platform must hop to its media/UI executor and call complete_media.
@@ -2102,6 +2205,188 @@ public func FfiConverterTypeCoreClient_lift(_ handle: UInt64) throws -> CoreClie
 #endif
 public func FfiConverterTypeCoreClient_lower(_ value: CoreClient) -> UInt64 {
     return FfiConverterTypeCoreClient.lower(value)
+}
+
+
+
+
+
+
+public protocol CrewLoginProtocol: AnyObject, Sendable {
+    
+    func begin(redirectUri: String) async throws  -> String
+    
+    func cancel() 
+    
+    func complete(callback: String) async throws  -> CrewAccount
+    
+    func restore(sessionJson: String) async throws  -> CrewAccount
+    
+}
+open class CrewLogin: CrewLoginProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_zeron_mobile_fn_clone_crewlogin(self.handle, $0) }
+    }
+public convenience init(controlOrigin: String, edgeOrigin: String, projectScope: String, deploymentId: String)throws  {
+    let handle =
+        try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_constructor_crewlogin_new(
+        FfiConverterString.lower(controlOrigin),
+        FfiConverterString.lower(edgeOrigin),
+        FfiConverterString.lower(projectScope),
+        FfiConverterString.lower(deploymentId),uniffiCallStatus
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_zeron_mobile_fn_free_crewlogin(handle, $0) }
+    }
+
+    
+
+    
+open func begin(redirectUri: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_crewlogin_begin(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(redirectUri)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func cancel()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_crewlogin_cancel(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+open func complete(callback: String)async throws  -> CrewAccount  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_crewlogin_complete(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(callback)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCrewAccount_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func restore(sessionJson: String)async throws  -> CrewAccount  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_crewlogin_restore(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(sessionJson)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCrewAccount_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCrewLogin: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = CrewLogin
+
+    public static func lift(_ handle: UInt64) throws -> CrewLogin {
+        return CrewLogin(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: CrewLogin) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CrewLogin {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: CrewLogin, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCrewLogin_lift(_ handle: UInt64) throws -> CrewLogin {
+    return try FfiConverterTypeCrewLogin.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCrewLogin_lower(_ value: CrewLogin) -> UInt64 {
+    return FfiConverterTypeCrewLogin.lower(value)
 }
 
 
@@ -6168,6 +6453,72 @@ public func FfiConverterTypeCoreConfig_lift(_ buf: RustBuffer) throws -> CoreCon
 #endif
 public func FfiConverterTypeCoreConfig_lower(_ value: CoreConfig) -> RustBuffer {
     return FfiConverterTypeCoreConfig.lower(value)
+}
+
+
+public struct CrewAccount: Equatable, Hashable {
+    public var credentials: Credentials
+    public var profileKey: String
+    public var name: String?
+    public var email: String?
+    public var projectScope: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(credentials: Credentials, profileKey: String, name: String?, email: String?, projectScope: String) {
+        self.credentials = credentials
+        self.profileKey = profileKey
+        self.name = name
+        self.email = email
+        self.projectScope = projectScope
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CrewAccount: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCrewAccount: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CrewAccount {
+        return
+            try CrewAccount(
+                credentials: FfiConverterTypeCredentials.read(from: &buf), 
+                profileKey: FfiConverterString.read(from: &buf), 
+                name: FfiConverterOptionString.read(from: &buf), 
+                email: FfiConverterOptionString.read(from: &buf), 
+                projectScope: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CrewAccount, into buf: inout [UInt8]) {
+        FfiConverterTypeCredentials.write(value.credentials, into: &buf)
+        FfiConverterString.write(value.profileKey, into: &buf)
+        FfiConverterOptionString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.email, into: &buf)
+        FfiConverterString.write(value.projectScope, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCrewAccount_lift(_ buf: RustBuffer) throws -> CrewAccount {
+    return try FfiConverterTypeCrewAccount.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCrewAccount_lower(_ value: CrewAccount) -> RustBuffer {
+    return FfiConverterTypeCrewAccount.lower(value)
 }
 
 
@@ -11933,6 +12284,8 @@ public func FfiConverterTypeCoreError_lower(_ value: CoreError) -> RustBuffer {
 
 public enum Credentials: Equatable, Hashable {
     
+    case scaffold(userId: String, orgId: String, controlOrigin: String, sessionJson: String
+    )
     /**
      * WorkOS session scoped to `org_id`.
      */
@@ -11969,13 +12322,16 @@ public struct FfiConverterTypeCredentials: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .workOs(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf), tokens: try FfiConverterTypeAuthTokens.read(from: &buf)
+        case 1: return .scaffold(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf), controlOrigin: try FfiConverterString.read(from: &buf), sessionJson: try FfiConverterString.read(from: &buf)
         )
         
-        case 2: return .dev(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf)
+        case 2: return .workOs(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf), tokens: try FfiConverterTypeAuthTokens.read(from: &buf)
         )
         
-        case 3: return .demo(options: try FfiConverterTypeDemoOptions.read(from: &buf)
+        case 3: return .dev(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .demo(options: try FfiConverterTypeDemoOptions.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -11986,21 +12342,29 @@ public struct FfiConverterTypeCredentials: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .workOs(userId,orgId,tokens):
+        case let .scaffold(userId,orgId,controlOrigin,sessionJson):
             writeInt(&buf, Int32(1))
+            FfiConverterString.write(userId, into: &buf)
+            FfiConverterString.write(orgId, into: &buf)
+            FfiConverterString.write(controlOrigin, into: &buf)
+            FfiConverterString.write(sessionJson, into: &buf)
+            
+        
+        case let .workOs(userId,orgId,tokens):
+            writeInt(&buf, Int32(2))
             FfiConverterString.write(userId, into: &buf)
             FfiConverterString.write(orgId, into: &buf)
             FfiConverterTypeAuthTokens.write(tokens, into: &buf)
             
         
         case let .dev(userId,orgId):
-            writeInt(&buf, Int32(2))
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(userId, into: &buf)
             FfiConverterString.write(orgId, into: &buf)
             
         
         case let .demo(options):
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(4))
             FfiConverterTypeDemoOptions.write(options, into: &buf)
             
         }
@@ -16770,6 +17134,14 @@ public func workosAuthorizeUrl(state: String) -> String  {
     )
 })
 }
+public func crewIsSessionLink(url: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_func_crew_is_session_link(
+        FfiConverterString.lower(url),uniffiCallStatus
+    )
+})
+}
 /**
  * The canonical mention link the host understands (`[name](zeron-file:path)`).
  */
@@ -16938,6 +17310,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_workos_authorize_url() != 35994) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_func_crew_is_session_link() != 31526) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_file_mention_link() != 14340) {
@@ -17141,10 +17516,40 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zeron_mobile_checksum_method_coreclient_workspace_revision() != 48105) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_crew_cached_link() != 3329) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_crew_control() != 20236) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_crew_import_legacy_backup() != 25654) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_crew_reconcile() != 11002) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_crew_refresh() != 39985) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_crew_resolve_link() != 42745) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zeron_mobile_checksum_method_coreclient_start_voice() != 62086) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_uploadprogress_on_progress() != 40458) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_crewlogin_begin() != 20877) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_crewlogin_cancel() != 47562) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_crewlogin_complete() != 864) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_crewlogin_restore() != 58145) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_sessionhandle_begin_queued_edit() != 9014) {
@@ -17346,6 +17751,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_constructor_coreclient_new() != 27504) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_constructor_crewlogin_new() != 26806) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_constructor_textsystem_new() != 55727) {

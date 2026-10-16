@@ -13,18 +13,15 @@ async fn live_run(cancel: bool) {
     let cwd = tempfile::tempdir().unwrap();
     let (steer, steering) = mpsc::channel(8);
     let interrupt = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: interrupt.clone(),
-        request_input: Box::new(|_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Vec::new());
-            rx
-        }),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: interrupt.clone(),
+    request_input: Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Vec::new());
+        rx
+    }),
+    turn: Default::default(), };
     let request = RunRequest {
         mcp: None,
         prompt: "Run the shell command `printf ACP-TOOL-OK` exactly once using bash. After seeing its result, reply exactly FIRST-DONE. Do not call any other tools.".into(),

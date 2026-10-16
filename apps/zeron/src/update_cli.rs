@@ -9,6 +9,9 @@ use zeron_update::{InstallKind, current_version, version_newer};
 /// `--check` prints the verdict and exits (nonzero when an update is available,
 /// so scripts can gate on it).
 pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
+    if !zeron_update::AUTOMATIC_UPDATES_SUPPORTED {
+        bail!("Crew Canary uses reviewed manual delivery; automatic updates and installed Crew restarts are disabled");
+    }
     let manifest = zeron_update::fetch_latest(edge_url).await?;
     let current = current_version();
     if !version_newer(&manifest.version, current) {
@@ -40,7 +43,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
                 app_root.join(&manifest.version).display(),
                 manifest.version
             );
-            match zeron_update::restart_service() {
+            match crate::daemon::restart() {
                 Ok(()) => println!("engine service restarted."),
                 Err(err) => println!(
                     "note: service restart failed ({err:#}) — restart the engine manually to finish."

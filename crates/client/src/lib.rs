@@ -30,6 +30,8 @@ pub mod catalog;
 mod client;
 pub mod config;
 pub mod connectivity;
+pub mod crew;
+pub mod legacy;
 mod demo;
 pub mod error;
 pub mod events;

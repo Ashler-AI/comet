@@ -719,26 +719,23 @@ mod tests {
     }
 
     fn chat(id: &str, title: Option<&str>) -> Chat {
-        Chat {
-            id: id.into(),
-            device_id: "dev".into(),
-            title: title.map(str::to_owned),
-            archived: false,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            parent_chat_id: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: None,
-        }
+        Chat { id: id.into(), crew: None, device_id: "dev".into(),
+        title: title.map(str::to_owned),
+        archived: false,
+        cwd: None,
+        branch: None,
+        checkout_id: None,
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at: None,
+        created_at: Utc::now(),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: None,
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     #[test]

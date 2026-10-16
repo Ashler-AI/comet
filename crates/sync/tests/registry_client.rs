@@ -30,26 +30,23 @@ fn device(id: &str) -> Device {
 }
 
 fn chat(id: &str, device_id: &str) -> Chat {
-    Chat {
-        id: id.into(),
-        device_id: device_id.into(),
-        title: Some("chat".into()),
-        archived: false,
-        cwd: Some("/tmp".into()),
-        branch: None,
-        checkout_id: None,
-        source_context: None,
-        config: None,
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: ts(2_000),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        parent_chat_id: None,
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None,
-    }
+    Chat { id: id.into(), crew: None, device_id: device_id.into(),
+    title: Some("chat".into()),
+    archived: false,
+    cwd: Some("/tmp".into()),
+    branch: None,
+    checkout_id: None,
+    source_context: None,
+    config: None,
+    last_message_preview: None,
+    last_message_at: None,
+    created_at: ts(2_000),
+    harness_session_id: None,
+    harness_session_cwd: None,
+    parent_chat_id: None,
+    space_id: None,
+    last_seen_at: None,
+    room_gen: None, }
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {

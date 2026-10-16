@@ -225,18 +225,15 @@ async fn exercise(prompt: &str, resume: Option<&str>) {
     let harness = AcpHarness::grok().with_executable(fixture(dir.path()));
     let (steer_tx, steering) = mpsc::channel(4);
     let interrupt = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(|_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Vec::new());
-            rx
-        }),
-        steering,
-        interrupt: interrupt.clone(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Vec::new());
+        rx
+    }),
+    steering,
+    interrupt: interrupt.clone(),
+    turn: Default::default(), };
     let operation = async {
         let mut stream = harness
             .run(request(&cwd, prompt, resume), controls)
@@ -321,17 +318,14 @@ async fn exercise_tree(prompt: &str, drop_stream: bool) {
         .with_graces(Duration::from_millis(100), Duration::from_millis(100));
     let (_steer, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(|_| {
-            let (_, rx) = oneshot::channel();
-            rx
-        }),
-        steering,
-        interrupt: interrupt.clone(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(|_| {
+        let (_, rx) = oneshot::channel();
+        rx
+    }),
+    steering,
+    interrupt: interrupt.clone(),
+    turn: Default::default(), };
     let mut stream = harness
         .run(request(dir.path(), prompt, None), controls)
         .await
@@ -482,18 +476,15 @@ async fn batch_overrides_launch_through_cmd() {
         // SAFETY: written before any child exists in this iteration.
         unsafe { std::env::set_var("ZERON_TEST_BATCH_ARGS_FILE", &received) };
         let (_steer, steering) = mpsc::channel(1);
-        let controls = RunControls {
-            realtime: None,
-            execution_lease: None,
-            request_input: Box::new(|_| {
-                let (tx, rx) = oneshot::channel();
-                let _ = tx.send(Vec::new());
-                rx
-            }),
-            steering,
-            interrupt: CancellationToken::new(),
-            turn: Default::default(),
-        };
+        let controls = RunControls { context: None, realtime: None, execution_lease: None,
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering,
+        interrupt: CancellationToken::new(),
+        turn: Default::default(), };
         // Consume the whole stream: the shim cannot speak any agent protocol,
         // so the run must fail loudly — but only AFTER a safe launch.
         let result = tokio::time::timeout(

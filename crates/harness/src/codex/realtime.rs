@@ -172,7 +172,25 @@ pub(super) fn attach(
     executable: PathBuf,
     context: ThreadContext,
     controls: RealtimeControls,
+    managed: bool,
 ) -> BridgeTask {
+    // Agent Auth exposes Responses/Messages, not the subscription voice protocol.
+    // Keep text usable and explicitly reject voice instead of probing local OAuth.
+    if managed {
+        return BridgeTask(tokio::spawn(async move {
+            let mut commands = controls.commands;
+            while let Some(command) = commands.recv().await {
+                match command {
+                    VoiceCommand::Probe { reply, .. } => { let _ = reply.send(Err(VoiceRejection::Unsupported)); }
+                    VoiceCommand::External { reply, .. } => { let _ = reply.send(Err(VoiceRejection::Unsupported)); }
+                    VoiceCommand::Start { reply, .. }
+                    | VoiceCommand::Mute { reply, .. }
+                    | VoiceCommand::Append { reply, .. } => { let _ = reply.send(Err(VoiceRejection::Unsupported)); }
+                    VoiceCommand::Stop { reply } => { let _ = reply.send(Ok(())); }
+                }
+            }
+        }));
+    }
     let abort = controls.audio_abort.clone();
     let invalidated = controls.invalidated.clone();
     let (mut wire, overflow) = client.subscribe_voice(move || {

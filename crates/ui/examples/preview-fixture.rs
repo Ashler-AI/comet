@@ -139,15 +139,13 @@ fn main() -> anyhow::Result<()> {
     let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, core.rpc_service()))?;
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
-    let boot = EngineBootConfig {
-        data_dir: data.clone(),
-        ipc_port,
-        edge_url: String::new(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: None,
-        default_harness: zeron_proto::HarnessId::ClaudeCode,
-    };
+    let boot = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: data.clone(),
+    ipc_port,
+    edge_url: String::new(),
+    edge_token: None,
+    org_id: None,
+    workos_client_id: None,
+    default_harness: zeron_proto::HarnessId::ClaudeCode, };
     let handle = runtime.block_on(state::EngineHandle::bootstrap(boot.clone()))?;
     let chats = core.workspace.read_chats()?;
     let spaces = core.workspace.read_spaces()?;

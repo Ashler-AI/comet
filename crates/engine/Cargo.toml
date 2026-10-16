@@ -34,7 +34,12 @@ libc.workspace = true
 gethostname.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
+parking_lot = "0.12"
 reqwest.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 ignore.workspace = true
 fff-search.workspace = true
 

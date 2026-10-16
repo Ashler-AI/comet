@@ -16,25 +16,22 @@ async fn main() {
         .unwrap_or_else(|| "/tmp/probe-grok-viz".into());
     std::fs::create_dir_all(&cwd).unwrap();
     let (_steer_tx, steering) = mpsc::channel(8);
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(move |questions| {
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: q.options.first().cloned().into_iter().collect(),
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
-        }),
-        steering,
-        interrupt: CancellationToken::new(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(move |questions| {
+        let (tx, rx) = oneshot::channel();
+        let answers: Vec<UserInputAnswer> = questions
+            .iter()
+            .map(|q| UserInputAnswer {
+                question_id: q.id.clone(),
+                labels: q.options.first().cloned().into_iter().collect(),
+            })
+            .collect();
+        let _ = tx.send(answers);
+        rx
+    }),
+    steering,
+    interrupt: CancellationToken::new(),
+    turn: Default::default(), };
     let request = RunRequest {
         mcp: None,
         prompt: "Use spawn_subagent to launch ONE subagent of type general with description \

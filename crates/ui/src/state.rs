@@ -103,6 +103,9 @@ pub struct EngineBootConfig {
     pub org_id: Option<String>,
     /// WorkOS client id for production authentication.
     pub workos_client_id: Option<String>,
+    pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
+    pub managed_inference: bool,
+    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
 }
@@ -307,6 +310,11 @@ impl EngineHandle {
             default_harness: config.default_harness,
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
+            scaffold: config.scaffold,
+            device: None,
+            device_bootstrap_file: None,
+            managed_inference: config.managed_inference,
+            scaffold_runtime_artifact: config.scaffold_runtime_artifact,
         };
 
         // Own the data dir before opening anything under it or binding IPC —
@@ -753,6 +761,7 @@ pub struct AppState {
     /// Fixed data boundary of the attached engine. Authentication may change
     /// in place, but changing this scope requires assembling a new runtime.
     pub workspace_scope: Option<WorkspaceScope>,
+    pub managed_inference: bool,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
@@ -809,6 +818,7 @@ pub struct AppState {
     pub chats_synced: bool,
     pub spaces_synced: bool,
     pending_deep_link: Option<crate::links::ConversationDeepLink>,
+    pending_crew_link: Option<crate::settings::PendingCrewLink>,
     deep_link_notice: Option<String>,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
@@ -928,6 +938,7 @@ impl AppState {
         Self {
             connection: ConnectionStatus::Connecting,
             workspace_scope: None,
+            managed_inference: false,
             auth: None,
             devices: Vec::new(),
             device_presentation: None,
@@ -978,6 +989,7 @@ impl AppState {
             chats_synced: false,
             spaces_synced: false,
             pending_deep_link: None,
+            pending_crew_link: None,
             deep_link_notice: None,
         }
     }
@@ -2449,6 +2461,7 @@ impl AppState {
         state.spaces = source.spaces.clone();
         state.devices = source.devices.clone();
         state.data_dir = source.data_dir.clone();
+        state.managed_inference = source.managed_inference;
         state.auto_selected = true;
         state.pending_side_chat = Some(chat.clone());
         state.unsaved_side_chat = unsaved;
@@ -2538,6 +2551,10 @@ impl AppState {
             s.workspace_scope = None;
             s.auth = None;
             s.data_dir = Some(data_dir);
+            s.managed_inference = config.managed_inference;
+            if s.pending_crew_link.is_none() {
+                s.pending_crew_link = crate::settings::current(cx).pending_crew_link;
+            }
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -2698,6 +2715,24 @@ impl AppState {
     }
 
     pub fn open_deep_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        if crate::links::crew_link_scope(url).is_some()
+            || (self.managed_inference && crate::links::parse_zeron_conversation_link(url).is_ok()) {
+            let pending = crate::settings::PendingCrewLink {
+                url: url.to_owned(),
+                owner: self.auth_user().map(|user| user.id.clone()),
+                expires_at: chrono::Utc::now().timestamp() + 1800,
+            };
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                settings.pending_crew_link = Some(pending.clone());
+            });
+            self.pending_crew_link = Some(pending);
+            if !matches!(self.auth, Some(AuthState::SignedIn { .. })) {
+                self.deep_link_notice = Some("Sign in to Crew to open this session. The link will continue after login; it will not start execution.".into());
+            }
+            self.apply_pending_deep_link(cx);
+            cx.notify();
+            return;
+        }
         match crate::links::parse_zeron_conversation_link(url) {
             Ok(link) => {
                 self.pending_deep_link = Some(link);
@@ -2710,6 +2745,9 @@ impl AppState {
 
     /// Returns whether a pending link was resolved (selected or rejected).
     fn apply_pending_deep_link(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pending_crew_link.is_some() {
+            return self.apply_pending_crew_link(cx);
+        }
         let Some(link) = self.pending_deep_link.clone() else {
             return false;
         };
@@ -2737,6 +2775,53 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    fn apply_pending_crew_link(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.pending_crew_link.clone() else { return false; };
+        if pending.expires_at <= chrono::Utc::now().timestamp() {
+            self.pending_crew_link = None;
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| settings.pending_crew_link = None);
+            self.deep_link_notice = Some("Session link expired while waiting for login. Open the original link again.".into());
+            return true;
+        }
+        let Some(AuthState::SignedIn { user, org_id }) = &self.auth else { return false; };
+        if self.workspace_scope != Some(WorkspaceScope::Synced) { return false; }
+        let owner = user.id.clone();
+        let conversation = crate::links::parse_zeron_conversation_link(&pending.url).ok();
+        let same_scope = if let Some(link) = &conversation {
+            if !self.chats_synced { return false; }
+            crate::links::workspace_locator(self.workspace_scope, self.auth.as_ref(), self.local_device_id.as_deref()).as_deref() == Some(link.workspace.as_str())
+        } else {
+            crate::links::crew_link_scope(&pending.url).is_some_and(|scope| org_id.as_deref() == Some(scope.project_id.as_str()))
+        };
+        let valid = pending.owner.as_ref().is_none_or(|expected| expected == &owner) && same_scope;
+        let Some(engine) = self.engine().cloned() else { return false; };
+        self.pending_crew_link = None;
+        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| settings.pending_crew_link = None);
+        if !valid {
+            self.deep_link_notice = Some("This session link belongs to a different account or project. Switch to its profile and reopen the link.".into());
+            return true;
+        }
+        if let Some(link) = conversation {
+            self.pending_deep_link = Some(link);
+            return self.apply_pending_deep_link(cx);
+        }
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call("ResolveCrewSessionLink", serde_json::json!({"url": pending.url})).await;
+            this.update(cx, |state, cx| {
+                if state.auth_user().map(|user| user.id.as_str()) != Some(owner.as_str()) { return; }
+                match result {
+                    Ok(value) => match value.get("chatId").and_then(serde_json::Value::as_str) {
+                        Some(id) if !id.is_empty() => state.select_chat(Some(id.to_owned()), cx),
+                        _ => state.deep_link_notice = Some("The session resolver returned no authorized session. Reopen the link after refreshing.".into()),
+                    },
+                    Err(error) => state.deep_link_notice = Some(format!("Could not open Crew session: {error}. Reopen the original link to retry.")),
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+        true
     }
 
     pub fn take_deep_link_notice(&mut self) -> Option<String> {
@@ -3598,15 +3683,13 @@ mod tests {
             Arc::new(LegacyIdentityRpc),
         ));
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .expect("legacy daemon remains attachable");
 
@@ -3628,15 +3711,13 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_embeds_engine_when_port_is_free() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: free_port().await,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None, // offline
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
@@ -3666,15 +3747,13 @@ mod tests {
         std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
         let port = free_port().await;
 
-        let error = match EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
-            default_harness: HarnessId::Mock,
-        })
+        let error = match EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+        default_harness: HarnessId::Mock, })
         .await
         {
             Ok(handle) => {
@@ -3723,15 +3802,13 @@ mod tests {
         ));
 
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .expect("second viewport attaches over IPC");
         assert!(matches!(handle.mode(), EngineMode::Remote { .. }));
@@ -3761,15 +3838,13 @@ mod tests {
         // separate daemon, and no launch ordering.
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None, // offline
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
@@ -3803,15 +3878,13 @@ mod tests {
         // and turn the other into a plain remote attach.
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
-        let config = EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            org_id: None,
-            workos_client_id: None,
-            default_harness: HarnessId::Mock,
-        };
+        let config = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None, // offline
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, };
         let (a, b) = tokio::join!(
             EngineHandle::bootstrap(config.clone()),
             EngineHandle::bootstrap(config.clone()),
@@ -3863,15 +3936,13 @@ mod tests {
             .unwrap();
         let port = squatter.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .expect("a taken port must not fail the boot");
         assert_eq!(handle.mode(), EngineMode::InProcess);
@@ -3890,15 +3961,13 @@ mod tests {
     #[tokio::test]
     async fn production_bootstrap_opens_local_data_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: free_port().await,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
 
@@ -3941,15 +4010,13 @@ mod tests {
             r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
         )
         .unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: Some("client_test".into()),
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: free_port().await,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
 
@@ -3999,15 +4066,13 @@ mod tests {
         tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
 
         let ui_dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: ui_dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
-            default_harness: HarnessId::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: ui_dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
         assert_eq!(
@@ -4039,26 +4104,24 @@ mod tests {
         let base = DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
             .unwrap()
             .to_utc();
-        Chat {
-            id: id.into(),
-            device_id: "dev".into(),
-            title: None,
-            archived: false,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),
-            created_at: base + TimeDelta::minutes(created_min),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            parent_chat_id: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: None,
-        }
+        Chat { crew: None, id: id.into(),
+        device_id: "dev".into(),
+        title: None,
+        archived: false,
+        cwd: None,
+        branch: None,
+        checkout_id: None,
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),
+        created_at: base + TimeDelta::minutes(created_min),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: None,
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     fn space(id: &str, device_id: &str, path: &str, created_min: i64) -> Space {

@@ -3694,26 +3694,24 @@ mod tests {
     }
 
     fn session(space: &str, last_message_at: Option<DateTime<Utc>>) -> zeron_proto::Chat {
-        zeron_proto::Chat {
-            id: "chat".into(),
-            device_id: "local".into(),
-            title: None,
-            archived: false,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at,
-            created_at: Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            parent_chat_id: None,
-            space_id: Some(space.into()),
-            last_seen_at: None,
-            room_gen: None,
-        }
+        zeron_proto::Chat { crew: None, id: "chat".into(),
+        device_id: "local".into(),
+        title: None,
+        archived: false,
+        cwd: None,
+        branch: None,
+        checkout_id: None,
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at,
+        created_at: Utc::now(),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: Some(space.into()),
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     fn project(id: &str, device: &str) -> ProjectRef {

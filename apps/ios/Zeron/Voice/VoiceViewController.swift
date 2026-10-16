@@ -150,7 +150,7 @@ final class VoiceViewController: UIViewController, UICollectionViewDelegate {
         s.appendItems([Row(id: "hero", title: "")], toSection: .hero)
         let chosen = voice.startHost?.id
         if devices.isEmpty {
-            s.appendItems([Row(id: "no-hosts", title: "No Mac or server yet", subtitle: "Open Zeron on your Mac or server with remote voice enabled.", symbol: "desktopcomputer", enabled: false)], toSection: .hosts)
+            s.appendItems([Row(id: "no-hosts", title: "No Mac or server yet", subtitle: "Open Crew on your Mac or server with remote voice enabled.", symbol: "desktopcomputer", enabled: false)], toSection: .hosts)
         } else {
             s.appendItems(devices.map { device in
                 let compatible = RemoteVoiceController.compatible(device)
@@ -158,7 +158,7 @@ final class VoiceViewController: UIViewController, UICollectionViewDelegate {
                 return Row(
                     id: "host-\(device.id)",
                     title: device.name,
-                    subtitle: !device.online ? "Offline" : !compatible ? "Update Zeron and enable remote voice" : "Ready",
+                    subtitle: !device.online ? "Offline" : !compatible ? "Update Crew and enable remote voice" : "Ready",
                     symbol: Self.symbol(for: device.platform),
                     selected: device.id == chosen,
                     enabled: ready && !voice.live,

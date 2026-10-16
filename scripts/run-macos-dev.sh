@@ -1,36 +1,35 @@
 #!/usr/bin/env bash
-# Build and run an isolated macOS development bundle. Zeron.app may remain
-# open: this bundle has a separate LaunchServices/TCC identity, data directory,
-# and engine IPC port.
-# Set ZERON_DEV_BUILD_ONLY=1 to prepare the signed bundle without launching it.
+# Build and run an isolated Crew Canary development bundle.
+# Set COMET_DEV_BUILD_ONLY=1 to prepare the signed bundle without launching.
 
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 DEV_ROOT="$ROOT/target/macos-dev"
-APP="$DEV_ROOT/Zeron Dev.app"
+APP="$DEV_ROOT/Crew Canary Dev.app"
 CONTENTS="$APP/Contents"
-DATA_DIR="${ZERON_DEV_DATA_DIR:-$DEV_ROOT/data}"
-IPC_PORT="${ZERON_DEV_IPC_PORT:-49777}"
-BUNDLE_ID="${ZERON_DEV_BUNDLE_ID:-sh.zeron.app.dev}"
+DATA_DIR="${COMET_DEV_DATA_DIR:-$DEV_ROOT/data}"
+IPC_PORT="${COMET_DEV_IPC_PORT:-27955}"
+BUNDLE_ID="ai.ashler.crew.upstream-canary.dev"
 
-if pgrep -f -x "$CONTENTS/MacOS/zeron" >/dev/null 2>&1; then
-  echo "Zeron Dev is already running. Quit it before rebuilding the signed bundle." >&2
+if pgrep -f -x "$CONTENTS/MacOS/comet" >/dev/null 2>&1; then
+  echo "Crew Canary Dev is already running. Quit it before rebuilding the signed bundle." >&2
   exit 1
 fi
 
 cd "$ROOT"
-cargo build -p zeron
+cargo build --locked -p zeron
 
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$DATA_DIR"
 TARGET_DIR="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
-install -m 755 "$TARGET_DIR/debug/zeron" "$CONTENTS/MacOS/zeron"
+install -m 755 "$TARGET_DIR/debug/zeron" "$CONTENTS/MacOS/comet"
 sed "s/__VERSION__/$VERSION/g" "$ROOT/dist/macos/Info-dev.plist" >"$CONTENTS/Info.plist"
 plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$CONTENTS/Info.plist"
-plutil -replace LSEnvironment.ZERON_DATA_DIR -string "$DATA_DIR" "$CONTENTS/Info.plist"
-plutil -replace LSEnvironment.ZERON_IPC_PORT -string "$IPC_PORT" "$CONTENTS/Info.plist"
+plutil -replace LSEnvironment.COMET_DATA_DIR -string "$DATA_DIR" "$CONTENTS/Info.plist"
+plutil -replace LSEnvironment.COMET_IPC_PORT -string "$IPC_PORT" "$CONTENTS/Info.plist"
 if [[ -n "${CODEX_EXECUTABLE:-}" ]]; then
   plutil -insert LSEnvironment.CODEX_EXECUTABLE -string "$CODEX_EXECUTABLE" "$CONTENTS/Info.plist"
 fi
@@ -50,9 +49,9 @@ if [[ ! -f "$CONTENTS/Resources/zeron.icns" ]]; then
 fi
 
 # A real Apple Development identity gives TCC a stable signing requirement
-# across rebuilds. Set ZERON_DEV_CODESIGN_IDENTITY explicitly when more than
+# across rebuilds. Set COMET_DEV_CODESIGN_IDENTITY explicitly when more than
 # one identity is installed; otherwise fall back to an ad-hoc signature.
-IDENTITY="${ZERON_DEV_CODESIGN_IDENTITY:-}"
+IDENTITY="${COMET_DEV_CODESIGN_IDENTITY:-}"
 if [[ -z "$IDENTITY" ]]; then
   IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -1)"
 fi
@@ -63,20 +62,20 @@ else
   echo "warning: no Apple Development signing identity found; macOS may ask for permissions again after a rebuild" >&2
 fi
 
-if [[ "${ZERON_DEV_BUILD_ONLY:-0}" == "1" ]]; then
+if [[ "${COMET_DEV_BUILD_ONLY:-0}" == "1" ]]; then
   echo "built: $APP" >&2
   exit 0
 fi
 
-echo "running Zeron Dev (bundle $BUNDLE_ID, data $DATA_DIR, IPC $IPC_PORT)" >&2
-# LaunchServices must own the process. Launching Contents/MacOS/zeron directly
+echo "running Crew Canary Dev (bundle $BUNDLE_ID, data $DATA_DIR, IPC $IPC_PORT)" >&2
+# LaunchServices must own the process. Launching Contents/MacOS/comet directly
 # makes TCC attribute Screen Recording to the terminal (Warp, Terminal, etc.).
 # -W keeps the script attached until the app exits. Runtime logs remain in the
 # isolated data directory (`target/macos-dev/data/logs/zeron-headed.log`).
 OPEN_ENV=(
-  --env "ZERON_AUTO_UPDATE=0"
-  --env "ZERON_DATA_DIR=$DATA_DIR"
-  --env "ZERON_IPC_PORT=$IPC_PORT"
+  --env "COMET_AUTO_UPDATE=0"
+  --env "COMET_DATA_DIR=$DATA_DIR"
+  --env "COMET_IPC_PORT=$IPC_PORT"
 )
 if [[ -n "${CODEX_EXECUTABLE:-}" ]]; then
   OPEN_ENV+=(--env "CODEX_EXECUTABLE=$CODEX_EXECUTABLE")

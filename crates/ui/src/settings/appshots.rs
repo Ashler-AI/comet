@@ -4,6 +4,15 @@ use super::*;
 use crate::appshots::{AppshotPlatform, CapabilityState};
 use crate::settings::widgets;
 
+fn process_diagnostics() -> &'static str {
+    static DETAILS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(
+        "Permissions apply only to Crew Canary desktop (PID {}), not an agent or headless daemon. Executable: {}. macOS may require quitting and reopening this app after a change.",
+        std::process::id(),
+        std::env::current_exe().map(|path| path.display().to_string()).unwrap_or_else(|error| format!("unavailable ({error})")),
+    ));
+    DETAILS.as_str()
+}
+
 fn row(
     theme: &Theme,
     first: bool,
@@ -287,6 +296,7 @@ impl ShortcutsPage {
                                     .line_height(px(20.0)),
                             )
                             .child(card)
+                            .child(widgets::page_subtitle(&theme, process_diagnostics()))
                             .child(
                                 div()
                                     .min_h(px(20.0))
@@ -310,7 +320,7 @@ impl ShortcutsPage {
                                             .text_size(px(12.0))
                                             .text_color(theme.text_muted)
                                             .child(
-                                                "Changed a permission? Check again after returning to Zeron.",
+                                                "Changed a permission? Check again after returning to Crew.",
                                             ),
                                     )
                                     .child(refresh),

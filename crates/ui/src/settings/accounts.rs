@@ -496,6 +496,7 @@ impl gpui::Global for AccountsSnapshotCache {}
 
 pub struct AccountsPage {
     state: Entity<AppState>,
+    crew: Entity<super::crew::CrewAccounts>,
     embedded: bool,
     embedded_harness: Option<HarnessId>,
     scroll: widgets::PageScroll,
@@ -523,6 +524,9 @@ pub struct AccountsPage {
 }
 
 impl AccountsPage {
+    pub(crate) fn capture_annotation_selection(&mut self, cx: &mut Context<Self>) {
+        self.crew.update(cx, |page, cx| page.capture_annotation_selection(cx));
+    }
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::new_with_layout(state, false, None, None, cx)
     }
@@ -551,6 +555,7 @@ impl AccountsPage {
             }
         });
         let mut page = Self {
+            crew: cx.new(|cx| super::crew::CrewAccounts::new(state.clone(), cx)),
             state,
             embedded,
             embedded_harness,
@@ -574,7 +579,9 @@ impl AccountsPage {
         // Paint from the last list (this session) or the engine's persisted
         // usage, then force one probe to update in place — the skeleton only
         // ever shows on a genuinely first load.
-        page.load(force_usage_for(LoadTrigger::Mount), cx);
+        if !page.state.read(cx).managed_inference {
+            page.load(force_usage_for(LoadTrigger::Mount), cx);
+        }
         page
     }
 
@@ -1872,6 +1879,10 @@ impl AccountsPage {
 
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.state.read(cx).managed_inference {
+            return div().id("crew-accounts-page").size_full().overflow_y_scroll()
+                .child(widgets::page_column().child(self.crew.clone())).into_any_element();
+        }
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();

@@ -218,6 +218,35 @@ pub fn device_room_ws_url(
     format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}")
 }
 
+fn directional_peer_url(edge_url: &str, device_id: Option<&str>, session_id: &str,
+    deployment_id: Option<&str>, token: &str, params: &serde_json::Value) -> Result<String, RpcError> {
+    let source = params["command"]["sourceChatId"].as_str()
+        .filter(|id| !id.is_empty()).ok_or_else(|| RpcError::BadParams("Missing peer source session".into()))?;
+    let source_device = params["command"]["sourceDeviceId"].as_str()
+        .filter(|id| !id.is_empty()).ok_or_else(|| RpcError::BadParams("Missing peer source device".into()))?;
+    let mut url = url::Url::parse(edge_url).map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+    let scheme = match url.scheme() { "https" => "wss", "http" => "ws", _ => return Err(RpcError::BadParams("Invalid Crew Edge scheme".into())) };
+    url.set_scheme(scheme).map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+    url.set_query(None); url.set_fragment(None);
+    {
+        let mut path = url.path_segments_mut().map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+        path.clear();
+        if let Some(device) = device_id { path.extend(["device", device, "ws"]); }
+        else { path.extend(["session", session_id, "peer", "ws"]); }
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("connId", &uuid::Uuid::new_v4().to_string())
+            .append_pair("token", token).append_pair("sourceSessionId", source)
+            .append_pair("sourceDeviceId", source_device);
+        if device_id.is_some() {
+            query.append_pair("role", "client").append_pair("purpose", "peer-reply").append_pair("peerSessionId", session_id);
+            if let Some(deployment) = deployment_id { query.append_pair("peerDeploymentId", deployment); }
+        } else if let Some(deployment) = deployment_id { query.append_pair("deploymentId", deployment); }
+    }
+    Ok(url.into())
+}
+
 // ---------------------------------------------------------------------------
 // Token source — the auth seam
 // ---------------------------------------------------------------------------
@@ -894,6 +923,37 @@ impl LinkCache {
         cache
     }
 
+    /// A one-command directional link. Never cache it as a general device client
+    /// and never retry an ambiguous admission under a fresh command identity.
+    pub async fn peer_call(&self, session_id: &str, deployment_id: Option<&str>,
+        method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+        self.directional_peer_call(None, session_id, deployment_id, method, params).await
+    }
+
+    pub async fn peer_device_call(&self, device_id: &str, session_id: &str,
+        deployment_id: Option<&str>, method: &str, params: serde_json::Value)
+        -> Result<serde_json::Value, RpcError> {
+        self.directional_peer_call(Some(device_id), session_id, deployment_id, method, params).await
+    }
+
+    async fn directional_peer_call(&self, device_id: Option<&str>, session_id: &str,
+        deployment_id: Option<&str>, method: &str, params: serde_json::Value)
+        -> Result<serde_json::Value, RpcError> {
+        if self.revoked.load(Ordering::Acquire) { return Err(RpcError::Failed("not signed in".into())); }
+        if method != "DeliverPeerMessage" || params["chatId"].as_str() != Some(session_id) {
+            return Err(RpcError::BadParams("Directional peers admit only one message to their bound session".into()));
+        }
+        let token = self.config.token.token().await.map_err(|error| RpcError::Transport(error.to_string()))?;
+        let url = directional_peer_url(&self.config.edge_url, device_id, session_id, deployment_id, &token, &params)?;
+        let link = DeviceLink::connect(&url).await?;
+        let client = link.client();
+        tokio::time::timeout(self.config.probe_timeout, client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({})))
+            .await.map_err(|_| RpcError::Transport("Directional peer readiness timed out".into()))??;
+        if self.revoked.load(Ordering::Acquire) { return Err(RpcError::Failed("not signed in".into())); }
+        tokio::time::timeout(std::time::Duration::from_secs(120), client.call(method, params))
+            .await.map_err(|_| RpcError::Transport("Peer admission outcome unknown; retain and retry the same command ID".into()))?
+    }
+
     /// A live `RpcClient` to `device_id`'s engine (dialed + cached on first use).
     /// Transient dial failures retry in place a couple of times before
     /// surfacing: the host relay's DO periodically ends its session and
@@ -1108,6 +1168,19 @@ impl LinkCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn directional_url_keeps_source_target_and_token_separate() {
+        let params = serde_json::json!({"command":{"sourceChatId":"source","sourceDeviceId":"device-source"}});
+        let url = super::directional_peer_url("https://edge.example", Some("target-device"), "target",
+            Some("canary"), "opaque+&token", &params).unwrap();
+        let url = url::Url::parse(&url).unwrap();
+        assert_eq!(url.path(), "/device/target-device/ws");
+        let pairs: std::collections::HashMap<_,_> = url.query_pairs().collect();
+        assert_eq!(pairs["token"], "opaque+&token");
+        assert_eq!(pairs["sourceSessionId"], "source");
+        assert_eq!(pairs["peerSessionId"], "target");
+        assert_eq!(pairs["purpose"], "peer-reply");
+    }
     #[tokio::test(start_paused = true)]
     async fn blocked_relay_upload_closes_link_and_fails_pending_rpc() {
         use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};

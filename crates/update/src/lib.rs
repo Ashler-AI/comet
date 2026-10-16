@@ -3,11 +3,11 @@
 //! (its own report-only checker, the "Check for Updates…" menu item, the
 //! sidebar update strip, and the desktop install paths).
 //!
-//! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
-//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
-//! releases published before the manifest existed.
+//! Crew Canary uses private/manual artifacts only. The upstream implementation
+//! below is retained for upstream merges, but its public feed and mutation
+//! entrypoints are disabled by the build's delivery policy. Signed Crew delivery
+//! must port its authenticated, signed candidate contract before enabling
+//! updates; changing an environment URL must never enable the upstream feed.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
@@ -45,6 +45,18 @@ pub mod windows;
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Compile-time delivery boundary, not a runtime preference or URL override.
+/// This branch has no signed Crew channel. Do not enable the upstream public
+/// feed: a signed-channel cutover must replace its trust/verification contract.
+pub const AUTOMATIC_UPDATES_SUPPORTED: bool = false;
+pub const MANUAL_UPDATE_MESSAGE: &str =
+    "Crew Canary uses private/manual packages; automatic Crew updates are unavailable.";
+
+fn require_update_delivery() -> anyhow::Result<()> {
+    anyhow::ensure!(AUTOMATIC_UPDATES_SUPPORTED, MANUAL_UPDATE_MESSAGE);
+    Ok(())
 }
 
 /// Successful checks repeat this often. The feed is a sub-kilobyte,
@@ -115,11 +127,13 @@ fn managed_updates_supported(os: &str) -> bool {
 
 fn require_managed_update_platform() -> anyhow::Result<()> {
     if !managed_updates_supported(std::env::consts::OS) {
+        // Preserve the platform-specific diagnostic on unsupported targets.
         bail!(
             "managed updates are not supported on {}",
             std::env::consts::OS
         );
     }
+    require_update_delivery()?;
     Ok(())
 }
 
@@ -130,6 +144,7 @@ fn require_mac_app_update_platform() -> anyhow::Result<()> {
             std::env::consts::OS
         );
     }
+    require_update_delivery()?;
     Ok(())
 }
 
@@ -324,6 +339,7 @@ pub const RELEASES_PAGE: &str = "https://github.com/zeronsh/zeron/releases";
 pub const LATEST_RELEASE_PAGE: &str = "https://github.com/zeronsh/zeron/releases/latest";
 
 fn release_base(edge_url: &str) -> anyhow::Result<String> {
+    require_update_delivery()?;
     if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
         && !url.trim().is_empty()
     {
@@ -388,6 +404,9 @@ impl std::fmt::Display for UpdateBlocker {
 impl InstallKind {
     /// Whether the desktop app downloads and installs updates itself.
     pub fn supports_desktop_update(&self) -> bool {
+        if !AUTOMATIC_UPDATES_SUPPORTED {
+            return false;
+        }
         match self {
             Self::MacApp { .. } => true,
             // The desktop path relaunches a GUI binary; on Linux that binary
@@ -422,6 +441,7 @@ impl InstallKind {
         manifest: &Manifest,
         data_dir: &Path,
     ) -> anyhow::Result<PathBuf> {
+        require_update_delivery()?;
         match self {
             Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
             Self::Managed { app_root } if self.supports_desktop_update() => {
@@ -440,6 +460,7 @@ impl InstallKind {
     /// effect at the next launch ("install on quit"). Either way the caller
     /// must quit after this succeeds.
     pub fn apply_desktop(&self, staged: &Path, relaunch: bool) -> anyhow::Result<()> {
+        require_update_delivery()?;
         match self {
             Self::MacApp { bundle } => {
                 apply_mac_app(staged, bundle)?;
@@ -743,6 +764,7 @@ pub async fn stage_headless(
 /// Atomically repoint `app_root/current` at `app_root/<ver>` (symlink to a temp
 /// name, then rename over — never a window with no `current`).
 pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
+    require_update_delivery()?;
     #[cfg(unix)]
     {
         let target = app_root.join(version);
@@ -991,6 +1013,9 @@ fn auto_update_enabled() -> bool {
 /// `ZERON_AUTO_UPDATE=0|false|no` — the desktop app then only reports: no
 /// background download and no install on quit. Unset means on.
 pub fn desktop_auto_update_enabled() -> bool {
+    if !AUTOMATIC_UPDATES_SUPPORTED {
+        return false;
+    }
     std::env::var("ZERON_AUTO_UPDATE")
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
         .unwrap_or(true)
@@ -1064,6 +1089,12 @@ impl Updater {
             shutdown_tx: Arc::new(shutdown_tx),
             check_task: Arc::new(std::sync::Mutex::new(None)),
         };
+        if !AUTOMATIC_UPDATES_SUPPORTED {
+            updater.status_tx.send_modify(|status| {
+                status.error = Some(MANUAL_UPDATE_MESSAGE.into());
+            });
+            return updater;
+        }
         // Subscribe before spawning so an immediate `check_now` cannot land
         // before the background task first polls and be lost behind the
         // initial delay.
@@ -1285,6 +1316,7 @@ impl Updater {
     /// after all network and staging I/O and directly before the destructive
     /// swap/restart boundary; `None` tells the caller to wait and try again.
     async fn apply_inner(&self, require_quiescent: bool) -> anyhow::Result<Option<String>> {
+        require_update_delivery()?;
         let InstallKind::Managed { app_root } = detect_install() else {
             bail!(
                 "this install is not update-managed — the desktop app updates from its UI; \
@@ -1413,6 +1445,26 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn manual_canary_never_fetches_or_applies_a_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("app");
+        assert!(!AUTOMATIC_UPDATES_SUPPORTED);
+        assert!(!desktop_auto_update_enabled());
+        assert!(fetch_latest("https://zeron.sh").await.unwrap_err().to_string().contains("private/manual"));
+        let manifest = Manifest { version: "999.0.0".into(), ..Manifest::default() };
+        assert!(stage_headless("https://zeron.sh", &manifest, &root).await.is_err());
+        assert!(!root.exists());
+        assert!(apply_headless(&root, &manifest.version).is_err());
+        let install = InstallKind::MacApp { bundle: root.clone() };
+        assert!(!install.supports_desktop_update());
+        assert!(install.apply_desktop(temp.path(), false).is_err());
+        let updater = Updater::spawn_desktop("https://zeron.sh".into());
+        assert!(updater.check_task.lock().is_ok_and(|task| task.is_none()));
+        assert_eq!(updater.watch().borrow().error.as_deref(), Some(MANUAL_UPDATE_MESSAGE));
+        updater.shutdown().await;
+    }
 
     #[tokio::test]
     async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {
@@ -1658,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_names_match_packaging() {
+    fn retained_upstream_artifact_names_are_not_canary_delivery() {
         let (os, arch) = platform_key();
         assert!(headless_artifact("0.2.0").starts_with("zeron-0.2.0-"));
         assert_eq!(
@@ -1713,7 +1765,7 @@ mod tests {
             apply_headless(&app_root, &manifest.version)
                 .unwrap_err()
                 .to_string()
-                .contains("not supported on windows")
+                .contains("private/manual")
         );
         assert!(
             apply_mac_app(&data_dir.join("Zeron.app"), &data_dir.join("Installed.app"))
@@ -1748,23 +1800,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn headless_symlink_swap() {
+    fn manual_canary_preserves_existing_install_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("app");
         for ver in ["0.1.0", "0.1.1"] {
             std::fs::create_dir_all(app_root.join(ver)).unwrap();
             std::fs::write(app_root.join(ver).join("zeron"), ver).unwrap();
         }
-        apply_headless(&app_root, "0.1.0").unwrap();
+        std::os::unix::fs::symlink(app_root.join("0.1.0"), app_root.join("current")).unwrap();
+        assert!(apply_headless(&app_root, "0.1.1").is_err());
         assert_eq!(
             std::fs::read_link(app_root.join("current")).unwrap(),
             app_root.join("0.1.0")
-        );
-        // Swap over an existing symlink.
-        apply_headless(&app_root, "0.1.1").unwrap();
-        assert_eq!(
-            std::fs::read_link(app_root.join("current")).unwrap(),
-            app_root.join("0.1.1")
         );
         // Unstaged version refuses.
         assert!(apply_headless(&app_root, "0.2.0").is_err());
@@ -1862,7 +1909,7 @@ mod tests {
             app_root: app_root.clone(),
         };
         assert_eq!(installed_version(&managed), None, "no current link yet");
-        apply_headless(&app_root, "0.4.0").unwrap();
+        std::os::unix::fs::symlink(app_root.join("0.4.0"), app_root.join("current")).unwrap();
         assert_eq!(installed_version(&managed).as_deref(), Some("0.4.0"));
 
         let bundle = tmp.path().join("Zeron.app");
@@ -1917,107 +1964,29 @@ mod tests {
         assert!(!dir_writable(&tmp.path().join("missing")));
     }
 
-    /// Serves `body` for every request until aborted.
-    async fn serve_forever(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn desktop_checker_never_contacts_a_channel_on_demand() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let body = body.clone();
-                tokio::spawn(async move {
-                    let mut request = [0; 4096];
-                    let _ = socket.read(&mut request).await;
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.write_all(&body).await;
-                });
-            }
-        });
-        (base, server)
-    }
-
-    #[tokio::test]
-    async fn desktop_checker_reports_a_newer_release_on_demand() {
-        let (base, server) = serve_forever(br#"{"version":"999.0.0","files":{}}"#.to_vec()).await;
-        let updater = Updater::spawn_desktop(base);
-        let status = updater.check().await.unwrap();
-        assert!(status.update_available);
-        assert_eq!(status.latest_version.as_deref(), Some("999.0.0"));
-        assert_eq!(status.current_version, current_version());
-        assert!(status.checked_at.is_some());
-        assert_eq!(*updater.watch().borrow(), status);
+        let updater = Updater::spawn_desktop(format!("http://{}", listener.local_addr().unwrap()));
+        assert!(updater.check().await.unwrap_err().to_string().contains("private/manual"));
+        assert!(!updater.watch().borrow().update_available);
+        assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err());
         updater.shutdown().await;
-        server.abort();
     }
 
-    /// A headless tarball whose `zeron` reports `reported` from `--version`.
-    #[cfg(unix)]
-    fn fake_headless_tarball(dir: &Path, reported: &str) -> Vec<u8> {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = dir.join("zeron-pkg");
-        std::fs::create_dir_all(&root).unwrap();
-        let binary = root.join("zeron");
-        std::fs::write(&binary, format!("#!/bin/sh\necho \"zeron {reported}\"\n")).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tarball = dir.join("pkg.tar.gz");
-        run(
-            "tar",
-            &[
-                "-czf",
-                &tarball.to_string_lossy(),
-                "-C",
-                &dir.to_string_lossy(),
-                "zeron-pkg",
-            ],
-        )
-        .unwrap();
-        std::fs::read(tarball).unwrap()
-    }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn headless_staging_rejects_a_binary_that_is_not_the_promised_release() {
+    async fn staged_binary_verification_rejects_the_wrong_release() {
+        use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
-        let app_root = tmp.path().join("app");
-        std::fs::create_dir_all(&app_root).unwrap();
-        let manifest = |bytes: &[u8]| Manifest {
-            version: "9.9.9".into(),
-            files: [(
-                headless_artifact("9.9.9"),
-                FileMeta {
-                    sha256: Some(format!("{:x}", Sha256::digest(bytes))),
-                },
-            )]
-            .into(),
-        };
-
-        let wrong = fake_headless_tarball(&tmp.path().join("wrong"), "1.0.0");
-        let (base, server) = serve_forever(wrong.clone()).await;
-        let error = stage_headless(&base, &manifest(&wrong), &app_root)
-            .await
-            .unwrap_err();
-        server.abort();
-        assert!(
-            format!("{error:#}").contains("expected \"zeron 9.9.9\""),
-            "unexpected error: {error:#}"
-        );
-        assert!(!app_root.join("9.9.9").exists());
-        assert_eq!(std::fs::read_dir(&app_root).unwrap().count(), 0);
-
-        let right = fake_headless_tarball(&tmp.path().join("right"), "9.9.9");
-        let (base, server) = serve_forever(right.clone()).await;
-        let staged = stage_headless(&base, &manifest(&right), &app_root)
-            .await
-            .unwrap();
-        server.abort();
-        assert_eq!(staged, app_root.join("9.9.9"));
-        assert!(staged.join("zeron").is_file());
+        let binary = tmp.path().join("zeron");
+        for version in ["1.0.0", "9.9.9"] {
+            std::fs::write(&binary, format!("#!/bin/sh\necho 'zeron {version}'\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = verify_staged_binary(&binary, "9.9.9").await;
+            assert_eq!(result.is_ok(), version == "9.9.9");
+        }
     }
 }

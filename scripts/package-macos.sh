@@ -1,32 +1,37 @@
 #!/usr/bin/env bash
-# macOS packaging: build the release binary for the host arch and produce
-#   target/package/zeron-<version>-macos-<arch>.dmg          (user download)
-#   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
-# containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set).
+# macOS packaging: build Crew Canary from the upstream zeron Cargo target.
+# Outputs under target/package: Crew Canary.app and
+# crew-upstream-canary-<version>-macos-<arch>{.dmg,-app.tar.gz}.
+# Delivery is manual; these artifacts are never a shared updater feed.
 #
 # Usage: scripts/package-macos.sh
 # Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
+#        CREW_PACKAGE_PROFILE=dev — build only the app from a local debug binary.
 #        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store Connect
 #        API key (.p8) for notarization; all three set → notarize + staple the
 #        app and the dmg, which removes the Gatekeeper warning entirely.
 
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 ARCH="$(uname -m)" # arm64 on Apple silicon runners
 OUT_DIR="$ROOT/target/package"
-APP="$OUT_DIR/Zeron.app"
-DMG="$OUT_DIR/zeron-$VERSION-macos-$ARCH.dmg"
-APP_TARBALL="$OUT_DIR/zeron-$VERSION-macos-$ARCH-app.tar.gz"
+APP="$OUT_DIR/Crew Canary.app"
+DMG="$OUT_DIR/crew-upstream-canary-$VERSION-macos-$ARCH.dmg"
+APP_TARBALL="$OUT_DIR/crew-upstream-canary-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
-cargo build --release -p zeron
+PROFILE="${CREW_PACKAGE_PROFILE:-release}"
+case "$PROFILE" in release) BUILD_DIR=release ;; dev) BUILD_DIR=debug ;; *) echo "Unsupported package profile: $PROFILE" >&2; exit 1 ;; esac
+cargo build --locked --profile "$PROFILE" -p zeron
+TARGET_DIR="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/zeron"
+install -m 755 "$TARGET_DIR/$BUILD_DIR/zeron" "$APP/Contents/MacOS/comet"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
@@ -58,6 +63,11 @@ else
   codesign --deep --force --entitlements "$ROOT/dist/macos/Zeron.entitlements" --sign - "$APP"
 fi
 
+if [[ "$PROFILE" == "dev" ]]; then
+  echo "packaged: $APP"
+  exit 0
+fi
+
 # notarize <path>: submit to Apple and wait for the verdict. A rejection may
 # still exit 0 depending on the notarytool version — the `stapler staple` that
 # follows each call has no ticket to attach then, and fails the build for us.
@@ -70,18 +80,17 @@ NOTARIZE=false
 [[ -n "${NOTARY_KEY_PATH:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] && NOTARIZE=true
 
 if $NOTARIZE; then
-  # Staple the bundle BEFORE tarring it: the auto-updater swaps the .app with
-  # no dmg involved, so the tarball copy must carry its own ticket to pass
-  # Gatekeeper offline.
-  ZIP="$OUT_DIR/zeron-notarize.zip"
+  # Staple the bundle before archiving so manual offline delivery carries
+  # the same Gatekeeper ticket as the dmg.
+  ZIP="$OUT_DIR/crew-upstream-canary-notarize.zip"
   ditto -c -k --keepParent "$APP" "$ZIP"
   notarize "$ZIP"
   rm -f "$ZIP"
   xcrun stapler staple "$APP"
 fi
 
-# The auto-updater artifact.
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" Zeron.app
+# Private/manual delivery artifact, not an auto-update channel.
+tar -czf "$APP_TARBALL" -C "$OUT_DIR" "Crew Canary.app"
 echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the
@@ -105,7 +114,7 @@ import dmgbuild
 app = os.environ["APP"]
 dmgbuild.build_dmg(
     filename=os.environ["DMG"],
-    volume_name="Zeron",
+    volume_name="Crew Canary",
     settings={
         "format": "UDZO",
         "files": [app],
@@ -122,7 +131,7 @@ dmgbuild.build_dmg(
         "window_rect": ((200, 120), (660, 400)),
         "icon_size": 104,
         "text_size": 12,
-        "icon_locations": {"Zeron.app": (165, 195), "Applications": (495, 195)},
+        "icon_locations": {"Crew Canary.app": (165, 195), "Applications": (495, 195)},
     },
 )
 PY

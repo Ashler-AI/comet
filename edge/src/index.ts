@@ -1,24 +1,15 @@
 /**
- * Zeron-native edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
- * edge, then forwarding into per-session, per-workspace, and per-device
- * Durable Objects. Also serves content-addressed R2 attachments (§1.2) and
- * the absorbed WorkOS auth routes (formerly apps/server).
+ * Crew upstream canary: Scaffold-verified personal registry, opaque chat2
+ * transport and capability-scoped DeviceRoom relay. No legacy workspace writes.
  *
- * Routes:
+ * Identity routes (all resource-bound to the configured Scaffold origin):
  *   GET  /health
- *   POST /auth/exchange               — WorkOS code → tokens
- *   POST /auth/refresh                — WorkOS refresh → fresh tokens
- *   GET  /auth/orgs                   — caller's active org memberships
- *   POST /auth/orgs                   — create org + admin membership
- *   GET  /auth/cli/callback           — headless sign-in paste-code page
- *   GET  /session/:chatId/ws          — loro-protocol room (wss upgrade)
- *   GET  /tail/:chatId                — L2 instant-open tail JSON (§5)
- *   GET  /diff/:chatId                — latest working-tree diff (§6.1)
- *   POST /diff/:chatId                — host publishes the diff sidecar
- *   GET  /snapshot/:chatId            — repair: read current doc snapshot
- *   POST /append/:chatId              — repair: merge-import a Loro update
- *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss; legacy clients)
- *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
+ *   GET  /auth/session
+ *   POST|DELETE /auth/device-grants
+ *   POST /auth/device-grants/exchange — one-time grant, public bearer exchange
+ *   POST /auth/device-token/refresh   — rotates an unexpired device credential
+ *   GET|HEAD /releases/*             — authenticated isolated R2 release artifacts
+ * Sync routes:
  *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
  *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
  *   GET  /registry/:orgId/rows        — registry full-table repair read
@@ -36,9 +27,10 @@
  *   GET  /chat2/:chatId/stats
  *   POST /chat2/:chatId/reset
  */
-import { authenticate } from "./auth";
+import { authenticateResult } from "./auth";
+import { authorizeRoute, trustedRequest } from "./authority";
 import { chatRoute } from "./chat-route";
-import { handleAuthRoute } from "./auth-routes";
+import { AuthGrant, handlePublicAuthRoute, handleAuthenticatedAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { previewRoute } from "./preview-route";
@@ -46,9 +38,9 @@ import { PreviewRoom } from "./preview-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
 import { ChatRoom } from "./chat-room";
-import installSh from "./install.sh";
+import { peerRoute } from "./peer-route";
 
-export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom };
+export { AuthGrant, SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -68,7 +60,7 @@ const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" }
+    headers: { "content-type": "application/json", "cache-control": "no-store" }
   });
 
 /** Forward into a DO with the verified user stamped on the request. */
@@ -78,22 +70,17 @@ const forward = (
   request: Request,
   userId: string,
   path: string,
-  search?: string,
-  roomKind?: "workspace"
+  search?: string
 ): Promise<Response> => {
   const stub = ns.get(ns.idFromName(name));
   const url = new URL(request.url);
   url.pathname = path;
   if (search !== undefined) url.search = search;
+  url.searchParams.delete("token");
   const headers = new Headers(request.headers);
-  // room-kind is a Worker-controlled signal (the DO relaxes owner gating for
-  // workspace rooms): clear any inbound value so only the explicit set below —
-  // reached solely on workspace forwards, after the org-membership check —
-  // can assert it. Do not drop this line; passthrough would let a caller
-  // choose their own room kind.
+  // Never forward caller-selected room authority.
   headers.delete(ROOM_KIND_HEADER);
   headers.set(AUTH_USER_HEADER, userId);
-  if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
 };
 
@@ -117,26 +104,65 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
 
     if (url.pathname === "/health") {
-      return json({ ok: true, auth: env.AUTH_MODE === "dev" ? "dev" : "workos" });
+      return json({ ok: true, auth: env.AUTH_MODE, environment: env.ENVIRONMENT });
     }
 
-    // ── public install surface (also routed from zeron.sh): the
-    //    `curl | sh` installer and the release artifacts it downloads ───────
-    if (url.pathname === "/install.sh" && (request.method === "GET" || request.method === "HEAD")) {
-      return new Response(request.method === "HEAD" ? null : installSh, {
-        headers: {
-          "content-type": "application/x-sh",
-          "cache-control": "public, max-age=0, must-revalidate"
-        }
-      });
+    // This isolated generation has no public upstream installer or release feed.
+    if (url.pathname === "/install.sh") return json({ error: "not_found" }, 404);
+    try {
+      const publicAuth = await handlePublicAuthRoute(request, env, url);
+      if (publicAuth) return publicAuth;
+    } catch {
+      return json({ error: "authority_unavailable" }, 503);
+    }
+    const result = await authenticateResult(env, request);
+    if (result.status !== "authenticated") {
+      return json({ error: result.status === "invalid" ? "unauthenticated" : "authority_unavailable" },
+        result.status === "invalid" ? 401 : 503);
+    }
+    const auth = result.identity;
+    if (url.pathname === "/auth/session" && request.method === "GET") return json(auth);
+    try {
+      const authRoute = await handleAuthenticatedAuthRoute(request, env, url, auth);
+      if (authRoute) return authRoute;
+    } catch {
+      return json({ error: "authority_unavailable" }, 503);
+    }
+    const peer = await peerRoute(request, env, auth);
+    if (peer) return peer;
+    if (!authorizeRoute(request, auth)) return json({ error: "forbidden" }, 403);
+    request = trustedRequest(request, auth);
+    // Compatibility is ownership-only: never revive the legacy session sync lane.
+    if (parts[0] === "session" && parts[2] === "directory-authority" && parts.length === 3) {
+      if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parts[1])) {
+        return json({ error: "invalid_session" }, 400);
+      }
+      if (!auth.capabilities.includes("session.control") ||
+          !auth.deploymentId || url.searchParams.get("deploymentId") !== auth.deploymentId) {
+        return json({ error: "forbidden" }, 403);
+      }
+      try {
+        const response = await forward(env.CHAT_ROOMS, `chat2/${parts[1]}`, request, auth.userId, "/directory-authority", "");
+        if (!response.ok) return json({ error: "directory_authority_unavailable" }, 503);
+        const result = await response.json() as { ownsSession?: unknown };
+        if (typeof result.ownsSession !== "boolean") return json({ error: "directory_authority_unavailable" }, 503);
+        return json({ ownsSession: result.ownsSession, projectId: auth.projectScope, actorId: auth.email, subject: auth.userId });
+      } catch {
+        return json({ error: "directory_authority_unavailable" }, 503);
+      }
+    }
+    // Legacy document lanes cannot share this generation's ownership or grants.
+    if (["session", "tail", "stats", "diff", "snapshot", "append", "workspace"].includes(parts[0])) {
+      return json({ error: "use_registry_chat2" }, 410);
     }
     if (
-      parts[0] === "releases" &&
-      parts.length >= 2 &&
+      ((parts[0] === "releases" && parts.length >= 2) ||
+        (parts[0] === "api" && parts[1] === "releases" && parts.length === 3)) &&
       (request.method === "GET" || request.method === "HEAD")
     ) {
-      const key = decodeURIComponent(url.pathname.slice("/releases/".length));
-      if (key.length === 0 || key.includes("..")) return json({ error: "bad request" }, 400);
+      const key = safeDecode(parts[0] === "api" ? parts[2] : url.pathname.slice("/releases/".length));
+      if (!key || key.includes("..")) return json({ error: "bad request" }, 400);
       const object = await env.RELEASES.get(key);
       if (!object) return json({ error: "not_found" }, 404);
       // latest.txt / manifest.json flip on release; artifacts are immutable by name.
@@ -148,57 +174,15 @@ export default {
             ? "application/json"
             : "application/octet-stream",
         "content-length": String(object.size),
-        "cache-control": mutable ? "public, max-age=60" : "public, max-age=86400, immutable",
+        "cache-control": mutable ? "private, max-age=60" : "private, max-age=86400, immutable",
         etag: object.httpEtag
       });
       return new Response(request.method === "HEAD" ? null : object.body, { headers });
     }
 
-    // ── WorkOS auth routes (pre-bearer: exchange/refresh/callback have no
-    //    access token yet; the org routes verify the bearer themselves) ─────
-    const authRouted = await handleAuthRoute(request, env, url);
-    if (authRouted) return authRouted;
-
-    const auth = await authenticate(env, request);
-    if (!auth) return json({ error: "unauthenticated" }, 401);
 
     const preview = previewRoute(request, env, auth);
     if (preview) return preview;
-
-    // ── session rooms ───────────────────────────────────────────────────────
-    if (parts[0] === "session" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "ws") {
-      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-        return json({ error: "expected websocket" }, 426);
-      }
-      // `s2/` = the WorkOS staging→production identity break: rooms are
-      // claim-on-first-join per user id, and prod issued a fresh id for
-      // everyone — a new namespace lets prod identities claim fresh rooms
-      // while hosts re-upload doc state from their local snapshots (same
-      // playbook as `ws3` below). Frame-level room ids stay the bare chatId.
-      return forward(
-        env.SESSION_ROOMS,
-        `s2/${parts[1]}`,
-        request,
-        auth.userId,
-        "/ws",
-        `?chatId=${parts[1]}${deviceParam(url)}`
-      );
-    }
-    if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/tail", "");
-    }
-    if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/stats", "");
-    }
-    if (parts[0] === "diff" && parts[1] && ID_RE.test(parts[1])) {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/diff", "");
-    }
-    if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/snapshot", "");
-    }
-    if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
-    }
 
     // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
     //    Claim-on-first-join ownership enforced in the DO (chat ids are
@@ -208,67 +192,6 @@ export default {
     const chatResponse = chatRoute(request, env, auth.userId);
     if (chatResponse) return chatResponse;
 
-    // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;
-    //    the caller's WorkOS org claim (`org_id`) must equal the URL's orgId,
-    //    and the room itself is derived from the caller's OWN user id — the
-    //    workspace doc (spaces, chats index, devices) is per-user; teammates
-    //    in the same org can never address each other's rooms. ──────────────
-    if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
-      const orgId = parts[1];
-      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      // `ws4` = the 2026-08-04 incident break: the ws3 instance's storage was
-      // left with causally-broken update rows by the abort-thrash loop (acks
-      // outran the debounced flush) and could not be trusted again even after
-      // /reset-log; a name bump allocates a virgin DO. (`ws3` was the per-user
-      // privacy break, `ws2` the spaces overhaul.) Legacy rooms are orphaned
-      // (hibernated, ~zero cost). URL path stays `/workspace/:orgId/*`; the
-      // name is worker-internal — clients echo their own roomId strings.
-      const room = `ws4/${orgId}/${auth.userId}`;
-      if (parts[2] === "ws") {
-        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-          return json({ error: "expected websocket" }, 426);
-        }
-        return forward(
-          env.SESSION_ROOMS,
-          room,
-          request,
-          auth.userId,
-          "/ws",
-          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
-          "workspace"
-        );
-      }
-      if (parts[2] === "tail" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/tail", "", "workspace");
-      }
-      // Observability: log/snapshot sizes for the per-user workspace room, so a
-      // human can see whether the compaction budget is holding (org-membership
-      // was already checked above; the DO bypasses the owner gate for
-      // workspace kind).
-      if (parts[2] === "stats" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
-      }
-      // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
-      // behind the shallow-locked rebuild converges by replacing its local
-      // workspace doc with this — see the incident repair recipe).
-      if (parts[2] === "snapshot" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/snapshot", "", "workspace");
-      }
-      // Operator wedge-break: clear a workspace room whose update log grew big
-      // enough to CPU-reset the DO on every cold start (org-membership already
-      // checked; state re-uploads from each device's local doc on rejoin).
-      if (parts[2] === "reset-log" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/reset-log", "", "workspace");
-      }
-      // Merge-safe repair write (the chat rooms' /append, for the workspace
-      // doc): lets an operator seed a reset room with ONE compact
-      // locally-exported history blob instead of waiting for every device to
-      // re-upload its whole doc — the N-way redundant re-seed is what kept
-      // ballooning the update log after the 2026-08-05 wedge breaks.
-      if (parts[2] === "append" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/append", "", "workspace");
-      }
-    }
 
     // ── registry rooms (docs/registry-sync.md): the row-table replacement for
     //    the Loro workspace doc. Same trust shape as /workspace: org claim
@@ -276,7 +199,7 @@ export default {
     //    trusts the stamped header. `reg1` = first registry generation. ─────
     if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
-      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      if ((auth.credential === "device" ? auth.projectScope : auth.orgId) !== orgId) return json({ error: "forbidden" }, 403);
       const room = `reg1/${orgId}/${auth.userId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {

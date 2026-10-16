@@ -582,26 +582,24 @@ mod tests {
     use chrono::Utc;
 
     fn chat(id: &str, archived: bool) -> Chat {
-        Chat {
-            id: id.into(),
-            device_id: "d".into(),
-            title: None,
-            archived,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            parent_chat_id: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: None,
-        }
+        Chat { crew: None, id: id.into(),
+        device_id: "d".into(),
+        title: None,
+        archived,
+        cwd: None,
+        branch: None,
+        checkout_id: None,
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at: None,
+        created_at: Utc::now(),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: None,
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     #[test]

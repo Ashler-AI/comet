@@ -237,15 +237,13 @@ mod pinned_session_tests {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: path.into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: path.into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         })
@@ -1115,15 +1113,13 @@ mod pinned_session_tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig {
-                        data_dir: dir.path().into(),
-                        ipc_port: 0,
-                        edge_url: "http://127.0.0.1:1".into(),
-                        edge_token: None,
-                        org_id: None,
-                        workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
-                    },
+                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock, },
                     cx,
                 );
                 shell.state.update(cx, |state, _| {
@@ -1235,15 +1231,13 @@ mod pinned_session_tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig {
-                        data_dir: dir.path().into(),
-                        ipc_port: 0,
-                        edge_url: "http://127.0.0.1:1".into(),
-                        edge_token: None,
-                        org_id: None,
-                        workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
-                    },
+                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock, },
                     cx,
                 );
                 shell.settings.sidebar_organization = SidebarOrganization::InOneList;
@@ -1769,15 +1763,13 @@ mod pinned_session_tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig {
-                        data_dir: dir.path().into(),
-                        ipc_port: 0,
-                        edge_url: "http://127.0.0.1:1".into(),
-                        edge_token: None,
-                        org_id: None,
-                        workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
-                    },
+                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock, },
                     cx,
                 );
                 shell.settings.sidebar_organization = SidebarOrganization::InOneList;
@@ -7657,26 +7649,24 @@ mod tests {
     }
 
     fn chat(id: &str) -> zeron_proto::Chat {
-        zeron_proto::Chat {
-            id: id.into(),
-            device_id: "device".into(),
-            title: None,
-            archived: false,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: Some(Utc.timestamp_opt(10, 0).unwrap()),
-            created_at: Utc.timestamp_opt(5, 0).unwrap(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            parent_chat_id: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: None,
-        }
+        zeron_proto::Chat { crew: None, id: id.into(),
+        device_id: "device".into(),
+        title: None,
+        archived: false,
+        cwd: None,
+        branch: None,
+        checkout_id: None,
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at: Some(Utc.timestamp_opt(10, 0).unwrap()),
+        created_at: Utc.timestamp_opt(5, 0).unwrap(),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: None,
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     #[test]
@@ -7832,15 +7822,13 @@ mod project_flow_tests {
             });
             Shell::new(
                 state,
-                EngineBootConfig {
-                    data_dir: data.path().into(),
-                    ipc_port: 0,
-                    edge_url: String::new(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
+                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: data.path().into(),
+                ipc_port: 0,
+                edge_url: String::new(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock, },
                 cx,
             )
         });

@@ -9,21 +9,20 @@
 # one-user-many-devices model; chat/device rooms are claim-on-first-join per user.
 #
 # Usage: scripts/e2e-smoke.sh
-# Env:   ZERON_E2E_EDGE_PORT (default 27640), ZERON_E2E_KEEP_LOGS=1 to keep logs.
+# Env: ZERON_E2E_EDGE_PORT (otherwise a free port), ZERON_E2E_KEEP_LOGS=1.
 
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
-EDGE_PORT="${ZERON_E2E_EDGE_PORT:-27640}"
-EDGE_URL="http://localhost:${EDGE_PORT}"
-TOKEN="alice@org1"
-ORG="org1"
-A_PORT=27801
-B_PORT=27802
-A_DIR=/tmp/e2e-a
-B_DIR=/tmp/e2e-b
-LOG_DIR="$(mktemp -d /tmp/zeron-e2e-logs.XXXXXX)"
+ORG="crew-e2e"
+TOKEN="alice@$ORG"
+LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/crew-e2e.XXXXXX")"
+A_DIR="$LOG_DIR/a"
+B_DIR="$LOG_DIR/b"
+A_PORT=""
+B_PORT=""
 
 EDGE_PID=""
 A_PID=""
@@ -71,20 +70,34 @@ wait_for() { # wait_for <description> <timeout_s> <command...>
   done
 }
 
-# ── 1. Edge worker (wrangler dev, dev auth: bearer == user@org) ────────────────
-if curl -sf -m 3 "$EDGE_URL/health" | grep -q '"auth":"dev"'; then
-  echo "edge: reusing healthy dev-mode worker on :$EDGE_PORT"
-else
-  echo "edge: starting wrangler dev on :$EDGE_PORT"
-  # Monitor mode gives the background job its own process group on both macOS
-  # and Linux, without depending on the Linux-only `setsid` utility.
-  set -m
-  bash -c "cd '$ROOT/edge' && exec npx wrangler dev --port '$EDGE_PORT' --var AUTH_MODE:dev" \
-    >"$LOG_DIR/edge.log" 2>&1 &
-  EDGE_PID=$!
-  set +m
-  wait_for "edge /health" 90 curl -sf -m 3 "$EDGE_URL/health"
-fi
+# Bind all three ports together before choosing them; an explicit occupied Edge
+# port fails instead of reusing another session's worker or persisted rooms.
+read -r EDGE_PORT A_PORT B_PORT < <(node --input-type=module -e '
+  import { createServer } from "node:net";
+  const servers = await Promise.all([process.env.ZERON_E2E_EDGE_PORT || 0, 0, 0].map(port =>
+    new Promise((resolve, reject) => {
+      const server = createServer().once("error", reject);
+      server.listen(Number(port), "127.0.0.1", () => resolve(server));
+    })));
+  console.log(servers.map(server => server.address().port).join(" "));
+  servers.forEach(server => server.close());
+')
+EDGE_URL="http://127.0.0.1:$EDGE_PORT"
+
+# ── 1. Fresh local-only Edge, with explicit development authority ─────────────
+echo "edge: starting isolated local worker on :$EDGE_PORT"
+set -m
+(
+  cd "$ROOT/edge"
+  exec node_modules/.bin/wrangler dev --env canary --local --ip 127.0.0.1 \
+    --port "$EDGE_PORT" --persist-to "$LOG_DIR/edge" \
+    --var AUTH_MODE:dev --var ENVIRONMENT:local \
+    --var "SCAFFOLD_PROJECT_SCOPE:$ORG" --var "SCAFFOLD_DEPLOYMENT_ID:$ORG" \
+    --var "SCAFFOLD_CONTROL_PLANE_URL:$EDGE_URL"
+) >"$LOG_DIR/edge.log" 2>&1 &
+EDGE_PID=$!
+set +m
+wait_for "edge /health" 90 curl -sf -m 3 "$EDGE_URL/health"
 
 # ── 2. Build the binaries (workspace target is warm in CI/dev) ─────────────────
 echo "build: zeron + e2e_driver"
@@ -97,14 +110,14 @@ ZERON="$ROOT/target/debug/zeron"
 DRIVER="$ROOT/target/debug/examples/e2e_driver"
 
 # ── 3. Two headless engines, one user, two devices ─────────────────────────────
-rm -rf "$A_DIR" "$B_DIR"
-mkdir -p "$A_DIR" "$B_DIR"
+mkdir -p "$A_DIR" "$B_DIR" "$LOG_DIR/home"
 
 start_engine() { # start_engine <data_dir> <ipc_port> <name> <log>
-  ZERON_DATA_DIR="$1" ZERON_IPC_PORT="$2" ZERON_DEVICE_NAME="$3" \
+  env -i HOME="$LOG_DIR/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+    ASHLER_INCREMENTAL_TSC_CHECKS=false ZERON_NO_LOGIN_SHELL=1 \
+    ZERON_DATA_DIR="$1" ZERON_IPC_PORT="$2" ZERON_DEVICE_NAME="$3" \
     ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$TOKEN" ZERON_ORG_ID="$ORG" \
-    ZERON_HARNESS=mock RUST_LOG=info \
-    "$ZERON" headless >"$4" 2>&1 &
+    ZERON_HARNESS=mock RUST_LOG=info "$ZERON" headless >"$4" 2>&1 &
 }
 
 start_engine "$A_DIR" "$A_PORT" "e2e-device-a" "$LOG_DIR/engine-a.log"; A_PID=$!

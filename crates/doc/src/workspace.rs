@@ -266,6 +266,10 @@ impl WorkspaceDoc {
             )?,
             None => row.delete("sourceContext")?,
         }
+        match &chat.crew {
+            Some(crew) => row.insert("crew", LoroValue::from(serde_json::to_value(crew)?))?,
+            None => row.delete("crew")?,
+        }
         match &chat.config {
             Some(config) => row.insert("config", LoroValue::from(serde_json::to_value(config)?))?,
             None => row.delete("config")?,
@@ -723,6 +727,8 @@ pub(crate) struct RawChat {
     room_gen: Option<u32>,
     #[serde(default)]
     parent_chat_id: Option<String>,
+    #[serde(default)]
+    crew: Option<zeron_proto::CrewChatMetadata>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -764,6 +770,7 @@ impl From<RawChat> for Chat {
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
+            crew: raw.crew,
         }
     }
 }
@@ -853,6 +860,7 @@ mod tests {
     fn chat(id: &str, device_id: &str) -> Chat {
         Chat {
             id: id.into(),
+            crew: None,
             device_id: device_id.into(),
             title: Some("First chat".into()),
             archived: false,

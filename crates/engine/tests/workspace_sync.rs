@@ -701,26 +701,23 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
             })
             .unwrap();
         legacy
-            .upsert_chat(&Chat {
-                id: "chat-legacy".into(),
-                device_id: "dev-a".into(),
-                title: Some("Migrated chat".into()),
-                archived: false,
-                cwd: Some("/tmp/legacy".into()),
-                branch: Some("main".into()),
-                checkout_id: None,
-                source_context: None,
-                config: None,
-                last_message_preview: Some("old preview".into()),
-                last_message_at: Some(now),
-                created_at: now,
-                harness_session_id: Some("hs-9".into()),
-                room_gen: None,
-                parent_chat_id: None,
-                harness_session_cwd: Some("/tmp/legacy".into()),
-                space_id: Some("space-legacy".into()),
-                last_seen_at: Some(now),
-            })
+            .upsert_chat(&Chat { id: "chat-legacy".into(), crew: None, device_id: "dev-a".into(),
+            title: Some("Migrated chat".into()),
+            archived: false,
+            cwd: Some("/tmp/legacy".into()),
+            branch: Some("main".into()),
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: Some("old preview".into()),
+            last_message_at: Some(now),
+            created_at: now,
+            harness_session_id: Some("hs-9".into()),
+            room_gen: None,
+            parent_chat_id: None,
+            harness_session_cwd: Some("/tmp/legacy".into()),
+            space_id: Some("space-legacy".into()),
+            last_seen_at: Some(now), })
             .unwrap();
         legacy
             .upsert_session(&Session {

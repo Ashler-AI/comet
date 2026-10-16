@@ -57,6 +57,7 @@ pub async fn stage(
     manifest: &super::Manifest,
     directory: &Path,
 ) -> anyhow::Result<PathBuf> {
+    super::require_update_delivery()?;
     ensure!(
         manifest
             .version
@@ -136,6 +137,7 @@ fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
 /// and [`Self::recover_from_backup`] cover the leftovers of a hard crash
 /// between the two renames.
 pub fn apply(staged: &Path, directory: &Path, relaunch: bool) -> anyhow::Result<()> {
+    super::require_update_delivery()?;
     let installed = directory.join("zeron.exe");
     ensure!(
         std::env::current_exe()?.canonicalize()? == installed.canonicalize()?,
@@ -226,6 +228,7 @@ fn swap_into_place(staged: &Path, installed: &Path) -> anyhow::Result<()> {
 /// The old image, renamed aside by the update, can only be deleted after its
 /// process exits — this is that moment.
 pub fn wait_for_exit(pid: u32) -> anyhow::Result<()> {
+    super::require_update_delivery()?;
     ensure!(pid != std::process::id(), "cannot wait for own process");
     let result = wait_for_exit_impl(pid);
     let _ = remove_own_backup();
@@ -252,6 +255,9 @@ fn wait_for_exit_impl(pid: u32) -> anyhow::Result<()> {
 /// aside can be deleted once no process runs it. Best-effort — a previous
 /// instance still exiting keeps it until the next launch.
 pub fn cleanup_previous_image() {
+    if !super::AUTOMATIC_UPDATES_SUPPORTED {
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -454,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_checksum_is_rejected_before_download() {
+    async fn manual_canary_rejects_download_before_staging() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = super::super::Manifest {
             version: "1.2.3".into(),
@@ -465,29 +471,15 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("checksum")
+                .contains("private/manual")
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
-    async fn corrupt_download_preserves_install_and_removes_staging() {
-        use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    async fn manual_canary_preserves_install_without_contacting_feed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut request = [0u8; 4096];
-            let _ = socket.read(&mut request).unwrap();
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt",
-                )
-                .unwrap();
-        });
         let dir = tempfile::tempdir().unwrap();
         let installed = dir.path().join("zeron.exe");
         std::fs::write(&installed, b"existing installation").unwrap();
@@ -502,8 +494,9 @@ mod tests {
             .into(),
         };
         let error = stage(&base, &manifest, dir.path()).await.unwrap_err();
-        server.join().unwrap();
-        assert!(error.to_string().contains("checksum mismatch"));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept()).await.is_err());
+        assert!(error.to_string().contains("private/manual"));
+        assert!(apply(&installed, dir.path(), false).is_err());
         assert_eq!(std::fs::read(&installed).unwrap(), b"existing installation");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }

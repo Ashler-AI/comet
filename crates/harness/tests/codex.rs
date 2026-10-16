@@ -114,25 +114,22 @@ fn controls(
 ) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(move |questions| {
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec![answer_label.into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: token.clone(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(move |questions| {
+        let (tx, rx) = oneshot::channel();
+        let answers: Vec<UserInputAnswer> = questions
+            .iter()
+            .map(|q| UserInputAnswer {
+                question_id: q.id.clone(),
+                labels: vec![answer_label.into()],
+            })
+            .collect();
+        let _ = tx.send(answers);
+        rx
+    }),
+    steering: steer_rx,
+    interrupt: token.clone(),
+    turn: Default::default(), };
     (controls, steer_tx, token)
 }
 
@@ -607,26 +604,23 @@ async fn approvals_round_trip_as_input_requests() {
     let _steer = steer_tx;
     let token = CancellationToken::new();
     let seen = asked.clone();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(move |questions| {
-            seen.lock().unwrap().extend(questions.iter().cloned());
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec!["Yes".into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: token.clone(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(move |questions| {
+        seen.lock().unwrap().extend(questions.iter().cloned());
+        let (tx, rx) = oneshot::channel();
+        let answers: Vec<UserInputAnswer> = questions
+            .iter()
+            .map(|q| UserInputAnswer {
+                question_id: q.id.clone(),
+                labels: vec!["Yes".into()],
+            })
+            .collect();
+        let _ = tx.send(answers);
+        rx
+    }),
+    steering: steer_rx,
+    interrupt: token.clone(),
+    turn: Default::default(), };
     let mut req = request("scenario:approve");
     req.auto_approve = false;
     let events = run_to_end(&harness(), req, controls).await;

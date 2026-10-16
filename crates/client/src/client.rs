@@ -519,7 +519,7 @@ impl ClientInner {
 /// One signed-in account (or Demo mode). Cheap to clone.
 #[derive(Clone)]
 pub struct Client {
-    inner: Arc<ClientInner>,
+    pub(crate) inner: Arc<ClientInner>,
 }
 
 impl std::fmt::Debug for Client {
@@ -537,6 +537,9 @@ impl Client {
         &self,
         device_id: &str,
     ) -> Result<Arc<zeron_voice_session::RpcTransport>> {
+        if matches!(&self.inner.credentials, Credentials::Scaffold { .. }) {
+            return Err(ClientError::Unsupported("Voice is unavailable in managed Crew until the host supports Agent Auth voice routing".into()));
+        }
         let live = self.inner.live().ok_or_else(|| {
             ClientError::Unsupported("remote voice requires a connected account".into())
         })?;
@@ -558,7 +561,7 @@ impl Client {
             return Err(ClientError::InvalidArgument("device_id is required".into()));
         }
         let events = EventPump::new(listener);
-        let tokens = TokenProvider::new(&credentials, config.edge_base(), events.clone());
+        let tokens = TokenProvider::new(&credentials, config.edge_base(), events.clone())?;
         // Live: restore the registry replica + open the docs store first, so
         // the very first snapshot renders the cached workspace (instant).
         let (registry, store) = if credentials.is_demo() {
@@ -749,6 +752,7 @@ impl Client {
             }
         };
         let chat = Chat {
+            crew: None,
             id,
             device_id,
             title: new.title.filter(|t| !t.trim().is_empty()),

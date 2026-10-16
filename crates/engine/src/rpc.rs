@@ -50,6 +50,8 @@
 //! handlers stay transport-agnostic. This includes the workspace file surface,
 //! whose checkout always lives on the routed target device.
 
+mod crew;
+mod native;
 mod voice_chat;
 mod voice_remote;
 use async_trait::async_trait;
@@ -696,6 +698,8 @@ pub struct EngineRpc {
     uploads: Uploads,
     agent_accounts: AgentAccounts,
     auth: Option<Auth>,
+    crew: Option<crate::crew::CrewServices>,
+    relay: bool,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     harness_updates: Option<crate::harness_updates::HarnessUpdateCoordinator>,
@@ -744,6 +748,8 @@ impl EngineRpc {
             uploads,
             agent_accounts,
             auth: None,
+            crew: None,
+            relay: false,
             links: None,
             updater: None,
             harness_updates: None,
@@ -760,6 +766,16 @@ impl EngineRpc {
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
     pub fn with_auth(mut self, auth: Auth) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    pub fn with_crew(mut self, crew: crate::crew::CrewServices) -> Self {
+        self.crew = Some(crew);
+        self
+    }
+
+    pub fn for_relay(mut self) -> Self {
+        self.relay = true;
         self
     }
 
@@ -1239,6 +1255,9 @@ impl EngineRpc {
                         .set_chat_branch(&chat_id, branch)
                         .map_err(failed)?;
                 }
+                if let Some(crew) = &self.crew {
+                    crew.adopt_chat(&self.workspace, &chat_id).map_err(failed)?;
+                }
                 Ok(())
             }
             MutateParams::CreateSpace {
@@ -1485,7 +1504,7 @@ const LOGIN_TUNNEL_TTL: Duration = Duration::from_secs(15 * 60);
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
 fn forwardable(method: &str) -> bool {
-    if voice_remote::handles(method) {
+    if voice_remote::handles(method) || crew::forwardable(method) || native::handles(method) {
         return true;
     }
     matches!(
@@ -1792,7 +1811,8 @@ impl RpcService for AuthRpc {
                 RpcReply::value(&serde_json::json!({ "url": url }))
             }
             methods::SIGN_IN_HEADLESS => {
-                let url = self.auth.start_headless_sign_in();
+                let url = self.auth.start_headless_sign_in().await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "url": url }))
             }
             methods::COMPLETE_SIGN_IN => {
@@ -1852,6 +1872,7 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        self.crew_guard(method, &params)?;
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if forwardable(method)
@@ -1887,6 +1908,12 @@ impl RpcService for EngineRpc {
             return AuthRpc::new(self.auth()?.clone())
                 .handle(method, params)
                 .await;
+        }
+        if crew::handles(method) {
+            return Box::pin(self.crew_rpc(method, params)).await;
+        }
+        if native::handles(method) {
+            return Box::pin(self.native_rpc(method, params)).await;
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
@@ -1926,6 +1953,11 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
+                if self.registry.managed_inference() {
+                    let models = zeron_harness::managed_models(p.harness)
+                        .ok_or_else(|| RpcError::Failed("This agent does not support Crew managed inference".into()))?;
+                    return RpcReply::value(&models);
+                }
                 let lease = std::sync::Arc::new(self.registry.execution_lease(p.harness).await);
                 let harness = self
                     .registry
@@ -3843,6 +3875,36 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_model_picker_works_without_native_harnesses_or_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        // An empty registry makes any accidental CLI discovery fail to resolve.
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(HarnessRegistry::new().with_execution_policy(true, false)),
+            HarnessId::Omp,
+            None,
+        ).unwrap();
+        let rpc = core.rpc_service();
+        for (harness, prefixes) in [
+            (HarnessId::Omp, &["openai-codex/", "anthropic/"][..]),
+            (HarnessId::ClaudeCode, &["claude-"][..]),
+            (HarnessId::Codex, &["gpt-"][..]),
+        ] {
+            let RpcReply::Value(value) = rpc.handle(methods::LIST_MODELS,
+                serde_json::json!({"harness": harness, "force": true})).await.unwrap()
+            else { panic!("expected offline model choices") };
+            let models: Vec<zeron_proto::Model> = serde_json::from_value(value).unwrap();
+            for prefix in prefixes {
+                assert!(models.iter().any(|model| model.id.starts_with(prefix)),
+                    "{harness:?} must offer a {prefix} model without provider discovery");
+            }
+        }
+        assert!(rpc.handle(methods::LIST_MODELS,
+            serde_json::json!({"harness": "cursor"})).await.is_err());
+        core.sessions.shutdown().await;
+    }
 
     #[tokio::test]
     async fn voice_owner_is_shared_across_services_and_shutdown_retires_it() {

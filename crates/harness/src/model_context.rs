@@ -103,6 +103,7 @@ pub(crate) fn context(
         HarnessId::Grok => &["GROK_", "XAI_"],
         HarnessId::Hermes => &["HERMES_", "OPENAI_", "ANTHROPIC_"],
         HarnessId::Pi => &["PI_", "OPENAI_", "ANTHROPIC_"],
+        HarnessId::Omp => &["OMP_", "PI_", "OPENAI_", "ANTHROPIC_"],
         HarnessId::Devin => &["DEVIN_"],
         HarnessId::Antigravity => &["GEMINI_", "GOOGLE_"],
         HarnessId::Cursor => &["CURSOR_"],

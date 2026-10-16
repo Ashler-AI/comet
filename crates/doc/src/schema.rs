@@ -359,6 +359,100 @@ impl SessionDoc {
         &self.doc
     }
 
+    /// Durable annotations are independent of transcript rendering and queue
+    /// messages. Restricted clients submit commands; they never write this map.
+    pub fn annotations(&self) -> Result<Vec<zeron_proto::SemanticAnnotation>, DocError> {
+        let value = self.doc.get_map("crewAnnotations").get_deep_value().to_json_value();
+        let rows: std::collections::BTreeMap<String, zeron_proto::SemanticAnnotation> =
+            serde_json::from_value(value)?;
+        Ok(rows.into_values().collect())
+    }
+
+    /// The annotation and its immutable command result share one Loro commit.
+    /// Callers serialize this with other transcript mutations and persist the
+    /// snapshot before acknowledging/finishing their external command claim.
+    pub fn apply_annotation_command(
+        &self,
+        command_id: &str,
+        command: &zeron_proto::AnnotationCommand,
+        principal: &zeron_proto::CollaborationPrincipal,
+        grant: Option<&zeron_proto::CapabilityGrant>,
+        metadata: &zeron_proto::CrewChatMetadata,
+        now: i64,
+    ) -> Result<zeron_proto::SemanticAnnotation, DocError> {
+        if command_id.is_empty() || command_id.len() > 256
+            || !metadata.permits(principal, grant, zeron_proto::CAPABILITY_SESSION_ANNOTATE, now) {
+            return Err(DocError::Schema("annotation command identity or access denied".into()));
+        }
+        let intent = serde_json::json!({
+            "principal":principal.subject, "scope":metadata.scope,
+            "sessionId":metadata.session_id, "chatId":self.chat_id(), "command":command,
+        });
+        let commands = self.doc.get_map("crewAnnotationCommands");
+        if let Some(existing) = commands.get(command_id) {
+            let existing = existing.get_deep_value().to_json_value();
+            if existing.get("intent") != Some(&intent) {
+                return Err(DocError::Schema("annotation command id was reused with different intent".into()));
+            }
+            return serde_json::from_value(existing.get("result").cloned()
+                .ok_or_else(|| DocError::Schema("annotation command result missing".into()))?).map_err(Into::into);
+        }
+        let annotation = self.prepare_annotation(command, principal, metadata, now)?;
+        let value = serde_json::to_value(&annotation)?;
+        let record = serde_json::json!({"intent":intent, "result":value});
+        self.doc.get_map("crewAnnotations").insert(&annotation.id, LoroValue::from(value))?;
+        commands.insert(command_id, LoroValue::from(record))?;
+        self.doc.commit();
+        Ok(annotation)
+    }
+
+    /// `None` is outcome-unknown, never permission to replay an external claim.
+    /// Authorization of this lookup is enforced by the host RPC boundary.
+    pub fn annotation_command_result(&self, command_id: &str) -> Result<Option<zeron_proto::SemanticAnnotation>, DocError> {
+        let Some(record) = self.doc.get_map("crewAnnotationCommands").get(command_id) else { return Ok(None); };
+        let value = record.get_deep_value().to_json_value();
+        Ok(Some(serde_json::from_value(value.get("result").cloned()
+            .ok_or_else(|| DocError::Schema("annotation command result missing".into()))?)?))
+    }
+
+    fn prepare_annotation(
+        &self,
+        command: &zeron_proto::AnnotationCommand,
+        principal: &zeron_proto::CollaborationPrincipal,
+        metadata: &zeron_proto::CrewChatMetadata,
+        now: i64,
+    ) -> Result<zeron_proto::SemanticAnnotation, DocError> {
+        use zeron_proto::{AnnotationCommand, AnnotationState, SemanticAnnotation};
+        let id = match command {
+            AnnotationCommand::Create { id, .. } | AnnotationCommand::Edit { id, .. }
+                | AnnotationCommand::Resolve { id, .. } => id,
+        };
+        let existing = self.annotations()?.into_iter().find(|value| &value.id == id);
+        let annotation = match (command, existing) {
+            (AnnotationCommand::Create { id, body, anchor }, None) => SemanticAnnotation {
+                id: id.clone(), author_subject: principal.subject.clone(), body: body.clone(),
+                anchor: anchor.clone(), state: AnnotationState::Anchored,
+                created_at: now, resolved_at: None, unknown: Default::default(),
+            },
+            (AnnotationCommand::Create { .. }, Some(_)) =>
+                return Err(DocError::Schema("annotation already exists".into())),
+            (_, None) => return Err(DocError::Schema("annotation not found".into())),
+            (command, Some(mut annotation)) => {
+                if annotation.author_subject != principal.subject && metadata.owner_subject != principal.subject {
+                    return Err(DocError::Schema("only the annotation author or session owner may edit it".into()));
+                }
+                match command {
+                    AnnotationCommand::Edit { body, .. } => annotation.body = body.clone(),
+                    AnnotationCommand::Resolve { resolved, .. } => annotation.resolved_at = resolved.then_some(now),
+                    AnnotationCommand::Create { .. } => unreachable!(),
+                }
+                annotation
+            }
+        };
+        crate::collaboration::validate_annotation(&annotation)?;
+        Ok(annotation)
+    }
+
     /// A single atomic value prevents tokens and capacity from tearing on sync.
     pub fn context_usage(&self) -> Option<zeron_proto::ContextUsage> {
         let loro::ValueOrContainer::Value(LoroValue::String(value)) =

@@ -1678,7 +1678,12 @@ impl Pickers {
                 pickers.catalog_rev += 1;
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                        Ok(list) => Loadable::Ready(list),
+                        Ok(mut list) => {
+                            if pickers.state.read(cx).managed_inference {
+                                list.retain(|descriptor| matches!(descriptor.id, HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex));
+                            }
+                            Loadable::Ready(list)
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -6036,6 +6041,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+        HarnessId::Omp => (crate::icons::TERMINAL, None),
     }
 }
 
