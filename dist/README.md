@@ -2,8 +2,9 @@
 
 This upstream-port branch delivers **private/manual canary artifacts**, not a
 replacement for signed Crew staging/production releases. It does not publish a
-shared bucket, public manifest, `latest` pointer, or release channel. Source Crew,
-its installed app, its services and its data remain unchanged.
+shared bucket, public manifest, `latest` pointer, or release channel. Packaging
+does not modify existing Crew apps, services or profiles. The separately approved
+staging broker deployment is recorded in the [port status](../docs/UPSTREAM-PORT-PLAN.md).
 
 ## macOS
 

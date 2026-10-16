@@ -20,12 +20,14 @@ Crew's initial integration is `eccc3324`; verified relay cleanup and migration
 checks are committed and pushed as `c5eda252`. The initial
 [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
 passed on macOS, Linux x64 and Linux ARM64, including remote Edge typechecks.
-Smoke and URL-isolation amendments are committed and pushed as `516ad3a2`;
-the pooled-account/sandbox UI and control fixes are `eb938af2`.
-[Its private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/38934010957)
-passed on macOS, Linux x64, Linux ARM64 and remote Edge contracts/typechecks.
-The downloaded Linux x64 archive and executable checksums were verified locally;
-nothing is published to a shared release channel.
+Current UI/recovery fixes are committed as `840704d8`; the registered,
+source-pinned artifact workflow is `2deefba1`.
+[Its private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/38947335812)
+passed the exact-source approval gate, macOS/Linux x64/Linux ARM64 builds and
+remote Edge contracts/typechecks. No shared release channel was published.
+The running local app was rebuilt and exercised; these new CI artifacts have
+not been installed. The configured, previously checksum-verified Linux pin is
+recorded below and remains unchanged while E2B runtime acceptance is blocked.
 This is a testing lane, not production or a completed cutover.
 
 | Area | Exercised evidence | Remaining acceptance |
@@ -69,6 +71,8 @@ accounts with usage. This proves live shared-pool inference, not sandbox-hosted
 execution. Account enrollment/import/revoke remain in Crew Staging; no provider
 credentials were copied. Authorities retain the canary-prefixed scope, private
 v2 gate and sandbox lifecycle validation.
+Live public probes without the broker trust key, and with forged actor headers
+but no canary bearer, both returned HTTP 403.
 
 Canary Worker `e3aaaff6-9b3e-43ee-ab13-6249f1674d9d` enables Cloudflare's native
 [`global_fetch_strictly_public`](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
