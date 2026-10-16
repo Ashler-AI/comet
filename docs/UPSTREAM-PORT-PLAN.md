@@ -15,9 +15,10 @@ Crew's initial integration is `eccc3324`; verified relay cleanup and migration
 checks are committed and pushed as `c5eda252`. The initial
 [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
 passed on macOS, Linux x64 and Linux ARM64, including remote Edge typechecks.
-[The `c5eda252` artifact run](https://github.com/Ashler-AI/comet/actions/runs/38853226542)
-also passed on macOS, Linux x64, Linux ARM64 and remote Edge contracts/typechecks.
-Its private Linux x64 archive and executable checksums were verified locally;
+Smoke and URL-isolation amendments are committed and pushed as `516ad3a2`.
+[Final private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/38916195528)
+passed on macOS, Linux x64, Linux ARM64 and remote Edge contracts/typechecks.
+Its downloaded Linux x64 archive and executable checksums were verified locally;
 nothing is published to a shared release channel.
 This is a testing lane, not production or a completed cutover.
 
@@ -61,10 +62,10 @@ production/staging handlers and had no canary-owned `zeron:` override. Safari's
 browser-to-app prompt remains unverified: its private window locked, and the
 foreground-control request was not granted. Native dispatch is not browser proof.
 
-The exact `c5eda252` Linux x64 runtime is configured under
-`~/.crew-upstream-canary/runtime/c5eda252693f9b5e139b03c8a42065e1b70c6828/comet`,
-SHA-256 `7417ec7b56a8133772d026c7f40ed987c5d23a06745507368710242a66c99d61`.
-The archive digest is `b5183ffc215f41774baa114a03ef1f7cbb43f1e543bb1b9c7f716a962da056c7`;
+The exact `516ad3a2` Linux x64 runtime is configured under
+`~/.crew-upstream-canary/runtime/516ad3a2c42f478dddd23ef9fb7bfff3087e0cd7/comet`,
+SHA-256 `03866b003aed7389241b34dd924081c0b33a3b83f3705c69f4b428da225d2966`.
+The archive digest is `7ceba3a16d9a8c882b2946cad11a1a11d3e6f8b4b0cf7ce2238fe12bf4d42774`;
 provenance records `scaffold.comet-runtime.v1`. This is not a sandbox-run claim.
 
 Launches from another Crew agent must pin Canary's IPC/data coordinates as shown
