@@ -7,10 +7,14 @@ The port is under implementation on `crew/upstream-canary`, based on upstream
 revision is `297717c55beab9323c53095f3f5f683f00676a5e`; its working tree, installed
 Crew Staging app and live profiles remain untouched. Platform changes use the
 separate same-named branch based on `c48442b7f433cb0c9e8c03885d7020c3cc5b1807`.
-Platform source is committed and pushed as
+Platform's initial source is committed and pushed as
 `4d877f1bd87feef03ec6f114a20c46f4d7882f2c`; its
 [remote Worker/provider/Agent Auth CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38847118006)
 passed, including remote typechecks and runtime contract suites.
+Canary sign-in's missing IAP audience was corrected in Platform `77341592d7`
+and deployed as canary Helm revision 2. The actual browser receives verified
+`auth: iap`; anonymous authorization redirects to Google and forged identity
+headers remain HTTP 401. A fresh manual desktop sign-in is still required.
 Crew's initial integration is `eccc3324`; verified relay cleanup and migration
 checks are committed and pushed as `c5eda252`. The initial
 [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
