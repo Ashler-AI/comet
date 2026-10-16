@@ -1884,8 +1884,16 @@ impl AccountsPage {
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.state.read(cx).managed_inference || self.crew.read(cx).view() != super::crew::CrewView::Accounts {
-            return div().id("crew-accounts-page").size_full().overflow_y_scroll()
-                .child(widgets::page_column().child(self.crew.clone())).into_any_element();
+            let theme = Theme::of(cx).for_settings_surface();
+            let scrollbar = popover::rail(self, "accounts-page-scrollbar", &theme, cx);
+            return div().id("crew-accounts-page-host").relative().size_full()
+                .on_hover(cx.listener(Self::on_scroll_hovered))
+                .child(crate::edge_fade::edge_faded(16.0, true, true,
+                    div().id("crew-accounts-page").size_full().overflow_y_scroll()
+                        .track_scroll(&self.scroll.scroll)
+                        .child(widgets::page_column().child(self.crew.clone())))
+                    .fade_overflow_y(&self.scroll.scroll))
+                .children(scrollbar).into_any_element();
         }
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();

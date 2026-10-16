@@ -275,11 +275,11 @@ impl CrewServices {
             environment
         };
         self.validate_environment(&environment, scope)?;
-        if matches!(command.control, Control::Attach { .. })
+        if matches!(command.control, Control::Create { .. } | Control::Attach { .. })
             && let SessionEnvironmentSource::Scaffold { lifecycle, .. } = &environment.source
             && matches!(lifecycle, ScaffoldLifecycle::Failed | ScaffoldLifecycle::Stopped) {
             return self.finish(command_id, None, Some(format!(
-                "Attach recovery retired because the sandbox is {lifecycle:?}; no command was replayed."
+                "Creation/attachment recovery retired because the sandbox is {lifecycle:?}; no command was replayed."
             )));
         }
         if let Some((binding, _)) = self.store.crew_command(&format!("{command_id}:binding")).map_err(failed)? {

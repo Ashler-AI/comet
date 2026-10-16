@@ -30,13 +30,13 @@ This is a testing lane, not production or a completed cutover.
 
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
-| Desktop | Local app rebuilt and launched with separate Accounts/Sandboxes/Annotations pages, provider-grouped shared-account usage, bounded session details, sidebar/new-session sandbox entries and managed-model selection; actual UI creation confirmation and successful link navigation exercised | Live shared-pool rows and managed turns await broker deployment |
-| Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme | Authenticated profile restart and cross-client verification |
-| Sync | Real workerd plus two real headless engines: session discovery, queued remote Run, transcript and working-to-idle status roundtrip passed | This used mock inference; reconnect/backpressure and real managed turns remain |
+| Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated multi-client/mobile exercise |
+| Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme; signed-in profile and saved chats survived rebuild/restart | Cross-client verification |
+| Sync | Real workerd plus two real headless engines: session discovery, queued remote Run, transcript and working-to-idle status roundtrip passed | That sync smoke used mock inference; live managed inference across two authenticated clients remains |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff`; unauthenticated identity/registry/chat reads returned 401 even with forged identity headers; public installer returned 404 | Live signed-in desktop/mobile authority and revocation |
-| Scaffold | Canary Helm revision 3 deployed the exact-baseline provider directory fix; authenticated directory GET now succeeds; existing failed attachment reconciles to rejected without replay; new sandbox form uses deployment source/default region and explicit managed-model selection | Shared inference admission and successful create/attach/pause/resume/stop |
-| Protocol checks | Shared-auth consumer/binding/OMP contracts 33/33, exact-live-staging broker security 6/6, canary config 2/2; existing Edge workerd 38/38 and wake/backup alarms 8/8 | Live shared-broker path awaits explicit deployment/key approval |
-| Rust checks | Scaffold library 39/39 and resolved-link navigation regression 1/1 passed; desktop build/package succeeded; existing client/document/engine/protocol/sync/harness checks recorded above | Actual shared-provider and sandbox runtime scenarios |
+| Scaffold | Canary Helm revision 3 provider, authenticated directory reads and confirmed publishing; actual creation and native Use sandbox confirmation exercised; failed creation/attachment recovery rejects without replay | E2B command channel returns HTTP 403 before Crew runtime starts; successful attach/pause/resume/stop remain blocked |
+| Protocol checks | Final bootstrap/device/broker/directory checks 20/20; broker remote Worker/provider/vault CI passed including typechecks; earlier consumer/binding/OMP 33/33, Edge workerd 38/38 and alarms 8/8 | Live sandbox device refresh/revocation |
+| Rust checks | Scaffold library 39/39, current engine coordinator/RPC checks 2/2 and resolved-link navigation 1/1 passed; desktop build/package and native UI smoke succeeded | Actual sandbox-runtime scenarios |
 | Mobile | Shared Rust core, generated Swift bindings and native app built; iOS 26.5 simulator displayed Crew Canary; warm directory link and cold Scaffold link stayed signed out; exact cold-link intent persisted across launch | Authenticated cross-client scenarios, lifecycle/network recovery and physical-device gates |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
 | Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated cross-client/provider/lifecycle gates |
@@ -47,18 +47,43 @@ and 6 connected Anthropic accounts. Its canonical owner ID differs from the
 isolated canary's owner; pointing at the same database would not fix ownership.
 No provider credentials have been copied, imported, or connected.
 
-Platform `0c1de2aa850` prepares the canary consumer of a narrow staging broker.
-The shared-service patch is separately based on the **exact live staging source**
-`94dc2c9cade2b89b4ba4b3fc80bee777695edbc4`, not the divergent canary fork.
-Commits `2b09634cc57` (broker) and `abe9f0d93e3` (directory compatibility) passed
-[remote Worker/vault/provider CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38932761302),
-including typechecks. Shared-controller deployment and a new dedicated server
-trust key await explicit user approval. This is not a live shared-pool claim.
-Account enrollment, import and revoke remain in Crew Staging; Canary displays and
-uses only the authorized pool. All delegated authority scopes are canary-prefixed
-and retain the shared v2 private-auth gate and sandbox lifecycle validation.
-The canary consumer also passed its own full
-[remote Worker/vault/provider CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38933796743).
+The user approved the narrow shared Agent Auth broker and dedicated server trust
+key. Staging broker `14e4a52409d` retains the rolled-back live source
+`94dc2c9cade2b89b4ba4b3fc80bee777695edbc4`, the reviewed broker patch, and the
+unchanged, already-applied `0029_remote_code_oauth_device_codes.sql` history.
+[Remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38943935518)
+passed, including typechecks. Clean guarded preflight applied no D1 or Durable
+Object migrations; secret synchronization was skipped. Active staging Worker
+version is `53d143f7-1ca2-49ea-8e46-615c3764fc90`. All 59 original bindings match
+the rollback snapshot; only the dedicated broker secret binding was added.
+
+A previous successful broker activation was undone at 17:35 UTC by the separate
+failed [staging candidate](https://github.com/Ashler-AI/ashler-platform/actions/runs/38925594570).
+The restore did not re-activate that candidate's newer source or change its
+service fleet. Until the broker patch is included in normal staging candidates,
+ordinary deployments/rollbacks can remove the capability again.
+
+Actual canary API requests returned HTTP 200 and the expected literal replies
+from `gpt-6.1-sol` and `claude-opus-5-5`. Account refresh returned all 11 shared
+accounts with usage. This proves live shared-pool inference, not sandbox-hosted
+execution. Account enrollment/import/revoke remain in Crew Staging; no provider
+credentials were copied. Authorities retain the canary-prefixed scope, private
+v2 gate and sandbox lifecycle validation.
+
+Canary Worker `e3aaaff6-9b3e-43ee-ab13-6249f1674d9d` enables Cloudflare's native
+[`global_fetch_strictly_public`](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
+flag: Worker-to-Worker owner checks had returned origin HTTP 404 despite direct
+authenticated Edge checks succeeding. The original smoke projection now has a
+confirmed directory publisher state. Chat2 bootstrap relies on verified grant
+ownership instead of opening the obsolete legacy session WebSocket.
+
+The fresh lifecycle smoke reached E2B VM creation, then failed in
+`wait_command_channel`: `[permission_denied] HTTP 403` for 120 seconds. Its
+native attachment outcome was reconciled to rejected without replay. No E2B
+access-policy change or replacement sandbox was attempted after that failure.
+The canary consumer's earlier full
+[remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38933796743)
+also passed.
 
 The isolated provider image was remotely built from the current provider's exact
 source plus its two-line canary link-scheme fix, then deployed only to the canary
@@ -92,16 +117,12 @@ production/staging handlers and had no canary-owned `zeron:` override. Safari's
 browser-to-app prompt remains unverified: its private window locked, and the
 foreground-control request was not granted. Native dispatch is not browser proof.
 
-The exact `516ad3a2` Linux x64 runtime is configured under
-`~/.crew-upstream-canary/runtime/516ad3a2c42f478dddd23ef9fb7bfff3087e0cd7/comet`,
-SHA-256 `03866b003aed7389241b34dd924081c0b33a3b83f3705c69f4b428da225d2966`.
-The archive digest is `7ceba3a16d9a8c882b2946cad11a1a11d3e6f8b4b0cf7ce2238fe12bf4d42774`;
-provenance records `scaffold.comet-runtime.v1`. This is not a sandbox-run claim.
-The new `eb938af2180996f6a5afa9643c7c5733aff48a85` Linux runtime is also downloaded
-and checksum-verified at the same runtime-directory layout, SHA-256
-`aa386f9941202d01cf05b53abd4318ce5271c0a26295f5af533ee4a8ab1c9c36`.
-It has not replaced the running host's artifact pin or any sandbox binary;
-activation belongs to the approved shared-auth/runtime smoke, not a silent restart.
+The configured Linux x64 runtime pin is
+`~/.crew-upstream-canary/runtime/eb938af2180996f6a5afa9643c7c5733aff48a85/comet`,
+SHA-256 `aa386f9941202d01cf05b53abd4318ce5271c0a26295f5af533ee4a8ab1c9c36`.
+Its downloaded executable checksum was verified and its contract is
+`scaffold.comet-runtime.v1`. The failed E2B command channel prevented installing
+or executing this artifact in the test sandbox; this is not a sandbox-run claim.
 
 Launches from another Crew agent must pin Canary's IPC/data coordinates as shown
 in `dist/README.md`; otherwise the parent's `COMET_IPC_PORT` can select its engine.
@@ -131,10 +152,10 @@ Parents are `7142b2c533bfc1e960abbd901238ff8845f15c24` (Crew on prior upstream)
 and `3b2f78027a2c31622c39c35716da4d6e1af8de15`; resulting tree is
 `fe83c31e96e6e325b9580d44146b7f24d6962b00`. This is not an empty merge.
 
-Authenticated cross-client/provider/lifecycle checks and physical-iOS verification
-remain open; there is no production promotion. Local typechecks are intentionally
-not run to preserve workstation resources. Remaining gates below are requirements,
-not claims of completed testing.
+Authenticated cross-client/lifecycle checks and physical-iOS verification remain
+open; live shared-provider API checks passed. No production promotion occurred.
+Local typechecks are intentionally not run to preserve workstation resources.
+Remaining gates below are requirements, not claims of completed testing.
 
 
 Status: implementation and verification in progress; no production cutover.
