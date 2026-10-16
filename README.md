@@ -2,7 +2,7 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
-## Unreleased: remote follow-up routing and sidebar activity
+## Crew 0.1.162 staging: remote follow-up routing and sidebar activity
 
 Follow-up sends keep their explicitly selected peer when its workspace chat row
 has not arrived. An existing indexed owner still takes precedence, and the fresh
