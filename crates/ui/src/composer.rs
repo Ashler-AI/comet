@@ -5083,11 +5083,14 @@ impl Composer {
 
     fn show_send_admission(&mut self, chat_id: &str, path: &Option<PathBuf>, send: &RetainedSend, admission: &SendAdmission, cx: &mut Context<Self>) {
         if self.state.read(cx).send_journal_path(chat_id).ok().flatten() != *path { return }
-        if send.accepted && !send.params["bootstrap"].is_null() {
+        if send.accepted {
             self.state.update(cx, |state, cx| {
-                state.complete_scaffold_session_startup(chat_id);
-                state.clear_chat_startup_phase(chat_id);
-                cx.notify();
+                state.ensure_session_ref(chat_id, cx);
+                if !send.params["bootstrap"].is_null() {
+                    state.complete_scaffold_session_startup(chat_id);
+                    state.clear_chat_startup_phase(chat_id);
+                    cx.notify();
+                }
             });
         }
         if self.current_key == chat_id {
@@ -7764,6 +7767,74 @@ mod tests {
             composer.submit_retained_control("chat".into(), prompt.into(), params, engine.clone(), cx);
         });
         cx.condition(composer, |composer, _| composer.failure.as_deref() != Some("waiting for test submission") && composer.refreshing_send_scopes.is_empty()).await;
+    }
+
+    #[gpui::test]
+    async fn admitted_rowless_thread_keeps_background_sidebar_status(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        const CHAT: &str = "00000000-0000-4000-8000-000000000129";
+        const OTHER: &str = "00000000-0000-4000-8000-000000000130";
+        let dir = tempfile::tempdir().unwrap();
+        let core = comet_engine::EngineCore::assemble_with_identity(dir.path(),
+            Arc::new(comet_engine::default_registry(comet_proto::RuntimeProfile::Mock)), HarnessId::Mock,
+            None, "project", "user", comet_proto::RuntimeProfile::LocalController).unwrap();
+        let other = core.workspace.upsert_session_ref(OTHER, None).unwrap();
+        let room = core.doc_host.open(CHAT).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let publish = |status, at| room.doc().append_publication(&comet_proto::PublicationRecord {
+            id: format!("owner/{at}"), schema_version: comet_proto::COLLABORATION_SCHEMA_VERSION,
+            published_at: at, published_by: "user".into(),
+            value: comet_proto::PublicationValue::AgentSession(Box::new(comet_proto::AgentSessionRecord {
+                session_id: CHAT.into(), chat_id: CHAT.into(), owner_subject: "user".into(),
+                owner_device_id: "boat".into(), source: AgentSessionSource::Local,
+                environment: None, harness: None, model: None, harness_session_id: None,
+                status: Some(status), model_retry: None, started_at: None,
+                updated_at: Some(at), created_at: now, unknown: Default::default(),
+            })), unknown: Default::default(),
+        }).unwrap();
+        publish(comet_proto::SessionStatus::Working, now);
+        let engine = EngineHandle::for_test(core.rpc_service());
+        let state = cx.new(|_| AppState::new());
+        let path = state.update(cx, |state, _| {
+            state.data_dir = Some(dir.path().to_owned());
+            state.local_device_id = Some(core.device_id.clone());
+            state.auth = Some(comet_proto::AuthState::SignedIn {
+                user: comet_proto::UserProfile { id: "user".into(), email: "user@example.com".into(), name: None },
+                project_scope: "project".into(),
+            });
+            state.apply_session_refs(vec![other]);
+            state.selected_chat = Some(OTHER.into());
+            state.set_engine_for_test(engine);
+            state.send_journal_path(CHAT).unwrap()
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        // Admission is already durable; its display hook must retain a non-owning
+        // membership so the real engine observes this room while another tab is selected.
+        let send = RetainedSend { prompt: "accepted".into(), message_id: "accepted-message".into(),
+            params: serde_json::json!({"chatId":CHAT}), accepted: true, applied: true,
+            terminal: true, failure: None, cancelled: false, admission_error: None };
+        composer.update(cx, |composer, cx| composer.show_send_admission(CHAT, &path, &send,
+            &SendAdmission { applied: true, notice: None, outcome_notice: false }, cx));
+        tokio::time::timeout(Duration::from_secs(5), cx.condition(&state, |state, _|
+            state.session_refs.iter().any(|reference| reference.chat_id == CHAT)))
+            .await.expect("accepted thread is retained for background status");
+        let mut statuses = core.workspace.merged_sessions_watch(core.sessions.watch_sessions());
+        for expected in [comet_proto::SessionStatus::Working, comet_proto::SessionStatus::Idle] {
+            if expected == comet_proto::SessionStatus::Idle { publish(expected, now + 1); }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if statuses.borrow_and_update().iter().any(|row| row.chat_id == CHAT
+                        && row.device_id == "boat" && row.status == expected) { break }
+                    statuses.changed().await.unwrap();
+                }
+            }).await.expect("unselected thread status follows its real room owner");
+        }
+        assert!(core.workspace.doc().chat(CHAT).unwrap().is_none());
+        assert!(!core.workspace.is_host(CHAT), "a sidebar membership must not claim execution ownership");
+        assert_eq!(state.read_with(cx, |state, _| state.selected_chat.clone()).as_deref(), Some(OTHER));
+        core.shutdown().await;
     }
 
     #[gpui::test]

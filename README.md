@@ -2,6 +2,19 @@
 
 Crew is Ashler's internal, multi-device controller for coding-agent sessions. The repository, binary, protocols, and service identifiers retain the `Comet` name for compatibility.
 
+## Unreleased: remote follow-up routing and sidebar activity
+
+Follow-up sends keep their explicitly selected peer when its workspace chat row
+has not arrived. An existing indexed owner still takes precedence, and the fresh
+peer connection still validates execution ownership. Command identity, payload,
+lifetime and selected destination are not replaced.
+
+After a successful desktop admission, Crew requests the existing non-owning
+session pin when it is missing. The background activity watcher can then follow
+the room owner's status even while another thread is selected or the host's
+browse metadata is pending. This reuses the normal pin flow without adding
+polling or grants; pin failure never undoes accepted execution.
+
 ## Crew 0.1.161: cold-room eviction deadlock
 
 Cold-room eviction resolves ownership outside the document-map mutex, then

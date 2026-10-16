@@ -2628,7 +2628,14 @@ impl AppState {
         }
     }
 
-    /// Issue the `AddSessionRef` pin recorded by a verified invitation. The
+    /// Keep admitted threads observable while the host's browse index catches up.
+    pub(crate) fn ensure_session_ref(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.session_refs.iter().any(|reference| reference.chat_id == chat_id) { return }
+        self.pending_session_pin = Some(chat_id.to_owned());
+        self.drain_session_pin(cx);
+    }
+
+    /// Issue a non-owning pin for an authenticated invitation or accepted send. The
     /// merged result lands immediately (the `WatchSessionRefs` frame carrying
     /// it is the durable source); a lost engine keeps the pin armed for the
     /// next snapshot.
