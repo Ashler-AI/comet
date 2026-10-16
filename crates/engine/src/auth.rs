@@ -287,7 +287,14 @@ impl Auth {
         let device_file = config.data_dir.join("scaffold-device-session.json");
         let device_mode = config.device.is_some() || device_file.exists();
         let scaffold_session = if device_mode {
-            zeron_sync::scaffold_auth::load_session(&device_file).ok().flatten().filter(|session| session.device.is_some())
+            zeron_sync::scaffold_auth::load_session(&device_file).ok().flatten().filter(|session| {
+                session.device.as_ref().is_some_and(|saved| config.device.as_ref().is_none_or(|device| {
+                    // A new grant re-enrolls; a consumed grant restores its durable credential.
+                    device.join_grant.is_empty() || device.join_grant.strip_prefix("cg1.")
+                        .and_then(|grant| grant.split_once('.'))
+                        .is_some_and(|(id, _)| id == saved.grant_id)
+                }))
+            })
         } else if config.scaffold.is_some() {
             zeron_sync::scaffold_auth::load_session(&config.data_dir.join("scaffold-session.json")).ok().flatten().filter(|session| session.device.is_none())
         } else { None };

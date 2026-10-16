@@ -90,37 +90,53 @@ async fn absent_or_invalid_managed_configuration_never_enables_development() {
 }
 
 #[tokio::test]
-async fn device_restart_rotates_before_trusting_identity_and_signout_cannot_downgrade() {
-    use zeron_sync::scaffold_auth::DeviceAuthority;
+async fn device_resume_enrolls_new_grant_and_restarts_preserve_its_authority() {
+    use zeron_sync::scaffold_auth::{DeviceAuthority, DeviceConfig};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let id = "0123456789abcdef0123456789abcdef";
+    let old_id = "00000000000000000000000000000000";
     let expires = chrono::Utc::now().timestamp_millis() + 12 * 60 * 60 * 1000;
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = vec![0; 8192];
-        let size = stream.read(&mut request).await.unwrap();
-        let request = String::from_utf8_lossy(&request[..size]);
-        assert!(request.starts_with("POST /auth/device-token/refresh "));
-        assert!(request.contains(&format!("cs1.{id}.old")));
-        let body = serde_json::json!({"accessToken":format!("cs1.{id}.new"),"expiresAt":expires,"userId":"owner","email":"owner@example.com","projectId":"canary","deploymentId":"deployment","sandboxId":"sandbox","targetDeviceId":"device","sessionId":"session","lifecycleEpoch":8,"capabilities":["session.read"]}).to_string();
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        let mut previous = "";
+        for secret in ["enrolled", "rotated", "restored"] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            if previous.is_empty() {
+                assert!(request.starts_with("POST /auth/device-grants/exchange "));
+                assert!(request.contains(&format!("cg1.{id}.grant")));
+            } else {
+                assert!(request.starts_with("POST /auth/device-token/refresh "));
+                assert!(request.contains(&format!("cs1.{id}.{previous}")));
+            }
+            let body = serde_json::json!({"accessToken":format!("cs1.{id}.{secret}"),"expiresAt":expires,"userId":"owner","email":"owner@example.com","projectId":"canary","deploymentId":"deployment","sandboxId":"sandbox","targetDeviceId":"device-e9","sessionId":"session","lifecycleEpoch":9,"capabilities":["session.read"]}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            previous = secret;
+        }
     });
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("scaffold-device-session.json");
     let session = ScaffoldSession {
-        access_token: format!("cs1.{id}.old"), resource: origin.clone(), edge_origin: origin.clone(),
+        access_token: format!("cs1.{old_id}.revoked"), resource: origin.clone(), edge_origin: origin.clone(),
         identity: ScaffoldIdentity { user_id:"owner".into(), email:"owner@example.com".into(), name:None, project_scope:"canary".into(), deployment_id:Some("deployment".into()), capabilities:vec!["session.read".into()] },
-        device:Some(DeviceAuthority { grant_id:id.into(), expires_at:expires, device_id:"device".into(), session_id:"session".into(), deployment_id:"deployment".into(), sandbox_id:"sandbox".into(), lifecycle_epoch:8 }),
+        device:Some(DeviceAuthority { grant_id:old_id.into(), expires_at:expires, device_id:"device-e8".into(), session_id:"session".into(), deployment_id:"deployment".into(), sandbox_id:"sandbox".into(), lifecycle_epoch:8 }),
     };
     save_session(&path, &session).unwrap();
     let mut config = AuthConfig::new(&origin, dir.path());
     config.scaffold = Some(ScaffoldConfig::new(&origin, &origin, "canary"));
+    config.device = Some(DeviceConfig { join_grant:format!("cg1.{id}.grant"), device_id:"device-e9".into(), session_id:"session".into(), deployment_id:"deployment".into(), sandbox_id:"sandbox".into(), lifecycle_epoch:9 });
+    for secret in ["enrolled", "rotated"] {
+        let auth = Auth::detect(config.clone()).await;
+        assert_eq!(auth.device_grant_authority().unwrap().lifecycle_epoch, 9);
+        assert_eq!(auth.access_token().await.unwrap(), format!("cs1.{id}.{secret}"));
+    }
+    config.device = None;
     let auth = Auth::detect(config.clone()).await;
     assert!(auth.device_mode());
-    assert_eq!(auth.device_grant_authority().unwrap().lifecycle_epoch, 8);
-    assert_eq!(auth.access_token().await.unwrap(), format!("cs1.{id}.new"));
-    assert!(std::fs::read_to_string(&path).unwrap().contains(&format!("cs1.{id}.new")));
+    assert_eq!(auth.device_grant_authority().unwrap().lifecycle_epoch, 9);
+    assert_eq!(auth.access_token().await.unwrap(), format!("cs1.{id}.restored"));
     auth.sign_out();
     config.scaffold = None;
     config.allow_dev_auth = true;
