@@ -2529,8 +2529,10 @@ impl RpcService for EngineRpc {
                 let bootstrap = p.bootstrap.take().map(Arc::new);
                 let indexed_chat = self.workspace.doc().chat(&p.chat_id)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
+                // Browse metadata may lag admission; the exact peer still verifies ownership.
                 let destination = indexed_chat.as_ref().map(|chat| chat.device_id.as_str())
-                    .or_else(|| bootstrap.as_ref().map(|setup| setup.chat.device_id.as_str()));
+                    .or_else(|| bootstrap.as_ref().map(|setup| setup.chat.device_id.as_str()))
+                    .or(p.target_device_id.as_deref());
                 if ordinary_peer_command(&p.command)
                     && let Some(destination) = destination
                     && destination != self.doc_host.device_id() && !destination.starts_with("comet-scaffold-") {
@@ -3680,6 +3682,90 @@ mod tests {
         assert_eq!(rpc.doc_host.open(chat).unwrap().doc().read_commands().unwrap(), vec![accepted]);
         server.await.unwrap();
         core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rowless_peer_followup_keeps_its_original_host_and_command() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        // Missing browse metadata must not reject a valid retained destination;
+        // the receiving host still has to prove its durable execution ownership.
+        const CHAT: &str = "00000000-0000-4000-8000-000000000128";
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote = crate::EngineCore::assemble_with_identity(remote_dir.path(),
+            Arc::new(crate::default_registry(RuntimeProfile::Mock)), HarnessId::Mock,
+            None, "project-a", "owner-a", RuntimeProfile::Mock).unwrap();
+        let mut auth = crate::auth::AuthConfig::new("http://127.0.0.1:1", remote_dir.path());
+        auth.project_scope = "project-a".into();
+        auth.dev_user_id = "owner-a".into();
+        remote.set_auth(Auth::new(auth));
+        remote.workspace.doc().binding().reject_workspace_snapshot("unrelated metadata conflict".into());
+        remote.workspace.doc().binding().install_journal(Vec::new(), Arc::new(|_, _| Err("index unavailable".into())));
+        let remote_rpc = remote.rpc_service();
+        let authority_device = remote.device_id.clone();
+        let authority = move || comet_rpc::PeerCommandAuthority {
+            subject: "owner-a".into(), project_id: "project-a".into(), device_id: authority_device.clone(),
+            chat_id: CHAT.into(), expires_at: crate::now_ms() + 60_000,
+        };
+        let created = chrono::Utc::now().to_rfc3339();
+        let setup = serde_json::json!({"chatId":CHAT,"commandId":"first-command",
+            "bootstrap":{"chat":{"id":CHAT,"deviceId":remote.device_id,"archived":false,"cwd":"/tmp",
+                "spaceId":"remote-space","config":{"harness":"mock","sandbox":"read-only"},"createdAt":created},
+                "space":{"id":"remote-space","deviceId":remote.device_id,"path":"/tmp","gitDetected":false,"createdAt":created}},
+            "command":{"kind":"run","messageId":"first-message","request":{"prompt":"first turn","cwd":"/tmp","sandbox":"read-only"}}});
+        remote_rpc.peer_command("AdmitPeerCommand", authority(), setup).await.unwrap();
+        let room = remote.doc_host.open(CHAT).unwrap();
+        let mut messages = room.watch_messages();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if messages.borrow_and_update().entries.iter().any(|row| row.role == comet_doc::MessageRole::Assistant
+                    && row.status == Some(comet_doc::MessageStatus::Complete)) { break }
+                messages.changed().await.unwrap();
+            }
+        }).await.expect("first turn completes despite the metadata conflict");
+        // Replaceable browse state can disappear while its admitted setup survives.
+        let raw = remote.workspace.doc().doc();
+        raw.get_map("chats").delete(CHAT).unwrap();
+        raw.commit();
+        assert!(remote.workspace.doc().chat(CHAT).unwrap().is_none());
+
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = crate::EngineCore::assemble_with_identity(local_dir.path(),
+            Arc::new(crate::default_registry(RuntimeProfile::Mock)), HarnessId::Mock,
+            None, "project-a", "owner-a", RuntimeProfile::Mock).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(frame)) = socket.next().await {
+                let Message::Binary(bytes) = frame else { continue };
+                let (header, payload) = comet_rpc::decode_device_frame(&bytes).unwrap();
+                let request: comet_rpc::ClientFrame = serde_json::from_slice(&payload).unwrap();
+                let result = remote_rpc.peer_command(request.method.as_deref().unwrap(), authority(), request.params).await.unwrap();
+                let reply = serde_json::to_vec(&serde_json::json!({"id":request.id,"ok":result})).unwrap();
+                socket.send(Message::Binary(comet_rpc::encode_device_frame(
+                    &comet_rpc::DeviceFrameHeader::new(header.s, header.k), &reply).unwrap())).await.unwrap();
+                break;
+            }
+        });
+        let rpc = local.build_rpc_service().with_links(LinkCache::new(comet_rpc::LinkCacheConfig::new(
+            origin, Arc::new(comet_rpc::StaticToken("test".into())))));
+        let now = crate::now_ms();
+        let followup = serde_json::json!({"chatId":CHAT,"commandId":"retained-followup",
+            "targetDeviceId":remote.device_id,"issuedAt":now,"expiresAt":now+60_000,
+            "command":{"kind":"run","messageId":"followup-message","request":{"prompt":"follow-up turn","cwd":"/tmp","sandbox":"read-only"}}});
+        let RpcReply::Value(receipt) = rpc.handle(methods::QUEUE_COMMAND, followup.clone()).await.unwrap() else { panic!("receipt") };
+        assert_eq!(receipt["commandId"], "retained-followup");
+        let retained = remote.doc_host.command_entry(CHAT, "retained-followup").unwrap().unwrap();
+        assert_eq!(retained.payload, serde_json::from_value(followup["command"].clone()).unwrap());
+        assert_eq!(retained.issued_at, now);
+        assert_eq!(retained.expires_at, Some(now + 60_000));
+        assert!(local.doc_host.command_entry(CHAT, "retained-followup").unwrap().is_none());
+        server.await.unwrap();
+        local.shutdown().await;
+        remote.shutdown().await;
     }
 
     #[test]
