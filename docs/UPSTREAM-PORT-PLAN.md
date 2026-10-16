@@ -11,32 +11,68 @@ Platform source is committed and pushed as
 `4d877f1bd87feef03ec6f114a20c46f4d7882f2c`; its
 [remote Worker/provider/Agent Auth CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38847118006)
 passed, including remote typechecks and runtime contract suites.
-Crew implementation is committed and pushed on the isolated branch as `eccc3324`.
-Its [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
-builds immutable macOS/Linux artifacts and runs Edge typechecks remotely.
+Crew's initial integration is `eccc3324`; verified relay cleanup and migration
+checks are committed and pushed as `c5eda252`. The initial
+[private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
+passed on macOS, Linux x64 and Linux ARM64, including remote Edge typechecks.
+[The `c5eda252` artifact run](https://github.com/Ashler-AI/comet/actions/runs/38853226542)
+also passed on macOS, Linux x64, Linux ARM64 and remote Edge contracts/typechecks.
+Its private Linux x64 archive and executable checksums were verified locally;
+nothing is published to a shared release channel.
 This is a testing lane, not production or a completed cutover.
 
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
-| Desktop | Rehearsal merge built, packaged and launched as Crew Canary; actual IPC now returns OMP/Claude/Codex managed catalogs and rejects Cursor; screenshots confirm managed thread naming and `~/.crew-upstream-canary/worktrees` | Authenticated controls, comments and links |
+| Desktop | Rehearsal merge built, packaged and launched as Crew Canary; actual IPC returns OMP/Claude/Codex managed catalogs and rejects Cursor; isolated headed demo renders seeded mock transcripts; actual compact-mode setting persists across cold restart | Authenticated controls, shared comments and links |
 | Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme | Authenticated profile restart and cross-client verification |
 | Sync | Real workerd plus two real headless engines: session discovery, queued remote Run, transcript and working-to-idle status roundtrip passed | This used mock inference; reconnect/backpressure and real managed turns remain |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff`; unauthenticated identity/registry/chat reads returned 401 even with forged identity headers; public installer returned 404 | Live signed-in desktop/mobile authority and revocation |
-| Scaffold | Controller Worker version `e8121145-bdc7-414e-adf9-286c7f608584`; dedicated Helm release installed; HTTPRoute Accepted/ResolvedRefs/Reconciled; public OAuth discovery returned the canary issuer and S256 PKCE | User sign-in, approved provider connection, exact-SHA Linux runtime and full sandbox lifecycle |
-| Protocol checks | Edge workerd 38/38; Platform auth/directory/broker 24/24; attach-routing 44/44; canary config/Helm checks 2/2 across four snapshot configurations | Remote runtime and actual-client scenarios below |
+| Scaffold | Controller Worker version `e8121145-bdc7-414e-adf9-286c7f608584`; dedicated Helm release installed; HTTPRoute Accepted/ResolvedRefs/Reconciled; public OAuth discovery returned the canary issuer and S256 PKCE; exact Linux runtime configured below | User sign-in, approved provider connection and full sandbox lifecycle |
+| Protocol checks | Edge workerd 38/38; corrected wake/backup alarm tests 8/8; Platform auth/directory/broker 24/24; attach-routing 44/44; canary config/Helm checks 2/2 across four snapshot configurations | Remote runtime and actual-client scenarios below |
 | Rust checks | Client 26, document 148, engine 614, protocol 91, sync 76 and harness 330 library tests passed; migration 8/8, scoped annotations 1/1, Scaffold auth 3/3 and native OMP 11/11 passed | Two engine tests and an OMP subprocess helper ignored; actual managed providers and sandbox lifecycle still require sign-in |
 | Mobile | Shared Rust core, generated Swift bindings and native app built; iOS 26.5 simulator displayed Crew Canary; warm directory link and cold Scaffold link stayed signed out; exact cold-link intent persisted across launch | Authenticated cross-client scenarios, lifecycle/network recovery and physical-device gates |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
-| Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync and headed desktop checks | Repeat mobile and authenticated gates |
+| Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated cross-client/provider/lifecycle gates |
 
 The new Agent Auth vault is empty. No provider credentials have been copied or
 connected. The user chose manual Crew Canary sign-in after foreground-control
 approval timed out. No provider connection/import permission has been inferred.
 
+The user approved provisioning and installing the isolated canary on the paired
+iPhone 18 Pro (iOS 27.0.1). Xcode 26.6 (`17F113`) cannot mount its current
+developer image: `0xe800010f`, missing hardware variant (board 10, chip 33120).
+Apple's documented `xcodebuild -runFirstLaunch -checkForNewerComponents` returned
+`No new updates for 17F113`. A compatible developer image/toolchain remains a
+prerequisite for on-device launch; no pairing or device security settings changed.
+The device build also failed automatic provisioning: Apple reported no registered
+team devices and no development profiles for the canary app/widget. Its produced
+app is unsigned and was not installed. Simulator success is a separate result.
+
 Canary continuation links use the exact configured project/deployment and can
 navigate ready, paused and stopped sessions without starting their host. Browser
 link generation and redirects were exercised with a provider transport that
 fails on execution. Existing legacy deployments retain their link policy.
+
+The desktop's native warm URL dispatch and cold launch with the synthetic
+directory link both preserved the exact signed-out intent; IPC `WatchChats` and
+`WatchSessions` remained empty. The inherited `zeron:` startup registration is
+removed; after cold launch, Launch Services still selected the installed Crew
+production/staging handlers and had no canary-owned `zeron:` override. Safari's
+browser-to-app prompt remains unverified: its private window locked, and the
+foreground-control request was not granted. Native dispatch is not browser proof.
+
+The exact `c5eda252` Linux x64 runtime is configured under
+`~/.crew-upstream-canary/runtime/c5eda252693f9b5e139b03c8a42065e1b70c6828/comet`,
+SHA-256 `7417ec7b56a8133772d026c7f40ed987c5d23a06745507368710242a66c99d61`.
+The archive digest is `b5183ffc215f41774baa114a03ef1f7cbb43f1e543bb1b9c7f716a962da056c7`;
+provenance records `scaffold.comet-runtime.v1`. This is not a sandbox-run claim.
+
+Launches from another Crew agent must pin Canary's IPC/data coordinates as shown
+in `dist/README.md`; otherwise the parent's `COMET_IPC_PORT` can select its engine.
+The verified local instance listens on 27954 and reports `signedOut`; managed
+account enumeration fails closed with `Crew sign-in required`. No credentials
+were borrowed from that parent. The demo now uses a fresh owned temp directory
+and seeds each project once, fixing its observed `no such space` failure.
 
 Managed model pickers use existing bundled OMP and upstream Claude/Codex
 catalogs without invoking local CLIs or reading provider credentials. Agent Auth
@@ -59,10 +95,10 @@ Parents are `7142b2c533bfc1e960abbd901238ff8845f15c24` (Crew on prior upstream)
 and `3b2f78027a2c31622c39c35716da4d6e1af8de15`; resulting tree is
 `fe83c31e96e6e325b9580d44146b7f24d6962b00`. This is not an empty merge.
 
-The Linux runtime artifact, completed behavioral update rehearsal, physical-iOS
-verification and production promotion are not yet recorded. Local typechecks
-are intentionally not run to preserve workstation resources. Remaining gates
-below are requirements, not claims of completed testing.
+Authenticated cross-client/provider/lifecycle checks and physical-iOS verification
+remain open; there is no production promotion. Local typechecks are intentionally
+not run to preserve workstation resources. Remaining gates below are requirements,
+not claims of completed testing.
 
 
 Status: implementation and verification in progress; no production cutover.

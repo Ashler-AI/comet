@@ -11,13 +11,23 @@ From this worktree on a macOS host:
 
 ```sh
 ASHLER_INCREMENTAL_TSC_CHECKS=false scripts/package-macos.sh
-open 'target/package/Crew Canary.app'
+open --env ASHLER_INCREMENTAL_TSC_CHECKS=false --env COMET_IPC_PORT=27954 \
+  --env "COMET_DATA_DIR=$HOME/.crew-upstream-canary" \
+  'target/package/Crew Canary.app' --args \
+  --ipc-port 27954 --data-dir "$HOME/.crew-upstream-canary"
 ```
 
 The script builds the upstream Cargo package/binary `zeron` with `--locked
 --release`, discovers Cargo's actual target directory, and copies that exact
 artifact into `target/package/Crew Canary.app/Contents/MacOS/comet`. Internal
 Cargo/crate and artwork filenames deliberately retain upstream names.
+
+Pin the launch coordinates when running from another Crew agent session: its
+inherited `COMET_IPC_PORT` addresses that session's engine, not Canary. For the
+existing lightweight local build cache, use `CARGO_BUILD_JOBS=2`,
+`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0` and `CREW_PACKAGE_PROFILE=dev`.
+Do not switch these flags between incremental smoke runs: Cargo rebuilds the
+dependency graph for a different profile configuration.
 
 The bundle has identifier `ai.ashler.crew.upstream-canary`, display name
 `Crew Canary`, and registers **only** `crew-upstream-canary:`. Runtime defaults

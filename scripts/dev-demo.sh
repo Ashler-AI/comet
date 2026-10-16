@@ -5,12 +5,14 @@
 #   scripts/dev-demo.sh            # build, seed demo data, open the app
 #   scripts/dev-demo.sh --slow     # pace mock streams (~10s) to watch streaming
 #
-# Everything lives under /tmp/zeron-demo-*; re-runs reuse it. Ctrl-C cleans up.
+# Each run owns a fresh crew-demo-* directory; Ctrl-C cleans it up.
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 cd "$(dirname "$0")/.."
 
-DAEMON_DIR=/tmp/zeron-demo-daemon
-UI_DIR=/tmp/zeron-demo-ui
+DEMO_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/crew-demo.XXXXXX")"
+DAEMON_DIR="$DEMO_ROOT/daemon"
+UI_DIR="$DEMO_ROOT/ui"
 IPC=27921
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
@@ -23,7 +25,7 @@ env ZERON_DATA_DIR="$DAEMON_DIR" ZERON_IPC_PORT=$IPC ZERON_HARNESS=mock \
   ${DELAY:+ZERON_MOCK_DELAY_MS=$DELAY} RUST_LOG=warn \
   ./target/debug/zeron headless &
 DAEMON_PID=$!
-trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
+trap 'kill "$DAEMON_PID" 2>/dev/null || true; rm -rf "$DEMO_ROOT"' EXIT
 for _ in $(seq 1 40); do
   (exec 3<>/dev/tcp/127.0.0.1/$IPC) 2>/dev/null && { exec 3>&-; break; }
   sleep 0.25
@@ -36,7 +38,7 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   DEV=$(probe LocalDevice '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["deviceId"])')
   # One space per demo folder, created up-front (chats join by space id).
   declare -A SPACES=()
-  for project in zeron soccertcg zeron aether; do
+  for project in zeron soccertcg aether; do
     sid=$(uuidgen | tr 'A-Z' 'a-z')
     probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
     SPACES[$project]="$sid"

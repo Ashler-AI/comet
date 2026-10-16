@@ -30,7 +30,7 @@ async function hostSocket(host: string, user = owner) {
 }
 async function retryNow(chat: string) {
   const room = chatRoom(chat);
-  await runInDurableObject(room, (_instance, state) => { state.storage.sql.exec("UPDATE chat_wake SET next_at=0"); });
+  await runInDurableObject(room, (_instance, state) => { state.storage.sql.exec("UPDATE chat_wake SET next_at=?", Date.now() - 1); });
   await runDurableObjectAlarm(room);
 }
 const waitForRetry = (chat: string) => expect.poll(() => runInDurableObject(chatRoom(chat), (_i, state) => pendingChatWake(state.storage.sql)?.attempts)).toBeGreaterThan(0);
@@ -133,7 +133,7 @@ it("keeps nightly backups scheduled after wake delivery without backing up on ev
   await runInDurableObject(chatRoom(chat), async (_i, state) => {
     expect(getMeta(state.storage.sql, "backupSeq")).toBeUndefined();
     expect(await state.storage.getAlarm()).toBe(Number(getMeta(state.storage.sql, "backupDue")));
-    setMeta(state.storage.sql, "backupDue", "0");
+    setMeta(state.storage.sql, "backupDue", String(Date.now() - 1));
   });
   await runDurableObjectAlarm(chatRoom(chat));
   await runInDurableObject(chatRoom(chat), async (_i, state) => {
@@ -190,7 +190,7 @@ it("moves the backup deadline a day on when rows land during the upload", async 
   await runInDurableObject(room, async (instance, state) => {
     const sql = state.storage.sql;
     sql.exec("DELETE FROM chat_wake");
-    setMeta(sql, "backupDue", "0");
+    setMeta(sql, "backupDue", String(Date.now() - 1));
     await state.storage.setAlarm(Date.now());
     // The chat keeps streaming while the R2 put is in flight.
     const target = instance as unknown as { env: { BLOBS: { put: (...args: unknown[]) => Promise<unknown> } } };

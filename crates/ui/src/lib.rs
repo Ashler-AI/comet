@@ -215,7 +215,7 @@ pub fn run_app(config: UiConfig) {
         terminal::panel::init(cx);
         app_menus::init(cx);
         app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
-        cx.register_url_scheme("zeron").detach();
+        // Bundle metadata owns URL registration; never replace another client's default handler.
 
         let state = cx.new(|cx| {
             let mut state = state::AppState::new();
