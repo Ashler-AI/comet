@@ -8,6 +8,7 @@
 //! LoroList of part maps whose text bodies live in **LoroText** — streaming appends RLE-merge at
 //! ~1.03x oplog overhead, whereas rewriting whole part values costs ~125x.
 
+pub mod collaboration;
 pub mod commands;
 pub mod constants;
 pub mod parts;
@@ -19,6 +20,7 @@ pub mod transcript_delta;
 pub mod voice;
 pub mod workspace;
 
+pub use collaboration::*;
 pub use commands::*;
 pub use constants::*;
 pub use parts::*;

@@ -108,6 +108,10 @@ pub struct UiConfig {
     /// WorkOS client id; `Some` makes the embedded headed engine require a
     /// production session before opening identity-scoped stores.
     pub workos_client_id: Option<String>,
+    /// Explicit resource-bound Crew OAuth configuration; never a WorkOS fallback.
+    pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
+    pub managed_inference: bool,
+    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
     /// Conversation URL passed by the OS on a cold launch.
@@ -116,15 +120,13 @@ pub struct UiConfig {
 
 impl UiConfig {
     fn boot(&self) -> EngineBootConfig {
-        EngineBootConfig {
-            data_dir: self.data_dir.clone(),
-            ipc_port: self.ipc_port,
-            edge_url: self.edge_url.clone(),
-            edge_token: self.edge_token.clone(),
-            org_id: self.org_id.clone(),
-            workos_client_id: self.workos_client_id.clone(),
-            default_harness: self.default_harness,
-        }
+        EngineBootConfig { scaffold_runtime_artifact: self.scaffold_runtime_artifact.clone(), managed_inference: self.managed_inference, scaffold: self.scaffold.clone(), data_dir: self.data_dir.clone(),
+        ipc_port: self.ipc_port,
+        edge_url: self.edge_url.clone(),
+        edge_token: self.edge_token.clone(),
+        org_id: self.org_id.clone(),
+        workos_client_id: self.workos_client_id.clone(),
+        default_harness: self.default_harness, }
     }
 }
 
@@ -412,7 +414,7 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
+                    title: cfg!(target_os = "windows").then(|| "Crew Canary".into()),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

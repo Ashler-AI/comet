@@ -17,6 +17,12 @@ use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod crew;
+mod crew_directory;
+pub mod scaffold;
+mod inference_relay;
+mod omp_session_artifact;
+mod worktree_handoff;
 mod change_request_store;
 pub mod change_requests;
 pub mod chat2_host;
@@ -126,8 +132,18 @@ pub struct EngineConfig {
     /// Workspace-doc org (`ws/{orgId}` room). `None` = `$ZERON_ORG_ID` or the dev default.
     /// In WorkOS mode the signed-in session's org wins.
     pub org_id: Option<String>,
-    /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
+    /// Optional upstream WorkOS authority, retained for explicit upstream embeds.
     pub workos_client_id: Option<String>,
+    /// Crew authority, shared by headed and headless initialization.
+    pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
+    /// One-use, scope-bound sandbox bootstrap; never a user credential.
+    pub device: Option<zeron_sync::scaffold_auth::DeviceConfig>,
+    /// Managed routes are mandatory unless user-owned local execution is explicit.
+    pub managed_inference: bool,
+    /// Consume the private one-use bootstrap only after verified exchange.
+    pub device_bootstrap_file: Option<PathBuf>,
+    /// Immutable Linux runtime artifact installed into isolated canary sandboxes.
+    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -152,6 +168,8 @@ pub struct EngineCore {
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
+    crew: Option<crew::CrewServices>,
+    crew_jobs: parking_lot::Mutex<[Option<tokio::task::JoinHandle<()>>; 2]>,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
@@ -220,17 +238,38 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
         lock: InstanceLock,
     ) -> Result<Self, EngineError> {
+        Self::assemble_with_services_locked(profile, registry, default_harness, edge, lock, None)
+    }
+
+    fn assemble_with_services_locked(
+        profile: EngineProfile,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+        lock: InstanceLock,
+        crew_context: Option<(Auth, scaffold::ScaffoldRuntime)>,
+    ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
-        let device_id = load_or_create_device_id(data_dir)?;
+        let device_id = match profile.device_id_override() {
+            Some(device) => device.to_owned(),
+            None => load_or_create_device_id(data_dir)?,
+        };
         // This device's harness enablement (Settings → Providers) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
+        let crew = crew_context
+            .map(|(auth, runtime)| crew::CrewServices::new(auth, runtime, store.clone()))
+            .transpose()?;
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        sessions.load_crew_import(profile.store_root())?;
+        if let Some(crew) = &crew {
+            sessions.set_crew(crew.clone());
+        }
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -283,6 +322,7 @@ impl EngineCore {
         // profile's uploads root read-only — transcripts imported earlier
         // embed absolute paths under it (same shape as the legacy adoption).
         if profile.scope() != WorkspaceScope::Local
+            && !profile.managed_scaffold()
             && let Some(root) =
                 local_import::marker_grants_read_root(data_dir, profile.org_id(), profile.user_id())
         {
@@ -290,13 +330,14 @@ impl EngineCore {
         }
         // Queued-attachment support: the doc host resolves `pending://` refs
         // against this store and pushes staged bytes to remote hosts.
+        uploads.load_crew_import(profile.store_root())?;
         doc_host.set_uploads(uploads.clone());
         let agent_accounts_config = AgentAccountsConfig::detect(data_dir);
         sessions.set_generated_images(
             uploads.clone(),
             agent_accounts_config.codex_home.join("generated_images"),
         );
-        let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
+        let local_import = (profile.scope() == WorkspaceScope::Synced && !profile.managed_scaffold()).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
                 &device_id,
@@ -312,9 +353,13 @@ impl EngineCore {
         // the P2P service, which serves it to that device alone.
         let agent_accounts =
             AgentAccounts::with_callback_routes(agent_accounts_config, previews.callback_routes());
+        let update_prefs_root = if profile.managed_scaffold() { profile.store_root() } else { data_dir };
         let harness_updates =
-            harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
-        harness_updates.start();
+            harness_updates::HarnessUpdateCoordinator::new(update_prefs_root, registry.clone());
+        if !registry.managed_inference() {
+            harness_updates.start();
+        }
+        harness_updates.post_update_refresh(update_prefs_root, zeron_update::AUTOMATIC_UPDATES_SUPPORTED);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -346,6 +391,8 @@ impl EngineCore {
             device_id,
             local_import,
             workspace_scope: profile.scope(),
+            crew,
+            crew_jobs: parking_lot::Mutex::new(Default::default()),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
@@ -445,7 +492,7 @@ impl EngineCore {
     pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
         let auth = self.auth();
         let config =
-            zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+            zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), auth.for_profile_tokens());
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             match doc_host.enqueue_wakeup(&chat_id) {
@@ -456,10 +503,10 @@ impl EngineCore {
                 }
             }
         });
-        zeron_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        zeron_rpc::HostRelay::spawn(config, Arc::new(self.build_rpc().for_relay()), on_nudge)
     }
 
-    pub fn rpc_service(&self) -> Arc<EngineRpc> {
+    fn build_rpc(&self) -> EngineRpc {
         let mut rpc = EngineRpc::new(
             self.sessions.clone(),
             self.doc_host.clone(),
@@ -478,6 +525,9 @@ impl EngineCore {
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
         .with_harness_updates(self.harness_updates.clone());
+        if let Some(crew) = &self.crew {
+            rpc = rpc.with_crew(crew.clone());
+        }
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -487,7 +537,11 @@ impl EngineCore {
         if let Some(importer) = self.local_import.clone() {
             rpc = rpc.with_local_import(importer);
         }
-        Arc::new(rpc)
+        rpc
+    }
+
+    pub fn rpc_service(&self) -> Arc<EngineRpc> {
+        Arc::new(self.build_rpc())
     }
 
     /// Revoke every account-scoped transport before any slower graceful
@@ -506,6 +560,9 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        let jobs = std::mem::take(&mut *self.crew_jobs.lock());
+        for job in jobs.iter().flatten() { job.abort(); }
+        for job in jobs.into_iter().flatten() { let _ = job.await; }
         self.previews.shutdown().await;
         self.harness_updates.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
@@ -632,6 +689,9 @@ impl Engine {
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
+        auth_config.scaffold = config.scaffold.clone();
+        auth_config.device = config.device.clone();
+        auth_config.allow_dev_auth = config.edge_token.as_ref().is_some_and(|token| !token.is_empty());
         if let Ok(base) = std::env::var("ZERON_WORKOS_API_BASE")
             && !base.trim().is_empty()
         {
@@ -646,13 +706,31 @@ impl Engine {
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
         }
-        Auth::new(auth_config)
+        let auth = Auth::detect(auth_config).await;
+        if auth.device_grant_authority().is_some()
+            && let Some(path) = &config.device_bootstrap_file
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not remove consumed device bootstrap");
+        }
+        auth
     }
 
     /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
     pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
-        if !auth.workos_enabled() {
-            WorkspaceScope::Development
+        if auth.scaffold_enabled() {
+            if auth.verified_scaffold_session().is_some() {
+                WorkspaceScope::Synced
+            } else {
+                WorkspaceScope::Local
+            }
+        } else if !auth.workos_enabled() {
+            if auth.dev_enabled() {
+                WorkspaceScope::Development
+            } else {
+                WorkspaceScope::Local
+            }
         } else if auth.loaded_workos_session() {
             WorkspaceScope::Synced
         } else {
@@ -690,6 +768,9 @@ impl Engine {
                 )))
             }
             WorkspaceScope::Synced => {
+                if auth.scaffold_enabled() {
+                    return EngineProfile::scaffold(&config.data_dir, auth).map(Some);
+                }
                 let state = auth.state();
                 let Some(user) = state.user() else {
                     return Err(EngineError::Other(
@@ -751,6 +832,10 @@ impl Engine {
         profile: EngineProfile,
         lock: Option<InstanceLock>,
     ) -> anyhow::Result<EngineRuntime> {
+        if profile.scaffold_profile_key() != auth.verified_profile_key().as_deref() {
+            anyhow::bail!("Crew profile authority changed during initialization");
+        }
+        let tokens = auth.for_profile_tokens();
         let edge_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
             WorkspaceScope::Synced => {
@@ -782,27 +867,53 @@ impl Engine {
             // burning attempts. No-op on platforms without a monitor.
             zeron_sync::net_path::spawn_path_monitor();
         }
-        let device_id = load_or_create_device_id(profile.device_root())?;
+        let device_id = match profile.device_id_override() {
+            Some(device) => device.to_owned(),
+            None => load_or_create_device_id(profile.device_root())?,
+        };
         let edge = edge_enabled.then(|| {
-            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
+            EdgeConfig::new(config.edge_url.clone(), tokens.clone()).with_device(device_id)
         });
 
         let preview_org = profile.org_id().to_string();
-        let core = match lock {
-            Some(lock) => EngineCore::assemble_with_profile_locked(
-                profile,
-                Arc::new(default_registry()),
-                config.default_harness,
-                edge.clone(),
-                lock,
-            )?,
-            None => EngineCore::assemble_with_profile(
-                profile,
-                Arc::new(default_registry()),
-                config.default_harness,
-                edge.clone(),
-            )?,
+        let registry = Arc::new(default_registry().with_execution_policy(
+            config.managed_inference, auth.device_mode(),
+        ));
+        let omp = if auth.device_mode() {
+            zeron_harness::omp::OmpHarness::scaffold_host()
+        } else {
+            zeron_harness::omp::OmpHarness::new()
+        }.with_supervisor_executable(std::env::current_exe()?);
+        registry.register(Arc::new(omp));
+        let crew_context = if let Some(authority) = &config.scaffold
+            && let Some(scope) = auth.verified_scope()
+        {
+            let deployment = scope.deployment_id.ok_or_else(|| {
+                EngineError::Other("Verified Crew deployment is missing".into())
+            })?;
+            let client = scaffold::ScaffoldClient::new(
+                &authority.control_origin, &authority.project_scope, tokens.clone(),
+            )?;
+            let grants = scaffold::EdgeDeviceJoinGrantClient::new(&config.edge_url, tokens.clone())?;
+            let mut runtime = scaffold::ScaffoldRuntime::new(client, &config.edge_url, Arc::new(grants))
+                .with_deployment_id(deployment)
+                .with_remote_executable("/workspace/.scaffold/crew-upstream-canary/bin/comet".into())
+                .with_remote_data_dir("/workspace/.scaffold/crew-upstream-canary/data".into())
+                .with_remote_ipc_port(27954);
+            if let Some((path, sha256)) = &config.scaffold_runtime_artifact {
+                runtime = runtime.with_runtime_artifact(path.clone(), sha256.clone())?;
+            }
+            Some((auth.clone(), runtime))
+        } else {
+            None
         };
+        let lock = match lock {
+            Some(lock) => lock,
+            None => InstanceLock::acquire(profile.device_root())?,
+        };
+        let core = EngineCore::assemble_with_services_locked(
+            profile, registry, config.default_harness, edge.clone(), lock, crew_context,
+        )?;
         core.set_auth(auth.clone());
         let preview_workspace = core.workspace.clone();
         let preview_device = core.device_id.clone();
@@ -818,9 +929,11 @@ impl Engine {
         let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
             edge_url: config.edge_url.clone(),
             org_id: preview_org,
-            tokens: Arc::new(auth.clone()),
+            tokens: tokens.clone(),
         });
         core.previews.start(projects, preview_signaling).await;
+        // Isolated canaries have no shared updater channel.
+        if !auth.scaffold_enabled() {
         // Release checker: polls {edge}/releases hourly (wall clock); headless
         // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.
@@ -843,15 +956,18 @@ impl Engine {
             core.set_updater_wake(wake);
         }
         core.set_updater(updater);
+        }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
         // Managed ACP adapters install in the background at boot (agents
         // whose CLI is present but whose adapter isn't yet), so a first chat
         // never waits on — or dies inside — an npm run.
-        zeron_harness::acp::prewarm_managed_adapters();
+        if !config.managed_inference && config.default_harness != HarnessId::Mock {
+            zeron_harness::acp::prewarm_managed_adapters();
+        }
 
         let host_relay = edge.as_ref().map(|edge| {
             let mut link_config =
-                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
+                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), tokens.clone());
             // Registry-dark dial gate: devices with no recent presence fail
             // fast with zero dials; presence returning un-parks them (the
             // peer-alive hook below clears any cooldown at the same moment).
@@ -868,6 +984,15 @@ impl Engine {
             core.set_links(links);
             core.start_host_relay(&edge.url)
         });
+
+        if let Some(services) = &core.crew {
+            let directory = crew_directory::start(auth.clone(), services.clone(), core.workspace.clone(), core.doc_host.clone());
+            let recovery = (!auth.device_mode()).then(|| {
+                let rpc = core.rpc_service();
+                tokio::spawn(async move { rpc.reconcile_crew_registry().await })
+            });
+            *core.crew_jobs.lock() = [Some(directory), recovery];
+        }
 
         Ok(EngineRuntime {
             core,
@@ -1036,8 +1161,8 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                     ));
                 }
                 if stdin_reader.is_none() {
-                    let url = auth.start_headless_sign_in();
-                    println!("Sign in to Zeron:\n\n  {url}\n");
+                    let url = auth.start_headless_sign_in().await?;
+                    println!("Sign in to Crew:\n\n  {url}\n");
                     println!("Then paste the code shown in the browser here and press enter.");
                     let auth = auth.clone();
                     stdin_reader = Some(tokio::spawn(async move {

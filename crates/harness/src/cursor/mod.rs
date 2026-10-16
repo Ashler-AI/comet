@@ -309,6 +309,7 @@ impl Harness for CursorHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let lease = if self.executable.is_none() {
             Some(state::Lease::acquire(&state::state_root(), request.resume.as_deref()).await?)
         } else {
@@ -321,6 +322,7 @@ impl Harness for CursorHarness {
             cmd.env("ZERON_CURSOR_STATE_DIR", state::state_root());
         }
         crate::compose_child_path(&mut cmd, &exe);
+        crate::apply_run_context(&mut cmd, controls.context.as_ref());
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -532,6 +534,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
+        context: _,
     } = controls;
 
     let mut assistant_message_id = new_message_id();

@@ -745,6 +745,12 @@ impl CodexHarness {
         title_only: bool,
         idle: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
+        if let Some(source) = controls.context.as_ref().and_then(|context| context.fork_from.as_deref()) {
+            if request.resume.as_deref() != Some(source) || title_only {
+                return Err(HarnessError::Protocol("Crew fork source does not match Codex resume".into()));
+            }
+        }
         let native = command_request(&request.prompt, "")?;
         if native
             .as_ref()
@@ -781,7 +787,26 @@ impl CodexHarness {
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
+        if let Some(route) = controls.context.as_ref().and_then(|context| context.inference.as_ref()) {
+            let base_url = serde_json::to_string(&format!("{}/v1", route.base_url.trim_end_matches('/')))
+                .expect("loopback URL serializes");
+            for setting in [
+                "model_provider=\"crew\"".to_string(),
+                "model_providers.crew.name=\"Crew Agent Auth\"".to_string(),
+                format!("model_providers.crew.base_url={base_url}"),
+                "model_providers.crew.env_key=\"COMET_INFERENCE_TOKEN\"".to_string(),
+                "model_providers.crew.wire_api=\"responses\"".to_string(),
+                "model_providers.crew.requires_openai_auth=false".to_string(),
+                "model_providers.crew.supports_websockets=false".to_string(),
+                "model_providers.crew.request_max_retries=0".to_string(),
+                "model_providers.crew.stream_max_retries=0".to_string(),
+            ] {
+                cmd.arg("-c").arg(setting);
+            }
+            request.model = Some(route.model.rsplit('/').next().unwrap_or(&route.model).to_owned());
+        }
         crate::compose_child_path(&mut cmd, &exe);
+        crate::apply_run_context(&mut cmd, controls.context.as_ref());
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -1065,8 +1090,11 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
+        context,
     } = controls;
     let request_input = Arc::new(request_input);
+    let managed = context.as_ref().is_some_and(|context| context.inference.is_some());
+    let fork_from = context.as_ref().and_then(|context| context.fork_from.as_deref());
 
     // ---- wire params ------------------------------------------------------
     // Parity with the Claude adapter, which auto-approves every `can_use_tool`
@@ -1119,6 +1147,10 @@ async fn run_session(session: Session) {
                 .expect("thread/start config overrides are an object");
             overrides.extend(codex_mcp_overrides(mcp));
         }
+        if managed {
+            // Resume must not restore a rollout's previous user-owned provider.
+            p.insert("modelProvider".into(), "crew".into());
+        }
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
         if let Some(model) = &request.model {
@@ -1147,7 +1179,7 @@ async fn run_session(session: Session) {
             .await?;
         client.notify("initialized", None);
 
-        if realtime.is_some() {
+        if realtime.is_some() && !managed {
             // Codex's first account/read announces the initial auth snapshot
             // via account/updated. Load it before attaching the voice router,
             // which must keep aborting media on subsequent identity updates.
@@ -1177,21 +1209,19 @@ async fn run_session(session: Session) {
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
-            match client.request("thread/resume", Value::Object(p)).await {
-                Ok(thread) => thread,
-                // A missing/foreign rollout falls back to a fresh thread.
-                Err(e) => {
-                    if command_request(&request.prompt, resume)?.is_some() {
-                        return Err(e);
-                    }
-                    tracing::debug!(
-                        target: "zeron_harness::codex",
-                        "thread/resume failed (starting fresh): {e}"
-                    );
-                    client
-                        .request("thread/start", Value::Object(start_params.clone()))
-                        .await?
+            if let Some(source) = fork_from {
+                if source != resume || title_only {
+                    return Err(HarnessError::Protocol("Crew fork source does not match Codex resume".into()));
                 }
+                p.insert("deferGoalContinuation".into(), Value::Bool(true));
+                let thread = client.request("thread/fork", Value::Object(p)).await?;
+                if thread["thread"]["id"].as_str().is_none_or(|id| id.is_empty() || id == source) {
+                    return Err(HarnessError::Protocol("Codex fork did not create a distinct native identity".into()));
+                }
+                thread
+            } else {
+                // Resume is an identity-preserving operation, never permission to create anew.
+                client.request("thread/resume", Value::Object(p)).await?
             }
         } else {
             client
@@ -1290,6 +1320,7 @@ async fn run_session(session: Session) {
             executable,
             voice_context,
             controls,
+            managed,
         )
     });
     if !idle {

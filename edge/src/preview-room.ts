@@ -1,9 +1,10 @@
 import { AUTH_USER_HEADER, type Env } from "./env";
+import { requestAuthority, socketAuthorized, sendAuthorized, type SocketAuthority } from "./authority";
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.localhost$/;
 const MAX_MESSAGE = 1024 * 1024;
-type Attachment = { device: string; connection: string; connected: number; lastSeen: number; budgetAt: number; messages: number };
+type Attachment = { device: string; connection: string; connected: number; lastSeen: number; budgetAt: number; messages: number; authority?: SocketAuthority };
 type Service = Record<string, string | number | boolean>;
 
 export function previewCatalog(value: unknown, device: string): Service[] | undefined {
@@ -38,7 +39,7 @@ export function previewSignal(value: unknown): object | undefined {
 /** One authenticated user's devices in one organization. Only presence, service
  * metadata and SDP/ICE coordination live here; binary preview frames are rejected. */
 export class PreviewRoom {
-  constructor(private state: DurableObjectState, _env: Env) {
+  constructor(private state: DurableObjectState, private env: Env) {
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS preview_catalog (device TEXT PRIMARY KEY, services TEXT NOT NULL)");
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -55,7 +56,7 @@ export class PreviewRoom {
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
     const now = Date.now();
-    server.serializeAttachment({ device, connection: crypto.randomUUID(), connected: now, lastSeen: now, budgetAt: now, messages: 0 } satisfies Attachment);
+    server.serializeAttachment({ device, authority: requestAuthority(request), connection: crypto.randomUUID(), connected: now, lastSeen: now, budgetAt: now, messages: 0 } satisfies Attachment);
     this.broadcast({ type: "catalog", device, services: [] }, server);
     for (const other of this.sockets()) {
       const peer = this.info(other).device;
@@ -65,6 +66,7 @@ export class PreviewRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (!(await socketAuthorized(this.env, ws))) return;
     const info = this.info(ws);
     if (!info.device) return;
     if (typeof message !== "string" || new TextEncoder().encode(message).byteLength > MAX_MESSAGE) { ws.close(1008, "Signaling messages only"); return; }
@@ -109,7 +111,7 @@ export class PreviewRoom {
   }
   private sockets(): WebSocket[] { return this.state.getWebSockets().filter(ws => this.info(ws)?.device); }
   private info(ws: WebSocket): Attachment { return ws.deserializeAttachment() as Attachment; }
-  private send(ws: WebSocket, value: object): void { try { ws.send(JSON.stringify(value)); } catch { ws.close(1011, "Signaling disconnected"); } }
+  private send(ws: WebSocket, value: object): void { sendAuthorized(this.env, this.state, ws, JSON.stringify(value)); }
   private broadcast(value: object, except: WebSocket): void { for (const ws of this.sockets()) if (ws !== except) this.send(ws, value); }
   private async remove(ws: WebSocket): Promise<void> {
     const info = this.info(ws);

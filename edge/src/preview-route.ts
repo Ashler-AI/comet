@@ -1,7 +1,7 @@
 import type { Verified } from "./auth";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 /** Route identity comes exclusively from verified JWT claims. */
-export function previewRoute(request: Request, env: Pick<Env, "PREVIEW_ROOMS">, auth: Verified): Promise<Response> | Response | undefined {
+export function previewRoute(request: Request, env: Pick<Env, "PREVIEW_ROOMS">, auth: Pick<Verified, "userId" | "orgId">): Promise<Response> | Response | undefined {
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter(Boolean);
   const id = /^[A-Za-z0-9_-]{1,128}$/;

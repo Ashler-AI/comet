@@ -772,6 +772,70 @@ impl AgentAccounts {
         Self::with_endpoints(config, ProbeEndpoints::default(), Default::default())
     }
 
+    /// Explicit consent imports only the selected OAuth login. Never switches,
+    /// deletes, or exposes the local credential through an RPC response.
+    pub(crate) async fn import_local_shared(
+        &self,
+        remote: &crate::scaffold::ScaffoldClient,
+        harness: HarnessId,
+        account_id: &str,
+    ) -> Result<crate::scaffold::RemoteAgentAccount, EngineError> {
+        if !matches!(harness, HarnessId::ClaudeCode | HarnessId::Codex) {
+            return Err(EngineError::Other("Only Claude and ChatGPT OAuth accounts can be shared".into()));
+        }
+        let _ops = self.inner.ops.lock().await;
+        *lock(&self.inner.claude_credentials) = None;
+        self.list_locked(false).await?;
+        let slot = self.read_slots(harness).into_iter()
+            .find(|slot| slot.id == account_id && slot.harness == harness)
+            .ok_or_else(|| EngineError::Other("Selected local login no longer exists".into()))?;
+        let (provider, access, refresh, expiry, scopes) = match harness {
+            HarnessId::ClaudeCode => {
+                let oauth = slot.credentials.get("claudeAiOauth")
+                    .ok_or_else(|| EngineError::Other("Selected login is not Claude OAuth".into()))?;
+                ("anthropic", str_field(oauth, "accessToken"), str_field(oauth, "refreshToken"),
+                    oauth.get("expiresAt").and_then(|value| value.as_i64())
+                        .and_then(DateTime::<Utc>::from_timestamp_millis),
+                    oauth.get("scopes").and_then(|value| value.as_array())
+                        .map(|values| values.iter().filter_map(|value| value.as_str().map(str::to_owned)).collect())
+                        .unwrap_or_default())
+            }
+            HarnessId::Codex => {
+                let tokens = slot.credentials.get("tokens")
+                    .ok_or_else(|| EngineError::Other("Selected login is not ChatGPT OAuth".into()))?;
+                let access = str_field(tokens, "access_token");
+                let expiry = access.as_deref().and_then(jwt_claims)
+                    .and_then(|claims| claims.get("exp").and_then(|value| value.as_i64()))
+                    .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+                ("openai", access, str_field(tokens, "refresh_token"), expiry, Vec::new())
+            }
+            _ => unreachable!(),
+        };
+        let required = |value: Option<String>| value.filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| EngineError::Other("Selected OAuth login is incomplete".into()));
+        let import = crate::scaffold::AgentAccountCredentialImport {
+            provider: provider.into(),
+            provider_account_id: slot.account_key.clone(),
+            email: Some(slot.profile.email),
+            display_name: slot.profile.display_name,
+            organization: slot.profile.organization,
+            plan: slot.profile.plan,
+            capabilities: vec![if provider == "openai" { "gpt-*" } else { "claude-*" }.into()],
+            credential: crate::scaffold::AgentAccountOAuthCredential {
+                access_token: required(access)?,
+                refresh_token: required(refresh)?,
+                expires_at: expiry.ok_or_else(|| EngineError::Other("Selected OAuth expiry is unavailable".into()))?.to_rfc3339(),
+                scopes,
+            },
+        };
+        let account = remote.import_agent_account(&import).await
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        if account.provider != provider || account.provider_account_id != slot.account_key {
+            return Err(EngineError::Other("Agent Auth returned a different account identity".into()));
+        }
+        Ok(account)
+    }
+
     /// [`Self::new`], publishing remote logins' callback ports to `routes`
     /// (the engine's P2P service, which serves them to the requester).
     pub fn with_callback_routes(
@@ -3101,6 +3165,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
+        HarnessId::Omp => "omp",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "antigravity",
         HarnessId::Mock => "mock",

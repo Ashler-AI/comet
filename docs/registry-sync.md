@@ -49,6 +49,62 @@ engine B ── RegistryDoc ── RegistryClient ──────────
   as `RoomClient`), reconnect with backoff. Fills the same `RoomStatsSnapshot` the
   SyncStatus RPC and `zeron sync` already render.
 
+### Scoped Scaffold host transport
+
+A verified device grant with `session.sync.write` may use the existing typed
+RegistryClient transport only when its device is exactly
+`comet-scaffold-<sandboxId>-e<lifecycleEpoch>`. The private host profile must use
+that same device ID and must never reuse a user's broad registry cache.
+HTTP initial/delta/repair and WebSocket state/broadcasts expose only the bound
+chat/status row, device row, and spaces owned by that single-session sandbox
+device. Spaces may arrive before the chat through upstream's normal separate
+pending batches; host-written space paths must stay beneath `/workspace`.
+
+The room validates typed columns, device ownership, owner/project/deployment,
+and current lifecycle binding before mutation. Scoped hosts cannot delete rows,
+reset the registry, read stats or push targets, or use arbitrary registry kinds.
+The controller retains Crew environment/route metadata and its clock even when
+an empty host profile initially upserts a chat without that metadata. A newer
+binding fences old hosts regardless of their LWW timestamps. Full user access
+continues to see the canonical host updates.
+
+Hello and presence identities come from the verified grant; forged devices are
+rejected. Native RegistryClient presence covers WebSocket and HTTP fallback,
+without a second DeviceRoom-to-Registry presence bridge. DeviceRoom's liveness
+alarms and established-socket grant revocation checks remain in place.
+
+### Crew directory projection
+
+`crew_directory::start(auth, services, workspace, doc_host)` returns the worker
+handle owned by the engine shutdown path. It observes registry changes (including
+ACKs whose optimistic sidebar values did not change), snapshot commits, and auth
+changes. `chat_sync_jobs` retains coalesced pending directory work across restart;
+`crew_directory_state` retains only locally observed source-version evidence and
+whether the directory acknowledged it, including after transcript deletion.
+
+The projection uses the acknowledged chat row's real `seq` as `r:registry1`,
+alongside the saved SessionDoc oplog version vector (`s:<peer>`). Pending overlay
+fields are never published under an older acknowledged sequence. New same-owner
+registry chats without Crew metadata use `CrewServices::adopt_chat` and wait for
+its registry acknowledgement. The existing title lifecycle remains responsible
+for generated titles; directory publishing performs no inference.
+
+Only the verified profile and exact deployment are used for directory get/upsert.
+Platform checks existing chat2 ownership through the read-only
+`/session/<UUID>/directory-authority?deploymentId=<exact>` endpoint. Empty chats
+without a chat2 owner stay pending: indexing never opens, claims, attaches, or
+executes a chat. Cached snapshots are projected one at a time (32 MiB compressed
+input cap), with bounded registry/work pages and chunked transcript text scanning.
+Slack/Notion URLs retain the source extraction semantics; server upsert and
+SourceURL search share canonical normalization.
+
+Every retry reads the current directory revision before an expected-revision
+upsert. Stale/concurrent transcript evidence waits for synchronization; unseen
+server counters are never copied into a candidate. A server sequence rollback
+persists a reconciliation-required flag, even when ordinary registry re-seeding
+succeeds. Directory writes then fail closed; recovery requires reconciling the
+directory and registry lineage rather than inventing a higher source version.
+
 ## Wire protocol (JSON text frames)
 
 Client→server:
@@ -137,3 +193,74 @@ registry snapshot and outbox before acknowledging migration; only then does the
 UI remove its legacy copy. A failed migration retains that copy and can retry on
 a new engine attachment/restart. Local workspaces continue using local settings.
 The deployed generic registry protocol already accepts these row kinds.
+
+## Explicit Crew legacy import
+
+Crew's project-scoped `workspace3` is **not** the upstream `workspace2`
+automatic migration. Use
+`zeron_sync::crew_import::import_legacy_crew_backup(backup, destination, principal, device_id)`
+off the UI/runtime thread. The caller supplies a freshly verified controller
+principal; a manifest is not authentication. The destination must not exist and
+must be outside the immutable backup. Never select the live old profile.
+
+After stopping every legacy writer and checkpointing SQLite, inventory a copied
+profile in `crew-backup.json` using `CrewBackupManifest` version 1:
+`writerStopped`, `sourceProfileRoot` (the original absolute profile path),
+`ownerSubject`, `projectId`, `deploymentId`, `files` (every relative file path
+mapped to its SHA-256), and `chats` (chat IDs mapped to
+`CrewChatMetadata`: owner, exact session scope, session ID, environment and
+credential-free Agent Auth route). The inventory excludes the manifest itself.
+Keep attachment, native-history and settings paths relative to the profile.
+For every OMP native resume, include `nativeHistories` mapping the canonical
+native ID to an inventoried `native-histories/…` journal copy. Header IDs and
+initial hashes are checked; missing OMP histories are errors. At startup load
+`imported_native_histories(profile)` into host-only launch state and replace
+OMP `RunRequest.resume` IDs with their copied absolute paths. Keep synchronized
+native IDs and cwd unchanged. The copied journal may append after import.
+Non-OMP native resumes fail before destination creation with the original
+chat/native IDs and cwd reported: an isolated external-native-store importer
+is a release/cutover prerequisite, not an approved retirement of those sessions.
+No live old-store pointer is carried into the new runtime. External worktree
+associations remain unchanged and require a separate consistent backup.
+Credentials are excluded and must be reauthenticated; no grants become
+registry authority.
+The upload resolver loads `imported_attachment_paths(profile)` once at startup:
+only inventoried original upload paths alias to the copied files. It never
+falls back to reading the old live profile. Pending upload chunks are an error.
+Exclude `session.json`, Scaffold session/bootstrap files and the entire
+secret-bearing `agent-accounts` directory, not just files named `auth.json`.
+
+The importer validates the entire input before creating the destination. It
+preserves chat/native IDs, raw transcript data and native cwd, environment,
+semantic annotations, copied asset hashes and all original database bytes
+(`legacy-crew.sqlite3`). Terminal command outcomes and semantic journal records
+are additionally accessible through `DocsStore::legacy_crew_records(chat_id)`;
+they are evidence, never an execution queue. Claimed pending commands remain
+claimed; unclaimed pending work and conflicting semantic intents fail closed.
+The new personal `registry1` is the only discovery index. Host disconnection
+does not remove entries. Import does not attach, launch a harness or publish
+to the legacy workspace.
+
+Foreign/granted sessions require authenticated reattachment rather than
+relabeling them as owned. Missing host rows/snapshots, pending nudges, unresolved
+startup/native-fork state, delayed worktree deletion, unknown tables or workspace
+containers, malformed rows, mismatched scope and unlisted/tampered files are
+explicit errors. Reconcile those in the legacy lane, then take a new backup.
+There is no automatic unsafe replay or silent record dropping.
+
+A successful import writes `crew-import-report.json` with preserved IDs and
+checksums. Failed writes retain `crew-import-incomplete`; `DocsStore::open`
+rejects that destination. Keep it for diagnosis and retry into a new profile.
+Retain the original backup through cutover. Once the new profile has writes,
+restoring the backup alone is not a lossless rollback.
+
+`Chat.crew` is index metadata, not authority. Restricted clients cannot write
+registry rows or opaque chat blobs. Annotation mutations use host-derived
+principal/grant checks and `SessionDoc::apply_annotation_command`; annotations
+and immutable command results share one Loro commit in `crewAnnotations` and
+`crewAnnotationCommands`. Both maps survive thin-document rebuilds. After a
+crash between snapshot persistence and external command completion, recover
+with `annotation_command_result`; never infer the result from a later-edited
+annotation or replay a claim with no persisted result. Durable
+Crew control claims store immutable request bytes before delivery, retain an
+unknown outcome across restart, and reject conflicting terminal outcomes.

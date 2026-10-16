@@ -67,22 +67,19 @@ async fn real_pi_mock_lifecycle() {
     ] {
         let (steer, steering) = mpsc::channel(8);
         let interrupt = CancellationToken::new();
-        let controls = RunControls {
-            realtime: None,
-            execution_lease: None,
-            steering,
-            interrupt: interrupt.clone(),
-            request_input: Box::new(|questions| {
-                let (tx, rx) = oneshot::channel();
-                tx.send(vec![UserInputAnswer {
-                    question_id: questions[0].id.clone(),
-                    labels: vec!["local answer".into()],
-                }])
-                .unwrap();
-                rx
-            }),
-            turn: Default::default(),
-        };
+        let controls = RunControls { context: None, realtime: None, execution_lease: None,
+        steering,
+        interrupt: interrupt.clone(),
+        request_input: Box::new(|questions| {
+            let (tx, rx) = oneshot::channel();
+            tx.send(vec![UserInputAnswer {
+                question_id: questions[0].id.clone(),
+                labels: vec!["local answer".into()],
+            }])
+            .unwrap();
+            rx
+        }),
+        turn: Default::default(), };
         let request = RunRequest {
             prompt: prompt.into(),
             harness: None,
@@ -176,14 +173,11 @@ async fn real_pi_mock_lifecycle() {
     // the UUID is not recreated. Pi has no public RPC to restore them; the chat
     // continues in a new session and says so instead of failing every message.
     let (_, steering) = mpsc::channel(1);
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: CancellationToken::new(),
-        request_input: Box::new(|_| oneshot::channel().1),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: CancellationToken::new(),
+    request_input: Box::new(|_| oneshot::channel().1),
+    turn: Default::default(), };
     let request = RunRequest {
         prompt: "after loss".into(),
         harness: None,
@@ -249,14 +243,11 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
     let (dir, harness) = isolated_pi();
     let cwd = dir.path();
     let (tx, steering) = mpsc::channel(8);
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: CancellationToken::new(),
-        request_input: Box::new(|_| oneshot::channel().1),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: CancellationToken::new(),
+    request_input: Box::new(|_| oneshot::channel().1),
+    turn: Default::default(), };
     let request = RunRequest {
         prompt: "burst hold".into(),
         harness: None,

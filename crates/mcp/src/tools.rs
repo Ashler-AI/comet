@@ -1049,26 +1049,23 @@ impl Tools {
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
             // The row may not have folded into WatchChats yet; build the
             // chat locally from what we just wrote rather than re-reading.
-            let chat = Chat {
-                id: chat_id.clone(),
-                device_id: device_id.clone(),
-                title: args.title.clone(),
-                archived: false,
-                cwd: cwd.clone(),
-                branch: args.branch.clone(),
-                checkout_id: None,
-                source_context: None,
-                config: Some(config),
-                last_message_preview: None,
-                last_message_at: None,
-                created_at: chrono::Utc::now(),
-                harness_session_id: None,
-                harness_session_cwd: None,
-                parent_chat_id: parent_chat_id.clone(),
-                space_id: space.as_ref().map(|s| s.id.clone()),
-                last_seen_at: None,
-                room_gen: None,
-            };
+            let chat = Chat { id: chat_id.clone(), crew: None, device_id: device_id.clone(),
+            title: args.title.clone(),
+            archived: false,
+            cwd: cwd.clone(),
+            branch: args.branch.clone(),
+            checkout_id: None,
+            source_context: None,
+            config: Some(config),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: parent_chat_id.clone(),
+            space_id: space.as_ref().map(|s| s.id.clone()),
+            last_seen_at: None,
+            room_gen: None, };
             let sent = self
                 .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
                 .await?;

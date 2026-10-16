@@ -432,26 +432,24 @@ mod tests {
     use super::*;
 
     fn chat(id: &str, device: &str, cwd: Option<&str>, checkout: Option<&str>) -> Chat {
-        Chat {
-            id: id.into(),
-            device_id: device.into(),
-            title: None,
-            archived: false,
-            cwd: cwd.map(str::to_owned),
-            branch: Some("feature/pr".into()),
-            checkout_id: checkout.map(str::to_owned),
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: Utc.timestamp_opt(0, 0).unwrap(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            parent_chat_id: None,
-            space_id: Some("space".into()),
-            last_seen_at: None,
-            room_gen: None,
-        }
+        Chat { crew: None, id: id.into(),
+        device_id: device.into(),
+        title: None,
+        archived: false,
+        cwd: cwd.map(str::to_owned),
+        branch: Some("feature/pr".into()),
+        checkout_id: checkout.map(str::to_owned),
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at: None,
+        created_at: Utc.timestamp_opt(0, 0).unwrap(),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: Some("space".into()),
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     fn space(device: &str) -> Space {

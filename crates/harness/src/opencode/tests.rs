@@ -256,27 +256,24 @@ impl TurnWire {
         let run = tokio::spawn(run_session(Session {
             server: Server::attached(base),
             event_tx,
-            controls: RunControls {
-                realtime: None,
-                execution_lease: None,
-                request_input: Box::new(move |questions| {
-                    let answer = answer.expect("fixture must not ask for input");
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = tx.send(
-                        questions
-                            .into_iter()
-                            .map(|q| UserInputAnswer {
-                                question_id: q.id,
-                                labels: vec![if answer { "Yes" } else { "No" }.into()],
-                            })
-                            .collect(),
-                    );
-                    rx
-                }),
-                steering,
-                interrupt: interrupt.clone(),
-                turn: Default::default(),
-            },
+            controls: RunControls { context: None, realtime: None, execution_lease: None,
+            request_input: Box::new(move |questions| {
+                let answer = answer.expect("fixture must not ask for input");
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(
+                    questions
+                        .into_iter()
+                        .map(|q| UserInputAnswer {
+                            question_id: q.id,
+                            labels: vec![if answer { "Yes" } else { "No" }.into()],
+                        })
+                        .collect(),
+                );
+                rx
+            }),
+            steering,
+            interrupt: interrupt.clone(),
+            turn: Default::default(), },
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_millis(50),

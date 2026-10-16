@@ -62,32 +62,29 @@ async fn main() {
     let mut stream = harness
         .run(
             request,
-            RunControls {
-                realtime: None,
-                execution_lease: None,
-                request_input: Box::new(move |questions| {
-                    assert!(
-                        answer_yes,
-                        "set OPENCODE_PROBE_ANSWER_YES to answer permission prompts"
-                    );
-                    let answers = questions
-                        .into_iter()
-                        .map(|question| {
-                            eprintln!("PERMISSION Yes (once): {}", question.question);
-                            zeron_proto::UserInputAnswer {
-                                question_id: question.id,
-                                labels: vec!["Yes".into()],
-                            }
-                        })
-                        .collect();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = tx.send(answers);
-                    rx
-                }),
-                steering,
-                interrupt: interrupt.clone(),
-                turn: Default::default(),
-            },
+            RunControls { context: None, realtime: None, execution_lease: None,
+            request_input: Box::new(move |questions| {
+                assert!(
+                    answer_yes,
+                    "set OPENCODE_PROBE_ANSWER_YES to answer permission prompts"
+                );
+                let answers = questions
+                    .into_iter()
+                    .map(|question| {
+                        eprintln!("PERMISSION Yes (once): {}", question.question);
+                        zeron_proto::UserInputAnswer {
+                            question_id: question.id,
+                            labels: vec!["Yes".into()],
+                        }
+                    })
+                    .collect();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(answers);
+                rx
+            }),
+            steering,
+            interrupt: interrupt.clone(),
+            turn: Default::default(), },
         )
         .await
         .expect("run starts");

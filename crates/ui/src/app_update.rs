@@ -385,6 +385,9 @@ pub fn strip_for(
     flow: &Flow,
     latest: &str,
 ) -> (SharedString, StripAction) {
+    if !zeron_update::AUTOMATIC_UPDATES_SUPPORTED {
+        return (zeron_update::MANUAL_UPDATE_MESSAGE.into(), StripAction::Explain);
+    }
     if install.supports_desktop_update() {
         if blocked {
             return (
@@ -448,93 +451,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_follows_the_flow_on_self_updating_installs() {
-        let mac_app = InstallKind::MacApp {
-            bundle: PathBuf::from("/Applications/Zeron.app"),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &Flow::Idle, "0.2.86"),
-            (
-                SharedString::from("Update available — v0.2.86"),
-                StripAction::Download
-            )
-        );
-        let downloading = Flow::Downloading {
-            version: "0.2.86".into(),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &downloading, "0.2.86"),
-            (
-                SharedString::from("Downloading v0.2.86…"),
-                StripAction::None
-            )
-        );
-        let ready = Flow::Ready {
-            version: "0.2.86".into(),
-            staged: PathBuf::from("/tmp/Zeron.app"),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &ready, "0.2.86").1,
-            StripAction::Restart
-        );
-        let failed = Flow::Failed {
-            version: "0.2.86".into(),
-            message: "offline".into(),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &failed, "0.2.86"),
-            (
-                SharedString::from("Update failed: offline"),
-                StripAction::Download
-            )
-        );
-        // A translocated or read-only bundle explains instead of failing.
-        assert_eq!(
-            strip_for(&mac_app, true, &Flow::Idle, "0.2.86").1,
-            StripAction::Explain
-        );
-    }
-
-    #[test]
-    fn strip_advises_installs_without_a_desktop_path() {
-        let unmanaged = strip_for(&InstallKind::Unmanaged, false, &Flow::Idle, "0.2.86");
-        assert_eq!(
-            unmanaged,
-            (
-                SharedString::from("Update available — v0.2.86 · download from GitHub"),
-                StripAction::Advise {
-                    open_releases: true
-                }
-            )
-        );
-        let managed = InstallKind::Managed {
-            app_root: PathBuf::from("/home/u/.zeron/app"),
-        };
-        let strip = strip_for(&managed, false, &Flow::Idle, "0.2.86");
-        if cfg!(target_os = "linux") {
-            // Linux desktop installs share the managed layout and update
-            // themselves like the other desktop platforms.
-            assert_eq!(strip.1, StripAction::Download);
-        } else {
-            assert_eq!(
-                strip.0,
-                SharedString::from("Update available — v0.2.86 · run `zeron update`")
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_installs_drive_the_desktop_flow() {
-        let installed = InstallKind::WindowsPortable {
-            directory: PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Zeron"),
-        };
-        assert_eq!(
-            strip_for(&installed, false, &Flow::Idle, "0.2.86"),
-            (
-                SharedString::from("Update available — v0.2.86"),
-                StripAction::Download
-            )
-        );
+    fn unsigned_canary_cannot_offer_a_previously_staged_update() {
+        let install = InstallKind::MacApp { bundle: PathBuf::from("/Applications/Crew Canary.app") };
+        let staged = Flow::Ready { version: "9.0.0".into(), staged: PathBuf::from("/tmp/old-channel.app") };
+        assert_eq!(strip_for(&install, false, &staged, "9.0.0").1, StripAction::Explain);
     }
 }

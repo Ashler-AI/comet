@@ -99,7 +99,7 @@ final class VoiceStageViewController: UIViewController {
             view.addSubview(label)
         }
 
-        minimize.accessibilityLabel = "Back to Zeron"
+        minimize.accessibilityLabel = "Back to Crew"
         minimize.accessibilityIdentifier = "voice-minimize"
         transcript.accessibilityLabel = "Open the voice transcript"
         transcript.accessibilityIdentifier = "voice-transcript"
@@ -373,7 +373,7 @@ extension UIViewController {
     func presentVoiceHostPicker(app: AppModel, source: UIView?) {
         let hosts = app.voice.hosts
         let message = hosts.isEmpty
-            ? "No online device can host Codex voice. Start Zeron with remote voice enabled on your Mac or server."
+            ? "No online device can host Codex voice. Start Crew with remote voice enabled on your Mac or server."
             : "Audio stays on this iPhone. Codex and its tools run on the device you pick."
         let sheet = UIAlertController(title: "Talk to Codex on…", message: message, preferredStyle: .actionSheet)
         for device in hosts {

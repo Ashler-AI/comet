@@ -156,7 +156,7 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             }
             if notificationStatus == .denied {
                 // Only the Settings app can turn them back on.
-                let alert = UIAlertController(title: "Notifications are off", message: "Allow notifications for Zeron in iOS Settings.", preferredStyle: .alert)
+                let alert = UIAlertController(title: "Notifications are off", message: "Allow notifications for Crew Canary in iOS Settings.", preferredStyle: .alert)
                 alert.addAction(UIAlertAction(title: "Not Now", style: .cancel) { [weak self] _ in self?.reload() })
                 alert.addAction(UIAlertAction(title: "Open Settings", style: .default) { [weak self] _ in
                     if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
@@ -188,6 +188,15 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         ])
         s.appendSections(["Devices"])
         s.appendItems(app.hostOptions.map { Row(id: "device:\($0.id)", title: $0.name, subtitle: $0.online ? "Online" : "Offline", symbol: "desktopcomputer", accessory: .dot($0.online)) })
+        if !app.isDemo {
+            s.appendSections(["Crew"])
+            s.appendItems([
+                Row(id: "crew-controls", title: "Scaffold sandboxes", subtitle: "Scoped operations through your desktop controller", symbol: "server.rack"),
+                Row(id: "crew-migration", title: "Legacy iOS backup", subtitle: "Preserve cached history and pending work without replay", symbol: "archivebox"),
+                Row(id: "crew-voice-unavailable", title: "Managed voice unavailable", subtitle: "Requires a compatible host Agent Auth voice adapter", symbol: "waveform", accessory: .none),
+                Row(id: "crew-link", title: "Open existing Crew link", subtitle: "Browse only; never creates or resumes execution", symbol: "link"),
+            ])
+        }
         if app.voice.available {
             s.appendSections(["Voice"])
             s.appendItems([Row(id: "voice", title: "Voice", subtitle: app.voice.selectedStyle.map { "Codex voice · \($0.capitalized)" } ?? "Codex voice device and style", symbol: "waveform")])
@@ -223,6 +232,18 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         collectionView.deselectItem(at: path, animated: true)
         guard let row = dataSource.itemIdentifier(for: path) else { return }
         switch row.id {
+        case "crew-controls": navigationController?.pushViewController(CrewControlsViewController(app: app), animated: true)
+        case "crew-migration": navigationController?.pushViewController(CrewMigrationViewController(app: app), animated: true)
+        case "crew-link":
+            let alert = UIAlertController(title: "Open in Crew", message: "Paste an existing Continue/Open in Crew session link. Its authenticated scope must match this canary.", preferredStyle: .alert)
+            alert.addTextField { $0.placeholder = "comet://session/…" }
+            alert.addAction(UIAlertAction(title: "Open", style: .default) { [weak self, weak alert] _ in
+                guard let text = alert?.textFields?.first?.text, crewIsSessionLink(url: text) else { return }
+                NotificationCenter.default.post(name: .crewOpenSessionLink, object: text)
+                self?.navigationController?.popToRootViewController(animated: true)
+            })
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            present(alert, animated: true)
         case "voice": navigationController?.pushViewController(VoiceViewController(app: app), animated: true)
         case let id where id.hasPrefix("appearance:"):
             let style = Int(id.dropFirst(11)) ?? 0

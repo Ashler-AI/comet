@@ -49,18 +49,15 @@ fn request(prompt: &str) -> RunRequest {
 fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(move |_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Vec::new());
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: token.clone(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(move |_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Vec::new());
+        rx
+    }),
+    steering: steer_rx,
+    interrupt: token.clone(),
+    turn: Default::default(), };
     (controls, steer_tx, token)
 }
 

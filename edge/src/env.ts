@@ -1,4 +1,10 @@
 export interface Env {
+  AUTH_GRANTS: DurableObjectNamespace;
+  ENVIRONMENT: string;
+  SCAFFOLD_CONTROL_PLANE_URL: string;
+  SCAFFOLD_PROJECT_SCOPE: string;
+  SCAFFOLD_DEPLOYMENT_ID: string;
+  SCAFFOLD_REQUIRED_CAPABILITIES: string;
   SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
   PREVIEW_ROOMS: DurableObjectNamespace;
@@ -9,36 +15,27 @@ export interface Env {
    * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
   CHAT_ROOMS: DurableObjectNamespace;
   BLOBS: R2Bucket;
-  /** Release artifacts (headless tarballs, dmgs, latest.txt) served at
-   * /releases/* for the curl-install flow. */
+  /** Isolated authenticated release artifacts; never an upstream or shared Crew bucket. */
   RELEASES: R2Bucket;
-  WORKOS_CLIENT_ID: string;
-  /** "workos" (verify AuthKit JWTs) or "dev" (bearer == userId, never prod). */
+  /** Scaffold resource-bound tokens, or local-only development credentials. */
   AUTH_MODE: string;
-  /** Optional overrides for the WorkOS trust anchor. */
-  WORKOS_ISSUER?: string;
-  WORKOS_JWKS_URL?: string;
-  /** WorkOS secret API key (wrangler secret) — powers the absorbed /auth/*
-   * routes (code exchange, refresh, orgs). Unset ⇒ those routes answer 501,
-   * matching the old apps/server dev-mode behavior. */
-  WORKOS_API_KEY?: string;
   /** APNs auth key (contents of AuthKey_XXXX.p8, wrangler secret) and its
    * key id. Unset ⇒ session notifications are decided and logged, not sent. */
   APNS_KEY_P8?: string;
   APNS_KEY_ID?: string;
-  /** Apple team id and the app's bundle id (defaults: the Zeron iOS app). */
+  /** Explicit Apple team and canary bundle id; no upstream credential fallback. */
   APNS_TEAM_ID?: string;
   APNS_TOPIC?: string;
 }
 
 /** APNs settings, when push is set up for this deployment. */
 export const apnsConfig = (env: Env) =>
-  env.APNS_KEY_P8 && env.APNS_KEY_ID
+  env.APNS_KEY_P8 && env.APNS_KEY_ID && env.APNS_TEAM_ID && env.APNS_TOPIC
     ? {
         keyP8: env.APNS_KEY_P8,
         keyId: env.APNS_KEY_ID,
-        teamId: env.APNS_TEAM_ID ?? "5XY3M483YQ",
-        topic: env.APNS_TOPIC ?? "sh.zeron.ios"
+        teamId: env.APNS_TEAM_ID,
+        topic: env.APNS_TOPIC
       }
     : undefined;
 

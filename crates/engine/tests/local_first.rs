@@ -28,6 +28,11 @@ fn config(
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
+        scaffold: None,
+        device: None,
+        managed_inference: false,
+        device_bootstrap_file: None,
+        scaffold_runtime_artifact: None,
     }
 }
 

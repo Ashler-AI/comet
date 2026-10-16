@@ -21,25 +21,22 @@ const POST_DONE_WINDOW: Duration = Duration::from_secs(20);
 fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec!["Yes".into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: token.clone(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
+        let (tx, rx) = oneshot::channel();
+        let answers: Vec<UserInputAnswer> = questions
+            .iter()
+            .map(|q| UserInputAnswer {
+                question_id: q.id.clone(),
+                labels: vec!["Yes".into()],
+            })
+            .collect();
+        let _ = tx.send(answers);
+        rx
+    }),
+    steering: steer_rx,
+    interrupt: token.clone(),
+    turn: Default::default(), };
     (controls, steer_tx, token)
 }
 

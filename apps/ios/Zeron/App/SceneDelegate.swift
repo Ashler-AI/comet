@@ -1,8 +1,22 @@
 import UIKit
 
+extension Notification.Name {
+    static let crewOpenSessionLink = Notification.Name("crew.openSessionLink")
+}
+
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
     private let app = AppModel()
+    private var linkObserver: AnyObject?
+    private var pastedLinkObserver: NSObjectProtocol?
+    private var deferredLink: String?
+    private var resolvingLink = false
+    private var requestedLink: String?
+    private var attemptedHosts: Set<String> = []
+    private var pendingLink: String? {
+        get { UserDefaults.standard.string(forKey: "crew.pendingSessionLink") }
+        set { UserDefaults.standard.set(newValue, forKey: "crew.pendingSessionLink") }
+    }
 
     func scene(
         _ scene: UIScene,
@@ -51,6 +65,12 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             showRoot(animated: false)
         }
         window.makeKeyAndVisible()
+        linkObserver = app.observe { [weak self] in self?.drainSessionLink() }
+        pastedLinkObserver = NotificationCenter.default.addObserver(forName: .crewOpenSessionLink, object: nil, queue: .main) { [weak self] note in
+            guard let text = note.object as? String, let url = URL(string: text) else { return }
+            self?.acceptURL(url)
+        }
+        for context in connectionOptions.urlContexts { acceptURL(context.url) }
         if !args.contains("-lab") { shellShown() }
 
         #if DEBUG
@@ -78,6 +98,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         guard app.isSignedIn else { return }
         if !app.isDemo { PushNotifications.shared.signedIn() }
         PushNotifications.shared.shellReady()
+        drainSessionLink()
     }
 
     private func showRoot(animated: Bool) {
@@ -101,12 +122,65 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
     }
 
-    /// `zeron://voice` (the call's Live Activity) returns to the stage.
-    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
-        guard URLContexts.contains(where: { $0.url.scheme == "zeron" && $0.url.host == "voice" }),
-              app.voice.live, let root = window?.rootViewController
-        else { return }
-        root.presentVoiceStage(app: app, source: nil)
+    func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) {
+        for context in contexts { acceptURL(context.url) }
+    }
+
+    private func acceptURL(_ url: URL) {
+        if url.scheme == Endpoints.callbackScheme, url.host == "voice" {
+            if app.voice.live { window?.rootViewController?.presentVoiceStage(app: app, source: nil) }
+        } else if crewIsSessionLink(url: url.absoluteString) {
+            pendingLink = url.absoluteString
+            requestedLink = nil
+            deferredLink = nil
+            attemptedHosts.removeAll()
+            drainSessionLink()
+        }
+    }
+
+    private func drainSessionLink() {
+        guard !resolvingLink, let url = pendingLink, deferredLink != url, let client = app.client,
+              let deployment = Endpoints.deploymentId,
+              let router = window?.rootViewController as? AppRouter else { return }
+        do {
+            if let id = try client.crewCachedLink(url: url, deployment: deployment) {
+                pendingLink = nil
+                requestedLink = nil
+                router.openSession(id)
+                return
+            }
+        } catch {
+            showLinkError(error.localizedDescription)
+            return
+        }
+        guard requestedLink != url,
+              let host = app.hostOptions.first(where: { $0.online && !attemptedHosts.contains($0.id) }) else { return }
+        attemptedHosts.insert(host.id)
+        resolvingLink = true
+        Task { @MainActor in
+            defer { resolvingLink = false }
+            do {
+                _ = try await client.crewResolveLink(deviceId: host.id, url: url, deployment: deployment)
+                guard pendingLink == url else { return }
+                requestedLink = url
+            } catch {
+                // Other online devices may be sandboxes; only a local controller may resolve.
+                if !app.hostOptions.contains(where: { $0.online && !attemptedHosts.contains($0.id) }) {
+                    showLinkError("Connect a desktop Crew controller to discover this session. \(error.localizedDescription)")
+                }
+            }
+            DispatchQueue.main.async { [weak self] in self?.drainSessionLink() }
+        }
+    }
+
+    private func showLinkError(_ message: String) {
+        guard let root = window?.rootViewController, root.presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "Crew session", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Keep for later", style: .cancel) { [weak self] _ in
+            self?.deferredLink = self?.pendingLink
+        })
+        alert.addAction(UIAlertAction(title: "Dismiss link", style: .default) { [weak self] _ in self?.pendingLink = nil })
+        root.present(alert, animated: true)
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
@@ -115,5 +189,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func sceneWillEnterForeground(_ scene: UIScene) {
         app.willEnterForeground()
+        requestedLink = nil
+        deferredLink = nil
+        attemptedHosts.removeAll()
+        drainSessionLink()
     }
 }

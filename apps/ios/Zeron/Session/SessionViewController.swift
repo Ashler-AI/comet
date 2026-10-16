@@ -667,7 +667,8 @@ final class StatusPill: UIControl {
 
 /// Unsent composer text per session, kept across navigation and launches.
 enum Drafts {
-    private static let key = "drafts"
+    static var profile = "signed-out"
+    private static var key: String { "drafts.\(profile)" }
 
     static func load(_ chatId: String) -> String {
         (UserDefaults.standard.dictionary(forKey: key) as? [String: String])?[chatId] ?? ""

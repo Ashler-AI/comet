@@ -1,28 +1,31 @@
-//! zeron — headed by default; `zeron headless` runs the engine alone. Both start
-//! local-only without credentials. `zeron login` and `zeron logout` select the
-//! profile used by the next engine start without mutating a live runtime.
+//! Crew Canary — headed by default; `comet headless` runs the engine alone.
+//! Runtime coordinates and data are isolated from installed Crew clients.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod auth_cli;
+mod crew_cli;
 mod daemon;
 mod paths;
 mod update_cli;
+mod session_cli;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "zeron",
+    name = "comet",
     version,
     about = "Multi-device controller for coding agents"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Open a Zeron conversation URL.
+    /// Open a Crew conversation URL.
     #[arg(value_name = "URL")]
     open_url: Option<String>,
+    #[command(flatten)]
+    runtime: crew_cli::RuntimeArgs,
     #[cfg(windows)]
     #[arg(long, hide = true)]
     wait_for_exit: Option<u32>,
@@ -31,24 +34,43 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the engine without a UI (local-only unless a saved session enables sync).
-    Headless,
+    Headless(crew_cli::HeadlessArgs),
     /// Sign in and enable sync on the next engine start.
     Login,
     /// Remove the saved session and return to local-only on the next start.
     Logout,
     /// Show workspace mode, optional auth, and engine status.
     Status,
+    #[command(hide = true)]
+    ScaffoldAuthority,
+    /// Coordinate native Crew sessions through the connected engine.
+    Session {
+        #[command(subcommand)]
+        command: session_cli::SessionCommand,
+    },
+    /// Control Scaffold using durable immutable operation IDs.
+    Scaffold {
+        #[command(subcommand)]
+        command: session_cli::ScaffoldCommand,
+    },
+    /// Explicitly import a stopped-writer backup into a NEW separate profile.
+    ImportBackup {
+        #[arg(long)]
+        backup: std::path::PathBuf,
+        #[arg(long)]
+        destination: std::path::PathBuf,
+    },
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
     #[cfg(target_os = "linux")]
     /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
     Appshot,
-    /// Serve the Zeron MCP (Model Context Protocol) server on stdin/stdout,
+    /// Serve the Crew MCP (Model Context Protocol) server on stdin/stdout,
     /// proxying to the running engine's IPC. Agents use it to create, read,
     /// and message chats. Logs go to stderr; stdout is the protocol.
     Mcp,
-    /// Manage `zeron headless` as a background service (launchd / systemd --user).
+    /// Manage the isolated Crew Canary engine as a background service.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -63,7 +85,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DaemonCommand {
-    /// Install, enable, and start the service (captures ZERON_* env).
+    /// Install, enable, and start the isolated service.
     Install,
     /// Stop and remove the service.
     Uninstall,
@@ -77,35 +99,6 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
-/// `ZERON_EDGE_URL` overrides (local dev / self-hosting).
-const DEFAULT_EDGE_URL: &str = "https://edge.zeron.sh";
-
-/// Production WorkOS AuthKit client id — public knowledge (it appears in every
-/// authorize URL), so baking it in is safe. Overridden by `ZERON_WORKOS_CLIENT_ID`;
-/// set it to the empty string — or set a dev bearer via `ZERON_EDGE_TOKEN` — to
-/// force dev-mode auth instead.
-const DEFAULT_WORKOS_CLIENT_ID: &str = "client_01KWD0EAKZKD50YCQJNYSRE4BY";
-
-fn edge_url_from_env() -> String {
-    std::env::var("ZERON_EDGE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
-}
-
-/// WorkOS client id resolution: explicit env wins (empty string = dev mode);
-/// otherwise a `ZERON_EDGE_TOKEN` dev bearer keeps dev mode (smoke tests,
-/// local wrangler); otherwise the baked production client id makes optional
-/// sync available while a bare start remains local-only.
-fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
-    match std::env::var("ZERON_WORKOS_CLIENT_ID") {
-        Ok(v) if v.trim().is_empty() => None,
-        Ok(v) => Some(v),
-        Err(_) if edge_token.is_some() => None,
-        Err(_) => Some(DEFAULT_WORKOS_CLIENT_ID.into()),
-    }
-}
 
 /// mimalloc, macOS only: libmalloc never returns the streaming churn's
 /// high-water pages, so transient allocation became permanent RSS
@@ -145,16 +138,20 @@ fn spawn_malloc_trimmer() {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = zeron_harness::omp::run_supervisor_from_env() {
+        return result.map_err(anyhow::Error::from);
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--noop-browser")) {
         return Ok(());
     }
     #[cfg(windows)]
     attach_parent_console();
     let cli = Cli::parse();
+    let mut config = cli.runtime.config()?;
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;
-    } else if matches!(&cli.command, None | Some(Command::Headless)) {
+    } else if matches!(&cli.command, None | Some(Command::Headless(_))) {
         zeron_update::windows::cleanup_previous_image();
     }
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
@@ -163,7 +160,7 @@ fn main() -> anyhow::Result<()> {
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let long_running = matches!(&cli.command, None | Some(Command::Headless(_)));
     let default_filter = if long_running {
         "info,loro_internal=warn,loro=warn"
     } else {
@@ -182,7 +179,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             "headed"
         };
-        open_log_file(mode)
+        open_log_file(&config.data_dir, mode)
     } else {
         None
     };
@@ -191,7 +188,7 @@ fn main() -> anyhow::Result<()> {
         use tracing_subscriber::util::SubscriberInitExt;
         // `zeron mcp` owns stdout for the protocol: a single log line on it
         // would corrupt the JSON-RPC stream, so its diagnostics go to stderr.
-        if matches!(&cli.command, Some(Command::Mcp)) {
+        if !long_running {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(
@@ -232,28 +229,41 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Some(Command::Headless) => {
+        Some(Command::Headless(args)) => {
+            if let Some(path) = args.device_bootstrap_file {
+                crew_cli::configure_device(&mut config, &path)?;
+            }
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(async {
-                let engine = zeron_engine::Engine::new(engine_config_from_env());
-                engine.run().await
-            })
+            runtime.block_on(zeron_engine::Engine::new(config).run())
         }
         Some(Command::Login) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::login(engine_config_from_env()))
+            runtime.block_on(auth_cli::login(config))
         }
         Some(Command::Logout) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::logout(engine_config_from_env()))
+            runtime.block_on(auth_cli::logout(config))
         }
         Some(Command::Status) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(auth_cli::status(engine_config_from_env()))
+            runtime.block_on(auth_cli::status(config))
+        }
+        Some(Command::ScaffoldAuthority) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(crew_cli::scaffold_authority(config.ipc_port))
+        }
+        Some(Command::Session { command }) => {
+            tokio::runtime::Runtime::new()?.block_on(session_cli::run(command, config.ipc_port))
+        }
+        Some(Command::Scaffold { command }) => {
+            tokio::runtime::Runtime::new()?.block_on(session_cli::scaffold(command, config.ipc_port))
+        }
+        Some(Command::ImportBackup { backup, destination }) => {
+            tokio::runtime::Runtime::new()?.block_on(session_cli::import(backup, destination, config.ipc_port))
         }
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+            runtime.block_on(sync_cli(config.ipc_port))
         }
         Some(Command::Mcp) => {
             // One bridge per agent session, and it only relays: stdio
@@ -265,19 +275,23 @@ fn main() -> anyhow::Result<()> {
                 .worker_threads(2)
                 .enable_all()
                 .build()?;
-            runtime.block_on(zeron_mcp::run(zeron_mcp::McpConfig::from_env()))
+            let mut mcp = zeron_mcp::McpConfig::from_env();
+            mcp.ipc_port = config.ipc_port;
+            if let Ok(id) = std::env::var("COMET_SESSION_ID") { mcp.origin.chat_id = Some(id); }
+            if let Ok(id) = std::env::var("COMET_DEVICE_ID") { mcp.origin.device_id = Some(id); }
+            runtime.block_on(zeron_mcp::run(mcp))
         }
         #[cfg(target_os = "linux")]
         Some(Command::Appshot) => {
-            zeron_ui::appshots::request_running_appshot(&engine_config_from_env().data_dir)
+            zeron_ui::appshots::request_running_appshot(&config.data_dir)
                 .map_err(anyhow::Error::msg)
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+            runtime.block_on(update_cli::update(&config.edge_url, check))
         }
         Some(Command::Daemon { command }) => match command {
-            DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
+            DaemonCommand::Install => daemon::install(&config),
             DaemonCommand::Uninstall => daemon::uninstall(),
             DaemonCommand::Start => daemon::start(),
             DaemonCommand::Stop => daemon::stop(),
@@ -285,21 +299,18 @@ fn main() -> anyhow::Result<()> {
             DaemonCommand::Status => daemon::status(),
         },
         None => {
-            let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
-            // Headed: the UI probes ZERON_IPC_PORT and connects to a running
-            // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
-                data_dir: paths::data_dir(),
-                ipc_port: std::env::var("ZERON_IPC_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
-                edge_url: edge_url_from_env(),
-                workos_client_id: workos_client_id_from_env(&edge_token),
-                edge_token,
-                org_id: std::env::var("ZERON_ORG_ID").ok(),
-                default_harness: zeron_ui::HarnessId::ClaudeCode,
+                data_dir: config.data_dir,
+                ipc_port: config.ipc_port,
+                edge_url: config.edge_url,
+                workos_client_id: config.workos_client_id,
+                edge_token: config.edge_token,
+                org_id: config.org_id,
+                default_harness: config.default_harness,
                 initial_url: cli.open_url,
+                scaffold: config.scaffold,
+                managed_inference: config.managed_inference,
+                scaffold_runtime_artifact: config.scaffold_runtime_artifact,
             });
             Ok(())
         }
@@ -331,45 +342,6 @@ fn attach_parent_console() {
     }
 }
 
-/// The env-resolved engine configuration shared by `headless`, `login`,
-/// `logout`, and `status` — one resolution so the CLI auth commands always
-/// operate on the exact session the daemon will load.
-fn engine_config_from_env() -> zeron_engine::EngineConfig {
-    // Dev-mode bearer (no WorkOS): an explicit token enables sync.
-    let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
-    zeron_engine::EngineConfig {
-        data_dir: paths::data_dir(),
-        edge_url: edge_url_from_env(),
-        ipc_port: std::env::var("ZERON_IPC_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
-        default_harness: harness_from_env(),
-        // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
-        // default "dev-org") scopes the workspace room otherwise.
-        org_id: std::env::var("ZERON_ORG_ID").ok(),
-        // Real auth against production by default; see
-        // `workos_client_id_from_env` for the dev-mode escape hatches.
-        workos_client_id: workos_client_id_from_env(&edge_token),
-        edge_token,
-    }
-}
-
-/// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
-/// config row — `mock` powers the e2e smoke; default `claude-code`.
-fn harness_from_env() -> zeron_engine::HarnessId {
-    match std::env::var("ZERON_HARNESS").as_deref().map(str::trim) {
-        Ok("mock") => zeron_engine::HarnessId::Mock,
-        Ok("codex") => zeron_engine::HarnessId::Codex,
-        Ok("cursor") => zeron_engine::HarnessId::Cursor,
-        Ok("devin") => zeron_engine::HarnessId::Devin,
-        Ok("grok") => zeron_engine::HarnessId::Grok,
-        Ok("hermes") => zeron_engine::HarnessId::Hermes,
-        Ok("pi") => zeron_engine::HarnessId::Pi,
-        Ok("antigravity") => zeron_engine::HarnessId::Antigravity,
-        _ => zeron_engine::HarnessId::ClaudeCode,
-    }
-}
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
 /// The introspection surface every 2026-08 incident was missing — "is this
@@ -507,9 +479,8 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
 /// the exact moment they were needed). A launch that finds the canonical file
 /// locked logs to `zeron-{mode}.{pid}.log` instead; the next lock-holding
 /// launch sweeps pid-suffixed files older than a week.
-fn open_log_file(mode: &str) -> Option<std::fs::File> {
-    let dir = paths::data_dir().join("logs");
-    open_log_file_in(&dir, mode)
+fn open_log_file(data_dir: &std::path::Path, mode: &str) -> Option<std::fs::File> {
+    open_log_file_in(&data_dir.join("logs"), mode)
 }
 
 /// Dir-parameterized body of [`open_log_file`] (unit-testable without env).

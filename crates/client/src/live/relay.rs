@@ -158,6 +158,16 @@ impl Relay {
         unreachable!("the second attempt always returns")
     }
 
+    /// Non-idempotent control-plane mutations must never retry an ambiguous call.
+    pub(crate) async fn call_once(&self, device_id: &str, method: &str, params: Value) -> Result<Value> {
+        let client = self.links.client(device_id).await.map_err(|e| map_rpc(device_id, method, e))?;
+        match tokio::time::timeout(deadline(method), client.call(method, params)).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(map_rpc(device_id, method, error)),
+            Err(_) => Err(ClientError::HostUnavailable(format!("{method} outcome unknown; reconcile command id"))),
+        }
+    }
+
     /// Chunked upload (`UploadChunk` ×N with `seq`, then `UploadCommit`).
     /// Returns the durable host path. Idempotent per `upload_id`.
     pub(crate) async fn upload(

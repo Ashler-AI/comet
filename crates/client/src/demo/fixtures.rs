@@ -413,6 +413,7 @@ pub(crate) fn seed(
             _ => None,
         };
         let chat = Chat {
+            crew: None,
             id: demo.id.into(),
             device_id: demo.device.into(),
             title: Some(demo.title.into()),

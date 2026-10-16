@@ -6115,26 +6115,24 @@ rename to new_name.rs
     }
 
     fn chat(checkout: Option<&str>, device: &str, cwd: Option<&str>) -> Chat {
-        Chat {
-            id: "c1".into(),
-            device_id: device.into(),
-            title: None,
-            archived: false,
-            cwd: cwd.map(Into::into),
-            branch: None,
-            checkout_id: checkout.map(Into::into),
-            source_context: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            parent_chat_id: None,
-            space_id: None,
-            last_seen_at: None,
-            room_gen: None,
-        }
+        Chat { crew: None, id: "c1".into(),
+        device_id: device.into(),
+        title: None,
+        archived: false,
+        cwd: cwd.map(Into::into),
+        branch: None,
+        checkout_id: checkout.map(Into::into),
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at: None,
+        created_at: Utc::now(),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: None,
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     #[test]

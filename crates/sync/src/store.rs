@@ -16,6 +16,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("command conflict: {0}")]
+    CommandConflict(String),
 }
 
 /// Synchronous command/doc callbacks still need commit-before-send semantics.
@@ -74,6 +76,24 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE sync_job_clock (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL) STRICT;
     INSERT INTO sync_job_clock VALUES (1,0);",
     "ALTER TABLE chat_sync_jobs ADD COLUMN cursor TEXT NOT NULL DEFAULT '';",
+    "CREATE TABLE crew_commands (
+        command_id TEXT PRIMARY KEY,
+        request BLOB NOT NULL,
+        outcome BLOB
+    ) STRICT;",
+    "CREATE TABLE legacy_crew_records (
+        doc_id TEXT NOT NULL,
+        container TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        value BLOB NOT NULL,
+        PRIMARY KEY(doc_id,container,record_id)
+    ) STRICT;",
+    // Observed directory evidence survives deleting a transcript. Work itself
+    // uses chat_sync_jobs, including its conditional-completion generation.
+    "CREATE TABLE crew_directory_state (
+        doc_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL
+    ) STRICT;",
 ];
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -106,12 +126,17 @@ pub struct DocsStore {
     failed_publications: Mutex<HashSet<String>>,
     /// Snapshot jobs wait here asynchronously before entering the blocking pool.
     pub snapshot_writer: std::sync::Arc<tokio::sync::Mutex<()>>,
+    directory_changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl DocsStore {
     /// Open (creating directory, database, and schema as needed).
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let data_dir = data_dir.as_ref();
+        if data_dir.join("crew-import-incomplete").exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "incomplete Crew import: retain it for diagnosis and import into a fresh profile").into());
+        }
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join("docs.sqlite3");
         let mut conn = Connection::open(&path)?;
@@ -131,7 +156,63 @@ impl DocsStore {
             conn: Mutex::new(conn),
             failed_publications: Mutex::new(HashSet::new()),
             snapshot_writer: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            directory_changed: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    pub fn watch_directory(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.directory_changed.subscribe()
+    }
+
+    pub fn queue_directory(&self, id: &str) -> Result<(), StoreError> {
+        self.schedule_sync_job(id, "crew-directory")?;
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
+    }
+
+    pub fn directory_state(&self, id: &str) -> Result<Option<String>, StoreError> {
+        store_blocking(|| Ok(self.conn().query_row(
+            "SELECT state FROM crew_directory_state WHERE doc_id=?1", params![id], |r| r.get(0),
+        ).optional()?))
+    }
+
+    pub fn save_directory_state(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        store_blocking(|| {
+            self.conn().execute(
+                "INSERT INTO crew_directory_state(doc_id,state) VALUES (?1,?2)
+                 ON CONFLICT(doc_id) DO UPDATE SET state=excluded.state", params![id, state],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Reject oversized compressed snapshots before SQLite allocates their blob.
+    pub fn load_directory_snapshot(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let size: Option<i64> = conn.query_row(
+                "SELECT length(bytes) FROM snapshots WHERE doc_id=?1", params![id], |r| r.get(0),
+            ).optional()?;
+            if size.is_some_and(|size| size > 32 * 1024 * 1024) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                    "directory snapshot exceeds 32 MiB; reconciliation required").into());
+            }
+            Ok(conn.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1",
+                params![id], |r| r.get(0)).optional()?)
+        })
+    }
+
+    fn queue_directory_in(&self, tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), StoreError> {
+        if uuid::Uuid::parse_str(id).is_ok() {
+            tx.execute("UPDATE sync_job_clock SET value=value+1 WHERE id=1", [])?;
+            tx.execute(
+                "INSERT INTO chat_sync_jobs(doc_id,kind,version)
+                 SELECT ?1,'crew-directory',value FROM sync_job_clock WHERE id=1
+                 ON CONFLICT(doc_id,kind) DO UPDATE SET version=excluded.version",
+                params![id],
+            )?;
+        }
+        Ok(())
     }
 
     /// Insert before sending. Stable IDs make crash-after-ACK replay idempotent.
@@ -317,7 +398,9 @@ impl DocsStore {
             params![doc_id, bytes, now_ms()],
         )?;
         self.invalidate_failed_publication(&tx, doc_id)?;
+        self.queue_directory_in(&tx, doc_id)?;
         tx.commit()?;
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
@@ -350,7 +433,9 @@ impl DocsStore {
             params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
         )?;
         self.invalidate_failed_publication(&tx, doc_id)?;
+        self.queue_directory_in(&tx, doc_id)?;
         tx.commit()?;
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
@@ -382,7 +467,9 @@ impl DocsStore {
             params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
         )?;
         self.invalidate_failed_publication(&tx, doc_id)?;
+        self.queue_directory_in(&tx, doc_id)?;
         tx.commit()?;
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
@@ -473,7 +560,7 @@ impl DocsStore {
         tx.execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
         tx.execute("DELETE FROM chat_outbox WHERE doc_id = ?1", params![doc_id])?;
         tx.execute(
-            "DELETE FROM chat_sync_jobs WHERE doc_id = ?1",
+            "DELETE FROM chat_sync_jobs WHERE doc_id = ?1 AND kind != 'crew-directory'",
             params![doc_id],
         )?;
         tx.execute(
@@ -567,6 +654,85 @@ impl DocsStore {
             params![command_id, now_ms()],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Claim immutable Crew control intent before network delivery. An existing
+    /// claim without an outcome is ambiguous and must be reconciled, never replayed.
+    pub fn claim_crew_command(&self, id: &str, request: &[u8]) -> Result<bool, StoreError> {
+        store_blocking(|| {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let existing: Option<Vec<u8>> = tx.query_row(
+                "SELECT request FROM crew_commands WHERE command_id=?1", [id],
+                |row| row.get(0),
+            ).optional()?;
+            if let Some(existing) = existing {
+                if existing != request {
+                    return Err(StoreError::CommandConflict(id.into()));
+                }
+                return Ok(false);
+            }
+            let claimed = tx.execute(
+                "INSERT OR IGNORE INTO processed_commands(command_id,processed_at) VALUES (?1,?2)",
+                params![id, now_ms()],
+            )?;
+            if claimed == 0 {
+                return Err(StoreError::CommandConflict(format!("{id}: legacy claim has no intent")));
+            }
+            tx.execute("INSERT INTO crew_commands(command_id,request) VALUES (?1,?2)", params![id, request])?;
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn crew_command(&self, id: &str) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>, StoreError> {
+        store_blocking(|| Ok(self.conn().query_row(
+            "SELECT request,outcome FROM crew_commands WHERE command_id=?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?))
+    }
+
+    /// Terminal outcomes are immutable. Identical completion is idempotent.
+    pub fn finish_crew_command(&self, id: &str, outcome: &[u8]) -> Result<(), StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let changed = conn.execute(
+                "UPDATE crew_commands SET outcome=?2 WHERE command_id=?1 AND (outcome IS NULL OR outcome=?2)",
+                params![id, outcome],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::CommandConflict(format!("{id}: missing claim or conflicting outcome")));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn crew_commands(&self) -> Result<Vec<(String, Vec<u8>, Option<Vec<u8>>)>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT command_id,request,outcome FROM crew_commands ORDER BY command_id")?;
+            Ok(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub fn pending_crew_commands(&self, after: &str, limit: usize) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT command_id,request FROM crew_commands WHERE outcome IS NULL AND command_id>?1 ORDER BY command_id LIMIT ?2")?;
+            Ok(stmt.query_map(params![after, limit.clamp(1, 64) as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Lossless migration evidence/outcomes, never an execution queue.
+    pub fn legacy_crew_records(&self, doc_id: &str) -> Result<Vec<(String, String, Vec<u8>)>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT container,record_id,value FROM legacy_crew_records WHERE doc_id=?1 ORDER BY container,record_id")?;
+            Ok(stmt.query_map([doc_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<_, _>>()?)
+        })
     }
 
     // Every snapshot path, including ACK/cursor persistence, must retain a

@@ -118,6 +118,7 @@ fn project_dirs(harness: HarnessId) -> &'static [&'static str] {
         HarnessId::Grok => &[".agents/skills", ".claude/skills", ".grok/skills"],
         HarnessId::Hermes => &[".agents/skills"],
         HarnessId::Pi => &[".agents/skills", ".pi/skills"],
+        HarnessId::Omp => &[".agents/skills", ".omp/skills"],
         HarnessId::Devin => &[".agents/skills"],
         HarnessId::Antigravity => &[".agents/skills", ".gemini/skills"],
         HarnessId::Codex => &[".agents/skills", ".codex/skills"],
@@ -142,6 +143,13 @@ fn discover_at(harness: HarnessId, cwd: &Path, home: &Path) -> Result<Vec<Skill>
             std::env::var_os("PI_CODING_AGENT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".pi/agent"))
+                .join("skills"),
+            String::new(),
+        )),
+        HarnessId::Omp => roots.push((
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".omp/agent"))
                 .join("skills"),
             String::new(),
         )),

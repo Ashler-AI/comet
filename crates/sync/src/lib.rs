@@ -13,9 +13,11 @@
 pub mod budget;
 pub mod chat_client;
 pub mod chat_frames;
+pub mod crew_import;
 pub mod dial;
 pub mod net_path;
 pub mod registry;
+pub mod scaffold_auth;
 pub mod socket;
 mod store;
 mod sync_jobs;

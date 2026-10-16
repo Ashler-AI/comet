@@ -251,32 +251,29 @@ fn device(id: &str, name: &str) -> Device {
 }
 
 fn chat(id: &str, device_id: &str) -> Chat {
-    Chat {
-        id: id.into(),
-        device_id: device_id.into(),
-        title: Some("First chat".into()),
-        archived: false,
-        cwd: Some("/tmp/repo".into()),
-        branch: Some("main".into()),
-        checkout_id: None,
-        source_context: None,
-        config: Some(ChatConfig {
-            harness: HarnessId::Mock,
-            model: Some("mock-1".into()),
-            reasoning: None,
-            model_options: Default::default(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-        }),
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: ts(2_000),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        parent_chat_id: Some("parent-chat".into()),
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None,
-    }
+    Chat { id: id.into(), crew: None, device_id: device_id.into(),
+    title: Some("First chat".into()),
+    archived: false,
+    cwd: Some("/tmp/repo".into()),
+    branch: Some("main".into()),
+    checkout_id: None,
+    source_context: None,
+    config: Some(ChatConfig {
+        harness: HarnessId::Mock,
+        model: Some("mock-1".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    }),
+    last_message_preview: None,
+    last_message_at: None,
+    created_at: ts(2_000),
+    harness_session_id: None,
+    harness_session_cwd: None,
+    parent_chat_id: Some("parent-chat".into()),
+    space_id: None,
+    last_seen_at: None,
+    room_gen: None, }
 }
 
 fn space(id: &str, device_id: &str, path: &str) -> Space {
@@ -2222,4 +2219,39 @@ fn attaching_an_edge_after_local_only_writes_reseeds_them() {
     let mut doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
     doc.set_local_only(false);
     assert_eq!(doc.pending_len(), 0);
+}
+
+#[test]
+fn directory_projection_never_labels_pending_rename_with_acknowledged_sequence() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    assert!(doc.acknowledged_row(KIND_CHATS, "chat-1").is_none());
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut doc]);
+    let before = doc.acknowledged_row(KIND_CHATS, "chat-1").unwrap().clone();
+    doc.rename_chat("chat-1", "Manual rename").unwrap();
+    assert_eq!(doc.chat("chat-1").unwrap().unwrap().title.as_deref(), Some("Manual rename"));
+    assert_eq!(doc.acknowledged_row(KIND_CHATS, "chat-1"), Some(&before));
+    server_round(&mut server, &mut seq, &mut [&mut doc]);
+    let acknowledged = doc.acknowledged_row(KIND_CHATS, "chat-1").unwrap();
+    assert!(acknowledged.seq > before.seq);
+    assert_eq!(acknowledged.fields["title"], json!("Manual rename"));
+    assert!(acknowledged.clocks["title"] > before.clocks["title"]);
+    doc.delete_chat("chat-1").unwrap();
+    assert!(!doc.acknowledged_row(KIND_CHATS, "chat-1").unwrap().deleted);
+    server_round(&mut server, &mut seq, &mut [&mut doc]);
+    assert!(doc.acknowledged_rows_after(KIND_CHATS, "", 64)[0].deleted);
+}
+
+#[test]
+fn directory_sequence_reset_requires_reconciliation_even_after_reseed_and_restart() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.apply_state(40, true, 0, Vec::new());
+    assert!(!doc.directory_reconciliation_required());
+    doc.apply_state(2, true, 0, Vec::new());
+    assert!(doc.directory_reconciliation_required());
+    doc.apply_state(80, true, 0, Vec::new());
+    let restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
+    assert!(restored.directory_reconciliation_required());
 }

@@ -1,30 +1,40 @@
 import AuthenticationServices
+import CryptoKit
 import UIKit
 
 enum Endpoints {
-    static let edgeURL = URL(string: "https://edge.zeron.sh")!
-    static let workosClientId = "client_01KWD0EAKZKD50YCQJNYSRE4BY"
-    static let callbackScheme = "zeron"
-
-    static func authorizeURL(state: String) -> URL {
-        var c = URLComponents(string: "https://api.workos.com/user_management/authorize")!
-        c.queryItems = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: workosClientId),
-            URLQueryItem(name: "redirect_uri", value: "\(callbackScheme)://callback"),
-            URLQueryItem(name: "provider", value: "authkit"),
-            URLQueryItem(name: "state", value: state),
-        ]
-        return c.url!
+    static let callbackScheme = "crew-upstream-canary"
+    static func setting(_ key: String) throws -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+              !value.isEmpty, !value.contains("$(") else {
+            throw CoreError.Auth(message: "Configure \(key) for the isolated Crew Canary build.")
+        }
+        return value
+    }
+    static var edgeURL: URL? { (try? setting("CrewEdgeOrigin")).flatMap(URL.init(string:)) }
+    static var deploymentId: String? { try? setting("CrewDeploymentId") }
+    static var storageScope: String {
+        let fields = ["CrewControlOrigin", "CrewEdgeOrigin", "CrewProjectScope", "CrewDeploymentId"]
+            .map { (try? setting($0)) ?? "unconfigured" }
+        let encoded = (try? JSONEncoder().encode(fields)) ?? Data()
+        return SHA256.hash(data: encoded).map { String(format: "%02x", $0) }.joined()
+    }
+    static func login() throws -> CrewLogin {
+        try CrewLogin(controlOrigin: setting("CrewControlOrigin"),
+                      edgeOrigin: setting("CrewEdgeOrigin"),
+                      projectScope: setting("CrewProjectScope"),
+                      deploymentId: setting("CrewDeploymentId"))
     }
 }
 
-/// Sign in with WorkOS (system web auth sheet).
+/// Resource-bound Scaffold OAuth, shared with the host through the Rust core.
 final class SignInViewController: UIViewController, ASWebAuthenticationPresentationContextProviding {
     private let app: AppModel
     private let status = UILabel()
     private let signIn = UIButton(type: .system)
     private var session: ASWebAuthenticationSession?
+    private var login: CrewLogin?
+    private var appToken: AnyObject?
 
     init(app: AppModel) {
         self.app = app
@@ -39,7 +49,7 @@ final class SignInViewController: UIViewController, ASWebAuthenticationPresentat
         let mark = UIImageView(image: UIImage(systemName: "sparkle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 44, weight: .light)))
         mark.tintColor = Palette.text
         let title = UILabel()
-        title.text = "Zeron"
+        title.text = "Crew Canary"
         title.font = Fonts.ui(.sansSemibold, 34)
         title.textColor = Palette.text
         let tagline = UILabel()
@@ -61,12 +71,14 @@ final class SignInViewController: UIViewController, ASWebAuthenticationPresentat
         }
         signIn.configuration = primary
         signIn.accessibilityIdentifier = "sign-in"
-        signIn.addAction(UIAction { [weak self] _ in self?.startWorkOS() }, for: .touchUpInside)
+        signIn.addAction(UIAction { [weak self] _ in self?.startCrewLogin() }, for: .touchUpInside)
 
         status.font = Fonts.ui(.sans, 14)
         status.textColor = Palette.danger
         status.numberOfLines = 0
         status.textAlignment = .center
+        status.text = app.restoreError
+        appToken = app.observe { [weak self] in self?.status.text = self?.app.restoreError }
 
         let top = UIStackView(arrangedSubviews: [mark, title, tagline])
         top.axis = .vertical
@@ -88,45 +100,46 @@ final class SignInViewController: UIViewController, ASWebAuthenticationPresentat
         ])
     }
 
-    private func startWorkOS() {
-        let state = UUID().uuidString
-        let s = ASWebAuthenticationSession(url: Endpoints.authorizeURL(state: state), callback: .customScheme(Endpoints.callbackScheme)) { [weak self] url, error in
-            guard let self else { return }
-            if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin { return }
-            guard let url, let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
-                  let code = items.first(where: { $0.name == "code" })?.value,
-                  items.first(where: { $0.name == "state" })?.value == state
-            else {
-                self.status.text = "Sign-in didn't complete. Try again."
-                return
-            }
-            self.signIn.configuration?.showsActivityIndicator = true
-            Task { @MainActor in
-                do {
-                    try await self.app.signIn(code: code) { orgs in await self.pickOrg(orgs) }
-                } catch {
-                    self.status.text = error.localizedDescription
+    private func startCrewLogin() {
+        app.cancelPendingRestore()
+        signIn.isEnabled = false
+        signIn.configuration?.showsActivityIndicator = true
+        status.text = nil
+        Task { @MainActor in
+            do {
+                let login = try Endpoints.login()
+                self.login = login
+                let authorize = try await login.begin(redirectUri: "\(Endpoints.callbackScheme)://callback")
+                guard let url = URL(string: authorize) else { throw CoreError.Auth(message: "Invalid authorization URL") }
+                let session = ASWebAuthenticationSession(url: url, callback: .customScheme(Endpoints.callbackScheme)) { [weak self] callback, error in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        defer {
+                            self.signIn.isEnabled = true
+                            self.signIn.configuration?.showsActivityIndicator = false
+                            self.login = nil
+                        }
+                        guard let callback else {
+                            login.cancel()
+                            if (error as? ASWebAuthenticationSessionError)?.code != .canceledLogin {
+                                self.status.text = error?.localizedDescription ?? "Sign-in did not complete."
+                            }
+                            return
+                        }
+                        do { try self.app.signIn(account: await login.complete(callback: callback.absoluteString)) }
+                        catch { self.status.text = error.localizedDescription }
+                    }
                 }
-                self.signIn.configuration?.showsActivityIndicator = false
+                session.presentationContextProvider = self
+                session.prefersEphemeralWebBrowserSession = false
+                self.session = session
+                if !session.start() { throw CoreError.Auth(message: "Could not open the sign-in sheet.") }
+            } catch {
+                login?.cancel()
+                status.text = error.localizedDescription
+                signIn.isEnabled = true
+                signIn.configuration?.showsActivityIndicator = false
             }
-        }
-        s.presentationContextProvider = self
-        s.prefersEphemeralWebBrowserSession = false
-        session = s
-        s.start()
-    }
-
-    /// Several organizations: let the user pick (nil = cancelled).
-    @MainActor
-    private func pickOrg(_ orgs: [AuthOrg]) async -> AuthOrg? {
-        await withCheckedContinuation { cont in
-            let sheet = UIAlertController(title: "Choose an organization", message: nil, preferredStyle: .actionSheet)
-            for org in orgs {
-                sheet.addAction(UIAlertAction(title: org.name, style: .default) { _ in cont.resume(returning: org) })
-            }
-            sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in cont.resume(returning: nil) })
-            sheet.popoverPresentationController?.sourceView = signIn
-            present(sheet, animated: true)
         }
     }
 

@@ -35,6 +35,31 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 struct Preferences {
     policies: HashMap<HarnessId, HarnessUpdatePolicy>,
     dismissed_versions: HashMap<HarnessId, String>,
+    // None lets a copied source update-prefs.json migrate once without
+    // overriding an explicit choice in this coordinator's newer settings.
+    harness_auto_update: Option<bool>,
+}
+
+fn store_preferences(path: &Path, prefs: &Preferences) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(prefs).map_err(|error| error.to_string())?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)
+        .and_then(|()| std::fs::rename(&temp, path))
+        .map_err(|error| format!("harness update preferences save failed: {error}"))
+}
+
+fn version_transition(data_dir: &Path) -> bool {
+    let stamp = data_dir.join("last-boot-version");
+    let current = env!("CARGO_PKG_VERSION");
+    let previous = std::fs::read_to_string(&stamp).ok();
+    if previous.as_deref().map(str::trim) == Some(current) {
+        return false;
+    }
+    if let Err(error) = std::fs::write(stamp, current) {
+        tracing::warn!(%error, "boot-version stamp not persisted");
+        return false;
+    }
+    previous.is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -252,6 +277,15 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: Some(&["update", "--self"]),
             manual_command: "pi update --self",
         },
+        HarnessId::Omp => ProviderSpec {
+            version_args: &["--version"],
+            latest: LatestSource::Github {
+                repository: "can1357/oh-my-pi",
+                tag_prefix: "v",
+            },
+            update_args: Some(&["update"]),
+            manual_command: "omp update",
+        },
         HarnessId::Opencode => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Opencode,
@@ -406,10 +440,21 @@ impl Drop for UpdateIntentGuard {
 impl HarnessUpdateCoordinator {
     pub fn new(data_dir: &Path, registry: Arc<HarnessRegistry>) -> Self {
         let prefs_path = data_dir.join("harness-update-prefs.json");
-        let prefs: Preferences = std::fs::read_to_string(&prefs_path)
+        let mut prefs: Preferences = std::fs::read_to_string(&prefs_path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        if prefs.harness_auto_update.is_none() {
+            // Only read the explicitly imported copy, never the live Crew store.
+            let legacy: Preferences = std::fs::read(data_dir.join("update-prefs.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            prefs.harness_auto_update = Some(legacy.harness_auto_update.unwrap_or(true));
+            if let Err(error) = store_preferences(&prefs_path, &prefs) {
+                tracing::warn!(%error, "harness update preference migration not persisted");
+            }
+        }
         let order: Vec<_> = registry
             .descriptors()
             .into_iter()
@@ -470,6 +515,70 @@ impl HarnessUpdateCoordinator {
                     .unwrap_or_default(),
             }),
         }
+    }
+
+    /// Persisted post-Crew-update policy, independent of per-agent monitoring.
+    pub fn harness_auto_update(&self) -> bool {
+        lock(&self.inner.prefs).harness_auto_update.unwrap_or(true)
+    }
+
+    pub fn set_harness_auto_update(&self, enabled: bool) -> Result<(), String> {
+        let mut prefs = lock(&self.inner.prefs);
+        let previous = prefs.harness_auto_update;
+        prefs.harness_auto_update = Some(enabled);
+        if let Err(error) = store_preferences(&self.inner.prefs_path, &prefs) {
+            prefs.harness_auto_update = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn post_update_enabled(&self) -> bool {
+        self.harness_auto_update()
+            && !std::env::var("COMET_UPDATE_HARNESSES").is_ok_and(|value| {
+                matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no")
+            })
+    }
+
+    /// Call once at engine boot. Manual canaries pass false: preserve the
+    /// preference and boot stamp, but never probe or mutate provider installs.
+    /// A supported signed delivery refreshes installed, enabled agents once
+    /// per Crew version transition, using the coordinator's idle/update locks.
+    pub fn post_update_refresh(&self, data_dir: &Path, supported: bool) {
+        let transitioned = version_transition(data_dir);
+        if !supported || !transitioned || !self.post_update_enabled() {
+            return;
+        }
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = coordinator.inner.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(20)) => {}
+            }
+            for harness in &coordinator.inner.order {
+                if !coordinator.post_update_enabled() || coordinator.inner.shutdown.is_cancelled() {
+                    break;
+                }
+                if !coordinator.inner.registry.enabled_set().contains(harness)
+                    || coordinator.policy(*harness) == HarnessUpdatePolicy::Off
+                    || coordinator.executable(*harness).is_err()
+                {
+                    continue;
+                }
+                if let Err(error) = coordinator.check_one_inner(*harness).await {
+                    tracing::warn!(?harness, %error, "post-update agent check failed");
+                    continue;
+                }
+                let status = coordinator.status(*harness);
+                if coordinator.post_update_enabled()
+                    && status.can_apply
+                    && matches!(status.phase, HarnessUpdatePhase::Available | HarnessUpdatePhase::ManualActionRequired)
+                    && let Err(error) = coordinator.apply(*harness).await
+                {
+                    tracing::warn!(?harness, %error, "post-update agent refresh failed");
+                }
+            }
+        });
     }
 
     /// Start the immediate check plus the six-hour jittered/retry loop. Bare
@@ -1767,18 +1876,8 @@ impl HarnessUpdateCoordinator {
         // Keep snapshot order and replacement order identical. Every writer
         // shares this lock and temporary path, including successful updates.
         let prefs = lock(&self.inner.prefs);
-        let json = match serde_json::to_string_pretty(&*prefs) {
-            Ok(json) => json,
-            Err(error) => {
-                tracing::warn!(%error, "harness update preferences serialize failed");
-                return;
-            }
-        };
-        let temp = self.inner.prefs_path.with_extension("json.tmp");
-        if let Err(error) = std::fs::write(&temp, json)
-            .and_then(|()| std::fs::rename(&temp, &self.inner.prefs_path))
-        {
-            tracing::warn!(%error, "harness update preferences save failed");
+        if let Err(error) = store_preferences(&self.inner.prefs_path, &prefs) {
+            tracing::warn!(%error);
         }
     }
 }
@@ -2985,6 +3084,42 @@ esac
                 HarnessUpdatePhase::Current
             );
         }
+        coordinator.shutdown().await;
+    }
+
+    #[test]
+    fn post_update_preference_migrates_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("update-prefs.json"), r#"{"harnessAutoUpdate":false}"#).unwrap();
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), Arc::new(HarnessRegistry::new()));
+        assert!(!coordinator.harness_auto_update());
+        coordinator.set_harness_auto_update(true).unwrap();
+        let restarted = super::HarnessUpdateCoordinator::new(temp.path(), Arc::new(HarnessRegistry::new()));
+        assert!(restarted.harness_auto_update());
+        assert!(!super::version_transition(temp.path()));
+        std::fs::write(temp.path().join("last-boot-version"), "0.0.0").unwrap();
+        // Unsupported/manual delivery records the transition without spawning.
+        restarted.post_update_refresh(temp.path(), false);
+        assert!(!super::version_transition(temp.path()));
+        let omp = provider(HarnessId::Omp);
+        assert_eq!(omp.update_args, Some(&["update"][..]));
+        assert!(matches!(omp.latest, LatestSource::Github { repository: "can1357/oh-my-pi", .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supported_post_update_runs_the_native_updater_once() {
+        let (temp, coordinator) = automatic_fixture();
+        std::fs::write(temp.path().join("last-boot-version"), "0.0.0").unwrap();
+        coordinator.post_update_refresh(temp.path(), true);
+        let mut status = coordinator.watch();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while coordinator.status(HarnessId::Grok).phase != HarnessUpdatePhase::Updated {
+                status.changed().await.unwrap();
+            }
+        }).await.unwrap();
+        assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "2.0.0\n");
+        assert!(!super::version_transition(temp.path()));
         coordinator.shutdown().await;
     }
 

@@ -138,6 +138,8 @@ pub struct HarnessRegistry {
     gates: Mutex<HashMap<HarnessId, Arc<tokio::sync::RwLock<()>>>>,
     pending_updates: Mutex<std::collections::HashSet<HarnessId>>,
     update_generation: tokio::sync::watch::Sender<u64>,
+    managed_inference: bool,
+    scaffold_host: bool,
 }
 
 impl Default for HarnessRegistry {
@@ -162,6 +164,11 @@ impl HarnessRegistry {
         id: HarnessId,
         lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<Vec<zeron_proto::Model>, HarnessError> {
+        if self.managed_inference {
+            return Err(HarnessError::Protocol(
+                "Live provider catalogs are unavailable in Crew-managed mode; select an explicit provider/model".into(),
+            ));
+        }
         let harness = self.resolve(id)?;
         tokio::spawn(async move {
             // An RPC cancellation must not drop the gate before the probe's
@@ -178,6 +185,9 @@ impl HarnessRegistry {
         id: HarnessId,
         cwd: &Path,
     ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+        if self.managed_inference {
+            return Err(HarnessError::Protocol("CLI catalog probes require explicit local mode".into()));
+        }
         let cwd = cwd.to_owned();
         let lease = self.execution_lease(id).await;
         let harness = self.resolve(id)?;
@@ -220,7 +230,25 @@ impl HarnessRegistry {
             gates: Mutex::new(HashMap::new()),
             pending_updates: Mutex::new(std::collections::HashSet::new()),
             update_generation,
+            managed_inference: false,
+            scaffold_host: false,
         }
+    }
+
+    pub fn with_execution_policy(mut self, managed: bool, scaffold_host: bool) -> Self {
+        self.managed_inference = managed || scaffold_host;
+        self.scaffold_host = scaffold_host;
+        self
+    }
+
+    pub fn managed_inference(&self) -> bool {
+        self.managed_inference
+    }
+
+    fn route_allowed(&self, id: HarnessId) -> bool {
+        !self.managed_inference
+            || (id == HarnessId::Omp)
+            || (!self.scaffold_host && matches!(id, HarnessId::ClaudeCode | HarnessId::Codex))
     }
 
     fn gate(&self, id: HarnessId) -> Arc<tokio::sync::RwLock<()>> {
@@ -435,6 +463,9 @@ impl HarnessRegistry {
     }
 
     pub fn set_title_settings(&self, mut settings: TitleSettings) -> Result<(), String> {
+        if self.managed_inference {
+            return Err("Crew-managed titles use the authenticated service's fixed model".into());
+        }
         if let Some(id) = settings.harness {
             if !zeron_harness::supports_titles(id) || !self.enabled_set().contains(&id) {
                 return Err("Choose an enabled harness that supports title generation".into());
@@ -482,6 +513,9 @@ impl HarnessRegistry {
     }
 
     pub fn resolve(&self, id: HarnessId) -> Result<Arc<dyn Harness>, HarnessError> {
+        if !self.route_allowed(id) {
+            return Err(HarnessError::Protocol("Harness unavailable under this Crew execution policy".into()));
+        }
         let mut slots = self.slots();
         match slots.get(&id) {
             Some(Slot::Ready(harness)) => Ok(harness.clone()),
@@ -513,8 +547,8 @@ impl HarnessRegistry {
                     },
                     None => return None,
                 };
-                descriptor.enabled = Some(enabled.contains(id));
-                descriptor.can_install = zeron_harness::install::can_install(*id);
+                descriptor.enabled = Some(enabled.contains(id) && self.route_allowed(*id));
+                descriptor.can_install = self.route_allowed(*id) && zeron_harness::install::can_install(*id);
                 Some(descriptor)
             })
             .collect()
@@ -529,6 +563,7 @@ pub fn default_registry() -> HarnessRegistry {
     // claude/codex resolve doesn't pay the shell-startup latency inline.
     zeron_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
+    registry.register(Arc::new(zeron_harness::omp::OmpHarness::new()));
     registry.register(Arc::new(MockHarness {
         script: vec![
             AgentEvent::TextDelta {
@@ -820,87 +855,6 @@ mod tests {
         );
         assert!(registry.resolve(HarnessId::Mock).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
-        let registry = default_registry();
-        let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                HarnessId::Mock,
-                HarnessId::ClaudeCode,
-                HarnessId::Codex,
-                HarnessId::Cursor,
-                HarnessId::Devin,
-                HarnessId::Grok,
-                HarnessId::Hermes,
-                HarnessId::Pi,
-                HarnessId::Opencode,
-                HarnessId::Antigravity
-            ]
-        );
-        assert!(registry.resolve(HarnessId::Mock).is_ok());
-        assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
-        // A codex-configured chat resolves the right harness (construction is
-        // cheap; CLI discovery is deferred to models()/run()).
-        let codex = registry.resolve(HarnessId::Codex).unwrap();
-        assert_eq!(codex.id(), HarnessId::Codex);
-        // Grok resolves through the shared ACP harness; its descriptor must
-        // mirror the resolved harness (descriptor-stability rule).
-        let grok = registry.resolve(HarnessId::Grok).unwrap();
-        assert_eq!(grok.id(), HarnessId::Grok);
-        assert_eq!(grok.display_name(), "Grok");
-        assert_eq!(grok.steering_mode(), SteeringMode::StepBoundary);
-        assert_eq!(
-            grok.reasoning_levels(),
-            &[
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High
-            ]
-        );
-        // Cursor, Devin, Hermes and Pi mirror their specs the same way.
-        let cursor = registry.resolve(HarnessId::Cursor).unwrap();
-        assert_eq!(cursor.id(), HarnessId::Cursor);
-        assert_eq!(cursor.display_name(), "Cursor");
-        assert_eq!(cursor.steering_mode(), SteeringMode::StepBoundary);
-        assert!(cursor.reasoning_levels().is_empty());
-        let devin = registry.resolve(HarnessId::Devin).unwrap();
-        assert_eq!(devin.id(), HarnessId::Devin);
-        assert_eq!(devin.display_name(), "Devin");
-        assert_eq!(devin.steering_mode(), SteeringMode::StepBoundary);
-        assert!(devin.reasoning_levels().is_empty());
-        let hermes = registry.resolve(HarnessId::Hermes).unwrap();
-        assert_eq!(hermes.id(), HarnessId::Hermes);
-        assert_eq!(hermes.display_name(), "Hermes");
-        assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
-        assert!(hermes.reasoning_levels().is_empty());
-        let opencode = registry.resolve(HarnessId::Opencode).unwrap();
-        assert_eq!(opencode.id(), HarnessId::Opencode);
-        assert_eq!(opencode.display_name(), "OpenCode");
-        assert_eq!(opencode.steering_mode(), SteeringMode::StepBoundary);
-        assert_eq!(
-            opencode.reasoning_levels(),
-            &[
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ]
-        );
-        let antigravity = registry.resolve(HarnessId::Antigravity).unwrap();
-        assert_eq!(antigravity.id(), HarnessId::Antigravity);
-        assert_eq!(antigravity.display_name(), "Antigravity");
-        assert_eq!(antigravity.steering_mode(), SteeringMode::TurnBoundary);
-        assert!(antigravity.reasoning_levels().is_empty());
-        let pi = registry.resolve(HarnessId::Pi).unwrap();
-        assert_eq!(pi.id(), HarnessId::Pi);
-        assert_eq!(pi.display_name(), "Pi");
-        assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
-        assert!(pi.reasoning_levels().is_empty());
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`

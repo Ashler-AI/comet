@@ -16,6 +16,7 @@
 use crate::SessionCommandStatus;
 use crate::parts::{MessagePart, SidecarPayload, diff_stat, summarize_tool_output};
 use crate::schema::{DocError, SessionDoc};
+use loro::ToJson;
 
 /// Doc lineage epoch written by [`rebuild_thin_doc`]. Pre-migration s2 docs
 /// read back as 0.
@@ -55,6 +56,18 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
 
     if let Some(usage) = source.context_usage() {
         thin.update_context_usage(usage.tokens, usage.window)?;
+    }
+    for annotation in source.annotations()? {
+        thin.doc().get_map("crewAnnotations").insert(
+            &annotation.id,
+            loro::LoroValue::from(serde_json::to_value(&annotation)?),
+        )?;
+    }
+    let commands: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_value(
+        source.doc().get_map("crewAnnotationCommands").get_deep_value().to_json_value(),
+    )?;
+    for (id, record) in commands {
+        thin.doc().get_map("crewAnnotationCommands").insert(&id, loro::LoroValue::from(record))?;
     }
     let mut sidecar = Vec::new();
     let entries = source.read_entries()?;

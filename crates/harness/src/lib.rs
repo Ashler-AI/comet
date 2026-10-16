@@ -7,7 +7,8 @@
 //! ([`OpencodeHarness`] — what the opencode desktop app speaks). The shared
 //! [`AcpHarness`] remains ONLY for agents built ground-up on ACP — Devin
 //! (`devin acp`), Grok (`grok agent stdio`) Hermes (`hermes acp`) and
-//! Antigravity. Pi uses native JSONL RPC ([`PiHarness`]).
+//! Antigravity. Pi uses native JSONL RPC ([`PiHarness`]); OMP has its own
+//! native adapter ([`OmpHarness`]), exact journal ownership, and process supervisor.
 //! Adapter-mediated ACP for claude/codex/cursor was retired — and opencode's
 //! ACP layer with it: the adapters held prompt turns open for background
 //! work the CLIs themselves settle eagerly (and opencode's settles on the
@@ -38,6 +39,10 @@ pub enum HarnessError {
     Discovery(#[from] CatalogFailure),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("the native session {session_id} already has a writer")]
+    SessionBusy { session_id: String },
+    #[error("the native session writer's ownership could not be verified")]
+    SessionOwnerUnverified,
 }
 
 /// A steer prompt pushed into a live run; delivered at the harness's steering boundary.
@@ -123,6 +128,35 @@ pub fn same_model_options(
         .all(|key| a.get(key).and_then(canonical) == b.get(key).and_then(canonical))
 }
 
+/// Host-owned launch authority; never serialized into a request or chat document.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InferenceRoute {
+    pub base_url: String,
+    pub token: String,
+    pub provider: String,
+    pub model: String,
+}
+
+impl std::fmt::Debug for InferenceRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferenceRoute")
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunContext {
+    pub session_id: String,
+    pub ipc_port: u16,
+    pub inference: Option<InferenceRoute>,
+    /// One-shot native fork source; never exported to the child environment.
+    pub fork_from: Option<String>,
+}
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
     pub realtime: Option<codex::realtime::RealtimeControls>,
@@ -143,6 +177,8 @@ pub struct RunControls {
     pub interrupt: CancellationToken,
     /// Turn-level stop and background-work reporting (see [`TurnControl`]).
     pub turn: TurnControl,
+    /// Engine-owned session identity and optional managed inference authority.
+    pub context: Option<RunContext>,
 }
 
 /// Catalog provenance stays internal; RPC clients retain the Vec<Model> shape.
@@ -281,6 +317,10 @@ pub trait Harness: Send + Sync {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
+    /// Explicit takeover only; never signal a process without verifying ownership.
+    async fn stop_session(&self, _session_id: &str) -> Result<(), HarnessError> {
+        Err(HarnessError::SessionOwnerUnverified)
+    }
 }
 
 pub mod acp;
@@ -300,6 +340,10 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;
 pub mod opencode;
+pub mod omp;
+pub use omp::OmpHarness;
+mod run_context;
+pub(crate) use run_context::{apply_run_context, validate_inference_route};
 pub mod pi;
 pub mod process;
 mod scratch;
@@ -321,6 +365,9 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
 /// version manager's bin dir, and the CLIs themselves shell out to tools
 /// (git, rg, node) that a GUI/service launch's own PATH may lack.
 pub fn compose_child_path(cmd: &mut process::Command, exe: &std::path::Path) {
+    // Every child starts without a stale nested Crew identity. Run launchers
+    // apply their host-owned context after composing the executable environment.
+    apply_run_context(cmd, None);
     compose_path(
         cmd.as_std_mut(),
         exe.parent().filter(|d| !d.as_os_str().is_empty()),
@@ -508,6 +555,17 @@ pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;
 pub use pi::PiHarness;
+
+/// Offline choices only. Agent Auth checks account/model access when a run starts;
+/// catalog discovery must not launch a CLI or load local provider credentials.
+pub fn managed_models(harness: HarnessId) -> Option<Vec<Model>> {
+    match harness {
+        HarnessId::Omp => Some(omp::scaffold_models()),
+        HarnessId::ClaudeCode => Some(claude::catalog::static_models()),
+        HarnessId::Codex => Some(codex::catalog::static_models()),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Child lifecycle (shared by the codex and ACP harnesses)

@@ -27,6 +27,9 @@ pub struct EngineProfile {
     uploads_root: PathBuf,
     org_id: String,
     user_id: String,
+    managed_scaffold: bool,
+    device_id_override: Option<String>,
+    scaffold_profile_key: Option<String>,
 }
 
 impl EngineProfile {
@@ -41,12 +44,34 @@ impl EngineProfile {
             store_root,
             org_id: LOCAL_ORG_ID.to_string(),
             user_id: profile_id,
+            managed_scaffold: false,
+            device_id_override: None,
+            scaffold_profile_key: None,
         })
     }
 
     /// Resolve an authenticated profile under its account-specific storage root.
     pub fn synced(data_dir: &Path, org_id: &str, user_id: &str) -> Self {
         Self::account_scoped(data_dir, org_id, user_id, WorkspaceScope::Synced)
+    }
+
+    /// Open only the verified Crew identity, isolated by both configured origins.
+    /// The resulting paths never change if the live auth service changes accounts.
+    pub fn scaffold(data_dir: &Path, auth: &crate::auth::Auth) -> Result<Self, EngineError> {
+        let session = auth.verified_scaffold_session().ok_or_else(|| EngineError::Other("Scaffold profile requires a verified identity".into()))?;
+        let key = zeron_sync::scaffold_auth::profile_key(&session);
+        let store_root = data_dir.join("profiles").join("scaffold").join(&key);
+        Ok(Self {
+            scope: WorkspaceScope::Synced,
+            device_root: data_dir.to_path_buf(),
+            uploads_root: store_root.join("uploads"),
+            store_root,
+            org_id: session.identity.project_scope,
+            user_id: session.identity.user_id,
+            managed_scaffold: true,
+            device_id_override: session.device.map(|device| device.device_id),
+            scaffold_profile_key: Some(key),
+        })
     }
 
     /// Resolve the explicit development profile under its account-specific storage root.
@@ -66,8 +91,17 @@ impl EngineProfile {
             store_root,
             org_id: org_id.to_string(),
             user_id: user_id.to_string(),
+            managed_scaffold: false,
+            device_id_override: None,
+            scaffold_profile_key: None,
         }
     }
+
+    pub fn managed_scaffold(&self) -> bool { self.managed_scaffold }
+
+    pub fn device_id_override(&self) -> Option<&str> { self.device_id_override.as_deref() }
+
+    pub fn scaffold_profile_key(&self) -> Option<&str> { self.scaffold_profile_key.as_deref() }
 
     pub fn scope(&self) -> WorkspaceScope {
         self.scope
@@ -101,6 +135,10 @@ impl EngineProfile {
     /// fallback. New writes always use [`Self::uploads_root`], and other accounts
     /// never receive the fallback root.
     pub(crate) fn claim_legacy_uploads_root(&self) -> Result<Option<PathBuf>, EngineError> {
+        // Managed profiles require explicit import; never claim unscoped old data.
+        if self.store_root.starts_with(self.device_root.join("profiles").join("scaffold")) {
+            return Ok(None);
+        }
         if self.scope == WorkspaceScope::Local {
             return Ok(None);
         }

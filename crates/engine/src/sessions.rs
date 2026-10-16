@@ -142,6 +142,7 @@ impl Drop for VoiceCall {
 }
 
 struct RunHandle {
+    inference: Option<zeron_harness::InferenceRoute>,
     voice: Option<zeron_harness::codex::realtime::RealtimeHandle>,
     voice_active: Arc<VoiceActivity>,
     run_id: String,
@@ -231,6 +232,9 @@ struct Inner {
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
+    crew: OnceLock<crate::crew::CrewServices>,
+    imported_native_histories: Mutex<std::collections::BTreeMap<String, std::path::PathBuf>>,
+    native_branches: OnceLock<std::path::PathBuf>,
     /// [`crate::Repos::scratch_root`]; bare tests fall back to
     /// `~/.zeron/scratch`.
     scratch_root: OnceLock<std::path::PathBuf>,
@@ -277,10 +281,73 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
+                crew: OnceLock::new(),
+                imported_native_histories: Mutex::new(Default::default()),
+                native_branches: OnceLock::new(),
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
+    }
+
+    pub(crate) fn set_crew(&self, crew: crate::crew::CrewServices) {
+        if let Some(titles) = self.inner.titles.get() {
+            titles.set_crew(crew.clone());
+        }
+        let _ = self.inner.crew.set(crew);
+    }
+
+    pub(crate) fn load_crew_import(&self, profile: &std::path::Path) -> Result<(), EngineError> {
+        let branches = profile.join("native-branches");
+        std::fs::create_dir_all(&branches)?;
+        let _ = self.inner.native_branches.set(branches.canonicalize()?);
+        *lock(&self.inner.imported_native_histories) =
+            zeron_sync::crew_import::imported_native_histories(profile)
+                .map_err(|error| EngineError::Other(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Rewrite only the host launch selector; the synced native ID stays portable.
+    pub(crate) fn native_launch_selector(&self, id: &str) -> String {
+        if let Some(path) = lock(&self.inner.imported_native_histories).get(id) {
+            return path.to_string_lossy().into_owned();
+        }
+        if let Ok(path) = self.native_branch_path(id) {
+            if path.is_file() { return path.to_string_lossy().into_owned(); }
+        }
+        id.to_owned()
+    }
+
+    pub(crate) fn native_branch_path(&self, id: &str) -> Result<std::path::PathBuf, EngineError> {
+        uuid::Uuid::parse_str(id).map_err(|_| EngineError::Other("Invalid native branch ID".into()))?;
+        Ok(self.inner.native_branches.get()
+            .ok_or_else(|| EngineError::Other("Native branch store unavailable".into()))?
+            .join(format!("{id}.jsonl")))
+    }
+
+    fn native_fork_source(&self, chat_id: &str, harness: HarnessId, resume: Option<&str>) -> Result<Option<String>, EngineError> {
+        let Some(host) = self.inner.doc_host() else { return Ok(None) };
+        let Some((bytes, _)) = host.crew_store().crew_command(&format!("native-fork-source:{chat_id}"))?
+            else { return Ok(None) };
+        #[derive(serde::Deserialize)]
+        struct Source { source: String, harness: HarnessId }
+        let source: Source = serde_json::from_slice(&bytes).map_err(|error| EngineError::Other(error.to_string()))?;
+        if resume != Some(source.source.as_str()) { return Ok(None); }
+        if harness != source.harness || !matches!(harness, HarnessId::ClaudeCode | HarnessId::Codex) {
+            return Err(EngineError::Other("Native fork must launch with its original harness".into()));
+        }
+        Ok(Some(source.source))
+    }
+
+    fn managed_services(&self) -> Result<Option<&crate::crew::CrewServices>, EngineError> {
+        if !self.inner.registry.managed_inference() {
+            return Ok(None);
+        }
+        let crew = self.inner.crew.get().ok_or_else(|| EngineError::Other(
+            "Crew-managed execution requires a verified signed-in authority".into(),
+        ))?;
+        crew.ensure_identity()?;
+        Ok(Some(crew))
     }
 
     pub(crate) fn voice_manager(&self) -> crate::voice::VoiceManager {
@@ -330,6 +397,9 @@ impl SessionsEngine {
     /// Wire the chat auto-titler (called once at engine assembly). After each
     /// completed exchange the run task fires it for still-untitled chats.
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
+        if let Some(crew) = self.inner.crew.get() {
+            titles.set_crew(crew.clone());
+        }
         let _ = self.inner.titles.set(titles);
     }
 
@@ -576,6 +646,11 @@ impl SessionsEngine {
         startup_retry: bool,
         idle: bool,
     ) -> Result<String, EngineError> {
+        let managed = self.managed_services()?.is_some();
+        if let Some(crew) = self.inner.crew.get() {
+            let workspace = self.inner.workspace().ok_or_else(|| EngineError::Other("Crew workspace unavailable".into()))?;
+            crew.adopt_chat(&workspace, chat_id)?;
+        }
         // Project-less chats store a home-relative cwd (the creating device
         // can't know the host's home); expand it here, on the host, where the
         // run spawns, creating a new chat's scratch folder.
@@ -595,7 +670,13 @@ impl SessionsEngine {
             (
                 h.run_id.clone(),
                 h.steerable && !h.retiring.load(std::sync::atomic::Ordering::Acquire),
-                h.runtime_config.route(harness_id, &request),
+                if managed && (h.runtime_config.request.model != request.model
+                    || h.runtime_config.request.model_options.get("crewAccountId") != request.model_options.get("crewAccountId"))
+                {
+                    None
+                } else {
+                    h.runtime_config.route(harness_id, &request)
+                },
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
                 h.fork_history_sent.clone(),
@@ -751,6 +832,20 @@ impl SessionsEngine {
             resume_injected = request.resume.is_some();
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        let fork_from = self.native_fork_source(chat_id, harness_id, request.resume.as_deref())?;
+        if harness_id == HarnessId::Omp {
+            request.resume = request.resume.as_deref().map(|id| self.native_launch_selector(id));
+        }
+        let inference = if let Some(crew) = self.managed_services()? {
+            Some(crew.prepare_inference(
+                chat_id,
+                harness_id,
+                request.model.as_deref(),
+                request.model_options.get("crewAccountId").and_then(serde_json::Value::as_str),
+            ).await?)
+        } else {
+            None
+        };
 
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
@@ -794,7 +889,13 @@ impl SessionsEngine {
         let (voice_handle, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
         let voice_active = Arc::new(VoiceActivity::default());
         let controls = RunControls {
-            realtime: (harness_id == HarnessId::Codex).then_some(realtime),
+            context: Some(zeron_harness::RunContext {
+                session_id: chat_id.to_owned(),
+                ipc_port: self.inner.ipc_port.load(std::sync::atomic::Ordering::Acquire),
+                inference: inference.clone(),
+                fork_from,
+            }),
+            realtime: (harness_id == HarnessId::Codex && !managed).then_some(realtime),
             execution_lease: None,
             request_input,
             steering: steer_rx,
@@ -805,7 +906,8 @@ impl SessionsEngine {
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
-                voice: (harness_id == HarnessId::Codex).then_some(voice_handle),
+                inference,
+                voice: (harness_id == HarnessId::Codex && !managed).then_some(voice_handle),
                 voice_active: voice_active.clone(),
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
@@ -918,6 +1020,7 @@ impl SessionsEngine {
         message_id: Option<String>,
         issued_at: i64,
     ) -> Result<SteerOutcome, EngineError> {
+        self.managed_services()?;
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable && !h.retiring.load(std::sync::atomic::Ordering::Acquire))
@@ -1304,6 +1407,13 @@ impl SessionsEngine {
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
         self.inner.voice.retire();
+        if let Some(crew) = self.inner.crew.get() {
+            for run in lock(&self.inner.runs).values() {
+                if let Some(route) = &run.inference {
+                    crew.retire_inference(route);
+                }
+            }
+        }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.terminate(&chat_id).await {
@@ -1723,9 +1833,18 @@ impl Inner {
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
-        let mut runs = lock(&self.runs);
-        if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+        let removed = {
+            let mut runs = lock(&self.runs);
+            if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
+                runs.remove(chat_id)
+            } else {
+                None
+            }
+        };
+        if let Some(route) = removed.and_then(|run| run.inference)
+            && let Some(crew) = self.crew.get()
+        {
+            crew.retire_inference(&route);
         }
     }
 }
@@ -4155,5 +4274,36 @@ mod tests {
         })
         .unwrap();
         core.sessions.shutdown().await;
+    }
+
+    #[test]
+    fn imported_native_launch_uses_copy_without_rewriting_canonical_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let histories = dir.path().join("native-histories");
+        std::fs::create_dir(&histories).unwrap();
+        let copy = histories.join("session.jsonl");
+        std::fs::write(&copy, "{\"type\":\"session\",\"id\":\"original-native\",\"cwd\":\"/original/repo\"}\n").unwrap();
+        let report = serde_json::json!({
+            "version":1,"sourceProfileRoot":"/old/profile","chatIds":["chat"],
+            "nativeSessionIds":{"chat":"original-native"},
+            "nativeHistories":{"original-native":"native-histories/session.jsonl"},
+            "filesSha256":{},"commandsRetained":0,"annotationsRetained":0,
+            "requiresReauthentication":true
+        });
+        std::fs::write(dir.path().join("crew-import-report.json"), serde_json::to_vec(&report).unwrap()).unwrap();
+        let sessions = SessionsEngine::new("host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()));
+        sessions.load_crew_import(dir.path()).unwrap();
+        sessions.inner.remember_harness_session("chat", "original-native", "/original/repo");
+        let id = sessions.inner.resume_for("chat", "/original/repo").unwrap();
+        assert_eq!(id, "original-native");
+        let copied_path = copy.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(sessions.native_launch_selector(&id), copied_path);
+        assert!(sessions.inner.resume_for("chat", "/other/repo").is_none());
+        std::fs::remove_file(&copy).unwrap();
+        // Missing copied data remains a failed exact-path resume, never a lookup
+        // against another user's or the old installed app's native store.
+        assert_eq!(sessions.native_launch_selector(&id), copied_path);
     }
 }

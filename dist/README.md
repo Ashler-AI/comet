@@ -1,87 +1,104 @@
-# Packaging
+# Crew Canary packaging
 
-## Linux (implemented)
-
-```sh
-scripts/package-linux.sh            # release build (thin LTO, stripped)
-PROFILE=debug scripts/package-linux.sh   # fast smoke package
-```
-
-Produces `target/package/zeron-<version>-linux-<arch>.tar.gz` containing:
-
-- `zeron` — the binary (headed by default; `zeron headless` runs the engine alone)
-- `zeron.desktop` — XDG desktop entry template (`Exec=zeron` for packagers;
-  the installers rewrite `Exec`, `TryExec`, and `Icon` to absolute paths under
-  `~/.zeron/app/current`, since `~/.local/bin` is often not on a desktop
-  session's `PATH`)
-- `zeron.png` — 1024×1024 Zeron app icon
-- `install.sh` — installs into `~/.zeron/app/<version>` behind a `current`
-  symlink (the curl installer's layout, which the in-app updater manages),
-  links `~/.local/bin/zeron` to it, and writes the desktop entry and icon under
-  `$XDG_DATA_HOME` (default `~/.local/share`). The curl installer does the same
-  from the extracted tarball; `scripts/test-linux-desktop-entry.sh` checks both
-
-The release profile in the root `Cargo.toml` sets `lto = "thin"` and
-`strip = "symbols"` for distribution builds.
+This upstream-port branch delivers **private/manual canary artifacts**, not a
+replacement for signed Crew staging/production releases. It does not publish a
+shared bucket, public manifest, `latest` pointer, or release channel. Source Crew,
+its installed app, its services and its data remain unchanged.
 
 ## macOS
 
+From this worktree on a macOS host:
+
 ```sh
-scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dmg
+ASHLER_INCREMENTAL_TSC_CHECKS=false scripts/package-macos.sh
+open 'target/package/Crew Canary.app'
 ```
 
-Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc
-signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
-dmg. The auto-update tarball retains an internal `Zeron.app` path so older
-installed builds can update into Zeron. CI runs this on tags
-(`.github/workflows/release.yml`). The manual steps it automates, for reference
-(run on a macOS host — gpui needs Metal; no cross-build from Linux):
+The script builds the upstream Cargo package/binary `zeron` with `--locked
+--release`, discovers Cargo's actual target directory, and copies that exact
+artifact into `target/package/Crew Canary.app/Contents/MacOS/comet`. Internal
+Cargo/crate and artwork filenames deliberately retain upstream names.
 
-1. Build the universal (or per-arch) binary:
-   ```sh
-   cargo build --release -p zeron --target aarch64-apple-darwin
-   cargo build --release -p zeron --target x86_64-apple-darwin
-   lipo -create -output zeron \
-     target/aarch64-apple-darwin/release/zeron \
-     target/x86_64-apple-darwin/release/zeron
-   ```
-2. Assemble the bundle:
-   ```sh
-   mkdir -p Zeron.app/Contents/{MacOS,Resources}
-   cp zeron Zeron.app/Contents/MacOS/zeron
-   sed "s/__VERSION__/$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')/" \
-     dist/macos/Info.plist > Zeron.app/Contents/Info.plist
-   ```
-3. Icon: generate `zeron.icns` from `dist/macos/icon-1024.png` (the macOS-shaped
-   variant of the artwork — squircle mask, margins, and shadow pre-baked, since
-   `sips` can't apply an alpha mask) and place it at
-   `Zeron.app/Contents/Resources/zeron.icns`:
-   ```sh
-   mkdir zeron.iconset && sips -z 256 256 dist/macos/icon-1024.png --out zeron.iconset/icon_256x256.png
-   iconutil -c icns zeron.iconset -o Zeron.app/Contents/Resources/zeron.icns
-   ```
-4. Sign + notarize (required for distribution):
-   ```sh
-   codesign --deep --force --options runtime --sign "Developer ID Application: …" Zeron.app
-   xcrun notarytool submit Zeron.zip --keychain-profile … --wait
-   xcrun stapler staple Zeron.app
-   ```
-5. Ship as a `.dmg` (`hdiutil create -volname Zeron -srcfolder Zeron.app -ov -format UDZO Zeron.dmg`).
+The bundle has identifier `ai.ashler.crew.upstream-canary`, display name
+`Crew Canary`, and registers **only** `crew-upstream-canary:`. Runtime defaults
+are `~/.crew-upstream-canary` and IPC port `27954`; the bundle does not replace
+Crew.app or register its production/staging schemes. Move only Crew Canary.app
+to Applications if a persistent installation is wanted.
+New worktrees default to the selected data directory's `worktrees` folder,
+not another installed client's `~/.zeron/worktrees`. Explicit existing worktree
+paths and user-selected custom locations remain unchanged.
 
-## Windows
+Artifacts:
 
-```powershell
-./scripts/package-windows.ps1 -ReleasesUrl https://github.com/zeronsh/zeron/releases/latest/download
+- `target/package/Crew Canary.app`
+- `target/package/crew-upstream-canary-<version>-macos-<arch>.dmg`
+- `target/package/crew-upstream-canary-<version>-macos-<arch>-app.tar.gz`
+
+Ad-hoc signing is the local default. Set `CODESIGN_IDENTITY` for an explicitly
+selected Developer ID. Optional `NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, and
+`NOTARY_ISSUER_ID` submit to Apple and staple the bundle and disk image. Neither
+signing nor notarization creates or enables a release channel.
+
+For an additional debug-only instance, `scripts/run-macos-dev.sh` builds
+`target/macos-dev/Crew Canary Dev.app`, uses bundle identifier
+`ai.ashler.crew.upstream-canary.dev`, a separate data directory under
+`target/macos-dev/data`, and IPC port `27955`. `COMET_DEV_BUILD_ONLY=1` builds
+without launching. `COMET_DEV_DATA_DIR`, `COMET_DEV_IPC_PORT` and
+`COMET_DEV_CODESIGN_IDENTITY` select the development profile and signing identity.
+
+## Linux and Scaffold runtime
+
+```sh
+ASHLER_INCREMENTAL_TSC_CHECKS=false scripts/package-linux.sh
+# PROFILE=debug is available for local fixture packages.
 ```
 
-Produces, under `target/package/`:
+Output: `target/package/crew-upstream-canary-<version>-linux-<arch>.tar.gz`.
+The archive root has the same stem and contains `comet`, licenses,
+`crew-upstream-canary.desktop`, `crew-upstream-canary.png`, and `install.sh`.
 
-- `zeron-<version>-windows-<arch>-setup.exe` — the per-user installer built
-  from `dist/windows/zeron.iss` with Inno Setup 6
-- `zeron-<version>-windows-<arch>.zip` — the portable package
-- `zeron-<version>-windows-<arch>.exe` — the bare executable the in-app
-  updater downloads
+The manual installer stores immutable binary-digest-qualified versions under
+`~/.crew-upstream-canary/app/<version>-<sha256>`, changes only that directory's
+`current` link, and links `~/.local/bin/crew-upstream-canary`. Desktop entry and
+icon names are also canary-specific. It does not overwrite a shared `comet`
+launcher, touch existing Crew/Zeron data, or install/restart any service. A new
+artifact of the same workspace version gets a distinct installation directory.
+The Scaffold handoff must select this exact binary with its SHA-256 and the
+checked-in `scaffold-runtime-version.txt` contract, not a mutable release feed.
 
-The installer and the zip both carry `zeron-update.json`, the marker that lets
-the app update itself in place. CI runs `scripts/test-windows-installer.ps1`
-against the setup on every Windows build.
+`bash scripts/test-linux-desktop-entry.sh` is an offline Linux regression for
+launcher quoting, XDG paths, repeated installation, same-version new artifacts,
+and preservation of existing installations. It uses a throwaway HOME.
+
+## Build-only workflow and update policy
+
+`.github/workflows/release.yml` is now **Crew Canary artifacts**, callable via
+manual dispatch or `workflow_call`. It builds the exact `github.sha`, uploads
+private Actions artifacts with archive `SHA256SUMS`, raw Linux executable
+`COMET_SHA256SUMS`, and `provenance.json`, and has only `contents: read`.
+`COMET_SHA256SUMS` names the extracted archive-root `comet` file; its digest
+is the value for `COMET_SCAFFOLD_RUNTIME_SHA256`, not the archive digest.
+It does not deploy, publish GitHub Releases, use shared release
+credentials, or change signed stable/staging channels. Canary infrastructure
+has its own isolated deployment workflow.
+
+`zeron-update::AUTOMATIC_UPDATES_SUPPORTED` is false for this branch. Direct
+CLI/UI checks, staging and apply paths fail closed before a shared channel can
+be contacted or an install replaced. Environment URL overrides cannot opt in.
+The dormant upstream downloader remains for mergeability; eventual signed Crew
+delivery must port the authenticated/signed candidate contract, not merely flip
+this constant or expose a public feed. Windows packaging/update assets are
+retained upstream tooling, not Crew Canary delivery artifacts; this workflow
+does not build or distribute them. iOS is packaged by its separate workstream.
+
+The **refresh agents after Crew updates** preference is retained independently
+of per-agent monitoring. The coordinator imports `harnessAutoUpdate` from an
+explicitly copied `<data_dir>/update-prefs.json` into `harness-update-prefs.json`
+without reading the live legacy store. Subsequent changes persist atomically.
+Manual canary delivery preserves the value but does not execute the post-update
+hook. Supported signed delivery calls `post_update_refresh(data_dir, true)` on
+boot: only a version transition triggers sequential enabled/installed-agent
+checks and applicable updates through existing idle/update locks. Explicit
+per-agent Off and `COMET_UPDATE_HARNESSES=0|false|no` remain respected. OMP uses
+its native `omp update` and `can1357/oh-my-pi` release metadata, never Pi's npm
+installer. Local typechecks are intentionally not part of this workflow.

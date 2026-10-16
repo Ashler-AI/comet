@@ -32,6 +32,7 @@ import {
 } from "./chat-log";
 import { decodeFrame, encodeFrame, FRAME } from "./chat-frames";
 import { AUTH_USER_HEADER, type Env } from "./env";
+import { requestAuthority, socketAuthorized, sendAuthorized, type SocketAuthority } from "./authority";
 import {
   ensureChatWakes, finishChatWake, MAX_WAKE_ATTEMPTS, PERMANENT_WAKE_REJECTIONS,
   pendingChatWake, queueChatWake, retryChatWake, validWakeRoute
@@ -54,6 +55,7 @@ const QUOTA_MAX_PUSHES = 300;
 const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
 
 interface SocketState {
+  authority?: SocketAuthority;
   userId: string;
   device: string;
   /** Set once a valid hello established the session. */
@@ -83,6 +85,9 @@ export class ChatRoom implements DurableObject {
   /** device → rolling push quota window. Memory-only. */
   private readonly quotas = new Map<string, QuotaWindow>();
   private wakeFlight?: Promise<void>;
+  private send(ws: WebSocket, type: (typeof FRAME)[keyof typeof FRAME], header: Record<string, unknown>, payload?: Uint8Array): void {
+    sendAuthorized(this.env, this.ctx, ws, encodeFrame(type, header, payload));
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -104,6 +109,19 @@ export class ChatRoom implements DurableObject {
 
     const sql = this.ctx.storage.sql;
     const owner = getMeta(sql, "owner");
+    const authority = requestAuthority(request);
+    // A directory lookup is not a join: an unknown chat must remain unclaimed.
+    if (url.pathname === "/directory-authority" && request.method === "GET") {
+      return json({ ownsSession: owner === userId });
+    }
+    if (url.pathname === "/bind-owner" && request.method === "POST") {
+      if (owner && owner !== userId) return json({ error: "forbidden" }, 403);
+      if (!owner) setMeta(sql, "owner", userId);
+      return json({ ok: true });
+    }
+    if (authority && !authority.writable && !["GET", "HEAD"].includes(request.method)) {
+      return json({ error: "opaque_write_forbidden" }, 403);
+    }
 
     if (url.pathname === "/ws") {
       // Claim-on-first-join ownership, then owner-only forever (the s2
@@ -119,7 +137,7 @@ export class ChatRoom implements DurableObject {
       const hostDevice = hint && validWakeRoute(chatId, hint) ? hint : "";
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      const state: SocketState = { userId, device, chatId, hostDevice };
+      const state: SocketState = { userId, device, chatId, hostDevice, authority };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -287,7 +305,7 @@ export class ChatRoom implements DurableObject {
         for (const socket of this.ctx.getWebSockets()) {
           const socketState = socket.deserializeAttachment() as SocketState | null;
           if (!socketState?.ready) continue;
-          send(socket, FRAME.row, { seq: outcome.seq, device, batchId }, payload);
+          this.send(socket, FRAME.row, { seq: outcome.seq, device, batchId }, payload);
         }
       }
       return json({ batchId, seq: outcome.seq, dup: outcome.dup });
@@ -354,6 +372,7 @@ export class ChatRoom implements DurableObject {
   // ── WebSocket protocol (binary frames, chat-frames.ts) ───────────────────
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (!(await socketAuthorized(this.env, ws))) return;
     if (typeof message === "string") {
       ws.close(1003, "binary frames only");
       return;
@@ -365,7 +384,7 @@ export class ChatRoom implements DurableObject {
     const frame = decodeFrame(new Uint8Array(message));
     const state = ws.deserializeAttachment() as SocketState;
     if (!frame) {
-      send(ws, FRAME.error, { code: "bad_frame", message: "malformed frame" });
+      this.send(ws, FRAME.error, { code: "bad_frame", message: "malformed frame" });
       return;
     }
     switch (frame.type) {
@@ -382,10 +401,10 @@ export class ChatRoom implements DurableObject {
         this.handlePresence(ws, state, frame.header, frame.payload);
         return;
       case FRAME.probe:
-        send(ws, FRAME.probeOk, { headSeq: headSeq(this.ctx.storage.sql) });
+        this.send(ws, FRAME.probeOk, { headSeq: headSeq(this.ctx.storage.sql) });
         return;
       default:
-        send(ws, FRAME.error, { code: "bad_frame", message: `unexpected type ${frame.type}` });
+        this.send(ws, FRAME.error, { code: "bad_frame", message: `unexpected type ${frame.type}` });
     }
   }
 
@@ -409,7 +428,7 @@ export class ChatRoom implements DurableObject {
     // Metadata + frontier only — the CLIENT decides what to load next
     // (frontier included in local doc → rows only; not included → GET
     // /checkpoint first; cursor > headSeq → server lost state, re-seed).
-    send(
+    this.send(
       ws,
       FRAME.state,
       {
@@ -426,16 +445,16 @@ export class ChatRoom implements DurableObject {
 
   private handleRowsReq(ws: WebSocket, state: SocketState, header: Record<string, unknown>): void {
     if (!state.ready) {
-      send(ws, FRAME.error, { code: "hello_first", message: "rows before hello" });
+      this.send(ws, FRAME.error, { code: "hello_first", message: "rows before hello" });
       return;
     }
     const after = typeof header.after === "number" && header.after >= 0 ? header.after : 0;
     const exclude = header.excludeOwn === true ? state.device : undefined;
     const sql = this.ctx.storage.sql;
     for (const row of rowsAfter(sql, after, exclude)) {
-      send(ws, FRAME.row, { seq: row.seq, device: row.device, batchId: row.batchId }, row.bytes);
+      this.send(ws, FRAME.row, { seq: row.seq, device: row.device, batchId: row.batchId }, row.bytes);
     }
-    send(ws, FRAME.rowsDone, { headSeq: headSeq(sql) });
+    this.send(ws, FRAME.rowsDone, { headSeq: headSeq(sql) });
   }
 
   private async handlePush(
@@ -444,24 +463,28 @@ export class ChatRoom implements DurableObject {
     header: Record<string, unknown>,
     payload: Uint8Array
   ): Promise<void> {
+    if (state.authority && !state.authority.writable) {
+      this.send(ws, FRAME.error, { code: "forbidden", message: "opaque document write requires session.sync.write", batchId: header.batchId });
+      return;
+    }
     const batchId = typeof header.batchId === "string" ? header.batchId : "";
     // Push errors carry the batchId so clients can RETIRE permanently
     // rejected batches from their replay queues (an unretireable batch
     // replays on every reconnect forever — the wedge class this replaces).
     if (!state.ready || batchId === "" || batchId.length > 128) {
       this.recordPush(state.device, false);
-      send(ws, FRAME.error, { code: "bad_push", message: "hello first / malformed push", batchId });
+      this.send(ws, FRAME.error, { code: "bad_push", message: "hello first / malformed push", batchId });
       return;
     }
     if (!this.admitQuota(state.device, payload.byteLength)) {
       this.recordPush(state.device, false);
-      send(ws, FRAME.error, { code: "quota", message: "per-device push quota exceeded", batchId });
+      this.send(ws, FRAME.error, { code: "quota", message: "per-device push quota exceeded", batchId });
       return;
     }
     const outcome = await this.acceptRow(state.device, batchId, payload, state.userId, state.chatId ?? "", state.hostDevice ?? "");
     if (!outcome.ok) {
       this.recordPush(state.device, false);
-      send(ws, FRAME.error, {
+      this.send(ws, FRAME.error, {
         code: outcome.error,
         message: `push rejected: ${outcome.error}`,
         batchId
@@ -478,7 +501,7 @@ export class ChatRoom implements DurableObject {
         if (socket === ws) continue;
         const socketState = socket.deserializeAttachment() as SocketState | null;
         if (!socketState?.ready) continue;
-        send(
+        this.send(
           socket,
           FRAME.row,
           { seq: outcome.seq, device: state.device, batchId },
@@ -486,7 +509,7 @@ export class ChatRoom implements DurableObject {
         );
       }
     }
-    send(ws, FRAME.ack, { batchId, seq: outcome.seq, dup: outcome.dup });
+    this.send(ws, FRAME.ack, { batchId, seq: outcome.seq, dup: outcome.dup });
   }
 
   private handlePresence(
@@ -505,7 +528,7 @@ export class ChatRoom implements DurableObject {
       if (socket === ws) continue;
       const socketState = socket.deserializeAttachment() as SocketState | null;
       if (!socketState?.ready) continue;
-      send(socket, FRAME.presence, { device: state.device, at }, payload);
+      this.send(socket, FRAME.presence, { device: state.device, at }, payload);
     }
   }
 
@@ -690,19 +713,6 @@ export class ChatRoom implements DurableObject {
   }
 }
 
-const send = (
-  ws: WebSocket,
-  type: (typeof FRAME)[keyof typeof FRAME],
-  header: Record<string, unknown>,
-  payload?: Uint8Array
-): void => {
-  try {
-    const frame = encodeFrame(type, header, payload);
-    ws.send(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength) as ArrayBuffer);
-  } catch {
-    /* socket already gone; hibernation API cleans it up */
-  }
-};
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {

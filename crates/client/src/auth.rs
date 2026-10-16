@@ -297,6 +297,10 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 
 enum Mode {
     Demo,
+    Scaffold {
+        auth: zeron_sync::scaffold_auth::ScaffoldAuth,
+        session: zeron_sync::scaffold_auth::ScaffoldSession,
+    },
     Dev {
         bearer: String,
     },
@@ -321,10 +325,25 @@ impl TokenProvider {
         credentials: &crate::config::Credentials,
         edge_url: &str,
         events: Arc<EventPump>,
-    ) -> Self {
+    ) -> Result<Self> {
         use crate::config::Credentials;
         let mode = match credentials {
             Credentials::Demo(_) => Mode::Demo,
+            Credentials::Scaffold { user_id, org_id, control_origin, session_json } => {
+                use zeron_sync::scaffold_auth::{ScaffoldAuth, ScaffoldConfig, ScaffoldSession, normalized_origin};
+                let session: ScaffoldSession = serde_json::from_str(session_json)
+                    .map_err(|_| ClientError::Auth("Invalid Crew credential".into()))?;
+                if session.device.is_some() || session.identity.user_id != *user_id
+                    || session.identity.project_scope != *org_id || session.identity.deployment_id.is_none()
+                    || session.edge_origin != normalized_origin(edge_url).map_err(scaffold_error)?
+                    || session.resource != normalized_origin(control_origin).map_err(scaffold_error)? {
+                    return Err(ClientError::Auth("Crew credential scope does not match this profile".into()));
+                }
+                let mut config = ScaffoldConfig::new(control_origin.clone(), edge_url.to_owned(), org_id.clone());
+                config.deployment_id = session.identity.deployment_id.clone();
+                let auth = ScaffoldAuth::new(config).map_err(scaffold_error)?;
+                Mode::Scaffold { auth, session }
+            },
             Credentials::Dev { user_id, org_id } => Mode::Dev {
                 bearer: if org_id.is_empty() {
                     user_id.clone()
@@ -339,11 +358,11 @@ impl TokenProvider {
                 refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
             },
         };
-        Self {
+        Ok(Self {
             mode,
             events,
             expired: Arc::new(AtomicBool::new(false)),
-        }
+        })
     }
 
     /// Replace the pair (the platform re-signed-in or restored newer tokens).
@@ -363,6 +382,21 @@ impl TokenProvider {
                 "demo mode has no edge credentials".into(),
             )),
             Mode::Dev { bearer } => Ok(bearer.clone()),
+            Mode::Scaffold { auth, session } => {
+                if self.expired.load(Ordering::Acquire) {
+                    return Err(ClientError::Auth("Crew session revoked; sign in again".into()));
+                }
+                match auth.verify(session).await.map_err(scaffold_error) {
+                    Ok(verified) => Ok(verified.access_token),
+                    Err(ClientError::Auth(reason)) => {
+                        if !self.expired.swap(true, Ordering::AcqRel) {
+                            self.events.ordered(ClientEvent::AuthExpired { reason: reason.clone() });
+                        }
+                        Err(ClientError::Auth(reason))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             Mode::WorkOs {
                 edge_url,
                 org_id,
@@ -435,6 +469,14 @@ async fn refresh_task(
             tracing::warn!(error = %err, "token refresh failed; using the stale access token");
             Ok(current.access_token)
         }
+    }
+}
+
+pub fn scaffold_error(error: zeron_sync::scaffold_auth::AuthError) -> ClientError {
+    use zeron_sync::scaffold_auth::AuthError;
+    match error {
+        AuthError::Unavailable(reason) => ClientError::Network(reason),
+        other => ClientError::Auth(other.to_string()),
     }
 }
 
@@ -530,7 +572,7 @@ mod tests {
                 refresh_token: "r1".into(),
             },
         };
-        (TokenProvider::new(&credentials, edge, events), collect)
+        (TokenProvider::new(&credentials, edge, events).unwrap(), collect)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -582,8 +624,31 @@ mod tests {
             user_id: "wing".into(),
             org_id: "acme".into(),
         };
-        let tokens = TokenProvider::new(&credentials, "http://unused", events);
+        let tokens = TokenProvider::new(&credentials, "http://unused", events).unwrap();
         assert_eq!(tokens.bearer().await.unwrap(), "wing@acme");
+    }
+
+    #[test]
+    fn crew_credentials_cannot_retarget_an_open_profile() {
+        use zeron_sync::scaffold_auth::{ScaffoldIdentity, ScaffoldSession};
+        let session = ScaffoldSession {
+            access_token: "opaque-user-bearer".into(),
+            identity: ScaffoldIdentity {
+                user_id: "owner".into(), email: "owner@example.com".into(), name: None,
+                project_scope: "project".into(), deployment_id: Some("staging".into()), capabilities: vec![],
+            },
+            resource: "https://control.example".into(),
+            edge_origin: "https://canary.example".into(),
+            device: None,
+        };
+        let credentials = crate::config::Credentials::Scaffold {
+            user_id: "another-user".into(), org_id: "project".into(),
+            control_origin: session.resource.clone(),
+            session_json: serde_json::to_string(&session).unwrap(),
+        };
+        let events = EventPump::new(Arc::new(crate::events::NullListener));
+        assert!(matches!(TokenProvider::new(&credentials, &session.edge_origin, events), Err(ClientError::Auth(_))));
+        assert!(!format!("{credentials:?}").contains("opaque-user-bearer"));
     }
 
     #[test]

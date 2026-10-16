@@ -240,6 +240,10 @@ pub struct Chat {
     /// deleted) is tolerated rather than cascaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
+    /// Credential-free, host-verified Crew identity. The personal registry
+    /// remains the index; disconnected environments never delete this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew: Option<crate::CrewChatMetadata>,
 }
 
 impl Chat {

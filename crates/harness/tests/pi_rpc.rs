@@ -31,18 +31,15 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (tx, rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     (
-        RunControls {
-            realtime: None,
-            execution_lease: None,
-            steering: rx,
-            interrupt: token.clone(),
-            request_input: Box::new(|_| {
-                let (tx, rx) = oneshot::channel();
-                let _ = tx.send(vec![]);
-                rx
-            }),
-            turn: Default::default(),
-        },
+        RunControls { context: None, realtime: None, execution_lease: None,
+        steering: rx,
+        interrupt: token.clone(),
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(vec![]);
+            rx
+        }),
+        turn: Default::default(), },
         tx,
         token,
     )

@@ -42,15 +42,13 @@ fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut Vis
         });
         let mut shell = Shell::new(
             state,
-            EngineBootConfig {
-                data_dir: dir.path().into(),
-                ipc_port: 0,
-                edge_url: String::new(),
-                edge_token: None,
-                org_id: None,
-                workos_client_id: None,
-                default_harness: zeron_proto::HarnessId::Mock,
-            },
+            EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+            ipc_port: 0,
+            edge_url: String::new(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock, },
             cx,
         );
         shell.debug_gate = Some(GatePhase::Ready);

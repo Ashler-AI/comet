@@ -256,6 +256,31 @@ impl Shell {
             .child(device_row)
             .child(project_row)
             .children(branch_row)
+            .when_some(chat.crew.as_ref(), |body, crew| {
+                body.child(crate::settings::widgets::page_subtitle(&theme, format!(
+                    "Owner {} · project {} · deployment {} · session {}",
+                    crew.owner_subject, crew.scope.project_id, crew.scope.deployment_id.as_deref().unwrap_or("none"), crew.session_id,
+                )))
+            })
+            .when(!online, |body| body.child(crate::settings::widgets::page_subtitle(&theme,
+                "Host offline. Synced history remains available; continuing requires its host.")))
+            .child(crate::settings::widgets::ghost_action(&theme)
+                .id("crew-session-controls").role(gpui::Role::Button)
+                .aria_label("Session controls and shared annotations").tab_index(0)
+                .focus_visible(|style| style.border_2().border_color(theme.accent))
+                .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.accounts_page.is_none() {
+                        let state = this.state.clone();
+                        this.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
+                    }
+                    if crate::markdown::selection::selected_message_anchor().is_some()
+                        && let Some(page) = &this.accounts_page {
+                        page.update(cx, |page, cx| page.capture_annotation_selection(cx));
+                    }
+                    this.open_settings(SettingsSection::Agents, cx);
+                }))
+                .child("Controls and annotations"))
             .child(popover::picker_divider())
             .child(side_chat)
             .child(fork)

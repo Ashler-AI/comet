@@ -18,8 +18,10 @@ export default defineConfig({
       main: "./test/workerd/fixture.ts",
       miniflare: {
         compatibilityDate: "2026-07-01",
+        bindings: { AUTH_MODE: "dev", ENVIRONMENT: "local", SCAFFOLD_PROJECT_SCOPE: "canary", SCAFFOLD_DEPLOYMENT_ID: "canary", SCAFFOLD_CONTROL_PLANE_URL: "https://authority.example" },
         r2Buckets: ["BLOBS"],
         durableObjects: {
+          AUTH_GRANTS: { className: "AuthGrant", useSQLite: true },
           DEVICE_ROOMS: { className: "DeviceRoom", useSQLite: true },
           TEST_LOG: { className: "TestLogRoom", useSQLite: true },
           CHAT_ROOMS: { className: "ChatRoom", useSQLite: true },

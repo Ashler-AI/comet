@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use zeron_proto::{AuthState, WorkspaceScope};
 
 pub mod accounts;
+pub mod annotations;
 pub mod appearance;
 pub mod archived;
 pub mod composer;
+pub mod crew;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
@@ -810,8 +812,19 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingCrewLink {
+    pub url: String,
+    pub owner: Option<String>,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    pub pending_crew_link: Option<PendingCrewLink>,
+    pub crew_annotation_commands: Vec<annotations::PendingAnnotation>,
+    pub crew_recovery_commands: HashMap<String, String>,
     pub dictation_enabled: bool,
     /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
     /// follows the system default.
@@ -1021,6 +1034,9 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            pending_crew_link: None,
+            crew_annotation_commands: Vec::new(),
+            crew_recovery_commands: HashMap::new(),
             dictation_enabled: false,
             dictation_input: None,
             window_geometry: None,
@@ -1670,6 +1686,9 @@ impl UiSettings {
             }};
         }
         merge!(
+            pending_crew_link,
+            crew_annotation_commands,
+            crew_recovery_commands,
             dictation_enabled,
             dictation_input,
             window_geometry,
