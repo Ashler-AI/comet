@@ -79,7 +79,7 @@ async function api(path, options = {}) {
   return payload;
 }
 api('native-open').then(({ url }) => {
-  if (typeof url !== 'string' || !/^comet(?:-staging)?:\/\/scaffold\/(?:[A-Za-z0-9._-]{1,256}\/){3}[A-Za-z0-9._-]{1,256}$/.test(url)) throw new Error('Crew returned an invalid session link.');
+  if (typeof url !== 'string' || !/^crew-upstream-canary:\/\/scaffold\/(?:[A-Za-z0-9._-]{1,256}\/){3}[A-Za-z0-9._-]{1,256}$/.test(url)) throw new Error('Crew returned an invalid session link.');
   $('native-open').href = url;
   $('native-open').hidden = false;
 }).catch(showError);
