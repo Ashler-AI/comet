@@ -8,6 +8,7 @@ mod tests {
     use hyper::{body::Frame, body::Incoming, service::service_fn};
     use serde_json::Value;
     use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     #[derive(Clone)]
@@ -863,7 +864,6 @@ mod tests {
                 HarnessId::Hermes,
                 Some("anthropic/claude-fable-5-1"),
                 None,
-                1,
             )
             .unwrap()
             .is_none()
@@ -873,21 +873,19 @@ mod tests {
     #[test]
     fn route_requests_preserve_automatic_and_pinned_account_selection() {
         let automatic =
-            inference_route_request("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None, 1)
+            inference_route_request("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None)
                 .unwrap()
                 .unwrap();
         assert_eq!(automatic.logical_session_id, "session-1");
         assert_eq!(automatic.provider, "openai");
         assert_eq!(automatic.model, "gpt-5.6-sol");
         assert_eq!(automatic.requested_account_id, None);
-        assert_eq!(automatic.lifecycle_epoch, 1);
 
         let pinned = inference_route_request(
             "session-1",
             HarnessId::ClaudeCode,
             Some("claude-opus-5"),
             Some("opaque-account-id"),
-            2,
         )
         .unwrap()
         .unwrap();
@@ -896,7 +894,6 @@ mod tests {
             pinned.requested_account_id.as_deref(),
             Some("opaque-account-id")
         );
-        assert_eq!(pinned.lifecycle_epoch, 2);
     }
 
     #[test]

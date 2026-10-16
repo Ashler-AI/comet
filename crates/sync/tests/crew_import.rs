@@ -206,7 +206,7 @@ fn backup_import_preserves_ids_assets_and_terminal_outcomes_without_replay() {
     assert!(matches!(&entries[1].parts[7], MessagePart::Tool {
         call: zeron_proto::ToolCall::Unknown { name, input: Some(input) }, resolved: true, is_error: true, ..
     } if name == "Legacy Crew Agent" && input == &legacy_messages()[1]["parts"][7]["call"]));
-    assert_eq!(doc.read_entry_window(None, 1).unwrap().entries[0].parts.last(), entries[2].parts.last());
+    assert_eq!(doc.read_opening_tail(1).unwrap()[0].parts.last(), entries[2].parts.last());
     assert_eq!(serde_json::to_value(doc.annotations().unwrap()).unwrap(),
         serde_json::json!([legacy_annotation("Edited and resolved comment", "orphaned", 15.into())]));
     let commands = doc.read_commands().unwrap();

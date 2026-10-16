@@ -11,18 +11,23 @@ Platform source is committed and pushed as
 `4d877f1bd87feef03ec6f114a20c46f4d7882f2c`; its
 [remote Worker/provider/Agent Auth CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38847118006)
 passed, including remote typechecks and runtime contract suites.
+Crew implementation is committed and pushed on the isolated branch as `eccc3324`.
+Its [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
+builds immutable macOS/Linux artifacts and runs Edge typechecks remotely.
 This is a testing lane, not production or a completed cutover.
 
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
-| Desktop | Native debug executable built, ad-hoc packaged and launched as Crew Canary; General and managed Accounts settings observed through accessibility and screenshots | Rebuild after the latest model-picker fix; authenticated controls, comments and links |
+| Desktop | Rehearsal merge built, packaged and launched as Crew Canary; actual IPC now returns OMP/Claude/Codex managed catalogs and rejects Cursor; screenshots confirm managed thread naming and `~/.crew-upstream-canary/worktrees` | Authenticated controls, comments and links |
 | Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme | Authenticated profile restart and cross-client verification |
 | Sync | Real workerd plus two real headless engines: session discovery, queued remote Run, transcript and working-to-idle status roundtrip passed | This used mock inference; reconnect/backpressure and real managed turns remain |
-| Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff` | Live signed-in desktop/mobile authority and revocation |
+| Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff`; unauthenticated identity/registry/chat reads returned 401 even with forged identity headers; public installer returned 404 | Live signed-in desktop/mobile authority and revocation |
 | Scaffold | Controller Worker version `e8121145-bdc7-414e-adf9-286c7f608584`; dedicated Helm release installed; HTTPRoute Accepted/ResolvedRefs/Reconciled; public OAuth discovery returned the canary issuer and S256 PKCE | User sign-in, approved provider connection, exact-SHA Linux runtime and full sandbox lifecycle |
 | Protocol checks | Edge workerd 38/38; Platform auth/directory/broker 24/24; attach-routing 44/44; canary config/Helm checks 2/2 across four snapshot configurations | Remote runtime and actual-client scenarios below |
-| Rust checks | Document suite 148/148; engine suite 612 passed, two ignored, two stale assertions failed; stale wiring/copy assertions removed rather than re-pinned | Rerun after integration fixes; remaining package and migration suites |
-| Mobile | Shared Rust mobile core built; real Swift bindings regenerated; native Crew Canary iOS app built and installed/launched on the isolated iOS 26.5 simulator | Actual simulator surface, authenticated cross-client scenarios and physical-device gates |
+| Rust checks | Client 26, document 148, engine 614, protocol 91, sync 76 and harness 330 library tests passed; migration 8/8, scoped annotations 1/1, Scaffold auth 3/3 and native OMP 11/11 passed | Two engine tests and an OMP subprocess helper ignored; actual managed providers and sandbox lifecycle still require sign-in |
+| Mobile | Shared Rust core, generated Swift bindings and native app built; iOS 26.5 simulator displayed Crew Canary; warm directory link and cold Scaffold link stayed signed out; exact cold-link intent persisted across launch | Authenticated cross-client scenarios, lifecycle/network recovery and physical-device gates |
+| Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
+| Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync and headed desktop checks | Repeat mobile and authenticated gates |
 
 The new Agent Auth vault is empty. No provider credentials have been copied or
 connected. The user chose manual Crew Canary sign-in after foreground-control
@@ -39,16 +44,25 @@ still validates actual account/model access at run admission. Managed title
 inference uses the controller's title route; realtime voice and unsupported
 harnesses remain explicitly unavailable, never local-provider fallbacks.
 
-The copy-only importer is undergoing committed-legacy schema verification,
-including real transcript parts, peer provenance, annotations and command
-outcomes. Unsupported or unreconciled records block cutover instead of being
-silently dropped. Existing web/legacy clients stay on their old isolated lane.
+The copy-only importer passed committed-legacy schema fixtures through the real
+target SQLite/Loro readers, including transcript parts, peer provenance,
+annotation revisions, native OMP bytes, attachments and durable command outcomes.
+Unsupported shared/granted/native records and unreconciled work explicitly block
+cutover rather than being silently dropped. Existing web/legacy clients stay on
+their old isolated lane.
 No live user profile has been imported.
 
-No Crew source commit, private runtime CI artifact, completed update rehearsal,
-physical-iOS verification or production promotion has yet been recorded. Local
-typechecks are intentionally not run to preserve workstation resources. Remaining
-gates below are requirements, not claims of completed testing.
+The rehearsal's three conflicts were the Cursor launch boundary and the macOS
+development plist/launcher. Resolution keeps both the managed-route guard and
+upstream's Plus model defaults, and keeps Crew's isolated environment names.
+Parents are `7142b2c533bfc1e960abbd901238ff8845f15c24` (Crew on prior upstream)
+and `3b2f78027a2c31622c39c35716da4d6e1af8de15`; resulting tree is
+`fe83c31e96e6e325b9580d44146b7f24d6962b00`. This is not an empty merge.
+
+The Linux runtime artifact, completed behavioral update rehearsal, physical-iOS
+verification and production promotion are not yet recorded. Local typechecks
+are intentionally not run to preserve workstation resources. Remaining gates
+below are requirements, not claims of completed testing.
 
 
 Status: implementation and verification in progress; no production cutover.
@@ -261,7 +275,7 @@ Minimum release evidence:
 
 No local typechecks: keep `ASHLER_INCREMENTAL_TSC_CHECKS=false`, including Git operations. Run typechecks in authorized remote CI. Executed implementation evidence and outstanding gates are recorded above; do not infer completion from the planned checks.
 
-Follow [the repository release workflow](../skills/comet-work/SKILL.md). A runtime-contract bump requires the platform-first sequence in `README.md`; it is not a desktop-only release. Preserve an immutable staging candidate, wait for the captain's explicit manual verification of the restarted build, and promote that exact candidate only with production authorization. Coordinate both Scaffold image lanes and Edge/client compatibility. The documented production pin-operation gap must be resolved before rollout, not guessed during release.
+The isolated canary uses the private manual delivery documented in [distribution guidance](../dist/README.md), not the shared updater. Eventual cutover must preserve the [existing Crew release gates](https://github.com/Ashler-AI/comet/blob/297717c55beab9323c53095f3f5f683f00676a5e/skills/comet-work/SKILL.md), including the [platform-first runtime sequence](https://github.com/Ashler-AI/comet/blob/297717c55beab9323c53095f3f5f683f00676a5e/README.md). Preserve an immutable staging candidate, wait for the captain's explicit manual verification of the restarted build, and promote that exact candidate only with production authorization. Coordinate both Scaffold image lanes and Edge/client compatibility. The documented production pin-operation gap must be resolved before rollout, not guessed during release.
 
 ## Source anchors
 

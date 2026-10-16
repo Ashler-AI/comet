@@ -16,7 +16,6 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::{Mutex, MutexGuard};
 use std::task::{Context, Poll};
@@ -36,7 +35,6 @@ struct InferenceRouteRequest {
     provider: String,
     model: String,
     requested_account_id: Option<String>,
-    lifecycle_epoch: u64,
 }
 
 const MAX_CONNECTIONS: usize = 64;
@@ -57,7 +55,6 @@ struct Inner {
     client: ScaffoldClient,
     port: u16,
     route_state: Mutex<RouteState>,
-    next_lifecycle_epoch: AtomicU64,
 }
 
 struct Route {
@@ -286,7 +283,6 @@ fn inference_route_request(
     harness: HarnessId,
     selected_model: Option<&str>,
     requested_account_id: Option<&str>,
-    lifecycle_epoch: u64,
 ) -> Result<Option<InferenceRouteRequest>, EngineError> {
     let Some((provider, model)) = inference_binding(harness, selected_model) else {
         return Ok(None);
@@ -302,7 +298,6 @@ fn inference_route_request(
         provider: provider.to_string(),
         model,
         requested_account_id,
-        lifecycle_epoch,
     }))
 }
 
@@ -325,7 +320,6 @@ impl InferenceRelay {
                 client,
                 port,
                 route_state: Mutex::new(RouteState::default()),
-                next_lifecycle_epoch: AtomicU64::new(0),
             }),
         };
         let runtime_listener = TcpListener::from_std(listener)?;
@@ -341,11 +335,6 @@ impl InferenceRelay {
         model: Option<&str>,
         requested_account_id: Option<&str>,
     ) -> Result<Option<InferenceRoute>, EngineError> {
-        let lifecycle_epoch = self
-            .inner
-            .next_lifecycle_epoch
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
         let agent_auth_session_id = agent_auth_logical_session_id(session_id);
         let local_session_id =
             matches!(&agent_auth_session_id, Cow::Owned(_)).then(|| session_id.to_string());
@@ -354,7 +343,6 @@ impl InferenceRelay {
             harness,
             model,
             requested_account_id,
-            lifecycle_epoch,
         )?
         else {
             tracing::debug!(?harness, "inference relay skipped for unsupported harness");
