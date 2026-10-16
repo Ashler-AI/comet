@@ -20,10 +20,11 @@ Crew's initial integration is `eccc3324`; verified relay cleanup and migration
 checks are committed and pushed as `c5eda252`. The initial
 [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
 passed on macOS, Linux x64 and Linux ARM64, including remote Edge typechecks.
-Smoke and URL-isolation amendments are committed and pushed as `516ad3a2`.
-[Final private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/38916195528)
+Smoke and URL-isolation amendments are committed and pushed as `516ad3a2`;
+the pooled-account/sandbox UI and control fixes are `eb938af2`.
+[Its private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/38934010957)
 passed on macOS, Linux x64, Linux ARM64 and remote Edge contracts/typechecks.
-Its downloaded Linux x64 archive and executable checksums were verified locally;
+The downloaded Linux x64 archive and executable checksums were verified locally;
 nothing is published to a shared release channel.
 This is a testing lane, not production or a completed cutover.
 
@@ -56,6 +57,8 @@ trust key await explicit user approval. This is not a live shared-pool claim.
 Account enrollment, import and revoke remain in Crew Staging; Canary displays and
 uses only the authorized pool. All delegated authority scopes are canary-prefixed
 and retain the shared v2 private-auth gate and sandbox lifecycle validation.
+The canary consumer also passed its own full
+[remote Worker/vault/provider CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38933796743).
 
 The isolated provider image was remotely built from the current provider's exact
 source plus its two-line canary link-scheme fix, then deployed only to the canary
@@ -94,6 +97,11 @@ The exact `516ad3a2` Linux x64 runtime is configured under
 SHA-256 `03866b003aed7389241b34dd924081c0b33a3b83f3705c69f4b428da225d2966`.
 The archive digest is `7ceba3a16d9a8c882b2946cad11a1a11d3e6f8b4b0cf7ce2238fe12bf4d42774`;
 provenance records `scaffold.comet-runtime.v1`. This is not a sandbox-run claim.
+The new `eb938af2180996f6a5afa9643c7c5733aff48a85` Linux runtime is also downloaded
+and checksum-verified at the same runtime-directory layout, SHA-256
+`aa386f9941202d01cf05b53abd4318ce5271c0a26295f5af533ee4a8ab1c9c36`.
+It has not replaced the running host's artifact pin or any sandbox binary;
+activation belongs to the approved shared-auth/runtime smoke, not a silent restart.
 
 Launches from another Crew agent must pin Canary's IPC/data coordinates as shown
 in `dist/README.md`; otherwise the parent's `COMET_IPC_PORT` can select its engine.
