@@ -4,7 +4,11 @@ name: Crew Canary artifacts
 # latest pointers or unauthenticated update manifests.
 on:
   workflow_dispatch:
-  workflow_call:
+    inputs:
+      reviewed_sha:
+        description: Exact reviewed integration-ready source SHA (private artifacts only)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,7 +17,18 @@ env:
   ASHLER_INCREMENTAL_TSC_CHECKS: 'false'
 
 jobs:
+  approve-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require exact reviewed source
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/crew/upstream-canary
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
   edge-contracts:
+    needs: approve-source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -31,6 +46,7 @@ jobs:
           npm test
 
   linux:
+    needs: approve-source
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +91,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    needs: approve-source
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

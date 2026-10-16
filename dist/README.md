@@ -82,15 +82,24 @@ and preservation of existing installations. It uses a throwaway HOME.
 
 ## Build-only workflow and update policy
 
-`.github/workflows/release.yml` is now **Crew Canary artifacts**, callable via
-manual dispatch or `workflow_call`. It builds the exact `github.sha`, uploads
+`.github/workflows/release.yml` is **Crew Canary artifacts**. Manual dispatch
+requires the exact reviewed SHA and builds that immutable `github.sha`, uploading
 private Actions artifacts with archive `SHA256SUMS`, raw Linux executable
 `COMET_SHA256SUMS`, and `provenance.json`, and has only `contents: read`.
 `COMET_SHA256SUMS` names the extracted archive-root `comet` file; its digest
 is the value for `COMET_SCAFFOLD_RUNTIME_SHA256`, not the archive digest.
-It does not deploy, publish GitHub Releases, use shared release
-credentials, or change signed stable/staging channels. Canary infrastructure
-has its own isolated deployment workflow.
+It does not deploy, publish GitHub Releases, use shared release credentials, or
+change signed stable/staging channels. Dispatch the registered workflow after review:
+
+```sh
+gh workflow run release.yml --repo Ashler-AI/comet --ref crew/upstream-canary \
+  -f "reviewed_sha=${REVIEWED_SHA:?Set the exact reviewed integration commit}"
+```
+
+Verify that the run's `headSha` is the reviewed commit before consuming its private
+artifacts. Edge deployment is a separate operator action: from `edge/`, run
+`npx wrangler deploy --env canary` only after that revision passes CI. The isolated
+controller uses Platform's `internal/scaffold/scripts/deploy-upstream-canary.mjs`.
 
 `zeron-update::AUTOMATIC_UPDATES_SUPPORTED` is false for this branch. Direct
 CLI/UI checks, staging and apply paths fail closed before a shared channel can

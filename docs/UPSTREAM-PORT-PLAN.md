@@ -81,9 +81,14 @@ The fresh lifecycle smoke reached E2B VM creation, then failed in
 `wait_command_channel`: `[permission_denied] HTTP 403` for 120 seconds. Its
 native attachment outcome was reconciled to rejected without replay. No E2B
 access-policy change or replacement sandbox was attempted after that failure.
+The provider's own non-resuming SDK lookup subsequently returned
+`SandboxNotFoundError` for that owned VM, confirming failed-start cleanup.
 The canary consumer's earlier full
 [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38933796743)
 also passed.
+Final controller source `9a12de49fc4` passed
+[remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38946679029),
+including all remote typechecks.
 
 The isolated provider image was remotely built from the current provider's exact
 source plus its two-line canary link-scheme fix, then deployed only to the canary
