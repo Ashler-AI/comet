@@ -524,6 +524,10 @@ pub struct AccountsPage {
 }
 
 impl AccountsPage {
+    pub(crate) fn set_crew_view(&mut self, view: super::crew::CrewView, cx: &mut Context<Self>) {
+        self.crew.update(cx, |page, cx| page.set_view(view, cx));
+    }
+
     pub(crate) fn capture_annotation_selection(&mut self, cx: &mut Context<Self>) {
         self.crew.update(cx, |page, cx| page.capture_annotation_selection(cx));
     }
@@ -1879,7 +1883,7 @@ impl AccountsPage {
 
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.state.read(cx).managed_inference {
+        if self.state.read(cx).managed_inference || self.crew.read(cx).view() != super::crew::CrewView::Accounts {
             return div().id("crew-accounts-page").size_full().overflow_y_scroll()
                 .child(widgets::page_column().child(self.crew.clone())).into_any_element();
         }

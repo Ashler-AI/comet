@@ -14,7 +14,8 @@ passed, including remote typechecks and runtime contract suites.
 Canary sign-in's missing IAP audience was corrected in Platform `77341592d7`
 and deployed as canary Helm revision 2. The actual browser receives verified
 `auth: iap`; anonymous authorization redirects to Google and forged identity
-headers remain HTTP 401. A fresh manual desktop sign-in is still required.
+headers remain HTTP 401. The user completed desktop sign-in; IPC confirms the
+same canary identity and preserves it across application restarts.
 Crew's initial integration is `eccc3324`; verified relay cleanup and migration
 checks are committed and pushed as `c5eda252`. The initial
 [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
@@ -28,20 +29,42 @@ This is a testing lane, not production or a completed cutover.
 
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
-| Desktop | Rehearsal merge built, packaged and launched as Crew Canary; actual IPC returns OMP/Claude/Codex managed catalogs and rejects Cursor; isolated headed demo renders seeded mock transcripts; actual compact-mode setting persists across cold restart | Authenticated controls, shared comments and links |
+| Desktop | Local app rebuilt and launched with separate Accounts/Sandboxes/Annotations pages, provider-grouped shared-account usage, bounded session details, sidebar/new-session sandbox entries and managed-model selection; actual UI creation confirmation and successful link navigation exercised | Live shared-pool rows and managed turns await broker deployment |
 | Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme | Authenticated profile restart and cross-client verification |
 | Sync | Real workerd plus two real headless engines: session discovery, queued remote Run, transcript and working-to-idle status roundtrip passed | This used mock inference; reconnect/backpressure and real managed turns remain |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff`; unauthenticated identity/registry/chat reads returned 401 even with forged identity headers; public installer returned 404 | Live signed-in desktop/mobile authority and revocation |
-| Scaffold | Controller Worker version `e8121145-bdc7-414e-adf9-286c7f608584`; dedicated Helm release installed; HTTPRoute Accepted/ResolvedRefs/Reconciled; public OAuth discovery returned the canary issuer and S256 PKCE; exact Linux runtime configured below | User sign-in, approved provider connection and full sandbox lifecycle |
-| Protocol checks | Edge workerd 38/38; corrected wake/backup alarm tests 8/8; Platform auth/directory/broker 24/24; attach-routing 44/44; canary config/Helm checks 2/2 across four snapshot configurations | Remote runtime and actual-client scenarios below |
-| Rust checks | Client 26, document 148, engine 614, protocol 91, sync 76 and harness 330 library tests passed; migration 8/8, scoped annotations 1/1, Scaffold auth 3/3 and native OMP 11/11 passed | Two engine tests and an OMP subprocess helper ignored; actual managed providers and sandbox lifecycle still require sign-in |
+| Scaffold | Canary Helm revision 3 deployed the exact-baseline provider directory fix; authenticated directory GET now succeeds; existing failed attachment reconciles to rejected without replay; new sandbox form uses deployment source/default region and explicit managed-model selection | Shared inference admission and successful create/attach/pause/resume/stop |
+| Protocol checks | Shared-auth consumer/binding/OMP contracts 33/33, exact-live-staging broker security 6/6, canary config 2/2; existing Edge workerd 38/38 and wake/backup alarms 8/8 | Live shared-broker path awaits explicit deployment/key approval |
+| Rust checks | Scaffold library 39/39 and resolved-link navigation regression 1/1 passed; desktop build/package succeeded; existing client/document/engine/protocol/sync/harness checks recorded above | Actual shared-provider and sandbox runtime scenarios |
 | Mobile | Shared Rust core, generated Swift bindings and native app built; iOS 26.5 simulator displayed Crew Canary; warm directory link and cold Scaffold link stayed signed out; exact cold-link intent persisted across launch | Authenticated cross-client scenarios, lifecycle/network recovery and physical-device gates |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
 | Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated cross-client/provider/lifecycle gates |
 
-The new Agent Auth vault is empty. No provider credentials have been copied or
-connected. The user chose manual Crew Canary sign-in after foreground-control
-approval timed out. No provider connection/import permission has been inferred.
+The initial empty canary vault caused the reported `agent_auth_v2_account_unavailable`.
+Read-only metadata verified the existing Crew Staging pool has 5 connected OpenAI
+and 6 connected Anthropic accounts. Its canonical owner ID differs from the
+isolated canary's owner; pointing at the same database would not fix ownership.
+No provider credentials have been copied, imported, or connected.
+
+Platform `0c1de2aa850` prepares the canary consumer of a narrow staging broker.
+The shared-service patch is separately based on the **exact live staging source**
+`94dc2c9cade2b89b4ba4b3fc80bee777695edbc4`, not the divergent canary fork.
+Commits `2b09634cc57` (broker) and `abe9f0d93e3` (directory compatibility) passed
+[remote Worker/vault/provider CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38932761302),
+including typechecks. Shared-controller deployment and a new dedicated server
+trust key await explicit user approval. This is not a live shared-pool claim.
+Account enrollment, import and revoke remain in Crew Staging; Canary displays and
+uses only the authorized pool. All delegated authority scopes are canary-prefixed
+and retain the shared v2 private-auth gate and sandbox lifecycle validation.
+
+The isolated provider image was remotely built from the current provider's exact
+source plus its two-line canary link-scheme fix, then deployed only to the canary
+release as digest `sha256:01f6d0e611c4fd94414b5c1a0fe9512d30c6fcc406e2af1d67c3bdfc09e5f5cc`.
+[Cloud Build](https://console.cloud.google.com/cloud-build/builds/5aa53535-4093-42f4-83bf-68f686135f95?project=54440053364)
+passed; the old provider rejected `crew-upstream-canary` before every directory
+operation. Three HTTP directory tests passed; disposable PostgreSQL integration
+was skipped because no test database was configured. Shared provider deployments
+and database permissions were not changed.
 
 The user approved provisioning and installing the isolated canary on the paired
 iPhone 18 Pro (iOS 27.0.1). Xcode 26.6 (`17F113`) cannot mount its current
@@ -74,10 +97,10 @@ provenance records `scaffold.comet-runtime.v1`. This is not a sandbox-run claim.
 
 Launches from another Crew agent must pin Canary's IPC/data coordinates as shown
 in `dist/README.md`; otherwise the parent's `COMET_IPC_PORT` can select its engine.
-The verified local instance listens on 27954 and reports `signedOut`; managed
-account enumeration fails closed with `Crew sign-in required`. No credentials
-were borrowed from that parent. The demo now uses a fresh owned temp directory
-and seeds each project once, fixing its observed `no such space` failure.
+The local instance listens on 27954 and reports the user's verified `signedIn`
+canary profile. Existing sessions survive restart; no credentials were borrowed
+from the parent. The demo uses a fresh owned temp directory and seeds each
+project once, fixing its observed `no such space` failure.
 
 Managed model pickers use existing bundled OMP and upstream Claude/Codex
 catalogs without invoking local CLIs or reading provider credentials. Agent Auth

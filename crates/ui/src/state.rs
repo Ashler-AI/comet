@@ -897,6 +897,14 @@ pub(crate) struct TranscriptTextChanged {
 
 impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
 
+/// An explicit conversation link passed workspace/owner resolution. Background
+/// selection changes do not request a shell route change.
+pub(crate) struct ConversationLinkOpened {
+    pub chat_id: String,
+}
+
+impl gpui::EventEmitter<ConversationLinkOpened> for AppState {}
+
 fn is_text_append(frame: &TranscriptFrame) -> bool {
     matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
         if upsert.is_empty() && remove.is_empty() && !append.is_empty())
@@ -2766,7 +2774,7 @@ impl AppState {
         }
         if self.chats.iter().any(|chat| chat.id == link.chat_id) {
             self.pending_deep_link = None;
-            self.select_chat(Some(link.chat_id), cx);
+            self.select_linked_chat(link.chat_id, cx);
             true
         } else if self.chats_synced {
             self.pending_deep_link = None;
@@ -2813,7 +2821,7 @@ impl AppState {
                 if state.auth_user().map(|user| user.id.as_str()) != Some(owner.as_str()) { return; }
                 match result {
                     Ok(value) => match value.get("chatId").and_then(serde_json::Value::as_str) {
-                        Some(id) if !id.is_empty() => state.select_chat(Some(id.to_owned()), cx),
+                        Some(id) if !id.is_empty() => state.select_linked_chat(id.to_owned(), cx),
                         _ => state.deep_link_notice = Some("The session resolver returned no authorized session. Reopen the link after refreshing.".into()),
                     },
                     Err(error) => state.deep_link_notice = Some(format!("Could not open Crew session: {error}. Reopen the original link to retry.")),
@@ -2822,6 +2830,11 @@ impl AppState {
             }).ok();
         }).detach();
         true
+    }
+
+    fn select_linked_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.select_chat(Some(chat_id.clone()), cx);
+        cx.emit(ConversationLinkOpened { chat_id });
     }
 
     pub fn take_deep_link_notice(&mut self) -> Option<String> {

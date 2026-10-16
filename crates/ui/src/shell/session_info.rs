@@ -257,16 +257,28 @@ impl Shell {
             .child(project_row)
             .children(branch_row)
             .when_some(chat.crew.as_ref(), |body, crew| {
-                body.child(crate::settings::widgets::page_subtitle(&theme, format!(
-                    "Owner {} · project {} · deployment {} · session {}",
-                    crew.owner_subject, crew.scope.project_id, crew.scope.deployment_id.as_deref().unwrap_or("none"), crew.session_id,
-                )))
+                let label = match crew.environment.as_ref().map(|environment| &environment.source) {
+                    Some(zeron_proto::SessionEnvironmentSource::Scaffold { lifecycle, .. }) => format!("{} · {}", crew.environment.as_ref().and_then(|environment| environment.name.as_deref()).unwrap_or("Scaffold sandbox"), crate::settings::crew::lifecycle_label(*lifecycle)),
+                    _ => if local { "Local host".into() } else { "Remote host".into() },
+                };
+                body.child(info_row(&theme, row_glyph(icons::MONITOR, &theme), label.into())
+                    .id("crew-session-environment")
+                    .tooltip(crate::settings::widgets::text_tooltip(format!("Owner {}\nProject {}\nDeployment {}\nSession {}", crew.owner_subject, crew.scope.project_id, crew.scope.deployment_id.as_deref().unwrap_or("none"), crew.session_id))))
             })
             .when(!online, |body| body.child(crate::settings::widgets::page_subtitle(&theme,
                 "Host offline. Synced history remains available; continuing requires its host.")))
-            .child(crate::settings::widgets::ghost_action(&theme)
+            .when(self.state.read(cx).managed_inference, |body| body.child(
+                crate::settings::widgets::ghost_action(&theme)
+                    .id("crew-session-sandboxes").role(gpui::Role::Button).tab_index(0)
+                    .aria_label("Manage Scaffold sandboxes")
+                    .focus_visible(|style| style.border_2().border_color(theme.accent))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_session_info_overlay(cx);
+                        this.open_settings(SettingsSection::Sandboxes, cx);
+                    })).child("Manage sandboxes")))
+            .when(chat.crew.is_some(), |body| body.child(crate::settings::widgets::ghost_action(&theme)
                 .id("crew-session-controls").role(gpui::Role::Button)
-                .aria_label("Session controls and shared annotations").tab_index(0)
+                .aria_label("Shared annotations").tab_index(0)
                 .focus_visible(|style| style.border_2().border_color(theme.accent))
                 .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -278,9 +290,9 @@ impl Shell {
                         && let Some(page) = &this.accounts_page {
                         page.update(cx, |page, cx| page.capture_annotation_selection(cx));
                     }
-                    this.open_settings(SettingsSection::Agents, cx);
+                    this.open_settings(SettingsSection::Annotations, cx);
                 }))
-                .child("Controls and annotations"))
+                .child("Shared annotations")))
             .child(popover::picker_divider())
             .child(side_chat)
             .child(fork)

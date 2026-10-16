@@ -3696,6 +3696,7 @@ impl Pickers {
             .flex_none()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap(px(4.0))
             .child(attach_overlay_end(
@@ -3712,6 +3713,16 @@ impl Pickers {
                 "device-popover",
                 closing,
             ))
+            .when(self.state.read(cx).managed_inference, |row| row.child(
+                crate::settings::widgets::ghost_action(&theme)
+                    .id("new-thread-sandboxes").role(gpui::Role::Button).tab_index(0)
+                    .aria_label("New sandbox or use existing sandbox")
+                    .focus_visible(|style| style.border_2().border_color(theme.accent))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dismiss(cx);
+                        window.dispatch_action(Box::new(crate::shell::OpenSandboxes), cx);
+                    }))
+                    .child("New / use sandbox…")))
             .into_any_element()
     }
 

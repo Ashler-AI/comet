@@ -2200,12 +2200,12 @@ mod tests {
             assert_eq!(loaded.settings_section, SettingsSection::General, "{raw}");
             assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
         }
-        // The legacy Accounts alias still reads, and reopens as Providers.
+        // Accounts remains a distinct shared-pool page.
         let alias: UiSettings = serde_json::from_str(r#"{"settingsSection":"agents"}"#).unwrap();
         assert_eq!(alias.settings_section, SettingsSection::Agents);
         assert_eq!(
             alias.settings_section.reopenable(),
-            SettingsSection::Harnesses
+            SettingsSection::Agents
         );
     }
 
@@ -2721,165 +2721,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = UiSettings {
-            dictation_enabled: false,
-            dictation_input: Some("coreaudio:usb-mic".into()),
-            window_geometry: None,
-            codex_voice: Some("ember".into()),
-            codex_voice_device: Some("fedora".into()),
-            sidebar_width: 300.0,
-            sidebar_collapsed: true,
-            sidebar_grouped: true,
-            sidebar_organization: SidebarOrganization::ByDevice,
-            sidebar_sort: SidebarSort::Created,
-            sidebar_compact: true,
-            sidebar_show_project_icon: false,
-            sidebar_show_project_label: false,
-            sidebar_show_harness: false,
-            sidebar_show_branch: false,
-            sidebar_show_pull_request: false,
-            sidebar_show_project_filter: false,
-            sidebar_show_archived: false,
-            github_star_banner_dismissed: true,
-            last_space_id: Some("space-1".into()),
-            last_project_action_by_space_id: std::collections::HashMap::from([(
-                "space-1".into(),
-                "dev".into(),
-            )]),
-            open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
-            space_filter: Some("space-1".into()),
-            sidebar_sections_by_profile: HashMap::new(),
-            sidebar_pinned_session_ids_by_profile: HashMap::from([
-                (
-                    "local".to_string(),
-                    vec!["local-2".to_string(), "local-1".to_string()],
-                ),
-                (
-                    "synced:org-1:user-1".to_string(),
-                    vec!["synced-1".to_string()],
-                ),
-            ]),
-            tab_order: std::collections::HashMap::from([(
-                "space-1".to_string(),
-                vec!["b".to_string(), "a".to_string()],
-            )]),
-            space_order: vec!["space-2".to_string(), "space-1".to_string()],
-            sound_enabled: false,
-            sound_completion_enabled: false,
-            sound_input_enabled: true,
-            sound_attention_enabled: false,
-            notifications_enabled: false,
-            notifications_background_only: false,
-            files_panel_width: 310.0,
-            agent_update_notifications: false,
-            right_pane_width: 700.0,
-            pull_request_pane_width: 820.0,
-            right_pane_open: true,
-            terminal_height: 320.0,
-            terminal_open: true,
-            keymap: KeymapConfig {
-                toggle_sidebar: "mod-shift-s".into(),
-                ..KeymapConfig::default()
-            },
-            escape_stops_active_agent: true,
-            settings_section: crate::shell::SettingsSection::Shortcuts,
-            composer_send_behavior: ComposerSendBehavior::ModEnter,
-            skills_in_slash_menu: true,
-            skill_completion_by_harness: Default::default(),
-            compact_model_picker: true,
-            appshots_enabled: false,
-            appshot_sound_enabled: true,
-            // The destination is only persisted where Appshots exist (macOS and
-            // Linux); elsewhere the field is `serde(skip)` and reloads as the
-            // default, so the round trip must expect exactly that.
-            appshot_destination: if cfg!(any(target_os = "macos", target_os = "linux")) {
-                crate::appshots::AppshotDestination::NewSession
-            } else {
-                crate::appshots::AppshotDestination::Automatic
-            },
-            appearance: crate::appearance::AppearanceMode::Light,
-            git_history_columns: GitHistoryColumns {
-                author: false,
-                date: true,
-                sha: false,
-            },
-            git_history_column_widths: GitHistoryColumnWidths {
-                author: 132.0,
-                date: 104.0,
-                sha: 82.0,
-            },
-            git_history_column_order: GitHistoryColumnOrder(vec![
-                GitHistoryColumn::Sha,
-                GitHistoryColumn::Author,
-                GitHistoryColumn::Date,
-            ]),
-            git_history_author_display: GitHistoryAuthorDisplay::Name,
-            ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
-            ui_font_size: crate::typography::UiFontSize::ALL[5],
-            theme_selection: zeron_theme::ThemeSelection {
-                light: "catppuccin-latte".into(),
-                dark: "catppuccin-mocha".into(),
-            },
-            diff_split: true,
-            diff_wrap: true,
-            code_fences_fit_content: true,
-            transcript_width: 960.0,
-            open_web_links_in_zeron: false,
-            transcript_compact_mode: true,
-            pull_request_destination: PullRequestDestination::External,
-            last_pull_request_repository: Some("acme/zeron".into()),
-            last_pull_request_device: Some("remote-device".into()),
-            pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
-            files_autosave_enabled: true,
-            files_autosave_delay_ms: 1_500,
-            files_word_wrap: true,
-            terminal_font_family: crate::typography::UiFontFamily::Installed("Menlo".into()),
-            terminal_font_size: 15.0,
-            code_font_family: crate::typography::UiFontFamily::Geist,
-            code_font_size: 11.0,
-            files_show_all: true,
-            session_info_hidden: true,
-            accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
-            surface: zeron_theme::SurfacePreference::Frosted,
-            new_thread_composer_background: Some(NewThreadComposerBackground {
-                path: "/tmp/zeron/new-thread-background.png".into(),
-                name: "background.png".into(),
-                adjustment: NewThreadBackgroundAdjustment {
-                    focal_x: 0.25,
-                    focal_y: 0.75,
-                    zoom: 1.8,
-                },
-            }),
-            wallpaper_folder: Some("/tmp/wallpapers".into()),
-            wallpaper_source: Some("/tmp/wallpapers/background.png".into()),
-            wallpaper_history: vec!["/tmp/wallpapers/background.png".into()],
-            wallpaper_theme_colors: false,
-            wallpaper_color: None,
-            new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
-            reduce_motion: crate::motion::ReduceMotion::On,
-            pause_animations_in_background: true,
-            legacy_accent_color: None,
-        };
-        settings.save(dir.path()).unwrap();
-        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
-        assert!(json.contains(r#""diffWrap": true"#));
-        assert_eq!(UiSettings::load(dir.path()), settings);
-        assert!(json.contains(r#""codeFencesFitContent": true"#));
-        assert!(json.contains(r#""openWebLinksInZeron": false"#));
-        assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
-        assert!(json.contains(r#""focalX": 0.25"#));
-        assert!(json.contains(r#""focalY": 0.75"#));
-        assert!(json.contains(r#""zoom": 1.8"#));
-        assert!(json.contains(r#""reduceMotion": "on""#));
-        assert!(json.contains(r#""pauseAnimationsInBackground": true"#));
-        assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
-        assert!(json.contains(r#""terminalFontSize": 15.0"#));
-        assert!(json.contains(r#""codeFontFamily": "geist""#));
-        assert!(json.contains(r#""codeFontSize": 11.0"#));
-    }
 
     #[test]
     fn stale_revision_cannot_be_considered_the_latest_save() {

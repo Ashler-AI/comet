@@ -124,6 +124,7 @@ actions!(
         OpenModelPicker,
         NewSession,
         OpenSettings,
+        OpenSandboxes,
         NextSession,
         PrevSession,
         ArchiveSession
@@ -543,6 +544,8 @@ pub enum SettingsSection {
     Harnesses,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
+    Sandboxes,
+    Annotations,
     Appearance,
     Files,
     Notifications,
@@ -557,7 +560,7 @@ pub enum SettingsSection {
 
 impl SettingsSection {
     /// Settings navigation includes the shared Crew account pool.
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 13] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
@@ -565,6 +568,8 @@ impl SettingsSection {
         SettingsSection::Shortcuts,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
+        SettingsSection::Sandboxes,
+        SettingsSection::Annotations,
         SettingsSection::Devices,
         SettingsSection::Files,
         SettingsSection::Appshots,
@@ -598,6 +603,8 @@ impl SettingsSection {
             SettingsSection::Devices => "devices",
             SettingsSection::Harnesses => "providers",
             SettingsSection::Agents => "agents",
+            SettingsSection::Sandboxes => "sandboxes",
+            SettingsSection::Annotations => "annotations",
             SettingsSection::Appearance => "appearance",
             SettingsSection::Files => "files",
             SettingsSection::Notifications => "notifications",
@@ -615,6 +622,8 @@ impl SettingsSection {
             "devices" => SettingsSection::Devices,
             "providers" | "harnesses" => SettingsSection::Harnesses,
             "agents" => SettingsSection::Agents,
+            "sandboxes" => SettingsSection::Sandboxes,
+            "annotations" => SettingsSection::Annotations,
             "appearance" => SettingsSection::Appearance,
             "files" => SettingsSection::Files,
             "notifications" => SettingsSection::Notifications,
@@ -640,6 +649,8 @@ impl SettingsSection {
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Providers",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::Sandboxes => "Sandboxes",
+            SettingsSection::Annotations => "Annotations",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
@@ -2330,6 +2341,7 @@ pub struct Shell {
     /// Redraw scheduled for the next clock-driven change (see [`shell_clock_wake`]).
     clock: ClockRedraw,
     _state_observation: Subscription,
+    _conversation_link_events: Subscription,
     _composer_events: Subscription,
     /// The primary transcript's spawn-chip events (subagent tabs).
     _transcript_events: Subscription,
@@ -2341,6 +2353,9 @@ impl Shell {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
+        });
+        let conversation_link_events = cx.subscribe(&state, |this: &mut Shell, _, event: &crate::state::ConversationLinkOpened, cx| {
+            this.open_chat(event.chat_id.clone(), cx);
         });
         // A reopened window reuses AppState, so the engine may already be
         // ready. Only show the boot splash while it is actually connecting.
@@ -2718,6 +2733,7 @@ impl Shell {
             activation_sub: None,
             clock: ClockRedraw::default(),
             _state_observation: observation,
+            _conversation_link_events: conversation_link_events,
             _composer_events: composer_events,
             _transcript_events: transcript_events,
             _transcript_invalidation: transcript_invalidation,
@@ -5562,10 +5578,18 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Agents => {
+            SettingsSection::Agents | SettingsSection::Sandboxes | SettingsSection::Annotations => {
                 if self.accounts_page.is_none() {
                     let state = self.state.clone();
                     self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
+                }
+                if let Some(page) = &self.accounts_page {
+                    let view = match section {
+                        SettingsSection::Sandboxes => settings::crew::CrewView::Sandboxes,
+                        SettingsSection::Annotations => settings::crew::CrewView::Annotations,
+                        _ => settings::crew::CrewView::Accounts,
+                    };
+                    page.update(cx, |page, cx| page.set_crew_view(view, cx));
                 }
                 match &self.accounts_page {
                     Some(page) => page.clone().into_any_element(),
@@ -7890,6 +7914,8 @@ impl Shell {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Sandboxes => icons::MONITOR,
+            SettingsSection::Annotations => icons::SETTINGS,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
@@ -9141,7 +9167,14 @@ impl Shell {
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
-        let filter_row = self.render_spaces_filter(theme, cx);
+        let filter_row = div().flex().flex_col().gap(px(4.0))
+            .child(self.render_spaces_filter(theme, cx))
+            .when(self.state.read(cx).managed_inference, |row| row.child(
+                settings::widgets::ghost_action(theme).id("sidebar-sandboxes")
+                    .role(gpui::Role::Button).tab_index(0).aria_label("Scaffold sandboxes")
+                    .focus_visible(|style| style.border_2().border_color(theme.accent))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_settings(SettingsSection::Sandboxes, cx)))
+                    .child("Scaffold sandboxes")));
         let active_list = if !list_items.is_empty() {
             let mut pinned_items = list_items;
             let mut custom_items = pinned_items.split_off(pinned_count);
@@ -13598,6 +13631,7 @@ impl Render for Shell {
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) toggle the modal from any section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.toggle_settings(cx)))
+            .on_action(cx.listener(|this, _: &OpenSandboxes, _, cx| this.open_settings(SettingsSection::Sandboxes, cx)))
             .on_action(cx.listener(|this, _: &NextSession, window, cx| {
                 this.cycle_navigation(true, window, cx)
             }))
@@ -16360,6 +16394,39 @@ mod exit_regressions {
         });
         shell.update(cx, |shell, _| shell.debug_gate = Some(GatePhase::Ready));
         (shell, cx, dir)
+    }
+
+    #[gpui::test]
+    fn resolved_conversation_links_leave_settings_but_background_selection_does_not(cx: &mut TestAppContext) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        let state = shell.read_with(cx, |shell, _| shell.state.clone());
+        state.update(cx, |state, _| {
+            state.workspace_scope = Some(WorkspaceScope::Local);
+            state.local_device_id = Some("local-link-host".into());
+            state.auto_selected = true;
+            state.chats_synced = true;
+            let mut chat = super::tests::chat_with_path(None, None);
+            chat.id = "linked-session".into();
+            state.chats.push(chat);
+        });
+        shell.update(cx, |shell, cx| shell.open_settings(SettingsSection::Sandboxes, cx));
+        state.update(cx, |state, cx| state.select_chat(Some("linked-session".into()), cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| assert!(matches!(shell.route, Route::Settings(SettingsSection::Sandboxes))));
+        let workspace = state.read_with(cx, |state, _| crate::links::workspace_locator(state.workspace_scope, state.auth.as_ref(), state.local_device_id.as_deref()).unwrap());
+        for (id, scope) in [("linked-session", "another-workspace"), ("missing-session", workspace.as_str())] {
+            let url = crate::links::zeron_conversation_link(id, scope);
+            state.update(cx, |state, cx| state.open_deep_link(&url, cx));
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, _| assert!(matches!(shell.route, Route::Settings(SettingsSection::Sandboxes))));
+        }
+        let url = crate::links::zeron_conversation_link("linked-session", &workspace);
+        state.update(cx, |state, cx| state.open_deep_link(&url, cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.route, Route::Chat));
+            assert_eq!(shell.nav.current(), &NavEntry::Chat("linked-session".into()));
+        });
     }
 
     fn open_pull_request(cx: &mut gpui::VisualTestContext, number: u32) {

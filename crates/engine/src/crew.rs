@@ -237,7 +237,8 @@ impl CrewServices {
 
     fn record_error(&self, id: &str, error: ScaffoldError) -> Result<ControlOutcome, RpcError> {
         // No retry for ambiguous mutation delivery (including cancellation or malformed replies).
-        if matches!(&error, ScaffoldError::Api(api) if (400..500).contains(&api.0.status) && api.0.status != 408 && api.0.status != 429) {
+        if matches!(&error, ScaffoldError::AttachRejected(_))
+            || matches!(&error, ScaffoldError::Api(api) if (400..500).contains(&api.0.status) && api.0.status != 408 && api.0.status != 429) {
             self.finish(id, None, Some(error.to_string()))
         } else { Ok(unknown(id, &error.to_string())) }
     }
@@ -274,6 +275,13 @@ impl CrewServices {
             environment
         };
         self.validate_environment(&environment, scope)?;
+        if matches!(command.control, Control::Attach { .. })
+            && let SessionEnvironmentSource::Scaffold { lifecycle, .. } = &environment.source
+            && matches!(lifecycle, ScaffoldLifecycle::Failed | ScaffoldLifecycle::Stopped) {
+            return self.finish(command_id, None, Some(format!(
+                "Attach recovery retired because the sandbox is {lifecycle:?}; no command was replayed."
+            )));
+        }
         if let Some((binding, _)) = self.store.crew_command(&format!("{command_id}:binding")).map_err(failed)? {
             let before: SessionEnvironment = serde_json::from_slice(&binding).map_err(failed)?;
             validate_transition(&before, &environment)?;

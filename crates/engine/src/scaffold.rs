@@ -188,6 +188,8 @@ pub enum ScaffoldError {
     },
     #[error("scaffold_response_invalid: {0}")]
     InvalidResponse(String),
+    #[error("scaffold_attach_rejected: sandbox lifecycle {0:?}")]
+    AttachRejected(zeron_proto::ScaffoldLifecycle),
     #[error("scaffold_scope_invalid: {0}")]
     InvalidScope(String),
     #[error("{0}")]
@@ -317,6 +319,7 @@ pub(crate) struct AgentAccountOAuthCredential {
 pub(crate) struct RemoteAgentUsageWindow {
     pub label: String,
     pub used_fraction: f32,
+    #[serde(rename(serialize = "resetsAt", deserialize = "resetAt"))]
     pub reset_at: Option<String>,
 }
 
@@ -340,6 +343,7 @@ pub(crate) struct RemoteAgentAccount {
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub organization: Option<String>,
+    #[serde(rename(serialize = "planLabel", deserialize = "plan"))]
     pub plan: Option<String>,
     pub status: AgentAccountStatus,
     #[serde(default)]
@@ -3262,9 +3266,7 @@ impl ScaffoldRuntime {
                 | zeron_proto::ScaffoldLifecycle::Ready
                 | zeron_proto::ScaffoldLifecycle::AgentRunning
         ) {
-            return Err(ScaffoldError::InvalidResponse(format!(
-                "sandbox {sandbox_id} cannot attach in lifecycle {lifecycle:?}"
-            )));
+            return Err(ScaffoldError::AttachRejected(lifecycle));
         }
         let deployment_id = scope
             .deployment_id
@@ -3559,6 +3561,19 @@ mod tests {
         assert_eq!(account.status, AgentAccountStatus::Unknown);
     }
 
+    #[test]
+    fn shared_pool_usage_preserves_reset_deadline_for_ui() {
+        let remote: RemoteAgentUsageWindow = serde_json::from_value(serde_json::json!({
+            "label": "Five-hour",
+            "usedFraction": 0.25,
+            "resetAt": "2026-10-16T20:00:00Z"
+        })).unwrap();
+        let view: zeron_proto::AgentUsageWindow = serde_json::from_value(
+            serde_json::to_value(remote).unwrap(),
+        ).unwrap();
+        assert_eq!(view.resets_at.map(|time| time.timestamp()), Some(1_792_180_800));
+    }
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -3782,6 +3797,25 @@ mod tests {
             "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
         );
         assert!(runtime.ensure_remote_runtime("box", &CancellationToken::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_attach_is_a_known_rejection_before_runtime_mutation() {
+        for (status, lifecycle) in [
+            ("failed", zeron_proto::ScaffoldLifecycle::Failed),
+            ("stopped", zeron_proto::ScaffoldLifecycle::Stopped),
+        ] {
+            let (origin, captured) = mock_server_with_status(vec![(200, comet_sandbox(status))]).await;
+            let runtime = ScaffoldRuntime::new(
+                ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
+                "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
+            );
+            let error = runtime.control(ScaffoldEnvironmentControl::Attach {
+                sandbox_id: "sandbox-a".into(), scope: scope(),
+            }, &CancellationToken::new()).await.unwrap_err();
+            assert!(matches!(error, ScaffoldError::AttachRejected(state) if state == lifecycle));
+            captured.await.unwrap();
+        }
     }
 
     const TEST_RUNTIME_BYTES: &[u8] = b"immutable crew runtime fixture";
