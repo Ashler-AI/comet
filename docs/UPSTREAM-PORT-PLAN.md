@@ -30,6 +30,24 @@ not been installed. The configured, previously checksum-verified Linux pin is
 recorded below and remains unchanged while E2B runtime acceptance is blocked.
 This is a testing lane, not production or a completed cutover.
 
+Native chat2 sandbox supervision and its browser bridge are implemented locally;
+deployment and the full managed-sandbox smoke are still pending. The host waits
+for the checksum-verified executable and atomically installed embedded browser
+assets. Startup authority is independent of browser readiness: native context
+must arrive before the browser can report healthy. Legacy/shared lanes retain
+their existing protocol selection.
+
+Local verification: native command admission/recovery 4/4, Scaffold 41/41,
+coordinator/RPC 2/2 and native installer 2/2; browser HTTP contracts 9/9,
+supervision/agent contracts 23/23, provider boundaries 14/14 and controller
+contracts 56/56 passed. An actual isolated engine run installed the embedded
+assets twice, completed a mock-inference turn, admitted a repeated command only
+once, returned its durable outcome without payload, rejected conflicting reuse,
+and rejected a stale interrupt without admission. Mock inference is not evidence
+of sandbox-hosted Agent Auth execution. The local app was rebuilt and packaged.
+The initial default-profile Rust build timed out; the established low-memory
+build profile completed. No local typechecks were run.
+
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
 | Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated multi-client/mobile exercise |

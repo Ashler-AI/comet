@@ -147,6 +147,8 @@ struct SetHarnessUpdatePolicyParams {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+    command_id: Option<String>,
+    expected_turn_id: Option<String>,
     /// Queued attachments (bytes already committed locally as `pending://`
     /// refs) the engine delivers to a remote host AFTER the command is
     /// durably queued — never as a gate in front of it.
@@ -1520,6 +1522,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
+            | methods::READ_COMMAND
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from
@@ -2033,9 +2036,21 @@ impl RpcService for EngineRpc {
                 let p: QueueCommandParams = parse_params(params)?;
                 let command_id = self
                     .doc_host
-                    .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
+                    .queue_command_named(&p.chat_id, p.command, p.transfers, p.command_id.as_deref(), p.expected_turn_id.as_deref())
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::READ_COMMAND => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params { chat_id: String, command_id: String }
+                let p: Params = parse_params(params)?;
+                let command = self.doc_host.open(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .doc().read_commands().map_err(|error| RpcError::Failed(error.to_string()))?
+                    .into_iter().find(|entry| entry.id == p.command_id)
+                    .map(|entry| serde_json::json!({ "id": entry.id, "status": entry.status, "resolution": entry.resolution }));
+                RpcReply::value(&serde_json::json!({ "command": command }))
             }
             methods::TAKE_PROJECT_ACTION_SETUP => {
                 let p: TakeProjectActionSetupParams = parse_params(params)?;

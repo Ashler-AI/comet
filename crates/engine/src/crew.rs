@@ -223,6 +223,15 @@ impl CrewServices {
             }
             Err(error) => return self.record_error(command_id, error),
         };
+        if matches!(command.control, Control::Attach { .. }) {
+            return match self.runtime.observe_attachment(result.environment, cancellation).await.map_err(failed)? {
+                Some(mut observed) => {
+                    observed.run_id = result.run_id;
+                    self.finish(command_id, Some(observed), None)
+                }
+                None => Ok(unknown(command_id, "Native host authority is not yet confirmed for the observed lifecycle")),
+            };
+        }
         if !operation_observed(&command.control, &result.environment) {
             return Ok(unknown(command_id, "Platform accepted the operation; outcome is not yet confirmed"));
         }
@@ -532,7 +541,8 @@ fn operation_observed(control:&Control,environment:&SessionEnvironment)->bool {
     match control {
         Control::Pause{..}=>*lifecycle==ScaffoldLifecycle::Paused,
         Control::Stop{..}=>*lifecycle==ScaffoldLifecycle::Stopped,
-        Control::Resume{..}|Control::Attach{..}=>matches!(lifecycle,ScaffoldLifecycle::Ready|ScaffoldLifecycle::AgentRunning),
+        Control::Resume{..}=>matches!(lifecycle,ScaffoldLifecycle::Ready|ScaffoldLifecycle::AgentRunning),
+        Control::Attach{..}=>false, // Attachment requires native authority, not application health.
         Control::Create{..}=>!matches!(lifecycle,ScaffoldLifecycle::Stopped|ScaffoldLifecycle::Failed),
         _=>true,
     }

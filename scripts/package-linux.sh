@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Linux packaging: build the release binary and produce
 #   target/package/crew-upstream-canary-<version>-linux-<arch>.tar.gz
-# containing comet, a desktop entry and icon, plus a manual install.sh.
+# containing comet, the matching crew-web bundle and contract, desktop assets,
+# and a manual install.sh. The browser bundle requires Node 22.4 or newer.
 # Installs only into ~/.crew-upstream-canary/app and a canary-named launcher.
 #
 # Usage: scripts/package-linux.sh
@@ -41,6 +42,10 @@ install -m 644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
+mkdir -p "$STAGE/crew-web/public"
+install -m 644 "$ROOT/apps/web/server.mjs" "$ROOT/apps/web/rpc.mjs" "$ROOT/apps/web/package.json" "$ROOT/apps/web/contract.json" "$STAGE/crew-web/"
+install -m 644 "$ROOT/apps/web/public/app.js" "$ROOT/apps/web/public/index.html" "$ROOT/apps/web/public/style.css" "$STAGE/crew-web/public/"
+install -m 644 "$ROOT/apps/web/contract.json" "$STAGE/crew-web-contract.json"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash

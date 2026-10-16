@@ -3440,7 +3440,7 @@ impl DocHost {
         payload: SessionCommandPayload,
         transfers: Vec<crate::uploads::AttachmentTransfer>,
     ) -> Result<String, EngineError> {
-        self.queue_command_named(chat_id, payload, transfers, None)
+        self.queue_command_named(chat_id, payload, transfers, None, None)
     }
 
     /// Native handoff retries keep the first admitted command and its outcome.
@@ -3450,15 +3450,23 @@ impl DocHost {
         payload: SessionCommandPayload,
         transfers: Vec<crate::uploads::AttachmentTransfer>,
         command_id: Option<&str>,
+        expected_turn_id: Option<&str>,
     ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
         let _owner = lock(&handle.transcript_import);
+        if expected_turn_id.is_some_and(|id| id.is_empty() || id.len() > 256)
+            || (expected_turn_id.is_some() && !matches!(payload, SessionCommandPayload::Interrupt {}))
+        {
+            return Err(EngineError::Other("Expected turn ID requires a valid targeted interrupt".into()));
+        }
         if let Some(id) = command_id {
             if id.is_empty() || id.len() > 256 {
                 return Err(EngineError::Other("Invalid immutable command ID".into()));
             }
             if let Some(existing) = handle.doc.read_commands()?.into_iter().find(|entry| entry.id == id) {
-                if existing.payload != payload || existing.issued_by != self.inner.config.device_id {
+                if existing.payload != payload || existing.issued_by != self.inner.config.device_id
+                    || expected_turn_id.is_some_and(|turn| existing.based_on.as_ref().and_then(|based| based.turn_id.as_deref()) != Some(turn))
+                {
                     return Err(EngineError::Other("Command ID already has a different immutable request".into()));
                 }
                 self.persist_fork(&handle)?;
@@ -3472,6 +3480,9 @@ impl DocHost {
             turn_id: Some(m.id.clone()),
             frontier: None,
         });
+        if expected_turn_id.is_some_and(|turn| based_on.as_ref().and_then(|based| based.turn_id.as_deref()) != Some(turn)) {
+            return Err(EngineError::Other("Targeted interrupt belongs to a past turn".into()));
+        }
         let is_message = matches!(
             payload,
             SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }

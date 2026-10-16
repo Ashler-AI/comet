@@ -2661,7 +2661,7 @@ impl RuntimeArtifact {
                 return Err(crate::EngineError::Other("Invalid runtime artifact size or type".into()));
             }
             let mut archive = NamedTempFile::new()?;
-            crate::worktree_handoff::append_tar_header(archive.as_file_mut(), "comet", metadata.len(), 0o700)?;
+            crate::worktree_handoff::append_tar_header(archive.as_file_mut(), "comet", metadata.len(), 0o600)?;
             let mut hash = Sha256::new();
             let mut remaining = metadata.len();
             let mut buffer = [0u8; 64 * 1024];
@@ -2692,11 +2692,11 @@ impl RuntimeArtifact {
 const PREPARE_RUNTIME_DIRECTORY: &str = r#"import os,pathlib,stat,sys
 p=pathlib.PurePosixPath(sys.argv[1])
 parts=p.parts
-if len(parts)!=6 or parts[:3]!=('/','workspace','.scaffold') or not parts[3].startswith('crew-') or parts[4:]!=('bin','comet'):
+if len(parts)!=4 or parts[0]!='.scaffold' or not parts[1].startswith('crew-') or parts[2:]!=('bin','comet'):
     raise SystemExit(40)
-current='/workspace'
+current=os.getcwd()
 if not stat.S_ISDIR(os.lstat(current).st_mode): raise SystemExit(41)
-for part in parts[2:-1]:
+for part in parts[:-1]:
     current=os.path.join(current,part)
     try: os.mkdir(current,0o700)
     except FileExistsError: pass
@@ -2785,7 +2785,7 @@ impl ScaffoldRuntime {
         Ok(self)
     }
 
-    async fn ensure_remote_runtime(&self, sandbox_id: &str, cancellation: &CancellationToken) -> Result<(), ScaffoldError> {
+    async fn ensure_remote_runtime(&self, sandbox_id: &str, environment: &SessionEnvironment, cancellation: &CancellationToken) -> Result<(), ScaffoldError> {
         let artifact = self.runtime_artifact.as_ref().ok_or_else(|| {
             ScaffoldError::InvalidScope("A verified runtime artifact is required for native attachment".into())
         })?;
@@ -2797,9 +2797,7 @@ impl ScaffoldRuntime {
             return Err(ScaffoldError::InvalidScope("Isolated runtime data directory and IPC port are required".into()));
         }
         let argv = vec!["python3".into(), "-c".into(), PREPARE_RUNTIME_DIRECTORY.into(), self.remote_executable.to_string()];
-        let prepared = self.inner.client.exec(sandbox_id, &ExecBody {
-            argv: &argv, mode: "inline", timeout_ms: 10_000,
-        }, cancellation).await?;
+        let prepared = self.probe_attach_authority(sandbox_id, &environment.scope, environment, &argv, cancellation).await?;
         if !prepared.ok || prepared.exit_code != Some(0) {
             return Err(ScaffoldError::InvalidScope("Runtime destination is not an isolated regular path".into()));
         }
@@ -2809,8 +2807,7 @@ impl ScaffoldRuntime {
             _ => return Err(ScaffoldError::InvalidResponse("Runtime destination probe failed".into())),
         };
         if !present {
-            let relative = self.remote_executable.strip_prefix("/workspace/")
-                .and_then(|path| path.strip_suffix("/comet"))
+            let relative = self.remote_executable.strip_suffix("/comet")
                 .ok_or_else(|| ScaffoldError::InvalidScope("Unsafe runtime artifact destination".into()))?;
             let grant: UploadGrantEnvelope = self.inner.client.request(Method::POST,
                 self.inner.client.sandbox_url(sandbox_id, Some("uploads"))?,
@@ -2837,6 +2834,13 @@ impl ScaffoldRuntime {
         }, cancellation).await?;
         if !secured.ok || secured.exit_code != Some(0) {
             return Err(ScaffoldError::InvalidResponse("Could not secure verified runtime artifact".into()));
+        }
+        let argv = self.remote_argv("scaffold-install-web");
+        let installed = self.inner.client.exec(sandbox_id, &ExecBody {
+            argv: &argv, mode: "inline", timeout_ms: 30_000,
+        }, cancellation).await?;
+        if !installed.ok || installed.exit_code != Some(0) {
+            return Err(ScaffoldError::InvalidResponse("Verified runtime browser installation failed".into()));
         }
         Ok(())
     }
@@ -3158,7 +3162,10 @@ impl ScaffoldRuntime {
     pub(crate) async fn observe_attachment(&self, environment: SessionEnvironment,
         cancellation: &CancellationToken) -> Result<Option<ScaffoldEnvironmentControlResult>, ScaffoldError> {
         let (lifecycle, _, sandbox_id) = scaffold_source(&environment)?;
-        if !matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Ready | zeron_proto::ScaffoldLifecycle::AgentRunning) {
+        if !matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Creating
+            | zeron_proto::ScaffoldLifecycle::RestoringSnapshot | zeron_proto::ScaffoldLifecycle::Starting
+            | zeron_proto::ScaffoldLifecycle::Resuming | zeron_proto::ScaffoldLifecycle::Ready
+            | zeron_proto::ScaffoldLifecycle::AgentRunning) {
             return Ok(None);
         }
         let argv = self.remote_argv("scaffold-authority");
@@ -3177,8 +3184,8 @@ impl ScaffoldRuntime {
         }))
     }
 
-    // Only retry the read-only authority probe, before minting credentials or
-    // launching a process. Application readiness depends on that bootstrap.
+    // Only retry authority reads or idempotent directory preparation, never
+    // credential minting or process launch. Bootstrap itself makes the app ready.
     async fn probe_attach_authority(
         &self,
         sandbox_id: &str,
@@ -3283,7 +3290,7 @@ impl ScaffoldRuntime {
         let lifecycle_epoch = lifecycle_epoch.ok_or_else(|| {
             ScaffoldError::InvalidResponse("sandbox lifecycle epoch is required to attach".into())
         })?;
-        self.ensure_remote_runtime(sandbox_id, cancellation).await?;
+        self.ensure_remote_runtime(sandbox_id, environment, cancellation).await?;
 
 
         // Reuse a live deployment-bound host before minting another grant. This
@@ -3404,12 +3411,6 @@ impl ScaffoldRuntime {
             bootstrap_path.clone(),
             "--edge-url".to_string(),
             self.inner.edge_origin.clone(),
-            "--scaffold-url".into(),
-            self.inner.client.origin.to_string(),
-            "--project-scope".into(),
-            self.inner.client.project_scope.clone(),
-            "--deployment-id".into(),
-            self.deployment_id.to_string(),
         ]);
         let started = match self
             .inner
@@ -3790,13 +3791,66 @@ mod tests {
         assert!(RuntimeArtifact::capture(source.path(), &digest).is_err());
     }
 
+    #[test]
+    fn runtime_archive_and_exec_share_the_api_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = ".scaffold/crew-test/bin/comet";
+        let prepare = |path: &str| std::process::Command::new("python3")
+            .args(["-c", PREPARE_RUNTIME_DIRECTORY, path])
+            .current_dir(workspace.path()).output().unwrap();
+        let first = prepare(executable);
+        assert!(first.status.success(), "{:?}", first);
+        assert_eq!(first.stdout, b"absent\n");
+        let mut source = NamedTempFile::new().unwrap();
+        source.write_all(TEST_RUNTIME_BYTES).unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES));
+        let artifact = RuntimeArtifact::capture(source.path(), &digest).unwrap();
+        let destination = workspace.path().join(executable).parent().unwrap().to_owned();
+        assert!(std::process::Command::new("tar").arg("-xf").arg(artifact.archive.path())
+            .arg("-C").arg(destination).status().unwrap().success());
+        let present = prepare(executable);
+        assert!(present.status.success(), "{:?}", present);
+        assert_eq!(present.stdout, b"present\n");
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(std::fs::read(workspace.path().join(executable)).unwrap())), digest);
+        for path in ["/workspace/.scaffold/crew-test/bin/comet", "../crew-test/bin/comet", ".scaffold/other/bin/comet"] {
+            assert!(!prepare(path).status.success(), "accepted {path}");
+        }
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), workspace.path().join(".scaffold/crew-link")).unwrap();
+            assert!(!prepare(".scaffold/crew-link/bin/comet").status.success());
+            assert!(!outside.path().join("bin").exists());
+        }
+    }
+
     #[tokio::test]
     async fn native_attachment_requires_an_explicit_runtime_artifact() {
         let runtime = ScaffoldRuntime::new(
             ScaffoldClient::new("http://127.0.0.1:1", "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
             "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
         );
-        assert!(runtime.ensure_remote_runtime("box", &CancellationToken::new()).await.is_err());
+        let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("starting")).unwrap();
+        let environment = envelope.sandbox.into_environment(scope()).unwrap();
+        assert!(runtime.ensure_remote_runtime("box", &environment, &CancellationToken::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn attachment_observes_current_native_authority_while_application_starts() {
+        for (authority_epoch, expected_grant) in [(1, Some("native-grant")), (2, None)] {
+            let authority = host_authority("native-grant", now_ms() + 60_000)
+                .replace("sandbox-a-e1", &format!("sandbox-a-e{authority_epoch}"))
+                .replace("\\\"lifecycleEpoch\\\":1", &format!("\\\"lifecycleEpoch\\\":{authority_epoch}"));
+            let (origin, server) = mock_server(vec![authority]).await;
+            let runtime = test_runtime(
+                ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
+                "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
+            );
+            let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("starting")).unwrap();
+            let observed = runtime.observe_attachment(envelope.sandbox.into_environment(scope()).unwrap(), &CancellationToken::new()).await.unwrap();
+            assert_eq!(observed.and_then(|result| result.control_grant).map(|grant| grant.id).as_deref(), expected_grant);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -3824,8 +3878,8 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut file, TEST_RUNTIME_BYTES).unwrap();
         ScaffoldRuntime::new(client, edge, grants)
-            .with_remote_executable("/workspace/.scaffold/crew-test/bin/comet".into())
-            .with_remote_data_dir("/workspace/.scaffold/crew-test/data".into())
+            .with_remote_executable(".scaffold/crew-test/bin/comet".into())
+            .with_remote_data_dir(".scaffold/crew-test/data".into())
             .with_remote_ipc_port(27954)
             .with_runtime_artifact(file.path().to_owned(), format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES)))
             .unwrap()
@@ -3875,9 +3929,10 @@ mod tests {
                     if argv.get(2).and_then(Value::as_str) == Some(PREPARE_RUNTIME_DIRECTORY) {
                         Some("present".to_string())
                     } else if argv.first().and_then(Value::as_str) == Some("sha256sum") {
-                        Some(format!("{:x}  /workspace/.scaffold/crew-test/bin/comet", sha2::Sha256::digest(TEST_RUNTIME_BYTES)))
-                    } else if argv.first().and_then(Value::as_str) == Some("chmod")
-                        && argv.get(1).and_then(Value::as_str) == Some("0700") {
+                        Some(format!("{:x}  .scaffold/crew-test/bin/comet", sha2::Sha256::digest(TEST_RUNTIME_BYTES)))
+                    } else if (argv.first().and_then(Value::as_str) == Some("chmod")
+                        && argv.get(1).and_then(Value::as_str) == Some("0700"))
+                        || argv.last().and_then(Value::as_str) == Some("scaffold-install-web") {
                         Some(String::new())
                     } else { None }
                 });

@@ -295,7 +295,7 @@ impl EngineRpc {
                 let command = input.command_id.clone();
                 let chat_id = chat.id.clone();
                 self.crew_services()?.admit_handoff(&receipt, move || {
-                    host.queue_command_named(&chat_id, payload, vec![], Some(&command)).map_err(failed)
+                    host.queue_command_named(&chat_id, payload, vec![], Some(&command), None).map_err(failed)
                 }).await?;
                 store.finish_crew_command(&key, &serde_json::to_vec(&receipt).map_err(failed)?).map_err(failed)?;
                 RpcReply::value(&receipt)
@@ -409,7 +409,7 @@ impl EngineRpc {
             handle.write_user_message(&message.command_id, &peer_prompt(message)?, crate::now_ms()).map_err(failed)?;
             self.doc_host.persist_fork(&handle).map_err(failed)?;
         } else {
-            self.doc_host.queue_command_named(&target.id, payload, vec![], Some(&message.command_id)).map_err(failed)?;
+            self.doc_host.queue_command_named(&target.id, payload, vec![], Some(&message.command_id), None).map_err(failed)?;
         }
         if let Some(waiter) = waiter {
             let _ = waiter.sender.send(json!({"commandId":message.command_id,"sourceChatId":message.source_chat_id,"text":message.text}));
@@ -545,20 +545,37 @@ mod tests {
         let config = DocHostConfig { device_id:"controller".into(), default_harness:HarnessId::Mock, edge:None };
         let host = DocHost::new(store.clone(), config.clone());
         let payload = SessionCommandPayload::Steer { prompt:"remote task".into(), message_id:Some("caller".into()) };
-        assert_eq!(host.queue_command_named("target", payload.clone(), vec![], Some("caller")).unwrap(), "caller");
+        assert_eq!(host.queue_command_named("target", payload.clone(), vec![], Some("caller"), None).unwrap(), "caller");
         let handle = host.open("target").unwrap();
         handle.doc().set_command_status("caller", zeron_doc::SessionCommandStatus::Cancelled, Some("Stopped")).unwrap();
         host.persist_fork(&handle).unwrap();
         assert!(store.mark_processed("caller").unwrap());
         let reopened = DocHost::new(store.clone(), config);
-        assert_eq!(reopened.queue_command_named("target", payload, vec![], Some("caller")).unwrap(), "caller");
+        assert_eq!(reopened.queue_command_named("target", payload, vec![], Some("caller"), None).unwrap(), "caller");
         let entries = reopened.open("target").unwrap().doc().read_commands().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, zeron_doc::SessionCommandStatus::Cancelled);
         assert!(!store.mark_processed("caller").unwrap());
         assert!(reopened.queue_command_named("target",
             SessionCommandPayload::Steer { prompt:"different task".into(), message_id:Some("caller".into()) },
-            vec![], Some("caller")).is_err());
+            vec![], Some("caller"), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn targeted_interrupt_rejects_stale_admission_and_preserves_retries() {
+        use crate::doc_host::{DocHost, DocHostConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(store, DocHostConfig { device_id:"controller".into(), default_harness:HarnessId::Mock, edge:None });
+        let handle = host.open("target").unwrap();
+        handle.write_user_message("first", "first turn", 1).unwrap();
+        let stop = SessionCommandPayload::Interrupt {};
+        host.queue_command_named("target", stop.clone(), vec![], Some("stop-first"), Some("first")).unwrap();
+        handle.write_user_message("second", "replacement turn", 2).unwrap();
+        assert!(host.queue_command_named("target", stop.clone(), vec![], Some("stale"), Some("first")).is_err());
+        assert_eq!(host.queue_command_named("target", stop.clone(), vec![], Some("stop-first"), Some("first")).unwrap(), "stop-first");
+        assert!(host.queue_command_named("target", stop, vec![], Some("stop-first"), Some("second")).is_err());
+        assert!(!handle.doc().read_commands().unwrap().iter().any(|entry| entry.id == "stale"));
     }
 
     #[tokio::test]

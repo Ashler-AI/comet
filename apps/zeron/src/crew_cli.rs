@@ -193,6 +193,95 @@ pub async fn scaffold_authority(ipc_port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
+// These bytes are authenticated by the same executable SHA-256 as the engine.
+const SCAFFOLD_WEB_ASSETS: &[(&str, &[u8])] = &[
+    ("server.mjs", include_bytes!("../../web/server.mjs")),
+    ("rpc.mjs", include_bytes!("../../web/rpc.mjs")),
+    ("package.json", include_bytes!("../../web/package.json")),
+    ("contract.json", include_bytes!("../../web/contract.json")),
+    ("public/app.js", include_bytes!("../../web/public/app.js")),
+    ("public/index.html", include_bytes!("../../web/public/index.html")),
+    ("public/style.css", include_bytes!("../../web/public/style.css")),
+];
+
+pub fn install_scaffold_web() -> anyhow::Result<()> {
+    let executable = std::env::current_exe()?;
+    let bin = executable.parent().context("runtime executable directory unavailable")?;
+    let root = bin.parent().context("runtime root unavailable")?;
+    if executable.file_name().is_none_or(|name| name != "comet")
+        || bin.file_name().is_none_or(|name| name != "bin")
+        || root.file_name().is_none_or(|name| name != "crew-upstream-canary")
+        || root.parent().and_then(Path::file_name).is_none_or(|name| name != ".scaffold")
+    { bail!("browser assets require the isolated Scaffold runtime layout"); }
+    install_web_assets(root)
+}
+
+fn install_web_assets(root: &Path) -> anyhow::Result<()> {
+    let web = root.join("web");
+    let public = web.join("public");
+    for directory in [root, web.as_path(), public.as_path()] {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)] {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&directory) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = std::fs::symlink_metadata(&directory)?;
+        if !metadata.is_dir() { bail!("browser asset directory is not a regular directory"); }
+        #[cfg(unix)] {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.mode() & 0o022 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+                bail!("browser asset directory is writable by another user");
+            }
+        }
+    }
+    for (name, bytes) in SCAFFOLD_WEB_ASSETS {
+        install_runtime_file(&web.join(name), bytes)?;
+    }
+    // The supervisor cannot execute the uploaded engine or browser before this.
+    install_runtime_file(&root.join("runtime-ready"), b"crew-upstream-canary\n")
+}
+
+fn install_runtime_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() != bytes.len() as u64 { bail!("existing browser asset differs from the verified runtime"); }
+            #[cfg(unix)] {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
+                    bail!("existing browser asset is not a private owned file");
+                }
+            }
+            let mut buffer = [0u8; 8192];
+            for expected in bytes.chunks(buffer.len()) {
+                file.read_exact(&mut buffer[..expected.len()])?;
+                if buffer[..expected.len()] != *expected { bail!("existing browser asset differs from the verified runtime"); }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = tempfile::NamedTempFile::new_in(path.parent().context("asset parent unavailable")?)?;
+            file.write_all(bytes)?;
+            file.as_file().sync_all()?;
+            file.persist_noclobber(path).map_err(|error| error.error)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -208,5 +297,22 @@ mod tests {
         let mut config = RuntimeArgs { data_dir: Some(dir.path().join("profile")), ..Default::default() }.config().unwrap();
         assert!(configure_device(&mut config, &link).is_err());
         assert_eq!(std::fs::read(source).unwrap(), b"private-bootstrap");
+    }
+
+    #[test]
+    fn embedded_web_install_rejects_changed_assets_and_directory_links() {
+        let root = tempfile::tempdir().unwrap();
+        install_web_assets(root.path()).unwrap();
+        install_web_assets(root.path()).unwrap();
+        let server = root.path().join("web/server.mjs");
+        std::fs::write(&server, b"changed").unwrap();
+        assert!(install_web_assets(root.path()).is_err());
+        assert_eq!(std::fs::read(&server).unwrap(), b"changed");
+        let unbound = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), unbound.path().join("web")).unwrap();
+        assert!(install_web_assets(unbound.path()).is_err());
+        assert!(!unbound.path().join("runtime-ready").exists());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 }

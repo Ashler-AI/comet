@@ -44,6 +44,8 @@ jobs:
           npm ci
           npm run typecheck
           npm test
+      - name: Verify native browser contracts
+        run: node --test apps/web/server.test.mjs
 
   linux:
     needs: approve-source

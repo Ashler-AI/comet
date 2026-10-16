@@ -304,7 +304,7 @@ impl EngineRpc {
             metadata.validate().map_err(denied)?;
             let device_missing = !workspace.read_devices().map_err(failed)?.iter().any(|device| device.id == host);
             if !device_missing && !update_config && existing.as_ref().is_some_and(|chat| {
-                chat.device_id == host && chat.room_gen == Some(2) && chat.crew.as_ref() == Some(&metadata)
+                chat.device_id == host && chat.room_gen == Some(2) && chat.cwd.is_some() && chat.crew.as_ref() == Some(&metadata)
                     && result.handoff_cwd.as_ref().is_none_or(|cwd| chat.cwd.as_ref() == Some(cwd) && chat.harness_session_cwd.as_ref() == Some(cwd))
                     && result.handoff_native_session_id.as_ref().is_none_or(|native| chat.harness_session_id.as_ref() == Some(native))
             }) { return Ok(existing.expect("unchanged session")); }
@@ -317,6 +317,7 @@ impl EngineRpc {
             });
             chat.device_id = host.clone();
             chat.room_gen = Some(2);
+            chat.cwd.get_or_insert_with(|| "/workspace/ashler-platform".into());
             if update_config && let Some(route) = &metadata.agent_route {
                 let config = chat.config.get_or_insert_with(|| ChatConfig {
                     harness: HarnessId::Omp, model: None, reasoning: None,

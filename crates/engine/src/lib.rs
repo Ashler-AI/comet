@@ -897,8 +897,8 @@ impl Engine {
             let grants = scaffold::EdgeDeviceJoinGrantClient::new(&config.edge_url, tokens.clone())?;
             let mut runtime = scaffold::ScaffoldRuntime::new(client, &config.edge_url, Arc::new(grants))
                 .with_deployment_id(deployment)
-                .with_remote_executable("/workspace/.scaffold/crew-upstream-canary/bin/comet".into())
-                .with_remote_data_dir("/workspace/.scaffold/crew-upstream-canary/data".into())
+                .with_remote_executable(".scaffold/crew-upstream-canary/bin/comet".into())
+                .with_remote_data_dir(".scaffold/crew-upstream-canary/data".into())
                 .with_remote_ipc_port(27954);
             if let Some((path, sha256)) = &config.scaffold_runtime_artifact {
                 runtime = runtime.with_runtime_artifact(path.clone(), sha256.clone())?;

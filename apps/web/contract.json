@@ -1,0 +1,22 @@
+{
+  "version": "crew.upstream-canary.web.v1",
+  "private": true,
+  "crewSyncGeneration": "chat2",
+  "runtimeSelection": "SCAFFOLD_CREW_SYNC_GENERATION=chat2",
+  "entrypoint": "web/server.mjs",
+  "packageDirectory": "crew-web",
+  "installDirectory": ".scaffold/crew-upstream-canary/web",
+  "dataDirectory": ".scaffold/crew-upstream-canary/data",
+  "node": ">=22.4.0",
+  "ipc": { "host": "127.0.0.1", "port": 27954, "transport": "websocket-json" },
+  "http": { "defaultPort": 4096, "authentication": "Basic opencode:CREW_WEB_AUTH_TOKEN", "mutationOriginHeader": "x-crew-web-origin-verified: true" },
+  "trustedProfile": "SCAFFOLD_COMET_RUNTIME_PROFILE_JSON",
+  "requiredProfileFields": ["projectId", "deploymentId", "sessionId", "sandboxId", "targetDeviceId", "lifecycleEpoch", "actor.sub"],
+  "authorityMethod": "ScaffoldHostAuthority",
+  "subscriptions": ["WatchChats", "WatchSessions", "WatchDocMessages"],
+  "commands": { "method": "QueueCommand", "id": "crew-web:<lifecycleEpoch>:<requestId>", "payloadKinds": ["run", "steer", "interrupt", "respondInput"], "interruptTarget": "expectedTurnId: last native transcript entry id", "outcomeMethod": "ReadCommand" },
+  "otherMethods": ["ListModels", "UploadChunk", "UploadCommit", "FetchToolBlob"],
+  "history": "Native reset/delta mirror, bounded HTTP pages with explicit display truncation",
+  "limits": { "jsonRequestBytes": 262144, "uploadBytes": 16777216, "rpcFrameBytes": 33554432, "transcriptMirrorBytes": 67108864, "pageBytes": 524288, "pageEntries": 100, "sseBacklogBytes": 2097152 },
+  "assets": ["server.mjs", "rpc.mjs", "package.json", "contract.json", "public/app.js", "public/index.html", "public/style.css"]
+}

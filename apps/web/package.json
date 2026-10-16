@@ -1,0 +1,12 @@
+{
+  "name": "@crew/upstream-canary-web",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.4.0" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "files": ["server.mjs", "rpc.mjs", "contract.json", "public"]
+}
