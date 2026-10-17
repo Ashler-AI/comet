@@ -20,22 +20,77 @@ Crew's initial integration is `eccc3324`; verified relay cleanup and migration
 checks are committed and pushed as `c5eda252`. The initial
 [private artifact and Edge CI run](https://github.com/Ashler-AI/comet/actions/runs/38848735417)
 passed on macOS, Linux x64 and Linux ARM64, including remote Edge typechecks.
-Current UI/recovery fixes are committed as `840704d8`; the registered,
-source-pinned artifact workflow is `2deefba1`.
-[Its private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/38947335812)
-passed the exact-source approval gate, macOS/Linux x64/Linux ARM64 builds and
-remote Edge contracts/typechecks. No shared release channel was published.
-The running local app was rebuilt and exercised; these new CI artifacts have
-not been installed. The configured, previously checksum-verified Linux pin is
-recorded below and remains unchanged while E2B runtime acceptance is blocked.
+Native runtime/browser integration is committed and pushed as `045be1b9`, with
+the private continuation scheme corrected in `225cc0df` and device-resume auth
+corrected in `69f631b6`.
+[The exact-source artifact build](https://github.com/Ashler-AI/comet/actions/runs/38975530294)
+passed on macOS/Linux x64/Linux ARM64, including remote Edge typechecks and native
+browser contracts. Both Linux checksums passed and the running local app selects
+the new executable. The rebuilt desktop retained all 17 conversation IDs and its
+signed-in scope. No shared release channel was published.
 This is a testing lane, not production or a completed cutover.
 
-Native chat2 sandbox supervision and its browser bridge are implemented locally;
-deployment and the full managed-sandbox smoke are still pending. The host waits
-for the checksum-verified executable and atomically installed embedded browser
-assets. Startup authority is independent of browser readiness: native context
-must arrive before the browser can report healthy. Legacy/shared lanes retain
-their existing protocol selection.
+Native chat2 supervision is deployed only to the isolated canary. The missing
+native `session.sync.write` bootstrap capability is fixed in Platform
+`30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),
+including typechecks and supervised-runtime suites. Eight local bootstrap checks
+passed; legacy grants retain their previous permissions. The final authority and
+live-epoch fixes in Platform `880a8d5bb0d` passed
+[remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38984328096),
+including remote typechecks and supervised-runtime suites. Verified canary Worker
+version is `9868c317-f624-4dba-9f22-6ff8125ba7b5`. The guarded isolated launcher
+reported no pending D1 migrations; these fixes were not deployed to a shared lane.
+
+[Cloud Build](https://console.cloud.google.com/cloud-build/builds/ae0b6339-6d2a-44a9-9e5a-2ff398a7051b?project=54440053364)
+published provider digest `e43f40cfce5594d98cbc420073d18a656d233833396dd69d1a818baba1103143`
+and runtime overlay digest `24070ec6cee010a7c57e34425b700cd07bf3b2879ed3135754106dfa239f398a`.
+The overlay retains the complete prior session image and replaces only the
+reviewed supervisor/agent bridge. E2B template `crew-upstream-native-06dfeec5c75`
+(ID `nj0xn9i97lgeefdpf06s`, build `ed882f0f-51ce-473d-ac6d-eb4c1e3cd571`) built
+successfully. Helm revision 7 selects it using its own release-owned pointer,
+`crew-upstream-canary-template-06dfeec5c75`; shared template pointers are unchanged.
+Deployment pins are committed as Platform `0ee2c1daa7f`.
+
+The host waits for the checksum-verified executable and atomically installed
+embedded browser assets. Startup authority is independent of browser readiness:
+native context must arrive before the browser can report healthy. The deployed
+native browser, managed inference and lifecycle sequence passed the live smoke
+below. Legacy/shared lanes retain their existing protocol selection.
+
+The owned native sandbox `rcs_5ecdcc8ec00c8f8fe2a3f056` created successfully,
+paused at epoch 2, and accepted a same-ID resume at epoch 3. Resume exposed a
+separate auth bug: a saved revoked credential took precedence over the fresh
+bootstrap. Crew `69f631b6` fixes new-grant selection while retaining refresh for
+an already-consumed grant. All three managed-auth regression checks passed.
+An actual isolated CLI smoke with a loopback test authority completed initial
+epoch-8 enrollment, epoch-9 re-enrollment, and restart using the consumed bootstrap;
+observed requests were exchange, exchange, refresh. This is not live E2B evidence.
+The rebuilt desktop retained all 17 conversation IDs and its signed-in scope.
+The failed resume sandbox was stopped at epoch 4 without replacement; its rejected
+second pause did not change the observed epoch. The corrected artifact installed
+into `rcs_45db1f808bb3cb58aa18ec6b`; attachment confirmed all seven native host
+capabilities. This sandbox reached `ready`, and its authenticated browser showed
+the assigned native conversation and managed model. The first submitted turn
+retained its prompt but was rejected because the authority response dropped
+`authorityId`. Platform `da0ff59bed2` preserves the issuer metadata; an incomplete
+test fixture initially failed remote CI and was corrected in `8bae3838235`.
+The authenticated browser then completed `CREW_NATIVE_CANARY_OK` through Agent
+Auth, and the desktop's native transcript subscription received the same completed
+assistant entry.
+
+That same sandbox paused at epoch 2 and resumed at epoch 3. Resume initially
+returned an unknown outcome; reconciliation of the original command confirmed
+`ready` without repeating Resume or creating a replacement. The resumed browser
+retained its earlier history. Its next turn exposed a scope check against the
+creation-time profile device ID rather than the live lifecycle. Platform
+`880a8d5bb0d` uses the existing canonical device-ID helper with the current epoch.
+The regression failed before the fix; all 19 device/broker/authority checks passed
+afterward, including stale-grant rejection. After isolated deployment, the browser
+completed `CREW_NATIVE_RESUME_OK`, and the desktop received that completed entry.
+All six entries, including the rejected attempts, remained readable through a
+fresh desktop subscription after Stop confirmed epoch 4. The scoped environment
+list contained only the same stopped sandbox; the browser showed Reconnecting
+while retaining its history. This is real managed inference and live E2B evidence.
 
 Local verification: native command admission/recovery 4/4, Scaffold 41/41,
 coordinator/RPC 2/2 and native installer 2/2; browser HTTP contracts 9/9,
@@ -44,7 +99,11 @@ contracts 56/56 passed. An actual isolated engine run installed the embedded
 assets twice, completed a mock-inference turn, admitted a repeated command only
 once, returned its durable outcome without payload, rejected conflicting reuse,
 and rejected a stale interrupt without admission. Mock inference is not evidence
-of sandbox-hosted Agent Auth execution. The local app was rebuilt and packaged.
+of sandbox-hosted Agent Auth execution. The rebuilt local app retained all 15
+chats and its signed-in controller scope. Real attachment reconciliation against
+the previously running native host returned confirmed while application startup
+was pending, published the correct workspace/host binding, and a subsequent Stop
+confirmed that same owned sandbox stopped without replacement.
 The initial default-profile Rust build timed out; the established low-memory
 build profile completed. No local typechecks were run.
 
@@ -52,14 +111,14 @@ build profile completed. No local typechecks were run.
 | --- | --- | --- |
 | Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated multi-client/mobile exercise |
 | Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme; signed-in profile and saved chats survived rebuild/restart | Cross-client verification |
-| Sync | Real workerd plus two real headless engines: session discovery, queued remote Run, transcript and working-to-idle status roundtrip passed | That sync smoke used mock inference; live managed inference across two authenticated clients remains |
+| Sync | Real workerd/two-engine discovery and mock Run roundtrip passed; live native sandbox browser completions before and after resume synced to the desktop with stable entry IDs, and all six entries stayed readable after Stop | Second interactive desktop/iPhone discovery, shared annotations and deep links |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff`; unauthenticated identity/registry/chat reads returned 401 even with forged identity headers; public installer returned 404 | Live signed-in desktop/mobile authority and revocation |
-| Scaffold | Canary Helm revision 3 provider, authenticated directory reads and confirmed publishing; actual creation and native Use sandbox confirmation exercised; failed creation/attachment recovery rejects without replay | E2B command channel returns HTTP 403 before Crew runtime starts; successful attach/pause/resume/stop remain blocked |
-| Protocol checks | Final bootstrap/device/broker/directory checks 20/20; broker remote Worker/provider/vault CI passed including typechecks; earlier consumer/binding/OMP 33/33, Edge workerd 38/38 and alarms 8/8 | Live sandbox device refresh/revocation |
-| Rust checks | Scaffold library 39/39, current engine coordinator/RPC checks 2/2 and resolved-link navigation 1/1 passed; desktop build/package and native UI smoke succeeded | Actual sandbox-runtime scenarios |
+| Scaffold | Exact `69f631b6` executable, native browser and Agent Auth completion; same sandbox ready at epoch 1, paused at 2, resumed and completed inference at 3, stopped at 4 without replacement | Interactive multi-client/mobile acceptance |
+| Protocol checks | Device/broker/authority checks 19/19, with failing-before/passing-after resume regression and stale-grant rejection; final remote Worker/provider/vault CI passed including typechecks | Additional interactive client/mobile revocation scenarios |
+| Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Authenticated mobile acceptance |
 | Mobile | Shared Rust core, generated Swift bindings and native app built; iOS 26.5 simulator displayed Crew Canary; warm directory link and cold Scaffold link stayed signed out; exact cold-link intent persisted across launch | Authenticated cross-client scenarios, lifecycle/network recovery and physical-device gates |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
-| Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated cross-client/provider/lifecycle gates |
+| Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated multi-client/mobile acceptance and final cutover |
 
 The initial empty canary vault caused the reported `agent_auth_v2_account_unavailable`.
 Read-only metadata verified the existing Crew Staging pool has 5 connected OpenAI
@@ -68,20 +127,21 @@ isolated canary's owner; pointing at the same database would not fix ownership.
 No provider credentials have been copied, imported, or connected.
 
 The user approved the narrow shared Agent Auth broker and dedicated server trust
-key. Staging broker `14e4a52409d` retains the rolled-back live source
-`94dc2c9cade2b89b4ba4b3fc80bee777695edbc4`, the reviewed broker patch, and the
-unchanged, already-applied `0029_remote_code_oauth_device_codes.sql` history.
-[Remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38943935518)
-passed, including typechecks. Clean guarded preflight applied no D1 or Durable
-Object migrations; secret synchronization was skipped. Active staging Worker
-version is `53d143f7-1ca2-49ea-8e46-615c3764fc90`. All 59 original bindings match
-the rollback snapshot; only the dedicated broker secret binding was added.
-
-A previous successful broker activation was undone at 17:35 UTC by the separate
-failed [staging candidate](https://github.com/Ashler-AI/ashler-platform/actions/runs/38925594570).
-The restore did not re-activate that candidate's newer source or change its
-service fleet. Until the broker patch is included in normal staging candidates,
-ordinary deployments/rollbacks can remove the capability again.
+key. Staging candidate `38976233582` removed that capability again, producing
+`owner_identity_key_invalid` before browser command admission. The approved patch
+was merged onto that deployment's exact source `d7eee03a1ec` without reverting its
+changes. Broker commit `f780e202baf` passed
+[remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38983204679),
+including typechecks, and all six local security checks passed. The guarded
+launcher applied no D1 or Durable Object migrations and inherited existing secrets.
+Verified staging Worker version is `6d93c9f5-df5c-4749-a4f2-f9586ba438df`; all 60
+bindings match the pre-deployment snapshot. Readback caught three primary service
+URLs inherited from the operator environment; passing the explicit staging
+overrides **after Infisical injection** corrected them before continuing acceptance.
+The canary again returned all 11 shared accounts, rejected a broker request without
+its trust key with HTTP 403, and completed native managed inference. No credentials
+were copied and no shared service fleet was deployed. Until this patch is included
+in normal staging candidates, ordinary deployments/rollbacks can remove it again.
 
 Actual canary API requests returned HTTP 200 and the expected literal replies
 from `gpt-6.1-sol` and `claude-opus-5-5`. Account refresh returned all 11 shared
@@ -144,12 +204,12 @@ production/staging handlers and had no canary-owned `zeron:` override. Safari's
 browser-to-app prompt remains unverified: its private window locked, and the
 foreground-control request was not granted. Native dispatch is not browser proof.
 
-The configured Linux x64 runtime pin is
-`~/.crew-upstream-canary/runtime/eb938af2180996f6a5afa9643c7c5733aff48a85/comet`,
-SHA-256 `aa386f9941202d01cf05b53abd4318ce5271c0a26295f5af533ee4a8ab1c9c36`.
-Its downloaded executable checksum was verified and its contract is
-`scaffold.comet-runtime.v1`. The failed E2B command channel prevented installing
-or executing this artifact in the test sandbox; this is not a sandbox-run claim.
+The configured Linux x64 pin is the `69f631b6c72c55c171f2e74d76121a0814990830`
+private artifact under `~/.crew-upstream-canary/runtime/`, SHA-256
+`bc282ba96a50cd89101caf06863f4debea83e1215cf31bfa83823c8139567539`.
+Its archive and executable checksums were verified before activation. This exact
+runtime served the native browser and completed managed Agent Auth turns before
+and after same-ID pause/resume. Stop retained the desktop's synchronized history.
 
 Launches from another Crew agent must pin Canary's IPC/data coordinates as shown
 in `dist/README.md`; otherwise the parent's `COMET_IPC_PORT` can select its engine.
