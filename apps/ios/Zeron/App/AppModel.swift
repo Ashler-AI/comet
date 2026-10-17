@@ -2,6 +2,9 @@ import Network
 import CryptoKit
 import Security
 import UIKit
+#if DEBUG && targetEnvironment(simulator)
+import Darwin
+#endif
 
 /// App-wide state owner: holds the Rust `CoreClient`, maps its snapshots
 /// into view models, and fans change notifications out to screens. All
@@ -218,8 +221,25 @@ final class AppModel {
     }
 
     @MainActor private func restoreSavedAccount() {
-        guard client == nil, !restoreInFlight, !restoreSuppressed,
-              case let .scaffold(_, _, _, sessionJson)? = Credentials.stored() else { return }
+        guard client == nil, !restoreInFlight, !restoreSuppressed else { return }
+        var sessionJson: String?
+        if case let .scaffold(_, _, _, saved)? = Credentials.stored() { sessionJson = saved }
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("-import-canary-session") {
+            // Consume once; path changes must not retry or fall back to another account.
+            restoreSuppressed = true
+            do {
+                sessionJson = try Self.consumeSimulatorSession(at: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("crew-scaffold-session.json"))
+            } catch {
+                restoreError = error.localizedDescription
+                observers.values.forEach { $0() }
+                return
+            }
+        }
+        #endif
+        guard let sessionJson else { return }
+        let discardRejectedCredential = !restoreSuppressed
         restoreInFlight = true
         let generation = authGeneration
         Task { @MainActor in
@@ -231,12 +251,36 @@ final class AppModel {
             } catch {
                 guard generation == authGeneration else { return }
                 restoreError = error.localizedDescription
-                // Only a definitive rejection forgets credentials; outages retain pending work.
-                if case CoreError.Auth = error { Credentials.clearStored() }
+                // Rejecting an import must not discard a previously saved account.
+                if case CoreError.Auth = error, discardRejectedCredential { Credentials.clearStored() }
                 observers.values.forEach { $0() }
             }
         }
     }
+
+    #if DEBUG && targetEnvironment(simulator)
+    static func consumeSimulatorSession(at url: URL) throws -> String {
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw CoreError.Storage(message: "Cannot open the private simulator session file.") }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? file.close() }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+            throw CoreError.Storage(message: "Simulator session import requires a regular file.")
+        }
+        // Remove the transfer file before parsing, network access or Keychain storage.
+        guard unlink(url.path) == 0 else { throw CoreError.Storage(message: "Cannot remove the simulator session transfer file.") }
+        guard info.st_uid == getuid(), info.st_nlink == 1, info.st_mode & 0o777 == 0o600,
+              info.st_size > 0, info.st_size <= 65_536 else {
+            throw CoreError.Storage(message: "Simulator session file must be private (0600), owned, unlinked and at most 64 KB.")
+        }
+        guard let data = try file.read(upToCount: 65_537), data.count == info.st_size,
+              let session = String(data: data, encoding: .utf8) else {
+            throw CoreError.Storage(message: "Simulator session file is incomplete or not UTF-8.")
+        }
+        return session
+    }
+    #endif
 
     @MainActor func signIn(account: CrewAccount) throws {
         client?.shutdown()

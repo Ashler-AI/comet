@@ -42,7 +42,10 @@ transient authority outage retains credentials and all local data.
 
 For an authorized simulator build, use `-project Zeron.xcodeproj -scheme
 'Crew Canary' -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` plus
-the four settings above and `CODE_SIGNING_ALLOWED=NO`. Do not run an install,
+the four settings above and `CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-`.
+Use Xcode's local simulator signing: disabling signing omits the simulated
+application identity and Keychain rejects writes with OSStatus `-34018`.
+No device provisioning is needed for this simulator build. Do not run an install,
 archive, signing, or TestFlight operation against an existing app identity.
 
 The Zeron target's **Rust core** build phase runs `scripts/ios/build-core.sh`,
@@ -52,6 +55,35 @@ which builds `crates/mobile` for the active platform (always optimized — the
 integrated build: the new `CrewLogin`, `CrewAccount`, Scaffold credential case,
 and `CoreClient.crew*` APIs are not in the old generated Swift file.
 `ZERON_SKIP_CORE=1` is only safe after rebuilding matching bindings/library.
+
+### Explicit simulator session import
+
+For an approved local test only, a **Debug simulator** build accepts
+`-import-canary-session`. Put the existing canary desktop's `scaffold-session.json`
+at `<simulator app data container>/tmp/crew-scaffold-session.json` with mode `0600`,
+then launch only `ai.ashler.crew.upstream-canary` with that flag. Discover the
+current container with `xcrun simctl get_app_container <simulator-udid>
+ai.ashler.crew.upstream-canary data`; installing a build can change its path.
+Never put a bearer in launch arguments, environment variables, logs or chat.
+
+The one-shot reader rejects symlinks, hard links, non-private/non-owned files and
+files over 64 KB. It unlinks the regular transfer file before parsing or network
+access. Existing `CrewLogin.restore` verifies the exact authority, Edge, user,
+project and deployment before the normal sign-in path stores it in Keychain.
+Failed imports do not erase a previously saved account or silently sign into it.
+Relaunch without the flag to use normal verified Keychain restoration.
+
+This copies a reusable, revocable **Scaffold** credential—not Google cookies,
+passwords, passkeys or provider credentials. Desktop and simulator share its
+revocation. It verifies authenticated mobile behavior, not independent Google
+sign-in. The hook is absent from device and Release builds.
+
+The three `CrewIsolationTests` passed, including private-file consumption and
+symlink/hard-link/size/encoding rejection. Live simulator checks rejected a
+wrong-project import, consumed both real and rejected transfer files, displayed
+the authorized account and synchronized sessions, and restored from Keychain
+after a subsequent rejected import and normal cold launch.
+
 
 ## Crew integration
 
