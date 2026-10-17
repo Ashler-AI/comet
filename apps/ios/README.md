@@ -33,6 +33,10 @@ Missing settings fail closed; there is no production fallback. Scaffold must
 permit public-client PKCE OAuth with redirect
 `crew-upstream-canary://callback`. The helper verifies discovery, resource,
 callback state/expiry, user/project/deployment, and exact configured origins.
+The authority accepts this exact callback only when its Crew link scheme,
+project and deployment are configured; registration, authorization and exchange
+share that validator. The app uses `Crew Canary` for both its display name and
+native authentication consent, while executable/module names stay upstream.
 On cold launch credentials are reverified before opening the profile. A
 transient authority outage retains credentials and all local data.
 

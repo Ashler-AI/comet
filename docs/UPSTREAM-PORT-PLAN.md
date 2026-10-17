@@ -109,14 +109,14 @@ build profile completed. No local typechecks were run.
 
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
-| Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated multi-client/mobile exercise |
-| Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme; signed-in profile and saved chats survived rebuild/restart | Cross-client verification |
-| Sync | Real workerd/two-engine discovery and mock Run roundtrip passed; live native sandbox browser completions before and after resume synced to the desktop with stable entry IDs, and all six entries stayed readable after Stop | Second interactive desktop/iPhone discovery, shared annotations and deep links |
+| Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated mobile exercise |
+| Isolation | Bundle `ai.ashler.crew.upstream-canary`, IPC 27954, data `~/.crew-upstream-canary`, only `crew-upstream-canary` registered as its URL scheme; independently authenticated second client has the same 18 session IDs | Mobile verification |
+| Sync | Both desktop clients resolve the same existing sandbox session; Chrome's actual Open in Crew link opened its retained transcript without changing stopped epoch 4; both annotation reads succeeded | Authorized annotation write/sync and signed-in mobile acceptance |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff`; unauthenticated identity/registry/chat reads returned 401 even with forged identity headers; public installer returned 404 | Live signed-in desktop/mobile authority and revocation |
 | Scaffold | Exact `69f631b6` executable, native browser and Agent Auth completion; same sandbox ready at epoch 1, paused at 2, resumed and completed inference at 3, stopped at 4 without replacement | Interactive multi-client/mobile acceptance |
 | Protocol checks | Device/broker/authority checks 19/19, with failing-before/passing-after resume regression and stale-grant rejection; final remote Worker/provider/vault CI passed including typechecks | Additional interactive client/mobile revocation scenarios |
 | Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Authenticated mobile acceptance |
-| Mobile | Shared Rust core, generated Swift bindings and native app built; iOS 26.5 simulator displayed Crew Canary; warm directory link and cold Scaffold link stayed signed out; exact cold-link intent persisted across launch | Authenticated cross-client scenarios, lifecycle/network recovery and physical-device gates |
+| Mobile | Shared Rust core, generated Swift bindings and native app built; iOS 26.5 simulator displayed Crew Canary; signed-out warm/cold links retained exact intent; corrected native OAuth registration now reaches sign-in consent | User consent/login, cross-client/lifecycle/network checks and physical-device gates |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
 | Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated multi-client/mobile acceptance and final cutover |
 
@@ -197,12 +197,35 @@ link generation and redirects were exercised with a provider transport that
 fails on execution. Existing legacy deployments retain their link policy.
 
 The desktop's native warm URL dispatch and cold launch with the synthetic
-directory link both preserved the exact signed-out intent; IPC `WatchChats` and
-`WatchSessions` remained empty. The inherited `zeron:` startup registration is
-removed; after cold launch, Launch Services still selected the installed Crew
-production/staging handlers and had no canary-owned `zeron:` override. Safari's
-browser-to-app prompt remains unverified: its private window locked, and the
-foreground-control request was not granted. Native dispatch is not browser proof.
+directory link preserved the exact signed-out intent; IPC `WatchChats` and
+`WatchSessions` remained empty. Launch Services preserved installed production
+and staging handlers; the canary did not register upstream's `zeron:` scheme.
+On 2026-10-17, two independently authenticated desktop clients returned the same
+18 conversation IDs and resolved sandbox `rcs_45db1f808bb3cb58aa18ec6b` to
+conversation `6ac457b2-f8d3-4cf2-921e-404d14c83dc2`. Clicking the real Chrome
+`Open in Crew` link and accepting its one-time app-open prompt displayed that
+conversation and retained transcript in Crew Canary. The same sandbox remained
+stopped at epoch 4; no resume, replacement or command was admitted.
+Both clients read the annotation collection successfully (empty); write/sync
+still requires approval for a test note, not another client login.
+
+iOS Sign In initially failed because Scaffold accepted only HTTP loopback OAuth
+callbacks. Its shared register/authorize/token validator now also accepts exactly
+the deployment-configured `crew-upstream-canary://callback`; other schemes and
+callback suffixes remain rejected. Isolated Worker
+`c198a3fc-321b-4063-8b72-dde6dc8fe53d` returned live HTTP 201 for the native
+callback and HTTP 400 for staging, query-suffixed and external HTTPS callbacks.
+Nine local OAuth/auth-session checks passed. The simulator reached native
+app/website consent, which requires user approval before authenticated testing.
+The native consent prompt exposed upstream's internal product name; setting
+`CFBundleName` to `Crew Canary` fixes that without renaming the executable/module.
+The isolated simulator app rebuilt and reinstalled successfully, and fresh native
+UI evidence shows `Crew Canary` requesting the exact canary authority. Consent
+was not granted automatically; physical installation remains blocked above.
+Platform fix `c45b67e6c5a` is pushed; its
+[remote Worker/provider/vault checks](https://github.com/Ashler-AI/ashler-platform/actions/runs/39049389627)
+passed, including remote typechecks and supervised-runtime suites. No shared
+deployment or production release was changed.
 
 The configured Linux x64 pin is the `69f631b6c72c55c171f2e74d76121a0814990830`
 private artifact under `~/.crew-upstream-canary/runtime/`, SHA-256
@@ -239,8 +262,9 @@ Parents are `7142b2c533bfc1e960abbd901238ff8845f15c24` (Crew on prior upstream)
 and `3b2f78027a2c31622c39c35716da4d6e1af8de15`; resulting tree is
 `fe83c31e96e6e325b9580d44146b7f24d6962b00`. This is not an empty merge.
 
-Authenticated cross-client/lifecycle checks and physical-iOS verification remain
-open; live shared-provider API checks passed. No production promotion occurred.
+Authenticated mobile/lifecycle checks, annotation write/sync and physical-iOS
+verification remain open. Desktop cross-client visibility and browser continuation
+passed; live shared-provider API checks passed. No production promotion occurred.
 Local typechecks are intentionally not run to preserve workstation resources.
 Remaining gates below are requirements, not claims of completed testing.
 
