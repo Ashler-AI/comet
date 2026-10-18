@@ -144,6 +144,7 @@ export const sendAuthorized = (env: Env, ctx: DurableObjectState, ws: WebSocket,
 
 /** Restricted peers use typed host commands; never raw terminal/filesystem RPC or opaque row mutation. */
 export const scopedRpcAllowed = (kind: string, payload: Uint8Array, authority?: SocketAuthority): boolean => {
+  if (kind === "echo") return payload.length === 0 && (!authority?.sessionId || authority.capabilities.includes("session.read"));
   if (!authority?.sessionId) return true;
   if (kind !== "rpc") return false;
   try {

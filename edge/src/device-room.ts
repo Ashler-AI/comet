@@ -283,13 +283,15 @@ export class DeviceRoom implements DurableObject {
       return;
     }
     if (state.role === "client") {
+      // Upstream probes the complete host path before admitting an RPC link.
+      const echo = frame.header.k === "echo" && frame.header.s === "echo" && frame.payload.length === 0;
       if (state.peer) {
         try {
           const authority = state.authority;
           const value = frame.header.k === "rpc" ? JSON.parse(new TextDecoder().decode(frame.payload)) : undefined;
           const localDevice = value?.method === "LocalDevice" && (!value.params || Object.keys(value.params).length === 0);
           const peer = frame.header.k === "rpc" && authority ? peerMessageAuthority(frame.payload, authority, state.peer, state.peer.reply) : undefined;
-          if (!authority || !authority.capabilities.includes("session.chat") || (!localDevice && !peer) ||
+          if (!authority || !authority.capabilities.includes("session.chat") || (!localDevice && !peer && !echo) ||
               await peerSessionDevice(this.env, authority, state.peer.targetSessionId) !== state.peer.targetDeviceId ||
               (peer && await peerSessionDevice(this.env, authority, peer.sourceSessionId) !== peer.sourceDeviceId)) {
             this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("session_scope_denied"));
@@ -311,14 +313,14 @@ export class DeviceRoom implements DurableObject {
             sourceSessionId: authority.sessionId, sourceDeviceId: authority.deviceId,
             targetSessionId: state.peer.targetSessionId, targetDeviceId: state.peer.targetDeviceId
           } : undefined);
-          const payload = stampRpcAuthority(frame.payload, authority, envelope);
-          if (payload) this.deliver(host, { s: frame.header.s, k: "rpc", from: state.connId }, payload);
+          const payload = echo ? frame.payload : stampRpcAuthority(frame.payload, authority, envelope);
+          if (payload) this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, payload);
         } catch {
           this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("peer_authority_unavailable"));
         }
         return;
       }
-      if (!["rpc", "term"].includes(frame.header.k) ||
+      if ((!echo && !["rpc", "term"].includes(frame.header.k)) ||
           !scopedRpcAllowed(frame.header.k, frame.payload, state.authority)) {
         this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("session_scope_denied"));
         return;

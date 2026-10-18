@@ -55,6 +55,8 @@ which builds `crates/mobile` for the active platform (always optimized — the
 integrated build: the new `CrewLogin`, `CrewAccount`, Scaffold credential case,
 and `CoreClient.crew*` APIs are not in the old generated Swift file.
 `ZERON_SKIP_CORE=1` is only safe after rebuilding matching bindings/library.
+`crates/mobile/uniffi.toml` leaves native error presentation to
+`Core/CoreError.swift`, preserving the message instead of reflecting enum names.
 
 ### Explicit simulator session import
 
@@ -78,9 +80,10 @@ passwords, passkeys or provider credentials. Desktop and simulator share its
 revocation. It verifies authenticated mobile behavior, not independent Google
 sign-in. The hook is absent from device and Release builds.
 
-The three `CrewIsolationTests` passed, including private-file consumption and
-symlink/hard-link/size/encoding rejection. Live simulator checks rejected a
-wrong-project import, consumed both real and rejected transfer files, displayed
+The four `CrewIsolationTests` passed, including native error presentation,
+private-file consumption and symlink/hard-link/size/encoding rejection. Live
+simulator checks rejected a wrong-project import, consumed both real and rejected
+transfer files, displayed
 the authorized account and synchronized sessions, and restored from Keychain
 after a subsequent rejected import and normal cold launch.
 
@@ -142,7 +145,7 @@ backup while `requiresReconciliation` is true. Legacy credentials are not
 imported; sign in again. Existing appearance preferences remain native,
 while new-session selections and composer drafts use the new profile.
 
-## Integration verification (not run during this port)
+## Integration acceptance
 
 Run the Rust client tests for Crew link parsing and copy-only legacy import,
 and `ZeronTests/CrewIsolationTests`. Exercise two desktops plus iOS with the
@@ -153,6 +156,8 @@ send after reconnect, revoked authority, and command-outcome recovery.
 The existing upstream mobile layout/network/streaming suites remain intact.
 Use authorized remote CI for typechecks; local typechecks are intentionally
 not run to preserve workstation resources.
+Exercised checks and remaining gates are recorded in
+[`docs/UPSTREAM-PORT-PLAN.md`](../../docs/UPSTREAM-PORT-PLAN.md).
 
 ## Layout
 

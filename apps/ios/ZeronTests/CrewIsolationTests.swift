@@ -2,6 +2,12 @@ import XCTest
 @testable import Zeron
 
 final class CrewIsolationTests: XCTestCase {
+    func testCoreErrorPreservesItsMessageThroughFoundation() {
+        let message = "Access denied · \(UUID().uuidString)\nUse the authenticated project."
+        let error: Error = CoreError.Auth(message: message)
+        XCTAssertEqual(error.localizedDescription, message)
+    }
+
     #if DEBUG && targetEnvironment(simulator)
     func testSimulatorSessionImportConsumesOnlyBoundedPrivateFiles() throws {
         let files = FileManager.default

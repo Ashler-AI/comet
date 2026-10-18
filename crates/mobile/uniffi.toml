@@ -1,0 +1,3 @@
+[bindings.swift]
+# Native presentation uses CoreError's message, not Swift's reflected enum name.
+omit_localized_error_conformance = true

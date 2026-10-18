@@ -29,6 +29,11 @@ browser contracts. Both Linux checksums passed and the running local app selects
 the new executable. The rebuilt desktop retained all 17 conversation IDs and its
 signed-in scope. No shared release channel was published.
 This is a testing lane, not production or a completed cutover.
+The current delivery target is separate desktop/Scaffold canary deployments and
+a distinct Crew Canary TestFlight app for daily-workflow validation. The user
+waived the standalone independent Google OAuth acceptance check for this dogfood
+delivery; authentication and scope enforcement remain unchanged. Existing Crew
+release channels and live profiles must not be replaced or migrated.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
@@ -110,13 +115,13 @@ build profile completed. No local typechecks were run.
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
 | Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated mobile exercise |
-| Isolation | Distinct canary desktop/iOS bundles and profiles; both independently authenticated desktops see the same 18 sessions; the explicitly approved simulator import verifies the same canary account without copying Google or provider credentials | Independent mobile Google OAuth and physical-device verification |
-| Sync | Two desktops resolve the same sandbox session; desktop browser continuation and authenticated iOS warm/cold links display its six retained transcript entries while stopped epoch 4 stays unchanged | Authorized retained annotation write/sync and mobile network/lifecycle scenarios |
-| Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; health returned 200, Scaffold auth and the exact canary environment; version `9277a59d-5e0a-40f6-844c-187494aed4ff`; unauthenticated identity/registry/chat reads returned 401 even with forged identity headers; public installer returned 404 | Live signed-in desktop/mobile authority and revocation |
+| Isolation | Distinct canary desktop/iOS bundles and profiles; both independently authenticated desktops see the same 18 sessions; the explicitly approved simulator import verifies the same canary account without copying Google or provider credentials | TestFlight delivery and physical-device acceptance; standalone Google OAuth check waived for dogfooding |
+| Sync | Two desktops resolve the same sandbox session; desktop browser continuation and authenticated iOS warm/cold links display its six retained transcript entries; native reachability-loss/socket-interruption recovery preserves both completion markers | Authorized retained annotation write/sync and physical-network/mobile execution scenarios |
+| Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; current version `9e476e0a-393f-4021-afd3-c54f55b0f563` is healthy and serves mobile controller reads; prior unauthenticated identity/registry/chat checks returned 401 even with forged identity headers, and the public installer returned 404 | Live client revocation and mobile execution scenarios |
 | Scaffold | Exact `69f631b6` executable, native browser and Agent Auth completion; same sandbox ready at epoch 1, paused at 2, resumed and completed inference at 3, stopped at 4 without replacement | Interactive multi-client/mobile acceptance |
 | Protocol checks | Device/broker/authority checks 19/19, with failing-before/passing-after resume regression and stale-grant rejection; final remote Worker/provider/vault CI passed including typechecks | Additional interactive client/mobile revocation scenarios |
 | Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Authenticated mobile acceptance |
-| Mobile | Signed simulator build imported the approved Scaffold session into Keychain; account/two desktops/session history visible; wrong-scope import rejected without losing saved credentials; cold restore, warm/cold links and background/foreground recovery passed | Independent Google OAuth, mobile lifecycle/network checks and physical-device gates |
+| Mobile | Signed simulator imported the approved Scaffold session into Keychain; account/two desktops/history visible; wrong-scope imports and project/deployment/sandbox links rejected; cold restore, background recovery, scoped disconnect/reconnect and controller reads passed; four native isolation/error checks passed | TestFlight delivery, physical-network/mobile execution scenarios and physical-device acceptance |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
 | Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated multi-client/mobile acceptance and final cutover |
 
@@ -247,6 +252,34 @@ Scaffold links, plus background/foreground recovery, displayed all six retained
 entries including `CREW_NATIVE_CANARY_OK` and `CREW_NATIVE_RESUME_OK`. The existing
 sandbox remained stopped at epoch 4; no replacement or execution was admitted.
 
+Signed-in mobile controller reads exposed a real upstream-port regression: the
+Edge allowlist rejected upstream's empty `echo` liveness frame and closed every
+device link before RPC readiness. The relay now admits only the empty, canonical
+probe, retaining authentication, session-target validation and RPC restrictions.
+A real workerd regression failed before the fix and passed afterward; five
+relay/nudge checks and fourteen authority/peer checks passed. Isolated Edge
+`9e476e0a-393f-4021-afd3-c54f55b0f563` is deployed and healthy. The simulator then
+listed canary sandboxes through the desktop controller and selected the original
+stopped sandbox/session IDs without executing a lifecycle command.
+After the scoped reconnect, the rebuilt simulator also completed a fresh read
+through the other desktop controller. A successful list cleared its prior
+selection error and preserved the canonical sandbox/session IDs.
+
+The rebuilt simulator presents native error messages without reflected
+`Zeron.CoreError` names. All four `CrewIsolationTests` passed. An integrated
+build initially failed compiling host-side `ring` because Xcode's PATH selected
+raw clang without an SDK; prioritizing Apple's `/usr/bin` compiler shims fixed
+the build and regenerated the bindings through the normal build phase.
+
+Recovery was exercised without changing host-wide networking: the debugger
+called the existing native reachability API and interrupted 35 TCP sockets in
+only the canary simulator process. The app displayed “Offline — sends are saved”
+while retaining both completion markers. Restoring reachability removed the
+banner and preserved the transcript; the debugger was detached. This is a
+process-scoped reachability/socket-interruption simulation, not a physical
+airplane-mode test or a claim that all subsequent network traffic was blocked.
+No message, annotation or sandbox lifecycle operation was submitted.
+
 The configured Linux x64 pin is the `69f631b6c72c55c171f2e74d76121a0814990830`
 private artifact under `~/.crew-upstream-canary/runtime/`, SHA-256
 `bc282ba96a50cd89101caf06863f4debea83e1215cf31bfa83823c8139567539`.
@@ -282,10 +315,11 @@ Parents are `7142b2c533bfc1e960abbd901238ff8845f15c24` (Crew on prior upstream)
 and `3b2f78027a2c31622c39c35716da4d6e1af8de15`; resulting tree is
 `fe83c31e96e6e325b9580d44146b7f24d6962b00`. This is not an empty merge.
 
-Independent mobile Google OAuth, mobile network/lifecycle scenarios, retained
-annotation write/sync and physical-iOS verification remain open. Desktop and
-simulator discovery, retained history and continuation checks passed; live
-shared-provider API checks passed. No production promotion occurred.
+TestFlight delivery, physical-network/mobile execution scenarios, retained
+annotation write/sync and physical-iOS verification remain open. The standalone
+independent Google OAuth check is explicitly waived for isolated dogfooding.
+Desktop/simulator discovery, scope-denial, retained history, continuation,
+scoped recovery and controller reads passed. No production promotion occurred.
 Local typechecks are intentionally not run to preserve workstation resources.
 Remaining gates below are requirements, not claims of completed testing.
 

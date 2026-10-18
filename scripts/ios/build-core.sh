@@ -32,11 +32,11 @@ if [[ "${ZERON_SKIP_CORE:-}" == "1" && -f "$OUT/libzeron_mobile.a" ]]; then
   exit 0
 fi
 
-# Xcode exports SDKROOT/deployment vars for the *app* SDK; host build scripts
-# (proc macros, build.rs) must not see them, so cargo runs in a clean env.
+# Xcode exports the app SDK and puts raw toolchain compilers before Apple's
+# SDK-selecting /usr/bin shims. Neither may leak into host build scripts/bindgen.
 run_cargo() {
   env -i HOME="$HOME" USER="${USER:-}" TERM="${TERM:-dumb}" \
-    PATH="$PATH" \
+    PATH="/usr/bin:/bin:$PATH" \
     ASHLER_INCREMENTAL_TSC_CHECKS=false \
     IPHONEOS_DEPLOYMENT_TARGET=26.0 \
     CARGO_TARGET_DIR="$ROOT/target" \

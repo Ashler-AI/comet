@@ -12099,7 +12099,7 @@ public func FfiConverterTypeControlKind_lower(_ value: ControlKind) -> RustBuffe
 
 
 public 
-enum CoreError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+enum CoreError: Swift.Error, Equatable, Hashable {
 
     
     
@@ -12138,10 +12138,6 @@ enum CoreError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
 
-    
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
     
 }
 

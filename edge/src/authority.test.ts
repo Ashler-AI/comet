@@ -57,6 +57,12 @@ describe("scoped transport authority", () => {
     expect(scopedRpcAllowed("rpc", payload("ApplyCrewAnnotation"), annotator)).toBe(true);
     expect(scopedRpcAllowed("rpc", payload("ApplyCrewAnnotation", "other"), annotator)).toBe(false);
   });
+  it("admits empty liveness probes without granting a data channel or extra capability", () => {
+    const authority = requestAuthority(trustedRequest(req("/device/device-a/ws"), device))!;
+    expect(scopedRpcAllowed("echo", new Uint8Array(), authority)).toBe(true);
+    expect(scopedRpcAllowed("echo", new Uint8Array([1]), authority)).toBe(false);
+    expect(scopedRpcAllowed("echo", new Uint8Array(), { ...authority, capabilities: [] })).toBe(false);
+  });
   it("overwrites forged annotation authority with nonsecret verified relay identity", () => {
     const authority = requestAuthority(trustedRequest(new Request("https://edge.example/device/device-a/ws?token=secret"), device));
     const payload = new TextEncoder().encode(JSON.stringify({

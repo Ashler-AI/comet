@@ -138,6 +138,7 @@ final class CrewControlsViewController: UIViewController {
                         self?.sandbox.text = id; self?.session.text = sessionId
                     })
                 }
+                status.text = nil
                 present(menu, animated: true)
             } catch { status.text = error.localizedDescription }
         }
