@@ -45,7 +45,7 @@ const columns: Record<string, Record<string, string>> = {
   devices: { id: "string", name: "string", platform: "string", lastSeenAt: "number", createdAt: "number", version: "string", cursorSdkVersion: "string", cursorSdkEngineVersion: "string", capabilities: "strings" },
   spaces: { id: "string", deviceId: "string", path: "string", name: "string", gitDetected: "boolean", gitCheckedAt: "number", checkoutId: "string", repositoryId: "string", createdAt: "number" },
   chats: { id: "string", deviceId: "string", title: "string", archived: "boolean", cwd: "string", branch: "string", checkoutId: "string", sourceContext: "object", config: "object", crew: "object", lastMessagePreview: "string", lastMessageAt: "number", createdAt: "number", harnessSessionId: "string", harnessSessionCwd: "string", spaceId: "string", parentChatId: "string", lastSeenAt: "number", roomGen: "number" },
-  sessions: { chatId: "string", deviceId: "string", status: "status", lastCompletedTurn: "number", startedAt: "number", updatedAt: "number", runningSubagents: "number" },
+  sessions: { chatId: "string", deviceId: "string", status: "status", lastCompletedTurn: "string", startedAt: "number", updatedAt: "number", runningSubagents: "number" },
 };
 function validValue(value: FieldValue, type?: string): boolean {
   if (!type) return false;

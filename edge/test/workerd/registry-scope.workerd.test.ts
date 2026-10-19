@@ -38,6 +38,31 @@ it("bootstraps device and space before chat without expanding the scoped view", 
   expect((await state(stub)).rows.find(row => row.kind === "sessions")?.fields.status).toBe("working");
 });
 
+it("publishes scoped host completion to the owner without admitting malformed or foreign status batches", async () => {
+  const stub = room();
+  const working = { chatId: "one", deviceId: host.deviceId!, status: "working", lastCompletedTurn: null, startedAt: 10, updatedAt: 10, runningSubagents: 0 };
+  expect((await push(stub, [op("chats", "one", { id: "one", deviceId: host.deviceId!, crew })])).status).toBe(200);
+  expect((await push(stub, [op("sessions", "one", working)], host)).status).toBe(200);
+  const before = await state(stub);
+  const completed = { ...working, status: "idle", lastCompletedTurn: "turn-one", startedAt: null, updatedAt: 20 };
+  expect((await push(stub, [
+    op("chats", "one", { lastMessagePreview: "CREW_CANARY_9C_RUNTIME_OK", lastMessageAt: 20 }, 2),
+    op("sessions", "one", completed, 2),
+  ], host)).status).toBe(200);
+  const update = await state(stub, undefined, `?since=${before.seq}`);
+  expect(update.rows.find(row => row.kind === "sessions")?.fields).toMatchObject({ status: "idle", lastCompletedTurn: "turn-one" });
+  expect(update.rows.find(row => row.kind === "chats")?.fields.lastMessagePreview).toBe("CREW_CANARY_9C_RUNTIME_OK");
+  const retained = await state(stub);
+  for (const bad of [
+    op("sessions", "one", { ...completed, lastCompletedTurn: 20 }, 3),
+    op("sessions", "two", { ...completed, chatId: "two" }, 3),
+    op("sessions", "one", { ...completed, deviceId: "desktop" }, 3),
+  ]) {
+    expect((await push(stub, [op("chats", "one", { title: "must not commit" }, 3), bad], host)).status).toBe(400);
+    expect(await state(stub)).toEqual(retained);
+  }
+});
+
 it("retains canonical metadata and filters initial/delta/repair and presence for two sessions", async () => {
   const stub = room();
   const config = { harness: "omp", model: "owner-selected", reasoning: "high", sandbox: "workspace-write", modelOptions: {} };
