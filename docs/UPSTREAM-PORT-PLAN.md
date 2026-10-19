@@ -48,12 +48,15 @@ the same signed-in owner and scope, and the previously reported session state.
 The first regression build timed out under the default profile; reusing the
 documented low-memory profile completed the regression and desktop builds.
 
-[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39277121002)
-passed for exact code revision `c104782f4b9575397eec90f2a31738aca6dd63c5` on macOS,
+[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39291477265)
+passed for exact code revision `7fd6b662cac37f3a53fe4cc5dcb85cb3883ee589` on macOS,
 Linux x64 and Linux ARM64, including remote Edge typechecks and browser contracts.
-Both macOS archive checksums and the strict app signature passed; the CI-built
-macOS app is installed and running with all 18 chats retained. Delivery remains
-private/manual and ad-hoc signed, not a shared release-channel promotion.
+The archive checksums and strict app signature passed. The verified macOS bundle
+was installed atomically without replacing the running executable inode; all 20
+existing chat IDs and engine PID 39240 were retained. That process still runs
+`c104782f` while the user's chats execute. Relaunch is required to activate the
+new admission-error handling. Delivery remains private/manual and ad-hoc signed;
+no shared release channel or existing Crew Staging installation was changed.
 
 The separate iOS `ai.ashler.crew.upstream-canary` app exported as version **1.0 (1)**
 with cloud-managed signing; strict signature and production push-entitlement checks
@@ -157,21 +160,24 @@ and 6 connected Anthropic accounts. Its canonical owner ID differs from the
 isolated canary's owner; pointing at the same database would not fix ownership.
 No provider credentials have been copied, imported, or connected.
 
-The user-approved shared Agent Auth broker is now merged through
-[Platform PR #9429](https://github.com/Ashler-AI/ashler-platform/pull/9429).
-The current staging candidate had omitted the route again. Broker-only commit
-`eb78bd405e8` applies the approved change to that deployment's exact source
-`ed64ee0205895b573548a51bc83b79e8b29121db`, preserving its unrelated changes.
+The user-approved shared Agent Auth broker first merged to `master` through
+[Platform PR #9429](https://github.com/Ashler-AI/ashler-platform/pull/9429), but
+staging candidates compile their selected source without merging `master`.
+[PR #9490](https://github.com/Ashler-AI/ashler-platform/pull/9490) now backports it
+onto the actual `scaffold-staging` lineage at `b9add0b5ffb7fe0e1dee5f0adfa17821e16db4fb`,
+preserving the deployed `f5d9ced3` stable per-pod Services changes. Future staging
+candidates must descend from this backport, not the obsolete `ed64ee02` rollout.
 All six local security checks and
-[remote Worker CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/39272274624)
-passed. The guarded deployment consumed a clean preflight report, applied no D1
-or Durable Object migrations, and inherited existing Worker secrets.
-Verified staging Worker version is `ea7a72ee-66e5-4eda-a756-471c57b74a75`.
-Both Agent Auth service bindings match the pre-deployment snapshot. The running
-canary returned all 11 shared accounts (6 Anthropic, 5 OpenAI); direct broker
-requests without the trust key, including forged actor headers, returned HTTP 403.
-No provider credentials were copied and no other shared service was deployed.
-Future staging candidates must include the merged broker change.
+[remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/39287090285)
+passed, including remote typechecks. Clean preflight permitted deployment without
+D1 or Durable Object migrations; existing secrets were inherited. Verified staging
+Worker version is `31695f4e-e8eb-4cd6-8790-802bb0522e96`. All 60 binding fingerprints,
+compatibility settings and schedules match the original live baseline.
+When using the shared operator secret path, put explicit staging overrides after
+`infisical run -- env`: its primary service-origin defaults otherwise override
+the caller environment. Verification caught and corrected all three affected URLs.
+The running canary returned 11 accounts (6 Anthropic, 5 OpenAI); the private broker
+still returned HTTP 403 without its trust key. No provider credentials were copied.
 
 Actual canary API requests returned HTTP 200 and the expected literal replies
 from `gpt-6.1-sol` and `claude-opus-5-5`. Account refresh returned all 11 shared
@@ -305,9 +311,9 @@ process-scoped reachability/socket-interruption simulation, not a physical
 airplane-mode test or a claim that all subsequent network traffic was blocked.
 No message, annotation or sandbox lifecycle operation was submitted.
 
-The configured Linux x64 pin is now the `32b8bb48bb39f9ab21123052dba5dfd5d7286724`
-private artifact under `~/.crew-upstream-canary/runtime/`, with configured executable
-SHA-256 `f4c08548ac55287eadc367fbfedee87f685e1d18c50d1945ceb2672f2ce66503`.
+The configured Linux x64 pin is now the `7fd6b662cac37f3a53fe4cc5dcb85cb3883ee589`
+private artifact under `~/.crew-upstream-canary/runtime/`, with verified executable
+SHA-256 `0617eb94f7c97ec551879de6e03387da6f0fe7d762b6951fd0d88a25dfdde200`.
 The earlier live native-browser and same-ID pause/resume inference evidence used
 `69f631b6c72c55c171f2e74d76121a0814990830`; Stop retained that synchronized history.
 
@@ -331,6 +337,18 @@ underlying service is restored, explicitly recover a confirmed rejected command
 with a fresh command ID and the original Run payload/message ID; the user entry
 is deduplicated. Do not automatically retry, replace the message ID, or use
 RetryDelivery for an already-saved message (it only reissues undelivered entries).
+The admission/recovery and existing startup-failure regressions passed. The actual
+offline headed demo displayed the durable error and **Run failed** state. Reported
+chat `379bf65b-4542-4630-be24-a36051dcb913` recovered through an explicit new command:
+its original user entry remains singular, the old command remains rejected, and
+real Agent Auth inference produced assistant text and tool calls.
+That response later hit `ECONNRESET`: GKE logs confirmed a 30-second backend
+deadline truncating HTTP 200 streams. Platform `ecab2c2e286` enables the existing
+streaming-only backend for Canary's three inference endpoints (3600 seconds),
+leaving ordinary API deadlines and authentication unchanged. A real 1200-line
+managed response then completed with its terminal marker and no errors over
+111 seconds from its first assistant entry. The earlier partial user response
+was retained, not automatically replayed; the user can explicitly continue it.
 
 The copy-only importer passed committed-legacy schema fixtures through the real
 target SQLite/Loro readers, including transcript parts, peer provenance,
