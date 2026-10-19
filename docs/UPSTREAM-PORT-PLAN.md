@@ -68,30 +68,45 @@ controller; an unsupported `WatchHarnessUpdates` request was rejected locally
 and the same sandbox history remained readable. The four focused Rust checks
 (shared login import recovery, scoped admission, persisted-identity validation,
 and usage reset deadlines) passed. Five signed simulator isolation/error checks
-also passed. Private artifact and TestFlight delivery of this update is pending.
+also passed. The final desktop build timed out locally after 15 minutes rebuilding
+dependencies; the exact-source remote build below passed and supplied the tested
+installed desktop. Local typechecks were intentionally skipped.
 
-[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39314716714)
-passed for exact code revision `fade0064a6dba3734aa72375893da25e9aa332eb` on macOS,
+[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39334305241)
+passed for exact code revision `9c2268c58871eaaf1342dee15033b15905df9174` on macOS,
 Linux x64 and Linux ARM64, including remote Edge typechecks and browser contracts.
-The archive checksums and strict app signature passed. The verified macOS bundle
-was installed atomically without replacing the running executable inode; all 24
-chat IDs at installation and engine PID 39240 were retained, including both
-working sessions. The subsequent authorized restart activated `fade0064` without
-replacing conversation identities. Delivery stays private/manual; no shared
-release channel or existing Crew Staging installation was changed.
+Archive checksums, executable checksum and strict app signature passed. The
+verified macOS bundle was installed and activated at `/Applications/Crew Canary.app`;
+all 26 conversation IDs, the original desktop device ID and signed-in scope were
+retained. All four previously failing sandbox histories retained their exact
+message IDs. Native maintenance disclosure and account controls were exercised
+in this CI-built app. Delivery stays private/manual; no shared release channel
+or existing Crew Staging installation was changed.
 Isolated Edge `7e239083-7289-4704-afce-c1448431429c` is deployed; its live health
 response confirms Scaffold auth and the `crew-upstream-canary` environment.
 
-The separate iOS `ai.ashler.crew.upstream-canary` app from source `6a296c87`
-is uploaded as **1.0 (2)** to **Crew Canary by Ashler** (App Store Connect app
-`6824662308`). Apple processing returned `VALID`; the
+The separate iOS `ai.ashler.crew.upstream-canary` app from source `9c2268c5`
+is uploaded as **1.0 (3)** to **Crew Canary by Ashler** (App Store Connect app
+`6824662308`). Apple processing completed; the
 [TestFlight group](https://appstoreconnect.apple.com/teams/678e64ca-9800-489a-9076-4e4195f35838/apps/6824662308/testflight/groups/169c6912-7fa0-4c1c-934d-50c906fd48f1/builds)
-shows **Testing**, one internal tester and one build. `Canary dogfood` contains
+shows **Testing**, one internal tester and two builds. `Canary dogfood` contains
 only the authorized account, with automatic distribution disabled. Cloud-managed
-signing preserved the canary app's production push entitlement. Apple accepted
-the upload with a non-blocking missing WebRTC dSYM warning; framework crash
-symbolication is incomplete. Physical-device installation/acceptance remains open.
+signing preserved the production push entitlement, verified in the exported IPA.
+Apple's processed build icon shows the new green/white mark on black. The upload
+retains the non-blocking missing WebRTC dSYM warning; framework crash symbolication
+is incomplete. Apple confirms the tester installed **1.0 (2)** on an iPhone 18 Pro;
+installation and hands-on acceptance of **1.0 (3)** still require the user's device.
+The available iPhone Mirroring route is locked and was not bypassed.
 No existing App Store app identity or shared Crew release channel was changed.
+
+Signed simulator checks exercised the promoted sandbox entry before the device
+inventory, online-controller choice, provider-qualified model selection, owned
+sandbox selection, and retained `CREW_COMPOSER_MEDIUM_OK` history. The maintenance
+menu still opens a scoped Stop confirmation; it was dismissed without executing.
+Source/region inputs are removed and optional diagnostic fields start collapsed.
+The desktop created then resolved one retained annotation on its dedicated smoke
+conversation; the independently authenticated controller received the same ID,
+exact text anchor and resolved state. No existing user conversation was edited.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
@@ -172,14 +187,14 @@ build profile completed. No local typechecks were run.
 
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
-| Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated mobile exercise |
-| Isolation | Distinct canary desktop/iOS bundles and profiles; both independently authenticated desktops see the same 18 sessions; the explicitly approved simulator import verifies the same canary account without copying Google or provider credentials; separate TestFlight 1.0 (2) is Testing for one authorized internal tester | Physical-device acceptance; standalone Google OAuth check waived for dogfooding |
-| Sync | Two desktops resolve the same sandbox session; desktop browser continuation and authenticated iOS warm/cold links display its six retained transcript entries; native reachability-loss/socket-interruption recovery preserves both completion markers | Authorized retained annotation write/sync and physical-network/mobile execution scenarios |
+| Desktop | CI-built app retained all 26 conversations; shared-account Refresh, usage resets, both sign-in dialogs, sandbox maintenance disclosure and annotation create/resolve exercised | Real provider credential grant remains user-interactive |
+| Isolation | Distinct canary bundles/profiles; approved simulator session import retained; TestFlight 1.0 (3) is Testing for the sole authorized tester and 1.0 (2) installation is confirmed by Apple | Updated physical-device acceptance; standalone Google OAuth check waived for dogfooding |
+| Sync | Two controllers retained the same sandbox histories and synchronized a real annotation create/resolve; authenticated iOS warm/cold links and socket-interruption recovery retained history | Physical-network/mobile execution scenarios |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; current version `9e476e0a-393f-4021-afd3-c54f55b0f563` is healthy and serves mobile controller reads; prior unauthenticated identity/registry/chat checks returned 401 even with forged identity headers, and the public installer returned 404 | Live client revocation and mobile execution scenarios |
 | Scaffold | Exact `69f631b6` executable, native browser and Agent Auth completion; same sandbox ready at epoch 1, paused at 2, resumed and completed inference at 3, stopped at 4 without replacement | Interactive multi-client/mobile acceptance |
 | Protocol checks | Device/broker/authority checks 19/19, with failing-before/passing-after resume regression and stale-grant rejection; final remote Worker/provider/vault CI passed including typechecks | Additional interactive client/mobile revocation scenarios |
 | Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Authenticated mobile acceptance |
-| Mobile | Signed simulator imported the approved Scaffold session into Keychain; account/two desktops/history visible; wrong-scope imports and project/deployment/sandbox links rejected; cold restore, background recovery, scoped disconnect/reconnect and controller reads passed; four native isolation/error checks passed | Physical-network/mobile execution scenarios and physical-device acceptance |
+| Mobile | Signed simulator restored the approved account, exercised controller/model/sandbox selectors and scoped Stop confirmation without execution, and displayed retained sandbox completion; five native isolation/error checks passed | Physical-network/mobile execution scenarios and updated physical-device acceptance |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
 | Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated multi-client/mobile acceptance and final cutover |
 
@@ -340,9 +355,9 @@ process-scoped reachability/socket-interruption simulation, not a physical
 airplane-mode test or a claim that all subsequent network traffic was blocked.
 No message, annotation or sandbox lifecycle operation was submitted.
 
-The configured Linux x64 pin is now the `fade0064a6dba3734aa72375893da25e9aa332eb`
+The configured Linux x64 pin is now the `9c2268c58871eaaf1342dee15033b15905df9174`
 private artifact under `~/.crew-upstream-canary/runtime/`, with verified executable
-SHA-256 `067613a1e91dc876dbcf79c451052ac483dd9bcb6c2ada3b2e50286191f2cc7c`.
+SHA-256 `3604c5d710cb8cf49236f8ddb12bbcf00e5c5ebba71c7b90e42c3fb78a7b1f9c`.
 The earlier live native-browser and same-ID pause/resume inference evidence used
 `69f631b6c72c55c171f2e74d76121a0814990830`; Stop retained that synchronized history.
 
