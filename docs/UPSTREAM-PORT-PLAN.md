@@ -37,26 +37,33 @@ release channels and live profiles must not be replaced or migrated.
 
 The device dropdown now offers **Scaffold (Local DB)**, **Scaffold (Staging DB)**
 and **Scaffold (Production DB)** using the same row styling as devices, replacing
-the separate **New / use sandbox** entry. Each choice opens the sandbox form with
-the corresponding database mode; the form appears before existing sandbox history.
-Selecting a choice does not create, resume or stop an environment. Canary snapshot
-provisioning remains governed by the existing local-only deployment configuration.
-The native UI exercised all three choices and confirmed creation is visible without
-scrolling. The targeted project/device-picker regression passed. The rebuilt,
-signature-verified `/Applications/Crew Canary.app` retained all 18 conversation IDs,
-the same signed-in owner and scope, and the previously reported session state.
-The first regression build timed out under the default profile; reusing the
-documented low-memory profile completed the regression and desktop builds.
+the separate **New / use sandbox** entry. Selecting a destination stays in the
+new-chat composer and does not provision anything. Submit uses its existing model,
+reasoning/options and attachments, then durably creates and attaches the sandbox
+before sending. Unknown outcomes retain the command ID and draft; checking them
+does not replay Create or Attach. The attached chat persists the selected settings.
+Canary snapshot provisioning remains governed by the local-only configuration.
+The sandbox settings page omits source-branch/region textboxes and reuses the
+searchable model picker with full labels. The native UI verified destination-only
+selection leaves the chat count unchanged, model search, and the simplified form.
+Transcript headers/sidebar details distinguish Scaffold from local execution,
+including lifecycle/offline state. Both live composer checks passed: the retained
+image prompt returned its exact generated text once, and a fresh sandbox using
+the `fade0064` runtime returned `CREW_COMPOSER_MEDIUM_OK`. The selected `medium`
+reasoning level persisted in chat `8676e377-ea1e-4c20-9be7-20e1ba2a0a83` and was
+read back through the independent dogfood controller.
 
-[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39291477265)
-passed for exact code revision `7fd6b662cac37f3a53fe4cc5dcb85cb3883ee589` on macOS,
+[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39314716714)
+passed for exact code revision `fade0064a6dba3734aa72375893da25e9aa332eb` on macOS,
 Linux x64 and Linux ARM64, including remote Edge typechecks and browser contracts.
 The archive checksums and strict app signature passed. The verified macOS bundle
-was installed atomically without replacing the running executable inode; all 20
-existing chat IDs and engine PID 39240 were retained. That process still runs
-`c104782f` while the user's chats execute. Relaunch is required to activate the
-new admission-error handling. Delivery remains private/manual and ad-hoc signed;
+was installed atomically without replacing the running executable inode; all 24
+chat IDs at installation and engine PID 39240 were retained, including both
+working sessions. That process still runs `c104782f`; manual relaunch is required
+to activate the composer/startup/attachment fixes. Delivery stays private/manual;
 no shared release channel or existing Crew Staging installation was changed.
+Isolated Edge `7e239083-7289-4704-afce-c1448431429c` is deployed; its live health
+response confirms Scaffold auth and the `crew-upstream-canary` environment.
 
 The separate iOS `ai.ashler.crew.upstream-canary` app exported as version **1.0 (1)**
 with cloud-managed signing; strict signature and production push-entitlement checks
@@ -311,9 +318,9 @@ process-scoped reachability/socket-interruption simulation, not a physical
 airplane-mode test or a claim that all subsequent network traffic was blocked.
 No message, annotation or sandbox lifecycle operation was submitted.
 
-The configured Linux x64 pin is now the `7fd6b662cac37f3a53fe4cc5dcb85cb3883ee589`
+The configured Linux x64 pin is now the `fade0064a6dba3734aa72375893da25e9aa332eb`
 private artifact under `~/.crew-upstream-canary/runtime/`, with verified executable
-SHA-256 `0617eb94f7c97ec551879de6e03387da6f0fe7d762b6951fd0d88a25dfdde200`.
+SHA-256 `067613a1e91dc876dbcf79c451052ac483dd9bcb6c2ada3b2e50286191f2cc7c`.
 The earlier live native-browser and same-ID pause/resume inference evidence used
 `69f631b6c72c55c171f2e74d76121a0814990830`; Stop retained that synchronized history.
 
@@ -349,6 +356,32 @@ leaving ordinary API deadlines and authentication unchanged. A real 1200-line
 managed response then completed with its terminal marker and no errors over
 111 seconds from its first assistant entry. The earlier partial user response
 was retained, not automatically replayed; the user can explicitly continue it.
+
+Native startup now rejects failed sandbox bootstrap before creating a local
+profile, device identity or IPC listener. Previously, a delayed binary install
+could exhaust the initial grant and silently start a local-profile host; that
+host then prevented the fresh Attach grant from taking effect. Native handoff
+attaches before waiting for host readiness. The actual built CLI rejected an
+invalid bootstrap with exit 1 and created neither a local profile nor identity.
+The reported session `834ecf25-ee4b-42fe-8584-5f7e42179df0` was recovered in place,
+without creating a replacement sandbox or replaying its prompt.
+
+Scoped peer readiness uses `LocalDevice`, not the host-wide `ListHarnesses`
+probe. Attachment chunks/commit carry the destination chat ID and require its
+existing `session.files` capability at Edge and the native host. Missing or
+mismatched session IDs remain denied; this does not grant host-wide file access.
+Queued attachment dispatch resolves the current session host on each attempt,
+so pending delivery follows a resumed host without creating another Run.
+The integrated desktop build, 28 Rust transport/attachment/client checks, three
+composer-recovery checks, 13 Edge authority checks and nine browser checks passed.
+The transport suite initially failed because its relay fixtures had no explicit
+dev authority; fixtures now opt in locally, while production remains fail-closed.
+One existing transport check is ignored. Local typechecks were not run.
+The first image sandbox auto-paused while CI ran. Inspect confirmed that state;
+same-ID Resume reached epoch 2. Its original command was rejected because bytes
+never arrived, so one explicit RetryDelivery recovered the original message with
+a fresh command. The transcript contains one user entry and one exact image-text
+response; no replacement sandbox or duplicate prompt was created.
 
 The copy-only importer passed committed-legacy schema fixtures through the real
 target SQLite/Loro readers, including transcript parts, peer provenance,
