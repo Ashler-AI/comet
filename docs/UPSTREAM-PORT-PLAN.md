@@ -65,10 +65,15 @@ no shared release channel or existing Crew Staging installation was changed.
 Isolated Edge `7e239083-7289-4704-afce-c1448431429c` is deployed; its live health
 response confirms Scaffold auth and the `crew-upstream-canary` environment.
 
-The separate iOS `ai.ashler.crew.upstream-canary` app exported as version **1.0 (1)**
-with cloud-managed signing; strict signature and production push-entitlement checks
-passed. TestFlight upload is not complete: App Store Connect returned no app record
-for that bundle ID, and its browser session requires renewed interactive sign-in.
+The separate iOS `ai.ashler.crew.upstream-canary` app from source `6a296c87`
+is uploaded as **1.0 (2)** to **Crew Canary by Ashler** (App Store Connect app
+`6824662308`). Apple processing returned `VALID`; the
+[TestFlight group](https://appstoreconnect.apple.com/teams/678e64ca-9800-489a-9076-4e4195f35838/apps/6824662308/testflight/groups/169c6912-7fa0-4c1c-934d-50c906fd48f1/builds)
+shows **Testing**, one internal tester and one build. `Canary dogfood` contains
+only the authorized account, with automatic distribution disabled. Cloud-managed
+signing preserved the canary app's production push entitlement. Apple accepted
+the upload with a non-blocking missing WebRTC dSYM warning; framework crash
+symbolication is incomplete. Physical-device installation/acceptance remains open.
 No existing App Store app identity or shared Crew release channel was changed.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
@@ -151,13 +156,13 @@ build profile completed. No local typechecks were run.
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
 | Desktop | Rebuilt local app shows 6 Anthropic and 5 OpenAI shared accounts with usage; both provider groups are reachable by native scrolling; bounded sidebar, separate settings and visible sandbox entry/confirmation exercised | Authenticated mobile exercise |
-| Isolation | Distinct canary desktop/iOS bundles and profiles; both independently authenticated desktops see the same 18 sessions; the explicitly approved simulator import verifies the same canary account without copying Google or provider credentials | TestFlight delivery and physical-device acceptance; standalone Google OAuth check waived for dogfooding |
+| Isolation | Distinct canary desktop/iOS bundles and profiles; both independently authenticated desktops see the same 18 sessions; the explicitly approved simulator import verifies the same canary account without copying Google or provider credentials; separate TestFlight 1.0 (2) is Testing for one authorized internal tester | Physical-device acceptance; standalone Google OAuth check waived for dogfooding |
 | Sync | Two desktops resolve the same sandbox session; desktop browser continuation and authenticated iOS warm/cold links display its six retained transcript entries; native reachability-loss/socket-interruption recovery preserves both completion markers | Authorized retained annotation write/sync and physical-network/mobile execution scenarios |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; current version `9e476e0a-393f-4021-afd3-c54f55b0f563` is healthy and serves mobile controller reads; prior unauthenticated identity/registry/chat checks returned 401 even with forged identity headers, and the public installer returned 404 | Live client revocation and mobile execution scenarios |
 | Scaffold | Exact `69f631b6` executable, native browser and Agent Auth completion; same sandbox ready at epoch 1, paused at 2, resumed and completed inference at 3, stopped at 4 without replacement | Interactive multi-client/mobile acceptance |
 | Protocol checks | Device/broker/authority checks 19/19, with failing-before/passing-after resume regression and stale-grant rejection; final remote Worker/provider/vault CI passed including typechecks | Additional interactive client/mobile revocation scenarios |
 | Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Authenticated mobile acceptance |
-| Mobile | Signed simulator imported the approved Scaffold session into Keychain; account/two desktops/history visible; wrong-scope imports and project/deployment/sandbox links rejected; cold restore, background recovery, scoped disconnect/reconnect and controller reads passed; four native isolation/error checks passed | TestFlight delivery, physical-network/mobile execution scenarios and physical-device acceptance |
+| Mobile | Signed simulator imported the approved Scaffold session into Keychain; account/two desktops/history visible; wrong-scope imports and project/deployment/sandbox links rejected; cold restore, background recovery, scoped disconnect/reconnect and controller reads passed; four native isolation/error checks passed | Physical-network/mobile execution scenarios and physical-device acceptance |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
 | Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated multi-client/mobile acceptance and final cutover |
 
@@ -398,7 +403,7 @@ Parents are `7142b2c533bfc1e960abbd901238ff8845f15c24` (Crew on prior upstream)
 and `3b2f78027a2c31622c39c35716da4d6e1af8de15`; resulting tree is
 `fe83c31e96e6e325b9580d44146b7f24d6962b00`. This is not an empty merge.
 
-TestFlight delivery, physical-network/mobile execution scenarios, retained
+Physical-network/mobile execution scenarios, retained
 annotation write/sync and physical-iOS verification remain open. The standalone
 independent Google OAuth check is explicitly waived for isolated dogfooding.
 Desktop/simulator discovery, scope-denial, retained history, continuation,
