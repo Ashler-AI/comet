@@ -31,6 +31,7 @@ pub struct Annotations {
     exact: Entity<ComposerInput>,
     body: Entity<ComposerInput>,
     editing: Option<String>,
+    advanced: bool,
     busy: bool,
     error: Option<String>,
     pending: Option<(String, AnnotationCommand)>,
@@ -47,6 +48,9 @@ impl Annotations {
                 page.chat = chat; page.annotations.clear(); page.editing = None;
                 page.pending = pending_for(state.read(cx), cx); page.error = None; page.busy = false;
                 page.body.update(cx, |input, cx| input.set_text("", cx));
+                page.target.update(cx, |input, cx| input.set_text("", cx));
+                page.exact.update(cx, |input, cx| input.set_text("", cx));
+                page.advanced = false;
             }
             cx.notify();
         });
@@ -54,7 +58,7 @@ impl Annotations {
             target: cx.new(|cx| ComposerInput::new("Message ID", cx)),
             exact: cx.new(|cx| ComposerInput::new("Exact selected text (optional)", cx)),
             body: cx.new(|cx| ComposerInput::new("Annotation note", cx)),
-            editing: None, busy: false, error: None, pending, _observe: observe }
+            editing: None, advanced: false, busy: false, error: None, pending, _observe: observe }
     }
 
     pub fn capture_selection(&mut self, cx: &mut Context<Self>) {
@@ -63,7 +67,7 @@ impl Annotations {
             self.exact.update(cx, |input, cx| input.set_text(exact, cx));
             self.editing = None; self.error = None;
         } else {
-            self.error = Some("Select up to 4 KB within one transcript message, or enter its message ID below.".into());
+            self.error = Some("Select up to 4 KB within one transcript message, or enter its message ID in Advanced options.".into());
         }
         cx.notify();
     }
@@ -146,30 +150,29 @@ impl Annotations {
 impl Render for Annotations {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
-        let mut body = div().flex().flex_col().gap(px(8.0)).child(widgets::row_title(&theme, "Selected session · retained annotations"));
+        let mut body = div().flex().flex_col().gap(px(16.0));
         let Some(chat) = self.chat.clone() else { return body.child("Open a session to view its annotations.").into_any_element(); };
-        body = body.child(widgets::page_subtitle(&theme, format!("Session {chat}. Shared annotations are durable; review comments and quoted context remain part of your next prompt.")))
-            .child(CrewAccounts::action(&theme, "annotations-refresh", if self.busy { "Working…" } else { "Refresh annotations" }).on_click(cx.listener(|page, _, _, cx| page.refresh(cx))))
-            .child(CrewAccounts::action(&theme, "annotations-selection", "Use selected transcript text").on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
-                .on_click(cx.listener(|page, _, _, cx| page.capture_selection(cx))));
+        let session_title = self.state.read(cx).selected_chat_row().and_then(|chat| chat.title.clone()).unwrap_or_else(|| "Selected session".into());
+        body = body.child(div().flex().items_center().justify_between().gap(px(12.0))
+            .child(div().id("annotation-session").min_w_0().truncate().tooltip(widgets::text_tooltip(format!("Session {chat}")))
+                .child(widgets::row_title(&theme, session_title)))
+            .child(CrewAccounts::action(&theme, "annotations-refresh", if self.busy { "Refreshing…" } else { "Refresh" }).on_click(cx.listener(|page, _, _, cx| page.refresh(cx)))));
         if let Some(error) = &self.error { body = body.child(widgets::error_strip(&theme, error.clone())); }
-        for annotation in self.annotations.clone() {
-            let edit = annotation.clone(); let resolve = annotation.clone();
-            body = body.child(widgets::section_card(&theme).p(px(12.0))
-                .child(widgets::row_title(&theme, format!("{} · {:?} · {}", annotation.author_subject, annotation.state, if annotation.resolved_at.is_some() { "Resolved" } else { "Open" })))
-                .child(div().child(SharedString::from(annotation.body)))
-                .child(widgets::page_subtitle(&theme, format!("{:?}: {}", annotation.anchor.target_kind, annotation.anchor.target_id)))
-                .child(CrewAccounts::action(&theme, format!("annotation-edit-{}", annotation.id), "Edit note").on_click(cx.listener(move |page, _, window, cx| {
-                    page.editing = Some(edit.id.clone()); page.body.update(cx, |input, cx| input.set_text(edit.body.clone(), cx));
-                    window.focus(&page.body.focus_handle(cx), cx); cx.notify();
-                })))
-                .child(CrewAccounts::action(&theme, format!("annotation-resolve-{}", annotation.id), if annotation.resolved_at.is_some() { "Reopen" } else { "Resolve" })
-                    .on_click(cx.listener(move |page, _, _, cx| page.submit(AnnotationCommand::Resolve { id: resolve.id.clone(), resolved: resolve.resolved_at.is_none() }, cx)))));
-        }
-        body = body.child(CrewAccounts::field(&theme, "Message ID for a new annotation", &self.target))
-            .child(CrewAccounts::field(&theme, "Selected text", &self.exact))
-            .child(CrewAccounts::field(&theme, "Annotation note", &self.body))
-            .child(CrewAccounts::action(&theme, "annotation-save", if self.editing.is_some() { "Save edited note" } else { "Create shared annotation" })
+        if self.pending.is_some() { body = body.child(CrewAccounts::action(&theme, "annotation-reconcile", "Reconcile retained annotation command").on_click(cx.listener(|page, _, _, cx| page.send_pending(cx)))); }
+        let target = self.target.read(cx).text().trim().to_owned();
+        let selected_text = self.exact.read(cx).text().to_owned();
+        let target_label = if let Some(annotation) = self.editing.as_ref().and_then(|id| self.annotations.iter().find(|row| &row.id == id)) {
+            format!("Editing note · {:?}: {}", annotation.anchor.target_kind, annotation.anchor.target_id)
+        } else if target.is_empty() { "No transcript selection yet".into() } else { format!("Message {target}") };
+        body = body.when(self.editing.is_none(), |el| el.child(CrewAccounts::action(&theme, "annotations-selection", "Use selected transcript text")
+                .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
+                .on_click(cx.listener(|page, _, _, cx| page.capture_selection(cx)))))
+            .child(widgets::page_subtitle(&theme, target_label))
+            .when(self.editing.is_none() && !selected_text.is_empty(), |el| el.child(div().max_h(px(88.0)).overflow_hidden().child(SharedString::from(selected_text))))
+            .child(CrewAccounts::field(&theme, "Note", &self.body))
+            .child(widgets::text_action(&theme, widgets::ActionTone::Filled, if self.editing.is_some() { "Save note" } else { "Create annotation" })
+                .id("annotation-save").role(gpui::Role::Button).aria_label(if self.editing.is_some() { "Save note" } else { "Create annotation" }).tab_index(0).self_start()
+                .focus_visible(|style| style.border_2().border_color(theme.accent))
                 .on_click(cx.listener(|page, _, _, cx| {
                     let body = page.body.read(cx).text().trim().to_owned();
                     if body.is_empty() { page.error = Some("Enter an annotation note.".into()); cx.notify(); return; }
@@ -186,7 +189,35 @@ impl Render for Annotations {
                     };
                     page.submit(command, cx);
                 })));
-        if self.pending.is_some() { body = body.child(CrewAccounts::action(&theme, "annotation-reconcile", "Reconcile retained annotation command").on_click(cx.listener(|page, _, _, cx| page.send_pending(cx)))); }
+        if self.editing.is_some() {
+            body = body.child(CrewAccounts::action(&theme, "annotation-cancel-edit", "Cancel editing")
+                .on_click(cx.listener(|page, _, _, cx| {
+                    page.editing = None;
+                    page.body.update(cx, |input, cx| input.set_text("", cx));
+                    cx.notify();
+                })));
+        }
+        if self.editing.is_none() {
+            body = body.child(CrewAccounts::action(&theme, "annotation-advanced", if self.advanced { "Hide advanced options" } else { "Advanced options" })
+                .aria_description("Override the target message ID and exact selected text")
+                .on_click(cx.listener(|page, _, _, cx| { page.advanced = !page.advanced; cx.notify(); })))
+                .when(self.advanced, |el| el
+                    .child(CrewAccounts::field(&theme, "Message ID", &self.target))
+                    .child(CrewAccounts::field(&theme, "Exact selected text (optional)", &self.exact)));
+        }
+        for annotation in self.annotations.clone() {
+            let edit = annotation.clone(); let resolve = annotation.clone();
+            body = body.child(widgets::section_card(&theme).p(px(12.0))
+                .child(widgets::row_title(&theme, format!("{} · {:?} · {}", annotation.author_subject, annotation.state, if annotation.resolved_at.is_some() { "Resolved" } else { "Open" })))
+                .child(div().child(SharedString::from(annotation.body)))
+                .child(widgets::page_subtitle(&theme, format!("{:?}: {}", annotation.anchor.target_kind, annotation.anchor.target_id)))
+                .child(CrewAccounts::action(&theme, format!("annotation-edit-{}", annotation.id), "Edit note").on_click(cx.listener(move |page, _, window, cx| {
+                    page.editing = Some(edit.id.clone()); page.body.update(cx, |input, cx| input.set_text(edit.body.clone(), cx));
+                    window.focus(&page.body.focus_handle(cx), cx); cx.notify();
+                })))
+                .child(CrewAccounts::action(&theme, format!("annotation-resolve-{}", annotation.id), if annotation.resolved_at.is_some() { "Reopen" } else { "Resolve" })
+                    .on_click(cx.listener(move |page, _, _, cx| page.submit(AnnotationCommand::Resolve { id: resolve.id.clone(), resolved: resolve.resolved_at.is_none() }, cx)))));
+        }
         body.into_any_element()
     }
 }

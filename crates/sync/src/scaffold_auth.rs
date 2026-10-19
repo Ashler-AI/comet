@@ -127,12 +127,17 @@ impl ScaffoldAuth {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| unavailable("could not initialize Scaffold HTTP client"))?;
         Ok(Self { config, http, sign_ins: Mutex::new(SignIns::default()) })
     }
-    async fn json<T: serde::de::DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T, AuthError> {
-        let response = request.send().await.map_err(|_| unavailable("Scaffold authority is unreachable"))?;
+    async fn json<T: serde::de::DeserializeOwned>(&self, stage: &str, request: reqwest::RequestBuilder) -> Result<T, AuthError> {
+        // Only fixed operation names and error categories cross this boundary;
+        // request URLs, bearer headers and authority response bodies stay private.
+        let response = request.send().await.map_err(|error| {
+            let cause = if error.is_timeout() { "request_timeout" } else if error.is_connect() { "connect_failure" } else { "send_failure" };
+            unavailable(&format!("Scaffold {stage}: {cause}"))
+        })?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN { return Err(AuthError::Rejected); }
-        if !status.is_success() { return Err(unavailable("Scaffold authority request failed")); }
-        response.json().await.map_err(|_| unavailable("invalid Scaffold authority response"))
+        if !status.is_success() { return Err(unavailable(&format!("Scaffold {stage}: HTTP {}", status.as_u16()))); }
+        response.json().await.map_err(|error| unavailable(&format!("Scaffold {stage}: {}", if error.is_timeout() { "response_timeout" } else if error.is_decode() { "invalid_response" } else { "response_body_failure" })))
     }
     pub fn cancel_sign_in(&self) {
         let mut flow = lock(&self.sign_ins);
@@ -149,15 +154,15 @@ impl ScaffoldAuth {
         #[derive(Deserialize)] struct Server { issuer: String, authorization_endpoint: String, token_endpoint: String, registration_endpoint: String, code_challenge_methods_supported: Vec<String> }
         #[derive(Deserialize)] struct Registration { client_id: String }
         let base = &self.config.control_origin;
-        let resource: Resource = self.json(self.http.get(format!("{base}/.well-known/oauth-protected-resource"))).await?;
+        let resource: Resource = self.json("resource discovery", self.http.get(format!("{base}/.well-known/oauth-protected-resource"))).await?;
         // The configured origin is the resource, not any same-origin arbitrary path.
         if normalized_origin(&resource.resource)? != *base || !has_scopes(&self.config.oauth_scopes, &resource.scopes_supported) { return Err(AuthError::Rejected); }
         let issuer = resource.authorization_servers.first().ok_or(AuthError::Rejected)?;
         if normalized_origin(issuer)? != *base { return Err(AuthError::Rejected); }
-        let server: Server = self.json(self.http.get(format!("{base}/.well-known/oauth-authorization-server"))).await?;
+        let server: Server = self.json("authorization discovery", self.http.get(format!("{base}/.well-known/oauth-authorization-server"))).await?;
         if normalized_origin(&server.issuer)? != *base || !server.code_challenge_methods_supported.iter().any(|value| value == "S256") { return Err(AuthError::Rejected); }
         for endpoint in [&server.authorization_endpoint, &server.token_endpoint, &server.registration_endpoint] { same_origin(base, endpoint)?; }
-        let registration: Registration = self.json(self.http.post(&server.registration_endpoint).json(&serde_json::json!({"redirect_uris":[redirect_uri],"token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"]}))).await?;
+        let registration: Registration = self.json("client registration", self.http.post(&server.registration_endpoint).json(&serde_json::json!({"redirect_uris":[redirect_uri],"token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"]}))).await?;
         if registration.client_id.trim().is_empty() { return Err(AuthError::Rejected); }
         let verifier = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
         let state = uuid::Uuid::new_v4().to_string();
@@ -182,7 +187,7 @@ impl ScaffoldAuth {
             if url.as_str() != pending.redirect_uri { return Err(AuthError::Rejected); }
         }
         #[derive(Deserialize)] struct Tokens { access_token: String, token_type: String, scope: String, resource: String }
-        let tokens: Tokens = self.json(self.http.post(&pending.token_endpoint).form(&[("grant_type", "authorization_code"), ("code", &code), ("client_id", &pending.client_id), ("redirect_uri", &pending.redirect_uri), ("code_verifier", &pending.verifier), ("resource", &pending.resource)])).await?;
+        let tokens: Tokens = self.json("token exchange", self.http.post(&pending.token_endpoint).form(&[("grant_type", "authorization_code"), ("code", &code), ("client_id", &pending.client_id), ("redirect_uri", &pending.redirect_uri), ("code_verifier", &pending.verifier), ("resource", &pending.resource)])).await?;
         if !tokens.token_type.eq_ignore_ascii_case("Bearer") || !tokens.access_token.starts_with("sc_rc_") || tokens.resource != pending.resource || !has_scopes(&self.config.oauth_scopes, &tokens.scope.split_whitespace().map(str::to_owned).collect::<Vec<_>>()) { return Err(AuthError::Rejected); }
         let session = self.verify_token(&tokens.access_token).await?;
         if lock(&self.sign_ins).generation != pending.generation { return Err(AuthError::Rejected); }
@@ -193,10 +198,10 @@ impl ScaffoldAuth {
         #[derive(Deserialize)] #[serde(rename_all="camelCase")] struct Actor { sub: String, auth: String, display_name: Option<String> }
         #[derive(Deserialize)] struct Session { ok: bool, resource: String, actor: Actor, scopes: Vec<String> }
         let resource = &self.config.control_origin;
-        let verified: Session = self.json(self.http.get(format!("{resource}/api/code-sandboxes/auth/session")).bearer_auth(token)).await?;
+        let verified: Session = self.json("control session verification", self.http.get(format!("{resource}/api/code-sandboxes/auth/session")).bearer_auth(token)).await?;
         if !verified.ok || normalized_origin(&verified.resource)? != *resource || verified.actor.auth != "iap" || verified.actor.sub.trim().is_empty() || !has_scopes(&self.config.oauth_scopes, &verified.scopes) { return Err(AuthError::Rejected); }
         #[derive(Deserialize)] #[serde(rename_all="camelCase")] struct EdgeIdentity { user_id: String, email: String, project_scope: String, capabilities: Vec<String>, credential: String, deployment_id: Option<String> }
-        let edge: EdgeIdentity = self.json(self.http.get(format!("{}/auth/session", self.config.edge_origin)).bearer_auth(token)).await?;
+        let edge: EdgeIdentity = self.json("Edge session verification", self.http.get(format!("{}/auth/session", self.config.edge_origin)).bearer_auth(token)).await?;
         if edge.credential != "scaffold" || edge.user_id != verified.actor.sub || edge.project_scope != self.config.project_scope || self.config.deployment_id.as_ref().is_some_and(|expected| Some(expected) != edge.deployment_id.as_ref()) { return Err(AuthError::Rejected); }
         Ok(ScaffoldSession { access_token: token.into(), identity: ScaffoldIdentity { user_id: edge.user_id, email: edge.email, name: verified.actor.display_name, project_scope: edge.project_scope, capabilities: edge.capabilities, deployment_id: edge.deployment_id }, resource: resource.clone(), edge_origin: self.config.edge_origin.clone(), device: None })
     }
@@ -208,7 +213,7 @@ impl ScaffoldAuth {
     }
     pub async fn exchange_device(&self, config: &DeviceConfig) -> Result<ScaffoldSession, AuthError> {
         let grant_id = grant_token_id(&config.join_grant, "cg1").ok_or(AuthError::Rejected)?;
-        let reply: DeviceReply = self.json(self.http.post(format!("{}/auth/device-grants/exchange", self.config.edge_origin)).json(&serde_json::json!({"grant":config.join_grant}))).await?;
+        let reply: DeviceReply = self.json("device grant exchange", self.http.post(format!("{}/auth/device-grants/exchange", self.config.edge_origin)).json(&serde_json::json!({"grant":config.join_grant}))).await?;
         self.device_session(reply, config, grant_id)
     }
     pub async fn refresh_device(&self, current: &ScaffoldSession, config: &DeviceConfig) -> Result<ScaffoldSession, AuthError> {
@@ -220,7 +225,7 @@ impl ScaffoldAuth {
         {
             return Err(AuthError::Rejected);
         }
-        let reply: DeviceReply = self.json(self.http.post(format!("{}/auth/device-token/refresh", self.config.edge_origin)).bearer_auth(&current.access_token)).await?;
+        let reply: DeviceReply = self.json("device token refresh", self.http.post(format!("{}/auth/device-token/refresh", self.config.edge_origin)).bearer_auth(&current.access_token)).await?;
         let next = self.device_session(reply, config, &authority.grant_id)?;
         if next.identity != current.identity { return Err(AuthError::Rejected); }
         Ok(next)

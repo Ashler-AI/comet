@@ -48,6 +48,18 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_test");
     status.store(503, Ordering::SeqCst);
     assert!(matches!(auth.access_token().await, Err(TokenError::TemporarilyUnavailable(_))));
+    let client = zeron_engine::scaffold::ScaffoldClient::new(&origin, "canary", bound).unwrap();
+    let scope = zeron_proto::CollaborationScope {
+        project_id: "canary".into(), deployment_id: Some("deployment".into()), session_id: None, unknown: Default::default(),
+    };
+    let error = client.list(&scope, &tokio_util::sync::CancellationToken::new()).await.unwrap_err();
+    let zeron_engine::scaffold::ScaffoldError::AuthTemporarilyUnavailable(reason) = error else {
+        panic!("authority outage must remain retryable");
+    };
+    assert!(reason.contains("503"));
+    assert!(!reason.contains(&origin));
+    assert!(!reason.contains("sc_rc_test"));
+    assert!(!reason.contains("user@example.com"));
     assert!(path.exists());
     assert_eq!(auth.verified_profile_key().as_deref(), Some(key.as_str()));
     status.store(401, Ordering::SeqCst);

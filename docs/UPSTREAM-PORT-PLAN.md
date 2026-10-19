@@ -53,15 +53,32 @@ the `fade0064` runtime returned `CREW_COMPOSER_MEDIUM_OK`. The selected `medium`
 reasoning level persisted in chat `8676e377-ea1e-4c20-9be7-20e1ba2a0a83` and was
 read back through the independent dogfood controller.
 
+The account page now uses the existing settings cards and usage meters, shows
+reset deadlines, and opens the existing shared Agent Auth sign-in flow for each
+provider. Refresh no longer depends on sandbox discovery; native Refresh and
+both provider sign-in dialogs were exercised without granting new credentials.
+Sandbox maintenance and diagnostic fields sit behind disclosure controls;
+reconciliation precedes new operations. Desktop and mobile artwork now uses the
+green center and four white pieces on black, generated from `dist/zeron.svg`.
+
+The intermittent history failure came from device-wide RPCs reaching a
+session-scoped sandbox link. Admission now occurs in the shared forwarding path,
+before acquiring that link. Four affected histories loaded in the rebuilt
+controller; an unsupported `WatchHarnessUpdates` request was rejected locally
+and the same sandbox history remained readable. The four focused Rust checks
+(shared login import recovery, scoped admission, persisted-identity validation,
+and usage reset deadlines) passed. Five signed simulator isolation/error checks
+also passed. Private artifact and TestFlight delivery of this update is pending.
+
 [Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39314716714)
 passed for exact code revision `fade0064a6dba3734aa72375893da25e9aa332eb` on macOS,
 Linux x64 and Linux ARM64, including remote Edge typechecks and browser contracts.
 The archive checksums and strict app signature passed. The verified macOS bundle
 was installed atomically without replacing the running executable inode; all 24
 chat IDs at installation and engine PID 39240 were retained, including both
-working sessions. That process still runs `c104782f`; manual relaunch is required
-to activate the composer/startup/attachment fixes. Delivery stays private/manual;
-no shared release channel or existing Crew Staging installation was changed.
+working sessions. The subsequent authorized restart activated `fade0064` without
+replacing conversation identities. Delivery stays private/manual; no shared
+release channel or existing Crew Staging installation was changed.
 Isolated Edge `7e239083-7289-4704-afce-c1448431429c` is deployed; its live health
 response confirms Scaffold auth and the `crew-upstream-canary` environment.
 

@@ -6,6 +6,24 @@ shared bucket, public manifest, `latest` pointer, or release channel. Packaging
 does not modify existing Crew apps, services or profiles. The separately approved
 staging broker deployment is recorded in the [port status](../docs/UPSTREAM-PORT-PLAN.md).
 
+## Brand artwork
+
+`dist/zeron.svg` is the Crew mark: the original 46-unit four-piece square in
+`#fafafa`, a 10-unit `#09de5e` core, and solid black. No frame, shadow, or nested
+tile is added. The mark occupies 46/72 of the artboard, preserving its geometry
+while leaving app-icon safe area. Internal `zeron` filenames remain compatible
+with existing consumers.
+
+Regenerate the desktop, launcher, landing-page and iOS artwork with
+`python3 scripts/gen-brand-icons.py` (Pillow required only for regeneration).
+The shared and iOS PNGs are opaque 1024×1024 RGB; iOS applies its own corner mask
+and derives dark/tinted appearances from this universal asset. The macOS PNG is
+1024×1024 RGBA with only the platform tile's exterior transparent. Packaging
+uses the existing `sips`/`iconutil` path to make `.icns`; the dev launcher refreshes
+its cached icon when the source changes. Repackage/reinstall Canary to pick up
+new bundle assets; generation alone never changes a running/installed app.
+
+
 ## macOS
 
 From this worktree on a macOS host:

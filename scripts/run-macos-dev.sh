@@ -37,7 +37,7 @@ fi
 mkdir -p "$CONTENTS/Resources/licenses"
 cp "$ROOT/crates/voice/NOTICE.md" "$CONTENTS/Resources/licenses"/parakeet-v3.txt
 
-if [[ ! -f "$CONTENTS/Resources/zeron.icns" ]]; then
+if [[ ! -f "$CONTENTS/Resources/zeron.icns" || "$ROOT/dist/macos/icon-1024.png" -nt "$CONTENTS/Resources/zeron.icns" ]]; then
   ICONSET="$DEV_ROOT/zeron-dev.iconset"
   mkdir -p "$ICONSET"
   for size in 16 32 128 256 512; do

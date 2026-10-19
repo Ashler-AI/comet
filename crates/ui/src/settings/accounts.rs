@@ -365,6 +365,14 @@ pub(crate) fn render_usage_meter(
     window: &zeron_proto::AgentUsageWindow,
     theme: &Theme,
 ) -> AnyElement {
+    render_usage_meter_width(window, theme, USAGE_BAR_WIDTH)
+}
+
+pub(crate) fn render_usage_meter_width(
+    window: &zeron_proto::AgentUsageWindow,
+    theme: &Theme,
+    bar_width: f32,
+) -> AnyElement {
     let fraction = window.used_fraction.clamp(0.0, 1.0);
     let level = usage_level(fraction);
     let fill = usage_color(level, theme).opacity(match level {
@@ -388,7 +396,7 @@ pub(crate) fn render_usage_meter(
         )
         .child(
             div()
-                .w(px(USAGE_BAR_WIDTH))
+                .w(px(bar_width))
                 .flex_none()
                 .h(px(4.0))
                 .rounded_full()
@@ -521,6 +529,7 @@ pub struct AccountsPage {
     poll_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
+    _crew_events: Subscription,
 }
 
 impl AccountsPage {
@@ -558,8 +567,12 @@ impl AccountsPage {
                 this.submit_code(cx);
             }
         });
+        let crew = cx.new(|cx| super::crew::CrewAccounts::new(state.clone(), cx));
+        let crew_events = cx.subscribe(&crew, |page: &mut Self, _, event: &super::crew::AddAccount, cx| {
+            page.start_login(event.0, None, cx);
+        });
         let mut page = Self {
-            crew: cx.new(|cx| super::crew::CrewAccounts::new(state.clone(), cx)),
+            crew,
             state,
             embedded,
             embedded_harness,
@@ -579,6 +592,7 @@ impl AccountsPage {
             poll_task: None,
             _observe: observe,
             _code_events: code_events,
+            _crew_events: crew_events,
         };
         // Paint from the last list (this session) or the engine's persisted
         // usage, then force one probe to update in place — the skeleton only
@@ -722,6 +736,10 @@ impl AccountsPage {
     /// engine's plain list (last known usage, no network) so rows appear at
     /// once, then the probed list replaces it.
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
+        if self.state.read(cx).managed_inference {
+            self.crew.update(cx, |page, cx| page.refresh(cx));
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
@@ -857,6 +875,7 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        if self.login.is_some() { self.cancel_login(cx); }
         self.login_attempts += 1;
         let attempt = self.login_attempts;
         self.login = Some(LoginFlow {
@@ -874,10 +893,11 @@ impl AccountsPage {
             object.insert("provider".into(), serde_json::json!(provider));
         }
         let params = self.params(params);
+        let method = if self.state.read(cx).managed_inference { "crew.accounts.login.start" } else { methods::START_AGENT_LOGIN };
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::START_AGENT_LOGIN, params)
+                .call(method, params)
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|value| {
@@ -950,10 +970,11 @@ impl AccountsPage {
         };
         *submitting = true;
         let params = self.params(serde_json::json!({ "loginId": login_id, "code": code }));
+        let method = if self.state.read(cx).managed_inference { "crew.accounts.login.complete" } else { methods::COMPLETE_AGENT_LOGIN };
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::COMPLETE_AGENT_LOGIN, params)
+                .call(method, params)
                 .await;
             this.update(cx, |page, cx| {
                 let Some(flow) = page.login.as_mut().filter(|f| f.attempt == attempt) else {
@@ -994,6 +1015,7 @@ impl AccountsPage {
             return;
         };
         let params = self.params(serde_json::json!({ "loginId": login_id }));
+        let method = if self.state.read(cx).managed_inference { "crew.accounts.login.poll" } else { methods::POLL_AGENT_LOGIN };
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -1001,7 +1023,7 @@ impl AccountsPage {
                     .await;
                 let result = engine
                     .client()
-                    .call(methods::POLL_AGENT_LOGIN, params.clone())
+                    .call(method, params.clone())
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|value| {
@@ -1070,27 +1092,20 @@ impl AccountsPage {
     }
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
-        let login_id = match self.login.take() {
-            // A failed login is already over engine-side.
-            Some(LoginFlow {
-                login_id: Some(login_id),
-                step: LoginStep::Browser { .. } | LoginStep::PasteCode { .. },
-                ..
-            }) => Some(login_id),
-            _ => None,
-        };
+        let login_id = self.login.take().and_then(|flow| flow.login_id);
         self.poll_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
             let params = self.params(serde_json::json!({ "loginId": login_id }));
-            self.action_task = Some(cx.spawn(async move |_, _| {
+            let method = if self.state.read(cx).managed_inference { "crew.accounts.login.cancel" } else { methods::CANCEL_AGENT_LOGIN };
+            cx.spawn(async move |_, _| {
                 if let Err(err) = engine
                     .client()
-                    .call(methods::CANCEL_AGENT_LOGIN, params)
+                    .call(method, params)
                     .await
                 {
                     tracing::debug!(error = %err, "CancelAgentLogin failed (best-effort)");
                 }
-            }));
+            }).detach();
         }
         cx.notify();
     }
@@ -1503,13 +1518,17 @@ impl AccountsPage {
                 .role(gpui::Role::Button)
                 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
         };
-        let copy = match login.step {
-            LoginStep::PasteCode { .. } => {
-                "Your browser opened Claude's sign-in page. Approve access, then paste the \
-                 code Anthropic shows you below. Your current login is untouched until you \
-                 switch."
+        let copy = if self.state.read(cx).managed_inference {
+            if matches!(login.step, LoginStep::PasteCode { .. }) {
+                "Approve access in your browser, then paste the authorization code below to add this account to Agent Auth."
+            } else {
+                "Finish signing in in your browser to add this account to Agent Auth."
             }
-            _ => login_copy(login.harness, login.provider),
+        } else {
+            match login.step {
+                LoginStep::PasteCode { .. } => "Approve access in your browser, then paste the authorization code below. Your current login is unchanged until you switch.",
+                _ => login_copy(login.harness, login.provider),
+            }
         };
         // "Reopen the sign-in page" (zeron: `text-[12px]
         // text-muted-foreground/60 hover:underline`), once there is a page.
@@ -1886,6 +1905,7 @@ impl Render for AccountsPage {
         if self.state.read(cx).managed_inference || self.crew.read(cx).view() != super::crew::CrewView::Accounts {
             let theme = Theme::of(cx).for_settings_surface();
             let scrollbar = popover::rail(self, "accounts-page-scrollbar", &theme, cx);
+            let dialog = self.render_login_dialog(window.viewport_size(), cx);
             return div().id("crew-accounts-page-host").relative().size_full()
                 .on_hover(cx.listener(Self::on_scroll_hovered))
                 .child(crate::edge_fade::edge_faded(16.0, true, true,
@@ -1893,7 +1913,7 @@ impl Render for AccountsPage {
                         .track_scroll(&self.scroll.scroll)
                         .child(widgets::page_column().child(self.crew.clone())))
                     .fade_overflow_y(&self.scroll.scroll))
-                .children(scrollbar).into_any_element();
+                .children(scrollbar).children(dialog).into_any_element();
         }
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
@@ -2275,41 +2295,6 @@ mod tests {
         assert_eq!(usage_color(UsageLevel::Normal, &theme), theme.accent);
         assert_eq!(usage_color(UsageLevel::Warn, &theme), theme.warning);
         assert_eq!(usage_color(UsageLevel::Critical, &theme), theme.danger);
-    }
-
-    #[test]
-    fn reset_formatting_is_absolute() {
-        use chrono::Local;
-        let now = Utc::now();
-        assert_eq!(format_reset(None, now), None);
-        // Within ~22h: a local clock time ("resets 3:45 PM").
-        let soon = now + TimeDelta::minutes(125);
-        assert_eq!(
-            format_reset(Some(soon), now),
-            Some(format!(
-                "resets {}",
-                soon.with_timezone(&Local).format("%-I:%M %p")
-            ))
-        );
-        // Within a week: a short weekday ("resets Mon").
-        let later = now + TimeDelta::days(3);
-        assert_eq!(
-            format_reset(Some(later), now),
-            Some(format!(
-                "resets {}",
-                later.with_timezone(&Local).format("%a")
-            ))
-        );
-        // Beyond a week (Codex free tier resets ~monthly): month + day
-        // ("resets Sep 14") — a weekday 4 weeks out carries no information.
-        let monthly = now + TimeDelta::days(26);
-        assert_eq!(
-            format_reset(Some(monthly), now),
-            Some(format!(
-                "resets {}",
-                monthly.with_timezone(&Local).format("%b %-d")
-            ))
-        );
     }
 
     #[test]

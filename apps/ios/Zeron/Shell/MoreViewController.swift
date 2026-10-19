@@ -186,8 +186,6 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         s.appendItems([
             Row(id: "account", title: app.accountName, subtitle: app.accountDetail, symbol: "person.crop.circle", accessory: .none),
         ])
-        s.appendSections(["Devices"])
-        s.appendItems(app.hostOptions.map { Row(id: "device:\($0.id)", title: $0.name, subtitle: $0.online ? "Online" : "Offline", symbol: "desktopcomputer", accessory: .dot($0.online)) })
         if !app.isDemo {
             s.appendSections(["Crew"])
             s.appendItems([
@@ -197,6 +195,8 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
                 Row(id: "crew-link", title: "Open existing Crew link", subtitle: "Browse only; never creates or resumes execution", symbol: "link"),
             ])
         }
+        s.appendSections(["Devices"])
+        s.appendItems(app.hostOptions.map { Row(id: "device:\($0.id)", title: $0.name, subtitle: $0.online ? "Online" : "Offline", symbol: "desktopcomputer", accessory: .dot($0.online)) })
         if app.voice.available {
             s.appendSections(["Voice"])
             s.appendItems([Row(id: "voice", title: "Voice", subtitle: app.voice.selectedStyle.map { "Codex voice · \($0.capitalized)" } ?? "Codex voice device and style", symbol: "waveform")])

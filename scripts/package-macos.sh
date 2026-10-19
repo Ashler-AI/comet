@@ -40,9 +40,9 @@ cp "$ROOT/THIRD_PARTY_NOTICES.md" "$ROOT/LICENSE" "$APP/Contents/Resources/licen
 mkdir -p "$APP/Contents/Resources/licenses"
 cp "$ROOT/crates/voice/NOTICE.md" "$APP/Contents/Resources/licenses"/parakeet-v3.txt
 
-# Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
-# baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is
-# applied ahead of time; dist/zeron.png stays the full-bleed shared artwork).
+# Icon: black macOS tile and transparent platform safe area, without a frame
+# or shadow. Regenerate dist/macos/icon-1024.png with scripts/gen-brand-icons.py;
+# dist/zeron.png stays the opaque, full-bleed shared artwork.
 ICONSET="$OUT_DIR/zeron.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do

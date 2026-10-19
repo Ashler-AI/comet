@@ -92,6 +92,9 @@ mod provisioning_tests {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CrewView { Accounts, Sandboxes, Annotations }
 
+pub(crate) struct AddAccount(pub zeron_proto::HarnessId);
+impl gpui::EventEmitter<AddAccount> for CrewAccounts {}
+
 pub struct CrewAccounts {
     state: Entity<AppState>,
     view: CrewView,
@@ -112,6 +115,8 @@ pub struct CrewAccounts {
     account_select: widgets::SelectState,
     database: ScaffoldDatabaseEnvironment,
     database_select: widgets::SelectState,
+    sandbox_options: bool,
+    managed_sandbox: Option<String>,
     _observe: Subscription,
 }
 
@@ -133,13 +138,15 @@ impl CrewAccounts {
             account: None, account_select: widgets::SelectState::default(),
             database: ScaffoldDatabaseEnvironment::Local,
             database_select: widgets::SelectState::default(),
+            sandbox_options: false,
+            managed_sandbox: None,
             _observe: observe,
         };
         if page.state.read(cx).managed_inference { page.refresh(cx); }
         page
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.busy { return; }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine unavailable. Reconnect, then refresh.".into()); cx.notify(); return;
@@ -347,22 +354,22 @@ impl CrewAccounts {
 impl Render for CrewAccounts {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
-        let (title, subtitle) = match self.view {
-            CrewView::Accounts => ("Shared accounts", "Your authorized Agent Auth pool, shared across Crew hosts. Accounts are selected on the server; local CLI logins are never switched or used as a fallback."),
-            CrewView::Sandboxes => ("Scaffold sandboxes", "Create a new environment or use an existing sandbox. Opening history does not resume a sandbox. Stopping a sandbox is separate from stopping an agent turn."),
-            CrewView::Annotations => ("Shared annotations", "Notes and selections for the current session."),
+        let title = match self.view {
+            CrewView::Accounts => "Accounts",
+            CrewView::Sandboxes => "Sandboxes",
+            CrewView::Annotations => "Annotations",
         };
-        let mut body = div().flex().flex_col().gap(px(12.0))
-            .child(widgets::page_header(&theme, title, None))
-            .child(widgets::page_subtitle(&theme, subtitle));
+        let mut body = div().flex().flex_col().gap(px(16.0))
+            .child(div().flex().items_center().justify_between().gap(px(12.0))
+                .child(widgets::page_header(&theme, title, (self.view == CrewView::Accounts).then_some(self.accounts.len())))
+                .when(self.view != CrewView::Annotations, |el| el.child(Self::action(&theme, "crew-refresh", if self.busy { "Refreshing…" } else { "Refresh" })
+                    .on_click(cx.listener(|page, _, _, cx| page.refresh(cx))))));
         if !matches!(self.state.read(cx).auth, Some(zeron_proto::AuthState::SignedIn { .. })) {
-            return body.child(widgets::page_subtitle(&theme, "Sign in to Crew using the account menu. Signing out does not enable local-provider fallback.")).into_any_element();
+            return body.child(widgets::page_subtitle(&theme, "Sign in using the account menu to continue.")).into_any_element();
         }
         if self.view == CrewView::Annotations {
             return body.child(self.annotations.clone()).into_any_element();
         }
-        body = body.child(Self::action(&theme, "crew-refresh", if self.busy { "Working…" } else { "Refresh" })
-            .on_click(cx.listener(|page, _, _, cx| page.refresh(cx))));
         if let Some(error) = &self.error { body = body.child(widgets::error_strip(&theme, error.clone())); }
         if let Some(notice) = &self.notice { body = body.child(widgets::page_subtitle(&theme, notice.clone())); }
         if let Some((_, _, description)) = &self.confirmation {
@@ -387,39 +394,41 @@ impl Render for CrewAccounts {
         }
         let Some(status) = self.status.clone() else { return body.into_any_element(); };
         if self.view == CrewView::Accounts {
+            let now = chrono::Utc::now();
             for (provider, title, harness) in [("anthropic", "Anthropic", zeron_proto::HarnessId::ClaudeCode), ("openai", "OpenAI", zeron_proto::HarnessId::Codex)] {
-                let accounts: Vec<_> = self.accounts.iter().filter(|account| account.provider.eq_ignore_ascii_case(provider)).cloned().collect();
-                let mut card = widgets::section_card(&theme).p(px(16.0)).flex().flex_col().gap(px(12.0))
+                let mut accounts = self.accounts.iter().filter(|account| account.provider.eq_ignore_ascii_case(provider)).peekable();
+                let header = div().flex().items_center().justify_between().gap(px(12.0))
                     .child(div().flex().items_center().gap(px(8.0))
-                        .child(crate::icons::icon(if harness == zeron_proto::HarnessId::Codex { crate::icons::OPENAI_MARK } else { crate::icons::CLAUDE_MARK }).size(px(22.0)).text_color(theme.text_muted))
-                        .child(widgets::row_title(&theme, title))
-                        .child(widgets::badge(&theme, format!("{} shared", accounts.len()))));
-                if accounts.is_empty() {
-                    card = card.child(widgets::page_subtitle(&theme, format!("No authorized {title} accounts are available. Refresh after access is updated in Crew Staging → Accounts.")));
+                        .child(crate::icons::icon(if harness == zeron_proto::HarnessId::Codex { crate::icons::OPENAI_MARK } else { crate::icons::CLAUDE_MARK }).size(px(20.0)).text_color(theme.text_muted))
+                        .child(widgets::row_title(&theme, title)))
+                    .when(status.role == "local_controller", |el| el.child(Self::action(&theme, format!("crew-add-{provider}"), "Add account")
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddAccount(harness))))));
+                let mut card = widgets::section_card(&theme).flex().flex_col();
+                if accounts.peek().is_none() {
+                    card = card.child(div().p(px(16.0)).child(widgets::page_subtitle(&theme, "No accounts yet.")));
                 }
                 for account in accounts {
                     let label = account.email.clone().or(account.display_name.clone()).unwrap_or_else(|| "Shared account".into());
-                    let health = match account.status.as_str() {
-                        "connected" | "active" | "ready" => "Connected",
-                        "disabled" => "Disabled", "revoked" => "Revoked", _ => "Needs attention",
-                    };
-                    let row = div().flex().items_start().gap(px(12.0)).py(px(10.0)).border_t_1().border_color(theme.border)
+                    let healthy = matches!(account.status.as_str(), "connected" | "active" | "ready");
+                    let row = div().flex().items_center().gap(px(12.0)).p(px(16.0)).border_b_1().border_color(theme.border)
                         .child(div().flex_none().size(px(32.0)).rounded_full().bg(theme.wash(0.09)).flex().items_center().justify_center()
                             .child(label.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into())))
-                        .child(div().flex_1().min_w_0().flex().flex_col().gap(px(4.0))
-                            .child(div().truncate().child(widgets::row_title(&theme, label.clone())))
-                            .child(widgets::page_subtitle(&theme, health))
-                            .when_some(account.plan_label.clone(), |row, plan| row.child(widgets::badge(&theme, plan)))
-                            .child(div().id(SharedString::from(format!("crew-usage-{}", account.id)))
-                                .tooltip(widgets::text_tooltip(super::accounts::usage_resets(&account.usage_windows, chrono::Utc::now())))
-                                .flex().flex_col().gap(px(4.0))
-                                .children(account.usage_windows.iter().map(|usage| super::accounts::render_usage_meter(usage, &theme)))
+                        .child(div().flex_1().min_w_0().flex().flex_col().gap(px(8.0))
+                            .child(div().flex().items_center().justify_between().gap(px(12.0))
+                                .child(div().min_w_0().truncate().child(widgets::row_title(&theme, label)))
+                                .when_some(account.plan_label.clone(), |row, plan| row.child(widgets::badge(&theme, plan))))
+                            .when(!healthy, |el| el.child(widgets::page_subtitle(&theme, match account.status.as_str() { "disabled" => "Disabled", "revoked" => "Revoked", _ => "Needs attention" })))
+                            .child(div().flex().flex_col().gap(px(5.0))
+                                .children(account.usage_windows.iter().map(|usage| {
+                                    div().flex().items_center().flex_wrap().gap(px(8.0))
+                                        .child(super::accounts::render_usage_meter_width(usage, &theme, 230.0))
+                                        .when_some(super::accounts::format_reset(usage.resets_at, now), |el, reset| el.child(widgets::page_subtitle(&theme, reset)))
+                                }))
                                 .when(account.usage_windows.is_empty(), |el| el.child(widgets::page_subtitle(&theme, "Usage unavailable")))));
                     card = card.child(row);
                 }
-                body = body.child(card);
+                body = body.child(div().flex().flex_col().gap(px(10.0)).child(header).child(card));
             }
-            body = body.child(widgets::page_subtitle(&theme, "Account management stays in Crew Staging → Accounts. This canary uses the existing shared pool without importing, connecting, or revoking accounts."));
             return body.into_any_element();
         }
         if let Some(outcome) = &self.outcome {
@@ -427,7 +436,7 @@ impl Render for CrewAccounts {
                 .child(div().id("crew-command-details").tooltip(widgets::text_tooltip(format!("Command {}", outcome.command_id)))
                     .child(widgets::row_title(&theme, format!("Last operation: {}", outcome.status))))
                 .child(widgets::page_subtitle(&theme, outcome.error.clone().unwrap_or_else(|| "State is the authoritative inspected result, not HTTP acceptance.".into())))
-                .child(Self::action(&theme, "crew-reconcile", "Check operation outcome (never replay)").on_click(cx.listener(|page, _, _, cx| {
+                .child(Self::action(&theme, "crew-reconcile", "Check status").on_click(cx.listener(|page, _, _, cx| {
                     if let Some(outcome) = &page.outcome {
                         let id = outcome.command_id.clone();
                         page.request("scaffold.reconcile", json!({"commandId": id}), cx);
@@ -435,21 +444,28 @@ impl Render for CrewAccounts {
                 }))));
         }
         if status.role == "local_controller" {
-            body = body.child(widgets::row_title(&theme, "New sandbox"))
-                .child(widgets::page_subtitle(&theme, "Source and region use deployment defaults. Choose a managed model and shared account."));
+            body = body.child(widgets::row_title(&theme, "New sandbox"));
             let model = self.model_picker.clone();
-            let provider = self.agent_route().map(|route| route.provider);
-            let candidates: Vec<_> = self.accounts.iter().filter(|account| matches!(account.status.as_str(), "active" | "connected" | "ready") && match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), None => false }).collect();
-            let selected = candidates.iter().position(|account| Some(&account.id) == self.account.as_ref()).map_or(0, |ix| ix + 1);
-            let ids: Vec<_> = candidates.iter().map(|account| account.id.clone()).collect();
-            let options = std::iter::once(widgets::SelectOption::new("Automatic · shared pool")).chain(candidates.iter().map(|account| widgets::SelectOption::new(account.email.clone().or(account.display_name.clone()).unwrap_or_else(|| "Shared account".into())))).collect::<Vec<_>>();
-            let account = widgets::select("crew-account", "Shared account", &theme, |page: &mut Self| &mut page.account_select)
-                .options(options, selected).on_select(move |page, ix, _, cx| { page.account = ix.checked_sub(1).and_then(|ix| ids.get(ix).cloned()); cx.notify(); }).render(&self.account_select, cx);
-            let database = widgets::select("crew-database", "Database environment", &theme, |page: &mut Self| &mut page.database_select)
-                .options(["Local", "Staging snapshot", "Production snapshot"].into_iter().map(widgets::SelectOption::new), match self.database { ScaffoldDatabaseEnvironment::Local => 0, ScaffoldDatabaseEnvironment::StagingSnapshot => 1, ScaffoldDatabaseEnvironment::ProductionSnapshot => 2 })
-                .on_select(|page, ix, _, cx| { page.database = match ix { 1 => ScaffoldDatabaseEnvironment::StagingSnapshot, 2 => ScaffoldDatabaseEnvironment::ProductionSnapshot, _ => ScaffoldDatabaseEnvironment::Local }; cx.notify(); }).render(&self.database_select, cx);
-            body = body.child(model).child(account).child(database)
-                .child(Self::action(&theme, "crew-create", "Create new sandbox…").on_click(cx.listener(|page, _, _, cx| page.create(cx))));
+            body = body.child(widgets::section_card(&theme).p(px(16.0)).flex().flex_col().gap(px(12.0))
+                .child(model)
+                .child(div().flex().items_center().justify_between().gap(px(12.0))
+                    .child(Self::action(&theme, "crew-create", "Create sandbox…").on_click(cx.listener(|page, _, _, cx| page.create(cx))))
+                    .child(Self::action(&theme, "crew-sandbox-options", if self.sandbox_options { "Hide options" } else { "Account & database…" })
+                        .aria_description("Choose a shared account or database snapshot")
+                        .on_click(cx.listener(|page, _, _, cx| { page.sandbox_options = !page.sandbox_options; cx.notify(); }))))
+                .when(self.sandbox_options, |el| {
+                    let provider = self.agent_route().map(|route| route.provider);
+                    let candidates: Vec<_> = self.accounts.iter().filter(|account| matches!(account.status.as_str(), "active" | "connected" | "ready") && match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), None => false }).collect();
+                    let selected = candidates.iter().position(|account| Some(&account.id) == self.account.as_ref()).map_or(0, |ix| ix + 1);
+                    let ids: Vec<_> = candidates.iter().map(|account| account.id.clone()).collect();
+                    let options = std::iter::once(widgets::SelectOption::new("Automatic · shared pool")).chain(candidates.iter().map(|account| widgets::SelectOption::new(account.email.clone().or(account.display_name.clone()).unwrap_or_else(|| "Shared account".into())))).collect::<Vec<_>>();
+                    let account = widgets::select("crew-account", "Shared account", &theme, |page: &mut Self| &mut page.account_select)
+                        .options(options, selected).on_select(move |page, ix, _, cx| { page.account = ix.checked_sub(1).and_then(|ix| ids.get(ix).cloned()); cx.notify(); }).render(&self.account_select, cx);
+                    let database = widgets::select("crew-database", "Database environment", &theme, |page: &mut Self| &mut page.database_select)
+                        .options(["Local", "Staging snapshot", "Production snapshot"].into_iter().map(widgets::SelectOption::new), match self.database { ScaffoldDatabaseEnvironment::Local => 0, ScaffoldDatabaseEnvironment::StagingSnapshot => 1, ScaffoldDatabaseEnvironment::ProductionSnapshot => 2 })
+                        .on_select(|page, ix, _, cx| { page.database = match ix { 1 => ScaffoldDatabaseEnvironment::StagingSnapshot, 2 => ScaffoldDatabaseEnvironment::ProductionSnapshot, _ => ScaffoldDatabaseEnvironment::Local }; cx.notify(); }).render(&self.database_select, cx);
+                    el.child(account).child(database)
+                }));
         } else { body = body.child(widgets::page_subtitle(&theme, "Browse-only on this host. Open Sandboxes on your Crew controller to create or manage environments.")); }
         body = body.child(widgets::row_title(&theme, "Use an existing sandbox"));
         if self.environments.is_empty() { body = body.child(widgets::page_subtitle(&theme, "No sandboxes yet. Create one above to run Crew in Scaffold, or refresh to find an existing environment.")); }
@@ -463,16 +479,22 @@ impl Render for CrewAccounts {
                     .child(widgets::row_title(&theme, name.clone())))
                 .child(widgets::page_subtitle(&theme, format!("{} · {}", lifecycle_label(*lifecycle), environment.source_ref.as_deref().unwrap_or("Source unavailable"))));
             if let Some(link) = crate::links::crew_scope_link(&environment.scope) {
-                row = row.child(Self::action(&theme, format!("crew-open-{sandbox_id}"), "Browse history (no resume)")
+                row = row.child(Self::action(&theme, format!("crew-open-{sandbox_id}"), "Open history")
                     .on_click(cx.listener(move |page, _, _, cx| page.state.update(cx, |state, cx| state.open_deep_link(&link, cx)))));
             }
             let mut controls = div().flex().flex_wrap().gap(px(8.0));
-            for operation in ["Inspect", "Use sandbox…", "Pause…", "Resume…", "Stop sandbox…", "Apply model/account…"] {
+            let expanded = self.managed_sandbox.as_ref() == Some(sandbox_id);
+            let mut has_maintenance = false;
+            for operation in ["Use sandbox…", "Resume…", "Pause…", "Apply model/account…", "Inspect", "Stop sandbox…"] {
                 if status.role != "local_controller" && operation != "Inspect" { continue; }
                 if stopped && operation != "Inspect" { continue; }
                 if *lifecycle == zeron_proto::ScaffoldLifecycle::Failed && !matches!(operation, "Inspect" | "Stop sandbox…") { continue; }
                 if operation == "Pause…" && *lifecycle == zeron_proto::ScaffoldLifecycle::Paused { continue; }
                 if operation == "Resume…" && *lifecycle != zeron_proto::ScaffoldLifecycle::Paused { continue; }
+                if operation != "Use sandbox…" && !(operation == "Inspect" && *lifecycle == zeron_proto::ScaffoldLifecycle::Failed) {
+                    has_maintenance = true;
+                    if !expanded { continue; }
+                }
                 let sandbox = sandbox_id.clone(); let scope = environment.scope.clone(); let label = name.clone();
                 controls = controls.child(Self::action(&theme, format!("crew-{operation}-{sandbox}"), operation).on_click(cx.listener(move |page, _, _, cx| {
                     let control = match operation {
@@ -494,6 +516,15 @@ impl Render for CrewAccounts {
                         page.confirmation = Some(("scaffold.control", json!({"commandId": uuid::Uuid::new_v4().to_string(), "control": control}), format!("{operation} {label}\n{warning}"))); cx.notify();
                     }
                 })));
+            }
+            if has_maintenance {
+                let sandbox = sandbox_id.clone();
+                controls = controls.child(Self::action(&theme, format!("crew-manage-{sandbox_id}"), if expanded { "Less" } else { "More…" })
+                    .aria_description(if expanded { "Hide sandbox maintenance actions" } else { "Show sandbox maintenance actions" })
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.managed_sandbox = if page.managed_sandbox.as_ref() == Some(&sandbox) { None } else { Some(sandbox.clone()) };
+                        cx.notify();
+                    })));
             }
             body = body.child(row.child(controls));
         }

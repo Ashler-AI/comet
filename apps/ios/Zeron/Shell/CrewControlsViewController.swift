@@ -6,10 +6,12 @@ final class CrewControlsViewController: UIViewController {
     private let stack = UIStackView()
     private let status = UILabel()
     private let hostButton = UIButton(type: .system)
+    private let sandboxButton = UIButton(type: .system)
+    private let modelButton = UIButton(type: .system)
+    private let advancedButton = UIButton(type: .system)
+    private let advanced = UIStackView()
     private let session = UITextField()
     private let sandbox = UITextField()
-    private let sourceRef = UITextField()
-    private let region = UITextField()
     private let model = UITextField()
     private let account = UITextField()
     private let database = UISegmentedControl(items: ["Local DB", "Staging snapshot"])
@@ -58,34 +60,80 @@ final class CrewControlsViewController: UIViewController {
             stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -20),
             stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -40),
         ])
-        let explanation = UILabel()
-        explanation.numberOfLines = 0
-        explanation.text = "Project: \(app.client?.orgId() ?? "")\nDeployment: \(Endpoints.deploymentId ?? "not configured")\nOpening history does not resume a sandbox. Attach explicitly resumes a paused sandbox; Stop is terminal. Stop a single agent turn from its composer instead."
-        stack.addArrangedSubview(explanation)
         hostButton.setTitle("Choose desktop controller", for: .normal)
+        hostButton.accessibilityIdentifier = "crew-control-host"
         hostButton.addAction(UIAction { [weak self] _ in self?.chooseHost() }, for: .touchUpInside)
         stack.addArrangedSubview(hostButton)
-        addButton("List sandboxes") { [weak self] in self?.listSandboxes() }
-        for (field, label) in [(session, "Session UUID"), (sandbox, "Sandbox ID"), (sourceRef, "Source ref (required for create)"), (region, "Region (required for create)"), (model, "Provider/model (openai-codex/… or anthropic/…)"), (account, "Optional opaque Agent Auth account ID")] {
+        status.numberOfLines = 0
+        status.accessibilityIdentifier = "crew-control-status"
+        stack.addArrangedSubview(status)
+        addButton("Reconcile retained command") { [weak self] in self?.chooseCommand() }
+        addHeading("Existing sandbox")
+        sandboxButton.setTitle("Choose sandbox", for: .normal)
+        sandboxButton.titleLabel?.numberOfLines = 0
+        sandboxButton.accessibilityIdentifier = "crew-control-sandbox"
+        sandboxButton.addAction(UIAction { [weak self] _ in self?.listSandboxes() }, for: .touchUpInside)
+        stack.addArrangedSubview(sandboxButton)
+        addButton("Open history") { [weak self] in self?.browse() }
+        addButton("Use sandbox") { [weak self] in self?.confirm("attach") }
+        let manageButton = UIButton(type: .system)
+        manageButton.setTitle("Manage sandbox", for: .normal)
+        manageButton.showsMenuAsPrimaryAction = true
+        manageButton.menu = UIMenu(children: [("inspect", "Inspect"), ("pause", "Pause"), ("resume", "Resume"), ("stop", "Stop")].map { operation, title in
+            UIAction(title: title, attributes: operation == "stop" ? .destructive : []) { [weak self] _ in
+                self?.confirm(operation)
+            }
+        })
+        stack.addArrangedSubview(manageButton)
+
+        addHeading("Create sandbox")
+        modelButton.setTitle("Choose model", for: .normal)
+        modelButton.showsMenuAsPrimaryAction = true
+        modelButton.menu = modelMenu()
+        modelButton.accessibilityIdentifier = "crew-control-model"
+        stack.addArrangedSubview(modelButton)
+        for (field, label) in [(model, "Provider/model override"), (session, "Existing session UUID"), (sandbox, "Existing sandbox ID"), (account, "Optional opaque Agent Auth account ID")] {
             field.placeholder = label
             field.accessibilityLabel = label
             field.borderStyle = .roundedRect
             field.autocapitalizationType = .none
             field.autocorrectionType = .no
-            stack.addArrangedSubview(field)
+            advanced.addArrangedSubview(field)
         }
-        session.text = UUID().uuidString.lowercased()
+        sandbox.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.sandboxButton.setTitle(self.sandbox.text?.nonEmpty.map { "Selected sandbox: \($0)" } ?? "Choose sandbox", for: .normal)
+        }, for: .editingChanged)
+        model.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.modelButton.setTitle(self.model.text?.nonEmpty ?? "Choose model", for: .normal)
+        }, for: .editingChanged)
         database.selectedSegmentIndex = 0
         database.accessibilityLabel = "Database environment"
         stack.addArrangedSubview(database)
-        for (operation, title) in [("create", "Create sandbox"), ("inspect", "Inspect"), ("attach", "Attach / resume same sandbox"), ("pause", "Pause sandbox"), ("resume", "Resume same sandbox"), ("stop", "Stop sandbox")] {
-            addButton(title) { [weak self] in self?.confirm(operation) }
-        }
-        addButton("Reconcile retained command") { [weak self] in self?.chooseCommand() }
-        addButton("Browse this session") { [weak self] in self?.browse() }
-        status.numberOfLines = 0
-        status.accessibilityIdentifier = "crew-control-status"
-        stack.addArrangedSubview(status)
+        addButton("Create sandbox") { [weak self] in self?.confirm("create") }
+
+        advanced.axis = .vertical
+        advanced.spacing = 12
+        advanced.isHidden = true
+        advancedButton.setTitle("Advanced options", for: .normal)
+        advancedButton.setImage(UIImage(systemName: "chevron.right"), for: .normal)
+        advancedButton.accessibilityValue = "Collapsed"
+        advancedButton.accessibilityIdentifier = "crew-control-advanced"
+        advancedButton.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.advanced.isHidden.toggle()
+            self.advancedButton.setImage(UIImage(systemName: self.advanced.isHidden ? "chevron.right" : "chevron.down"), for: .normal)
+            self.advancedButton.accessibilityValue = self.advanced.isHidden ? "Collapsed" : "Expanded"
+        }, for: .touchUpInside)
+        stack.addArrangedSubview(advancedButton)
+        stack.addArrangedSubview(advanced)
+        let explanation = UILabel()
+        explanation.numberOfLines = 0
+        explanation.font = .preferredFont(forTextStyle: .footnote)
+        explanation.adjustsFontForContentSizeCategory = true
+        explanation.text = "Project: \(app.client?.orgId() ?? "")\nDeployment: \(Endpoints.deploymentId ?? "not configured")\nOpen history does not resume a sandbox. Use sandbox attaches to or resumes the same sandbox; Stop is terminal. Stop a single agent turn from its composer instead. Source and region use deployment defaults. Inference always uses host Agent Auth."
+        stack.addArrangedSubview(explanation)
         do {
             if FileManager.default.fileExists(atPath: storageURL.path) {
                 records = try JSONDecoder().decode([Command].self, from: Data(contentsOf: storageURL))
@@ -95,6 +143,15 @@ final class CrewControlsViewController: UIViewController {
             status.text = "Retained commands could not be read. Original journal preserved; controls blocked until recovery. \(error.localizedDescription)"
         }
         if let last = records.last { status.text = "Retained command \(last.id): \(last.status). Reconcile before repeating an unknown operation." }
+    }
+
+    private func addHeading(_ title: String) {
+        let label = UILabel()
+        label.text = title
+        label.font = .preferredFont(forTextStyle: .headline)
+        label.adjustsFontForContentSizeCategory = true
+        label.accessibilityTraits.insert(.header)
+        stack.addArrangedSubview(label)
     }
 
     private func addButton(_ title: String, action: @escaping () -> Void) {
@@ -113,11 +170,42 @@ final class CrewControlsViewController: UIViewController {
         let menu = sheet("Desktop controller", message: "A sandbox or phone cannot authorize these operations.")
         for host in app.hostOptions where host.online {
             menu.addAction(UIAlertAction(title: host.name, style: .default) { [weak self] _ in
-                self?.hostId = host.id
-                self?.hostButton.setTitle(host.name, for: .normal)
+                guard let self else { return }
+                if self.hostId != host.id {
+                    self.model.text = nil
+                    self.modelButton.setTitle("Choose model", for: .normal)
+                    self.session.text = nil
+                    self.sandbox.text = nil
+                    self.sandboxButton.setTitle("Choose sandbox", for: .normal)
+                }
+                self.hostId = host.id
+                self.hostButton.setTitle(host.name, for: .normal)
             })
         }
         present(menu, animated: true)
+    }
+    private func modelMenu() -> UIMenu {
+        UIMenu(title: "Model", children: [UIDeferredMenuElement.uncached { [weak self] done in
+            guard let self, let hostId = self.hostId, let client = self.app.client else {
+                return done([UIAction(title: "Choose a desktop controller first", attributes: .disabled) { _ in }])
+            }
+            Task { @MainActor in
+                let models = await client.listModels(deviceId: hostId, harness: "omp").filter {
+                    let parts = $0.id.split(separator: "/", maxSplits: 1)
+                    return parts.count == 2 && ["openai", "openai-codex", "anthropic"].contains(String(parts[0])) && !parts[1].isEmpty
+                }
+                guard self.hostId == hostId else { return done([]) }
+                if models.isEmpty {
+                    return done([UIAction(title: "No models available; refresh or use Advanced options", attributes: .disabled) { _ in }])
+                }
+                done(models.map { model in
+                    UIAction(title: model.label, subtitle: model.id, state: model.id == self.model.text ? .on : .off) { [weak self] _ in
+                        self?.model.text = model.id
+                        self?.modelButton.setTitle(model.label, for: .normal)
+                    }
+                })
+            }
+        }])
     }
     private func listSandboxes() {
         guard !busy, let hostId, let client = app.client, let deployment = Endpoints.deploymentId else { status.text = "Select an online desktop controller."; return }
@@ -134,8 +222,10 @@ final class CrewControlsViewController: UIViewController {
                           environment["ownerPrincipal"] as? String == client.userId(),
                           let source = environment["source"] as? [String: Any], let id = source["sandbox_id"] as? String,
                           let sessionId = scope["sessionId"] as? String else { continue }
-                    menu.addAction(UIAlertAction(title: "\(environment["name"] as? String ?? id) · \(source["lifecycle"] as? String ?? "unknown")", style: .default) { [weak self] _ in
+                    let label = "\(environment["name"] as? String ?? id) · \(source["lifecycle"] as? String ?? "unknown")"
+                    menu.addAction(UIAlertAction(title: label, style: .default) { [weak self] _ in
                         self?.sandbox.text = id; self?.session.text = sessionId
+                        self?.sandboxButton.setTitle("Selected: \(label)", for: .normal)
                     })
                 }
                 status.text = nil
@@ -143,22 +233,28 @@ final class CrewControlsViewController: UIViewController {
             } catch { status.text = error.localizedDescription }
         }
     }
-    private func control(_ operation: String) throws -> String {
-        guard let client = app.client, let deployment = Endpoints.deploymentId,
-              let id = session.text, UUID(uuidString: id) != nil else { throw CoreError.InvalidArgument(message: "A valid session UUID and configured deployment are required.") }
-        var control: [String: Any] = ["operation": operation, "scope": ["projectId": client.orgId(), "deploymentId": deployment, "sessionId": id.lowercased()]]
+    static func sessionID(for operation: String, selected: String?) throws -> String {
+        if operation == "create" { return UUID().uuidString.lowercased() }
+        guard let selected, UUID(uuidString: selected) != nil else {
+            throw CoreError.InvalidArgument(message: "Choose an existing sandbox with a valid session UUID.")
+        }
+        return selected.lowercased()
+    }
+
+    private func control(_ operation: String, sessionId: String) throws -> String {
+        guard let client = app.client, let deployment = Endpoints.deploymentId else {
+            throw CoreError.InvalidArgument(message: "A configured deployment is required.")
+        }
+        var control: [String: Any] = ["operation": operation, "scope": ["projectId": client.orgId(), "deploymentId": deployment, "sessionId": sessionId]]
         if operation == "create" {
             let selected = model.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let parts = selected.split(separator: "/", maxSplits: 1).map(String.init)
-            guard parts.count == 2, ["openai", "openai-codex", "anthropic"].contains(parts[0]), !parts[1].isEmpty,
-                  let source = sourceRef.text?.nonEmpty, let region = region.text?.nonEmpty else {
-                throw CoreError.InvalidArgument(message: "Choose a provider-qualified model, source ref, and region. Inference always uses host Agent Auth.")
+            guard parts.count == 2, ["openai", "openai-codex", "anthropic"].contains(parts[0]), !parts[1].isEmpty else {
+                throw CoreError.InvalidArgument(message: "Choose a provider-qualified model (openai-codex/… or anthropic/…). Inference always uses host Agent Auth.")
             }
             var route: [String: Any] = ["provider": parts[0] == "anthropic" ? "anthropic" : "openai", "model": parts[1], "fallback": "disabled", "routingMode": "automatic"]
             if let accountId = account.text?.nonEmpty { route["accountId"] = accountId; route["routingMode"] = "pinned" }
             control["agentRoute"] = route
-            control["source_ref"] = source
-            control["region"] = region
             control["database_environment"] = database.selectedSegmentIndex == 0 ? "local" : "staging_snapshot"
         } else {
             guard let id = sandbox.text?.nonEmpty else { throw CoreError.InvalidArgument(message: "Choose an existing sandbox.") }
@@ -169,8 +265,11 @@ final class CrewControlsViewController: UIViewController {
     private func confirm(_ operation: String) {
         guard !busy, let hostId, let client = app.client, let deployment = Endpoints.deploymentId else { status.text = "Select an online desktop controller."; return }
         do {
-            let control = try control(operation)
-            let menu = sheet("\(operation.capitalized) this sandbox?", message: "Controller: \(hostButton.title(for: .normal) ?? hostId)\nSession: \(session.text ?? "")\nSandbox: \(sandbox.text ?? "new")\nDeployment: \(deployment)" + (operation == "create" ? "\nSource: \(sourceRef.text ?? "")\nRegion: \(region.text ?? "")\nModel: \(model.text ?? "")\nDB: \(database.titleForSegment(at: database.selectedSegmentIndex) ?? "")" : ""))
+            // Create allocates a distinct identity once per confirmation. The exact
+            // payload is then journaled and reconciliation never regenerates it.
+            let sessionId = try Self.sessionID(for: operation, selected: session.text)
+            let control = try control(operation, sessionId: sessionId)
+            let menu = sheet("\(operation.capitalized) this sandbox?", message: "Controller: \(hostButton.title(for: .normal) ?? hostId)\nSession: \(sessionId)\nSandbox: \(operation == "create" ? "new" : sandbox.text ?? "")\nDeployment: \(deployment)" + (operation == "create" ? "\nSource: Deployment default\nRegion: Deployment default\nModel: \(model.text ?? "")\nDB: \(database.titleForSegment(at: database.selectedSegmentIndex) ?? "")\nAccount: \(account.text?.nonEmpty ?? "Automatic host selection")" : ""))
             menu.addAction(UIAlertAction(title: operation.capitalized, style: operation == "stop" ? .destructive : .default) { [weak self] _ in
                 guard let self else { return }
                 let command = Command(id: UUID().uuidString.lowercased(), deviceId: hostId, controlJSON: control, status: "pending", result: nil)
@@ -218,6 +317,8 @@ final class CrewControlsViewController: UIViewController {
                 status.text = "\(records[index].status.capitalized): \(command.id)\n\(value["error"] as? String ?? "")"
                 if let result = value["result"] as? [String: Any], let env = result["environment"] as? [String: Any], let source = env["source"] as? [String: Any] {
                     sandbox.text = source["sandbox_id"] as? String ?? sandbox.text
+                    session.text = (env["scope"] as? [String: Any])?["sessionId"] as? String
+                    sandboxButton.setTitle("Selected: \(env["name"] as? String ?? sandbox.text ?? "Sandbox") · \(source["lifecycle"] as? String ?? "unknown")", for: .normal)
                     status.text = (status.text ?? "") + "\nObserved lifecycle: \(source["lifecycle"] as? String ?? "unknown")"
                 }
             } catch {

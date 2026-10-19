@@ -126,7 +126,7 @@ impl CrewServices {
         Ok((principal, scope))
     }
 
-    fn controller(&self) -> Result<(String, CollaborationScope), RpcError> {
+    pub(crate) fn controller(&self) -> Result<(String, CollaborationScope), RpcError> {
         let identity = self.identity()?;
         if self.auth.device_mode() { return Err(denied("Sandbox hosts cannot control other environments or shared accounts")); }
         Ok(identity)

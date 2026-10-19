@@ -175,8 +175,8 @@ fn classify_transport_error(error: &reqwest::Error) -> ScaffoldTransportCause {
 pub enum ScaffoldError {
     #[error("scaffold_auth_unavailable")]
     AuthUnavailable,
-    #[error("scaffold_auth_temporarily_unavailable")]
-    AuthTemporarilyUnavailable,
+    #[error("scaffold_auth_temporarily_unavailable: {0}")]
+    AuthTemporarilyUnavailable(String),
     #[error("scaffold_request_cancelled")]
     Cancelled,
     #[error("scaffold_request_failed: {cause}")]
@@ -275,7 +275,7 @@ async fn control_bearer(source: &dyn TokenSource) -> Result<String, ScaffoldErro
     match source.token().await {
         Ok(token) if !token.trim().is_empty() => Ok(token),
         Ok(_) | Err(zeron_rpc::TokenError::SignedOut) => Err(ScaffoldError::AuthUnavailable),
-        Err(zeron_rpc::TokenError::TemporarilyUnavailable(_)) => Err(ScaffoldError::AuthTemporarilyUnavailable),
+        Err(zeron_rpc::TokenError::TemporarilyUnavailable(reason)) => Err(ScaffoldError::AuthTemporarilyUnavailable(reason)),
     }
 }
 

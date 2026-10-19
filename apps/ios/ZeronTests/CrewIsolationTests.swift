@@ -2,6 +2,18 @@ import XCTest
 @testable import Zeron
 
 final class CrewIsolationTests: XCTestCase {
+    @MainActor
+    func testCreatingSandboxNeverReusesSelectedSessionIdentity() throws {
+        let selected = UUID().uuidString.lowercased()
+        let created = try CrewControlsViewController.sessionID(for: "create", selected: selected)
+        XCTAssertNotEqual(created, selected)
+        XCTAssertNotNil(UUID(uuidString: created))
+        XCTAssertNotEqual(created, try CrewControlsViewController.sessionID(for: "create", selected: selected))
+        XCTAssertEqual(try CrewControlsViewController.sessionID(for: "attach", selected: selected), selected)
+        XCTAssertThrowsError(try CrewControlsViewController.sessionID(for: "attach", selected: nil))
+        XCTAssertThrowsError(try CrewControlsViewController.sessionID(for: "inspect", selected: "invalid"))
+    }
+
     func testCoreErrorPreservesItsMessageThroughFoundation() {
         let message = "Access denied · \(UUID().uuidString)\nUse the authenticated project."
         let error: Error = CoreError.Auth(message: message)

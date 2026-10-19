@@ -3758,14 +3758,7 @@ impl Pickers {
             .flex_row()
             .flex_wrap()
             .items_center()
-            .gap(px(4.0))
-            .when(self.config.scaffold_database.is_none(), |el| el.child(attach_overlay_end(
-                project_chip,
-                &mut overlay,
-                PickerKind::Space,
-                "project-popover",
-                closing,
-            )))
+            .gap(px(8.0))
             .child(attach_overlay_end(
                 device_chip,
                 &mut overlay,
@@ -3773,6 +3766,13 @@ impl Pickers {
                 "device-popover",
                 closing,
             ))
+            .when(self.config.scaffold_database.is_none(), |el| el.child(attach_overlay_end(
+                project_chip,
+                &mut overlay,
+                PickerKind::Space,
+                "project-popover",
+                closing,
+            )))
             .into_any_element()
     }
 

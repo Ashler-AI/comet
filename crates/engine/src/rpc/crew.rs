@@ -18,10 +18,25 @@ pub(super) fn handles(method: &str) -> bool {
 
 pub(super) fn forwardable(method: &str) -> bool {
     handles(method) && !matches!(method, "crew.accounts.importLocal" | "ScaffoldHostAuthority")
+        && !method.starts_with("crew.accounts.login.")
 }
 
 fn failed(error: impl std::fmt::Display) -> RpcError { RpcError::Failed(error.to_string()) }
 fn denied(message: &str) -> RpcError { RpcError::Failed(message.into()) }
+
+// Match Edge's scopedRpcAllowed contract before touching the shared device link.
+// A rejected device-wide watch otherwise tears down unrelated session streams.
+fn scaffold_host_rpc_allowed(method: &str, params: &Value, session_id: &str) -> bool {
+    if params.get("chatId").and_then(Value::as_str) != Some(session_id) { return false; }
+    match method {
+        methods::WATCH_DOC_MESSAGES | methods::WATCH_QUEUE | methods::FOCUS_CHAT
+        | methods::UPLOAD_CHUNK | methods::UPLOAD_COMMIT
+        | "ListCrewAnnotations" | "ApplyCrewAnnotation" => true,
+        methods::QUEUE_COMMAND => matches!(params.get("command").and_then(|command| command.get("kind"))
+            .and_then(Value::as_str), Some("run" | "steer" | "interrupt" | "respondInput")),
+        _ => false,
+    }
+}
 
 fn own_directory_search(params: &mut Value, owner: &str) -> Result<(), RpcError> {
     let object = params.as_object_mut().ok_or_else(|| denied("Session search requires an object"))?;
@@ -63,14 +78,31 @@ impl EngineRpc {
         Ok(services)
     }
 
+    pub(super) fn guard_scaffold_target(&self, target: &str, method: &str, params: &Value) -> Result<(), RpcError> {
+        let chats = self.workspace.watch_chats();
+        if let Some(chat) = chats.borrow().iter().find(|chat| chat.device_id == target
+            && chat.crew.as_ref().and_then(|metadata| metadata.environment.as_ref())
+                .is_some_and(|environment| matches!(environment.source, SessionEnvironmentSource::Scaffold { .. })))
+            && !scaffold_host_rpc_allowed(method, params, &chat.id)
+        {
+            return Err(RpcError::Failed(format!("{method} is unavailable for this session-scoped Scaffold host")));
+        }
+        Ok(())
+    }
+
     pub(super) fn crew_guard(&self, method: &str, params: &Value) -> Result<(), RpcError> {
         if !self.relay && params.get("__crewAuthority").is_some() {
             return Err(denied("Relay authority cannot be supplied over local IPC"));
         }
-        if matches!(method, "crew.accounts.importLocal" | "ScaffoldHostAuthority")
+        if (matches!(method, "crew.accounts.importLocal" | "ScaffoldHostAuthority")
+            || method.starts_with("crew.accounts.login."))
             && params.get("targetDeviceId").and_then(Value::as_str).is_some_and(|device| device != self.doc_host.device_id())
         {
             return Err(denied("This operation requires local IPC on the explicitly selected device"));
+        }
+        if method.starts_with("crew.accounts.login.") {
+            if self.relay { return Err(denied("Shared account login requires local controller consent")); }
+            self.crew_services()?.controller()?;
         }
         if self.registry.managed_inference() {
             if super::voice_remote::handles(method) {
@@ -175,6 +207,39 @@ impl EngineRpc {
                 let authority = self.auth()?.device_grant_authority()
                     .ok_or_else(|| denied("Verified sandbox authority unavailable"))?;
                 RpcReply::value(&authority)
+            }
+            "crew.accounts.login.start" | "crew.accounts.login.complete"
+            | "crew.accounts.login.poll" | "crew.accounts.login.cancel" => {
+                if self.relay { return Err(denied("Shared account login requires local controller consent")); }
+                let services = self.crew_services()?;
+                services.controller()?;
+                match method {
+                    "crew.accounts.login.start" => {
+                        #[derive(Deserialize)] struct Input { harness: HarnessId }
+                        let input: Input = zeron_rpc::parse_params(params)?;
+                        RpcReply::value(&self.agent_accounts.start_shared_login(input.harness).await.map_err(failed)?)
+                    }
+                    "crew.accounts.login.complete" => {
+                        #[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+                        struct Input { login_id: String, code: String }
+                        let input: Input = zeron_rpc::parse_params(params)?;
+                        self.agent_accounts.complete_shared_login(&services.runtime().client(), &input.login_id, &input.code).await.map_err(failed)?;
+                        RpcReply::value(&json!({}))
+                    }
+                    "crew.accounts.login.poll" => {
+                        #[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+                        struct Input { login_id: String }
+                        let input: Input = zeron_rpc::parse_params(params)?;
+                        RpcReply::value(&self.agent_accounts.poll_shared_login(&services.runtime().client(), &input.login_id).await.map_err(failed)?)
+                    }
+                    _ => {
+                        #[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+                        struct Input { login_id: String }
+                        let input: Input = zeron_rpc::parse_params(params)?;
+                        self.agent_accounts.cancel_shared_login(&input.login_id).await;
+                        RpcReply::value(&json!({}))
+                    }
+                }
             }
             "crew.accounts.importLocal" => {
                 if self.relay { return Err(denied("Local credential import requires local consent")); }
@@ -548,5 +613,21 @@ mod tests {
     fn personal_directory_search_rejects_a_foreign_owner() {
         let mut request = json!({"query": "private", "ownerId": "another@example.com"});
         assert!(own_directory_search(&mut request, "owner@example.com").is_err());
+    }
+
+    #[test]
+    fn scoped_host_admission_keeps_device_watches_off_session_links() {
+        let device = json!({"targetDeviceId": "host"});
+        let session = json!({"targetDeviceId": "host", "chatId": "session"});
+        for method in [methods::WATCH_HARNESS_UPDATES, methods::WATCH_CHECKOUT_DIFFS, methods::LIST_MODELS] {
+            assert!(!scaffold_host_rpc_allowed(method, &device, "session"));
+            assert!(!scaffold_host_rpc_allowed(method, &session, "session"));
+        }
+        assert!(scaffold_host_rpc_allowed(methods::WATCH_DOC_MESSAGES, &session, "session"));
+        assert!(!scaffold_host_rpc_allowed(methods::WATCH_DOC_MESSAGES, &session, "other"));
+        assert!(scaffold_host_rpc_allowed(methods::QUEUE_COMMAND,
+            &json!({"chatId": "session", "command": {"kind": "run"}}), "session"));
+        assert!(!scaffold_host_rpc_allowed(methods::QUEUE_COMMAND,
+            &json!({"chatId": "session", "command": {"kind": "unknown"}}), "session"));
     }
 }

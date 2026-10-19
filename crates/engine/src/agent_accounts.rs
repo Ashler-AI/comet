@@ -720,6 +720,8 @@ struct Inner {
     /// removal and cause the wrong live account to be signed out.
     ops: tokio::sync::Mutex<()>,
     flows: Mutex<HashMap<String, LoginFlow>>,
+    /// Managed logins retain exchanged tokens only until Agent Auth acknowledges them.
+    shared_logins: Mutex<HashMap<String, Option<Arc<Slot>>>>,
     /// `"{harness}:{accountKey}"` → usage state; mirrored to disk.
     usage: Mutex<HashMap<String, UsageEntry>>,
     /// Accounts with a usage probe in flight — overlapping forced lists (the
@@ -789,7 +791,14 @@ impl AgentAccounts {
         let slot = self.read_slots(harness).into_iter()
             .find(|slot| slot.id == account_id && slot.harness == harness)
             .ok_or_else(|| EngineError::Other("Selected local login no longer exists".into()))?;
-        let (provider, access, refresh, expiry, scopes) = match harness {
+        Self::import_shared_slot(remote, &slot).await
+    }
+
+    async fn import_shared_slot(
+        remote: &crate::scaffold::ScaffoldClient,
+        slot: &Slot,
+    ) -> Result<crate::scaffold::RemoteAgentAccount, EngineError> {
+        let (provider, access, refresh, expiry, scopes) = match slot.harness {
             HarnessId::ClaudeCode => {
                 let oauth = slot.credentials.get("claudeAiOauth")
                     .ok_or_else(|| EngineError::Other("Selected login is not Claude OAuth".into()))?;
@@ -809,17 +818,17 @@ impl AgentAccounts {
                     .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
                 ("openai", access, str_field(tokens, "refresh_token"), expiry, Vec::new())
             }
-            _ => unreachable!(),
+            _ => return Err(EngineError::Other("Only Claude and ChatGPT OAuth accounts can be shared".into())),
         };
         let required = |value: Option<String>| value.filter(|value| !value.trim().is_empty())
             .ok_or_else(|| EngineError::Other("Selected OAuth login is incomplete".into()));
         let import = crate::scaffold::AgentAccountCredentialImport {
             provider: provider.into(),
             provider_account_id: slot.account_key.clone(),
-            email: Some(slot.profile.email),
-            display_name: slot.profile.display_name,
-            organization: slot.profile.organization,
-            plan: slot.profile.plan,
+            email: Some(slot.profile.email.clone()),
+            display_name: slot.profile.display_name.clone(),
+            organization: slot.profile.organization.clone(),
+            plan: slot.profile.plan.clone(),
             capabilities: vec![if provider == "openai" { "gpt-*" } else { "claude-*" }.into()],
             credential: crate::scaffold::AgentAccountOAuthCredential {
                 access_token: required(access)?,
@@ -886,6 +895,7 @@ impl AgentAccounts {
                 endpoints,
                 ops: tokio::sync::Mutex::new(()),
                 flows: Mutex::new(HashMap::new()),
+                shared_logins: Mutex::new(HashMap::new()),
                 usage: Mutex::new(usage),
                 inflight_probes: Mutex::new(std::collections::HashSet::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
@@ -1454,6 +1464,77 @@ impl AgentAccounts {
 
     // ── add-account OAuth flows ─────────────────────────────────────────────
 
+    pub(crate) async fn start_shared_login(&self, harness: HarnessId) -> Result<AgentLoginStart, EngineError> {
+        let _ops = self.inner.ops.lock().await;
+        self.sweep_flows();
+        let start = match harness {
+            HarnessId::ClaudeCode => self.start_claude_paste_login(),
+            HarnessId::Codex => self.start_codex_login(None).await?,
+            _ => return Err(EngineError::Other("Only Claude and ChatGPT OAuth accounts can be shared".into())),
+        };
+        lock(&self.inner.shared_logins).insert(start.login_id.clone(), None);
+        Ok(start)
+    }
+
+    pub(crate) async fn complete_shared_login(
+        &self,
+        remote: &crate::scaffold::ScaffoldClient,
+        login_id: &str,
+        code: &str,
+    ) -> Result<(), EngineError> {
+        // Serialize exchange/import/cancel so a one-use code is never redeemed twice.
+        let _ops = self.inner.ops.lock().await;
+        self.sweep_flows();
+        let cached = lock(&self.inner.shared_logins).get(login_id).cloned()
+            .ok_or_else(|| EngineError::Other("Shared sign-in expired — start again.".into()))?;
+        if cached.is_none() {
+            let slot = self.exchange_claude_login(login_id, code).await?;
+            let mut logins = lock(&self.inner.shared_logins);
+            let pending = logins.get_mut(login_id)
+                .ok_or_else(|| EngineError::Other("Shared sign-in was cancelled.".into()))?;
+            *pending = Some(Arc::new(slot));
+        }
+        self.finish_shared_login(remote, login_id).await
+    }
+
+    async fn finish_shared_login(
+        &self,
+        remote: &crate::scaffold::ScaffoldClient,
+        login_id: &str,
+    ) -> Result<(), EngineError> {
+        let slot = lock(&self.inner.shared_logins).get(login_id).and_then(Clone::clone)
+            .ok_or_else(|| EngineError::Other("Shared sign-in has no exchanged credential.".into()))?;
+        Self::import_shared_slot(remote, &slot).await?;
+        self.cancel_login(login_id);
+        Ok(())
+    }
+
+    pub(crate) async fn poll_shared_login(
+        &self,
+        remote: &crate::scaffold::ScaffoldClient,
+        login_id: &str,
+    ) -> Result<AgentLoginPoll, EngineError> {
+        let _ops = self.inner.ops.lock().await;
+        self.poll_login_with_sink(login_id, Some(remote)).await
+    }
+
+    pub(crate) async fn cancel_shared_login(&self, login_id: &str) {
+        let _ops = self.inner.ops.lock().await;
+        let shared = lock(&self.inner.shared_logins).contains_key(login_id);
+        if shared { self.cancel_login(login_id); }
+    }
+
+    async fn poll_shared_import(&self, remote: &crate::scaffold::ScaffoldClient, login_id: &str) -> AgentLoginPoll {
+        match self.finish_shared_login(remote, login_id).await {
+            Ok(()) => AgentLoginPoll { status: AgentLoginStatus::Done, message: None, url: None, callback_port: None },
+            // Keep the tokens and retry on the next poll, never redeem the code again.
+            Err(error) => AgentLoginPoll { status: AgentLoginStatus::Pending,
+                message: Some(format!("Agent Auth has not acknowledged the account: {}. Retrying; cancel to discard this sign-in.",
+                    zeron_harness::redact::redact_output(&error.to_string()))),
+                url: None, callback_port: None },
+        }
+    }
+
     pub async fn start_login(&self, harness: HarnessId) -> Result<AgentLoginStart, EngineError> {
         self.start_login_for(harness, None).await
     }
@@ -1613,17 +1694,19 @@ impl AgentAccounts {
         let (callback, mut browser) = await_claude_callback(&listener, state).await;
         drop(listener);
         let result = match callback {
-            Ok(code) => {
-                self.redeem_claude_code(
+            Ok(code) => async {
+                let slot = self.redeem_claude_code(
                     &self.inner.endpoints.claude_loopback_token,
                     &code,
                     state,
                     verifier,
                     redirect,
                     CLAUDE_LOOPBACK_SCOPES,
-                )
-                .await
-            }
+                ).await?;
+                let _ops = self.inner.ops.lock().await;
+                self.write_slot(&slot)?;
+                self.adopt_if_live(&slot).await
+            }.await,
             Err(message) => Err(EngineError::Other(message)),
         };
         let response = match &result {
@@ -1932,6 +2015,20 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        if lock(&self.inner.shared_logins).contains_key(login_id) {
+            return Err(EngineError::Other("Shared sign-ins require Crew account operations.".into()));
+        }
+        let slot = self.exchange_claude_login(login_id, code).await?;
+        {
+            let _ops = self.inner.ops.lock().await;
+            self.write_slot(&slot)?;
+            self.adopt_if_live(&slot).await?;
+        }
+        self.remove_flow(login_id);
+        self.list(false).await
+    }
+
+    async fn exchange_claude_login(&self, login_id: &str, code: &str) -> Result<Slot, EngineError> {
         let (verifier, expected_state) = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude {
                 verifier, state, ..
@@ -1957,20 +2054,17 @@ impl AgentAccounts {
             ));
         }
         self.redeem_claude_code(
-            CLAUDE_TOKEN_URL,
+            &self.inner.endpoints.claude_token,
             &auth_code,
             &state,
             &verifier,
             CLAUDE_REDIRECT,
             CLAUDE_SCOPES,
         )
-        .await?;
-        self.remove_flow(login_id);
-        self.list(false).await
+        .await
     }
 
-    /// Redeem a Claude authorization code at `token_url` and save the account
-    /// as a slot (see [`Self::adopt_if_live`] for when it also becomes live).
+    /// Redeem a Claude authorization code without persisting or activating it.
     /// `redirect` must be the one the authorize url named.
     async fn redeem_claude_code(
         &self,
@@ -1980,7 +2074,7 @@ impl AgentAccounts {
         verifier: &str,
         redirect: &str,
         default_scopes: &str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Slot, EngineError> {
         let token = self
             .inner
             .http
@@ -2115,13 +2209,26 @@ impl AgentAccounts {
             created_at: None,
             store_key: None,
         };
-        let _ops = self.inner.ops.lock().await;
-        self.write_slot(&slot)?;
-        self.adopt_if_live(&slot).await
+        Ok(slot)
     }
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
+        self.poll_login_with_sink(login_id, None).await
+    }
+
+    async fn poll_login_with_sink(
+        &self,
+        login_id: &str,
+        remote: Option<&crate::scaffold::ScaffoldClient>,
+    ) -> Result<AgentLoginPoll, EngineError> {
         self.sweep_flows();
+        let shared = lock(&self.inner.shared_logins).get(login_id).cloned();
+        if shared.is_some() != remote.is_some() {
+            return Err(EngineError::Other("Sign-in requires its original account operation, or has expired.".into()));
+        }
+        if let (Some(Some(_)), Some(remote)) = (shared, remote) {
+            return Ok(self.poll_shared_import(remote, login_id).await);
+        }
         if let Some(poll) = self.poll_task_login(login_id) {
             return Ok(poll);
         }
@@ -2173,6 +2280,26 @@ impl AgentAccounts {
             SpawnedCompletion::ExitSuccess => None,
         };
         if let Some(detected) = detected {
+            if let Some(remote) = remote {
+                let slot = Slot {
+                    id: slot_id_for(harness, &detected.account_key),
+                    harness,
+                    account_key: detected.account_key,
+                    profile: detected.profile,
+                    credentials: detected.credentials.ok_or_else(|| EngineError::Other("Sign-in returned no credentials.".into()))?,
+                    claude_config: detected.claude_config,
+                    saved_at: now_ms(),
+                    created_at: None,
+                    store_key: detected.store_key,
+                };
+                {
+                    let mut logins = lock(&self.inner.shared_logins);
+                    let pending = logins.get_mut(login_id)
+                        .ok_or_else(|| EngineError::Other("Shared sign-in was cancelled.".into()))?;
+                    *pending = Some(Arc::new(slot));
+                }
+                return Ok(self.poll_shared_import(remote, login_id).await);
+            }
             let _ops = self.inner.ops.lock().await;
             self.snapshot_detected(harness, &detected)?;
             // "Connect" semantics: with no (usable) live login, or a re-login
@@ -2300,6 +2427,7 @@ impl AgentAccounts {
     /// Drop a flow's bookkeeping, and with it any callback route it published.
     fn remove_flow(&self, login_id: &str) -> Option<LoginFlow> {
         self.inner.callback_routes.remove(login_id);
+        lock(&self.inner.shared_logins).remove(login_id);
         lock(&self.inner.flows).remove(login_id)
     }
 
@@ -4759,6 +4887,81 @@ mod login_tests {
     fn write(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_login_retries_import_without_redeeming_or_writing_local_credentials() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let account = |id: &str| serde_json::json!({"account": {
+            "id": "shared-account", "provider": "anthropic", "providerAccountId": id,
+            "status": "connected"
+        }}).to_string();
+        let responses = vec![
+            ("200 OK", serde_json::json!({
+                "access_token": "access", "refresh_token": "refresh", "expires_in": 3600,
+                "account": {"email_address": "new@example.com", "uuid": "acct-new"}
+            }).to_string()),
+            ("503 Service Unavailable", "{}".into()), // Optional provider profile.
+            ("503 Service Unavailable", "{}".into()), // Agent Auth did not acknowledge.
+            ("200 OK", account("wrong-account")),
+            ("200 OK", account("acct-new")),
+        ];
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers.lines().filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap()).unwrap_or(0);
+                        if bytes.len() >= end + 4 + length { break; }
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                socket.write_all(http_response(status, &[("Content-Type", "application/json")], &body).as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            requests
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        write(&config.claude_creds_file(), "live-claude");
+        write(&config.claude_config_file, "live-profile");
+        write(&config.codex_auth_file(), "live-codex");
+        let accounts = AgentAccounts::with_endpoints(config.clone(), ProbeEndpoints {
+            claude_token: format!("{origin}/token"), claude_profile: format!("{origin}/profile"),
+            ..Default::default()
+        }, Default::default());
+        let remote = crate::scaffold::ScaffoldClient::new(&origin, "project", Arc::new(zeron_rpc::StaticToken("controller".into()))).unwrap();
+        let start = accounts.start_shared_login(HarnessId::ClaudeCode).await.unwrap();
+        assert!(accounts.complete_login(&start.login_id, "code").await.is_err());
+        assert!(accounts.poll_login(&start.login_id).await.is_err());
+        assert!(accounts.complete_shared_login(&remote, &start.login_id, "code#wrong-state").await.is_err());
+        assert!(accounts.complete_shared_login(&remote, &start.login_id, "one-use-code").await.is_err());
+        assert!(lock(&accounts.inner.shared_logins).get(&start.login_id).unwrap().is_some());
+        assert_eq!(accounts.poll_shared_login(&remote, &start.login_id).await.unwrap().status, AgentLoginStatus::Pending);
+        assert_eq!(accounts.poll_shared_login(&remote, &start.login_id).await.unwrap().status, AgentLoginStatus::Done);
+        assert!(!lock(&accounts.inner.shared_logins).contains_key(&start.login_id));
+        assert!(!lock(&accounts.inner.flows).contains_key(&start.login_id));
+        assert!(!config.root_dir().exists(), "managed OAuth must not create steady-state slots");
+        assert_eq!(std::fs::read_to_string(config.claude_creds_file()).unwrap(), "live-claude");
+        assert_eq!(std::fs::read_to_string(&config.claude_config_file).unwrap(), "live-profile");
+        assert_eq!(std::fs::read_to_string(config.codex_auth_file()).unwrap(), "live-codex");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /token ")).count(), 1);
+        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /api/agent-accounts/import ")).count(), 3);
+        let cancelled = accounts.start_shared_login(HarnessId::ClaudeCode).await.unwrap();
+        accounts.cancel_shared_login(&cancelled.login_id).await;
+        assert!(!lock(&accounts.inner.flows).contains_key(&cancelled.login_id));
+        assert!(!lock(&accounts.inner.shared_logins).contains_key(&cancelled.login_id));
     }
 
     #[test]
