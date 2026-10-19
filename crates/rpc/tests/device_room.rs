@@ -293,7 +293,7 @@ impl Drop for StreamGuard {
 impl RpcService for TestService {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            methods::LIST_HARNESSES => Ok(RpcReply::Value(serde_json::json!([]))),
+            methods::LOCAL_DEVICE => Ok(RpcReply::Value(serde_json::json!({"id": self.label}))),
             "Echo" => Ok(RpcReply::Value(
                 serde_json::json!({ "host": self.label, "params": params }),
             )),

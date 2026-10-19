@@ -364,8 +364,11 @@ impl Auth {
     /// Revalidate persisted credentials before a managed profile can be selected.
     pub async fn detect(config: AuthConfig) -> Self {
         let auth = Self::new(config);
-        if auth.scaffold_enabled() {
-            let _ = auth.access_token().await;
+        if auth.scaffold_enabled()
+            && let Err(error) = auth.access_token().await
+            && auth.device_mode()
+        {
+            tracing::error!(%error, "Crew sandbox device authentication failed; native host startup requires verified authority");
         }
         auth
     }
@@ -387,6 +390,11 @@ impl Auth {
     pub fn capabilities(&self) -> Vec<String> {
         if !self.state().is_signed_in() { return Vec::new(); }
         lock(&self.inner.scaffold_session).as_ref().map(|session| session.identity.capabilities.clone()).unwrap_or_default()
+    }
+
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.state().is_signed_in() && lock(&self.inner.scaffold_session).as_ref()
+            .is_some_and(|session| session.identity.capabilities.iter().any(|value| value == capability))
     }
 
     pub fn verified_scope(&self) -> Option<zeron_proto::CollaborationScope> {

@@ -538,6 +538,7 @@ fn unb64(input: &str) -> Vec<u8> {
 struct HostService {
     chunks: Mutex<std::collections::BTreeMap<(String, u64), String>>,
     committed: Mutex<Vec<(String, String, Vec<u8>)>>,
+    upload_calls: Mutex<Vec<serde_json::Value>>,
     spaces: Mutex<Vec<String>>,
 }
 
@@ -556,7 +557,11 @@ impl zeron_rpc::RpcService for HostService {
     ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
         use serde_json::json;
         use zeron_rpc::{RpcReply, methods as m};
+        if matches!(method, m::UPLOAD_CHUNK | m::UPLOAD_COMMIT) {
+            self.upload_calls.lock().unwrap().push(params.clone());
+        }
         let value = match method {
+            m::LOCAL_DEVICE => json!({ "id": HOST }),
             m::LIST_HARNESSES => json!([
                 {"id": "claude-code", "name": "Claude Code", "supportsSteering": true,
                  "steeringMode": "step-boundary", "reasoningLevels": ["high"], "installed": true,
@@ -784,6 +789,11 @@ async fn host_rpcs_ride_the_device_relay() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let calls = service.upload_calls.lock().unwrap();
+    let escorted: Vec<_> = calls.iter().filter(|params| params["uploadId"] == upload_id).collect();
+    assert!(escorted.len() >= 2);
+    assert!(escorted.iter().all(|params| params["chatId"] == CHAT));
+    drop(calls);
 
     // New project: asked of the owning host (Mutate createSpace).
     let c = client.clone();

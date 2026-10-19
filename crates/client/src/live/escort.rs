@@ -160,6 +160,7 @@ async fn run(
             .relay
             .upload(
                 &meta.host_device_id,
+                Some(&meta.chat_id),
                 upload_id,
                 &meta.name,
                 &bytes,

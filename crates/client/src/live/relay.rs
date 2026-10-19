@@ -173,6 +173,7 @@ impl Relay {
     pub(crate) async fn upload(
         &self,
         device_id: &str,
+        chat_id: Option<&str>,
         upload_id: &str,
         file_name: &str,
         data: &[u8],
@@ -206,7 +207,7 @@ impl Relay {
                 let report = &report;
                 async move {
                     let params =
-                        json!({ "uploadId": upload_id, "seq": seq, "data": b64::encode(slice) });
+                        json!({ "chatId": chat_id, "uploadId": upload_id, "seq": seq, "data": b64::encode(slice) });
                     let mut last = None;
                     for attempt in 0..3u64 {
                         if attempt > 0 {
@@ -242,7 +243,7 @@ impl Relay {
             .call(
                 device_id,
                 methods::UPLOAD_COMMIT,
-                json!({ "uploadId": upload_id, "fileName": file_name }),
+                json!({ "chatId": chat_id, "uploadId": upload_id, "fileName": file_name }),
             )
             .await?;
         if let Some(progress) = &progress {

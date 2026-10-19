@@ -472,7 +472,7 @@ export class Viewport {
     const generation = this.generation;
     await this.readContext();
     const authority = await this.readAuthority();
-    requireValue(authority.capabilities.includes(CAP_CHAT), 'Session capability unavailable', 403);
+    requireValue(authority.capabilities.includes(CAP_CHAT) && authority.capabilities.includes('session.files'), 'Session capability unavailable', 403);
     let name;
     try { name = decodeURIComponent(req.headers['x-filename'] || ''); } catch { throw new HttpError(400, 'Invalid file name'); }
     requireValue(name.length > 0 && name.length <= 200 && !/[\x00-\x1f/\\]/.test(name) && name !== '.' && name !== '..', 'Invalid file name');
@@ -483,11 +483,11 @@ export class Viewport {
     for (let offset = 0, seq = 0; offset < bytes.length; offset += chunkSize, seq++) {
       await this.authority(CAP_CHAT);
       requireValue(generation === this.generation && this.ready(), 'Crew session state changed; retry', 503);
-      await this.rpc.call('UploadChunk', { uploadId: id, seq, data: bytes.subarray(offset, offset + chunkSize).toString('base64') });
+      await this.rpc.call('UploadChunk', { chatId: this.config.sessionId, uploadId: id, seq, data: bytes.subarray(offset, offset + chunkSize).toString('base64') });
     }
     await this.authority(CAP_CHAT);
     requireValue(generation === this.generation && this.ready(), 'Crew session state changed; retry', 503);
-    const { path } = await this.rpc.call('UploadCommit', { uploadId: id, fileName: name });
+    const { path } = await this.rpc.call('UploadCommit', { chatId: this.config.sessionId, uploadId: id, fileName: name });
     const type = /^image\/(png|jpeg|gif|webp)$/.test(req.headers['content-type'] || '') ? req.headers['content-type'] : 'application/octet-stream';
     const metadata = { id, name, size: bytes.length, type };
     await atomicJson(join(this.config.storage, `upload-${digest(id)}.json`), { ...metadata, path });

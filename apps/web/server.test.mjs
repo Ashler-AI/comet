@@ -29,7 +29,7 @@ async function fixture(t, publish = true) {
     scope: { projectId: profile.projectId, deploymentId: profile.deploymentId, sessionId: profile.sessionId },
     sandboxId: profile.sandboxId, deviceId: profile.targetDeviceId, lifecycleEpoch: 1,
     principalSubject: profile.actor.sub, grantId: 'private-grant', expiresAt: Date.now() + 60000,
-    capabilities: ['session.read', 'session.chat', 'session.control'],
+    capabilities: ['session.read', 'session.chat', 'session.control', 'session.files'],
   };
   const context = {
     id: profile.sessionId, deviceId: profile.targetDeviceId, roomGen: 2, cwd: '/workspace', title: 'Assigned chat',

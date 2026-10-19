@@ -137,10 +137,14 @@ impl EngineRpc {
         }
         if auth.device_mode() {
             let scope = auth.verified_scope().ok_or_else(|| denied("Sandbox authority unavailable"))?;
-            if params.get("chatId").and_then(Value::as_str)
-                .is_some_and(|chat| Some(chat) != scope.session_id.as_deref())
-            {
+            let chat_id = params.get("chatId").and_then(Value::as_str);
+            if chat_id.is_some_and(|chat| Some(chat) != scope.session_id.as_deref()) {
                 return Err(denied("Sandbox host is bound to a different session"));
+            }
+            if matches!(method, methods::UPLOAD_CHUNK | methods::UPLOAD_COMMIT)
+                && (chat_id.is_none() || !auth.has_capability(zeron_proto::CAPABILITY_SESSION_FILES))
+            {
+                return Err(denied("Sandbox file access requires its exact session and session.files authority"));
             }
             if matches!(method, methods::LIST_AGENT_ACCOUNTS | methods::ACTIVATE_AGENT_ACCOUNT
                 | methods::FORGET_AGENT_ACCOUNT | methods::START_AGENT_LOGIN | methods::COMPLETE_AGENT_LOGIN

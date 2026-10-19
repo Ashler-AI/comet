@@ -63,6 +63,22 @@ describe("scoped transport authority", () => {
     expect(scopedRpcAllowed("echo", new Uint8Array([1]), authority)).toBe(false);
     expect(scopedRpcAllowed("echo", new Uint8Array(), { ...authority, capabilities: [] })).toBe(false);
   });
+  it("admits scoped upload bytes only for the exact session and existing files capability", () => {
+    const authority = requestAuthority(trustedRequest(req("/device/device-a/ws"), device))!;
+    const files = { ...authority, capabilities: [...authority.capabilities, "session.files"] };
+    for (const method of ["UploadChunk", "UploadCommit"]) {
+      for (const chatId of ["session-a", "other", undefined]) {
+        const payload = new TextEncoder().encode(JSON.stringify({ method, params: { chatId, uploadId: "upload", data: "eA==", seq: 0, fileName: "image.png" } }));
+        expect(scopedRpcAllowed("rpc", payload, files)).toBe(chatId === "session-a");
+        expect(scopedRpcAllowed("rpc", payload, authority)).toBe(false);
+        expect(scopedRpcAllowed("term", payload, files)).toBe(false);
+      }
+    }
+    for (const method of ["LocalDevice", "ListHarnesses", "ReadFile", "WriteFile", "ReadAttachmentChunk"]) {
+      const payload = new TextEncoder().encode(JSON.stringify({ method, params: {} }));
+      expect(scopedRpcAllowed("rpc", payload, files)).toBe(method === "LocalDevice");
+    }
+  });
   it("overwrites forged annotation authority with nonsecret verified relay identity", () => {
     const authority = requestAuthority(trustedRequest(new Request("https://edge.example/device/device-a/ws?token=secret"), device));
     const payload = new TextEncoder().encode(JSON.stringify({

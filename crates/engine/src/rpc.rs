@@ -34,8 +34,8 @@
 //!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
 //!   `PollAgentLogin {loginId}`, `CancelAgentLogin {loginId}`.
-//! - Uploads (§3.7): `UploadChunk {uploadId, data, seq?}`,
-//!   `UploadCommit {uploadId, fileName}` → `{path}`,
+//! - Uploads (§3.7): `UploadChunk {chatId?, uploadId, data, seq?}`,
+//!   `UploadCommit {chatId?, uploadId, fileName}` → `{path}`; sandbox hosts require their exact `chatId` and `session.files` authority.
 //!   `ReadAttachmentChunk {path, offset}` → `{name, mimeType, data, nextOffset,
 //!   done}` (path-jailed to the uploads dir + workspace-known chat cwds).
 //!

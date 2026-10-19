@@ -451,6 +451,14 @@ impl CrewServices {
             let created = confirmed(create)?;
             environment_id(&created.environment).ok_or_else(|| failed("Created environment has no sandbox"))?.into()
         };
+        // Attach installs the verified runtime and releases its startup marker;
+        // waiting for application readiness first would strand a fresh sandbox.
+        let attach_id = format!("{root_id}:attach");
+        let mut attachment = self.control(&attach_id,Control::Attach {
+            sandbox_id:sandbox.clone(),scope:scope.clone(),
+        },cancellation).await?;
+        if attachment.status == "unknown" { attachment = self.reconcile(&attach_id, cancellation).await?; }
+        let attachment = confirmed(attachment)?;
         let ready = async {
             loop {
                 let environment = self.runtime.client().inspect(&sandbox, &scope, cancellation).await.map_err(failed)?;
@@ -471,12 +479,6 @@ impl CrewServices {
         let transferred = confirmed(self.control(&format!("{root_id}:transfer"),Control::HandoffOmpSession {
             sandbox_id:sandbox.clone(),scope:scope.clone(),native_session_id:request.native_session_id.clone(),cwd:request.cwd,
         },cancellation).await?)?;
-        let attach_id = format!("{root_id}:attach");
-        let mut attachment = self.control(&attach_id,Control::Attach {
-            sandbox_id:sandbox.clone(),scope,
-        },cancellation).await?;
-        if attachment.status == "unknown" { attachment = self.reconcile(&attach_id, cancellation).await?; }
-        let attachment = confirmed(attachment)?;
         let receipt = HandoffReceipt {chat_id,sandbox_id:sandbox,command_id:request.command_id,
             environment:attachment.environment.clone(),attachment,
             native_session_id:transferred.handoff_native_session_id.ok_or_else(|| failed("Missing transferred native identity"))?,

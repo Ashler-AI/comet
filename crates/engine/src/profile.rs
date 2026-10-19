@@ -58,7 +58,13 @@ impl EngineProfile {
     /// Open only the verified Crew identity, isolated by both configured origins.
     /// The resulting paths never change if the live auth service changes accounts.
     pub fn scaffold(data_dir: &Path, auth: &crate::auth::Auth) -> Result<Self, EngineError> {
-        let session = auth.verified_scaffold_session().ok_or_else(|| EngineError::Other("Scaffold profile requires a verified identity".into()))?;
+        let session = auth.verified_scaffold_session().ok_or_else(|| EngineError::Other(
+            if auth.device_mode() {
+                "Crew sandbox authentication failed; inspect the device bootstrap exchange error and recover this same sandbox. Local-profile fallback is disabled."
+            } else {
+                "Crew profile requires a verified identity"
+            }.into()
+        ))?;
         let key = zeron_sync::scaffold_auth::profile_key(&session);
         let store_root = data_dir.join("profiles").join("scaffold").join(&key);
         Ok(Self {

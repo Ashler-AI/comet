@@ -1414,7 +1414,7 @@ impl Client {
                 let file_name = attachments::upload_file_name(name);
                 let path = live
                     .relay
-                    .upload(device_id, &upload_id, &file_name, &data, progress)
+                    .upload(device_id, None, &upload_id, &file_name, &data, progress)
                     .await?;
                 self.inner
                     .attachment_cache

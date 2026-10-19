@@ -825,6 +825,7 @@ pub struct UiSettings {
     pub pending_crew_link: Option<PendingCrewLink>,
     pub crew_annotation_commands: Vec<annotations::PendingAnnotation>,
     pub crew_recovery_commands: HashMap<String, String>,
+    pub crew_pending_prompts: HashMap<String, String>,
     pub dictation_enabled: bool,
     /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
     /// follows the system default.
@@ -1037,6 +1038,7 @@ impl Default for UiSettings {
             pending_crew_link: None,
             crew_annotation_commands: Vec::new(),
             crew_recovery_commands: HashMap::new(),
+            crew_pending_prompts: HashMap::new(),
             dictation_enabled: false,
             dictation_input: None,
             window_geometry: None,
@@ -1689,6 +1691,7 @@ impl UiSettings {
             pending_crew_link,
             crew_annotation_commands,
             crew_recovery_commands,
+            crew_pending_prompts,
             dictation_enabled,
             dictation_input,
             window_geometry,

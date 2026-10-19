@@ -1777,6 +1777,7 @@ impl Composer {
                     for attachment in &staged {
                         let path = crate::attachments::upload_attachment(
                             &engine, cx.background_executor(), Some(&host_device_id),
+                            &chat_id,
                             &uuid::Uuid::new_v4().to_string(), attachment, None,
                         ).await.map_err(|err| err.to_string())?;
                         paths.push(path);

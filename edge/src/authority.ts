@@ -156,6 +156,9 @@ export const scopedRpcAllowed = (kind: string, payload: Uint8Array, authority?: 
       return authority.capabilities.includes("session.read");
     }
     if (!params || params.chatId !== authority.sessionId) return false;
+    if (["UploadChunk", "UploadCommit"].includes(value.method)) {
+      return authority.capabilities.includes("session.files");
+    }
     if (["WatchDocMessages", "WatchQueue", "FocusChat", "ListCrewAnnotations"].includes(value.method)) {
       return authority.capabilities.includes("session.read");
     }

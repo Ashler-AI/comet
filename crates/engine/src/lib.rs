@@ -720,7 +720,7 @@ impl Engine {
     /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
     pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
         if auth.scaffold_enabled() {
-            if auth.verified_scaffold_session().is_some() {
+            if auth.device_mode() || auth.verified_scaffold_session().is_some() {
                 WorkspaceScope::Synced
             } else {
                 WorkspaceScope::Local
@@ -1372,6 +1372,43 @@ mod identity_lock_retry_tests {
             lock.is_ok(),
             "acquire did not retry through the sharing violation"
         );
+    }
+}
+
+#[cfg(test)]
+mod device_bootstrap_tests {
+    use super::*;
+    use zeron_sync::scaffold_auth::{DeviceConfig, ScaffoldConfig};
+
+    #[tokio::test]
+    async fn rejected_device_bootstrap_never_opens_a_local_profile_on_start_or_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig {
+            data_dir: directory.path().to_owned(), edge_url: "https://edge.example".into(),
+            edge_token: None, ipc_port: 27954, default_harness: HarnessId::Omp,
+            org_id: None, workos_client_id: None, managed_inference: true,
+            scaffold: Some(ScaffoldConfig::new("https://scaffold.example", "https://edge.example", "project")),
+            device: Some(DeviceConfig {
+                join_grant: "invalid-grant".into(), device_id: "comet-scaffold-box-e1".into(),
+                session_id: "session".into(), deployment_id: "deployment".into(),
+                sandbox_id: "box".into(), lifecycle_epoch: 1,
+            }),
+            device_bootstrap_file: None, scaffold_runtime_artifact: None,
+        };
+        for restart in [false, true] {
+            if restart { config.device = None; }
+            // An invalid grant is rejected locally; no network or provider mutation.
+            // Restart restores device mode from the rejection tombstone, not argv.
+            let auth = Engine::build_auth(&config).await;
+            assert!(auth.device_mode());
+            assert!(auth.device_grant_authority().is_none());
+            let scope = Engine::initial_workspace_scope(&auth);
+            assert_eq!(scope, WorkspaceScope::Synced);
+            assert!(Engine::resolve_profile(&config, &auth, scope).is_err());
+            assert!(!directory.path().join("local-profile.json").exists());
+            assert!(!directory.path().join("device-id").exists());
+            assert!(!directory.path().join("profiles").exists());
+        }
     }
 }
 

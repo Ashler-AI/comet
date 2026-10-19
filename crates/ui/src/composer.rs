@@ -6044,6 +6044,12 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    scaffold_command: Option<String>,
+    scaffold_recovery_key: Option<String>,
+    scaffold_admission: Option<String>,
+    scaffold_config: Option<crate::pickers::ResolvedRunConfig>,
+    scaffold_session: Option<String>,
+    scaffold_database: Option<zeron_proto::ScaffoldDatabaseEnvironment>,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -6335,6 +6341,12 @@ impl Composer {
             popup_bar: crate::popover::MenuScrollbarState::default(),
             current_key,
             sending: false,
+            scaffold_command: None,
+            scaffold_recovery_key: None,
+            scaffold_admission: None,
+            scaffold_config: None,
+            scaffold_session: None,
+            scaffold_database: None,
             launching_new_chat: false,
             failure: None,
             wizard: None,
@@ -8416,6 +8428,17 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        let delivered = {
+            let state = self.state.read(cx);
+            state.selected_chat.as_ref().filter(|chat| {
+                crate::settings::current(cx).crew_pending_prompts.get(*chat)
+                    .is_some_and(|id| state.transcript.iter().any(|entry| &entry.id == id))
+            }).cloned()
+        };
+        if let Some(chat) = delivered {
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| { settings.crew_pending_prompts.remove(&chat); });
+            if self.scaffold_session.as_ref() == Some(&chat) { self.finish_scaffold_provisioning(cx); }
+        }
         {
             let state = self.state.read(cx);
             // AppState also notifies at clock-only transitions, so a run that
@@ -8658,6 +8681,7 @@ impl Composer {
     /// New chats need a runnable agent, but may target the device's home
     /// directory without a project. Existing chats carry their own run config.
     fn send_blocked(&self, cx: &App) -> bool {
+        if self.sending { return true; }
         if self.queue_edit_finishing {
             return true;
         }
@@ -8779,12 +8803,172 @@ impl Composer {
         }
     }
 
+    fn finish_scaffold_provisioning(&mut self, cx: &mut Context<Self>) {
+        if let (Some(key), Some(command)) = (&self.scaffold_recovery_key, &self.scaffold_command) {
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                if settings.crew_recovery_commands.get(key) == Some(command) {
+                    settings.crew_recovery_commands.remove(key);
+                }
+            });
+        }
+        self.scaffold_recovery_key = None;
+        self.scaffold_command = None;
+        self.scaffold_config = None;
+        self.scaffold_session = None;
+        self.scaffold_database = None;
+        self.scaffold_admission = None;
+    }
+
+    fn retire_rejected_scaffold_create(&mut self, outcome: &crate::settings::crew::Outcome, cx: &mut Context<Self>) {
+        if outcome.status == "rejected" && outcome.command_id.ends_with(":create")
+            && self.scaffold_command.as_ref() == Some(&outcome.command_id) {
+            self.finish_scaffold_provisioning(cx);
+        }
+    }
+
+    fn provision_scaffold(&mut self, cx: &mut Context<Self>) {
+        if self.sending { return; }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.show_error("Engine not connected", cx); return;
+        };
+        let database = self.pickers.read(cx).draft().scaffold_database.expect("Scaffold destination");
+        if self.scaffold_database.is_some_and(|pending| pending != database) {
+            self.show_error("A sandbox is already pending for another database choice. Restore that destination and reconcile it before creating another sandbox.", cx);
+            return;
+        }
+        let resolved = self.scaffold_config.clone().unwrap_or_else(|| self.pickers.read(cx).resolved(cx));
+        let Some(mut route) = resolved.model.as_deref().and_then(zeron_proto::AgentRoute::from_omp_model) else {
+            self.show_error("Choose a managed Crew model before creating a sandbox.", cx); return;
+        };
+        if let Some(account) = resolved.model_options.get("crewAccountId").and_then(serde_json::Value::as_str) {
+            route = zeron_proto::AgentRoute::pinned(route.provider, route.model, account.to_string());
+        }
+        if references_require_update(self.input.read(cx).text(), false) || !self.staged_appshots().is_empty() || !self.staged_comments(cx).is_empty() {
+            self.show_error("Local file/skill references, app captures and review comments cannot be sent to a new sandbox. Attach file bytes instead; your draft is preserved.", cx); return;
+        }
+        let submitted_text = self.input.read(cx).text().to_string();
+        let submitted_attachments: Vec<String> = self.staged().iter().map(|attachment| attachment.id.clone()).collect();
+        self.sending = true;
+        self.failure = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let status: crate::settings::crew::CrewStatus = serde_json::from_value(engine.client().call("crew.status", serde_json::json!({})).await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                if status.role != "local_controller" { return Err("Scaffold provisioning requires your Crew controller.".to_string()); }
+                let recovery_key = serde_json::json!([status.principal_id, status.scope]).to_string();
+                let (mut command_id, mut control) = this.update(cx, |composer, cx| {
+                    if let Some(command_id) = &composer.scaffold_command {
+                        if composer.scaffold_recovery_key.as_ref() != Some(&recovery_key) { return Err("Crew account or deployment changed; reconcile the original command first.".to_string()); }
+                        return Ok((command_id.clone(), None));
+                    }
+                    if crate::settings::current(cx).crew_recovery_commands.contains_key(&recovery_key) {
+                        return Err("A previous Crew operation needs reconciliation in Sandboxes. Your draft is preserved; no new sandbox was created.".to_string());
+                    }
+                    let command_id = format!("{}:create", uuid::Uuid::new_v4());
+                    let mut scope = status.scope.clone();
+                    scope.session_id = Some(uuid::Uuid::new_v4().to_string());
+                    composer.scaffold_session = scope.session_id.clone();
+                    let control = zeron_proto::ScaffoldEnvironmentControl::Create { scope, name: None, source_ref: None, region: None, database_environment: database, agent_route: route };
+                    composer.scaffold_database = Some(database);
+                    composer.scaffold_command = Some(command_id.clone());
+                    composer.scaffold_recovery_key = Some(recovery_key.clone());
+                    composer.scaffold_config = Some(resolved.clone());
+                    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| { settings.crew_recovery_commands.insert(recovery_key.clone(), command_id.clone()); });
+                    Ok((command_id, Some(control)))
+                }).map_err(|e| e.to_string())??;
+                loop {
+                    let (method, params) = match control.take() {
+                        Some(control) => ("scaffold.control", serde_json::json!({"commandId": command_id, "control": control})),
+                        None => ("scaffold.reconcile", serde_json::json!({"commandId": command_id})),
+                    };
+                    let value = attachments::call_with_timeout(&engine, cx.background_executor(), method, params, std::time::Duration::from_secs(120)).await?;
+                    let outcome: crate::settings::crew::Outcome = serde_json::from_value(value).map_err(|e| e.to_string())?;
+                    if outcome.command_id != command_id { return Err("Crew returned another command identity; reconcile in Sandboxes.".into()); }
+                    if outcome.status == "rejected" {
+                        this.update(cx, |composer, cx| composer.retire_rejected_scaffold_create(&outcome, cx)).map_err(|e| e.to_string())?;
+                        let recovery = if command_id.ends_with(":create") {
+                            "Your draft is preserved. Change the destination or settings and submit again."
+                        } else {
+                            "Your draft and existing sandbox are preserved. Manage its rejected attachment in Sandboxes; no replacement will be created."
+                        };
+                        return Err(format!("{} {recovery}", outcome.error.unwrap_or_else(|| "Crew operation was rejected.".into())));
+                    }
+                    if let Some((id, next)) = crate::settings::crew::attachment_after_create(&outcome) {
+                        this.update(cx, |composer, cx| {
+                            composer.scaffold_command = Some(id.clone());
+                            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| { settings.crew_recovery_commands.insert(recovery_key.clone(), id.clone()); });
+                        }).map_err(|e| e.to_string())?;
+                        command_id = id;
+                        control = Some(next);
+                        continue;
+                    }
+                    let Some((session, device)) = crate::settings::crew::attached_session(&outcome) else {
+                        return Err(format!("{} Your draft is preserved. Submit again to check this same operation; no create or attach will be replayed.", outcome.error.unwrap_or_else(|| format!("Crew operation is {}.", outcome.status))));
+                    };
+                    let (session, device) = (session.to_string(), device.to_string());
+                    for _ in 0..60 {
+                        let ready = this.update(cx, |composer, cx| {
+                            let state = composer.state.read(cx);
+                            state.chats.iter().any(|chat| chat.id == session && chat.device_id == device && chat.cwd.is_some()) && state.device_online(&device, chrono::Utc::now())
+                        }).map_err(|e| e.to_string())?;
+                        if ready {
+                            let mut config = resolved.chat_config().ok_or_else(|| "Crew model configuration is unavailable.".to_string())?;
+                            this.update(cx, |composer, cx| {
+                                if let Some(existing) = composer.state.read(cx).chats.iter()
+                                    .find(|chat| chat.id == session).and_then(|chat| chat.config.as_ref()) {
+                                    config.sandbox = existing.sandbox;
+                                }
+                            }).map_err(|e| e.to_string())?;
+                            attachments::call_with_timeout(&engine, cx.background_executor(), methods::MUTATE,
+                                serde_json::json!({"op": "setChatConfig", "chatId": session, "config": config}),
+                                std::time::Duration::from_secs(30)).await?;
+                            return Ok((session, config));
+                        }
+                        cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                    }
+                    return Err("Crew is attached but its session host is not online yet. Your draft is preserved; submit again to check the same sandbox.".into());
+                }
+            }.await;
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                match result {
+                    Ok((session, config)) => {
+                        if composer.state.read(cx).selected_chat.is_some() || composer.pickers.read(cx).draft().scaffold_database != Some(database) {
+                            composer.show_error("Crew sandbox is attached. Return to the original Scaffold draft to submit; no prompt was sent.", cx);
+                            return;
+                        }
+                        if composer.input.read(cx).text() != submitted_text
+                            || !composer.staged().iter().map(|attachment| &attachment.id).eq(submitted_attachments.iter())
+                            || !composer.staged_appshots().is_empty() || !composer.staged_comments(cx).is_empty() {
+                            composer.show_error("Your draft changed while Crew started. Submit again to use this same attached sandbox; nothing was sent.", cx);
+                            return;
+                        }
+                        composer.state.update(cx, |state, cx| { state.apply_chat_config(&session, config); state.select_chat(Some(session.clone()), cx); });
+                        composer.send(submitted_text, false, cx);
+                        if composer.sending { composer.scaffold_admission = Some(session); }
+                    }
+                    Err(error) => composer.show_error(error, cx),
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
     /// Queue a Run doc command with an optimistic echo — or, with the agent
     /// busy, park the message on the chat's pending queue instead. New chats
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        if (self.scaffold_admission.as_ref() == self.state.read(cx).selected_chat.as_ref() && self.scaffold_admission.is_some())
+            || self.state.read(cx).selected_chat.as_ref().is_some_and(|chat| crate::settings::current(cx).crew_pending_prompts.contains_key(chat)) {
+            self.show_error("The initial Crew command has an uncertain outcome. Check session history and delivery status; it will not be replayed.", cx);
+            return;
+        }
+        if self.state.read(cx).selected_chat.is_none() && self.pickers.read(cx).draft().scaffold_database.is_some() {
+            self.provision_scaffold(cx);
+            return;
+        }
         if !self.check_reference_delivery(&text, cx) {
             return;
         }
@@ -8806,7 +8990,8 @@ impl Composer {
         let plan = self.pickers.read(cx).checkout_plan();
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
-        let resolved = self.pickers.read(cx).resolved(cx);
+        let resolved = self.scaffold_config.as_ref().filter(|_| self.scaffold_session.as_deref() == Some(chat_id.as_str()))
+            .cloned().unwrap_or_else(|| self.pickers.read(cx).resolved(cx));
         if self.state.read(cx).managed_inference {
             if !matches!(self.state.read(cx).auth, Some(zeron_proto::AuthState::SignedIn { .. })) {
                 self.show_error("Sign in to Crew before sending in managed mode. Local provider fallback is disabled.", cx);
@@ -9084,7 +9269,9 @@ impl Composer {
         let restore_text = typed;
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
+        let scaffold_initial = self.scaffold_session.as_deref() == Some(chat_id.as_str()) && self.scaffold_command.is_some();
         self.send_task = Some(cx.spawn(async move |this, cx| {
+            let mut admission_attempted = false;
             let result: Result<Option<String>, String> = async {
                 // Attachments stage FIRST — before the chat row or anything
                 // else exists. Staging is chat-independent (keyed by
@@ -9124,6 +9311,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             None,
+                            &chat_id,
                             upload_id,
                             att,
                             Some(progress.clone()),
@@ -9159,6 +9347,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &chat_id,
                             upload_id,
                             att,
                             Some(progress.clone()),
@@ -9441,6 +9630,14 @@ impl Composer {
                 }
                 // Deadline-bounded: QueueCommand is a local write (in-process
                 // or IPC), but a deferred engine handle can park forever.
+                if scaffold_initial {
+                    this.update(cx, |_, cx| {
+                        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                            settings.crew_pending_prompts.insert(chat_id.clone(), message_id.clone());
+                        });
+                    }).map_err(|e| e.to_string())?;
+                    admission_attempted = true;
+                }
                 let queued = attachments::call_with_timeout(
                     &engine,
                     cx.background_executor(),
@@ -9542,6 +9739,16 @@ impl Composer {
             }
             this.update(cx, |composer, cx| {
                 composer.sending = false;
+                if scaffold_initial && (result.is_ok() || !admission_attempted) {
+                    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                        if settings.crew_pending_prompts.get(&err_chat_id) == Some(&err_message_id) {
+                            settings.crew_pending_prompts.remove(&err_chat_id);
+                        }
+                    });
+                    if composer.scaffold_session.as_deref() == Some(err_chat_id.as_str()) {
+                        composer.finish_scaffold_provisioning(cx);
+                    }
+                }
                 composer
                     .state
                     .update(cx, |s, _| s.end_upload_progress());
@@ -12422,6 +12629,81 @@ mod tests {
                 None,
                 "{literal:?}"
             );
+        }
+    }
+
+    #[gpui::test]
+    fn rejected_scaffold_create_releases_database_choice_but_unknown_and_attach_do_not(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            composer.input.update(cx, |input, cx| input.set_text("keep my prompt", cx));
+            composer.attachments.insert(composer.current_key.clone(), vec![attachments::stage_png_bytes("draft.png".into(), Vec::new())]);
+            for (command, status, released) in [("one:create", "unknown", false), ("one:create:attach", "rejected", false), ("one:create", "rejected", true)] {
+                composer.scaffold_command = Some(command.into());
+                composer.scaffold_recovery_key = Some("scope".into());
+                composer.scaffold_session = Some("session".into());
+                composer.scaffold_config = Some(Default::default());
+                composer.scaffold_database = Some(zeron_proto::ScaffoldDatabaseEnvironment::StagingSnapshot);
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings.crew_recovery_commands.insert("scope".into(), command.into());
+                });
+                composer.retire_rejected_scaffold_create(&crate::settings::crew::Outcome {
+                    command_id: command.into(), status: status.into(), result: None, error: Some("Unsupported database".into()),
+                }, cx);
+                assert_eq!(composer.scaffold_command.is_none(), released);
+                assert_eq!(composer.scaffold_recovery_key.is_none(), released);
+                assert_eq!(composer.scaffold_session.is_none(), released);
+                assert_eq!(composer.scaffold_config.is_none(), released);
+                // The same guard used before submission now permits changing to Local.
+                assert_eq!(!composer.scaffold_database.is_some_and(|database| database != zeron_proto::ScaffoldDatabaseEnvironment::Local), released);
+                assert_eq!(!crate::settings::current(cx).crew_recovery_commands.contains_key("scope"), released);
+                assert_eq!(composer.input.read(cx).text(), "keep my prompt");
+                assert_eq!(composer.staged().len(), 1);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn observed_scaffold_prompt_clears_completed_provisioning_without_clearing_another_command(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        for newer_command in [false, true] {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("session".into());
+                state.transcript = vec![SessionMessageEntry {
+                    id: "initial-message".into(), role: MessageRole::User,
+                    parts: vec![], created_at: 0, device_id: "remote".into(),
+                    status: None, continuation_of: None, duration_ms: None,
+                }];
+                state
+            });
+            let composer = cx.new(|cx| Composer::new(state, cx));
+            composer.update(cx, |composer, cx| {
+                composer.scaffold_command = Some("one:create:attach".into());
+                composer.scaffold_recovery_key = Some("scope".into());
+                composer.scaffold_session = Some("session".into());
+                composer.scaffold_config = Some(Default::default());
+                composer.scaffold_database = Some(zeron_proto::ScaffoldDatabaseEnvironment::Local);
+                composer.scaffold_admission = Some("session".into());
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings.crew_pending_prompts.insert("session".into(), "initial-message".into());
+                    settings.crew_recovery_commands.insert("scope".into(), if newer_command { "another-command" } else { "one:create:attach" }.into());
+                });
+                composer.on_state_changed(cx);
+                assert!(composer.scaffold_command.is_none());
+                assert!(composer.scaffold_recovery_key.is_none());
+                assert!(composer.scaffold_session.is_none());
+                assert!(composer.scaffold_config.is_none());
+                assert!(composer.scaffold_database.is_none());
+                assert!(composer.scaffold_admission.is_none());
+                let settings = crate::settings::current(cx);
+                assert!(!settings.crew_pending_prompts.contains_key("session"));
+                assert_eq!(settings.crew_recovery_commands.get("scope").map(String::as_str), newer_command.then_some("another-command"));
+            });
         }
     }
 

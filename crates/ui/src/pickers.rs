@@ -98,12 +98,21 @@ pub fn bump_harness_catalog(cx: &mut App) {
 pub struct DraftConfig {
     pub harness: Option<HarnessId>,
     pub model: Option<String>,
+    pub scaffold_database: Option<ScaffoldDatabaseEnvironment>,
     pub reasoning: Option<ReasoningLevel>,
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
     /// Where the new session runs (the t3code env-mode).
     pub checkout: CheckoutKind,
+}
+
+pub(crate) fn scaffold_destination_label(database: ScaffoldDatabaseEnvironment) -> &'static str {
+    match database {
+        ScaffoldDatabaseEnvironment::Local => "Scaffold (Local DB)",
+        ScaffoldDatabaseEnvironment::StagingSnapshot => "Scaffold (Staging DB)",
+        ScaffoldDatabaseEnvironment::ProductionSnapshot => "Scaffold (Production DB)",
+    }
 }
 
 /// Where a new session runs (t3code's env-mode: `local | worktree`). "Current
@@ -761,6 +770,7 @@ pub struct Pickers {
     /// emits the local device's title settings instead of a composer draft.
     /// `config.harness` then only tracks the tab being browsed.
     title: Option<TitleSettings>,
+    managed_models_only: bool,
     /// Sticky last-used picks (zeron `zeron.composer.defaults:v1`): seeds the
     /// new-chat chips and is rewritten on every new-chat pick.
     defaults: ComposerDefaults,
@@ -901,6 +911,12 @@ impl Pickers {
         Self::build(state, Some(settings), cx)
     }
 
+    pub(crate) fn new_for_sandboxes(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut picker = Self::new_for_titles(state, TitleSettings { harness: Some(HarnessId::Omp), model: None }, cx);
+        picker.managed_models_only = true;
+        picker
+    }
+
     pub fn set_title_settings(&mut self, settings: TitleSettings, cx: &mut Context<Self>) {
         self.config.harness = None;
         self.title = Some(settings);
@@ -966,6 +982,7 @@ impl Pickers {
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
+                this.config.scaffold_database = None;
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
@@ -1047,6 +1064,7 @@ impl Pickers {
         let device_owner = state.read(cx).effective_device_id();
         Self {
             state,
+            managed_models_only: false,
             space_owner,
             device_owner,
             target_generation: 0,
@@ -1155,6 +1173,10 @@ impl Pickers {
     /// narrowed to title-capable agents when bound to thread naming.
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
         let mut offered = offered_harnesses(list);
+        if self.managed_models_only || self.config.scaffold_database.is_some() {
+            offered.retain(|d| d.id == HarnessId::Omp);
+            return offered;
+        }
         if self.title.is_some() {
             offered.retain(|d| zeron_harness::supports_titles(d.id) && d.id != HarnessId::Mock);
         }
@@ -1172,7 +1194,7 @@ impl Pickers {
     /// anywhere" from a Mac without codex).
     fn space_target(&self, cx: &App) -> Option<String> {
         // Thread naming is this device's setting; so are its catalogs.
-        if self.title.is_some() {
+        if self.title.is_some() || self.config.scaffold_database.is_some() {
             return None;
         }
         let state = self.state.read(cx);
@@ -1182,6 +1204,7 @@ impl Pickers {
 
     /// Effective harness: picked, or the chat's config, or the first listed.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+        if self.managed_models_only || self.config.scaffold_database.is_some() { return Some(HarnessId::Omp); }
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -1798,7 +1821,12 @@ impl Pickers {
                         // Display hygiene for catalogs from older engines
                         // (`default` alias rows, orphan `[1m]` variants,
                         // version-less alias labels).
-                        Ok(models) => Loadable::Ready(normalize_model_rows(harness, models)),
+                        Ok(mut models) => {
+                            if pickers.managed_models_only || pickers.config.scaffold_database.is_some() {
+                                models.retain(|model| zeron_proto::AgentRoute::from_omp_model(&model.id).is_some());
+                            }
+                            Loadable::Ready(normalize_model_rows(harness, models))
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -2803,21 +2831,36 @@ impl Pickers {
         self.device_rows(cx)
             .iter()
             .position(|row| match &row.target {
-                DeviceTarget::Device { space: Some(space), .. } => selected.as_deref() == Some(space.id.as_str()),
-                DeviceTarget::Device { device_id, .. } => effective.as_deref() == Some(device_id.as_str()),
-                DeviceTarget::Scaffold(_) => false,
+                DeviceTarget::Device { space: Some(space), .. } => self.config.scaffold_database.is_none() && selected.as_deref() == Some(space.id.as_str()),
+                DeviceTarget::Device { device_id, .. } => self.config.scaffold_database.is_none() && effective.as_deref() == Some(device_id.as_str()),
+                DeviceTarget::Scaffold(database) => self.config.scaffold_database == Some(*database),
             })
             .unwrap_or(0)
     }
 
-    /// Select a checkout or open the existing sandbox flow with its database mode.
+    /// Keep remote provisioning on the composer; selection never creates a sandbox.
     fn pick_device_row(&mut self, row: DeviceRow, cx: &mut Context<Self>) {
+        if self.config.scaffold_database.is_some() || matches!(&row.target, DeviceTarget::Scaffold(_)) {
+            self.models.clear();
+            self.stale_models.clear();
+            self.revalidating.clear();
+            self.load_task = None;
+            self.harnesses = Loadable::Idle;
+            self.harnesses_stale = false;
+            self.harnesses_revalidating = false;
+            self.target_generation = self.target_generation.wrapping_add(1);
+            self.catalog_rev += 1;
+        }
+        self.config.scaffold_database = None;
         match row.target {
             DeviceTarget::Device { space: Some(space), .. } => self.pick_space(space.id, cx),
             DeviceTarget::Device { device_id, .. } => self.pick_device(device_id, cx),
             DeviceTarget::Scaffold(database) => {
-                self.dismiss(cx);
-                cx.defer(move |cx| cx.dispatch_action(&crate::shell::OpenSandboxes(database)));
+                self.config.scaffold_database = Some(database);
+                self.config.harness = Some(HarnessId::Omp);
+                self.config.model = None;
+                self.ensure_models(HarnessId::Omp, true, cx);
+                self.close(cx);
             }
         }
     }
@@ -2872,9 +2915,9 @@ impl Pickers {
                                 let is_local = matches!(&row.target, DeviceTarget::Device { device_id, .. } if local.as_deref() == Some(device_id.as_str()));
                                 let label = row.name.clone();
                                 let is_selected = match &row.target {
-                                    DeviceTarget::Device { space: Some(space), .. } => selected_space.as_deref() == Some(space.id.as_str()),
-                                    DeviceTarget::Device { device_id, .. } => effective.as_deref() == Some(device_id.as_str()),
-                                    DeviceTarget::Scaffold(_) => false,
+                                    DeviceTarget::Device { space: Some(space), .. } => self.config.scaffold_database.is_none() && selected_space.as_deref() == Some(space.id.as_str()),
+                                    DeviceTarget::Device { device_id, .. } => self.config.scaffold_database.is_none() && effective.as_deref() == Some(device_id.as_str()),
+                                    DeviceTarget::Scaffold(database) => self.config.scaffold_database == Some(*database),
                                 };
                                 let detail = row.detail.clone().map(SharedString::from);
                                 popover::picker_row(
@@ -3431,6 +3474,9 @@ impl Pickers {
             .relative()
             .child(self.measure_trigger(kind, cx))
             .id(id.clone())
+            .role(gpui::Role::Button)
+            .aria_label(label.clone())
+            .tab_index(0)
             .h(px(32.0))
             .max_w(px(248.0))
             // Shrinkable under row pressure — four footer chips share one
@@ -3677,7 +3723,8 @@ impl Pickers {
                 .map(str::to_string)
                 .unwrap_or_else(|| "This device".to_string())
                 .into();
-            let offline = device_id
+            let device_label = self.config.scaffold_database.map(|database| SharedString::from(scaffold_destination_label(database))).unwrap_or(device_label);
+            let offline = self.config.scaffold_database.is_none() && device_id
                 .as_deref()
                 .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
             let project_label: SharedString = state
@@ -3712,13 +3759,13 @@ impl Pickers {
             .flex_wrap()
             .items_center()
             .gap(px(4.0))
-            .child(attach_overlay_end(
+            .when(self.config.scaffold_database.is_none(), |el| el.child(attach_overlay_end(
                 project_chip,
                 &mut overlay,
                 PickerKind::Space,
                 "project-popover",
                 closing,
-            ))
+            )))
             .child(attach_overlay_end(
                 device_chip,
                 &mut overlay,
@@ -3735,6 +3782,7 @@ impl Pickers {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if self.config.scaffold_database.is_some() { return None; }
         let git = self
             .state
             .read(cx)
@@ -6329,7 +6377,9 @@ impl Render for Pickers {
         // so instead of wearing a brand mark for an agent that can't run.
         let no_agents = self.no_agents_available() && self.effective_harness(cx).is_none();
         let model_name = self.model_name(cx);
-        let model_label: SharedString = if let Some(title) = &self.title {
+        let model_label: SharedString = if self.managed_models_only && self.title.as_ref().is_none_or(|title| title.model.is_none()) {
+            "Choose a managed model…".into()
+        } else if let Some(title) = &self.title {
             // The saved choice, not the tab being browsed.
             match (title.harness, title.model.as_deref()) {
                 (None, _) => "Session agent".into(),
@@ -7707,6 +7757,10 @@ mod tests {
                 pickers.search.update(cx, |search, cx| search.set_text(query, cx));
                 let targets: Vec<_> = pickers.filtered_device_rows(cx).into_iter().map(|row| row.target).collect();
                 assert_eq!(targets, [DeviceTarget::Scaffold(database)]);
+                pickers.pick_device_row(DeviceRow { target: DeviceTarget::Scaffold(database), name: scaffold_destination_label(database).into(), detail: None }, cx);
+                assert_eq!(pickers.draft().scaffold_database, Some(database));
+                assert!(pickers.state.read(cx).selected_chat.is_none());
+                assert_eq!(pickers.effective_harness(cx), Some(HarnessId::Omp));
             }
             assert_eq!(pickers.state.read(cx).selected_space.as_deref(), Some("server"));
         });

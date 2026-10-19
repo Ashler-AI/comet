@@ -802,7 +802,7 @@ pub struct LinkCacheConfig {
     pub cooldown_base: Duration,
     pub cooldown_max: Duration,
     /// Readiness probe budget: the relay accepts client joins even when the host is
-    /// offline, so a `ListHarnesses` round-trip proves the path before caching.
+    /// offline, so a `LocalDevice` round-trip proves the path before caching.
     pub probe_timeout: Duration,
     /// Optional dial gate: a `Dark` verdict fails the call fast with NO dial.
     /// Without it, retrying callers hot-dialed devices that had been offline
@@ -1123,7 +1123,7 @@ impl LinkCache {
         // Readiness probe: prove the host answers before caching (an offline host bounces
         // host_offline, which closes the link and fails this call fast).
         let client = link.client();
-        let probe = client.call(crate::methods::LIST_HARNESSES, serde_json::json!({}));
+        let probe = client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({}));
         tokio::time::timeout(self.config.probe_timeout, probe)
             .await
             .map_err(|_| {

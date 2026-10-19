@@ -195,7 +195,11 @@ fn registry_for(harness: HarnessId) -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
+    let core = EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles");
+    let mut auth = zeron_engine::AuthConfig::new("http://localhost:27640", dir);
+    auth.allow_dev_auth = true;
+    core.set_auth(zeron_engine::Auth::new(auth));
+    core
 }
 
 async fn git(cwd: &std::path::Path, args: &[&str]) {
@@ -236,15 +240,15 @@ struct StaticChangeRequestLookup {
 
 /// Models a host from before the checkout change-request watch existed.
 struct LegacyChangeRequestService {
-    list_harnesses_calls: AtomicUsize,
+    readiness_and_catalog_calls: AtomicUsize,
 }
 
 #[async_trait]
 impl RpcService for LegacyChangeRequestService {
     async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            methods::LIST_HARNESSES => {
-                self.list_harnesses_calls.fetch_add(1, Ordering::AcqRel);
+            methods::LOCAL_DEVICE | methods::LIST_HARNESSES => {
+                self.readiness_and_catalog_calls.fetch_add(1, Ordering::AcqRel);
                 RpcReply::value(&serde_json::json!([]))
             }
             other => Err(RpcError::UnknownMethod(other.into())),
@@ -521,7 +525,7 @@ async fn unsupported_remote_change_request_watch_keeps_the_shared_device_link() 
     let (relay_url, _relay) = fake_device_room().await;
     let dirs = tempfile::tempdir().expect("tempdir");
     let legacy = Arc::new(LegacyChangeRequestService {
-        list_harnesses_calls: AtomicUsize::new(0),
+        readiness_and_catalog_calls: AtomicUsize::new(0),
     });
     let _legacy_host = HostRelay::spawn(
         HostRelayConfig::new(
@@ -583,7 +587,7 @@ async fn unsupported_remote_change_request_watch_keeps_the_shared_device_link() 
         .expect("a capability rejection must not sever the shared link");
     assert_eq!(harnesses, serde_json::json!([]));
     assert_eq!(
-        legacy.list_harnesses_calls.load(Ordering::Acquire),
+        legacy.readiness_and_catalog_calls.load(Ordering::Acquire),
         2,
         "one readiness probe and one forwarded call prove the existing link was reused"
     );
@@ -1999,6 +2003,9 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         None,
     )
     .unwrap();
+    let mut auth = zeron_engine::AuthConfig::new("http://localhost:27640", &remote_dir);
+    auth.allow_dev_auth = true;
+    b.set_auth(zeron_engine::Auth::new(auth));
     let registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
     a.workspace.connect_registry_url(&registry.url());
     b.workspace.connect_registry_url(&registry.url());

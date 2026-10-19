@@ -10,10 +10,10 @@ use super::widgets;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CrewStatus {
-    scope: CollaborationScope,
-    principal_id: String,
-    role: String,
+pub(crate) struct CrewStatus {
+    pub(crate) scope: CollaborationScope,
+    pub(crate) principal_id: String,
+    pub(crate) role: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -34,11 +34,59 @@ struct Accounts { accounts: Vec<SharedAccount> }
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Outcome {
-    command_id: String,
-    status: String,
-    result: Option<ScaffoldEnvironmentControlResult>,
-    error: Option<String>,
+pub(crate) struct Outcome {
+    pub(crate) command_id: String,
+    pub(crate) status: String,
+    pub(crate) result: Option<ScaffoldEnvironmentControlResult>,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) fn attachment_after_create(outcome: &Outcome) -> Option<(String, ScaffoldEnvironmentControl)> {
+    if outcome.status != "confirmed" || !outcome.command_id.ends_with(":create") { return None; }
+    let result = outcome.result.as_ref()?;
+    let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source else { return None; };
+    Some((format!("{}:attach", outcome.command_id), ScaffoldEnvironmentControl::Attach {
+        sandbox_id: sandbox_id.clone(), scope: result.environment.scope.clone(),
+    }))
+}
+
+pub(crate) fn attached_session(outcome: &Outcome) -> Option<(&str, &str)> {
+    if outcome.status != "confirmed" { return None; }
+    let result = outcome.result.as_ref()?;
+    result.control_grant.as_ref()?;
+    Some((result.environment.scope.session_id.as_deref()?, result.attached_device_id.as_deref()?))
+}
+
+#[cfg(test)]
+mod provisioning_tests {
+    use super::*;
+
+    #[test]
+    fn create_requires_a_distinct_durable_attach_and_unknown_never_advances() {
+        let mut outcome: Outcome = serde_json::from_value(json!({
+            "commandId": "one:create", "status": "confirmed", "result": {
+                "environment": { "source": { "kind": "scaffold", "sandbox_id": "sandbox", "lifecycle": "starting" },
+                    "ownerPrincipal": "owner", "scope": { "projectId": "project", "sessionId": "session" } }
+            }
+        })).unwrap();
+        let (id, control) = attachment_after_create(&outcome).unwrap();
+        assert_eq!(id, "one:create:attach");
+        assert!(matches!(control, ScaffoldEnvironmentControl::Attach { sandbox_id, scope } if sandbox_id == "sandbox" && scope.session_id.as_deref() == Some("session")));
+        assert!(attached_session(&outcome).is_none());
+        outcome.status = "unknown".into();
+        assert!(attachment_after_create(&outcome).is_none());
+        assert!(attached_session(&outcome).is_none());
+        outcome.command_id = id;
+        outcome.status = "confirmed".into();
+        let result = outcome.result.as_mut().unwrap();
+        result.attached_device_id = Some("sandbox-host".into());
+        assert!(attached_session(&outcome).is_none());
+        outcome.result.as_mut().unwrap().control_grant = Some(zeron_proto::ScaffoldControlGrant {
+            id: "grant".into(), expires_at: i64::MAX, capabilities: vec![],
+        });
+        assert_eq!(attached_session(&outcome), Some(("session", "sandbox-host")));
+        assert!(attachment_after_create(&outcome).is_none());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,11 +104,10 @@ pub struct CrewAccounts {
     error: Option<String>,
     notice: Option<String>,
     confirmation: Option<(&'static str, Value, String)>,
-    source: Entity<ComposerInput>,
-    region: Entity<ComposerInput>,
+    model_picker: Entity<crate::pickers::Pickers>,
+    _model_picked: Subscription,
     model: Option<String>,
     models: Vec<zeron_proto::Model>,
-    model_select: widgets::SelectState,
     account: Option<String>,
     account_select: widgets::SelectState,
     database: ScaffoldDatabaseEnvironment,
@@ -71,13 +118,18 @@ pub struct CrewAccounts {
 impl CrewAccounts {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let model_picker = cx.new(|cx| crate::pickers::Pickers::new_for_sandboxes(state.clone(), cx));
+        let model_picked = cx.subscribe(&model_picker, |page: &mut Self, _, event: &crate::pickers::TitleModelPicked, cx| {
+            page.model = event.0.model.clone();
+            page.account = None;
+            cx.notify();
+        });
         let mut page = Self {
             annotations: cx.new(|cx| super::annotations::Annotations::new(state.clone(), cx)),
             state, view: CrewView::Accounts, status: None, accounts: vec![], environments: vec![], outcome: None,
             busy: false, error: None, notice: None, confirmation: None,
-            source: cx.new(|cx| ComposerInput::new("Deployment default (optional override)", cx)),
-            region: cx.new(|cx| ComposerInput::new("Region (empty uses deployment default)", cx)),
-            model: None, models: vec![], model_select: widgets::SelectState::default(),
+            model_picker, _model_picked: model_picked,
+            model: None, models: vec![],
             account: None, account_select: widgets::SelectState::default(),
             database: ScaffoldDatabaseEnvironment::Local,
             database_select: widgets::SelectState::default(),
@@ -150,12 +202,21 @@ impl CrewAccounts {
             self.error = Some("Refresh the verified Crew scope before issuing an operation.".into()); cx.notify(); return;
         };
         let recovery_key = json!([status.principal_id, status.scope]).to_string();
+        if method == "scaffold.control" {
+            if let Some(pending) = super::current(cx).crew_recovery_commands.get(&recovery_key) {
+                let next = self.outcome.as_ref().filter(|outcome| &outcome.command_id == pending).and_then(attachment_after_create);
+                if !next.is_some_and(|(id, _)| params.get("commandId").and_then(Value::as_str) == Some(id.as_str())) {
+                    self.outcome = Some(Outcome { command_id: pending.clone(), status: "unknown".into(), result: None, error: None });
+                    self.error = Some("Reconcile the pending Crew operation before issuing another command.".into());
+                    cx.notify(); return;
+                }
+            }
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine unavailable. No action was sent.".into()); cx.notify(); return;
         };
         self.busy = true; self.error = None; self.notice = None;
         let command_id = params.get("commandId").and_then(Value::as_str).map(str::to_owned);
-        let open_environment = method == "scaffold.control" && matches!(params.pointer("/control/operation").and_then(Value::as_str), Some("attach" | "create"));
         if let Some(id) = command_id.as_ref() {
             super::update(super::SavePolicy::Immediate, cx, |settings| { settings.crew_recovery_commands.insert(recovery_key.clone(), id.clone()); });
             self.outcome = Some(Outcome { command_id: id.clone(), status: "pending".into(), result: None, error: None });
@@ -167,17 +228,26 @@ impl CrewAccounts {
                 match result {
                     Ok(value) if command_id.is_some() => match serde_json::from_value::<Outcome>(value) {
                         Ok(outcome) => {
+                            if let Some((command_id, control)) = attachment_after_create(&outcome) {
+                                page.outcome = Some(outcome);
+                                page.request("scaffold.control", json!({"commandId": command_id, "control": control}), cx);
+                                return;
+                            }
                             if let Some(result) = &outcome.result {
                                 page.environments.retain(|environment| environment.scope != result.environment.scope);
                                 page.environments.push(result.environment.clone());
-                                if open_environment && outcome.status == "confirmed" {
+                                if attached_session(&outcome).is_some() {
                                     if let Some(link) = crate::links::crew_scope_link(&result.environment.scope) {
                                         page.state.update(cx, |state, cx| state.open_deep_link(&link, cx));
                                     }
                                 }
                             }
                             if matches!(outcome.status.as_str(), "confirmed" | "rejected") {
-                                super::update(super::SavePolicy::Immediate, cx, |settings| { settings.crew_recovery_commands.remove(&recovery_key); });
+                                super::update(super::SavePolicy::Immediate, cx, |settings| {
+                                    if settings.crew_recovery_commands.get(&recovery_key) == Some(&outcome.command_id) {
+                                        settings.crew_recovery_commands.remove(&recovery_key);
+                                    }
+                                });
                             }
                             let rejected = outcome.status == "rejected";
                             page.outcome = Some(outcome);
@@ -211,17 +281,15 @@ impl CrewAccounts {
         let Some(route) = self.agent_route() else {
             self.error = Some("Choose a managed model before creating a sandbox.".into()); cx.notify(); return;
         };
-        let source = self.source.read(cx).text().trim().to_owned();
-        let region = self.region.read(cx).text().trim().to_owned();
         let mut scope = status.scope.clone();
         scope.session_id = Some(uuid::Uuid::new_v4().to_string());
-        let description = format!("Create a new Scaffold sandbox from {} using {} and the {} database? This creates a new environment; it does not attach to an existing sandbox.", if source.is_empty() { "the deployment default" } else { &source }, route.omp_model(), self.database.as_str());
+        let description = format!("Create a new Scaffold sandbox using {} and the {} database? Source and region use deployment defaults.", route.omp_model(), self.database.as_str());
         let control = ScaffoldEnvironmentControl::Create {
-            scope, name: None, source_ref: (!source.is_empty()).then_some(source),
-            region: (!region.is_empty()).then_some(region), database_environment: self.database,
+            scope, name: None, source_ref: None,
+            region: None, database_environment: self.database,
             agent_route: route,
         };
-        self.confirmation = Some(("scaffold.control", json!({"commandId": uuid::Uuid::new_v4().to_string(), "control": control}),
+        self.confirmation = Some(("scaffold.control", json!({"commandId": format!("{}:create", uuid::Uuid::new_v4()), "control": control}),
             description));
         cx.notify();
     }
@@ -249,7 +317,11 @@ impl CrewAccounts {
         if !self.models.iter().any(|model| model.id == selected) { return None; }
         let route = AgentRoute::from_omp_model(selected)?;
         Some(match &self.account {
-            Some(account) => AgentRoute::pinned(route.provider, route.model, account.clone()),
+            Some(account) => {
+                let provider = match route.provider { AgentProvider::Anthropic => "anthropic", AgentProvider::OpenAi => "openai" };
+                if !self.accounts.iter().any(|candidate| candidate.id == *account && candidate.provider.eq_ignore_ascii_case(provider) && matches!(candidate.status.as_str(), "active" | "connected" | "ready")) { return None; }
+                AgentRoute::pinned(route.provider, route.model, account.clone())
+            }
             None => route,
         })
     }
@@ -364,21 +436,10 @@ impl Render for CrewAccounts {
         }
         if status.role == "local_controller" {
             body = body.child(widgets::row_title(&theme, "New sandbox"))
-                .child(Self::field(&theme, "Source branch or commit (optional)", &self.source))
-                .child(widgets::page_subtitle(&theme, "Leave source blank to use the deployment's configured source. Model access is validated by Agent Auth when the sandbox starts."))
-                .child(Self::field(&theme, "Region (optional)", &self.region));
-            let selected_model = self.models.iter().position(|model| Some(&model.id) == self.model.as_ref()).map_or(0, |ix| ix + 1);
-            let ids: Vec<_> = self.models.iter().map(|model| model.id.clone()).collect();
-            let options = std::iter::once(widgets::SelectOption::new("Choose a model…")).chain(self.models.iter().map(|model| {
-                let provider = AgentRoute::from_omp_model(&model.id).map(|route| if route.provider == AgentProvider::Anthropic { "Anthropic" } else { "OpenAI" }).unwrap_or("Managed");
-                widgets::SelectOption::new(format!("{provider} · {}", model.label))
-            })).collect::<Vec<_>>();
-            let model = widgets::select("crew-model", "Managed model", &theme, |page: &mut Self| &mut page.model_select)
-                .options(options, selected_model)
-                .on_select(move |page, ix, _, cx| { page.model = ix.checked_sub(1).and_then(|ix| ids.get(ix).cloned()); page.account = None; cx.notify(); })
-                .render(&self.model_select, cx);
+                .child(widgets::page_subtitle(&theme, "Source and region use deployment defaults. Choose a managed model and shared account."));
+            let model = self.model_picker.clone();
             let provider = self.agent_route().map(|route| route.provider);
-            let candidates: Vec<_> = self.accounts.iter().filter(|account| match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), None => false }).collect();
+            let candidates: Vec<_> = self.accounts.iter().filter(|account| matches!(account.status.as_str(), "active" | "connected" | "ready") && match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), None => false }).collect();
             let selected = candidates.iter().position(|account| Some(&account.id) == self.account.as_ref()).map_or(0, |ix| ix + 1);
             let ids: Vec<_> = candidates.iter().map(|account| account.id.clone()).collect();
             let options = std::iter::once(widgets::SelectOption::new("Automatic · shared pool")).chain(candidates.iter().map(|account| widgets::SelectOption::new(account.email.clone().or(account.display_name.clone()).unwrap_or_else(|| "Shared account".into())))).collect::<Vec<_>>();

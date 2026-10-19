@@ -4504,7 +4504,7 @@ impl DocHost {
             let Some(target) = self.remote_host_for(chat) else {
                 return true; // became locally hosted: bytes already here
             };
-            match self.push_attachments(&target, transfers).await {
+            match self.push_attachments(chat, &target, transfers).await {
                 Ok(()) => {
                     tracing::info!(chat = %chat, device = %target,
                         count = transfers.len(), "queued attachments delivered");
@@ -4820,6 +4820,7 @@ impl DocHost {
     /// of feeding a zombie pipe forever (2026-08-19 incident).
     async fn push_attachments(
         &self,
+        chat_id: &str,
         target: &str,
         transfers: &[crate::uploads::AttachmentTransfer],
     ) -> Result<(), TransferError> {
@@ -4857,6 +4858,7 @@ impl DocHost {
             loop {
                 let end = (start + TRANSFER_CHUNK_B64).min(b64.len());
                 let params = serde_json::json!({
+                    "chatId": chat_id,
                     "uploadId": transfer.upload_id, "seq": seq, "data": &b64[start..end],
                 });
                 let call = client.call(zeron_rpc::methods::UPLOAD_CHUNK, params);
@@ -4885,6 +4887,7 @@ impl DocHost {
                 }
             }
             let params = serde_json::json!({
+                "chatId": chat_id,
                 "uploadId": transfer.upload_id, "fileName": transfer.file_name,
             });
             let call = client.call(zeron_rpc::methods::UPLOAD_COMMIT, params);

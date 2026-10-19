@@ -4704,12 +4704,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_keeps_credentials_out_of_process_arguments() {
+    async fn attach_starts_host_before_application_ready_and_keeps_credentials_private() {
         let join_expires_at = now_ms() + 60_000;
         let access_expires_at =
             join_expires_at - i64::from(JOIN_GRANT_TTL_SECONDS) * 1000 + DEVICE_ACCESS_TTL_MS;
         let responses = vec![
-            sandbox("ready"),
+            sandbox("starting"),
             r#"{"ok":false,"exitCode":1}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
             format!(
@@ -4737,6 +4737,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(result.environment.source, SessionEnvironmentSource::Scaffold {
+            lifecycle: zeron_proto::ScaffoldLifecycle::Starting, lifecycle_epoch: Some(1), ..
+        }));
+        assert_eq!(result.environment.scope, scope());
+        assert_eq!(result.control_grant.as_ref().unwrap().id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(
             result.attached_device_id.as_deref(),
             Some("comet-scaffold-sandbox-a-e1")
