@@ -48,6 +48,13 @@ the same signed-in owner and scope, and the previously reported session state.
 The first regression build timed out under the default profile; reusing the
 documented low-memory profile completed the regression and desktop builds.
 
+[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39277121002)
+passed for exact code revision `c104782f4b9575397eec90f2a31738aca6dd63c5` on macOS,
+Linux x64 and Linux ARM64, including remote Edge typechecks and browser contracts.
+Both macOS archive checksums and the strict app signature passed; the CI-built
+macOS app is installed and running with all 18 chats retained. Delivery remains
+private/manual and ad-hoc signed, not a shared release-channel promotion.
+
 The separate iOS `ai.ashler.crew.upstream-canary` app exported as version **1.0 (1)**
 with cloud-managed signing; strict signature and production push-entitlement checks
 passed. TestFlight upload is not complete: App Store Connect returned no app record
