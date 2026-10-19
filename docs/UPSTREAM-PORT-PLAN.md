@@ -72,7 +72,7 @@ also passed. The final desktop build timed out locally after 15 minutes rebuildi
 dependencies; the exact-source remote build below passed and supplied the tested
 installed desktop. Local typechecks were intentionally skipped.
 
-[Private artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39334305241)
+[Initial branded artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39334305241)
 passed for exact code revision `9c2268c58871eaaf1342dee15033b15905df9174` on macOS,
 Linux x64 and Linux ARM64, including remote Edge typechecks and browser contracts.
 Archive checksums, executable checksum and strict app signature passed. The
@@ -82,7 +82,7 @@ retained. All four previously failing sandbox histories retained their exact
 message IDs. Native maintenance disclosure and account controls were exercised
 in this CI-built app. Delivery stays private/manual; no shared release channel
 or existing Crew Staging installation was changed.
-Isolated Edge `7e239083-7289-4704-afce-c1448431429c` is deployed; its live health
+Isolated Edge `d6780161-12a7-4da3-a606-31984ae095fc` is deployed; its live health
 response confirms Scaffold auth and the `crew-upstream-canary` environment.
 
 The separate iOS `ai.ashler.crew.upstream-canary` app from source `9c2268c5`
@@ -107,6 +107,53 @@ Source/region inputs are removed and optional diagnostic fields start collapsed.
 The desktop created then resolved one retained annotation on its dedicated smoke
 conversation; the independently authenticated controller received the same ID,
 exact text anchor and resolved state. No existing user conversation was edited.
+
+The final fresh-runtime smoke used sandbox `rcs_93416ae0420298468f4a4aef` and
+session `720d4a20-e8da-4521-bb09-4142c702d0b1`. Attachment enforces the pinned
+Linux executable checksum before launch; the remote device reported `0.2.113`.
+The native turn and two actual simulator continuations produced
+`CREW_CANARY_9C_RUNTIME_OK`, `CREW_CANARY_MOBILE_OK` and `CREW_CANARY_STATUS_OK.`.
+All six complete message IDs were retained and visible in the installed desktop
+and simulator. This does not replace hands-on acceptance on the physical iPhone.
+
+This smoke exposed a scoped Edge schema mismatch: `lastCompletedTurn` was typed
+as a number, but native completion IDs are strings. Whole-batch rejection left
+the session showing `working` after completed inference. `3bdfc486` corrects the
+field type without expanding host authority; five focused workerd checks passed,
+including owner-visible completion and transactional rejection of invalid types
+and foreign identities. The live watcher observed `working` to `idle` at
+`2026-10-19T23:15:48.935Z`, with the final assistant ID retained as the completion
+ID. Authoritative Edge and controller reads subsequently agreed. The initial
+90-second observer timed out before convergence; no restart, re-attachment,
+status override or prompt replay was used, and the delay's cause is unproven.
+The same smoke sandbox was then confirmed stopped (epoch 2); local native history
+and the installed desktop retained all six exact message IDs. No other sandbox
+was stopped and the conversation was not archived or deleted.
+[Exact-source CI](https://github.com/Ashler-AI/comet/actions/runs/39339937493)
+passed for the Edge correction, including remote typechecks, all Edge tests,
+native-browser contracts and macOS/Linux x64/Linux ARM64 packaging.
+
+Stop acceptance also exposed MCP `read_chat` and `get_chat` forcing requests to
+the stopped host despite complete synchronized history. `b9b36ab5` routes both
+read-only consumers through the existing native `transcript` path; live send,
+input-response and turn-wait reads remain explicitly host-targeted. The actual
+CI-built MCP executable returned all six retained complete IDs and
+`get_chat.messageCount:6` with the final assistant marker, without a target-device
+override or fallback. No `openingTail` preview is requested by this path.
+[Final native artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39341325253)
+passed for `b9b36ab5dff291871d6977dcfff8d9128b48fbae` on macOS and both Linux
+architectures, with remote Edge typechecks/tests and native-browser contracts.
+Archive checksums, Linux executable checksum and strict macOS signature passed.
+The final bundle is installed and activated at `/Applications/Crew Canary.app`;
+its executable SHA-256 is
+`cde30d3764fb1cb13fd85aca67a2c4599075f409833934c06c7e64c582cbad06`.
+The restart retained all 27 conversations, both synchronized macOS device IDs,
+all three pre-restart working-session host identities and their message IDs,
+and the six-entry stopped smoke history. Generic app activation did not expose
+Canary IPC; the documented explicit profile/port launch restored the correct
+controller. Keep those coordinates pinned when launching from another Crew
+agent. No existing sandbox was paused or restarted. TestFlight remains 1.0 (3):
+the final caller correction is desktop/CLI-only, not an iOS change.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
@@ -187,14 +234,14 @@ build profile completed. No local typechecks were run.
 
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
-| Desktop | CI-built app retained all 26 conversations; shared-account Refresh, usage resets, both sign-in dialogs, sandbox maintenance disclosure and annotation create/resolve exercised | Real provider credential grant remains user-interactive |
+| Desktop | Final CI-built app retained all 27 conversations and three working-session identities/histories; shared-account Refresh, usage resets, both sign-in dialogs, sandbox maintenance disclosure and annotation create/resolve exercised | Real provider credential grant remains user-interactive |
 | Isolation | Distinct canary bundles/profiles; approved simulator session import retained; TestFlight 1.0 (3) is Testing for the sole authorized tester and 1.0 (2) installation is confirmed by Apple | Updated physical-device acceptance; standalone Google OAuth check waived for dogfooding |
-| Sync | Two controllers retained the same sandbox histories and synchronized a real annotation create/resolve; authenticated iOS warm/cold links and socket-interruption recovery retained history | Physical-network/mobile execution scenarios |
-| Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; current version `9e476e0a-393f-4021-afd3-c54f55b0f563` is healthy and serves mobile controller reads; prior unauthenticated identity/registry/chat checks returned 401 even with forged identity headers, and the public installer returned 404 | Live client revocation and mobile execution scenarios |
-| Scaffold | Exact `69f631b6` executable, native browser and Agent Auth completion; same sandbox ready at epoch 1, paused at 2, resumed and completed inference at 3, stopped at 4 without replacement | Interactive multi-client/mobile acceptance |
+| Sync | Two controllers retained sandbox histories and synchronized a real annotation; authenticated iOS warm/cold links, socket-interruption recovery and two actual simulator continuations retained history; live completion reached idle with its native turn ID | Physical-network recovery and updated physical-device acceptance |
+| Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; version `d6780161-12a7-4da3-a606-31984ae095fc` is healthy and accepts scoped string completion IDs; five focused checks and full remote Edge CI passed; prior forged-identity checks returned 401 and public installer returned 404 | Live client revocation |
+| Scaffold | Fresh `9c2268c5` runtime completed native/mobile inference and same-ID Stop with six retained entries; earlier `69f631b6` pause/resume preserved its sandbox through epochs 1–4; final `b9b36ab5` runtime pin is checksum-verified and its real MCP stopped-history reads passed | Updated physical-device execution |
 | Protocol checks | Device/broker/authority checks 19/19, with failing-before/passing-after resume regression and stale-grant rejection; final remote Worker/provider/vault CI passed including typechecks | Additional interactive client/mobile revocation scenarios |
 | Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Authenticated mobile acceptance |
-| Mobile | Signed simulator restored the approved account, exercised controller/model/sandbox selectors and scoped Stop confirmation without execution, and displayed retained sandbox completion; five native isolation/error checks passed | Physical-network/mobile execution scenarios and updated physical-device acceptance |
+| Mobile | Signed simulator restored the approved account, exercised controller/model/sandbox selectors and scoped Stop confirmation, and completed two real continuations on the fresh smoke sandbox; five native isolation/error checks passed | Physical-network recovery and updated physical-device acceptance |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
 | Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated multi-client/mobile acceptance and final cutover |
 
@@ -355,9 +402,12 @@ process-scoped reachability/socket-interruption simulation, not a physical
 airplane-mode test or a claim that all subsequent network traffic was blocked.
 No message, annotation or sandbox lifecycle operation was submitted.
 
-The configured Linux x64 pin is now the `9c2268c58871eaaf1342dee15033b15905df9174`
+The configured Linux x64 pin is now the `b9b36ab5dff291871d6977dcfff8d9128b48fbae`
 private artifact under `~/.crew-upstream-canary/runtime/`, with verified executable
-SHA-256 `3604c5d710cb8cf49236f8ddb12bbcf00e5c5ebba71c7b90e42c3fb78a7b1f9c`.
+SHA-256 `f48ed03ae72f23f6301879309dccff7f33d89bb726c3ed6d2690641a3c3bce26`.
+The fresh native/mobile inference and final Stop smoke used `9c2268c5`; the
+final `b9b36ab5` delta changes only read-only MCP caller routing, exercised on
+the same stopped history without creating another sandbox.
 The earlier live native-browser and same-ID pause/resume inference evidence used
 `69f631b6c72c55c171f2e74d76121a0814990830`; Stop retained that synchronized history.
 
