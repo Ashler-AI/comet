@@ -324,6 +324,14 @@ still validates actual account/model access at run admission. Managed title
 inference uses the controller's title route; realtime voice and unsupported
 harnesses remain explicitly unavailable, never local-provider fallbacks.
 
+Pre-runtime admission failures (including Agent Auth authority errors) retain an
+assistant error entry and an errored session status, while the command remains
+rejected. A saved user message alone does not imply inference started. After the
+underlying service is restored, explicitly recover a confirmed rejected command
+with a fresh command ID and the original Run payload/message ID; the user entry
+is deduplicated. Do not automatically retry, replace the message ID, or use
+RetryDelivery for an already-saved message (it only reissues undelivered entries).
+
 The copy-only importer passed committed-legacy schema fixtures through the real
 target SQLite/Loro readers, including transcript parts, peer provenance,
 annotation revisions, native OMP bytes, attachments and durable command outcomes.

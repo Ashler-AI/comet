@@ -3226,6 +3226,50 @@ async fn real_image_generation_profile_smoke() {
     core.sessions.shutdown().await;
 }
 
+/// Admission failures precede drive_run, but must still explain the saved
+/// prompt. An explicit new attempt reuses its message identity, never its text
+/// as a second user turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_failure_is_visible_and_recovers_with_same_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(HarnessRegistry::new());
+    let core = EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let payload = SessionCommandPayload::Run {
+        request: run_request("saved prompt"),
+        message_id: "original-message".into(),
+    };
+    // No harness is available yet: rejection happens before a runtime starts.
+    queue_as_viewer(handle.doc(), "admission-failed", payload.clone());
+    wait_for(
+        || matches!(command_status(&core, "admission-failed"), Some((SessionCommandStatus::Rejected, _))),
+        "admission rejected",
+    ).await;
+    let reason = command_status(&core, "admission-failed").unwrap().1.unwrap();
+    let failed = entries(&core);
+    assert_eq!(failed.iter().filter(|e| e.role == MessageRole::User).count(), 1);
+    assert!(failed.iter().any(|e| e.role == MessageRole::Assistant
+        && e.status == Some(MessageStatus::Complete)
+        && matches!(e.parts.as_slice(), [MessagePart::Error { message, .. }] if message == &reason)));
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().status, SessionStatus::Errored);
+    assert_eq!(handle.doc().read_commands().unwrap().len(), 1);
+
+    registry.register(Arc::new(MockHarness { script: mock_script() }));
+    queue_as_viewer(handle.doc(), "explicit-recovery", payload);
+    wait_for(
+        || matches!(command_status(&core, "explicit-recovery"), Some((SessionCommandStatus::Applied, _)))
+            && core.sessions.session_status(CHAT).is_some_and(|s| s.status == SessionStatus::Idle),
+        "explicit recovery completed",
+    ).await;
+    let recovered = entries(&core);
+    let users: Vec<_> = recovered.iter().filter(|e| e.role == MessageRole::User).collect();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, "original-message");
+    assert_eq!(recovered.iter().filter(|e| e.role == MessageRole::Assistant).count(), 2);
+    assert_eq!(command_status(&core, "admission-failed").unwrap().0, SessionCommandStatus::Rejected);
+    core.sessions.shutdown().await;
+}
+
 /// A harness that fails before streaming (an OpenCode server that never
 /// booted) must leave its reason in the transcript, not only a bare
 /// "Run failed" status.

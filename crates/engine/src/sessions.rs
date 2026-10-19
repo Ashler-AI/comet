@@ -610,8 +610,28 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
-        self.dispatch_with(chat_id, harness_id, request, message_id, false)
-            .await
+        let result = self.dispatch_with(chat_id, harness_id, request, message_id, false)
+            .await;
+        // Admission can fail before drive_run exists (for example Agent Auth).
+        // The saved user entry is not proof of execution: retain the reason in
+        // the same durable error-part format as a harness startup failure.
+        if let Err(error) = &result
+            && !lock(&self.inner.runs).contains_key(chat_id)
+        {
+            let written = self.doc_handle(chat_id).and_then(|handle| {
+                finish_segment(
+                    &handle.writer(), None, &new_id(), &self.inner.device_id, now_ms(),
+                    &[MessagePart::Error { id: "e0".into(), message: error.to_string() }],
+                    MessageStatus::Complete,
+                )
+                .map_err(EngineError::from)
+            });
+            if let Err(error) = written {
+                tracing::warn!(chat = %chat_id, %error, "admission failure entry failed");
+            }
+            self.set_status(chat_id, SessionStatus::Errored, false);
+        }
+        result
     }
 
     /// [`Self::dispatch`] with the startup-crash retry marker: the retry
