@@ -524,8 +524,8 @@ pub struct AccountsPage {
 }
 
 impl AccountsPage {
-    pub(crate) fn set_crew_view(&mut self, view: super::crew::CrewView, cx: &mut Context<Self>) {
-        self.crew.update(cx, |page, cx| page.set_view(view, cx));
+    pub(crate) fn set_crew_view(&mut self, view: super::crew::CrewView, database: Option<zeron_proto::ScaffoldDatabaseEnvironment>, cx: &mut Context<Self>) {
+        self.crew.update(cx, |page, cx| page.set_view(view, database, cx));
     }
 
     pub(crate) fn capture_annotation_selection(&mut self, cx: &mut Context<Self>) {

@@ -124,7 +124,6 @@ actions!(
         OpenModelPicker,
         NewSession,
         OpenSettings,
-        OpenSandboxes,
         NextSession,
         PrevSession,
         ArchiveSession
@@ -314,6 +313,10 @@ pub struct JumpSession(pub usize);
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = shell, no_json)]
 pub struct SelectPaletteTab(pub usize);
+
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct OpenSandboxes(pub zeron_proto::ScaffoldDatabaseEnvironment);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -5589,7 +5592,7 @@ impl Shell {
                         SettingsSection::Annotations => settings::crew::CrewView::Annotations,
                         _ => settings::crew::CrewView::Accounts,
                     };
-                    page.update(cx, |page, cx| page.set_crew_view(view, cx));
+                    page.update(cx, |page, cx| page.set_crew_view(view, None, cx));
                 }
                 match &self.accounts_page {
                     Some(page) => page.clone().into_any_element(),
@@ -13631,7 +13634,12 @@ impl Render for Shell {
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) toggle the modal from any section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.toggle_settings(cx)))
-            .on_action(cx.listener(|this, _: &OpenSandboxes, _, cx| this.open_settings(SettingsSection::Sandboxes, cx)))
+            .on_action(cx.listener(|this, action: &OpenSandboxes, _, cx| {
+                let state = this.state.clone();
+                let page = this.accounts_page.get_or_insert_with(|| cx.new(|cx| AccountsPage::new(state, cx)));
+                page.update(cx, |page, cx| page.set_crew_view(settings::crew::CrewView::Sandboxes, Some(action.0), cx));
+                this.open_settings(SettingsSection::Sandboxes, cx);
+            }))
             .on_action(cx.listener(|this, _: &NextSession, window, cx| {
                 this.cycle_navigation(true, window, cx)
             }))

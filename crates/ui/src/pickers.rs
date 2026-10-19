@@ -25,7 +25,8 @@ use gpui::{
 
 use zeron_engine::registry::{HarnessDescriptor, TitleSettings};
 use zeron_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
+    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    ScaffoldDatabaseEnvironment, Space,
 };
 use zeron_rpc::methods;
 
@@ -578,13 +579,17 @@ struct ProjectRow {
     name: String,
 }
 
-/// One device-picker row: a device, and the picked project's checkout on it.
+#[derive(Clone, Debug, PartialEq)]
+enum DeviceTarget {
+    Device { device_id: String, space: Option<Space> },
+    Scaffold(ScaffoldDatabaseEnvironment),
+}
+
+/// A device checkout or Scaffold database choice in the destination picker.
 #[derive(Clone, Debug, PartialEq)]
 struct DeviceRow {
-    device_id: String,
-    name: String,
-    /// The project's space on this device; `None` when no project is picked.
-    space: Option<Space>,
+    target: DeviceTarget,
+    name: SharedString,
     /// The checkout's path, when the device holds several of the project.
     detail: Option<String>,
 }
@@ -2722,16 +2727,10 @@ impl Pickers {
     /// home.
     fn device_rows(&self, cx: &App) -> Vec<DeviceRow> {
         let state = self.state.read(cx);
-        let local = state.local_device_id.clone();
-        let device_name = |id: &str| {
-            state
-                .device_name(id)
-                .unwrap_or("Unknown device")
-                .to_string()
-        };
-        if let Some(space) = state.selected_space_row() {
+        let local = state.local_device_id.as_deref();
+        let mut rows: Vec<DeviceRow> = if let Some(space) = state.selected_space_row() {
             let members = state.project_members(space);
-            return members
+            members
                 .iter()
                 .map(|member| {
                     let shared = members
@@ -2740,31 +2739,39 @@ impl Pickers {
                         .count()
                         > 1;
                     DeviceRow {
-                        device_id: member.device_id.clone(),
-                        name: device_name(&member.device_id),
-                        space: Some((*member).clone()),
+                        target: DeviceTarget::Device {
+                            device_id: member.device_id.clone(),
+                            space: Some((*member).clone()),
+                        },
+                        name: state.device_name(&member.device_id).unwrap_or("Unknown device").to_owned().into(),
                         detail: shared.then(|| member.path.clone()),
                     }
                 })
-                .collect();
+                .collect()
+        } else {
+            let mut devices: Vec<&zeron_proto::Device> = state.devices.iter().collect();
+            devices.sort_by_key(|d| {
+                (local != Some(d.id.as_str()), d.name.to_lowercase(), d.id.clone())
+            });
+            devices
+                .into_iter()
+                .map(|device| DeviceRow {
+                    target: DeviceTarget::Device { device_id: device.id.clone(), space: None },
+                    name: device.name.clone().into(),
+                    detail: None,
+                })
+                .collect()
+        };
+        if state.managed_inference {
+            rows.extend([
+                ("Scaffold (Local DB)", ScaffoldDatabaseEnvironment::Local),
+                ("Scaffold (Staging DB)", ScaffoldDatabaseEnvironment::StagingSnapshot),
+                ("Scaffold (Production DB)", ScaffoldDatabaseEnvironment::ProductionSnapshot),
+            ].into_iter().map(|(name, database)| DeviceRow {
+                target: DeviceTarget::Scaffold(database), name: name.into(), detail: None,
+            }));
         }
-        let mut devices: Vec<&zeron_proto::Device> = state.devices.iter().collect();
-        devices.sort_by_key(|d| {
-            (
-                local.as_deref() != Some(d.id.as_str()),
-                d.name.to_lowercase(),
-                d.id.clone(),
-            )
-        });
-        devices
-            .into_iter()
-            .map(|device| DeviceRow {
-                device_id: device.id.clone(),
-                name: device.name.clone(),
-                space: None,
-                detail: None,
-            })
-            .collect()
+        rows
     }
 
     /// [`Self::device_rows`] filtered by the search box (same ranked
@@ -2776,7 +2783,7 @@ impl Pickers {
             .iter()
             .map(|row| match &row.detail {
                 Some(detail) => format!("{} {detail}", row.name),
-                None => row.name.clone(),
+                None => row.name.to_string(),
             })
             .collect();
         popover::filter_indices(&query, &names)
@@ -2795,19 +2802,23 @@ impl Pickers {
         };
         self.device_rows(cx)
             .iter()
-            .position(|row| match &row.space {
-                Some(space) => selected.as_deref() == Some(space.id.as_str()),
-                None => effective.as_deref() == Some(row.device_id.as_str()),
+            .position(|row| match &row.target {
+                DeviceTarget::Device { space: Some(space), .. } => selected.as_deref() == Some(space.id.as_str()),
+                DeviceTarget::Device { device_id, .. } => effective.as_deref() == Some(device_id.as_str()),
+                DeviceTarget::Scaffold(_) => false,
             })
             .unwrap_or(0)
     }
 
-    /// A device row picks the project's checkout there, or — without a
-    /// project — the device itself.
+    /// Select a checkout or open the existing sandbox flow with its database mode.
     fn pick_device_row(&mut self, row: DeviceRow, cx: &mut Context<Self>) {
-        match row.space {
-            Some(space) => self.pick_space(space.id, cx),
-            None => self.pick_device(row.device_id, cx),
+        match row.target {
+            DeviceTarget::Device { space: Some(space), .. } => self.pick_space(space.id, cx),
+            DeviceTarget::Device { device_id, .. } => self.pick_device(device_id, cx),
+            DeviceTarget::Scaffold(database) => {
+                self.dismiss(cx);
+                cx.defer(move |cx| cx.dispatch_action(&crate::shell::OpenSandboxes(database)));
+            }
         }
     }
 
@@ -2830,7 +2841,10 @@ impl Pickers {
                 state.effective_device_id(),
                 state.local_device_id.clone(),
                 rows.iter()
-                    .map(|row| state.device_online(&row.device_id, now))
+                    .map(|row| match &row.target {
+                        DeviceTarget::Device { device_id, .. } => state.device_online(device_id, now),
+                        DeviceTarget::Scaffold(_) => true,
+                    })
                     .collect(),
             )
         };
@@ -2855,13 +2869,12 @@ impl Pickers {
                         .max_h(px(self.list_budget(64.0)))
                         .children(rows.into_iter().zip(online).enumerate().map(
                             |(ix, (row, online))| {
-                                let is_local = local.as_deref() == Some(row.device_id.as_str());
-                                let label: SharedString = row.name.clone().into();
-                                let is_selected = match &row.space {
-                                    Some(space) => {
-                                        selected_space.as_deref() == Some(space.id.as_str())
-                                    }
-                                    None => effective.as_deref() == Some(row.device_id.as_str()),
+                                let is_local = matches!(&row.target, DeviceTarget::Device { device_id, .. } if local.as_deref() == Some(device_id.as_str()));
+                                let label = row.name.clone();
+                                let is_selected = match &row.target {
+                                    DeviceTarget::Device { space: Some(space), .. } => selected_space.as_deref() == Some(space.id.as_str()),
+                                    DeviceTarget::Device { device_id, .. } => effective.as_deref() == Some(device_id.as_str()),
+                                    DeviceTarget::Scaffold(_) => false,
                                 };
                                 let detail = row.detail.clone().map(SharedString::from);
                                 popover::picker_row(
@@ -3713,16 +3726,6 @@ impl Pickers {
                 "device-popover",
                 closing,
             ))
-            .when(self.state.read(cx).managed_inference, |row| row.child(
-                crate::settings::widgets::ghost_action(&theme)
-                    .id("new-thread-sandboxes").role(gpui::Role::Button).tab_index(0)
-                    .aria_label("New sandbox or use existing sandbox")
-                    .focus_visible(|style| style.border_2().border_color(theme.accent))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.dismiss(cx);
-                        window.dispatch_action(Box::new(crate::shell::OpenSandboxes), cx);
-                    }))
-                    .child("New / use sandbox…")))
             .into_any_element()
     }
 
@@ -7653,7 +7656,10 @@ mod tests {
             let devices: Vec<(String, Option<String>)> = pickers
                 .device_rows(cx)
                 .into_iter()
-                .map(|row| (row.device_id, row.detail))
+                .map(|row| match row.target {
+                    DeviceTarget::Device { device_id, .. } => (device_id, row.detail),
+                    DeviceTarget::Scaffold(_) => panic!("unmanaged device picker offered Scaffold"),
+                })
                 .collect();
             assert_eq!(
                 devices,
@@ -7675,7 +7681,10 @@ mod tests {
             let devices: Vec<(String, bool)> = pickers
                 .device_rows(cx)
                 .into_iter()
-                .map(|row| (row.device_id, row.space.is_some()))
+                .map(|row| match row.target {
+                    DeviceTarget::Device { device_id, space } => (device_id, space.is_some()),
+                    DeviceTarget::Scaffold(_) => panic!("unmanaged device picker offered Scaffold"),
+                })
                 .collect();
             assert_eq!(devices, [("mac".into(), false), ("vps".into(), false)]);
         });
@@ -7684,6 +7693,22 @@ mod tests {
             state.select_space(Some("laptop".into()), cx);
             state.select_device("vps".into(), cx);
             assert_eq!(state.selected_space.as_deref(), Some("server"));
+        });
+        state.update(cx, |state, cx| {
+            state.managed_inference = true;
+            cx.notify();
+        });
+        pickers.update(cx, |pickers, cx| {
+            for (query, database) in [
+                ("local db", ScaffoldDatabaseEnvironment::Local),
+                ("staging db", ScaffoldDatabaseEnvironment::StagingSnapshot),
+                ("production db", ScaffoldDatabaseEnvironment::ProductionSnapshot),
+            ] {
+                pickers.search.update(cx, |search, cx| search.set_text(query, cx));
+                let targets: Vec<_> = pickers.filtered_device_rows(cx).into_iter().map(|row| row.target).collect();
+                assert_eq!(targets, [DeviceTarget::Scaffold(database)]);
+            }
+            assert_eq!(pickers.state.read(cx).selected_space.as_deref(), Some("server"));
         });
     }
 

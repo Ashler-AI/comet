@@ -35,6 +35,25 @@ waived the standalone independent Google OAuth acceptance check for this dogfood
 delivery; authentication and scope enforcement remain unchanged. Existing Crew
 release channels and live profiles must not be replaced or migrated.
 
+The device dropdown now offers **Scaffold (Local DB)**, **Scaffold (Staging DB)**
+and **Scaffold (Production DB)** using the same row styling as devices, replacing
+the separate **New / use sandbox** entry. Each choice opens the sandbox form with
+the corresponding database mode; the form appears before existing sandbox history.
+Selecting a choice does not create, resume or stop an environment. Canary snapshot
+provisioning remains governed by the existing local-only deployment configuration.
+The native UI exercised all three choices and confirmed creation is visible without
+scrolling. The targeted project/device-picker regression passed. The rebuilt,
+signature-verified `/Applications/Crew Canary.app` retained all 18 conversation IDs,
+the same signed-in owner and scope, and the previously reported session state.
+The first regression build timed out under the default profile; reusing the
+documented low-memory profile completed the regression and desktop builds.
+
+The separate iOS `ai.ashler.crew.upstream-canary` app exported as version **1.0 (1)**
+with cloud-managed signing; strict signature and production push-entitlement checks
+passed. TestFlight upload is not complete: App Store Connect returned no app record
+for that bundle ID, and its browser session requires renewed interactive sign-in.
+No existing App Store app identity or shared Crew release channel was changed.
+
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
 `30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),
@@ -131,22 +150,21 @@ and 6 connected Anthropic accounts. Its canonical owner ID differs from the
 isolated canary's owner; pointing at the same database would not fix ownership.
 No provider credentials have been copied, imported, or connected.
 
-The user approved the narrow shared Agent Auth broker and dedicated server trust
-key. Staging candidate `38976233582` removed that capability again, producing
-`owner_identity_key_invalid` before browser command admission. The approved patch
-was merged onto that deployment's exact source `d7eee03a1ec` without reverting its
-changes. Broker commit `f780e202baf` passed
-[remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38983204679),
-including typechecks, and all six local security checks passed. The guarded
-launcher applied no D1 or Durable Object migrations and inherited existing secrets.
-Verified staging Worker version is `6d93c9f5-df5c-4749-a4f2-f9586ba438df`; all 60
-bindings match the pre-deployment snapshot. Readback caught three primary service
-URLs inherited from the operator environment; passing the explicit staging
-overrides **after Infisical injection** corrected them before continuing acceptance.
-The canary again returned all 11 shared accounts, rejected a broker request without
-its trust key with HTTP 403, and completed native managed inference. No credentials
-were copied and no shared service fleet was deployed. Until this patch is included
-in normal staging candidates, ordinary deployments/rollbacks can remove it again.
+The user-approved shared Agent Auth broker is now merged through
+[Platform PR #9429](https://github.com/Ashler-AI/ashler-platform/pull/9429).
+The current staging candidate had omitted the route again. Broker-only commit
+`eb78bd405e8` applies the approved change to that deployment's exact source
+`ed64ee0205895b573548a51bc83b79e8b29121db`, preserving its unrelated changes.
+All six local security checks and
+[remote Worker CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/39272274624)
+passed. The guarded deployment consumed a clean preflight report, applied no D1
+or Durable Object migrations, and inherited existing Worker secrets.
+Verified staging Worker version is `ea7a72ee-66e5-4eda-a756-471c57b74a75`.
+Both Agent Auth service bindings match the pre-deployment snapshot. The running
+canary returned all 11 shared accounts (6 Anthropic, 5 OpenAI); direct broker
+requests without the trust key, including forged actor headers, returned HTTP 403.
+No provider credentials were copied and no other shared service was deployed.
+Future staging candidates must include the merged broker change.
 
 Actual canary API requests returned HTTP 200 and the expected literal replies
 from `gpt-6.1-sol` and `claude-opus-5-5`. Account refresh returned all 11 shared
@@ -280,12 +298,11 @@ process-scoped reachability/socket-interruption simulation, not a physical
 airplane-mode test or a claim that all subsequent network traffic was blocked.
 No message, annotation or sandbox lifecycle operation was submitted.
 
-The configured Linux x64 pin is the `69f631b6c72c55c171f2e74d76121a0814990830`
-private artifact under `~/.crew-upstream-canary/runtime/`, SHA-256
-`bc282ba96a50cd89101caf06863f4debea83e1215cf31bfa83823c8139567539`.
-Its archive and executable checksums were verified before activation. This exact
-runtime served the native browser and completed managed Agent Auth turns before
-and after same-ID pause/resume. Stop retained the desktop's synchronized history.
+The configured Linux x64 pin is now the `32b8bb48bb39f9ab21123052dba5dfd5d7286724`
+private artifact under `~/.crew-upstream-canary/runtime/`, with configured executable
+SHA-256 `f4c08548ac55287eadc367fbfedee87f685e1d18c50d1945ceb2672f2ce66503`.
+The earlier live native-browser and same-ID pause/resume inference evidence used
+`69f631b6c72c55c171f2e74d76121a0814990830`; Stop retained that synchronized history.
 
 Launches from another Crew agent must pin Canary's IPC/data coordinates as shown
 in `dist/README.md`; otherwise the parent's `COMET_IPC_PORT` can select its engine.

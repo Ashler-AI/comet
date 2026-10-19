@@ -228,7 +228,12 @@ impl CrewAccounts {
 
     pub(crate) fn view(&self) -> CrewView { self.view }
 
-    pub(crate) fn set_view(&mut self, view: CrewView, cx: &mut Context<Self>) {
+    pub(crate) fn set_view(&mut self, view: CrewView, database: Option<ScaffoldDatabaseEnvironment>, cx: &mut Context<Self>) {
+        if let Some(database) = database {
+            self.database = database;
+            self.confirmation = None;
+            cx.notify();
+        }
         if self.view != view {
             self.view = view;
             self.confirmation = None;
@@ -357,52 +362,6 @@ impl Render for CrewAccounts {
                     }
                 }))));
         }
-        body = body.child(widgets::row_title(&theme, "Use an existing sandbox"));
-        if self.environments.is_empty() { body = body.child(widgets::page_subtitle(&theme, "No sandboxes yet. Create one below to run Crew in Scaffold, or refresh to find an existing environment.")); }
-        for environment in self.environments.clone() {
-            let SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle, .. } = &environment.source else { continue; };
-            let name = environment.name.clone().unwrap_or_else(|| format!("Sandbox · {}", environment.source_ref.as_deref().unwrap_or("Scaffold")));
-            let stopped = matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Stopped);
-            let mut row = widgets::section_card(&theme).p(px(12.0)).flex().flex_col().gap(px(8.0))
-                .child(div().id(SharedString::from(format!("crew-sandbox-details-{sandbox_id}"))).min_w_0().truncate()
-                    .tooltip(widgets::text_tooltip(format!("Sandbox {sandbox_id}\nOwner {}\nProject {}\nDeployment {}\nSession {}", environment.owner_principal, environment.scope.project_id, environment.scope.deployment_id.as_deref().unwrap_or("none"), environment.scope.session_id.as_deref().unwrap_or("unassigned"))))
-                    .child(widgets::row_title(&theme, name.clone())))
-                .child(widgets::page_subtitle(&theme, format!("{} · {}", lifecycle_label(*lifecycle), environment.source_ref.as_deref().unwrap_or("Source unavailable"))));
-            if let Some(link) = crate::links::crew_scope_link(&environment.scope) {
-                row = row.child(Self::action(&theme, format!("crew-open-{sandbox_id}"), "Browse history (no resume)")
-                    .on_click(cx.listener(move |page, _, _, cx| page.state.update(cx, |state, cx| state.open_deep_link(&link, cx)))));
-            }
-            let mut controls = div().flex().flex_wrap().gap(px(8.0));
-            for operation in ["Inspect", "Use sandbox…", "Pause…", "Resume…", "Stop sandbox…", "Apply model/account…"] {
-                if status.role != "local_controller" && operation != "Inspect" { continue; }
-                if stopped && operation != "Inspect" { continue; }
-                if *lifecycle == zeron_proto::ScaffoldLifecycle::Failed && !matches!(operation, "Inspect" | "Stop sandbox…") { continue; }
-                if operation == "Pause…" && *lifecycle == zeron_proto::ScaffoldLifecycle::Paused { continue; }
-                if operation == "Resume…" && *lifecycle != zeron_proto::ScaffoldLifecycle::Paused { continue; }
-                let sandbox = sandbox_id.clone(); let scope = environment.scope.clone(); let label = name.clone();
-                controls = controls.child(Self::action(&theme, format!("crew-{operation}-{sandbox}"), operation).on_click(cx.listener(move |page, _, _, cx| {
-                    let control = match operation {
-                        "Apply model/account…" => {
-                            let Some(agent_route) = page.agent_route() else {
-                                page.error = Some("Choose a managed model in the new-sandbox form below first.".into()); cx.notify(); return;
-                            };
-                            ScaffoldEnvironmentControl::UpdateAgentRoute { sandbox_id: sandbox.clone(), scope: scope.clone(), agent_route }
-                        }
-                        "Inspect" => ScaffoldEnvironmentControl::Inspect { sandbox_id: sandbox.clone(), scope: scope.clone() },
-                        "Pause…" => ScaffoldEnvironmentControl::Pause { sandbox_id: sandbox.clone(), scope: scope.clone() },
-                        "Resume…" => ScaffoldEnvironmentControl::Resume { sandbox_id: sandbox.clone(), scope: scope.clone() },
-                        "Stop sandbox…" => ScaffoldEnvironmentControl::Stop { sandbox_id: sandbox.clone(), scope: scope.clone() },
-                        _ => ScaffoldEnvironmentControl::Attach { sandbox_id: sandbox.clone(), scope: scope.clone() },
-                    };
-                    if operation == "Inspect" { page.control(control, cx); }
-                    else {
-                        let warning = if operation == "Stop sandbox…" { "Stop is terminal: this sandbox cannot be resumed. This is NOT the composer Stop button, which only stops an agent turn." } else if operation == "Use sandbox…" { "Attach to this same sandbox; if paused, it will resume. This does not create another sandbox." } else { "Apply this operation to the selected sandbox?" };
-                        page.confirmation = Some(("scaffold.control", json!({"commandId": uuid::Uuid::new_v4().to_string(), "control": control}), format!("{operation} {label}\n{warning}"))); cx.notify();
-                    }
-                })));
-            }
-            body = body.child(row.child(controls));
-        }
         if status.role == "local_controller" {
             body = body.child(widgets::row_title(&theme, "New sandbox"))
                 .child(Self::field(&theme, "Source branch or commit (optional)", &self.source))
@@ -431,6 +390,52 @@ impl Render for CrewAccounts {
             body = body.child(model).child(account).child(database)
                 .child(Self::action(&theme, "crew-create", "Create new sandbox…").on_click(cx.listener(|page, _, _, cx| page.create(cx))));
         } else { body = body.child(widgets::page_subtitle(&theme, "Browse-only on this host. Open Sandboxes on your Crew controller to create or manage environments.")); }
+        body = body.child(widgets::row_title(&theme, "Use an existing sandbox"));
+        if self.environments.is_empty() { body = body.child(widgets::page_subtitle(&theme, "No sandboxes yet. Create one above to run Crew in Scaffold, or refresh to find an existing environment.")); }
+        for environment in self.environments.clone() {
+            let SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle, .. } = &environment.source else { continue; };
+            let name = environment.name.clone().unwrap_or_else(|| format!("Sandbox · {}", environment.source_ref.as_deref().unwrap_or("Scaffold")));
+            let stopped = matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Stopped);
+            let mut row = widgets::section_card(&theme).p(px(12.0)).flex().flex_col().gap(px(8.0))
+                .child(div().id(SharedString::from(format!("crew-sandbox-details-{sandbox_id}"))).min_w_0().truncate()
+                    .tooltip(widgets::text_tooltip(format!("Sandbox {sandbox_id}\nOwner {}\nProject {}\nDeployment {}\nSession {}", environment.owner_principal, environment.scope.project_id, environment.scope.deployment_id.as_deref().unwrap_or("none"), environment.scope.session_id.as_deref().unwrap_or("unassigned"))))
+                    .child(widgets::row_title(&theme, name.clone())))
+                .child(widgets::page_subtitle(&theme, format!("{} · {}", lifecycle_label(*lifecycle), environment.source_ref.as_deref().unwrap_or("Source unavailable"))));
+            if let Some(link) = crate::links::crew_scope_link(&environment.scope) {
+                row = row.child(Self::action(&theme, format!("crew-open-{sandbox_id}"), "Browse history (no resume)")
+                    .on_click(cx.listener(move |page, _, _, cx| page.state.update(cx, |state, cx| state.open_deep_link(&link, cx)))));
+            }
+            let mut controls = div().flex().flex_wrap().gap(px(8.0));
+            for operation in ["Inspect", "Use sandbox…", "Pause…", "Resume…", "Stop sandbox…", "Apply model/account…"] {
+                if status.role != "local_controller" && operation != "Inspect" { continue; }
+                if stopped && operation != "Inspect" { continue; }
+                if *lifecycle == zeron_proto::ScaffoldLifecycle::Failed && !matches!(operation, "Inspect" | "Stop sandbox…") { continue; }
+                if operation == "Pause…" && *lifecycle == zeron_proto::ScaffoldLifecycle::Paused { continue; }
+                if operation == "Resume…" && *lifecycle != zeron_proto::ScaffoldLifecycle::Paused { continue; }
+                let sandbox = sandbox_id.clone(); let scope = environment.scope.clone(); let label = name.clone();
+                controls = controls.child(Self::action(&theme, format!("crew-{operation}-{sandbox}"), operation).on_click(cx.listener(move |page, _, _, cx| {
+                    let control = match operation {
+                        "Apply model/account…" => {
+                            let Some(agent_route) = page.agent_route() else {
+                                page.error = Some("Choose a managed model in the new-sandbox form above first.".into()); cx.notify(); return;
+                            };
+                            ScaffoldEnvironmentControl::UpdateAgentRoute { sandbox_id: sandbox.clone(), scope: scope.clone(), agent_route }
+                        }
+                        "Inspect" => ScaffoldEnvironmentControl::Inspect { sandbox_id: sandbox.clone(), scope: scope.clone() },
+                        "Pause…" => ScaffoldEnvironmentControl::Pause { sandbox_id: sandbox.clone(), scope: scope.clone() },
+                        "Resume…" => ScaffoldEnvironmentControl::Resume { sandbox_id: sandbox.clone(), scope: scope.clone() },
+                        "Stop sandbox…" => ScaffoldEnvironmentControl::Stop { sandbox_id: sandbox.clone(), scope: scope.clone() },
+                        _ => ScaffoldEnvironmentControl::Attach { sandbox_id: sandbox.clone(), scope: scope.clone() },
+                    };
+                    if operation == "Inspect" { page.control(control, cx); }
+                    else {
+                        let warning = if operation == "Stop sandbox…" { "Stop is terminal: this sandbox cannot be resumed. This is NOT the composer Stop button, which only stops an agent turn." } else if operation == "Use sandbox…" { "Attach to this same sandbox; if paused, it will resume. This does not create another sandbox." } else { "Apply this operation to the selected sandbox?" };
+                        page.confirmation = Some(("scaffold.control", json!({"commandId": uuid::Uuid::new_v4().to_string(), "control": control}), format!("{operation} {label}\n{warning}"))); cx.notify();
+                    }
+                })));
+            }
+            body = body.child(row.child(controls));
+        }
         body.into_any_element()
     }
 }
