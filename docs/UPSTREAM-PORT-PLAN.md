@@ -94,9 +94,10 @@ only the authorized account, with automatic distribution disabled. Cloud-managed
 signing preserved the production push entitlement, verified in the exported IPA.
 Apple's processed build icon shows the new green/white mark on black. The upload
 retains the non-blocking missing WebRTC dSYM warning; framework crash symbolication
-is incomplete. Apple confirms the tester installed **1.0 (2)** on an iPhone 18 Pro;
-installation and hands-on acceptance of **1.0 (3)** still require the user's device.
-The available iPhone Mirroring route is locked and was not bypassed.
+is incomplete. Apple previously confirmed **1.0 (2)** installed on an iPhone 18 Pro.
+After being asked to unlock the test iPhone and verify **1.0 (3)**, the user
+confirmed "unlocked and verified". This closes the physical-device hands-on gate
+for Canary dogfooding; it is user-reported acceptance, not an automated device run.
 No existing App Store app identity or shared Crew release channel was changed.
 
 Signed simulator checks exercised the promoted sandbox entry before the device
@@ -114,7 +115,8 @@ Linux executable checksum before launch; the remote device reported `0.2.113`.
 The native turn and two actual simulator continuations produced
 `CREW_CANARY_9C_RUNTIME_OK`, `CREW_CANARY_MOBILE_OK` and `CREW_CANARY_STATUS_OK.`.
 All six complete message IDs were retained and visible in the installed desktop
-and simulator. This does not replace hands-on acceptance on the physical iPhone.
+and simulator. Physical-device hands-on acceptance was subsequently confirmed by
+the user as recorded above.
 
 This smoke exposed a scoped Edge schema mismatch: `lastCompletedTurn` was typed
 as a number, but native completion IDs are strings. Whole-batch rejection left
@@ -235,15 +237,15 @@ build profile completed. No local typechecks were run.
 | Area | Exercised evidence | Remaining acceptance |
 | --- | --- | --- |
 | Desktop | Final CI-built app retained all 27 conversations and three working-session identities/histories; shared-account Refresh, usage resets, both sign-in dialogs, sandbox maintenance disclosure and annotation create/resolve exercised | Real provider credential grant remains user-interactive |
-| Isolation | Distinct canary bundles/profiles; approved simulator session import retained; TestFlight 1.0 (3) is Testing for the sole authorized tester and 1.0 (2) installation is confirmed by Apple | Updated physical-device acceptance; standalone Google OAuth check waived for dogfooding |
-| Sync | Two controllers retained sandbox histories and synchronized a real annotation; authenticated iOS warm/cold links, socket-interruption recovery and two actual simulator continuations retained history; live completion reached idle with its native turn ID | Physical-network recovery and updated physical-device acceptance |
+| Isolation | Distinct canary bundles/profiles; approved simulator session import retained; TestFlight 1.0 (3) is Testing for the sole authorized tester, who confirmed the requested physical-device verification | Standalone Google OAuth check waived for dogfooding |
+| Sync | Two controllers retained sandbox histories and synchronized a real annotation; authenticated iOS warm/cold links, socket-interruption recovery and two actual simulator continuations retained history; live completion reached idle with its native turn ID | Physical-network recovery beyond the user-confirmed app verification |
 | Edge | Live `https://crew-upstream-canary.cgoggins.workers.dev`; version `d6780161-12a7-4da3-a606-31984ae095fc` is healthy and accepts scoped string completion IDs; five focused checks and full remote Edge CI passed; prior forged-identity checks returned 401 and public installer returned 404 | Live client revocation |
-| Scaffold | Fresh `9c2268c5` runtime completed native/mobile inference and same-ID Stop with six retained entries; earlier `69f631b6` pause/resume preserved its sandbox through epochs 1–4; final `b9b36ab5` runtime pin is checksum-verified and its real MCP stopped-history reads passed | Updated physical-device execution |
+| Scaffold | Fresh `9c2268c5` runtime completed native/mobile inference and same-ID Stop with six retained entries; earlier `69f631b6` pause/resume preserved its sandbox through epochs 1–4; final `b9b36ab5` runtime pin is checksum-verified and its real MCP stopped-history reads passed | Physical-device lifecycle scenarios were not separately reported |
 | Protocol checks | Device/broker/authority checks 19/19, with failing-before/passing-after resume regression and stale-grant rejection; final remote Worker/provider/vault CI passed including typechecks | Additional interactive client/mobile revocation scenarios |
-| Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Authenticated mobile acceptance |
-| Mobile | Signed simulator restored the approved account, exercised controller/model/sandbox selectors and scoped Stop confirmation, and completed two real continuations on the fresh smoke sandbox; five native isolation/error checks passed | Physical-network recovery and updated physical-device acceptance |
+| Rust checks | Native command recovery 4/4, Scaffold 41/41, coordinator/RPC 2/2 and installer 2/2; actual native managed browser turns and live pause/resume/Stop passed | Additional client/mobile revocation scenarios |
+| Mobile | Signed simulator exercised controller/model/sandbox selectors and scoped Stop confirmation, and completed two real continuations; five native isolation/error checks passed; user confirmed physical-device app verification | Physical-network recovery beyond the reported hands-on verification |
 | Clean upstream | Unmodified `3b2f7802` executable built in a detached worktree; separate workerd and two clean engines completed remote queued Run, transcript and working-to-idle sync | Mock inference only; no WorkOS credentials were required or borrowed |
-| Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Authenticated multi-client/mobile acceptance and final cutover |
+| Update rehearsal | Crew patch replayed onto `9609f994`, then actually merged `3b2f7802`; merge `06ac4276703a68db1ae8be50fbce0b568df135ba` is tree-identical to `eccc3324`; merged executable passed real two-engine/workerd queued Run, transcript and working-to-idle sync, headed desktop checks, shared mobile-core/Swift/native iOS builds and simulator cold launch | Final cutover remains separate from this isolated Canary acceptance |
 
 The initial empty canary vault caused the reported `agent_auth_v2_account_unavailable`.
 Read-only metadata verified the existing Crew Staging pool has 5 connected OpenAI
