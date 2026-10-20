@@ -43,6 +43,9 @@ zeron login        # or: zeron logout to return to local-only
 zeron daemon start
 ```
 
+Crew's Scaffold sign-in completes in the browser; `login` exits without an extra
+keystroke. Hosted paste-code sign-in and workspace selection still use terminal input.
+
 Devices signed in to the same account can read and write each other's workspace files, so only sign in devices you trust. Existing local sessions are never uploaded.
 
 ## Sponsors

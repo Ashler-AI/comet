@@ -1118,15 +1118,16 @@ pub async fn serve_ipc(
     )))
 }
 
-/// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the
-/// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
-/// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
-/// errors immediately — a daemon under systemd/launchd must load the session that
+/// Block until the session is signed in AND org-scoped. On a TTY, print the
+/// browser sign-in URL (Scaffold loopback or legacy paste-code) and run workspace
+/// onboarding (create / auto-join / numbered picker). Off a TTY this errors
+/// immediately — a daemon under systemd/launchd must load the session that
 /// `zeron login` persisted, never wait on a prompt nobody can see.
 pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal();
     let mut state_rx = auth.watch_state();
+    let mut sign_in_started = false;
     let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
     let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
     loop {
@@ -1160,26 +1161,31 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                         "not signed in — run `zeron login` on this machine first".into(),
                     ));
                 }
-                if stdin_reader.is_none() {
+                if !sign_in_started {
                     let url = auth.start_headless_sign_in().await?;
+                    sign_in_started = true;
                     println!("Sign in to Crew:\n\n  {url}\n");
-                    println!("Then paste the code shown in the browser here and press enter.");
-                    let auth = auth.clone();
-                    stdin_reader = Some(tokio::spawn(async move {
-                        loop {
-                            let Some(line) = read_stdin_line().await else {
-                                return;
-                            };
-                            let pasted = line.trim();
-                            if pasted.is_empty() {
-                                continue;
+                    if auth.scaffold_enabled() {
+                        println!("Complete sign-in in your browser. Crew will continue automatically.");
+                    } else {
+                        println!("Then paste the code shown in the browser here and press enter.");
+                        let auth = auth.clone();
+                        stdin_reader = Some(tokio::spawn(async move {
+                            loop {
+                                let Some(line) = read_stdin_line().await else {
+                                    return;
+                                };
+                                let pasted = line.trim();
+                                if pasted.is_empty() {
+                                    continue;
+                                }
+                                match auth.complete_sign_in(pasted).await {
+                                    Ok(()) => return,
+                                    Err(err) => println!("Sign-in failed: {err}"),
+                                }
                             }
-                            match auth.complete_sign_in(pasted).await {
-                                Ok(()) => return,
-                                Err(err) => println!("Sign-in failed: {err}"),
-                            }
-                        }
-                    }));
+                        }));
+                    }
                 }
             }
         }

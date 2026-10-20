@@ -307,3 +307,147 @@ async fn sandbox_storage_survives_epoch_change_without_reusing_authority() {
     }
     server.abort();
 }
+
+#[cfg(unix)]
+mod terminal_login {
+    use super::*;
+    use std::os::fd::FromRawFd;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
+
+    #[tokio::test]
+    async fn child() {
+        let Some(origin) = std::env::var_os("CREW_TERMINAL_LOGIN_TEST_ORIGIN") else {
+            return;
+        };
+        let origin = origin.to_str().unwrap();
+        let dir = std::env::var_os("CREW_TERMINAL_LOGIN_TEST_DIR").unwrap();
+        let mut config = AuthConfig::new(origin, std::path::Path::new(&dir));
+        config.scaffold = Some(ScaffoldConfig::new(origin, origin, "canary"));
+        let auth = Auth::new(config);
+        zeron_engine::terminal_sign_in(&auth).await.unwrap();
+        assert!(matches!(auth.state(), AuthState::SignedIn { user, .. }
+            if user.email == "terminal-test@example.com"));
+        println!("Terminal sign-in completed.");
+        // Normal test-runtime destruction must also finish, not just the future.
+    }
+
+    async fn serve_authority(listener: tokio::net::TcpListener, origin: String) {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let target = line.split_whitespace().nth(1).unwrap().to_string();
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            stream.read_exact(&mut vec![0; content_length]).await.unwrap();
+            let scopes = DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>();
+            let body = match target.as_str() {
+                "/.well-known/oauth-protected-resource" => serde_json::json!({
+                    "resource": origin, "authorization_servers": [&origin], "scopes_supported": scopes,
+                }),
+                "/.well-known/oauth-authorization-server" => serde_json::json!({
+                    "issuer": origin, "authorization_endpoint": format!("{origin}/authorize"),
+                    "token_endpoint": format!("{origin}/token"),
+                    "registration_endpoint": format!("{origin}/register"),
+                    "code_challenge_methods_supported": ["S256"],
+                }),
+                "/register" => serde_json::json!({"client_id": "terminal-test-client"}),
+                "/token" => serde_json::json!({
+                    "access_token": "sc_rc_terminal_test", "token_type": "Bearer",
+                    "scope": DEFAULT_OAUTH_SCOPES, "resource": origin,
+                }),
+                "/api/code-sandboxes/auth/session" => serde_json::json!({
+                    "ok": true, "resource": origin,
+                    "actor": {"sub": "terminal-test-user", "auth": "iap"}, "scopes": scopes,
+                }),
+                "/auth/session" => serde_json::json!({
+                    "userId": "terminal-test-user", "email": "terminal-test@example.com",
+                    "projectScope": "canary", "credential": "scaffold", "capabilities": ["session.read"],
+                }),
+                _ => panic!("unexpected authority request: {target}"),
+            }.to_string();
+            stream.get_mut().write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+            ).as_bytes()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn scaffold_loopback_exits_with_stdin_open_and_silent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve_authority(listener, origin.clone()));
+        let dir = tempfile::tempdir().unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        // Only stdin needs a TTY; keep stdout piped for bounded async observation.
+        assert_eq!(unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        }, 0);
+        // SAFETY: openpty returned two fresh, owned file descriptors above.
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "terminal_login::child", "--nocapture"])
+            .env("CREW_TERMINAL_LOGIN_TEST_ORIGIN", &origin)
+            .env("CREW_TERMINAL_LOGIN_TEST_DIR", dir.path())
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn().unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut transcript = String::new();
+        let url = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = output.next_line().await.unwrap().expect("child sign-in URL");
+                transcript.push_str(&line);
+                transcript.push('\n');
+                if line.trim().starts_with(&format!("{origin}/authorize?")) {
+                    break reqwest::Url::parse(line.trim()).unwrap();
+                }
+            }
+        }).await.expect("terminal sign-in should print its browser URL");
+        let params = url.query_pairs().collect::<std::collections::HashMap<_, _>>();
+        let mut callback = reqwest::Url::parse(&params["redirect_uri"]).unwrap();
+        callback.query_pairs_mut().append_pair("state", &params["state"]).append_pair("code", "terminal-test-code");
+        // Model time in the browser so an erroneous blocking reader can start.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let response = reqwest::Client::new().get(callback)
+            .timeout(Duration::from_secs(5)).send().await.unwrap();
+        assert!(response.status().is_success());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = output.next_line().await.unwrap().expect("child sign-in completion");
+                transcript.push_str(&line);
+                transcript.push('\n');
+                if line == "Terminal sign-in completed." {
+                    break;
+                }
+            }
+        }).await.expect("loopback callback should complete terminal sign-in");
+        let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(status) => status.unwrap(),
+            Err(_) => {
+                child.kill().await.unwrap();
+                panic!("login returned but its Tokio runtime hung with stdin open: {transcript}");
+            }
+        };
+        // No input, EOF, or extra newline was supplied before process exit.
+        drop(master);
+        server.abort();
+        assert!(status.success(), "{status}: {transcript}");
+    }
+}
