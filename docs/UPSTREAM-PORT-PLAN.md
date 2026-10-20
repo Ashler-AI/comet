@@ -178,12 +178,34 @@ One-shot CLI commands now resolve explicit/inherited IPC routing without saving
 it into `crew-runtime.json`; intentional application, headless, auth and daemon
 startup still persist their launch settings. This prevents a Canary CLI invoked
 from Crew Staging from changing the next Canary launch's port. Private artifact
-CI includes native recovery and actual CLI subprocess regressions. These new
-changes are locally verified source, not yet an installed artifact.
+CI includes native recovery and actual CLI subprocess regressions.
+
+[Recovery artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39367786890)
+passed for `52552efcf598837c528b5d9c64c310aac72d78ff` on macOS and both Linux
+architectures, including 12 native OMP and two CLI regressions, remote Edge
+typechecks/tests and browser contracts. Archive/executable checksums and strict
+macOS signature verification passed. The packaged CLI read a real retained
+transcript through inherited IPC 27954 while its private profile named a different
+test-owned port; both that profile and the live Canary settings remained
+byte-identical.
+
+The verified app is installed and activated at `/Applications/Crew Canary.app`
+with executable SHA-256
+`cb7816c09053350d1a5fd216628ccbb6a6596e00b6f4ba362318f5067a85900d`.
+Restart verification retained all 28 chat IDs, the same synced controller identity,
+all 26 entries across six sampled transcripts, and the three previously working
+remote session/host pairs. The affected native OMP history ID is unchanged.
+Fresh native screenshot/AX showed the signed-in controller and retained transcript;
+workspace and focused-chat sync are connected/synced with no pending pushes or
+durable jobs. The new Linux x64 artifact is pinned for future Canary host launches,
+SHA-256 `2f0d063a1bd23b90a5bb6afaa2b5b83b051b1d023fe113a60d8df6e1d37daef3`.
+Existing sandbox hosts, Crew Staging, Canary Dev, TestFlight and shared deployment
+channels were not restarted or changed. Local typechecks were intentionally skipped.
 
 Coordination request `8cd29fbc-3147-41f0-8d03-e77f99b7cb22` is persisted in
-Scaffold session `95e5f344-d332-445d-b91e-dd2e691153f6`. Its prior turn ended with
-`503 agent_auth_v2_account_unavailable`; no integration reply is present yet.
+Scaffold session `95e5f344-d332-445d-b91e-dd2e691153f6`. Its attempted coordination
+response `96c1e19c-760f-4f56-bd96-0ff33371e1e1` failed with
+`503 agent_auth_v2_account_unavailable`; no integration agreement was reached.
 The new harness tier's native Crew state/cold-restore contract and isolated
 deployment ownership must be confirmed before a shared rollout. No peer source,
 existing sandbox or shared deployment was changed for this coordination.
