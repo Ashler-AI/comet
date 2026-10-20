@@ -487,11 +487,11 @@ Parents are `7142b2c533bfc1e960abbd901238ff8845f15c24` (Crew on prior upstream)
 and `3b2f78027a2c31622c39c35716da4d6e1af8de15`; resulting tree is
 `fe83c31e96e6e325b9580d44146b7f24d6962b00`. This is not an empty merge.
 
-Physical-network/mobile execution scenarios, retained
-annotation write/sync and physical-iOS verification remain open. The standalone
-independent Google OAuth check is explicitly waived for isolated dogfooding.
-Desktop/simulator discovery, scope-denial, retained history, continuation,
-scoped recovery and controller reads passed. No production promotion occurred.
+The isolated Canary delivery checklist is complete, including retained annotation
+write/sync and the user's physical-iOS app verification. This is not full release
+qualification: the remaining-acceptance matrix and minimum release evidence below
+still apply. The standalone independent Google OAuth check is waived only for
+isolated dogfooding. No production promotion or live-profile migration occurred.
 Local typechecks are intentionally not run to preserve workstation resources.
 Remaining gates below are requirements, not claims of completed testing.
 
