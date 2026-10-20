@@ -291,6 +291,20 @@ control 429s or upstream 503s. Pending directory jobs remained durable (16 on De
 26 on the installed host); they were not discarded to make the check pass. Native
 screenshots showed the recovered local run and its latest transcript in Dev.
 
+Directory-retry source [`49ef1539`](https://github.com/Ashler-AI/comet/commit/49ef1539b20b6aa8afb1ff3bbe2fff046604906a)
+passed private artifact [CI](https://github.com/Ashler-AI/comet/actions/runs/39451135985)
+on macOS ARM64 and Linux x64/ARM64, including the directory regression, native
+recovery/storage checks, remote Edge typechecks and browser contracts. The verified
+macOS artifact is installed and running at `/Applications/Crew Canary.app`, executable
+SHA-256 `96a9880d145efa6314333062099fbf48001b539bb237cf1a8de79fb49ae892a1`.
+Canary Dev runs a signed local build of the same source. Post-installation native
+UI and IPC verification retained all 29 chats and their model/native-history
+identities. Both clients stayed connected/synced for another 120 seconds with zero
+stale-source retries, 429s or 503s; the host had no pending durable work and Dev
+retained 15 intentionally parked directory jobs. The other Platform session kept
+its original active run. Runtime host pins and shared release lanes are unchanged;
+local typechecks were intentionally skipped to preserve workstation resources.
+
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
 `30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),
