@@ -202,13 +202,36 @@ SHA-256 `2f0d063a1bd23b90a5bb6afaa2b5b83b051b1d023fe113a60d8df6e1d37daef3`.
 Existing sandbox hosts, Crew Staging, Canary Dev, TestFlight and shared deployment
 channels were not restarted or changed. Local typechecks were intentionally skipped.
 
-Coordination request `8cd29fbc-3147-41f0-8d03-e77f99b7cb22` is persisted in
-Scaffold session `95e5f344-d332-445d-b91e-dd2e691153f6`. Its attempted coordination
-response `96c1e19c-760f-4f56-bd96-0ff33371e1e1` failed with
-`503 agent_auth_v2_account_unavailable`; no integration agreement was reached.
-The new harness tier's native Crew state/cold-restore contract and isolated
-deployment ownership must be confirmed before a shared rollout. No peer source,
-existing sandbox or shared deployment was changed for this coordination.
+Scheduled coordination resumed in Scaffold session
+`95e5f344-d332-445d-b91e-dd2e691153f6` after its earlier Agent Auth 503. The peer
+owns Platform `/private/tmp/harness-pr` and the harness deployment; this session
+owns Crew. Its contract review identified shared loopback, incomplete filesystem
+and privilege isolation, missing native DATA checkpoints and missing same-epoch
+native-process supervision. These are source findings, not a live exploit test.
+Distinct IPC ports are not a security boundary. Live harness testing remains
+gated on those fixes and an isolated `crew-upstream-canary`/chat2 lane; the existing
+Canary profile must not be retargeted to legacy shared staging Edge.
+
+Local Crew integration changes now separate logical sandbox storage from the
+device/epoch-bound authentication fingerprint. A validated storage binding keeps
+current-authority legacy roots and absolute attachment paths in place; it must be
+saved with the data. Earlier-epoch legacy roots without a prior verified binding
+still require explicit recovery, never foreign-store scanning or credential reuse.
+Explicit Resume uses native attachment and confirms only live, current-epoch host
+authority; observation of provider readiness alone cannot confirm it. Unknown
+mutations are not replayed, and stopped/failed resumes retire.
+
+All 47 focused Rust checks passed (four managed-auth/storage checks, 42 Scaffold
+checks and the resume-readiness check); the native application build also passed.
+An actual three-process headless smoke upgraded an isolated legacy store, then
+changed its lifecycle epoch while retaining the open SQLite store, processed and
+pending command records, and an absolute-path attachment. It exercised one saved
+authority refresh, two fresh enrollment exchanges and three graceful shutdowns.
+Authentication used a loopback fixture, not real Scaffold or provider credentials;
+this is not cloud cold-restore or end-to-end harness evidence. The initial observer
+missed one-shot RPC `ok` replies; correcting that fixture produced the passing run.
+Existing compiler warnings remain; local typechecks were intentionally skipped.
+These changes have not replaced the installed Canary runtime or a shared lane.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform

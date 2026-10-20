@@ -71,6 +71,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Package exact checkout
         run: scripts/package-linux.sh
+      - name: Verify sandbox storage and native resume
+        run: |
+          cargo test --locked --release -p zeron-engine --test scaffold_auth
+          cargo test --locked --release -p zeron-engine --lib scaffold::tests
+          cargo test --locked --release -p zeron-engine --lib crew::tests::accepted_startup_is_not_a_confirmed_resume
       - name: Record private artifact provenance
         run: |
           cd target/package
@@ -104,10 +109,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Package isolated ad-hoc signed app
         run: scripts/package-macos.sh
-      - name: Verify native recovery and one-shot routing
+      - name: Verify native recovery, routing and sandbox lifecycle
         run: |
           cargo test --locked --release -p zeron-harness --test omp
           cargo test --locked --release -p zeron --test noop_browser
+          cargo test --locked --release -p zeron-engine --test scaffold_auth
+          cargo test --locked --release -p zeron-engine --lib scaffold::tests
+          cargo test --locked --release -p zeron-engine --lib crew::tests::accepted_startup_is_not_a_confirmed_resume
       - name: Record private artifact provenance
         run: |
           cd target/package

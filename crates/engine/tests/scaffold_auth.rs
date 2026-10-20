@@ -44,6 +44,7 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     let auth = Auth::detect(config.clone()).await;
     assert!(auth.state().is_signed_in());
     let key = auth.verified_profile_key().unwrap();
+    assert_eq!(zeron_engine::EngineProfile::scaffold(dir.path(), &auth).unwrap().store_root(), dir.path().join("profiles/scaffold").join(&key));
     let bound = auth.for_profile_tokens();
     assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_test");
     status.store(503, Ordering::SeqCst);
@@ -158,4 +159,151 @@ async fn device_resume_enrolls_new_grant_and_restarts_preserve_its_authority() {
     assert_eq!(restarted.state(), AuthState::SignedOut);
     assert!(!std::fs::read_to_string(&path).unwrap().contains("cs1."));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn sandbox_storage_survives_epoch_change_without_reusing_authority() {
+    use zeron_engine::{Engine, EngineConfig, EngineProfile, HarnessId};
+    use zeron_sync::{DocsStore, scaffold_auth::{DeviceAuthority, DeviceConfig, profile_key}};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let other_origin = origin.replace("127.0.0.1", "localhost");
+    let grant_id = "0123456789abcdef0123456789abcdef";
+    let first = ScaffoldSession {
+        access_token: format!("cs1.{grant_id}.current"), resource: origin.clone(), edge_origin: origin.clone(),
+        identity: ScaffoldIdentity { user_id:"owner".into(), email:"owner@example.com".into(), name:None, project_scope:"canary".into(), deployment_id:Some("deployment".into()), capabilities:vec!["session.read".into()] },
+        device: Some(DeviceAuthority { grant_id:grant_id.into(), expires_at:chrono::Utc::now().timestamp_millis() + 3_600_000, device_id:"device-e8".into(), session_id:"session".into(), deployment_id:"deployment".into(), sandbox_id:"sandbox".into(), lifecycle_epoch:8 }),
+    };
+    let authority = Arc::new(std::sync::Mutex::new(first.clone()));
+    let server_authority = authority.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let size = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("POST /auth/device-token/refresh "));
+            let session = server_authority.lock().unwrap().clone();
+            let device = session.device.unwrap();
+            let body = serde_json::json!({
+                "accessToken":session.access_token, "expiresAt":device.expires_at,
+                "userId":session.identity.user_id, "email":session.identity.email,
+                "projectId":session.identity.project_scope, "deploymentId":device.deployment_id,
+                "sandboxId":device.sandbox_id, "targetDeviceId":device.device_id,
+                "sessionId":device.session_id, "lifecycleEpoch":device.lifecycle_epoch,
+                "capabilities":session.identity.capabilities,
+            }).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("profiles/scaffold").join(profile_key(&first));
+    let request = br#"{"principalId":"owner","control":{"type":"inspect"}}"#;
+    let upload = legacy.join("uploads/retained.txt");
+    let outcome_bytes = serde_json::to_vec(&serde_json::json!({"commandId":"done", "status":"confirmed", "attachment":upload})).unwrap();
+    let outcome = outcome_bytes.as_slice();
+    {
+        let store = DocsStore::open(&legacy).unwrap();
+        assert!(store.claim_crew_command("done", request).unwrap());
+        store.finish_crew_command("done", outcome).unwrap();
+        assert!(store.claim_crew_command("pending", request).unwrap());
+    }
+    std::fs::create_dir_all(upload.parent().unwrap()).unwrap();
+    std::fs::write(&upload, b"absolute upload path survives").unwrap();
+    let mut original_profile = None;
+    let mut isolated_roots = std::collections::HashSet::new();
+    let mut resumed = first.clone();
+    resumed.device.as_mut().unwrap().device_id = "device-e9".into();
+    resumed.device.as_mut().unwrap().lifecycle_epoch = 9;
+    for field in ["first", "epoch", "owner", "resource", "edge", "project", "deployment", "session", "sandbox"] {
+        let mut session = if field == "first" { first.clone() } else { resumed.clone() };
+        match field {
+            "owner" => session.identity.user_id = "other-owner".into(),
+            "resource" => session.resource = other_origin.clone(),
+            "edge" => session.edge_origin = other_origin.clone(),
+            "project" => session.identity.project_scope = "other-project".into(),
+            "deployment" => {
+                session.identity.deployment_id = Some("other-deployment".into());
+                session.device.as_mut().unwrap().deployment_id = "other-deployment".into();
+            }
+            "session" => session.device.as_mut().unwrap().session_id = "other-session".into(),
+            "sandbox" => session.device.as_mut().unwrap().sandbox_id = "other-sandbox".into(),
+            _ => {}
+        }
+        *authority.lock().unwrap() = session.clone();
+        // A checkpoint credential alone is never trusted: the local authority
+        // must refresh/verify it before profile resolution below can succeed.
+        save_session(&dir.path().join("scaffold-device-session.json"), &session).unwrap();
+        let device = session.device.as_ref().unwrap();
+        let mut config = AuthConfig::new(&session.edge_origin, dir.path());
+        config.scaffold = Some(ScaffoldConfig::new(&session.resource, &session.edge_origin, &session.identity.project_scope));
+        config.device = Some(DeviceConfig {
+            join_grant:String::new(), device_id:device.device_id.clone(), session_id:device.session_id.clone(),
+            deployment_id:device.deployment_id.clone(), sandbox_id:device.sandbox_id.clone(), lifecycle_epoch:device.lifecycle_epoch,
+        });
+        let auth = Auth::detect(config.clone()).await;
+        assert!(auth.state().is_signed_in(), "{field}");
+        let profile = EngineProfile::scaffold(dir.path(), &auth).unwrap();
+        assert_eq!(profile.scaffold_profile_key(), Some(profile_key(&session).as_str()));
+        assert_eq!(profile.device_id_override(), Some(device.device_id.as_str()));
+        if field != "epoch" {
+            assert!(isolated_roots.insert(profile.store_root().to_path_buf()), "{field}");
+        }
+        let store = DocsStore::open(profile.store_root()).unwrap();
+        if field == "first" || field == "epoch" {
+            assert_eq!(profile.store_root(), legacy);
+            assert_eq!(std::fs::read(&upload).unwrap(), b"absolute upload path survives");
+            assert_eq!(store.crew_command("done").unwrap(), Some((request.to_vec(), Some(outcome.to_vec()))));
+            assert_eq!(store.crew_command("pending").unwrap(), Some((request.to_vec(), None)));
+            assert!(!store.claim_crew_command("pending", request).unwrap(), "ambiguous commands cannot replay after resume");
+        } else {
+            assert_ne!(profile.store_root(), legacy, "{field}");
+            assert!(store.crew_commands().unwrap().is_empty(), "{field}");
+            assert!(!profile.uploads_root().join("retained.txt").exists(), "{field}");
+        }
+        if field == "first" {
+            original_profile = Some(profile);
+        } else if field == "epoch" {
+            let old = original_profile.as_ref().unwrap();
+            assert_ne!(old.scaffold_profile_key(), profile.scaffold_profile_key());
+            let runtime_config = EngineConfig {
+                data_dir:dir.path().into(), edge_url:session.edge_origin.clone(), edge_token:None,
+                ipc_port:0, default_harness:HarnessId::Mock, org_id:None, workos_client_id:None,
+                scaffold:config.scaffold, device:config.device, managed_inference:false,
+                device_bootstrap_file:None, scaffold_runtime_artifact:None,
+            };
+            assert!(Engine::assemble_runtime(&runtime_config, auth.clone(), old.clone()).await.is_err(), "old auth fingerprint must be rejected even with identical storage");
+            let binding = std::fs::read_dir(legacy.parent().unwrap()).unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.file_name().unwrap().to_string_lossy().ends_with(".store.json"))
+                .unwrap();
+            let binding_bytes = std::fs::read(&binding).unwrap();
+            let oversized = vec![b' '; 4097];
+            std::fs::write(&binding, &oversized).unwrap();
+            assert!(EngineProfile::scaffold(dir.path(), &auth).is_err());
+            assert_eq!(std::fs::read(&binding).unwrap(), oversized);
+            std::fs::write(&binding, &binding_bytes).unwrap();
+            #[cfg(unix)]
+            {
+                let target = dir.path().join("binding-link-target.json");
+                std::fs::write(&target, &binding_bytes).unwrap();
+                std::fs::remove_file(&binding).unwrap();
+                std::os::unix::fs::symlink(&target, &binding).unwrap();
+                assert!(EngineProfile::scaffold(dir.path(), &auth).is_err());
+                assert_eq!(std::fs::read(&target).unwrap(), binding_bytes);
+                std::fs::remove_file(&binding).unwrap();
+                std::fs::write(&binding, &binding_bytes).unwrap();
+            }
+            assert_eq!(EngineProfile::scaffold(dir.path(), &auth).unwrap().store_root(), legacy);
+            assert_eq!(std::fs::read(&upload).unwrap(), b"absolute upload path survives");
+            assert_eq!(store.crew_command("done").unwrap(), Some((request.to_vec(), Some(outcome.to_vec()))));
+            // A second epoch-keyed store must never be merged or hidden by the binding.
+            let competing = dir.path().join("profiles/scaffold").join(profile_key(&session));
+            std::fs::create_dir(&competing).unwrap();
+            std::fs::write(competing.join("outcome"), b"different state").unwrap();
+            assert!(EngineProfile::scaffold(dir.path(), &auth).is_err());
+            assert_eq!(std::fs::read(competing.join("outcome")).unwrap(), b"different state");
+        }
+    }
+    server.abort();
 }

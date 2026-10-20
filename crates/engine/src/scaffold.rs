@@ -2894,6 +2894,7 @@ impl ScaffoldRuntime {
         control: ScaffoldEnvironmentControl,
         cancellation: &CancellationToken,
     ) -> Result<ScaffoldEnvironmentControlResult, ScaffoldError> {
+        let resume_requested = matches!(control, ScaffoldEnvironmentControl::Resume { .. });
         let mut control_grant = None;
         let (environment, attached_device_id, run_id, handoff) = match control {
             ScaffoldEnvironmentControl::Inspect { sandbox_id, scope } => (
@@ -2940,15 +2941,6 @@ impl ScaffoldRuntime {
                 None,
                 None,
             ),
-            ScaffoldEnvironmentControl::Resume { sandbox_id, scope } => (
-                self.inner
-                    .client
-                    .resume(&sandbox_id, &scope, cancellation)
-                    .await?,
-                None,
-                None,
-                None,
-            ),
             ScaffoldEnvironmentControl::Stop { sandbox_id, scope } => (
                 self.inner
                     .client
@@ -2971,13 +2963,18 @@ impl ScaffoldRuntime {
                 None,
                 None,
             ),
-            ScaffoldEnvironmentControl::Attach { sandbox_id, scope } => {
+            ScaffoldEnvironmentControl::Attach { sandbox_id, scope }
+            | ScaffoldEnvironmentControl::Resume { sandbox_id, scope } => {
                 let mut environment = self
                     .inner
                     .client
                     .inspect(&sandbox_id, &scope, cancellation)
                     .await?;
-                if scaffold_source(&environment)?.0 == zeron_proto::ScaffoldLifecycle::Paused {
+                let lifecycle = scaffold_source(&environment)?.0;
+                if matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Failed | zeron_proto::ScaffoldLifecycle::Stopped) {
+                    return Err(ScaffoldError::AttachRejected(lifecycle));
+                }
+                if resume_requested || lifecycle == zeron_proto::ScaffoldLifecycle::Paused {
                     let resumed = self
                         .inner
                         .client
@@ -2986,6 +2983,7 @@ impl ScaffoldRuntime {
                     if environment_sandbox_id(&resumed)? != sandbox_id
                         || resumed.scope != environment.scope
                         || resumed.owner_principal != environment.owner_principal
+                        || scaffold_source(&resumed)?.1 < scaffold_source(&environment)?.1
                     {
                         return Err(ScaffoldError::InvalidResponse(
                             "sandbox identity changed while resuming".into(),
@@ -4512,6 +4510,135 @@ mod tests {
             })
         );
     }
+    #[tokio::test]
+    async fn resume_requires_current_native_authority_and_recovers_without_replay() {
+        use crate::{auth::{Auth, AuthConfig}, crew::CrewServices};
+        use zeron_sync::{DocsStore, scaffold_auth::{save_session, ScaffoldConfig,
+            ScaffoldIdentity, ScaffoldSession, DEFAULT_OAUTH_SCOPES}};
+
+        let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth_origin = format!("http://{}", auth_listener.local_addr().unwrap());
+        let resource = auth_origin.clone();
+        let auth_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = auth_listener.accept().await.unwrap();
+                let mut bytes = [0_u8; 8192];
+                let size = stream.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..size]);
+                let body = if request.starts_with("GET /auth/session ") {
+                    serde_json::json!({"userId":"alice", "email":"alice@example.com",
+                        "projectScope":"project-a", "deploymentId":"deployment-a",
+                        "credential":"scaffold", "capabilities":["session.read"]})
+                } else {
+                    assert!(request.starts_with("GET /api/code-sandboxes/auth/session "));
+                    serde_json::json!({"ok":true, "resource":resource,
+                        "actor":{"sub":"alice", "auth":"iap"},
+                        "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})
+                }.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        save_session(&directory.path().join("scaffold-session.json"), &ScaffoldSession {
+            access_token: "sc_rc_test".into(), resource: auth_origin.clone(), edge_origin: auth_origin.clone(), device: None,
+            identity: ScaffoldIdentity { user_id: "alice".into(), email: "alice@example.com".into(), name: None,
+                project_scope: "project-a".into(), deployment_id: Some("deployment-a".into()), capabilities: vec!["session.read".into()] },
+        }).unwrap();
+        let mut config = AuthConfig::new(&auth_origin, directory.path());
+        config.scaffold = Some(ScaffoldConfig::new(&auth_origin, &auth_origin, "project-a"));
+        let auth = Auth::detect(config).await;
+        assert!(auth.state().is_signed_in());
+        auth_server.await.unwrap();
+
+        let grant_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let expires_at = now_ms() + 60_000;
+        let authority = host_authority(grant_id, expires_at)
+            .replace("sandbox-a-e1", "sandbox-a-e3")
+            .replace(r#"\"lifecycleEpoch\":1"#, r#"\"lifecycleEpoch\":3"#);
+        let current = |status| comet_sandbox(status).replace("\"lifecycleEpoch\":1", "\"lifecycleEpoch\":3");
+        let unavailable = r#"{"ok":false,"exitCode":1}"#.to_string();
+        let (origin, captured) = mock_server(vec![
+            comet_sandbox("paused"), // Controller validates the old binding.
+            comet_sandbox("paused"), // Native attachment validates the resume transition.
+            current("resuming"),
+            unavailable.clone(),
+            r#"{"ok":true,"exitCode":0}"#.into(),
+            format!(r#"{{"grant":"cg1.{grant_id}.secret","expiresAt":{expires_at}}}"#),
+            r#"{"ok":true}"#.into(),
+            r#"{"ok":true,"exitCode":0}"#.into(),
+            r#"{"ok":true,"runId":"resumed-host"}"#.into(),
+            authority.clone(),
+            current("ready"),
+            unavailable.clone(), // Provider readiness alone must not confirm Resume.
+            current("ready"),
+            host_authority(grant_id, expires_at), // Old epoch is not live authority.
+            current("ready"),
+            authority.replace(grant_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .replace(&expires_at.to_string(), "0"), // Current epoch with an expired grant is not authority.
+            current("ready"),
+            authority.clone(),
+            current("failed"),
+            current("stopped"),
+            current("failed"),
+            current("failed"),
+            current("stopped"),
+            current("stopped"),
+            current("paused"),
+            current("paused"),
+            r#"{"ok":true}"#.into(), // Resume delivery is unknown after a malformed reply.
+            current("ready"),
+            unavailable,
+            current("ready"),
+            authority,
+        ]).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("control-token".into()));
+        let runtime = test_runtime(
+            ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+            &origin, Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+        ).with_deployment_id("deployment-a".into());
+        let store = Arc::new(DocsStore::open(&directory.path().join("store")).unwrap());
+        let services = CrewServices::new(auth, runtime, store.clone()).unwrap();
+        let cancellation = CancellationToken::new();
+        let control = ScaffoldEnvironmentControl::Resume { sandbox_id: "sandbox-a".into(), scope: scope() };
+        let first = services.control("resume-once", control.clone(), &cancellation).await.unwrap();
+        assert_eq!(first.status, "unknown");
+        assert!(first.result.is_none());
+        assert_eq!(services.control("resume-once", control, &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.reconcile("resume-once", &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.reconcile("resume-once", &cancellation).await.unwrap().status, "unknown");
+        let confirmed = services.reconcile("resume-once", &cancellation).await.unwrap();
+        assert_eq!(confirmed.status, "confirmed");
+        let result = confirmed.result.unwrap();
+        assert_eq!(result.attached_device_id.as_deref(), Some("comet-scaffold-sandbox-a-e3"));
+        assert_eq!(result.control_grant.unwrap().id, grant_id);
+        assert_eq!(scaffold_source(&result.environment).unwrap().1, Some(3));
+        assert_eq!(result.room_projection.unwrap().session_id, scope().session_id.unwrap());
+
+        // Pending resumes also retire on terminal provider observations, without launching.
+        let (request, _) = store.crew_command("resume-once").unwrap().unwrap();
+        for id in ["resume-failed", "resume-stopped"] {
+            assert!(store.claim_crew_command(id, &request).unwrap());
+            assert_eq!(services.reconcile(id, &cancellation).await.unwrap().status, "rejected");
+            assert_eq!(services.outcome(id).unwrap().status, "rejected");
+        }
+        for id in ["direct-resume-failed", "direct-resume-stopped"] {
+            let control = ScaffoldEnvironmentControl::Resume { sandbox_id: "sandbox-a".into(), scope: scope() };
+            assert_eq!(services.control(id, control, &cancellation).await.unwrap().status, "rejected");
+        }
+        let control = ScaffoldEnvironmentControl::Resume { sandbox_id: "sandbox-a".into(), scope: scope() };
+        assert_eq!(services.control("resume-ambiguous", control.clone(), &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.control("resume-ambiguous", control, &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.reconcile("resume-ambiguous", &cancellation).await.unwrap().status, "unknown");
+        let recovered = services.reconcile("resume-ambiguous", &cancellation).await.unwrap();
+        assert_eq!(recovered.status, "confirmed");
+        assert_eq!(recovered.result.unwrap().attached_device_id.as_deref(), Some("comet-scaffold-sandbox-a-e3"));
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/resume ")).count(), 2);
+        assert_eq!(requests.iter().filter(|request| request.contains(r#""mode":"background""#)).count(), 1);
+        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /auth/device-grants ")).count(), 1);
+        assert!(!requests.iter().any(|request| request.starts_with("POST /api/code-sandboxes HTTP")));
+    }
+
     #[tokio::test]
     async fn attach_resumes_existing_sandbox_and_uses_new_epoch_authority() {
         let grant_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

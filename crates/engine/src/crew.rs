@@ -223,7 +223,7 @@ impl CrewServices {
             }
             Err(error) => return self.record_error(command_id, error),
         };
-        if matches!(command.control, Control::Attach { .. }) {
+        if matches!(command.control, Control::Attach { .. } | Control::Resume { .. }) {
             return match self.runtime.observe_attachment(result.environment, cancellation).await.map_err(failed)? {
                 Some(mut observed) => {
                     observed.run_id = result.run_id;
@@ -263,7 +263,7 @@ impl CrewServices {
             .unwrap_or_else(|| Ok(unknown(command_id, "Command delivery is pending or its outcome is unknown; reconcile without replay")))
     }
 
-    /// Reconcile only by observation. Never resubmit an unknown create, attach, or exec.
+    /// Reconcile only by observation. Never resubmit an unknown create, resume, attach, or exec.
     pub async fn reconcile(&self, command_id: &str, cancellation: &CancellationToken) -> Result<ControlOutcome, RpcError> {
         let _gate = self.control_gate.lock().await;
         let old = self.outcome(command_id)?;
@@ -284,18 +284,18 @@ impl CrewServices {
             environment
         };
         self.validate_environment(&environment, scope)?;
-        if matches!(command.control, Control::Create { .. } | Control::Attach { .. })
+        if matches!(command.control, Control::Create { .. } | Control::Attach { .. } | Control::Resume { .. })
             && let SessionEnvironmentSource::Scaffold { lifecycle, .. } = &environment.source
             && matches!(lifecycle, ScaffoldLifecycle::Failed | ScaffoldLifecycle::Stopped) {
             return self.finish(command_id, None, Some(format!(
-                "Creation/attachment recovery retired because the sandbox is {lifecycle:?}; no command was replayed."
+                "Creation/attachment/resume recovery retired because the sandbox is {lifecycle:?}; no command was replayed."
             )));
         }
         if let Some((binding, _)) = self.store.crew_command(&format!("{command_id}:binding")).map_err(failed)? {
             let before: SessionEnvironment = serde_json::from_slice(&binding).map_err(failed)?;
             validate_transition(&before, &environment)?;
         }
-        if matches!(command.control, Control::Attach { .. }) {
+        if matches!(command.control, Control::Attach { .. } | Control::Resume { .. }) {
             return match self.runtime.observe_attachment(environment, cancellation).await.map_err(failed)? {
                 Some(result) => self.finish(command_id, Some(result), None),
                 None => Ok(old),
@@ -543,8 +543,7 @@ fn operation_observed(control:&Control,environment:&SessionEnvironment)->bool {
     match control {
         Control::Pause{..}=>*lifecycle==ScaffoldLifecycle::Paused,
         Control::Stop{..}=>*lifecycle==ScaffoldLifecycle::Stopped,
-        Control::Resume{..}=>matches!(lifecycle,ScaffoldLifecycle::Ready|ScaffoldLifecycle::AgentRunning),
-        Control::Attach{..}=>false, // Attachment requires native authority, not application health.
+        Control::Attach{..}|Control::Resume{..}=>false, // Native authority, not application health, confirms attachment/resume.
         Control::Create{..}=>!matches!(lifecycle,ScaffoldLifecycle::Stopped|ScaffoldLifecycle::Failed),
         _=>true,
     }
@@ -567,6 +566,8 @@ mod tests {
     fn accepted_startup_is_not_a_confirmed_resume() {
         let scope=CollaborationScope{project_id:"p".into(),deployment_id:Some("d".into()),session_id:Some("s".into()),unknown:Default::default()};
         let mut environment=SessionEnvironment{source:SessionEnvironmentSource::Scaffold{sandbox_id:"box".into(),region:None,lifecycle:ScaffoldLifecycle::Resuming,lifecycle_epoch:Some(2),links:Default::default()},name:None,owner_principal:"owner@example.com".into(),scope:scope.clone(),source_ref:None,last_activity_at:None,database_environment:None,unknown:Default::default()};
+        assert!(!operation_observed(&Control::Resume{sandbox_id:"box".into(),scope:scope.clone()},&environment));
+        if let SessionEnvironmentSource::Scaffold{lifecycle,..}=&mut environment.source{*lifecycle=ScaffoldLifecycle::Ready;}
         assert!(!operation_observed(&Control::Resume{sandbox_id:"box".into(),scope:scope.clone()},&environment));
         let previous=environment.clone();
         if let SessionEnvironmentSource::Scaffold{lifecycle,lifecycle_epoch,..}=&mut environment.source{*lifecycle=ScaffoldLifecycle::Ready;*lifecycle_epoch=Some(1);}
