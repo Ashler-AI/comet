@@ -212,7 +212,8 @@ Distinct IPC ports are not a security boundary. Live harness testing remains
 gated on those fixes and an isolated `crew-upstream-canary`/chat2 lane; the existing
 Canary profile must not be retargeted to legacy shared staging Edge.
 
-Local Crew integration changes now separate logical sandbox storage from the
+Crew integration source [`fc12483c`](https://github.com/Ashler-AI/comet/commit/fc12483c7fa0aed93b84e8aaa03e755c8ff78704)
+separates logical sandbox storage from the
 device/epoch-bound authentication fingerprint. A validated storage binding keeps
 current-authority legacy roots and absolute attachment paths in place; it must be
 saved with the data. Earlier-epoch legacy roots without a prior verified binding
@@ -232,6 +233,18 @@ this is not cloud cold-restore or end-to-end harness evidence. The initial obser
 missed one-shot RPC `ok` replies; correcting that fixture produced the passing run.
 Existing compiler warnings remain; local typechecks were intentionally skipped.
 These changes have not replaced the installed Canary runtime or a shared lane.
+Private artifact-only [CI](https://github.com/Ashler-AI/comet/actions/runs/39390433796)
+passed for that exact source on macOS ARM64, Linux x64 and Linux ARM64, including
+remote Edge checks. Downloaded archive checksums, extracted Linux executable
+checksums and the macOS app signature verified. These private artifacts are not
+an installed-runtime or cloud-rollout claim.
+
+The follow-up native launcher passes its verified control origin, project and
+deployment through existing CLI flags instead of relying on provider environment
+variables. Without them, the actual CI executable exited before enrollment with
+`device bootstrap requires a configured Scaffold authority`; with them it returned
+the expected `ScaffoldHostAuthority` and shut down gracefully. This used isolated
+loopback authentication. All 42 Scaffold checks passed after the launcher change.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform

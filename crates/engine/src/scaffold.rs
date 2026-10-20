@@ -3409,6 +3409,12 @@ impl ScaffoldRuntime {
             bootstrap_path.clone(),
             "--edge-url".to_string(),
             self.inner.edge_origin.clone(),
+            "--scaffold-url".to_string(),
+            self.inner.client.origin.as_str().to_owned(),
+            "--project-scope".to_string(),
+            scope.project_id.clone(),
+            "--deployment-id".to_string(),
+            deployment_id.to_owned(),
         ]);
         let started = match self
             .inner
