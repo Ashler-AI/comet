@@ -135,6 +135,54 @@ async fn resume_path_and_id_use_the_same_canonical_handshake() {
 }
 
 #[tokio::test]
+async fn native_retry_continuation_finishes_without_an_error_card() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let session_dir = temp.path().join("sessions");
+    write_omp_session(&session_dir, "retry-session");
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_WRITER_STATE", "inactive");
+    }
+    let harness = OmpHarness::new()
+        .with_executable(fixture_path())
+        .with_session_dir(session_dir)
+        .with_session_writer_probe(fixture_path());
+    let mut request = request(Some("retry-session"));
+    request.prompt = "scenario:retry".into();
+    let mut stream = harness.run(request, controls()).await.unwrap();
+    let mut parts = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("native retry settles")
+            .expect("stream remains open through recovery")
+            .expect("valid recovery event");
+        zeron_doc::fold_event_into_parts(&mut parts, &event);
+        if let AgentEvent::Done { status, error, session_id, .. } = event {
+            assert_eq!(status, DoneStatus::Completed);
+            assert_eq!(error, None);
+            assert_eq!(session_id.as_deref(), Some("retry-session"));
+            break;
+        }
+    }
+    assert!(parts.iter().any(|part| matches!(part,
+        zeron_doc::MessagePart::Text { text, .. } if text == "hello from omp"
+    )));
+    assert!(!parts.iter().any(|part| matches!(part, zeron_doc::MessagePart::Error { .. })));
+    let completed: Vec<_> = parts.iter().filter_map(|part| match part {
+        zeron_doc::MessagePart::Tool { id, resolved, is_error, .. } if id == "before-retry" => {
+            Some((*resolved, *is_error))
+        }
+        _ => None,
+    }).collect();
+    assert_eq!(completed, [(true, false)]);
+    unsafe {
+        std::env::remove_var("OMP_WRITER_STATE");
+    }
+}
+
+#[tokio::test]
 async fn inactive_takeover_is_idempotent_and_invalid_or_ambiguous_journals_fail() {
     let temp = tempfile::tempdir().unwrap();
     let journal = write_omp_session(temp.path(), "inactive-session");
@@ -360,20 +408,26 @@ async fn errored_rpc_run_releases_writer_before_done() {
         .run(request(Some("errored-session")), controls())
         .await
         .expect("errored turn starts");
-    let mut saw_provider_error = false;
+    let mut parts = Vec::new();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
             .expect("errored turn settles")
             .expect("stream remains open")
             .expect("valid errored event");
+        zeron_doc::fold_event_into_parts(&mut parts, &event);
         match event {
-            AgentEvent::Error { message } => {
-                saw_provider_error = message.contains("No API key for provider");
-            }
-            AgentEvent::Done { status, .. } => {
+            AgentEvent::Done { status, error, .. } => {
                 assert_eq!(status, DoneStatus::Errored);
-                assert!(saw_provider_error);
+                assert_eq!(error.as_deref(), Some("No API key for provider: comet-anthropic"));
+                let errors: Vec<_> = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        zeron_doc::MessagePart::Error { message, .. } => Some(message.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(errors, ["No API key for provider: comet-anthropic"]);
                 #[cfg(unix)]
                 {
                     let pid = std::fs::read_to_string(&pid_log)
@@ -601,4 +655,82 @@ async fn catalog_uses_native_omp_model_and_command_discovery() {
     let commands = harness.commands_for(temp.path()).await.unwrap();
     assert!(commands.iter().any(|command| command.name == "ralplan"));
     unsafe { std::env::remove_var("OMP_ARGV_LOG"); }
+}
+
+#[tokio::test]
+#[ignore = "requires OMP_EXECUTABLE; isolated native OMP with loopback Responses SSE only"]
+async fn real_omp_recovers_idle_stream_without_replaying_completed_tool() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _env = env_lock().await;
+    let executable = std::env::var_os("OMP_EXECUTABLE").expect("set OMP_EXECUTABLE to the native OMP binary");
+    let executable = std::fs::canonicalize(executable).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    // OMP deliberately leaves HOME on startup; keep it separate from the workspace.
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let agent = temp.path().join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(temp.path().join("completed.txt"), "completed before the stall\n").unwrap();
+    let extension = temp.path().join("retry-provider.ts");
+    std::fs::write(&extension, include_str!("fixtures/omp-retry-provider.ts")).unwrap();
+    let config = temp.path().join("settings.yml");
+    std::fs::write(&config, "retry:\n  maxRetries: 2\n  baseDelayMs: 1\n  modelFallback: false\nfeatures:\n  unexpectedStopDetection: none\n").unwrap();
+    let quote = |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let wrapper = temp.path().join("omp-probe");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nexec /usr/bin/env -i HOME={} PATH={} ASHLER_INCREMENTAL_TSC_CHECKS=false PI_CODING_AGENT_DIR={} PI_OPENAI_STREAM_IDLE_TIMEOUT_MS=250 PI_OPENAI_STATEFUL=0 {} \"$@\" --extension {}\n",
+        quote(&home), quote(std::path::Path::new(&std::env::var_os("PATH").unwrap_or_default())),
+        quote(&agent), quote(&executable), quote(&extension),
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let harness = OmpHarness::new().with_executable(wrapper).with_session_dir(agent.join("sessions"));
+    let mut request = request(None);
+    request.cwd = temp.path().display().to_string();
+    request.model = Some("crew-retry-fixture/fixture".into());
+    request.prompt = "Read completed.txt, then reply RECOVERED.".into();
+    // Isolate inherited overlays too; Crew's generated run config still comes last.
+    // OmpRunConfig::apply converts these paths to repeated --config arguments;
+    // the env -i wrapper preserves them through "$@", not PI_CONFIG_FILES.
+    let inherited = std::env::var_os("PI_CONFIG_FILES");
+    unsafe { std::env::set_var("PI_CONFIG_FILES", &config); }
+    let run = harness.run(request, controls()).await;
+    unsafe {
+        match inherited {
+            Some(value) => std::env::set_var("PI_CONFIG_FILES", value),
+            None => std::env::remove_var("PI_CONFIG_FILES"),
+        }
+    }
+    let events: Vec<AgentEvent> = tokio::time::timeout(Duration::from_secs(45), run.unwrap().collect::<Vec<_>>())
+        .await.expect("native retry must settle")
+        .into_iter().collect::<Result<_, _>>().unwrap();
+    let mut parts = Vec::new();
+    for event in &events {
+        zeron_doc::fold_event_into_parts(&mut parts, event);
+    }
+    assert!(matches!(events.last(), Some(AgentEvent::Done {
+        status: DoneStatus::Completed, error: None, ..
+    })), "native events: {events:?}");
+    assert!(!parts.iter().any(|part| matches!(part, zeron_doc::MessagePart::Error { .. })));
+    assert!(parts.iter().any(|part| matches!(part,
+        zeron_doc::MessagePart::Text { text, .. } if text == "RECOVERED"
+    )));
+    let reads = events.iter().filter(|event| matches!(event,
+        AgentEvent::ToolCall { call: zeron_proto::ToolCall::ReadFile { .. }, .. }
+    )).count();
+    assert_eq!(reads, 1, "completed read must not execute again");
+    assert!(parts.iter().any(|part| matches!(part,
+        zeron_doc::MessagePart::Tool { resolved: true, is_error: false, .. }
+    )), "native parts: {parts:?}; events: {events:?}");
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::ToolResult { is_error: false, output: Some(output), .. }
+            if output.contains("completed before the stall")
+    )), "native events: {events:?}");
+    let requests: Vec<serde_json::Value> = std::fs::read_to_string(temp.path().join("retry-requests.jsonl"))
+        .unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(requests.len(), 3, "tool turn, stalled attempt, recovered attempt");
+    let results: Vec<_> = requests[2]["input"].as_array().unwrap().iter()
+        .filter(|item| item["type"] == "function_call_output").collect();
+    assert_eq!(results.len(), 1, "recovered request retains the completed tool result once");
+    assert!(results[0]["output"].to_string().contains("completed before the stall"));
 }

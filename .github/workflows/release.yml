@@ -104,6 +104,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Package isolated ad-hoc signed app
         run: scripts/package-macos.sh
+      - name: Verify native recovery and one-shot routing
+        run: |
+          cargo test --locked --release -p zeron-harness --test omp
+          cargo test --locked --release -p zeron --test noop_browser
       - name: Record private artifact provenance
         run: |
           cd target/package

@@ -148,6 +148,15 @@ while IFS= read -r line; do
           ;;
       esac
       printf '%s\n' '{"type":"agent_start"}'
+      if has "$line" 'scenario:retry'; then
+        printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse"}}'
+        printf '%s\n' '{"type":"tool_execution_start","toolCallId":"before-retry","toolName":"read","args":{"path":"completed.txt"}}'
+        printf '%s\n' '{"type":"tool_execution_end","toolCallId":"before-retry","toolName":"read","isError":false,"result":{"content":[{"type":"text","text":"already completed"}],"details":{}}}'
+        printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"OpenAI responses stream stalled while waiting for the next event","content":[]}}'
+        printf '%s\n' '{"type":"auto_retry_start","attempt":1,"maxAttempts":10,"delayMs":0}'
+        printf '%s\n' '{"type":"agent_end","isTerminal":false,"messages":[]}'
+        printf '%s\n' '{"type":"agent_start"}'
+      fi
       printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking"}}'
       printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello from omp"}}'
       if [ -n "${OMP_STEER_SCENARIO:-}" ]; then

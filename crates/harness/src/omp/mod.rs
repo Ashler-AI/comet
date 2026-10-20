@@ -45,13 +45,9 @@ const SCAFFOLD_INFERENCE_EXTENSION_BYTES: u64 = 64 * 1024;
 // Agent Auth accepts at most 8 MiB per inference request. OMP's 3840x2400
 // Computer default can retain multi-megabyte PNGs in Responses history, so use
 // its documented coordinate-safe capture cap for every Comet-owned OMP run.
-const OMP_RUN_CONFIG: &[u8] = br#"retry:
-  enabled: false
-  maxRetries: 0
-  baseDelayMs: 1000
-  provider:
-    maxRetries: 0
-computer:
+// Leave retries to OMP's configured, replay-aware turn recovery. Crew must not
+// turn recoverable provider failures into terminal RPC errors.
+const OMP_RUN_CONFIG: &[u8] = br#"computer:
   maxWidth: 1280
   maxHeight: 896
 "#;

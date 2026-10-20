@@ -46,7 +46,7 @@ fn setting(name: &str, upstream: &str) -> Option<String> {
 }
 
 impl RuntimeArgs {
-    pub fn config(&self) -> anyhow::Result<EngineConfig> {
+    pub fn config(&self, persist: bool) -> anyhow::Result<EngineConfig> {
         let data_dir = std::path::absolute(self.data_dir.clone().unwrap_or_else(crate::paths::data_dir))?;
         let settings_path = data_dir.join("crew-runtime.json");
         let saved = match std::fs::read(&settings_path) {
@@ -103,7 +103,7 @@ impl RuntimeArgs {
         };
         // These are non-secret launch coordinates, retained for Finder launches
         // and device restarts. Credential storage belongs to the auth service.
-        if scaffold.is_some() {
+        if persist && scaffold.is_some() {
             std::fs::create_dir_all(&data_dir)?;
             let settings = RuntimeSettings {
                 edge_url: Some(edge_url.clone()), scaffold_url, project_scope,
@@ -294,7 +294,7 @@ mod tests {
         std::fs::write(&source, b"private-bootstrap").unwrap();
         let link = dir.path().join("link");
         symlink(&source, &link).unwrap();
-        let mut config = RuntimeArgs { data_dir: Some(dir.path().join("profile")), ..Default::default() }.config().unwrap();
+        let mut config = RuntimeArgs { data_dir: Some(dir.path().join("profile")), ..Default::default() }.config(false).unwrap();
         assert!(configure_device(&mut config, &link).is_err());
         assert_eq!(std::fs::read(source).unwrap(), b"private-bootstrap");
     }

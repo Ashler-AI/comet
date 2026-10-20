@@ -1006,14 +1006,10 @@ pub(crate) async fn run_rpc(
                         } else {
                             DoneStatus::Completed
                         };
-                        if let Some(message) = turn_error.clone()
-                            && events.send(Ok(AgentEvent::Error { message })).await.is_err()
-                        {
-                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                            return Ok(());
-                        }
                         // A terminal error closes the persistent RPC run. Reap its
                         // session writer before Done makes queued recovery dispatchable.
+                        // Done carries the sole visible error; emitting Error as
+                        // well would fold the same failure into two transcript cards.
                         if status == DoneStatus::Errored {
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
                         }

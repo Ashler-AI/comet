@@ -149,7 +149,11 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
     let cli = Cli::parse();
-    let mut config = cli.runtime.config()?;
+    // IPC clients may inherit another engine's port without changing future app launches.
+    let persist_runtime = matches!(&cli.command,
+        None | Some(Command::Headless(_) | Command::Login | Command::Logout)
+        | Some(Command::Daemon { command: DaemonCommand::Install | DaemonCommand::Start | DaemonCommand::Restart }));
+    let mut config = cli.runtime.config(persist_runtime)?;
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;

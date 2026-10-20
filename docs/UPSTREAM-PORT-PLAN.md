@@ -157,6 +157,37 @@ controller. Keep those coordinates pinned when launching from another Crew
 agent. No existing sandbox was paused or restarted. TestFlight remains 1.0 (3):
 the final caller correction is desktop/CLI-only, not an iOS change.
 
+The October 20 interruption investigation found Crew forcing OMP's native turn
+recovery off. The reported stream-idle failure coincided with host clamshell
+sleep/dark wake; this is not evidence that Agent Auth rejected the request.
+Crew now leaves retry limits and replay-safety decisions to OMP rather than
+adding a second HTTP or turn-replay loop. Terminal RPC failures carry their
+visible error only on `Done`, after reaping the writer, avoiding two error cards
+for one failure. Previously saved transcript entries are not rewritten.
+
+The real OMP 18.11.1 smoke passed through a loopback Responses SSE endpoint:
+one native file read completed, the next request stalled, and native recovery
+returned `RECOVERED` with the completed tool result retained once. No provider
+credentials or live sessions were used. All 12 non-ignored native OMP regression
+checks passed, including final-error rendering and writer release. The smoke
+keeps HOME separate from its workspace because OMP intentionally leaves HOME
+on startup; full tool output is checked in native events/history, not the
+deliberately output-free synchronized tool chip.
+
+One-shot CLI commands now resolve explicit/inherited IPC routing without saving
+it into `crew-runtime.json`; intentional application, headless, auth and daemon
+startup still persist their launch settings. This prevents a Canary CLI invoked
+from Crew Staging from changing the next Canary launch's port. Private artifact
+CI includes native recovery and actual CLI subprocess regressions. These new
+changes are locally verified source, not yet an installed artifact.
+
+Coordination request `8cd29fbc-3147-41f0-8d03-e77f99b7cb22` is persisted in
+Scaffold session `95e5f344-d332-445d-b91e-dd2e691153f6`. Its prior turn ended with
+`503 agent_auth_v2_account_unavailable`; no integration reply is present yet.
+The new harness tier's native Crew state/cold-restore contract and isolated
+deployment ownership must be confirmed before a shared rollout. No peer source,
+existing sandbox or shared deployment was changed for this coordination.
+
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
 `30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),
