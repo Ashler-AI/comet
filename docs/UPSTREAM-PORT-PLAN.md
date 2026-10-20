@@ -266,6 +266,31 @@ No installed runtime, existing host, shared release channel or deployment change
 The independent review tool failed on provider HTTP 402; the bounded launcher
 producer/consumer review was completed inline. Local typechecks remained disabled.
 
+The October 20 local-Canary recovery found the installed host stopped and Canary
+Dev retrying 15 directory jobs with no local transcript snapshots. Dev logged 188
+stale-source conflicts in one minute; both clients shared a credential/rate-limit
+bucket and encountered control HTTP 429 followed by Edge HTTP 503. The worker now
+keeps server versions only as in-memory prerequisites: it leaves conflicted jobs
+durable and performs no further lookup until that chat's actually observed source
+dominates the prerequisite. Remote counters never become projection evidence, and
+transient GET/upsert failures remain retryable.
+
+All four directory regressions passed, including loopback HTTP request counts,
+unrelated wakeups, snapshot catch-up, fresh-worker recovery and transient failures.
+The isolated headed demo built and rendered completed mock turns; its initial
+300-second readiness wait expired during build/seed, then it became ready normally.
+Recovery retained all 29 chat IDs, controller/model/native-history identities and
+resumed both interrupted local runs. Launches from a Crew agent must explicitly
+set Canary IPC 27954 (Dev 27955) rather than inherit Staging's `COMET_IPC_PORT`;
+the accidental misattachment during recovery was closed and saved routing restored.
+No shared engine, remote host, deployment lane or authentication guard changed.
+The rebuilt, signature-verified Dev observer and recovered installed host then ran
+together for a measured 120 seconds: both retained all 29 chat IDs and device
+identities, stayed connected/synced, and logged zero repeated stale-source retries,
+control 429s or upstream 503s. Pending directory jobs remained durable (16 on Dev,
+26 on the installed host); they were not discarded to make the check pass. Native
+screenshots showed the recovered local run and its latest transcript in Dev.
+
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
 `30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),

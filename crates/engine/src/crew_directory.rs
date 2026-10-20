@@ -33,6 +33,8 @@ pub(crate) fn start(auth: Auth, services: CrewServices, workspace: WorkspaceHost
     let mut identity = auth.watch_state();
     tokio::spawn(async move {
         let mut inventory = true;
+        // Remote versions are prerequisites only, never local projection evidence.
+        let mut required_sources = BTreeMap::new();
         loop {
             registry.borrow_and_update();
             snapshots.borrow_and_update();
@@ -45,7 +47,7 @@ pub(crate) fn start(auth: Auth, services: CrewServices, workspace: WorkspaceHost
                         inventory = false;
                     }
                 }
-                if let Err(error) = drain(&store, &services, &workspace).await {
+                if let Err(error) = drain(&store, &services, &workspace, &mut required_sources).await {
                     tracing::warn!(%error, "directory pending work retained for retry");
                 }
             }
@@ -75,8 +77,8 @@ async fn enqueue_registry(store: &DocsStore, workspace: &WorkspaceHost) -> Resul
     }
 }
 
-async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost)
-    -> Result<(), EngineError> {
+async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
+    required_sources: &mut BTreeMap<String, Version>) -> Result<(), EngineError> {
     let mut after = String::new();
     loop {
         let ids = store.pending_sync_jobs(JOB, &after, 64)?;
@@ -85,8 +87,12 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
             after.clone_from(&id);
             services.ensure_identity()?;
             let Some(generation) = store.sync_job_version(&id, JOB)? else { continue };
-            match publish(store, services, workspace, &id).await {
-                Ok(()) => store.complete_sync_job(&id, JOB, generation)?,
+            match publish(store, services, workspace, &id, required_sources).await {
+                Ok(true) => {
+                    store.complete_sync_job(&id, JOB, generation)?;
+                    required_sources.remove(&id);
+                }
+                Ok(false) => {}, // Keep the durable job until its own source catches up.
                 Err(error) => tracing::warn!(session = %id, %error, "directory update awaits synchronization or reconciliation"),
             }
         }
@@ -95,7 +101,7 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
 }
 
 async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
-    id: &str) -> Result<(), EngineError> {
+    id: &str, required_sources: &mut BTreeMap<String, Version>) -> Result<bool, EngineError> {
     if workspace.directory_reconciliation_required() {
         return Err(failure("registry server reset observed; directory reconciliation required"));
     }
@@ -140,8 +146,12 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
     });
     if row.deleted { links.clear(); }
     version.insert(REGISTRY_VERSION.into(), row.seq);
-    require_observed(&version, &evidence.source_version)?;
-    if evidence.confirmed && evidence.source_version == version { return Ok(()); }
+    require_observed(&version, &Version::new())?;
+    if require_observed(&version, &evidence.source_version).is_err()
+        || required_sources.get(id).is_some_and(|required| require_observed(&version, required).is_err()) {
+        return Ok(false);
+    }
+    if evidence.confirmed && evidence.source_version == version { return Ok(true); }
     services.ensure_identity()?;
     let client = services.runtime().client();
     let remote = client.get_crew_session(id, Some(deployment)).await
@@ -150,8 +160,11 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
     let revision = if !previous.is_null() {
         let observed: Version = serde_json::from_value(previous["sourceVersion"].clone())
             .map_err(|_| failure("invalid directory server version"))?;
-        require_observed(&version, &observed)?;
-        if previous.get("deleted").and_then(Value::as_bool) == Some(true) { return Ok(()); }
+        if let Err(error) = require_observed(&version, &observed) {
+            required_sources.insert(id.to_owned(), observed);
+            return Err(error);
+        }
+        if previous.get("deleted").and_then(Value::as_bool) == Some(true) { return Ok(true); }
         Some(previous["revision"].as_u64().filter(|revision| *revision > 0)
             .ok_or_else(|| failure("invalid directory server revision"))?)
     } else { None };
@@ -183,7 +196,7 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
     evidence.confirmed = true;
     store.save_directory_state(id, &serde_json::to_string(&evidence)
         .map_err(|_| failure("invalid directory evidence"))?)?;
-    Ok(())
+    Ok(true)
 }
 
 fn require_observed(candidate: &Version, previous: &Version) -> Result<(), EngineError> {
@@ -325,6 +338,166 @@ fn extract_links(text: &str, links: &mut BTreeSet<String>) -> Result<(), EngineE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conflicted_jobs_wait_for_own_source_and_retry_transport_failures() {
+        use std::{collections::VecDeque, convert::Infallible, sync::Mutex};
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use hyper::{Request, Response, body::Incoming, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use crate::{auth::AuthConfig, scaffold::{ScaffoldClient, ScaffoldRuntime,
+            UnavailableDeviceJoinGrantProvider}, workspace_host::WorkspaceHostConfig};
+        use zeron_doc::{RegistryDoc, REGISTRY_DOC_ID, registry::{RegistryRow, KIND_CHATS}};
+        use zeron_sync::scaffold_auth::{save_session, ScaffoldConfig, ScaffoldIdentity,
+            ScaffoldSession, DEFAULT_OAUTH_SCOPES};
+
+        let id = "9dd173da-fb53-48df-9581-026009c783e2";
+        let doc = loro::LoroDoc::new();
+        doc.set_peer_id(42).unwrap();
+        doc.get_map("source").insert("observed", true).unwrap();
+        doc.commit();
+        let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+        let (mut version, _) = project(&snapshot).unwrap();
+        version.insert(REGISTRY_VERSION.into(), 9);
+        let remote = json!({"session":{"revision":7, "sourceVersion":version, "deleted":false}});
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            (200_u16, remote.clone()), // First stale source.
+            (200, remote.clone()), // A fresh worker must rediscover the conflict.
+            (503, json!({})), // Catch-up is not suppressed after a failed GET.
+            (200, remote.clone()), (503, json!({})), // Nor after a failed upsert.
+            (200, remote), (200, json!({"revision":8})),
+        ])));
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn({
+            let origin = origin.clone();
+            let responses = responses.clone();
+            let requests = requests.clone();
+            async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let origin = origin.clone();
+                    let responses = responses.clone();
+                    let requests = requests.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let origin = origin.clone();
+                            let responses = responses.clone();
+                            let requests = requests.clone();
+                            async move {
+                                let path = request.uri().path().to_owned();
+                                let body = request.into_body().collect().await.unwrap().to_bytes();
+                                let (status, response) = match path.as_str() {
+                                    "/auth/session" => (200, json!({"userId":"alice", "email":"alice@example.com",
+                                        "projectScope":"project-a", "deploymentId":"deployment-a",
+                                        "credential":"scaffold", "capabilities":["session.read"]})),
+                                    "/api/code-sandboxes/auth/session" => (200, json!({"ok":true,
+                                        "resource":origin, "actor":{"sub":"alice", "auth":"iap"},
+                                        "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})),
+                                    "/api/crew-directory/get" | "/api/crew-directory/upsert" => {
+                                        requests.lock().unwrap().push((path, serde_json::from_slice(&body).unwrap()));
+                                        responses.lock().unwrap().pop_front().unwrap_or((500, json!({})))
+                                    }
+                                    _ => panic!("unexpected request: {path}"),
+                                };
+                                Ok::<_, Infallible>(Response::builder().status(status)
+                                    .header("content-type", "application/json").header("connection", "close")
+                                    .body(Full::new(Bytes::from(response.to_string()))).unwrap())
+                            }
+                        });
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service).await.unwrap();
+                    });
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        save_session(&dir.path().join("scaffold-session.json"), &ScaffoldSession {
+            access_token: "sc_rc_test".into(), resource: origin.clone(), edge_origin: origin.clone(), device: None,
+            identity: ScaffoldIdentity { user_id: "alice".into(), email: "alice@example.com".into(), name: None,
+                project_scope: "project-a".into(), deployment_id: Some("deployment-a".into()),
+                capabilities: vec!["session.read".into()] },
+        }).unwrap();
+        let mut config = AuthConfig::new(&origin, dir.path());
+        config.scaffold = Some(ScaffoldConfig::new(&origin, &origin, "project-a"));
+        let auth = Auth::detect(config).await;
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(&origin, "project-a", auth.for_profile_tokens()).unwrap(),
+            &origin, Arc::new(UnavailableDeviceJoinGrantProvider),
+        ).with_deployment_id("deployment-a".into());
+        let store = Arc::new(DocsStore::open(&dir.path().join("store")).unwrap());
+        let services = CrewServices::new(auth, runtime, store.clone()).unwrap();
+        let mut registry = RegistryDoc::new("test-device");
+        let _ = registry.apply_state(9, true, 0, vec![RegistryRow {
+            kind: KIND_CHATS.into(), id: id.into(), seq: 9, deleted: false, del_hlc: None,
+            fields: BTreeMap::from([("id".into(), json!(id)), ("deviceId".into(), json!("test-device")),
+                ("crew".into(), serde_json::to_value(services.session_metadata(id).unwrap()).unwrap())]),
+            clocks: BTreeMap::new(),
+        }]);
+        store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+        let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
+            device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
+            org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
+        }).unwrap();
+        let mut required = BTreeMap::new();
+        enqueue_registry(&store, &workspace).await.unwrap();
+        drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(required[id], version);
+        assert!(store.directory_state(id).unwrap().is_none(), "remote counters are not evidence");
+
+        for _ in 0..3 {
+            // The worker inventories on any registry wake and drains on any snapshot wake.
+            enqueue_registry(&store, &workspace).await.unwrap();
+            store.save_snapshot("unrelated", &snapshot).unwrap();
+            drain(&store, &services, &workspace, &mut required).await.unwrap();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(store.sync_job_version(id, JOB).unwrap().is_some());
+        }
+        required.clear(); // Worker-local suppression does not persist across restart.
+        drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        store.save_snapshot(id, &snapshot).unwrap();
+        for expected_requests in [3, 5] {
+            drain(&store, &services, &workspace, &mut required).await.unwrap();
+            assert_eq!(requests.lock().unwrap().len(), expected_requests);
+            assert!(store.sync_job_version(id, JOB).unwrap().is_some());
+        }
+        drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 7);
+        assert!(responses.lock().unwrap().is_empty());
+        assert!(store.sync_job_version(id, JOB).unwrap().is_none());
+        assert!(required.is_empty());
+        {
+            let requests = requests.lock().unwrap();
+            let published = &requests[6];
+            assert_eq!(published.0, "/api/crew-directory/upsert");
+            assert_eq!(published.1["sourceVersion"], json!(version));
+            assert_eq!(published.1["expectedRevision"], 7);
+        }
+        let saved = store.directory_state(id).unwrap().unwrap();
+        let evidence: Evidence = serde_json::from_str(&saved).unwrap();
+        assert!(evidence.confirmed);
+        assert_eq!(evidence.source_version, version);
+
+        // Losing the local snapshot must wait on saved evidence without any HTTP.
+        store.delete_snapshot(id).unwrap();
+        store.queue_directory(id).unwrap();
+        for _ in 0..2 {
+            drain(&store, &services, &workspace, &mut required).await.unwrap();
+            assert!(store.sync_job_version(id, JOB).unwrap().is_some());
+            assert_eq!(requests.lock().unwrap().len(), 7);
+        }
+        store.save_snapshot(id, &snapshot).unwrap();
+        drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert!(store.sync_job_version(id, JOB).unwrap().is_none());
+        assert_eq!(requests.lock().unwrap().len(), 7);
+        assert_eq!(store.directory_state(id).unwrap().unwrap(), saved);
+        workspace.shutdown();
+        server.abort();
+    }
 
     #[test]
     fn stale_concurrent_and_reset_sources_never_borrow_server_evidence() {
