@@ -211,6 +211,9 @@ native-process supervision. These are source findings, not a live exploit test.
 Distinct IPC ports are not a security boundary. Live harness testing remains
 gated on those fixes and an isolated `crew-upstream-canary`/chat2 lane; the existing
 Canary profile must not be retargeted to legacy shared staging Edge.
+At 2026-10-20 09:46 UTC, the peer stopped on an Anthropic safety refusal before
+finishing that prerequisite handback. No retry or provider switch was attempted;
+explicit interactive approval is required before resuming that session.
 
 Crew integration source [`fc12483c`](https://github.com/Ashler-AI/comet/commit/fc12483c7fa0aed93b84e8aaa03e755c8ff78704)
 separates logical sandbox storage from the
@@ -239,12 +242,29 @@ remote Edge checks. Downloaded archive checksums, extracted Linux executable
 checksums and the macOS app signature verified. These private artifacts are not
 an installed-runtime or cloud-rollout claim.
 
-The follow-up native launcher passes its verified control origin, project and
+Launcher source [`82eedae4`](https://github.com/Ashler-AI/comet/commit/82eedae49a738a7e53ab6016eafbe1598c2bc084)
+passes its verified control origin, project and
 deployment through existing CLI flags instead of relying on provider environment
 variables. Without them, the actual CI executable exited before enrollment with
 `device bootstrap requires a configured Scaffold authority`; with them it returned
 the expected `ScaffoldHostAuthority` and shut down gracefully. This used isolated
 loopback authentication. All 42 Scaffold checks passed after the launcher change.
+
+Its private artifact-only [CI](https://github.com/Ashler-AI/comet/actions/runs/39400100955)
+passed on macOS ARM64 and Linux x64/ARM64, including remote Edge and native-browser
+checks. All downloaded archive and Linux executable checksums verified; the macOS
+app signature verified. The exact macOS CI executable passed the isolated native
+authority smoke with one enrollment exchange and graceful shutdown. These are
+loopback-fixture results, not live harness integration or deployment evidence.
+Verified Linux executable SHA-256 values (not active pins):
+- x64: `2a6128c7e421a69f353fc5d03236a35a84bc5922c6bfd313ac43b4fbe0db097a`
+- ARM64: `4cd868e36a97ce30480c8e91c60bff4c86bdd176076cf710787d0b41475f945b`
+
+Fresh installed-Canary readback retained all 28 baseline chats and the same
+controller, with connected/synced workspace and zero pending durable writes.
+No installed runtime, existing host, shared release channel or deployment changed.
+The independent review tool failed on provider HTTP 402; the bounded launcher
+producer/consumer review was completed inline. Local typechecks remained disabled.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
