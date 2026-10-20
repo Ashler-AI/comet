@@ -305,6 +305,28 @@ retained 15 intentionally parked directory jobs. The other Platform session kept
 its original active run. Runtime host pins and shared release lanes are unchanged;
 local typechecks were intentionally skipped to preserve workstation resources.
 
+The subsequent connection-warning investigation found redundant verification on
+every user-bearer read: 24 concurrent account reads through the installed binary
+made 24 control and 24 Edge verification requests against an isolated authority.
+The shared desktop/mobile auth helper now coalesces verification and reuses a
+server-verified identity for at most 60 seconds. Both monotonic and wall-clock
+age bound freshness across suspend; cold starts still verify. Cancellation
+fences queued/in-flight results, and credential, subject, resource, project and
+deployment boundaries remain checked. Protected requests still authorize on the
+server; a fresh local identity cannot override a denied operation.
+
+Transient failures share one cooldown, honoring numeric/date `Retry-After`
+without an upper cap. A one-second local minimum prevents zero/past-date retry
+storms; absent/invalid headers use bounded 1–5-second backoff. Expired success is
+never reused during an outage, and definitive rejection cannot revive it.
+The 11 shared-auth regressions passed. In the actual rebuilt headed app, the same
+24 concurrent account reads took 25 ms and added zero verification requests;
+a protected HTTP 403 still failed. After expiry, 48 consumers shared a 429
+cooldown without extra verification or sign-out, then recovered through one
+verification pair without restarting. This used a private loopback fixture,
+not a live backend outage. The desktop helper was closed, so native macOS window
+capture supplied the headed screenshot; no permissions were changed.
+
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
 `30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),

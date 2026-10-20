@@ -492,7 +492,7 @@ impl Auth {
                 self.clear_session(&mut lifecycle);
                 Err(TokenError::SignedOut)
             }
-            Err(ScaffoldError::Unavailable(message)) => Err(TokenError::TemporarilyUnavailable(message)),
+            Err(ScaffoldError::Unavailable { message, .. }) => Err(TokenError::TemporarilyUnavailable(message)),
         }
     }
 

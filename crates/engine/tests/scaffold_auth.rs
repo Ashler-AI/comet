@@ -11,6 +11,8 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let status = Arc::new(AtomicU16::new(200));
     let server_status = status.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_calls = calls.clone();
     let resource = origin.clone();
     let server = tokio::spawn(async move {
         loop {
@@ -20,6 +22,7 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
             let request = String::from_utf8_lossy(&request[..size]);
             assert!(request.to_ascii_lowercase().contains("authorization: bearer sc_rc_test"));
             let code = server_status.load(Ordering::SeqCst);
+            server_calls.fetch_add(1, Ordering::SeqCst);
             let body = if request.starts_with("GET /auth/session ") {
                 serde_json::json!({"userId":"user@example.com", "email":"user@example.com", "projectScope":"canary", "credential":"scaffold", "capabilities":["session.read"]})
             } else {
@@ -47,8 +50,16 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     assert_eq!(zeron_engine::EngineProfile::scaffold(dir.path(), &auth).unwrap().store_root(), dir.path().join("profiles/scaffold").join(&key));
     let bound = auth.for_profile_tokens();
     assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_test");
+    let tokens = futures::future::join_all((0..16).map(|_| auth.access_token())).await;
+    assert!(tokens.iter().all(|token| token.as_deref() == Ok("sc_rc_test")));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "warm engine token reads do not reverify");
     status.store(503, Ordering::SeqCst);
+    assert_eq!(auth.access_token().await.unwrap(), "sc_rc_test", "fresh verification is reused during an outage");
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::time::resume();
     assert!(matches!(auth.access_token().await, Err(TokenError::TemporarilyUnavailable(_))));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     let client = zeron_engine::scaffold::ScaffoldClient::new(&origin, "canary", bound).unwrap();
     let scope = zeron_proto::CollaborationScope {
         project_id: "canary".into(), deployment_id: Some("deployment".into()), session_id: None, unknown: Default::default(),
@@ -63,7 +74,11 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     assert!(!reason.contains("user@example.com"));
     assert!(path.exists());
     assert_eq!(auth.verified_profile_key().as_deref(), Some(key.as_str()));
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "the downstream retry reuses the shared outage");
     status.store(401, Ordering::SeqCst);
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::time::resume();
     assert_eq!(auth.access_token().await, Err(TokenError::SignedOut));
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert!(!path.exists());

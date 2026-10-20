@@ -475,7 +475,7 @@ async fn refresh_task(
 pub fn scaffold_error(error: zeron_sync::scaffold_auth::AuthError) -> ClientError {
     use zeron_sync::scaffold_auth::AuthError;
     match error {
-        AuthError::Unavailable(reason) => ClientError::Network(reason),
+        AuthError::Unavailable { message, .. } => ClientError::Network(message),
         other => ClientError::Auth(other.to_string()),
     }
 }
@@ -483,6 +483,66 @@ pub fn scaffold_error(error: zeron_sync::scaffold_auth::AuthError) -> ClientErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn crew_bearers_coalesce_and_transient_failures_do_not_expire_credentials() {
+        use std::sync::atomic::{AtomicU16, AtomicUsize};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeron_sync::scaffold_auth::{ScaffoldIdentity, ScaffoldSession, DEFAULT_OAUTH_SCOPES};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let resource = origin.clone();
+        let status = Arc::new(AtomicU16::new(200));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (server_status, server_calls) = (status.clone(), calls.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let size = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.to_ascii_lowercase().contains("authorization: bearer sc_rc_secret"));
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                let body = if request.starts_with("GET /auth/session ") {
+                    serde_json::json!({"userId":"owner", "email":"owner@example.com", "projectScope":"project", "deploymentId":"deployment", "credential":"scaffold", "capabilities":[]})
+                } else {
+                    assert!(request.starts_with("GET /api/code-sandboxes/auth/session "));
+                    serde_json::json!({"ok":true, "resource":resource, "actor":{"sub":"owner", "auth":"iap"}, "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})
+                }.to_string();
+                socket.write_all(format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 120\r\nConnection: close\r\n\r\n{body}", server_status.load(Ordering::SeqCst), body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let session = ScaffoldSession { access_token: "sc_rc_secret".into(), resource: origin.clone(), edge_origin: origin.clone(), identity: ScaffoldIdentity { user_id: "owner".into(), email: "owner@example.com".into(), name: None, project_scope: "project".into(), deployment_id: Some("deployment".into()), capabilities: vec![] }, device: None };
+        let credentials = crate::config::Credentials::Scaffold { user_id: "owner".into(), org_id: "project".into(), control_origin: origin.clone(), session_json: serde_json::to_string(&session).unwrap() };
+        let events = EventPump::new(Arc::new(crate::events::NullListener));
+        let tokens = TokenProvider::new(&credentials, &origin, events).unwrap();
+        let results = futures::future::join_all((0..16).map(|_| tokens.bearer())).await;
+        assert!(results.iter().all(|result| result.as_ref().is_ok_and(|token| token == "sc_rc_secret")));
+        assert_eq!(tokens.bearer().await.unwrap(), "sc_rc_secret");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        status.store(429, Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        let results = futures::future::join_all((0..16).map(|_| tokens.bearer())).await;
+        assert!(results.iter().all(|result| matches!(result, Err(ClientError::Network(_)))));
+        assert!(!tokens.expired.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        status.store(200, Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        assert_eq!(tokens.bearer().await.unwrap(), "sc_rc_secret");
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        status.store(403, Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
+        assert!(tokens.expired.load(Ordering::Acquire));
+        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        server.abort();
+    }
 
     #[test]
     fn percent_decode_handles_edges() {

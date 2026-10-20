@@ -73,6 +73,8 @@ jobs:
         run: scripts/package-linux.sh
       - name: Verify sandbox storage and native resume
         run: |
+          cargo test --locked --release -p zeron-sync --lib scaffold_auth::tests
+          cargo test --locked --release -p zeron-client --lib auth::tests
           cargo test --locked --release -p zeron-engine --test scaffold_auth
           cargo test --locked --release -p zeron-engine --lib scaffold::tests
           cargo test --locked --release -p zeron-engine --lib crew::tests::accepted_startup_is_not_a_confirmed_resume
@@ -112,6 +114,8 @@ jobs:
         run: scripts/package-macos.sh
       - name: Verify native recovery, routing and sandbox lifecycle
         run: |
+          cargo test --locked --release -p zeron-sync --lib scaffold_auth::tests
+          cargo test --locked --release -p zeron-client --lib auth::tests
           cargo test --locked --release -p zeron-harness --test omp
           cargo test --locked --release -p zeron --test noop_browser
           cargo test --locked --release -p zeron-engine --test scaffold_auth

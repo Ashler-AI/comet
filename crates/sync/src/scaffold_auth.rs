@@ -7,14 +7,17 @@ use sha2::{Digest, Sha256};
 use reqwest::Url;
 
 const TTL: Duration = Duration::from_secs(900);
+const VERIFICATION_FRESHNESS: Duration = Duration::from_secs(60);
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_CAP: Duration = Duration::from_secs(5);
 pub const DEFAULT_OAUTH_SCOPES: &str = "remote_code:create remote_code:read remote_code:write remote_code:exec remote_code:lifecycle";
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("Scaffold authorization rejected or expired")]
     Rejected,
-    #[error("{0}")]
-    Unavailable(String),
+    #[error("{message}")]
+    Unavailable { message: String, retry_after: Option<Duration> },
 }
 
 #[derive(Clone, Debug)]
@@ -92,14 +95,45 @@ struct Pending {
     resource: String,
 }
 #[derive(Default)]
-struct SignIns { generation: u64, pending: HashMap<String, Pending> }
+struct SignIns {
+    generation: u64,
+    pending: HashMap<String, Pending>,
+    verification: Option<Verification>,
+}
+// One credential per helper: configuration is immutable, cancellation clears this
+// alongside the generation, and caller-provided identity never enters the cache.
+struct Verification {
+    token: String,
+    result: Result<ScaffoldSession, AuthError>,
+    at: tokio::time::Instant,
+    wall: SystemTime,
+    lifetime: Duration,
+    failures: u32,
+}
+impl Verification {
+    fn remaining(&self) -> Duration {
+        self.lifetime.saturating_sub(self.at.elapsed().max(self.wall.elapsed().unwrap_or_default()))
+    }
+}
 pub struct ScaffoldAuth {
     config: ScaffoldConfig,
     http: reqwest::Client,
     sign_ins: Mutex<SignIns>,
+    verification_gate: tokio::sync::Mutex<()>,
 }
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { value.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
-fn unavailable(message: &str) -> AuthError { AuthError::Unavailable(message.into()) }
+fn unavailable(message: &str) -> AuthError { AuthError::Unavailable { message: message.into(), retry_after: None } }
+fn retry_after(value: &reqwest::header::HeaderValue, now: SystemTime) -> Option<Duration> {
+    let value = value.to_str().ok()?.trim();
+    let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        Duration::from_secs(value.parse().ok()?)
+    } else {
+        let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+        let now: chrono::DateTime<chrono::Utc> = now.into();
+        (date.with_timezone(&chrono::Utc) - now).to_std().unwrap_or_default()
+    };
+    Some(delay)
+}
 fn now_ms() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64 }
 
 /// Only exact TLS origins (or explicit loopback HTTP) are authority configuration.
@@ -125,7 +159,7 @@ impl ScaffoldAuth {
         config.edge_origin = normalized_origin(&config.edge_origin)?;
         if config.project_scope.trim().is_empty() || config.oauth_scopes.trim().is_empty() { return Err(AuthError::Rejected); }
         let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| unavailable("could not initialize Scaffold HTTP client"))?;
-        Ok(Self { config, http, sign_ins: Mutex::new(SignIns::default()) })
+        Ok(Self { config, http, sign_ins: Mutex::new(SignIns::default()), verification_gate: tokio::sync::Mutex::new(()) })
     }
     async fn json<T: serde::de::DeserializeOwned>(&self, stage: &str, request: reqwest::RequestBuilder) -> Result<T, AuthError> {
         // Only fixed operation names and error categories cross this boundary;
@@ -136,13 +170,19 @@ impl ScaffoldAuth {
         })?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN { return Err(AuthError::Rejected); }
-        if !status.is_success() { return Err(unavailable(&format!("Scaffold {stage}: HTTP {}", status.as_u16()))); }
+        if !status.is_success() {
+            let retry_after = if matches!(status.as_u16(), 429 | 503) {
+                response.headers().get(reqwest::header::RETRY_AFTER).and_then(|value| retry_after(value, SystemTime::now()))
+            } else { None };
+            return Err(AuthError::Unavailable { message: format!("Scaffold {stage}: HTTP {}", status.as_u16()), retry_after });
+        }
         response.json().await.map_err(|error| unavailable(&format!("Scaffold {stage}: {}", if error.is_timeout() { "response_timeout" } else if error.is_decode() { "invalid_response" } else { "response_body_failure" })))
     }
     pub fn cancel_sign_in(&self) {
         let mut flow = lock(&self.sign_ins);
         flow.generation = flow.generation.wrapping_add(1);
         flow.pending.clear();
+        flow.verification = None;
     }
     pub async fn begin_sign_in(&self, redirect_uri: &str) -> Result<String, AuthError> {
         let redirect = Url::parse(redirect_uri).map_err(|_| AuthError::Rejected)?;
@@ -189,12 +229,50 @@ impl ScaffoldAuth {
         #[derive(Deserialize)] struct Tokens { access_token: String, token_type: String, scope: String, resource: String }
         let tokens: Tokens = self.json("token exchange", self.http.post(&pending.token_endpoint).form(&[("grant_type", "authorization_code"), ("code", &code), ("client_id", &pending.client_id), ("redirect_uri", &pending.redirect_uri), ("code_verifier", &pending.verifier), ("resource", &pending.resource)])).await?;
         if !tokens.token_type.eq_ignore_ascii_case("Bearer") || !tokens.access_token.starts_with("sc_rc_") || tokens.resource != pending.resource || !has_scopes(&self.config.oauth_scopes, &tokens.scope.split_whitespace().map(str::to_owned).collect::<Vec<_>>()) { return Err(AuthError::Rejected); }
-        let session = self.verify_token(&tokens.access_token).await?;
+        let session = self.verified_token(&tokens.access_token, pending.generation).await?;
         if lock(&self.sign_ins).generation != pending.generation { return Err(AuthError::Rejected); }
         Ok(session)
     }
-    async fn verify_token(&self, token: &str) -> Result<ScaffoldSession, AuthError> {
+    async fn verified_token(&self, token: &str, generation: u64) -> Result<ScaffoldSession, AuthError> {
         if !token.starts_with("sc_rc_") { return Err(AuthError::Rejected); }
+        let _gate = self.verification_gate.lock().await;
+        let failures = {
+            let flow = lock(&self.sign_ins);
+            if flow.generation != generation { return Err(AuthError::Rejected); }
+            match flow.verification.as_ref().filter(|cached| cached.token == token) {
+                Some(cached) => {
+                    let remaining = cached.remaining();
+                    if matches!(cached.result, Err(AuthError::Rejected)) || !remaining.is_zero() {
+                        return match &cached.result {
+                            Err(AuthError::Unavailable { message, .. }) => Err(AuthError::Unavailable { message: message.clone(), retry_after: Some(remaining) }),
+                            result => result.clone(),
+                        };
+                    }
+                    cached.failures
+                }
+                None => 0,
+            }
+        };
+        let mut at = tokio::time::Instant::now();
+        let mut wall = SystemTime::now();
+        let mut result = self.verify_token(token).await;
+        let mut flow = lock(&self.sign_ins);
+        if flow.generation != generation { return Err(AuthError::Rejected); }
+        let (lifetime, failures) = match &mut result {
+            Ok(_) => (VERIFICATION_FRESHNESS, 0),
+            Err(AuthError::Rejected) => (Duration::ZERO, 0),
+            Err(AuthError::Unavailable { retry_after, .. }) => {
+                let delay = retry_after.unwrap_or_else(|| RETRY_BASE.saturating_mul(1 << failures.min(3)).min(RETRY_CAP)).max(RETRY_BASE);
+                *retry_after = Some(delay);
+                at = tokio::time::Instant::now();
+                wall = SystemTime::now();
+                (delay, failures.saturating_add(1))
+            }
+        };
+        flow.verification = Some(Verification { token: token.into(), result: result.clone(), at, wall, lifetime, failures });
+        result
+    }
+    async fn verify_token(&self, token: &str) -> Result<ScaffoldSession, AuthError> {
         #[derive(Deserialize)] #[serde(rename_all="camelCase")] struct Actor { sub: String, auth: String, display_name: Option<String> }
         #[derive(Deserialize)] struct Session { ok: bool, resource: String, actor: Actor, scopes: Vec<String> }
         let resource = &self.config.control_origin;
@@ -207,7 +285,8 @@ impl ScaffoldAuth {
     }
     pub async fn verify(&self, session: &ScaffoldSession) -> Result<ScaffoldSession, AuthError> {
         if session.resource != self.config.control_origin || session.edge_origin != self.config.edge_origin || session.identity.project_scope != self.config.project_scope || session.device.is_some() { return Err(AuthError::Rejected); }
-        let verified = self.verify_token(&session.access_token).await?;
+        let generation = lock(&self.sign_ins).generation;
+        let verified = self.verified_token(&session.access_token, generation).await?;
         if verified.identity.user_id != session.identity.user_id || verified.identity.deployment_id != session.identity.deployment_id { return Err(AuthError::Rejected); }
         Ok(verified)
     }
@@ -303,6 +382,210 @@ fn valid_persisted_credential(session: &ScaffoldSession) -> Result<(), AuthError
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct VerificationServer {
+        auth: ScaffoldAuth,
+        session: ScaffoldSession,
+        response: std::sync::Arc<Mutex<(u16, u16, String)>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+        blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for VerificationServer {
+        fn drop(&mut self) { self.task.abort(); }
+    }
+    impl VerificationServer {
+        async fn new() -> Self {
+            use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let auth = ScaffoldAuth::new(ScaffoldConfig::new(&origin, &origin, "project")).unwrap();
+            let session = ScaffoldSession { access_token: "sc_rc_secret".into(), resource: origin.clone(), edge_origin: origin.clone(), identity: ScaffoldIdentity { user_id: "owner".into(), email: "owner@example.com".into(), name: None, project_scope: "project".into(), deployment_id: Some("deployment".into()), capabilities: vec![] }, device: None };
+            let response = Arc::new(Mutex::new((200, 200, String::new())));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let blocked = Arc::new(AtomicBool::new(false));
+            let (reply, count, received, resume, block) = (response.clone(), calls.clone(), entered.clone(), release.clone(), blocked.clone());
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = vec![0; 8192];
+                    let size = socket.read(&mut bytes).await.unwrap();
+                    let request = String::from_utf8_lossy(&bytes[..size]);
+                    let edge = request.starts_with("GET /auth/session ");
+                    assert!(edge || request.starts_with("GET /api/code-sandboxes/auth/session "));
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if block.swap(false, Ordering::SeqCst) {
+                        received.notify_one();
+                        resume.notified().await;
+                    }
+                    let (control_status, edge_status, retry) = lock(&reply).clone();
+                    let status = if edge { edge_status } else { control_status };
+                    let body = if edge {
+                        serde_json::json!({"userId":"owner", "email":"owner@example.com", "projectScope":"project", "deploymentId":"deployment", "credential":"scaffold", "capabilities":["session.read"]})
+                    } else {
+                        serde_json::json!({"ok":true, "resource":origin, "actor":{"sub":"owner", "auth":"iap"}, "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})
+                    }.to_string();
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            Self { auth, session, response, calls, entered, release, blocked, task }
+        }
+        fn calls(&self) -> usize { self.calls.load(std::sync::atomic::Ordering::SeqCst) }
+        fn expire(&self, suspend: bool) {
+            let mut flow = lock(&self.auth.sign_ins);
+            let cached = flow.verification.as_mut().unwrap();
+            if suspend { cached.wall -= cached.lifetime; } else { cached.at -= cached.lifetime; }
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_coalesces_and_checks_each_callers_identity() {
+        let server = VerificationServer::new().await;
+        let mut wrong = server.session.clone();
+        wrong.identity.user_id = "different-owner".into();
+        // Cache only the server identity, even when the first caller supplied a bad subject.
+        assert!(matches!(server.auth.verify(&wrong).await, Err(AuthError::Rejected)));
+        let results = futures::future::join_all((0..16).map(|_| server.auth.verify(&server.session))).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(server.calls(), 2);
+        for field in ["resource", "edge", "project", "deployment", "subject", "device"] {
+            let mut wrong = server.session.clone();
+            match field {
+                "resource" => wrong.resource = "https://other.example".into(),
+                "edge" => wrong.edge_origin = "https://other.example".into(),
+                "project" => wrong.identity.project_scope = "other".into(),
+                "deployment" => wrong.identity.deployment_id = None,
+                "subject" => wrong.identity.user_id = "other".into(),
+                _ => wrong.device = Some(DeviceAuthority { grant_id: "grant".into(), expires_at: i64::MAX, device_id: "device".into(), session_id: "session".into(), deployment_id: "deployment".into(), sandbox_id: "sandbox".into(), lifecycle_epoch: 1 }),
+            }
+            assert!(matches!(server.auth.verify(&wrong).await, Err(AuthError::Rejected)), "{field}");
+        }
+        assert_eq!(server.calls(), 2);
+        server.auth.cancel_sign_in();
+        let results = futures::future::join_all((0..16).map(|_| server.auth.verify(&server.session))).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(server.calls(), 4, "cold concurrent readers share one verification pair");
+        assert_eq!(server.auth.verify(&server.session).await.unwrap().identity.capabilities, ["session.read"]);
+        assert_eq!(server.calls(), 4);
+        let mut other = server.session.clone();
+        other.access_token = "sc_rc_other".into();
+        server.auth.verify(&other).await.unwrap();
+        assert_eq!(server.calls(), 6, "different credentials never share verification");
+        let cold = ScaffoldAuth::new(server.auth.config.clone()).unwrap();
+        cold.verify(&server.session).await.unwrap();
+        assert_eq!(server.calls(), 8, "a new helper must verify persisted credentials");
+        let mut config = server.auth.config.clone();
+        config.deployment_id = Some("different-deployment".into());
+        let isolated = ScaffoldAuth::new(config).unwrap();
+        assert!(matches!(isolated.verify(&server.session).await, Err(AuthError::Rejected)));
+        assert_eq!(server.calls(), 10, "configuration pins cannot inherit another helper's success");
+        cold.verify(&server.session).await.unwrap();
+        assert_eq!(server.calls(), 10, "another helper's rejection cannot poison valid authority");
+    }
+
+    #[tokio::test]
+    async fn expired_verification_shares_cooldown_without_stale_success() {
+        let server = VerificationServer::new().await;
+        server.auth.verify(&server.session).await.unwrap();
+        *lock(&server.response) = (429, 200, "120".into());
+        server.auth.verify(&server.session).await.unwrap();
+        assert_eq!(server.calls(), 2);
+        server.expire(false);
+        let results = futures::future::join_all((0..16).map(|_| server.auth.verify(&server.session))).await;
+        assert!(results.iter().all(|result| matches!(result, Err(AuthError::Unavailable { retry_after: Some(delay), .. }) if *delay > Duration::from_secs(119))));
+        assert_eq!(server.calls(), 3);
+        *lock(&server.response) = (200, 200, String::new());
+        assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Unavailable { .. })));
+        assert_eq!(server.calls(), 3);
+        server.expire(true);
+        server.auth.verify(&server.session).await.unwrap();
+        assert_eq!(server.calls(), 5);
+        server.expire(true);
+        let date = (chrono::Utc::now() + chrono::Duration::hours(1)).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        *lock(&server.response) = (200, 503, date);
+        let error = server.auth.verify(&server.session).await.unwrap_err();
+        assert!(matches!(&error, AuthError::Unavailable { retry_after: Some(delay), .. } if *delay > Duration::from_secs(3598)));
+        assert!(!error.to_string().contains("sc_rc_secret"));
+        assert!(!error.to_string().contains("owner@example.com"));
+        assert!(!error.to_string().contains(&server.session.resource));
+        assert_eq!(server.calls(), 7);
+        assert!(server.auth.verify(&server.session).await.is_err());
+        assert_eq!(server.calls(), 7);
+        server.expire(false);
+        *lock(&server.response) = (503, 200, "invalid".into());
+        for expected in [2, 4, 5, 5] {
+            assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Unavailable { retry_after: Some(delay), .. }) if delay == Duration::from_secs(expected)));
+            server.expire(false);
+        }
+        *lock(&server.response) = (200, 200, String::new());
+        server.auth.verify(&server.session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_or_suspended_verification_observes_revocation() {
+        for (status, suspend) in [(401, false), (403, true)] {
+            let server = VerificationServer::new().await;
+            server.auth.verify(&server.session).await.unwrap();
+            *lock(&server.response) = if suspend { (200, status, String::new()) } else { (status, 200, String::new()) };
+            server.expire(suspend);
+            assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Rejected)));
+            let calls = server.calls();
+            *lock(&server.response) = (200, 200, String::new());
+            assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Rejected)));
+            assert_eq!(server.calls(), calls, "rejection cannot resurrect a cached success");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_fences_inflight_and_queued_verification() {
+        let server = VerificationServer::new().await;
+        server.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+        let flight = server.auth.verify(&server.session);
+        tokio::pin!(flight);
+        tokio::select! {
+            _ = server.entered.notified() => {},
+            _ = &mut flight => panic!("verification must wait for the server"),
+        }
+        let waiter = server.auth.verify(&server.session);
+        tokio::pin!(waiter);
+        assert!(futures::poll!(&mut waiter).is_pending());
+        server.auth.cancel_sign_in();
+        server.release.notify_one();
+        assert!(matches!(flight.await, Err(AuthError::Rejected)));
+        assert!(matches!(waiter.await, Err(AuthError::Rejected)));
+        assert!(lock(&server.auth.sign_ins).verification.is_none());
+        assert_eq!(server.calls(), 2);
+        assert!(matches!(server.auth.verified_token(&server.session.access_token, 0).await, Err(AuthError::Rejected)), "a token exchange from the cancelled generation cannot refill the cache");
+        assert_eq!(server.calls(), 2);
+        server.auth.verify(&server.session).await.unwrap();
+        assert_eq!(server.calls(), 4, "post-cancel verification starts cold");
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_dates_without_overflow() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_445_412_480);
+        let parse = |value: &str| retry_after(&reqwest::header::HeaderValue::from_str(value).unwrap(), now);
+        assert_eq!(parse("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse("Wed, 21 Oct 2015 07:30:00 GMT"), Some(Duration::from_secs(120)));
+        assert_eq!(parse("Wed, 21 Oct 2015 07:20:00 GMT"), Some(Duration::ZERO));
+        assert_eq!(parse("18446744073709551615"), Some(Duration::from_secs(u64::MAX)));
+        for invalid in ["", "-1", "+1", "1.5", "garbage", "18446744073709551616"] { assert_eq!(parse(invalid), None); }
+    }
+
+    #[tokio::test]
+    async fn backwards_wall_clock_cannot_extend_verification_freshness() {
+        let server = VerificationServer::new().await;
+        server.auth.verify(&server.session).await.unwrap();
+        lock(&server.auth.sign_ins).verification.as_mut().unwrap().wall += Duration::from_secs(3600);
+        server.expire(false);
+        *lock(&server.response) = (401, 200, String::new());
+        assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Rejected)));
+        assert_eq!(server.calls(), 3);
+    }
     #[tokio::test]
     async fn device_authority_is_bound_and_only_rotating_credential_persists() {
         let auth = ScaffoldAuth::new(ScaffoldConfig::new("https://control.example", "https://edge.example", "project")).unwrap();
