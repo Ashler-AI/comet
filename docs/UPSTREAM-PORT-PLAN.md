@@ -327,6 +327,17 @@ verification pair without restarting. This used a private loopback fixture,
 not a live backend outage. The desktop helper was closed, so native macOS window
 capture supplied the headed screenshot; no permissions were changed.
 
+The complete targeted run passed 25 checks: shared auth 11, engine auth 6 and
+client auth 8. The first command exhausted its deadline during compilation;
+the remaining suites completed after resuming. The engine regression initially
+counted an independent cold-auth instance in its warm-read expectation; it now
+measures the warm-read delta instead of pinning that incidental cumulative count.
+The signed local Canary Dev build retained all 46 baseline chat IDs, its device
+and native-history identities, and signed-in connected/synced state after restart.
+Independent native-provider review found no blocking correctness/security issues;
+the specialized review provider was unavailable with HTTP 402. Local typechecks
+and unrelated lint were not run.
+
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
 `30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),

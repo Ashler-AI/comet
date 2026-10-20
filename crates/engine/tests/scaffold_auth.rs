@@ -48,18 +48,20 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     assert!(auth.state().is_signed_in());
     let key = auth.verified_profile_key().unwrap();
     assert_eq!(zeron_engine::EngineProfile::scaffold(dir.path(), &auth).unwrap().store_root(), dir.path().join("profiles/scaffold").join(&key));
+    // The unbound profile above verified through a separate cold Auth instance.
+    let verified_calls = calls.load(Ordering::SeqCst);
     let bound = auth.for_profile_tokens();
     assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_test");
     let tokens = futures::future::join_all((0..16).map(|_| auth.access_token())).await;
     assert!(tokens.iter().all(|token| token.as_deref() == Ok("sc_rc_test")));
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "warm engine token reads do not reverify");
+    assert_eq!(calls.load(Ordering::SeqCst), verified_calls, "warm engine token reads do not reverify");
     status.store(503, Ordering::SeqCst);
     assert_eq!(auth.access_token().await.unwrap(), "sc_rc_test", "fresh verification is reused during an outage");
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(60)).await;
     tokio::time::resume();
     assert!(matches!(auth.access_token().await, Err(TokenError::TemporarilyUnavailable(_))));
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), verified_calls + 1);
     let client = zeron_engine::scaffold::ScaffoldClient::new(&origin, "canary", bound).unwrap();
     let scope = zeron_proto::CollaborationScope {
         project_id: "canary".into(), deployment_id: Some("deployment".into()), session_id: None, unknown: Default::default(),
@@ -74,7 +76,7 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     assert!(!reason.contains("user@example.com"));
     assert!(path.exists());
     assert_eq!(auth.verified_profile_key().as_deref(), Some(key.as_str()));
-    assert_eq!(calls.load(Ordering::SeqCst), 3, "the downstream retry reuses the shared outage");
+    assert_eq!(calls.load(Ordering::SeqCst), verified_calls + 1, "the downstream retry reuses the shared outage");
     status.store(401, Ordering::SeqCst);
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
