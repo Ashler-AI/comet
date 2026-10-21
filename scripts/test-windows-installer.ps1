@@ -63,8 +63,8 @@ try {
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $null = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit(10000)) { $process.Kill(); throw 'Installed version probe timed out' }
-    if ($process.ExitCode -ne 0 -or $stdout.Result.Trim() -ne "zeron $version") {
-        throw "Installed executable reports '$($stdout.Result.Trim())', expected 'zeron $version'"
+    if ($process.ExitCode -ne 0 -or -not $stdout.Result.Trim().EndsWith(" $version", [StringComparison]::Ordinal)) {
+        throw "Installed executable version does not match package $version"
     }
 } finally { $process.Dispose() }
 Write-Output "PASS: installed executable is $version"

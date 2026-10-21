@@ -2173,9 +2173,8 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     offline_links.liveness = Some(Arc::new(|_| zeron_rpc::PeerLiveness::Dark));
     offline.set_links(LinkCache::new(offline_links));
     let offline_client = zeron_rpc::memory_client(offline.rpc_service());
-    let offline_tools = Tools::new(Arc::new(Zeron::with_client(
-        offline_client.clone(), Origin::default(),
-    )));
+    let offline_zeron = Arc::new(Zeron::with_client(offline_client, Origin::default()));
+    let offline_tools = Tools::new(offline_zeron.clone());
     assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
     let unknown = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
     assert_eq!(unknown["messages"], retained["messages"]);
@@ -2208,8 +2207,7 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
     assert_eq!(summary["messageCount"], retained["total"]);
     assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
-    assert!(offline_client.subscribe_checked(methods::WATCH_DOC_MESSAGES,
-        json!({"chatId":chat_id,"targetDeviceId":"device-b"})).await.is_err(),
+    assert!(offline_zeron.transcript_on(chat_id, Some("device-b")).await.is_err(),
         "an explicit offline host must not fall back to retained history");
     offline.workspace.disconnect_edge();
     assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
