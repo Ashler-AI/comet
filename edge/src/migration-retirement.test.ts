@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { URL as NodeUrl } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { SessionRoom, DeviceRoom, AuthGrant } from "./migration-retirement";
 import { fetchReleaseObject } from "./release-feed";
@@ -379,8 +380,8 @@ describe("staging legacy retirement export", () => {
   });
 
   it("keeps the original class migrations and excludes every legacy runtime import", () => {
-    const source = readFileSync(new URL("./migration-retirement.ts", import.meta.url), "utf8");
-    const config = readFileSync(new URL("../wrangler.migration-staging.jsonc", import.meta.url), "utf8");
+    const source = readFileSync(new NodeUrl("./migration-retirement.ts", import.meta.url), "utf8");
+    const config = readFileSync(new NodeUrl("../wrangler.migration-staging.jsonc", import.meta.url), "utf8");
     const parsed = JSON.parse(config.replace(/^\s*\/\/.*$/gm, ""));
     expect(parsed.name).toBe("ashler-comet-edge-staging");
     expect(parsed.main).toBe("src/migration-retirement.ts");
