@@ -3804,7 +3804,8 @@ mod tests {
             .current_dir(workspace.path()).output().unwrap();
         let first = prepare(executable);
         assert!(first.status.success(), "{:?}", first);
-        assert_eq!(first.stdout, b"absent\n");
+        assert!(!workspace.path().join(executable).exists());
+        assert!(workspace.path().join(executable).parent().unwrap().is_dir());
         let mut source = NamedTempFile::new().unwrap();
         source.write_all(TEST_RUNTIME_BYTES).unwrap();
         let digest = format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES));
@@ -3814,7 +3815,6 @@ mod tests {
             .arg("-C").arg(destination).status().unwrap().success());
         let present = prepare(executable);
         assert!(present.status.success(), "{:?}", present);
-        assert_eq!(present.stdout, b"present\n");
         assert_eq!(format!("{:x}", sha2::Sha256::digest(std::fs::read(workspace.path().join(executable)).unwrap())), digest);
         for path in ["/workspace/.scaffold/crew-test/bin/comet", "../crew-test/bin/comet", ".scaffold/other/bin/comet"] {
             assert!(!prepare(path).status.success(), "accepted {path}");
@@ -5343,6 +5343,7 @@ mod tests {
         assert!(runtime.inner.handoff_permits.try_acquire().is_ok());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_handoff_streams_a_manifest_bound_archive() {
         let repo = tempfile::tempdir().unwrap();

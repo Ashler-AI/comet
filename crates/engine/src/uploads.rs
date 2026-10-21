@@ -567,11 +567,18 @@ mod tests {
     fn crew_import_reads_only_verified_copies_and_rejects_missing_or_changed_assets() {
         use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
+        // A Unix-rooted path is not absolute on Windows; keep both profiles owned.
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir(source.path().join("uploads")).unwrap();
+        let original = source.path().join("uploads/asset.png");
+        let unlisted = source.path().join("uploads/not-in-inventory.png");
+        std::fs::write(&original, b"live-original-not-the-copy").unwrap();
+        std::fs::write(&unlisted, b"live-unlisted").unwrap();
         std::fs::create_dir(dir.path().join("uploads")).unwrap();
         let copy = dir.path().join("uploads/asset.png");
         std::fs::write(&copy, b"retained").unwrap();
         let report = serde_json::json!({
-            "version":1, "sourceProfileRoot":"/old/profile", "chatIds":[],
+            "version":1, "sourceProfileRoot":source.path(), "chatIds":[],
             "nativeSessionIds":{}, "commandsRetained":0, "annotationsRetained":0,
             "requiresReauthentication":true,
             "filesSha256":{"uploads/asset.png":format!("{:x}", Sha256::digest(b"retained"))},
@@ -579,10 +586,10 @@ mod tests {
         std::fs::write(dir.path().join("crew-import-report.json"), serde_json::to_vec(&report).unwrap()).unwrap();
         let uploads = Uploads::new(dir.path());
         uploads.load_crew_import(dir.path()).unwrap();
-        assert_eq!(uploads.read_chunk("/old/profile/uploads/asset.png", 0, &[]).unwrap().data, BASE64.encode(b"retained"));
-        assert!(uploads.read_chunk("/old/profile/uploads/not-in-inventory.png", 0, &[]).is_err());
+        assert_eq!(uploads.read_chunk(original.to_str().unwrap(), 0, &[]).unwrap().data, BASE64.encode(b"retained"));
+        assert!(uploads.read_chunk(unlisted.to_str().unwrap(), 0, &[]).is_err());
         std::fs::write(&copy, b"tampered-longer").unwrap();
-        assert!(uploads.read_chunk("/old/profile/uploads/asset.png", 0, &[]).is_err());
+        assert!(uploads.read_chunk(original.to_str().unwrap(), 0, &[]).is_err());
         assert!(Uploads::new(dir.path()).load_crew_import(dir.path()).is_err());
         std::fs::remove_file(&copy).unwrap();
         assert!(Uploads::new(dir.path()).load_crew_import(dir.path()).is_err());

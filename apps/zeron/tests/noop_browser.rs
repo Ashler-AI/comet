@@ -36,8 +36,16 @@ fn session_read_uses_inherited_ipc_without_rewriting_saved_runtime() {
         drop(connection);
         sent.send(()).unwrap();
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zeron"))
-        .env_clear()
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zeron"));
+    command.env_clear();
+    // Winsock needs the Windows installation path, but no caller credentials or profile.
+    #[cfg(windows)]
+    for name in ["SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
         .env("COMET_IPC_PORT", inherited_port.to_string())
         .env("COMET_LOCAL_AGENT_RUNTIME", "1")
         .arg("--data-dir").arg(profile.path())

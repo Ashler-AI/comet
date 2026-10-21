@@ -1318,6 +1318,7 @@ mod tests {
         (temp, sha)
     }
 
+    #[cfg(unix)]
     #[test]
     fn captures_modified_untracked_and_deleted_paths_in_a_bounded_tar() {
         let (temp, base) = fixture();
@@ -1344,6 +1345,7 @@ mod tests {
         assert!(!listing.contains("files/deleted.txt"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn includes_ignored_omp_context_but_not_other_ignored_files() {
         let (temp, _) = fixture();
@@ -1400,6 +1402,7 @@ mod tests {
         assert!(listing_bytes <= MAX_TAR_LISTING_BYTES + 4096);
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_unborn_head() {
         let temp = tempfile::tempdir().unwrap();
@@ -1420,7 +1423,35 @@ mod tests {
         let (temp, _) = fixture();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        assert!(capture_worktree_handoff_cancellable(temp.path(), None, &cancellation).is_err());
+        let error = capture_worktree_handoff_cancellable(temp.path(), None, &cancellation)
+            .unwrap_err();
+        assert!(matches!(error, EngineError::Other(_)));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn source_capture_fails_closed_without_process_group_cancellation() {
+        let (source, _) = fixture();
+        let error = capture_worktree_handoff(source.path()).unwrap_err();
+        assert!(matches!(error, EngineError::Other(_)));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn isolated_fetch_and_verification_fail_closed_without_memory_enforcement() {
+        let directory = tempfile::tempdir().unwrap();
+        for lazy in [false, true] {
+            let error = run_git_with_reader_fetching::<()>(
+                directory.path(),
+                &["--version"],
+                &CancellationToken::new(),
+                Some((directory.path(), FetchLimits::default(), lazy)),
+                |_| panic!("unsupported isolated Git subprocess must not start"),
+            )
+            .unwrap_err();
+            assert!(matches!(error, EngineError::Other(_)));
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -1478,6 +1509,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
     #[test]
     fn captures_linked_worktree_head_instead_of_main_checkout_head() {
         let (source, main_head) = fixture();
@@ -1518,6 +1550,7 @@ mod tests {
         assert_eq!(run_head(&restored), linked_head);
     }
 
+    #[cfg(unix)]
     #[test]
     fn transfers_source_snapshot_and_nested_dirty_worktree_without_destination_base() {
         let (source, _) = fixture();
@@ -1634,6 +1667,7 @@ mod tests {
         assert!(file.metadata().unwrap().len() <= MAX_HANDOFF_ARCHIVE_BYTES);
     }
 
+    #[cfg(unix)]
     fn unpack(snapshot: &WorktreeHandoffArchive) -> (tempfile::TempDir, serde_json::Value) {
         let unpacked = tempfile::tempdir().unwrap();
         assert!(
@@ -1652,6 +1686,7 @@ mod tests {
         (unpacked, manifest)
     }
 
+    #[cfg(unix)]
     fn restore_snapshot(unpacked: &Path, head: &str) -> PathBuf {
         let restored = unpacked.join("restored");
         std::fs::create_dir(&restored).unwrap();
@@ -1663,6 +1698,7 @@ mod tests {
         restored
     }
 
+    #[cfg(unix)]
     #[test]
     fn snapshot_omits_large_deleted_history_and_unknown_prerequisite() {
         let (source, _) = fixture();
@@ -1704,6 +1740,7 @@ mod tests {
         assert_eq!(std::fs::read(restored.join("kept.txt")).unwrap(), b"base\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn delta_requires_and_restores_against_exact_ancestor() {
         let (source, prerequisite) = fixture();
@@ -1743,6 +1780,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn equal_head_sends_empty_repository_with_dirty_overlay() {
         let (source, head) = fixture();
@@ -1769,6 +1807,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn object_store_fingerprint(objects: &Path) -> BTreeSet<(PathBuf, String)> {
         let mut pending = vec![objects.to_path_buf()];
         let mut result = BTreeSet::new();
@@ -1789,6 +1828,7 @@ mod tests {
         result
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn rejects_oversized_isolated_fetch_without_mutating_source_objects() {
         let (origin, _) = fixture();
@@ -1906,6 +1946,7 @@ mod tests {
         assert_eq!(object_store_fingerprint(&source_objects), before);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn captures_shallow_partial_clone_without_exporting_promisor_config() {
         let (origin, _) = fixture();
@@ -1989,6 +2030,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_missing_non_promisor_blob_instead_of_emitting_incomplete_snapshot() {
         let (source, _) = fixture();
@@ -2005,6 +2047,7 @@ mod tests {
         assert!(capture_worktree_handoff(source.path()).is_err());
     }
 
+    #[cfg(unix)]
     fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
         let output = Command::new("git")
             .args(args)
@@ -2016,6 +2059,7 @@ mod tests {
         output.stdout
     }
 
+    #[cfg(unix)]
     fn run_head(cwd: &Path) -> String {
         String::from_utf8(
             Command::new("git")
@@ -2031,6 +2075,7 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(unix)]
     #[test]
     fn merged_older_boundary_falls_back_to_snapshot_for_depth_one_receiver() {
         let (source, older_boundary) = fixture();
@@ -2119,6 +2164,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn delta_restores_blob_from_before_shallow_prerequisite() {
         let (source, _) = fixture();
