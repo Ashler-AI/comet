@@ -33,6 +33,15 @@ zeron update      # update to the latest release
 zeron daemon start|stop|restart|status
 ```
 
+### Native session search
+
+`comet session search --query "title words" --limit 50` searches the signed-in
+controller's own directory entries; `--source-url URL` can replace or accompany
+the query. Omitted options use directory defaults. `--owner-id` may explicitly
+select that same verified owner, but cannot select another account. Search uses
+the engine at `--ipc-port` (or inherited `COMET_IPC_PORT`); updating the CLI alone
+does not update an already-running engine's search behavior.
+
 ### Native Scaffold handoff
 
 `comet session handoff [CHAT_ID] --prompt-file FILE` forks the last completed
