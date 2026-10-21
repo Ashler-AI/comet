@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { exportPKCS8, generateKeyPair } from "jose";
 import { fetchReleaseObject, type ReleaseFeedEnv } from "./release-feed";
 
 const env: ReleaseFeedEnv = {
@@ -111,12 +112,8 @@ describe("authenticated private GCS release feed", () => {
   });
 
   it("exchanges a signed read-only service-account assertion using the legacy escaped PEM binding", async () => {
-    const key = await crypto.subtle.generateKey(
-      { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
-      true, ["sign", "verify"]
-    );
-    const privateBytes = new Uint8Array(await crypto.subtle.exportKey("pkcs8", key.privateKey));
-    const pem = `-----BEGIN PRIVATE KEY-----\\n${btoa(String.fromCharCode(...privateBytes))}\\n-----END PRIVATE KEY-----`;
+    const key = await generateKeyPair("RS256", { extractable: true, modulusLength: 2048 });
+    const pem = (await exportPKCS8(key.privateKey)).replaceAll("\n", "\\n");
     let assertion = "";
     const upstream = vi.fn(async (input: string, init?: RequestInit) => {
       if (input === "https://oauth2.googleapis.com/token") {

@@ -50,6 +50,15 @@ The release compatibility marker is not the stored profile or wire schema versio
 
 The workflow builds Linux and both independently signed/notarized macOS identities, verifies candidate signatures, uploads immutable objects to the environment's private GCS bucket, and reads back the selected staging channels. Preserve its run URL, run ID, candidate SHA-256, source commit, channel manifests and Linux archive/raw executable checksums. Do not confuse the archive SHA-256 used for image pinning with `COMET_SHA256SUMS`' extracted executable digest.
 
+Native Edge uses the separate staging-only `deploy.yml` workflow. Dispatch its reviewed source with `--ref`; `source_sha` must equal that ref's resolved full commit SHA. The workflow rejects a different SHA before checkout or dependency/cache access, and every job checks out the dispatched commit. For a candidate-only run:
+
+```sh
+gh workflow run deploy.yml --repo Ashler-AI/comet --ref "${reviewed_ref:?Set the reviewed source ref}" \
+  -f source_sha="${reviewed_sha:?Set the matching full commit SHA}" -f target=candidate
+```
+
+Use `target=staging` only with explicit staging deployment authorization; this builds and verifies an immutable candidate before secret synchronization and deployment. Environment protection settings must be checked separately, not assumed to require reviewers. Native Worker bindings are declared in `edge/src/env.ts`; the existing `typecheck` and unit/workerd tests validate them, without a generated binding step.
+
 ## 4. Manual-verification stop
 
 Report the staging run and version, then obtain explicit operator approval before any production action. A successful workflow, silence, or a source change is not production authorization. The operator must update/restart the signed Crew Staging app and verify the changed behavior. Keep `Crew.app`, production profiles, production release pointers and production Scaffold pins untouched during a staging-only assignment.

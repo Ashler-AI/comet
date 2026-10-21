@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: "Reviewed full 40-character commit SHA to test and deploy"
+        description: "Reviewed full 40-character commit SHA; must match the dispatched ref"
         required: true
         type: string
       target:
@@ -36,26 +36,26 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
       digest: ${{ steps.candidate.outputs.digest }}
     steps:
-      - name: Require reviewed immutable source and staging-only target
+      - id: source_request
+        name: Require reviewed immutable source and staging-only target
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::source_sha must be a full lowercase 40-character commit SHA'; exit 1; }
+          [[ "$SOURCE_SHA" = "$GITHUB_SHA" ]] || { echo '::error::source_sha must match the dispatched ref; select that reviewed source with --ref'; exit 1; }
           case "$TARGET" in candidate|staging) ;; *) echo '::error::unsupported deployment target'; exit 1 ;; esac
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - id: source
         name: Verify reviewed checkout
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
@@ -66,11 +66,6 @@ jobs:
         run: npm ci
       - name: Verify native browser contracts
         run: node --test apps/web/server.test.mjs
-      - name: Generate Worker binding types
-        working-directory: edge
-        run: npm run types
-      - name: Require current Worker binding declarations
-        run: git diff --exit-code -- edge/worker-configuration.d.ts
       - name: Typecheck
         working-directory: edge
         run: npm run typecheck
@@ -112,7 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.candidate.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -139,7 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.candidate.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -159,6 +154,7 @@ jobs:
           EXPECTED_DIGEST: ${{ needs.candidate.outputs.digest }}
         run: |
           set -euo pipefail
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           actual="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
           test "$actual" = "$EXPECTED_DIGEST"

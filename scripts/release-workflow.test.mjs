@@ -481,6 +481,20 @@ describe("release channel publication", () => {
 });
 
 describe("Crew edge deployment", () => {
+  it("accepts only the dispatched reviewed source before installing candidate tooling", async (t) => {
+    const script = shellStep(await read(".github/workflows/deploy.yml"), "candidate", "source_request");
+    const dir = scratch(t);
+    for (const source of [RUN_SHA, "c".repeat(40), "", "HEAD", RUN_SHA.toUpperCase()]) {
+      for (const target of ["candidate", "staging", "production", ""]) {
+        const result = command(dir, "bash", ["-c", script], {
+          SOURCE_SHA: source, GITHUB_SHA: RUN_SHA, TARGET: target,
+        });
+        assert.equal(result.status === 0,
+          source === RUN_SHA && ["candidate", "staging"].includes(target), result.stderr);
+      }
+    }
+  });
+
   const complete = {
     CLOUDFLARE_API_TOKEN: "cloudflare-token",
     CLOUDFLARE_ACCOUNT_ID: "cloudflare-account",
