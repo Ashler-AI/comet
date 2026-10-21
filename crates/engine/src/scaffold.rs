@@ -3914,7 +3914,8 @@ mod tests {
             .current_dir(workspace.path()).output().unwrap();
         let first = prepare(executable);
         assert!(first.status.success(), "{:?}", first);
-        assert_eq!(first.stdout, b"absent\n");
+        // Match ensure_remote_runtime's status parsing, not platform line endings.
+        assert_eq!(std::str::from_utf8(&first.stdout).unwrap().trim(), "absent");
         assert!(workspace.path().join(".scaffold/crew-data").is_dir());
         assert!(!workspace.path().join(executable).exists());
         assert!(workspace.path().join(executable).parent().unwrap().is_dir());
@@ -3927,6 +3928,7 @@ mod tests {
             .arg("-C").arg(destination).status().unwrap().success());
         let present = prepare(executable);
         assert!(present.status.success(), "{:?}", present);
+        assert_eq!(std::str::from_utf8(&present.stdout).unwrap().trim(), "present");
         assert_eq!(format!("{:x}", sha2::Sha256::digest(std::fs::read(workspace.path().join(executable)).unwrap())), digest);
         for path in ["/workspace/.scaffold/crew/bin/comet", "../crew/bin/comet", ".scaffold/other/bin/comet", ".scaffold/crew-upstream-canary/bin/comet"] {
             assert!(!prepare(path).status.success(), "accepted {path}");

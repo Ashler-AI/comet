@@ -596,6 +596,7 @@ impl SessionCore {
             }),
             expires_at: Some(now + zeron_doc::COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
+            accepted_at: None,
             resolution: None,
         };
         let id = entry.id.clone();
@@ -720,6 +721,7 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
         first_issued: i64,
         live: bool,
         dead: bool,
+        accepted: bool,
     }
     let mut order: Vec<String> = Vec::new();
     let mut attempts: HashMap<String, Attempt> = HashMap::new();
@@ -741,7 +743,7 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
         if st.tracker.contains_id(message_id) {
             continue;
         }
-        let expired = now >= command.effective_expiry();
+        let expired = !command.is_accepted() && now >= command.effective_expiry();
         let (live, dead) = match command.status {
             SessionCommandStatus::Pending => (!expired, expired),
             SessionCommandStatus::Applied => (true, false),
@@ -758,10 +760,12 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
                 first_issued: command.issued_at,
                 live: false,
                 dead: false,
+                accepted: false,
             }
         });
         attempt.live |= live;
         attempt.dead |= dead;
+        attempt.accepted |= command.is_accepted();
     }
     let mut next = Vec::with_capacity(order.len());
     for message_id in order {
@@ -773,7 +777,12 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
             .unwrap_or(attempt.first_issued);
         let parsed = attachments::parse_user_message(&attempt.text);
         next.push(PendingSend {
-            state: send_state(started, degraded, attempt.dead && !attempt.live, now),
+            state: send_state(
+                if attempt.accepted && !degraded { now } else { started },
+                degraded,
+                attempt.dead && !attempt.live,
+                now,
+            ),
             message_id,
             text: attempt.text.clone(),
             visible_text: parsed.text,
@@ -1425,7 +1434,7 @@ impl SessionHandle {
             if landed(&message_id) {
                 continue;
             }
-            let expired = now >= command.effective_expiry();
+            let expired = !command.is_accepted() && now >= command.effective_expiry();
             match command.status {
                 SessionCommandStatus::Pending if !expired => {
                     live.insert(message_id);
@@ -1458,5 +1467,118 @@ impl SessionHandle {
         client.after_command(&self.core, true);
         client.kick_room(&self.core.chat_id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_only_import_refreshes_cached_acceptance_retry_and_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::ClientConfig::new("https://edge.invalid", dir.path());
+        config.device_id = "sender".into();
+        let client = crate::Client::new(
+            config,
+            crate::Credentials::Demo(Default::default()),
+            Arc::new(crate::events::NullListener),
+        ).unwrap();
+        client.inner.cancel.cancel(); // Drive every projection explicitly, without timers.
+        let sender = SessionDoc::init("chat-blog").unwrap();
+        let command = SessionCommandEntry {
+            id: "receipt-command".into(),
+            payload: SessionCommandPayload::Steer {
+                prompt: "hello".into(),
+                message_id: Some("receipt-message".into()),
+            },
+            issued_by: "sender".into(),
+            issued_at: 0,
+            based_on: None,
+            expires_at: Some(30_000),
+            status: SessionCommandStatus::Pending,
+            accepted_at: None,
+            resolution: None,
+        };
+        sender.queue_command(&command).unwrap();
+        let core = SessionCore::new("chat-blog", &client.inner, sender, 0);
+        core.refresh();
+        assert!(!lock(&core.state).commands[0].is_accepted());
+        assert!(!lock(&core.dirty).commands);
+
+        // The relay host has no sender row: both imports touch receipts only.
+        let host = SessionDoc::from_doc(loro::LoroDoc::new());
+        host.accept_command(&command, 1).unwrap();
+        core.doc.doc().import(&host.export_snapshot().unwrap()).unwrap();
+        assert!(lock(&core.dirty).commands);
+        core.refresh();
+        {
+            let mut st = lock(&core.state);
+            assert!(st.commands[0].is_accepted());
+            derive_pending(&mut st, "sender", false, crate::connectivity::UNDELIVERED_GRACE_MS + 1);
+            assert_eq!(st.pending[0].state, SendState::Sending);
+            assert!(st.tracker.entries().is_empty());
+        }
+        SessionHandle { core: core.clone() }.retry_delivery().unwrap();
+        assert_eq!(core.doc.read_commands().unwrap().len(), 1, "accepted retry must not duplicate the send");
+
+        host.set_command_status(
+            &command.id,
+            SessionCommandStatus::Rejected,
+            Some("Retry with another branch."),
+        ).unwrap();
+        core.doc.doc().import(&host.export_snapshot().unwrap()).unwrap();
+        assert!(lock(&core.dirty).commands);
+        core.refresh();
+        let st = lock(&core.state);
+        assert!(!st.commands[0].is_accepted());
+        assert_eq!(st.pending[0].state, SendState::Failed);
+        assert_eq!(st.commands[0].resolution.as_deref(), Some("Retry with another branch."));
+        assert_eq!(zeron_doc::command_delivery(&st.commands)["receipt-message"],
+            zeron_doc::CommandDeliveryStatus::Failed { reason: "Retry with another branch.".into() });
+        assert!(st.tracker.entries().is_empty());
+        assert!(host.read_commands().unwrap().is_empty());
+    }
+
+    #[test]
+    fn accepted_send_survives_expiry_without_transcript_ack() {
+        let mut st = CoreState {
+            tracker: Tracker::new(),
+            queue: Vec::new(),
+            commands: vec![SessionCommandEntry {
+                id: "command".into(),
+                payload: SessionCommandPayload::Steer {
+                    prompt: "hello".into(),
+                    message_id: Some("message".into()),
+                },
+                issued_by: "device".into(),
+                issued_at: 0,
+                based_on: None,
+                expires_at: Some(30_000),
+                status: SessionCommandStatus::Pending,
+                accepted_at: Some(1),
+                resolution: None,
+            }],
+            context_usage: None,
+            echoes: HashMap::new(),
+            pending: Vec::new(),
+            grace_started: HashMap::new(),
+            queue_actions_pending: HashSet::new(),
+            queue_error: None,
+            last_submitted: None,
+            transfer_progress: None,
+            hydrated: false,
+            transcript_revision: 0,
+            composer_revision: 0,
+        };
+        let now = crate::connectivity::UNDELIVERED_GRACE_MS + 1;
+        assert!(derive_pending(&mut st, "device", false, now));
+        assert_eq!(st.pending[0].state, SendState::Sending);
+        assert!(st.tracker.entries().is_empty());
+        assert!(derive_pending(&mut st, "device", true, now));
+        assert_eq!(st.pending[0].state, SendState::Failed);
+        st.commands[0].status = SessionCommandStatus::Rejected;
+        derive_pending(&mut st, "device", false, 2);
+        assert_eq!(st.pending[0].state, SendState::Failed);
     }
 }

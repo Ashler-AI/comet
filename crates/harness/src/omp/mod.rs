@@ -33,6 +33,26 @@ pub const MIN_OMP_VERSION: &str = "17.2.9";
 const RPC_STARTUP_DEADLINE: Duration = Duration::from_secs(60);
 // Includes the startup boundary plus the command stream's two-second settle.
 const RPC_COMMAND_CATALOG_DEADLINE: Duration = Duration::from_secs(65);
+// Registered during extension loading, before session_start can initiate a turn.
+// The private flag makes a failed guard import a native CLI error before session creation.
+const COMMAND_CATALOG_GUARD: &str = r#"import { writeSync } from "node:fs";
+export default function (pi) {
+  // OMP reports hook exceptions and continues; only this disposable probe exits.
+  const denyInference = () => {
+    const message = "OMP command discovery cannot start inference";
+    try {
+      writeSync(2, message + "\n");
+      // Report failure before supervisor cleanup can outlast catalog settling.
+      writeSync(1, JSON.stringify({ type: "notice", level: "error", source: "command-catalog", message }) + "\n");
+    } finally {
+      process.exit(1);
+    }
+  };
+  pi.on("before_agent_start", denyInference);
+  pi.on("before_provider_request", denyInference);
+  pi.registerFlag("comet-command-catalog", { type: "boolean" });
+}
+"#;
 const SCAFFOLD_PROFILE: &str = "scaffold-host";
 const AUTH_BROKER_URL_ENV: &str = "OMP_AUTH_BROKER_URL";
 const AUTH_BROKER_TOKEN_ENV: &str = "OMP_AUTH_BROKER_TOKEN";
@@ -247,6 +267,7 @@ fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), Ha
     }
     let mut command = ProcessCommand::new(executable);
     command.args(args);
+    let command_catalog = command.get_args().any(|arg| arg == "--comet-command-catalog");
     unsafe {
         command.pre_exec(|| {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
@@ -262,6 +283,14 @@ fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), Ha
             || SUPERVISOR_STOPPING.load(std::sync::atomic::Ordering::Relaxed)
             || unsafe { libc::getppid() } != parent_pid as i32
         {
+            if command_catalog && let Some(status) = status.filter(|status| !status.success()) {
+                let notice = serde_json::json!({
+                    "type": "notice", "level": "error", "source": "command-catalog-supervisor",
+                    "message": format!("OMP command catalog exited unsuccessfully ({status})"),
+                });
+                // A closed RPC pipe must never skip owned-descendant teardown.
+                let _ = writeln!(std::io::stdout().lock(), "{notice}");
+            }
             unsafe {
                 libc::kill(-(root as i32), libc::SIGTERM);
             }
@@ -1881,16 +1910,15 @@ impl OmpHarness {
         command
     }
 
-    /// The persistent RPC-mode child that owns a run: JSONL frames on stdio,
-    /// hardened the same way the ACP lane was (yolo approvals; scaffold hosts
-    /// run the isolated profile with discovery disabled).
+    /// A catalog RPC child: retain the existing supervisor until startup
+    /// descendants are cleaned up, even when OMP exits before the catalog settles.
     fn rpc_mode_command(
         &self,
         executable: &Path,
         cwd: &str,
         include_auth_broker_token: bool,
     ) -> Command {
-        let mut command = self.base_command(executable, cwd, include_auth_broker_token, false);
+        let mut command = self.base_command(executable, cwd, include_auth_broker_token, cfg!(unix));
         // OMP sets CI on tool children independently of its launch environment.
         // Repository-owned wrappers use this local-only marker to recover local
         // command semantics; Scaffold explicitly omits it and stays CI.
@@ -1970,9 +1998,14 @@ impl OmpHarness {
         command
     }
 
-    fn command_catalog_command(&self, executable: &Path, cwd: &str) -> Command {
+    fn command_catalog_command(&self, executable: &Path, cwd: &str, guard: &Path) -> Command {
         let mut command = self.rpc_mode_command(executable, cwd, false);
-        command.arg("--no-session");
+        command.args(["--no-session", "--comet-command-catalog", "--extension"]).arg(guard);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.as_std_mut().process_group(0);
+        }
         command
     }
 }
@@ -2151,8 +2184,19 @@ impl Harness for OmpHarness {
     async fn commands_for(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let cwd = cwd.to_str().ok_or_else(|| HarnessError::Protocol("OMP cwd is not UTF-8".into()))?;
         let executable = self.resolve_executable()?;
-        let mut child = self
-            .command_catalog_command(&executable, cwd)
+        let catalog = crate::scratch::ScratchDir::new("omp-command-catalog")?;
+        let guard = catalog.path().join("guard.js");
+        std::fs::write(&guard, COMMAND_CATALOG_GUARD)?;
+        let config = catalog.path().join("config.yml");
+        // These startup jobs run before session hooks; keep their metadata loaded
+        // without compressing skills or starting a memory inference scheduler.
+        std::fs::write(&config, "skillful: false\nmemory:\n  backend: off\n")?;
+        let mut command = self.command_catalog_command(&executable, cwd, &guard);
+        command.env_remove(PI_CONFIG_FILES_ENV);
+        for path in config_overlay_paths(std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(), &config) {
+            command.arg("--config").arg(path);
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -2161,6 +2205,12 @@ impl Harness for OmpHarness {
                     HarnessError::Io(error)
                 }
             })?;
+        #[cfg(unix)]
+        let process_group = child.id().map(|pid| pid as i32);
+        #[cfg(not(unix))]
+        let process_group = None;
+        let process_group_guard =
+            rpc_mode::ProcessGroupGuard::new(process_group, cfg!(unix) && self.supervisor_executable.is_some());
         let stdin = child
             .stdin
             .take()
@@ -2186,8 +2236,8 @@ impl Harness for OmpHarness {
                 client,
                 frames,
                 stderr_tail,
-                process_group: None,
-                process_group_guard: rpc_mode::ProcessGroupGuard::new(None, false),
+                process_group,
+                process_group_guard,
                 run_config: None,
             },
             RPC_COMMAND_CATALOG_DEADLINE,
@@ -2253,6 +2303,9 @@ impl Harness for OmpHarness {
             std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(),
         );
         crate::apply_run_context(&mut command, controls.context.as_ref());
+        // OMP uses the run-owned gateway below, not the legacy globally loaded
+        // extension that activates on this Codex-only token alias.
+        command.env_remove("COMET_INFERENCE_TOKEN");
         if let Some(inference) = controls
             .context
             .as_ref()
@@ -2268,7 +2321,13 @@ impl Harness for OmpHarness {
                 _ => return Err(HarnessError::Protocol("Unsupported Agent Auth provider".into())),
             };
             let model = inference.model.rsplit('/').next().unwrap_or(&inference.model);
-            command.args(["--model", &format!("{provider}/{model}")]);
+            let model = format!("{provider}/{model}");
+            command.args(["--model", &model]);
+            // Keep role-selected children on this run's Agent Auth route without
+            // changing workstation preferences or shadowable extension flags.
+            for role in ["PI_SMOL_MODEL", "PI_SLOW_MODEL", "PI_PLAN_MODEL"] {
+                command.env(role, &model);
+            }
             run_config.gateway = Some(gateway);
         } else if self.scaffold_host {
             configure_scaffold_inference_profile(&mut command, request.model.as_deref())?;

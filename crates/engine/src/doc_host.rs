@@ -3524,6 +3524,7 @@ impl DocHost {
             expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
             resolution: None,
+            accepted_at: None,
         };
         handle.doc.queue_command(&entry)?;
         if command_id.is_some() {
@@ -4646,6 +4647,9 @@ impl DocHost {
             chat2.redial();
         }
         self.nudge_remote_host(chat_id);
+        // Read outcomes and execution liveness together, and serialize retry
+        // reissues: retiring preparation must not look like a dead attempt.
+        let executing = lock(&self.inner.executing);
         let commands = handle.doc.read_commands()?;
         let pending: Vec<SessionCommandEntry> = commands
             .iter()
@@ -4688,7 +4692,7 @@ impl DocHost {
                 SessionCommandStatus::Rejected | SessionCommandStatus::Expired => true,
                 SessionCommandStatus::Pending => {
                     self.inner.store.is_processed(&c.id).unwrap_or(false)
-                        && !lock(&self.inner.executing).contains(&c.id)
+                        && !executing.contains(&c.id)
                 }
                 _ => false,
             };
@@ -4700,7 +4704,8 @@ impl DocHost {
             let live_attempt = commands.iter().any(|o| {
                 o.id != c.id
                     && o.status == SessionCommandStatus::Pending
-                    && !self.inner.store.is_processed(&o.id).unwrap_or(false)
+                    && (!self.inner.store.is_processed(&o.id).unwrap_or(false)
+                        || executing.contains(&o.id))
                     && match (&o.payload, &c.payload) {
                         (
                             SessionCommandPayload::Run { message_id: a, .. },
@@ -4751,6 +4756,7 @@ impl DocHost {
                 expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
                 status: SessionCommandStatus::Pending,
                 resolution: None,
+                accepted_at: None,
             };
             tracing::info!(chat = %chat_id, old = %old.id, new = %reissue.id,
                 "retry re-issues a dead send attempt");
@@ -4828,15 +4834,23 @@ impl DocHost {
                 CommandDisposition::Skip => Ok("duplicate"),
                 CommandDisposition::Expired => Ok("expired"),
                 CommandDisposition::Superseded => Ok("superseded"),
-                CommandDisposition::Execute => match {
+                CommandDisposition::Execute => {
                     if _prompt_guard.is_some() {
                         self.await_earlier_controls(&handle, &entry.id).await;
                     }
-                    self.execute(&sessions, &handle, &entry).await
-                } {
-                    Ok(_) => Ok("executed"),
-                    Err(err) => Err(err),
-                },
+                    let result = self.execute(&sessions, &handle, &entry).await;
+                    if commands.iter().any(|command| command.id == entry.id)
+                        || matches!(&entry.payload, SessionCommandPayload::Run { request, .. } if request.worktree.is_some())
+                    {
+                        let error = result.as_ref().err().map(ToString::to_string);
+                        let (status, resolution) = match &result {
+                            Ok((status, resolution)) => (*status, resolution.as_deref()),
+                            Err(_) => (SessionCommandStatus::Rejected, error.as_deref()),
+                        };
+                        self.resolve_command(&handle, &entry.id, status, resolution);
+                    }
+                    result.map(|_| "executed")
+                }
             },
         };
         lock(&self.inner.executing).remove(&entry.id);
@@ -5138,6 +5152,21 @@ impl DocHost {
                         skipped.insert(c.id.clone());
                     }
                 }
+                // Relay preparation can precede the sender's command row.
+                // A receipt is observational only: reject abandoned work,
+                // never turn a receipt into an executable command.
+                if let Ok(receipts) = handle.doc.pending_command_receipt_ids() {
+                    for id in receipts {
+                        if is_processed(&id) && !executing.contains(&id) {
+                            self.resolve_command(
+                                handle,
+                                &id,
+                                SessionCommandStatus::Rejected,
+                                Some("interrupted before completion — retry to send again"),
+                            );
+                        }
+                    }
+                }
                 commands
             };
             let Some(entry) = commands
@@ -5398,6 +5427,7 @@ impl DocHost {
                 "command outcome write failed"
             );
         }
+        handle.publish_messages_if_watched();
     }
 
     /// `entry` is a prompt sent before the Stop that has already acted on
@@ -5468,6 +5498,10 @@ impl DocHost {
                 let worktree_spec = request.worktree.take();
                 let fresh_worktree = match &worktree_spec {
                     Some(spec) => {
+                        // Acceptance is not transcript delivery: keep failures
+                        // retryable while the host prepares the checkout.
+                        handle.doc.accept_command(entry, now_ms())?;
+                        handle.publish_messages_if_watched();
                         let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;
                         request.cwd = cwd;
                         fresh

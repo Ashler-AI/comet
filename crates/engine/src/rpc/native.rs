@@ -548,6 +548,7 @@ impl EngineRpc {
                 id:message.command_id.clone(), payload, issued_by:self.doc_host.device_id().into(),
                 issued_at:crate::now_ms(), based_on:None, expires_at:None,
                 status:zeron_doc::SessionCommandStatus::Applied, resolution:Some("Delivered to waiting CLI".into()),
+                accepted_at: None,
             }).map_err(failed)?;
             handle.write_user_message(&message.command_id, &peer_prompt(message)?, crate::now_ms()).map_err(failed)?;
             self.doc_host.persist_fork(&handle).map_err(failed)?;

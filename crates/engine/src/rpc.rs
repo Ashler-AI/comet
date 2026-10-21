@@ -1678,8 +1678,9 @@ fn doc_messages_stream(
             doc,
             None,
             zeron_doc::TranscriptBaseline::default(),
+            std::collections::HashMap::new(),
         ),
-        |(mut rx, mut prev, doc, mut previous_usage, mut opening_baseline)| async move {
+        |(mut rx, mut prev, doc, mut previous_usage, mut opening_baseline, mut previous_delivery)| async move {
             loop {
                 if prev.is_some() {
                     rx.changed().await.ok()?;
@@ -1720,20 +1721,23 @@ fn doc_messages_stream(
                     _ => None,
                 };
                 prev = Some(current);
-                // No-op commits (a second watcher attaching, command-only
-                // changes) produce empty deltas — skip the frame entirely.
+                // Command acceptance/failure is meaningful even without transcript edits.
                 let usage = doc.context_usage();
-                if frame.is_empty_delta() && usage == previous_usage && replay_baseline.is_none() {
+                let command_delivery = doc.command_delivery().ok()?;
+                if frame.is_empty_delta() && usage == previous_usage
+                    && command_delivery == previous_delivery && replay_baseline.is_none() {
                     continue;
                 }
                 previous_usage = usage;
-                let value = serde_json::to_value(zeron_doc::TranscriptUpdate {
+                let update = zeron_doc::TranscriptUpdate {
                     frame,
                     context_usage: usage,
                     replay_baseline,
-                })
-                .ok()?;
-                return Some((value, (rx, prev, doc, previous_usage, opening_baseline)));
+                    command_delivery,
+                };
+                let value = serde_json::to_value(&update).ok()?;
+                previous_delivery = update.command_delivery;
+                return Some((value, (rx, prev, doc, previous_usage, opening_baseline, previous_delivery)));
             }
         },
     )
@@ -1753,6 +1757,7 @@ async fn opening_doc_messages_stream(
             frame: zeron_doc::TranscriptFrame::reset(&entries),
             context_usage: handle.doc().context_usage(),
             replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
+            command_delivery: handle.doc().command_delivery()?,
         })
         .map_err(|e| crate::EngineError::Other(e.to_string()))?;
         preview["historyPending"] = serde_json::Value::Bool(true);
@@ -5191,5 +5196,40 @@ mod context_usage_tests {
         remote.clear_context_usage().unwrap();
         tx.send_replace(crate::doc_host::TranscriptSnapshot::default());
         assert!(stream.next().await.unwrap()["contextUsage"].is_null());
+    }
+
+    #[tokio::test]
+    async fn command_only_delivery_changes_reach_transcript_watch() {
+        let doc = Arc::new(zeron_doc::SessionDoc::init("delivery-chat").unwrap());
+        let entry = zeron_doc::SessionCommandEntry {
+            id: "command".into(),
+            payload: zeron_doc::SessionCommandPayload::Steer {
+                prompt: "go".into(), message_id: Some("message".into()),
+            },
+            issued_by: "sender".into(), issued_at: 1, based_on: None, expires_at: None,
+            status: zeron_doc::SessionCommandStatus::Pending, accepted_at: None, resolution: None,
+        };
+        let snapshot = crate::doc_host::TranscriptSnapshot::default();
+        let (tx, rx) = watch::channel(snapshot.clone());
+        let mut stream = doc_messages_stream(rx, doc.clone());
+        assert_eq!(stream.next().await.unwrap()["commandDelivery"], serde_json::json!({}));
+        doc.accept_command(&entry, 2).unwrap();
+        tx.send_replace(snapshot.clone());
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await.unwrap().unwrap();
+        assert_eq!(accepted["commandDelivery"]["message"], "preparing");
+        assert!(doc.read_entries().unwrap().is_empty());
+        doc.set_command_status(&entry.id, zeron_doc::SessionCommandStatus::Rejected,
+            Some("Choose another branch and retry.")).unwrap();
+        tx.send_replace(snapshot.clone());
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await.unwrap().unwrap();
+        assert_eq!(failed["commandDelivery"]["message"]["failed"]["reason"],
+            "Choose another branch and retry.");
+        doc.set_command_status(&entry.id, zeron_doc::SessionCommandStatus::Applied, None).unwrap();
+        tx.send_replace(snapshot);
+        let applied = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await.unwrap().unwrap();
+        assert_eq!(applied["commandDelivery"], serde_json::json!({}));
     }
 }

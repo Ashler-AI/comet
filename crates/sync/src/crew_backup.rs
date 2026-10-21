@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use loro::{LoroDoc, ToJson};
+use loro::ToJson;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -237,32 +237,6 @@ fn owned_publication(
     Ok(true)
 }
 
-fn source_documents(db: &Connection) -> Result<BTreeMap<String, LoroDoc>, CrewImportError> {
-    let mut documents = BTreeMap::new();
-    for row in db
-        .prepare("SELECT doc_id,bytes FROM snapshots ORDER BY doc_id")?
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?
-    {
-        let (id, bytes) = row?;
-        if id.starts_with("recovery-original/") {
-            continue;
-        } // Opaque evidence remains in the original SQLite file.
-        let doc = LoroDoc::new();
-        let status = doc
-            .import(&bytes)
-            .map_err(|error| unsafe_data(format!("snapshot {id}: {error}")))?;
-        if status.pending.is_some() || doc.is_detached() || doc.state_vv() != doc.oplog_vv() {
-            return Err(unsafe_data(format!(
-                "snapshot has unresolved causal operations: {id}"
-            )));
-        }
-        documents.insert(id, doc);
-    }
-    Ok(documents)
-}
-
 fn metadata(
     db: &Connection,
     principal: &CollaborationPrincipal,
@@ -306,21 +280,17 @@ fn metadata(
         }
         metadata
     };
-    let mut documents = source_documents(db)?;
     let mut associated_ids = native_archive_ids.clone();
     if let Some(proof) = desktop {
         associated_ids.extend(proof.source_witnesses.keys().cloned());
     }
-    let inert =
-        crate::crew_import_aliases::inert_bootstrap_snapshots(db, &documents, &associated_ids)?;
+    let inert = crate::crew_import_aliases::inert_bootstrap_snapshots_from_store(db, &associated_ids)?;
     if desktop.is_some_and(|proof| proof.inert_bootstrap_snapshots != inert) {
         return Err(unsafe_data(
             "desktop inert-bootstrap disposition differs from the complete reconciled source",
         ));
     }
-    for id in inert.keys() {
-        documents.remove(id);
-    } // Exact snapshots remain in the inventoried SQLite source.
+    let excluded = inert.into_keys().collect(); // Original source snapshots remain untouched.
     // This binding is only input to the shared alias validator, not ownership
     // evidence. Explicit owner publications are required below before export.
     let provisional = CrewBackupManifest {
@@ -343,18 +313,15 @@ fn metadata(
         desktop_source: None,
         original_epoch_histories: BTreeMap::new(),
     };
-    crate::crew_import_aliases::reconcile_execution_snapshots(
-        &mut documents,
-        &provisional,
-        principal,
+    let staged = crate::crew_import_aliases::prepare_execution_snapshots(
+        db, temporary_parent, &provisional, principal, &excluded,
     )?;
-    let mut documents: BTreeMap<_, _> = documents
-        .into_iter()
-        .map(|(id, doc)| (id, doc.get_deep_value().to_json_value()))
-        .collect();
-    let workspace = documents
-        .remove("workspace3")
-        .ok_or_else(|| unsafe_data("missing workspace3"))?;
+    let document_ids = staged.connection.prepare("SELECT doc_id FROM snapshots WHERE doc_id != 'workspace3' ORDER BY doc_id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    // Retain workspace membership and compact IDs, never all decoded source histories.
+    let workspace = crate::crew_import_aliases::load_execution_doc(&staged.connection, "workspace3")?
+        .get_deep_value().to_json_value();
     if remote.is_some() || desktop.is_some() {
         assets.collect(&workspace)?;
     }
@@ -369,7 +336,7 @@ fn metadata(
         .get("chats")
         .and_then(Value::as_object)
         .ok_or_else(|| unsafe_data("workspace has no chat map"))?;
-    terminals.prepare(rows, &documents, principal, temporary_parent)?;
+    terminals.prepare(rows, &staged.connection, principal, temporary_parent)?;
     if let Some(refs) = workspace.get("sessionRefs") {
         for row in refs
             .as_object()
@@ -388,7 +355,7 @@ fn metadata(
                 || !row
                     .get("chatId")
                     .and_then(Value::as_str)
-                    .is_some_and(|id| documents.contains_key(id))
+                    .is_some_and(|id| document_ids.contains(id))
             {
                 return Err(unsafe_data(
                     "shared, remote or unresolved session membership",
@@ -414,9 +381,11 @@ fn metadata(
     let mut chats = BTreeMap::new();
     let mut native = BTreeMap::new();
     let mut required_native = BTreeSet::new();
-    for (id, doc) in &documents {
+    for id in &document_ids {
+        let doc = crate::crew_import_aliases::load_execution_doc(&staged.connection, id)?
+            .get_deep_value().to_json_value();
         if remote.is_some() || desktop.is_some() {
-            assets.collect(doc)?;
+            assets.collect(&doc)?;
         }
         let local = zeron_proto::is_local_history_chat(id);
         if (!zeron_proto::is_cloud_session_id(id) && !local)
@@ -450,7 +419,7 @@ fn metadata(
         let metadata = if let Some(metadata) = original_epoch {
             metadata.clone()
         } else if let Some(remote) = remote {
-            remote.document(id, device, row, doc)?
+            remote.document(id, device, row, &doc)?
         } else {
             projected_metadata(id, &scopes[id])
         };
@@ -686,9 +655,8 @@ pub fn inspect_inert_bootstraps(
     if integrity != "ok" {
         return Err(unsafe_data("copied SQLite integrity check failed"));
     }
-    let documents = source_documents(&db)?;
     let inert =
-        crate::crew_import_aliases::inert_bootstrap_snapshots(&db, &documents, &native_ids)?;
+        crate::crew_import_aliases::inert_bootstrap_snapshots_from_store(&db, &native_ids)?;
     drop(db);
     if hash(&database)? != before {
         return Err(unsafe_data(

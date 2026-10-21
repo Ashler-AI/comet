@@ -483,6 +483,7 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         issued_at: now,
         based_on,
         expires_at: None,
+        accepted_at: None,
         status: SessionCommandStatus::Pending,
         resolution: None,
     })
@@ -1195,6 +1196,245 @@ async fn retry_reissues_a_swallowed_send() {
         run_attempts(&handle.doc().read_commands().unwrap()),
         2,
         "retry after delivery must not duplicate the send"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_worktree_preparation_accepts_once_before_dispatch() {
+    check_slow_worktree_preparation(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_worktree_preparation_rejects_with_reason_and_allows_retry() {
+    check_slow_worktree_preparation(true).await;
+}
+
+#[cfg(unix)]
+async fn check_slow_worktree_preparation(fail_first: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    let hooks = repo.join(".git/hooks");
+    git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    std::fs::write(repo.join("README.md"), "real checkout\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "init"]);
+
+    let gate = hooks.join("gate");
+    std::fs::create_dir(&gate).unwrap();
+    let hook = hooks.join("post-checkout");
+    // The release file, not elapsed time, decides when preparation finishes.
+    // Removing the temp directory on panic also releases the hook process.
+    std::fs::write(
+        &hook,
+        r#"#!/bin/sh
+set -eu
+gate="$(dirname "$0")/gate"
+printf 'entered\n' >> "$gate/invocations"
+: > "$gate/entered"
+while [ ! -f "$gate/release" ]; do
+    [ -d "$gate" ] || exit 99
+    sleep 0.05
+done
+code=$(cat "$gate/release")
+if [ "$code" != 0 ]; then
+    printf 'slow-worktree-hook: checkout refused\n' >&2
+fi
+exit "$code"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let seen: Arc<std::sync::Mutex<Vec<RunRequest>>> = Default::default();
+    let core = assemble(
+        &root.join("engine"),
+        Arc::new(CapturingHarness {
+            script: mock_script(),
+            seen: seen.clone(),
+        }),
+    );
+    core.repos
+        .set_worktree_settings(zeron_proto::WorktreeSettings {
+            use_custom_directory: true,
+            custom_directory: Some(root.join("worktrees").to_string_lossy().into_owned()),
+        })
+        .await
+        .unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let mut request = run_request("gated real worktree");
+    request.cwd = repo.to_string_lossy().into_owned();
+    request.worktree = Some(zeron_proto::WorktreeSpec {
+        repo_path: request.cwd.clone(),
+        base: "main".into(),
+        space_id: None,
+    });
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-slow-worktree",
+        SessionCommandPayload::Run {
+            request,
+            message_id: "m-slow-worktree".into(),
+        },
+    );
+    let attempts = || {
+        handle
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .filter(|command| {
+                matches!(&command.payload, SessionCommandPayload::Run { message_id, .. }
+                    if message_id == "m-slow-worktree")
+            })
+            .collect::<Vec<_>>()
+    };
+    let assert_blocked = |id: &str, count: usize| {
+        let commands = attempts();
+        assert_eq!(commands.len(), count, "retry must not mint a live attempt");
+        let command = commands.iter().find(|command| command.id == id).unwrap();
+        assert_eq!(command.status, SessionCommandStatus::Pending);
+        assert!(
+            command.accepted_at.is_some(),
+            "host accepted before checkout finished"
+        );
+        assert!(command.is_accepted());
+        assert!(entries(&core).iter().all(|entry| entry.role != MessageRole::User));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no dispatch before materialization"
+        );
+    };
+    let mut active_id = "cmd-slow-worktree".to_owned();
+    for attempt in 0..=usize::from(fail_first) {
+        wait_for(|| gate.join("entered").exists(), "post-checkout entered").await;
+        assert_blocked(&active_id, attempt + 1);
+        core.doc_host.retry_delivery(CHAT).unwrap();
+        assert_blocked(&active_id, attempt + 1);
+        assert_eq!(
+            std::fs::read_to_string(gate.join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            attempt + 1,
+            "one real checkout per explicit attempt"
+        );
+        std::fs::write(
+            gate.join("release-next"),
+            if fail_first && attempt == 0 { "42\n" } else { "0\n" },
+        )
+        .unwrap();
+        // Publish a complete result atomically; the hook must never read an empty file.
+        std::fs::rename(gate.join("release-next"), gate.join("release")).unwrap();
+        if fail_first && attempt == 0 {
+            wait_for(
+                || matches!(
+                    command_status(&core, &active_id),
+                    Some((SessionCommandStatus::Rejected, _))
+                ),
+                "failed checkout rejected",
+            )
+            .await;
+            let failed = attempts()
+                .into_iter()
+                .find(|command| command.id == active_id)
+                .unwrap();
+            assert!(!failed.is_accepted(), "rejection ends preparation");
+            assert!(
+                failed.resolution.as_deref().unwrap()
+                    .contains("slow-worktree-hook: checkout refused"),
+                "retain the hook's actual failure: {:?}",
+                failed.resolution
+            );
+            assert!(entries(&core).iter().all(|entry| entry.role != MessageRole::User));
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "failed checkout never dispatches"
+            );
+            std::fs::remove_file(gate.join("entered")).unwrap();
+            std::fs::remove_file(gate.join("release")).unwrap();
+            core.doc_host.retry_delivery(CHAT).unwrap();
+            let commands = attempts();
+            assert_eq!(commands.len(), 2, "explicit retry mints one fresh attempt");
+            active_id = commands
+                .into_iter()
+                .find(|command| command.id != active_id)
+                .unwrap()
+                .id;
+        }
+    }
+    wait_for(
+        || {
+            command_status(&core, &active_id)
+                .is_some_and(|(status, _)| status == SessionCommandStatus::Applied)
+                && entries_now(&core).iter().any(|entry| {
+                    entry.role == MessageRole::Assistant
+                        && entry.status == Some(MessageStatus::Complete)
+                })
+        },
+        "released checkout dispatches and completes",
+    )
+    .await;
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    core.shutdown().await;
+    assert_eq!(attempts().len(), 1 + usize::from(fail_first));
+    assert_eq!(
+        entries(&core)
+            .iter()
+            .filter(|entry| entry.role == MessageRole::User)
+            .count(),
+        1,
+        "exactly one landed user entry"
+    );
+    assert!(entries(&core).iter().any(|entry| entry.id == "m-slow-worktree"));
+    let requests = seen.lock().unwrap();
+    let dispatched: Vec<_> = requests
+        .iter()
+        .filter(|request| request.prompt == "gated real worktree")
+        .collect();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "exactly one prompt dispatch (excluding auto-title)"
+    );
+    let cwd = std::path::Path::new(&dispatched[0].cwd);
+    assert!(cwd.starts_with(root.join("worktrees")));
+    assert!(cwd.join(".git").is_file(), "dispatch uses a real linked worktree");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("README.md")).unwrap(),
+        "real checkout\n"
+    );
+    assert!(
+        dispatched[0].worktree.is_none(),
+        "materialization consumes the directive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gate.join("invocations"))
+            .unwrap()
+            .lines()
+            .count(),
+        1 + usize::from(fail_first)
     );
 }
 

@@ -5,6 +5,7 @@ use crate::crew_desktop_backup::PreparedDesktopDatabase;
 use crate::crew_import::{CrewImportError, OriginalEpochProof};
 use crate::crew_import_epoch::{OriginalEpochScope, OriginalEpochTermination};
 use crate::crew_remote_backup::RemoteBackupContext;
+use loro::ToJson;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -144,7 +145,7 @@ impl TerminalBackups {
     pub(crate) fn prepare(
         &mut self,
         rows: &serde_json::Map<String, Value>,
-        documents: &BTreeMap<String, Value>,
+        documents: &rusqlite::Connection,
         principal: &CollaborationPrincipal,
         temporary_parent: &Path,
     ) -> Result<(), CrewImportError> {
@@ -154,11 +155,8 @@ impl TerminalBackups {
                     "original epoch has no actual replica host/config row: {id}"
                 ))
             })?;
-            let doc = documents.get(id).ok_or_else(|| {
-                unsafe_data(format!(
-                    "original epoch has no complete source snapshot: {id}"
-                ))
-            })?;
+            let doc = crate::crew_import_aliases::load_execution_doc(documents, id)?
+                .get_deep_value().to_json_value();
             if row.get("id").and_then(Value::as_str) != Some(id.as_str()) {
                 return Err(unsafe_data("original epoch host row identity mismatch"));
             }
@@ -240,7 +238,7 @@ impl TerminalBackups {
                 .and_then(Value::as_str)
                 .ok_or_else(|| unsafe_data("original epoch host device missing"))?;
             let mut metadata =
-                context.original_epoch_document(id, device, row, doc, config.harness)?;
+                context.original_epoch_document(id, device, row, &doc, config.harness)?;
             metadata.original_epoch_history = Some(marker.clone());
             let mut file = tempfile::NamedTempFile::new_in(temporary_parent)?;
             file.write_all(&bytes)?;

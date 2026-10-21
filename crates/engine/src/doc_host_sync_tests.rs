@@ -218,14 +218,28 @@ async fn relay(hold: Hold) -> Relay {
     }
 }
 
-async fn until(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !condition() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("dispatcher failed to make progress");
+#[track_caller]
+fn until(condition: impl FnMut() -> bool) -> impl Future<Output = ()> {
+    until_with_diagnostics(condition, String::new)
+}
+
+#[track_caller]
+fn until_with_diagnostics(
+    mut condition: impl FnMut() -> bool,
+    diagnostics: impl FnOnce() -> String,
+) -> impl Future<Output = ()> {
+    let caller = std::panic::Location::caller();
+    async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!("dispatcher failed to make progress at {caller}: {error:?}\n{}", diagnostics())
+        });
+    }
 }
 
 fn host(store: Arc<DocsStore>, relay: &Relay) -> DocHost {
@@ -899,14 +913,34 @@ async fn focused_waiter_displaces_one_running_writer_without_stopping_local_writ
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(DocsStore::open(dir.path()).unwrap());
     let host = host(store.clone(), &relay);
+    let diagnostics = || {
+        format!(
+            "resources={}\nclients={:?}\nrelay joins={} by_chat={:?} rows_requests={}",
+            host.sync_resources(),
+            host.sync_statuses(),
+            relay.joins.load(Ordering::SeqCst),
+            lock(&relay.joins_by_chat),
+            relay.rows_requests.load(Ordering::SeqCst),
+        )
+    };
+    let mut handles = Vec::new();
     let mut writers = Vec::new();
     for n in 0..ACTIVE_SYNC_CAP {
         let id = format!("writer-{n}");
         store.initialize_chat_outbox(&id, &[]).unwrap();
-        writers.push(host.open(&id).unwrap().writer());
+        let handle = host.open(&id).unwrap();
+        writers.push(handle.writer());
+        handles.push(handle);
         host.focus_chat(&id).unwrap();
     }
-    until(|| relay.joins.load(Ordering::SeqCst) == ACTIVE_SYNC_CAP).await;
+    // A relay upgrade precedes HELLO/STATE and ROWS_DONE. Finish startup on
+    // every client before testing displacement of an established writer.
+    until_with_diagnostics(|| {
+        handles
+            .iter()
+            .all(|h| lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up()))
+    }, &diagnostics).await;
+    assert_eq!(relay.joins.load(Ordering::SeqCst), ACTIVE_SYNC_CAP);
     // Refocusing the oldest-created thread makes writer-1 the least
     // recently focused. A fresh internal read of writer-1 must not save it.
     host.focus_chat("writer-0").unwrap();
@@ -915,10 +949,9 @@ async fn focused_waiter_displaces_one_running_writer_without_stopping_local_writ
     let fresh = host.open("new-view").unwrap();
     let _view = fresh.watch_messages();
 
-    until(|| lock(&fresh.chat2).as_ref().is_some_and(|c| c.caught_up())).await;
+    until_with_diagnostics(|| lock(&fresh.chat2).as_ref().is_some_and(|c| c.caught_up()), &diagnostics).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(relay.joins.load(Ordering::SeqCst), ACTIVE_SYNC_CAP + 1);
-    let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
     let displaced: Vec<_> = handles
         .iter()
         .filter(|h| {
@@ -934,7 +967,7 @@ async fn focused_waiter_displaces_one_running_writer_without_stopping_local_writ
         .insert(0, "still running")
         .unwrap();
     h.doc.doc().commit();
-    until(|| store.has_pending_chat_updates(&h.chat_id).unwrap()).await;
+    until_with_diagnostics(|| store.has_pending_chat_updates(&h.chat_id).unwrap(), &diagnostics).await;
     assert!(h.sync_requested.load(Ordering::Acquire));
     // An incidental read/watch must not reclaim the slot or invent user focus.
     let old_focus = h.last_focus.load(Ordering::Acquire);
@@ -944,10 +977,10 @@ async fn focused_waiter_displaces_one_running_writer_without_stopping_local_writ
     assert!(!h.sync_started.load(Ordering::Acquire));
     assert_eq!(h.last_focus.load(Ordering::Acquire), old_focus);
     host.focus_chat(&h.chat_id).unwrap();
-    until(|| {
+    until_with_diagnostics(|| {
         lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up())
             && !store.has_pending_chat_updates(&h.chat_id).unwrap()
-    })
+    }, &diagnostics)
     .await;
     assert_eq!(
         h.doc.doc().get_text("while-queued").to_string(),

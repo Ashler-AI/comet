@@ -335,7 +335,7 @@ pub(crate) struct PreparedRemoteDatabase {
 #[cfg(test)]
 fn import_complete(doc: &LoroDoc, bytes: &[u8]) -> Result<(), CrewImportError> {
     let status = doc.import(bytes)?;
-    if status.pending.is_some() || doc.is_detached() || doc.state_vv() != doc.oplog_vv() {
+    if status.pending.is_some() || doc.is_detached() || !crate::crew_import_aliases::state_matches_oplog(doc, &doc.oplog_vv())? {
         return Err(unsafe_data(
             "authoritative reconciliation has unresolved causal operations",
         ));
@@ -538,7 +538,7 @@ pub fn reconstruct_frozen_storage(
         .iter()
         .any(|(peer, end)| version.get(peer).copied().unwrap_or(0) < *end)
         || doc.is_detached()
-        || doc.state_vv() != version
+        || !crate::crew_import_aliases::state_matches_oplog(&doc, &version)?
     {
         return Err(unsafe_data(
             "frozen storage contains unresolved accepted causal operations",

@@ -193,6 +193,7 @@ fn queue_run_with(
             based_on: None::<CommandBasedOn>,
             expires_at: None,
             status: SessionCommandStatus::Pending,
+            accepted_at: None,
             resolution: None,
         })
         .expect("queue command");

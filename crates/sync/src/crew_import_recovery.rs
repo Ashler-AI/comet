@@ -1,6 +1,6 @@
 //! A known interrupted legacy request, not a guessed prompt or an execution replay.
 use crate::crew_import::{CrewBackupManifest, CrewImportError, CrewImportReport};
-use loro::{LoroDoc, ToJson};
+use loro::ToJson;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,6 +54,36 @@ enum Identity {
 }
 fn unsafe_data(message: impl Into<String>) -> CrewImportError {
     CrewImportError::Unsafe(message.into())
+}
+
+fn read_recovery_events(
+    mut reader: impl std::io::BufRead,
+    expected_sha256: &str,
+) -> Result<Value, CrewImportError> {
+    let mut digest = Sha256::new();
+    let mut line = Vec::new();
+    let mut last = None;
+    let mut previous = None;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 { break; }
+        // Bind the exact consumed bytes, including delimiters and blank lines.
+        digest.update(&line);
+        if line.last() == Some(&b'\n') { line.pop(); }
+        if line.is_empty() { continue; }
+        let event: Value = serde_json::from_slice(&line)?;
+        let seq = event.get("seq").and_then(Value::as_u64)
+            .ok_or_else(|| unsafe_data("recovery event has no sequence"))?;
+        if previous.is_some_and(|prior| seq <= prior) {
+            return Err(unsafe_data("recovery events are not ordered"));
+        }
+        previous = Some(seq);
+        last = Some(event);
+    }
+    if format!("{:x}", digest.finalize()) != expected_sha256 {
+        return Err(unsafe_data("recovery event evidence hash mismatch"));
+    }
+    last.ok_or_else(|| unsafe_data("recovery has no durable interrupted outcome"))
 }
 
 fn read_intent(
@@ -262,29 +292,11 @@ fn read_intent(
     if !events_path.starts_with(&root) {
         return Err(unsafe_data("recovery event evidence escapes profile"));
     }
-    let event_bytes = std::fs::read(events_path)?;
-    if manifest.files.get(&events_relative) != Some(&format!("{:x}", Sha256::digest(&event_bytes)))
-    {
-        return Err(unsafe_data("recovery event evidence hash mismatch"));
-    }
-    let mut last = None;
-    let mut previous = None;
-    for line in event_bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let event: Value = serde_json::from_slice(line)?;
-        let seq = event
-            .get("seq")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| unsafe_data("recovery event has no sequence"))?;
-        if previous.is_some_and(|prior| seq <= prior) {
-            return Err(unsafe_data("recovery events are not ordered"));
-        }
-        previous = Some(seq);
-        last = Some(event);
-    }
-    let last = last.ok_or_else(|| unsafe_data("recovery has no durable interrupted outcome"))?;
+    let expected = manifest.files.get(&events_relative)
+        .ok_or_else(|| unsafe_data("recovery event evidence hash mismatch"))?;
+    let last = read_recovery_events(
+        std::io::BufReader::new(std::fs::File::open(events_path)?), expected,
+    )?;
     if last.pointer("/event/type").and_then(Value::as_str) != Some("done")
         || last.pointer("/event/status").and_then(Value::as_str) != Some("interrupted")
         || last["seq"]
@@ -340,14 +352,12 @@ pub(crate) fn prepare(
     principal: &CollaborationPrincipal,
     device: &str,
     states: &mut BTreeMap<String, String>,
-    documents: &BTreeMap<String, LoroDoc>,
-) -> Result<Vec<ImportedRecoveryIntent>, CrewImportError> {
-    let workspace = documents
-        .get("workspace3")
-        .ok_or_else(|| unsafe_data("recovery workspace is missing"))?
+    staged: &Connection,
+) -> Result<BTreeMap<String, String>, CrewImportError> {
+    let workspace = crate::crew_import_aliases::load_execution_doc(staged, "workspace3")?
         .get_deep_value()
         .to_json_value();
-    let mut intents = Vec::new();
+    let mut intents = BTreeMap::new();
     for (source, state) in states
         .iter_mut()
         .filter(|(_, state)| state.as_str() == "pending-recovery")
@@ -371,9 +381,7 @@ pub(crate) fn prepare(
                 "recovery source host/native/worktree association differs",
             ));
         }
-        let doc = documents
-            .get(&intent.chat_id)
-            .ok_or_else(|| unsafe_data("recovery transcript missing"))?
+        let doc = crate::crew_import_aliases::load_execution_doc(staged, &intent.chat_id)?
             .get_deep_value()
             .to_json_value();
         if doc
@@ -395,16 +403,15 @@ pub(crate) fn prepare(
                 "recovery model differs from source chat configuration",
             ));
         }
-        if intents
-            .iter()
-            .any(|prior: &ImportedRecoveryIntent| prior.chat_id == intent.chat_id)
-        {
+        if intents.contains_key(&intent.chat_id) {
             return Err(unsafe_data(
                 "multiple pending requests target one recovered chat",
             ));
         }
         *state = "validated-interrupted-request".into();
-        intents.push(intent);
+        staged.execute("INSERT INTO retained_records(doc_id,container,record_id,value) VALUES (?1,'recovery-intent',?2,?3)",
+            rusqlite::params![intent.chat_id, intent.command_id, serde_json::to_vec(&intent)?])?;
+        intents.insert(intent.chat_id, intent.command_id);
     }
     Ok(intents)
 }
@@ -454,10 +461,11 @@ pub fn imported_recovery_intents(
         profile.join("docs.sqlite3"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let records = db.prepare("SELECT value FROM legacy_crew_records WHERE container='recovery-intent' ORDER BY doc_id,record_id")?
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let mut statement = db.prepare("SELECT value FROM legacy_crew_records WHERE container='recovery-intent' ORDER BY doc_id,record_id")?;
+    let records = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut result = Vec::new();
     for bytes in records {
+        let bytes = bytes?;
         let saved: ImportedRecoveryIntent = serde_json::from_slice(&bytes)?;
         let actual = read_intent(
             profile,
@@ -479,4 +487,36 @@ pub fn imported_recovery_intents(
         return Err(unsafe_data("imported recovery membership differs"));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_event_hash_binds_exact_consumed_bytes_and_delimiters() {
+        let first = r#"{"seq":1,"event":{"type":"message"}}"#;
+        let terminal = r#"{"seq":2,"event":{"type":"done","status":"interrupted"}}"#;
+        for bytes in [
+            format!("\n{first}\n{terminal}\n").into_bytes(),
+            format!("{first}\r\n{terminal}").into_bytes(),
+        ] {
+            let expected = format!("{:x}", Sha256::digest(&bytes));
+            let read = |input: &[u8], hash: &str| read_recovery_events(
+                std::io::BufReader::with_capacity(3, std::io::Cursor::new(input)), hash,
+            );
+            assert_eq!(read(&bytes, &expected).unwrap()["seq"], 2);
+            // Identical parsed events are not identical evidence bytes.
+            let mut changed = bytes.clone();
+            changed.push(b'\n');
+            assert!(read(&changed, &expected).unwrap_err().to_string().contains("hash mismatch"));
+            let forged = String::from_utf8(bytes.clone()).unwrap()
+                .replace("interrupted", "complete");
+            assert!(read(forged.as_bytes(), &expected).unwrap_err().to_string().contains("hash mismatch"));
+        }
+        let reordered = format!("{terminal}\n{first}\n");
+        let expected = format!("{:x}", Sha256::digest(reordered.as_bytes()));
+        assert!(read_recovery_events(std::io::Cursor::new(reordered.as_bytes()), &expected)
+            .unwrap_err().to_string().contains("not ordered"));
+    }
 }

@@ -1121,3 +1121,74 @@ fn inert_bootstrap_inspection_and_export_preserve_evidence_and_reject_associatio
         }
     }
 }
+
+#[test]
+fn streamed_metadata_matches_single_session_and_gates_late_invalid_documents() {
+    for scenario in ["valid", "late-owner", "late-malformed"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (source, principal) = fixture(&root, "owner", CHAT);
+        let baseline = export(&source, &root.join("baseline"), &principal).unwrap();
+        let db = Connection::open(source.join(DATABASE)).unwrap();
+        let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id='workspace3'", [], |row| row.get(0)).unwrap();
+        let workspace = LoroDoc::new();
+        workspace.import(&bytes).unwrap();
+        let original = workspace.get_deep_value().to_json_value();
+        let mut expected_chats = baseline.chats.clone();
+        for number in 2..=9 {
+            let id = format!("{number:08}-2222-4222-8222-222222222222");
+            let mut row = original["chats"][CHAT].clone();
+            row["id"] = json!(id);
+            workspace.get_map("chats").insert(&id, LoroValue::from(row)).unwrap();
+            workspace.get_map("sessionRefs").insert(&format!("5:owner:{id}"), LoroValue::from(json!({
+                "chatId":id,"userId":"owner","addedAt":1
+            }))).unwrap();
+            let doc = LoroDoc::new();
+            doc.get_map("meta").insert("chatId", id.as_str()).unwrap();
+            doc.get_map("meta").insert("schemaVersion", 2i64).unwrap();
+            let owner = if number == 9 && scenario == "late-owner" { "foreign" } else { "owner" };
+            doc.get_map("agentSessions").insert(&id, LoroValue::from(json!({
+                "id":"owner-proof","schemaVersion":2,"publishedAt":1,"publishedBy":owner,
+                "kind":"agentSession","value":{
+                    "sessionId":id,"chatId":id,"ownerSubject":owner,"ownerDeviceId":"host",
+                    "source":"local","harness":"omp","harnessSessionId":"native-retained","createdAt":1
+                }
+            }))).unwrap();
+            doc.get_list("messages").push(LoroValue::from(json!({
+                "id":format!("message-{number}"),"role":"assistant","status":"complete",
+                "parts":[{"id":"text","type":"text","text":"retained history ".repeat(2048)}]
+            }))).unwrap();
+            doc.commit();
+            let snapshot = if number == 9 && scenario == "late-malformed" {
+                b"invalid final source document".to_vec()
+            } else { doc.export(ExportMode::Snapshot).unwrap() };
+            db.execute("INSERT INTO snapshots VALUES (?1,?2)", params![id, snapshot]).unwrap();
+            db.execute("INSERT INTO document_scopes VALUES (?1,?2)", params![id, json!({
+                "project":"ashler-staging","principal":"owner","deployment":"ashler-staging","session":id
+            }).to_string()]).unwrap();
+            let mut expected = baseline.chats[CHAT].clone();
+            expected.session_id = id.clone();
+            expected.scope.session_id = Some(id.clone());
+            expected_chats.insert(id, expected);
+        }
+        workspace.commit();
+        db.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id='workspace3'", [workspace.export(ExportMode::Snapshot).unwrap()]).unwrap();
+        drop(db);
+        let before = std::fs::read(source.join(DATABASE)).unwrap();
+        let destination = root.join("streamed");
+        let result = export(&source, &destination, &principal);
+        assert_eq!(std::fs::read(source.join(DATABASE)).unwrap(), before);
+        if scenario == "valid" {
+            let manifest = result.unwrap();
+            assert_eq!(manifest.chats, expected_chats);
+            assert_eq!(manifest.native_histories, baseline.native_histories);
+            assert_eq!(std::fs::read(destination.join("docs.sqlite3")).unwrap(), before);
+            for (path, digest) in baseline.files.iter().filter(|(path, _)| path.as_str() != "docs.sqlite3") {
+                assert_eq!(manifest.files.get(path), Some(digest));
+            }
+        } else {
+            assert!(result.is_err(), "accepted {scenario} after valid earlier histories");
+            assert!(!destination.exists(), "published destination before all source gates completed");
+        }
+    }
+}

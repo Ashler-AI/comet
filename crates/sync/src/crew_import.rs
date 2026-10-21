@@ -1,6 +1,8 @@
 //! Explicit, offline Crew backup import. Never open a live legacy profile with
 //! the upstream runtime. A hash inventory and verified identity bind the input;
 //! publication uses the ordinary personal registry, not the old workspace room.
+//! A private SQLite spool bounds import memory to the workspace and current chat;
+//! no destination is published until every source record has passed validation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
@@ -288,7 +290,7 @@ fn checked_path(value: &str) -> Result<&Path, CrewImportError> {
     Ok(path)
 }
 
-fn hash_file(path: &Path) -> Result<String, CrewImportError> {
+pub(super) fn hash_file(path: &Path) -> Result<String, CrewImportError> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut digest = Sha256::new();
@@ -304,11 +306,14 @@ fn hash_file(path: &Path) -> Result<String, CrewImportError> {
 /// Preserve Crew-only display records using existing upstream render types.
 /// The copied legacy SQLite snapshot remains the byte-exact source of truth.
 pub fn convert_legacy_parts(doc: &SessionDoc, chat_id: &str) -> Result<Vec<(String, Vec<u8>)>, CrewImportError> {
-    convert_parts(doc, chat_id, false)
+    let mut retained = Vec::new();
+    convert_parts(doc, chat_id, false, |id, bytes| { retained.push((id.to_owned(), bytes)); Ok(()) })?;
+    Ok(retained)
 }
 
-fn convert_parts(doc: &SessionDoc, chat_id: &str, original_epoch_history: bool) -> Result<Vec<(String, Vec<u8>)>, CrewImportError> {
-    let mut retained = Vec::new();
+fn convert_parts(doc: &SessionDoc, chat_id: &str, original_epoch_history: bool,
+    mut retain: impl FnMut(&str, Vec<u8>) -> Result<(), CrewImportError>,
+) -> Result<(), CrewImportError> {
     let messages = doc.doc().get_list("messages");
     for index in 0..messages.len() {
         let Some(loro::ValueOrContainer::Container(loro::Container::Map(message))) = messages.get(index) else {
@@ -350,7 +355,7 @@ fn convert_parts(doc: &SessionDoc, chat_id: &str, original_epoch_history: bool) 
             if original["parts"].as_array().is_some_and(|parts| parts.iter().any(|part| part.get("id").and_then(Value::as_str) == Some(part_id.as_str()))) {
                 return Err(unsafe_data(format!("legacy provenance part ID collision: {message_id}")));
             }
-            retained.push((message_id.to_owned(), serde_json::to_vec(&original)?));
+            retain(message_id, serde_json::to_vec(&original)?)?;
             // Append only: existing text, IDs and anchored part indices do not move.
             let part = parts.push_container(loro::LoroMap::new())?;
             part.insert("id", part_id)?;
@@ -358,7 +363,7 @@ fn convert_parts(doc: &SessionDoc, chat_id: &str, original_epoch_history: bool) 
             part.insert("text", format!("Legacy Crew peer provenance (historical metadata, not authorization): {}", serde_json::to_string(&original["peerMessage"])?))?;
         }
     }
-    Ok(retained)
+    Ok(())
 }
 
 /// Import into a nonexistent destination. `principal` MUST come from current
@@ -371,7 +376,7 @@ pub fn import_legacy_crew_backup(
     import_backup(backup, destination, principal, device_id, false, false, None)
 }
 
-/// Run the identical inventory and semantic checks without creating any files.
+/// Run the identical inventory and semantic checks without creating a destination.
 pub fn validate_legacy_crew_backup(
     backup: &Path, destination: &Path, principal: &CollaborationPrincipal, device_id: &str,
 ) -> Result<CrewImportReport, CrewImportError> {
@@ -534,6 +539,7 @@ fn import_backup(
         percent_encoding::utf8_percent_encode(database_path, percent_encoding::NON_ALPHANUMERIC));
     let db = Connection::open_with_flags(database_uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)?;
+    db.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;")?;
     let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" { return Err(unsafe_data("SQLite integrity check failed")); }
     let tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
@@ -558,14 +564,10 @@ fn import_backup(
         let count: i64 = db.query_row("SELECT COUNT(*) FROM pending_nudges", [], |row| row.get(0))?;
         if count != 0 { return Err(unsafe_data("accepted pending nudges require legacy reconciliation before import")); }
     }
-    let snapshots = db.prepare("SELECT doc_id,bytes FROM snapshots ORDER BY doc_id")?
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut claims = db.prepare("SELECT command_id,processed_at FROM processed_commands")?
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     let mut claimed: BTreeSet<String> = claims.iter().map(|(id, _)| id.clone()).collect();
-    let mut retained_records = Vec::<(String, String, String, Vec<u8>)>::new();
     let mut scopes = BTreeMap::<String, String>::new();
     if tables.contains("document_scopes") {
         for entry in db.prepare("SELECT doc_id,scope FROM document_scopes")?
@@ -585,36 +587,39 @@ fn import_backup(
                 && previous != canonical { return Err(unsafe_data("ambiguous document scope binding")); }
         }
     }
-    let mut documents = BTreeMap::new();
     let mut recovery_snapshot_ids = Vec::new();
-    for (id, bytes) in &snapshots {
-        if id.starts_with("recovery-original/") {
-            // Legacy install_document_journal deliberately retains these prior
-            // caches. They are not a second session or a new source of authority.
-            recovery_snapshot_ids.push(id.clone());
-            retained_records.push((id.clone(), "snapshot".into(), id.clone(), bytes.clone()));
-            continue;
-        }
-        let doc = LoroDoc::new();
-        let status = doc.import(bytes).map_err(|error| unsafe_data(format!("snapshot {id}: {error}")))?;
-        if status.pending.is_some() || doc.is_detached() || doc.state_vv() != doc.oplog_vv() {
-            return Err(unsafe_data(format!("snapshot has unresolved causal dependencies: {id}")));
-        }
-        documents.insert(id.clone(), doc);
-    }
     let mut associated_ids: BTreeSet<String> = manifest.native_histories.keys().chain(manifest.chats.keys()).cloned().collect();
     if let Some(proof) = &manifest.desktop_source { associated_ids.extend(proof.source_witnesses.keys().cloned()); }
-    let inert_bootstraps = crate::crew_import_aliases::inert_bootstrap_snapshots(&db, &documents, &associated_ids)?;
+    let inert_bootstraps = crate::crew_import_aliases::inert_bootstrap_snapshots_from_store(&db, &associated_ids)?;
     if manifest.desktop_source.as_ref().is_some_and(|proof| proof.inert_bootstrap_snapshots != inert_bootstraps) {
         return Err(unsafe_data("inert bootstrap disposition differs from original source evidence"));
     }
+    let temporary = tempfile::tempdir()?;
+    let prepared = crate::crew_import_aliases::prepare_execution_snapshots(&db, &temporary.path().canonicalize()?, &manifest, principal,
+        &inert_bootstraps.keys().cloned().collect())?;
+    let staged = &prepared.connection;
+    staged.execute_batch("CREATE TABLE retained_records(doc_id TEXT NOT NULL,container TEXT NOT NULL,record_id TEXT NOT NULL,value BLOB NOT NULL,
+            PRIMARY KEY(doc_id,container,record_id)) STRICT;
+        CREATE TABLE converted_snapshots(doc_id TEXT PRIMARY KEY,bytes BLOB NOT NULL) STRICT;")?;
+    staged.execute_batch("BEGIN")?;
+    let execution_aliases = &prepared.execution_aliases;
     let mut inert_bootstrap_snapshots = BTreeMap::new();
     for (id, snapshot_sha256) in inert_bootstraps {
-        documents.remove(&id);
-        retained_records.push((id.clone(), "inert-bootstrap".into(), id.clone(), snapshots[&id].clone()));
         inert_bootstrap_snapshots.insert(id, InertBootstrapSnapshot { snapshot_sha256, disposition: "inert-bootstrap".into() });
     }
-    let execution_aliases = crate::crew_import_aliases::reconcile_execution_snapshots(&mut documents, &manifest, principal)?;
+    // Original bytes stay inert evidence; only staged canonical snapshots execute.
+    for entry in db.prepare("SELECT doc_id FROM snapshots ORDER BY doc_id")?
+        .query_map([], |row| row.get::<_, String>(0))? {
+        let id = entry?;
+        let container = if id.starts_with("recovery-original/") {
+            recovery_snapshot_ids.push(id.clone());
+            "snapshot"
+        } else if inert_bootstrap_snapshots.contains_key(&id) { "inert-bootstrap" }
+        else if execution_aliases.contains_key(&id) { "snapshot" }
+        else { continue; };
+        let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [&id], |row| row.get(0))?;
+        staged.execute("INSERT INTO retained_records VALUES (?1,?2,?1,?3)", rusqlite::params![id, container, bytes])?;
+    }
     for (path, state) in &mut legacy_journal_states {
         let stem = Path::new(path).file_stem().and_then(|name| name.to_str()).unwrap_or("");
         let mut parts = stem.split("__session__");
@@ -627,32 +632,26 @@ fn import_backup(
         matches!(state.as_str(), "pending-stream" | "unreconciled-context")) {
         return Err(unsafe_data(format!("legacy execution journal requires reconciliation before import: {path} ({state})")));
     }
-    let recovery_intents = crate::crew_import_recovery::prepare(&backup, &manifest, principal, device_id,
-        &mut legacy_journal_states, &documents).map_err(|error|
+    let recovery_intent_ids = crate::crew_import_recovery::prepare(&backup, &manifest, principal, device_id,
+        &mut legacy_journal_states, staged).map_err(|error|
             unsafe_data(format!("legacy execution journal requires reconciliation before import: {error}")))?;
-    let mut recovery_intent_ids = BTreeMap::new();
-    for intent in recovery_intents {
-        recovery_intent_ids.insert(intent.chat_id.clone(), intent.command_id.clone());
-        retained_records.push((intent.chat_id.clone(), "recovery-intent".into(), intent.command_id.clone(), serde_json::to_vec(&intent)?));
-    }
-    for alias in execution_aliases.keys() {
-        if let Some(bytes) = snapshots.get(alias) {
-            retained_records.push((alias.clone(), "snapshot".into(), alias.clone(), bytes.clone()));
-        }
-    }
     // A pending semantic journal record must already be represented exactly
     // in the consistent snapshot. Never silently flatten a conflicting intent.
     if tables.contains("semantic_intents") {
-        let records = db.prepare("SELECT doc_id,container,record_id,value FROM semantic_intents ORDER BY doc_id,container,record_id")?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (doc_id, container, key, bytes) in records {
+        let mut statement = db.prepare("SELECT doc_id,container,record_id,value FROM semantic_intents ORDER BY doc_id,container,record_id")?;
+        let records = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))?;
+        // Preserve source order, including scope-string rows that revisit a chat.
+        // Persist outcomes before eviction; materialize the current root only once.
+        let mut cached: Option<(String, LoroDoc, Value, bool)> = None;
+        for entry in records {
+            let (doc_id, container, key, bytes) = entry?;
             let original_doc_id = scopes.get(&doc_id).cloned().unwrap_or(doc_id);
             let doc_id = execution_aliases.get(&original_doc_id).cloned().unwrap_or_else(|| original_doc_id.clone());
             let mut record: Value = serde_json::from_slice(&bytes)?;
-            retained_records.push((original_doc_id.clone(), format!("journal/{container}"), key.clone(), bytes));
+            staged.execute("INSERT INTO retained_records VALUES (?1,?2,?3,?4)",
+                rusqlite::params![original_doc_id, format!("journal/{container}"), key, bytes])?;
             if original_epochs.contains_key(&doc_id) { continue; } // Exact old intent bytes stay inert, never replayed in a new epoch.
-            for (alias, canonical) in &execution_aliases {
+            for (alias, canonical) in execution_aliases {
                 if let Some(value) = record.get_mut("value").filter(|value| !value.is_null()) {
                     crate::crew_import_aliases::normalize_execution_record(&container, value, alias, canonical)?;
                 }
@@ -674,8 +673,18 @@ fn import_backup(
                 }
                 execution_aliases.get(&key).cloned().unwrap_or(key)
             };
-            let doc = documents.get(&doc_id).ok_or_else(|| unsafe_data(format!("journal has no snapshot: {doc_id}")))?;
-            let root = doc.get_deep_value().to_json_value();
+            if cached.as_ref().is_none_or(|(id, _, _, _)| id != &doc_id) {
+                if let Some((id, doc, _, dirty)) = cached.take() {
+                    if dirty {
+                        staged.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id=?2",
+                            rusqlite::params![SessionDoc::from_doc(doc).export_snapshot()?, id])?;
+                    }
+                }
+                let doc = crate::crew_import_aliases::load_execution_doc(staged, &doc_id)?;
+                let root = doc.get_deep_value().to_json_value();
+                cached = Some((doc_id.clone(), doc, root, false));
+            }
+            let (_, doc, root, dirty) = cached.as_mut().expect("current journal snapshot loaded");
             let present = match root.get(&container) {
                 Some(Value::Object(rows)) => rows.get(&key),
                 Some(Value::Array(rows)) => rows.iter().find(|row| row.get("id").and_then(Value::as_str) == Some(key.as_str())),
@@ -691,6 +700,17 @@ fn import_backup(
                         let status = serde_json::from_value(outcome["status"].clone())?;
                         SessionDoc::from_doc(doc.clone()).set_command_status(&key, status,
                             outcome.get("resolution").and_then(Value::as_str))?;
+                        // Match set_command_status: absent resolution leaves it unchanged.
+                        let current = match root.get_mut(&container) {
+                            Some(Value::Object(rows)) => rows.get_mut(&key),
+                            Some(Value::Array(rows)) => rows.iter_mut().find(|row| row.get("id").and_then(Value::as_str) == Some(key.as_str())),
+                            _ => None,
+                        }.expect("reconciled command exists");
+                        current["status"] = outcome["status"].clone();
+                        if let Some(resolution) = outcome.get("resolution").and_then(Value::as_str) {
+                            current["resolution"] = Value::from(resolution);
+                        }
+                        *dirty = true;
                         continue;
                     }
                     return Err(unsafe_data(format!("command outcome conflicts with snapshot: {doc_id}/{key}")));
@@ -701,8 +721,12 @@ fn import_backup(
                 return Err(unsafe_data(format!("unreconciled semantic intent {doc_id}/{container}/{key}")));
             }
         }
+        if let Some((id, doc, _, true)) = cached {
+            staged.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id=?2",
+                rusqlite::params![SessionDoc::from_doc(doc).export_snapshot()?, id])?;
+        }
     }
-    let workspace = documents.remove("workspace3").ok_or_else(|| unsafe_data("missing version-3 legacy workspace snapshot"))?;
+    let workspace = crate::crew_import_aliases::load_execution_doc(staged, "workspace3")?;
     let raw_devices = workspace.get_map("devices");
     let workspace = workspace.get_deep_value().to_json_value();
     let workspace = workspace.as_object().ok_or_else(|| unsafe_data("invalid workspace root"))?;
@@ -786,7 +810,7 @@ fn import_backup(
         native_histories: manifest.native_histories.clone(),
         command_outcomes: claims.iter().map(|(id, _)| (id.clone(), "unknown".into())).collect(),
         files_sha256: manifest.files.clone(), commands_retained: claims.len(), annotations_retained: 0,
-        requires_reauthentication: true, source_table_rows, recovery_snapshot_ids, execution_aliases,
+        requires_reauthentication: true, source_table_rows, recovery_snapshot_ids, execution_aliases: execution_aliases.clone(),
         destination_snapshots_sha256: BTreeMap::new(),
         source_manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
         owner_subject: principal.subject.clone(), project_id: principal.project_id.clone(),
@@ -794,8 +818,10 @@ fn import_backup(
         attachment_aliases: manifest.attachment_aliases.clone(), desktop_source: manifest.desktop_source.clone(),
         original_epoch_histories: manifest.original_epoch_histories.clone(), selected_chat_id: None, inert_bootstrap_snapshots };
     let mut command_ids = BTreeSet::new();
-    let mut converted = BTreeMap::new();
-    for (id, raw) in documents {
+    for entry in staged.prepare("SELECT doc_id FROM snapshots WHERE doc_id!='workspace3' ORDER BY doc_id")?
+        .query_map([], |row| row.get::<_, String>(0))? {
+        let id = entry?;
+        let raw = crate::crew_import_aliases::load_execution_doc(staged, &id)?;
         let metadata = manifest.chats.get(&id).ok_or_else(|| unsafe_data(format!("snapshot has no verified chat binding: {id}")))?;
         metadata.validate().map_err(unsafe_data)?;
         let original_epoch = original_epochs.get(&id);
@@ -815,9 +841,11 @@ fn import_backup(
         }
         let doc = SessionDoc::from_doc(raw);
         if doc.chat_id().as_deref() != Some(id.as_str()) { return Err(unsafe_data(format!("chat identity mismatch: {id}"))); }
-        for (message_id, bytes) in convert_parts(&doc, &id, original_epoch.is_some())? {
-            retained_records.push((id.clone(), "messages".into(), message_id, bytes));
-        }
+        convert_parts(&doc, &id, original_epoch.is_some(), |message_id, bytes| {
+            staged.execute("INSERT INTO retained_records VALUES (?1,'messages',?2,?3)",
+                rusqlite::params![id, message_id, bytes])?;
+            Ok(())
+        })?;
         let root = doc.doc().get_deep_value().to_json_value();
         if !matches!(root.get("meta").and_then(|meta| meta.get("schemaVersion")).and_then(Value::as_u64), Some(1 | 2)) {
             return Err(unsafe_data(format!("unsupported legacy transcript schema version: {id}")));
@@ -859,7 +887,8 @@ fn import_backup(
                 original_outcomes.insert(command_id.to_owned(), status.to_owned());
                 report.command_outcomes.insert(command_id.into(),
                     if status == "pending" && original_epoch.is_none() { "unknown" } else { status }.into());
-                retained_records.push((id.clone(), "commands".into(), command_id.into(), serde_json::to_vec(command)?));
+                staged.execute("INSERT INTO retained_records VALUES (?1,'commands',?2,?3)",
+                    rusqlite::params![id, command_id, serde_json::to_vec(command)?])?;
                 if claimed.insert(command_id.into()) { claims.push((command_id.into(), 0)); }
             }
         }
@@ -932,7 +961,7 @@ fn import_backup(
         registry.import_crew_row("chats", &id, row)?;
         doc.doc().get_map("meta").insert("epoch", 2i64)?;
         doc.doc().commit();
-        converted.insert(id.clone(), doc.export_snapshot()?);
+        staged.execute("INSERT INTO converted_snapshots VALUES (?1,?2)", rusqlite::params![id, doc.export_snapshot()?])?;
         report.chat_ids.push(id);
     }
     if !chat_rows.is_empty() || report.chat_ids.len() != manifest.chats.len() {
@@ -942,6 +971,7 @@ fn import_backup(
     if registry.read_chats()?.len() != report.chat_ids.len() {
         return Err(unsafe_data("one or more legacy rows cannot be represented by the upstream chat schema"));
     }
+    staged.execute_batch("COMMIT")?;
     if verify_only {
         let destination = destination.canonicalize()?;
         if !embedded && destination.starts_with(&backup) { return Err(unsafe_data("readback destination overlaps backup")); }
@@ -964,18 +994,20 @@ fn import_backup(
         if selected_chat.is_none() {
             let actual_ids = actual.prepare("SELECT doc_id FROM snapshots ORDER BY doc_id")?
                 .query_map([], |row| row.get::<_, String>(0))?.collect::<Result<BTreeSet<_>, _>>()?;
-            let expected_ids = converted.keys().cloned().chain([REGISTRY_DOC_ID.to_owned()]).collect::<BTreeSet<_>>();
+            let expected_ids = report.chat_ids.iter().cloned().chain([REGISTRY_DOC_ID.to_owned()]).collect::<BTreeSet<_>>();
             if actual_ids != expected_ids { return Err(unsafe_data("destination snapshot membership differs")); }
         }
         let mut selected_commands = BTreeSet::new();
         let mut selected_annotations = 0;
-        for (id, expected) in converted.iter().filter(|(id, _)| selected_chat.is_none_or(|selected| id.as_str() == selected)) {
-            let bytes: Vec<u8> = actual.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [id], |row| row.get(0))?;
+        for entry in staged.prepare("SELECT doc_id,bytes FROM converted_snapshots WHERE ?1 IS NULL OR doc_id=?1 ORDER BY doc_id")?
+            .query_map([selected_chat], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))? {
+            let (id, expected) = entry?;
+            let bytes: Vec<u8> = actual.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [&id], |row| row.get(0))?;
             let actual_doc = LoroDoc::new();
-            if actual_doc.import(&bytes)?.pending.is_some() || actual_doc.is_detached() || actual_doc.state_vv() != actual_doc.oplog_vv() {
+            if actual_doc.import(&bytes)?.pending.is_some() || actual_doc.is_detached() || !crate::crew_import_aliases::state_matches_oplog(&actual_doc, &actual_doc.oplog_vv())? {
                 return Err(unsafe_data(format!("destination has unresolved causal operations: {id}")));
             }
-            let expected_doc = LoroDoc::new(); expected_doc.import(expected)?;
+            let expected_doc = LoroDoc::new(); expected_doc.import(&expected)?;
             if actual_doc.get_deep_value() != expected_doc.get_deep_value() {
                 return Err(unsafe_data(format!("destination transcript/semantic state differs: {id}")));
             }
@@ -1010,13 +1042,18 @@ fn import_backup(
                 .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?.collect::<Result<BTreeMap<_, _>, _>>()?;
             if actual_claims != claims.into_iter().collect() { return Err(unsafe_data("destination durable command claims differ")); }
         }
-        let actual_records = actual.prepare("SELECT doc_id,container,record_id,value FROM legacy_crew_records WHERE ?1 IS NULL OR doc_id=?1 OR doc_id LIKE ?1 || '::session::%' ORDER BY doc_id,container,record_id")?
-            .query_map([selected_chat], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        retained_records.retain(|(id, _, _, _)| selected_chat.is_none_or(|selected|
-            id == selected || report.execution_aliases.get(id).is_some_and(|canonical| canonical == selected)));
-        retained_records.sort();
-        if actual_records != retained_records { return Err(unsafe_data("destination immutable outcomes/evidence differ")); }
+        let mut actual_statement = actual.prepare("SELECT doc_id,container,record_id,value FROM legacy_crew_records WHERE ?1 IS NULL OR doc_id=?1 OR doc_id LIKE ?1 || '::session::%' ORDER BY doc_id,container,record_id")?;
+        let mut actual_records = actual_statement.query_map([selected_chat], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))?;
+        for entry in staged.prepare("SELECT doc_id,container,record_id,value FROM retained_records ORDER BY doc_id,container,record_id")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))? {
+            let expected = entry?;
+            if selected_chat.is_some_and(|selected| expected.0 != selected
+                && !report.execution_aliases.get(&expected.0).is_some_and(|canonical| canonical == selected)) { continue; }
+            if actual_records.next().transpose()?.as_ref() != Some(&expected) {
+                return Err(unsafe_data("destination immutable outcomes/evidence differ"));
+            }
+        }
+        if actual_records.next().transpose()?.is_some() { return Err(unsafe_data("destination immutable outcomes/evidence differ")); }
         if let Some(id) = selected_chat {
             report.selected_chat_id = Some(id.into());
             report.chat_ids.retain(|chat| chat == id);
@@ -1066,14 +1103,20 @@ fn import_backup(
     {
         let mut conn = store.conn();
         let tx = conn.transaction()?;
-        for (doc_id, container, record_id, value) in retained_records {
+        for entry in staged.prepare("SELECT doc_id,container,record_id,value FROM retained_records ORDER BY rowid")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))? {
+            let (doc_id, container, record_id, value) = entry?;
             tx.execute("INSERT INTO legacy_crew_records(doc_id,container,record_id,value) VALUES (?1,?2,?3,?4)",
                 rusqlite::params![doc_id, container, record_id, value])?;
         }
         tx.commit()?;
     }
     store.import_processed_commands(&claims)?;
-    for (id, bytes) in converted { store.save_snapshot(&id, &bytes)?; }
+    for entry in staged.prepare("SELECT doc_id,bytes FROM converted_snapshots ORDER BY doc_id")?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))? {
+        let (id, bytes) = entry?;
+        store.save_snapshot(&id, &bytes)?;
+    }
     store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes()?)?;
     std::fs::write(destination.join("crew-import-source.json"), &manifest_bytes)?;
     std::fs::write(destination.join("crew-import-report.json"), serde_json::to_vec_pretty(&report)?)?;

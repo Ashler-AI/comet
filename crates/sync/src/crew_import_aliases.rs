@@ -12,6 +12,79 @@ fn unsafe_data(message: impl Into<String>) -> CrewImportError {
     CrewImportError::Unsafe(message.into())
 }
 
+fn change_meta(doc: &LoroDoc, id: loro::ID) -> Result<Option<loro::ChangeMeta>> {
+    Ok(doc.with_oplog(|oplog| oplog.change_store().get_change_meta(id))?)
+}
+
+/// Compare causal state without caching a version vector for every ancestor.
+/// Keep the native trimmed-history semantics for shallow snapshots.
+pub(crate) fn state_matches_oplog(doc: &LoroDoc, version: &loro::VersionVector) -> Result<bool> {
+    frontiers_match_oplog(doc, &doc.state_frontiers(), version)
+}
+
+fn frontiers_match_oplog(doc: &LoroDoc, frontiers: &loro::Frontiers, version: &loro::VersionVector) -> Result<bool> {
+    let baseline = doc.shallow_since_vv();
+    let root_deps = if baseline.is_empty() {
+        None
+    } else {
+        if baseline.iter().any(|(peer, end)| *end < 0 || *end > version.get(peer).copied().unwrap_or(0)) {
+            return Err(unsafe_data("shallow baseline lies outside the oplog"));
+        }
+        let root = doc.shallow_since_frontiers().as_single()
+            .ok_or_else(|| unsafe_data("invalid shallow causal root"))?;
+        let change = change_meta(doc, root)?.ok_or_else(|| unsafe_data("missing shallow causal root"))?;
+        if change.id != root || baseline.get(&root.peer).copied().unwrap_or(0) != root.counter
+            || change.len == 0 || change.deps.iter().any(|id| id.counter < 0 || baseline.get(&id.peer).copied().unwrap_or(0) <= id.counter) {
+            return Err(unsafe_data("invalid shallow causal root span"));
+        }
+        Some(change.deps)
+    };
+    // Pinned Loro treats the dependencies immediately before the retained root
+    // as the trimmed baseline, not as individually resolvable history entries.
+    if root_deps.as_ref() == Some(frontiers) {
+        return Ok(baseline.to_vv() == *version);
+    }
+    let mut reachable = loro::VersionVector::default();
+    let mut visited = BTreeSet::new();
+    let mut pending: Vec<_> = frontiers.iter().map(|id| (id, None::<u32>)).collect();
+    while let Some((id, parent_lamport)) = pending.pop() {
+        if !version.includes_id(id) {
+            return Err(unsafe_data("causal frontier or dependency lies outside the oplog"));
+        }
+        if baseline.get(&id.peer).copied().unwrap_or(0) > id.counter {
+            if parent_lamport.is_none() {
+                return Err(unsafe_data("state frontier precedes retained history"));
+            }
+            reachable.extend_to_include_vv(baseline.iter());
+            continue;
+        }
+        let change = change_meta(doc, id)?.ok_or_else(|| unsafe_data("missing causal dependency"))?;
+        let end = i32::try_from(change.len).ok().and_then(|len| change.id.counter.checked_add(len))
+            .filter(|end| change.id.counter >= 0 && *end > change.id.counter
+                && *end <= version.get(&id.peer).copied().unwrap_or(0))
+            .ok_or_else(|| unsafe_data("invalid causal change span"))?;
+        if change.id.peer != id.peer || id.counter < change.id.counter || id.counter >= end {
+            return Err(unsafe_data("causal identity does not belong to its change"));
+        }
+        let lamport = change.lamport.checked_add((id.counter - change.id.counter) as u32)
+            .ok_or_else(|| unsafe_data("causal Lamport overflow"))?;
+        if parent_lamport.is_some_and(|parent| lamport >= parent) {
+            return Err(unsafe_data("causal dependency does not precede its change"));
+        }
+        // A frontier can stop inside a change. Include only its requested prefix,
+        // even when another path has already visited this change's dependencies.
+        reachable.extend_to_include_last_id(id);
+        if visited.insert((change.id.peer, change.id.counter)) {
+            if root_deps.as_ref() == Some(&change.deps) {
+                reachable.extend_to_include_vv(baseline.iter());
+            } else {
+                pending.extend(change.deps.iter().map(|dep| (dep, Some(change.lamport))));
+            }
+        }
+    }
+    Ok(reachable == *version)
+}
+
 // Same grammar as legacy workspace::execution_chat_id, including repeated self aliases.
 pub(crate) fn canonical_execution_id(key: &str) -> Option<&str> {
     let (id, suffix) = key.split_once("::session::")?;
@@ -20,116 +93,142 @@ pub(crate) fn canonical_execution_id(key: &str) -> Option<&str> {
     .then_some(id)
 }
 
-/// Classify inert bootstrap documents without changing their source snapshots or history.
-/// `documents` contains decoded current source snapshots; retained recovery snapshots
-/// are also read directly. Associated IDs include manifest, native and source-witness identities.
+#[cfg(test)]
+/// Classify borrowed source documents without changing their snapshots or history.
 pub fn inert_bootstrap_snapshots(
     db: &rusqlite::Connection,
     documents: &BTreeMap<String, LoroDoc>,
     associated_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, String>> {
-    use sha2::{Digest, Sha256};
+    let mut possible = inert_snapshot_ids(db)?;
+    possible.extend(documents.keys().cloned());
+    classify_inert_snapshots(db, documents.iter().map(|(id, doc)| Ok((id.clone(), doc))), possible, associated_ids)
+}
 
-    fn references(value: &Value, parent: &str, physical_source: bool, ids: &mut BTreeSet<String>) {
+/// Read and validate every current snapshot, retaining only one decoded document at a time.
+pub(crate) fn inert_bootstrap_snapshots_from_store(
+    db: &rusqlite::Connection,
+    associated_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>> {
+    let possible = inert_snapshot_ids(db)?;
+    let mut statement = db.prepare("SELECT doc_id,bytes FROM snapshots WHERE substr(doc_id,1,length(?1))!=?1")?;
+    let rows = statement.query_map(["recovery-original/"], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let documents = rows.map(|row| {
+        let (id, bytes) = row?;
+        let doc = LoroDoc::new();
+        let status = doc.import(&bytes).map_err(|error| zeron_doc::DocError::Schema(error.to_string()))?;
+        if status.pending.is_some() || doc.is_detached() || !state_matches_oplog(&doc, &doc.oplog_vv())? {
+            return Err(unsafe_data(format!("snapshot has unresolved causal dependencies: {id}")));
+        }
+        Ok((id, doc))
+    });
+    classify_inert_snapshots(db, documents, possible, associated_ids)
+}
+
+fn inert_snapshot_ids(db: &rusqlite::Connection) -> Result<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+    let mut statement = db.prepare("SELECT doc_id FROM snapshots")?;
+    for id in statement.query_map([], |row| row.get::<_, String>(0))? {
+        if !ids.insert(id?) { return Err(unsafe_data("duplicate source snapshot identity")); }
+    }
+    Ok(ids)
+}
+
+struct InertReferences {
+    possible: BTreeSet<String>,
+    referenced: BTreeSet<String>,
+}
+
+impl InertReferences {
+    fn insert(&mut self, id: &str) {
+        if self.possible.contains(id) { self.referenced.insert(id.to_owned()); }
+    }
+
+    fn value(&mut self, value: &Value, parent: &str, physical_source: bool) {
         let physical_environment = parent == "environment"
             && <zeron_proto::SessionEnvironment as serde::Deserialize>::deserialize(value)
-                .is_ok_and(|environment| {
-                    matches!(
-                        environment.source,
-                        zeron_proto::SessionEnvironmentSource::Scaffold { .. }
-                    )
-                });
+                .is_ok_and(|environment| matches!(environment.source, zeron_proto::SessionEnvironmentSource::Scaffold { .. }));
         match value {
-            Value::String(id) => {
-                ids.insert(id.clone());
-            }
-            Value::Array(values) => {
-                for value in values {
-                    references(value, parent, false, ids);
-                }
-            }
-            Value::Object(fields) => {
-                for (key, value) in fields {
-                    // Only a successfully decoded Scaffold environment proves a physical-only pointer.
-                    if physical_source && key == "sandbox_id" {
-                        continue;
-                    }
-                    ids.insert(key.clone());
-                    references(value, key, physical_environment && key == "source", ids);
-                }
-            }
+            Value::String(id) => self.insert(id),
+            Value::Array(values) => for value in values { self.value(value, parent, false); },
+            Value::Object(fields) => for (key, value) in fields {
+                if physical_source && key == "sandbox_id" { continue; }
+                self.insert(key);
+                self.value(value, key, physical_environment && key == "source");
+            },
             _ => {}
         }
     }
 
-    fn retained_references(doc: &LoroDoc, id: &str, ids: &mut BTreeSet<String>) -> Result<bool> {
-        // A trimmed source can hide a prior association even when its current
-        // projection is empty. It cannot establish that any orphan is inert.
-        if doc.is_shallow() || doc.is_detached() || doc.state_vv() != doc.oplog_vv() {
-            return Ok(false);
-        }
+    fn retained(&mut self, doc: &LoroDoc, id: &str) -> Result<bool> {
+        if doc.is_shallow() || doc.is_detached() || !state_matches_oplog(doc, &doc.oplog_vv())? { return Ok(false); }
         let metadata = loro::ContainerID::new_root("meta", loro::ContainerType::Map);
         for (peer, end) in doc.oplog_vv().iter() {
-            // Enumerate child-container operations too; inspecting a parent
-            // container ID or its latest value cannot recover deleted fields.
-            for change in doc.export_json_in_id_span(loro::IdSpan::new(*peer, 0, *end)) {
-                for op in change.ops {
-                    match op.content {
-                        loro::JsonOpContent::Map(loro::JsonMapOp::Insert { key, value }) => {
-                            let value = value.to_json_value();
-                            if op.container == metadata
-                                && key == "chatId"
-                                && value.as_str() == Some(id)
-                            {
-                                continue;
+            doc.with_oplog(|oplog| {
+                oplog.change_store().try_visit_json_ops::<CrewImportError>(
+                    loro::IdSpan::new(*peer, 0, *end),
+                    |_, op| {
+                        match op.content {
+                            loro::JsonOpContent::Map(loro::JsonMapOp::Insert { key, value }) => {
+                                let value = value.to_json_value();
+                                if op.container == metadata && key == "chatId" && value.as_str() == Some(id) { return Ok(()); }
+                                self.insert(&key);
+                                self.value(&value, &key, false);
                             }
-                            ids.insert(key.clone());
-                            // The same typed physical-resource exception applies
-                            // to retained whole environment values, not a bare
-                            // sandbox_id field with unknown historical ancestry.
-                            references(&value, &key, false, ids);
+                            loro::JsonOpContent::Map(loro::JsonMapOp::Delete { key }) => self.insert(&key),
+                            content => self.value(&serde_json::to_value(content)?, "", false),
                         }
-                        loro::JsonOpContent::Map(loro::JsonMapOp::Delete { key }) => {
-                            ids.insert(key);
-                        }
-                        content => references(&serde_json::to_value(content)?, "", false, ids),
-                    }
-                }
-            }
+                        Ok(())
+                    },
+                )
+            })?;
         }
         Ok(true)
     }
 
-    let mut referenced = associated_ids.clone();
-    for (id, doc) in documents {
-        if !retained_references(doc, id, &mut referenced)? {
-            return Ok(BTreeMap::new());
-        }
-    }
-    let roots: BTreeMap<_, _> = documents
-        .iter()
-        .map(|(id, doc)| (id.as_str(), doc.get_deep_value().to_json_value()))
-        .collect();
-    for (id, root) in &roots {
-        for (key, value) in root
-            .as_object()
-            .ok_or_else(|| unsafe_data("invalid source document root"))?
-        {
-            referenced.insert(key.clone());
+    fn root(&mut self, root: &Value, id: &str) -> Result<()> {
+        for (key, value) in root.as_object().ok_or_else(|| unsafe_data("invalid source document root"))? {
+            self.insert(key);
             if key == "meta" {
-                let meta = value
-                    .as_object()
-                    .ok_or_else(|| unsafe_data("invalid source document metadata"))?;
-                for (field, value) in meta {
-                    if field == "chatId" && value.as_str() == Some(*id) {
-                        continue;
-                    }
-                    referenced.insert(field.clone());
-                    references(value, field, false, &mut referenced);
+                for (field, value) in value.as_object().ok_or_else(|| unsafe_data("invalid source document metadata"))? {
+                    if field == "chatId" && value.as_str() == Some(id) { continue; }
+                    self.insert(field);
+                    self.value(value, field, false);
                 }
-            } else {
-                references(value, key, false, &mut referenced);
-            }
+            } else { self.value(value, key, false); }
+        }
+        Ok(())
+    }
+}
+
+fn classify_inert_snapshots<D: std::borrow::Borrow<LoroDoc>>(
+    db: &rusqlite::Connection,
+    documents: impl IntoIterator<Item = Result<(String, D)>>,
+    possible: BTreeSet<String>,
+    associated_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>> {
+    use sha2::{Digest, Sha256};
+    let mut references = InertReferences { possible, referenced: BTreeSet::new() };
+    for id in associated_ids { references.insert(id); }
+    let mut eligible = BTreeMap::new();
+    let mut complete = true;
+    for document in documents {
+        let (id, doc) = document?;
+        let doc = doc.borrow();
+        // Keep decoding every later store row even when absence of references cannot be proved.
+        if !complete { continue; }
+        if !references.retained(doc, &id)? {
+            complete = false;
+            eligible.clear();
+            continue;
+        }
+        let root = doc.get_deep_value().to_json_value();
+        references.root(&root, &id)?;
+        if pristine_bootstrap(doc, &id, &root)? {
+            let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [&id], |row| row.get(0))?;
+            eligible.insert(id, format!("{:x}", Sha256::digest(&bytes)));
         }
     }
     let mut recovery =
@@ -138,23 +237,20 @@ pub fn inert_bootstrap_snapshots(
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
         if let Some(original) = id.strip_prefix("recovery-original/") {
-            referenced.insert(original.to_owned());
-            referenced.extend(original.split('/').map(str::to_owned));
+            references.insert(original);
+            for part in original.split('/') { references.insert(part); }
         }
         let bytes: Vec<u8> = row.get(1)?;
         let doc = LoroDoc::new();
         let Ok(status) = doc.import(&bytes) else {
-            return Ok(BTreeMap::new());
+            complete = false;
+            continue;
         };
-        if status.pending.is_some() || !retained_references(&doc, &id, &mut referenced)? {
-            return Ok(BTreeMap::new());
+        if status.pending.is_some() || !references.retained(&doc, &id)? {
+            complete = false;
+            continue;
         }
-        references(
-            &doc.get_deep_value().to_json_value(),
-            "",
-            false,
-            &mut referenced,
-        );
+        references.value(&doc.get_deep_value().to_json_value(), "", false);
     }
     for (table, identity, payload) in [
         ("document_scopes", "doc_id", Some("scope")),
@@ -188,7 +284,7 @@ pub fn inert_bootstrap_snapshots(
         let mut statement = db.prepare(&sql)?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            referenced.insert(row.get::<_, String>(0)?);
+            references.insert(&row.get::<_, String>(0)?);
             if payload.is_some() {
                 let bytes = match row.get_ref(1)? {
                     rusqlite::types::ValueRef::Text(bytes)
@@ -199,35 +295,30 @@ pub fn inert_bootstrap_snapshots(
                 if !value.is_object() {
                     return Err(unsafe_data("invalid bootstrap association payload"));
                 }
-                references(&value, "", false, &mut referenced);
+                references.value(&value, "", false);
             }
         }
     }
-    let mut eligible = BTreeMap::new();
-    for (id, doc) in documents {
-        if id == "workspace3"
-            || id.starts_with("recovery-original/")
-            || referenced.contains(id)
-            || doc.is_shallow()
-            || doc.is_detached()
-            || doc.state_vv() != doc.oplog_vv()
-        {
-            continue;
-        }
-        let root = roots[id.as_str()]
-            .as_object()
-            .ok_or_else(|| unsafe_data("invalid bootstrap root"))?;
+    if !complete { return Ok(BTreeMap::new()); }
+    eligible.retain(|id, _| !references.referenced.contains(id));
+    Ok(eligible)
+}
+
+fn pristine_bootstrap(doc: &LoroDoc, id: &str, root: &Value) -> Result<bool> {
+        if id == "workspace3" || id.starts_with("recovery-original/")
+            || doc.is_shallow() || doc.is_detached() || !state_matches_oplog(doc, &doc.oplog_vv())? { return Ok(false); }
+        let root = root.as_object().ok_or_else(|| unsafe_data("invalid bootstrap root"))?;
         if root.iter().any(|(key, value)| match key.as_str() {
             "meta" => false,
             "messages" | "commands" => !value.as_array().is_some_and(Vec::is_empty),
             _ => true,
         }) {
-            continue;
+            return Ok(false);
         }
         let Some(meta) = root.get("meta").and_then(Value::as_object) else {
-            continue;
+            return Ok(false);
         };
-        if meta.get("chatId").and_then(Value::as_str) != Some(id.as_str())
+        if meta.get("chatId").and_then(Value::as_str) != Some(id)
             || meta.get("schemaVersion").and_then(Value::as_u64) != Some(2)
             || meta.iter().any(|(key, value)| match key.as_str() {
                 "chatId" | "schemaVersion" => false,
@@ -235,43 +326,34 @@ pub fn inert_bootstrap_snapshots(
                 _ => true,
             })
         {
-            continue;
+            return Ok(false);
         }
         let version = doc.oplog_vv();
         if version.iter().map(|(_, end)| i64::from(*end)).sum::<i64>() != meta.len() as i64 {
-            continue;
+            return Ok(false);
         }
         let mut inserted = BTreeSet::new();
-        // Unlike export_json_updates, ID-span export never implicitly commits the document.
-        let only_initial_metadata = version.iter().all(|(peer, end)| {
-            doc.export_json_in_id_span(loro::IdSpan::new(*peer, 0, *end))
-                .into_iter()
-                .flat_map(|change| change.ops)
-                .all(|op| {
-                    if op.container != loro::ContainerID::new_root("meta", loro::ContainerType::Map)
-                    {
-                        return false;
-                    }
-                    let loro::JsonOpContent::Map(loro::JsonMapOp::Insert { key, value }) =
-                        op.content
-                    else {
-                        return false;
-                    };
-                    meta.get(&key) == Some(&value.to_json_value()) && inserted.insert(key)
-                })
-        });
-        if !only_initial_metadata || inserted.len() != meta.len() {
-            continue;
-        }
-        let bytes: Vec<u8> =
-            db.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [id], |row| {
-                row.get(0)
+        let mut only_initial_metadata = true;
+        let metadata = loro::ContainerID::new_root("meta", loro::ContainerType::Map);
+        for (peer, end) in version.iter() {
+            doc.with_oplog(|oplog| {
+                oplog.change_store().try_visit_json_ops::<CrewImportError>(
+                    loro::IdSpan::new(*peer, 0, *end),
+                    |_, op| {
+                        only_initial_metadata &= op.container == metadata && match op.content {
+                            loro::JsonOpContent::Map(loro::JsonMapOp::Insert { key, value }) =>
+                                meta.get(&key) == Some(&value.to_json_value()) && inserted.insert(key),
+                            _ => false,
+                        };
+                        Ok(())
+                    },
+                )
             })?;
-        eligible.insert(id.clone(), format!("{:x}", Sha256::digest(&bytes)));
-    }
-    Ok(eligible)
+        }
+        Ok(only_initial_metadata && inserted.len() == meta.len())
 }
 
+#[cfg(test)]
 /// Reconcile offline semantic records, never CRDT-import two independently initialized
 /// rooms. Their map/list operations have unrelated identity and could hide records.
 /// Originals remain in the inventoried SQLite backup. No command is executed here.
@@ -281,103 +363,154 @@ pub(crate) fn reconcile_execution_snapshots(
     manifest: &CrewBackupManifest,
     principal: &CollaborationPrincipal,
 ) -> Result<BTreeMap<String, String>> {
-    let mut aliases = BTreeMap::new();
-    for key in documents.keys().filter(|key| key.contains("::session::")) {
-        let canonical = canonical_execution_id(key).ok_or_else(|| {
-            unsafe_data(format!(
-                "distinct or invalid private execution identity: {key}"
-            ))
-        })?;
-        aliases.insert(key.clone(), canonical.to_owned());
-    }
-    if principal.session_id.is_some()
-        || principal.subject != manifest.owner_subject
-        || principal.project_id != manifest.project_id
-        || principal.deployment_id != manifest.deployment_id
-    {
-        return Err(unsafe_data(
-            "private execution import requires verified manifest owner scope",
-        ));
-    }
-    let workspace_doc = documents
-        .get("workspace3")
+    let workspace_doc = documents.get("workspace3")
         .ok_or_else(|| unsafe_data("private execution has no workspace owner binding"))?;
-    let mut workspace = workspace_doc.get_deep_value().to_json_value();
-    normalize_workspace(
-        workspace_doc,
-        &mut workspace,
-        &mut aliases,
-        manifest,
-        principal,
-    )?;
-    if aliases.is_empty() {
-        return Ok(aliases);
-    }
-    complete(workspace_doc)?;
-    let mut candidates = BTreeMap::<String, Value>::new();
-    for (alias, canonical) in &aliases {
-        let binding = manifest.chats.get(canonical).ok_or_else(|| {
-            unsafe_data(format!(
-                "private execution has no canonical manifest binding: {alias}"
-            ))
-        })?;
-        binding.validate().map_err(unsafe_data)?;
-        if binding.session_id != *canonical
-            || binding.owner_subject != principal.subject
-            || binding.scope.project_id != principal.project_id
-            || binding.scope.deployment_id != principal.deployment_id
-        {
-            return Err(unsafe_data(format!(
-                "private execution canonical owner/scope mismatch: {alias}"
-            )));
-        }
-        let owner_device = workspace
-            .get("chats")
-            .and_then(|rows| rows.get(canonical))
-            .and_then(|row| row.get("deviceId"))
-            .and_then(Value::as_str)
-            .filter(|device| !device.is_empty())
-            .ok_or_else(|| {
-                unsafe_data(format!(
-                    "private execution has no canonical workspace device: {alias}"
-                ))
-            })?;
-        if !candidates.contains_key(canonical) {
-            let target = documents.get(canonical).ok_or_else(|| {
-                unsafe_data(format!(
-                    "private execution has no canonical snapshot: {alias}"
-                ))
-            })?;
-            complete(target)?;
-            let mut root = target.get_deep_value().to_json_value();
-            validate_source(&mut root, canonical, canonical, principal, owner_device)?;
-            candidates.insert(canonical.clone(), root);
-        }
-        let Some(source) = documents.get(alias) else {
-            continue;
-        };
-        complete(source)?;
-        let mut source = source.get_deep_value().to_json_value();
-        validate_source(&mut source, alias, canonical, principal, owner_device)?;
-        merge_root(
-            candidates.get_mut(canonical).expect("candidate inserted"),
-            source,
-        )?;
-    }
+    let (aliases, workspace) = execution_plan(documents.keys().map(String::as_str), workspace_doc, manifest, principal)?;
+    if aliases.is_empty() { return Ok(aliases); }
     let mut replacements = BTreeMap::new();
-    for (id, root) in candidates {
-        replacements.insert(id, materialize(&root)?);
+    for canonical in aliases.values().collect::<BTreeSet<_>>() {
+        let merged = reconcile_execution_group(canonical, &aliases, &workspace, manifest, principal, |id| {
+            documents.get(id).map(execution_root).transpose()
+        })?;
+        replacements.insert(canonical.clone(), merged);
     }
     replacements.insert("workspace3".into(), materialize_workspace(&workspace)?);
-    for alias in aliases.keys() {
-        documents.remove(alias);
-    }
+    for alias in aliases.keys() { documents.remove(alias); }
     documents.extend(replacements);
     Ok(aliases)
 }
 
+pub(crate) struct PreparedExecutionSnapshots {
+    pub connection: rusqlite::Connection,
+    _file: tempfile::NamedTempFile,
+    pub execution_aliases: BTreeMap<String, String>,
+}
+
+/// Temporary private staging only; original snapshot bytes remain untouched in `source`.
+pub(crate) fn prepare_execution_snapshots(
+    source: &rusqlite::Connection,
+    temporary_parent: &std::path::Path,
+    manifest: &CrewBackupManifest,
+    principal: &CollaborationPrincipal,
+    excluded: &BTreeSet<String>,
+) -> Result<PreparedExecutionSnapshots> {
+    let ids = inert_snapshot_ids(source)?;
+    let file = tempfile::NamedTempFile::new_in(temporary_parent)?;
+    let mut connection = rusqlite::Connection::open(file.path())?;
+    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
+        CREATE TABLE snapshots(doc_id TEXT PRIMARY KEY,bytes BLOB NOT NULL) STRICT;")?;
+    {
+        let transaction = connection.transaction()?;
+        let mut statement = source.prepare("SELECT doc_id,bytes FROM snapshots WHERE substr(doc_id,1,length(?1))!=?1")?;
+        let mut rows = statement.query(["recovery-original/"])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            // Validate even excluded records before omitting them from the live staging view.
+            decode_execution_doc(&bytes)?;
+            if !excluded.contains(&id) {
+                transaction.execute("INSERT INTO snapshots VALUES (?1,?2)", rusqlite::params![id, bytes])?;
+            }
+        }
+        transaction.commit()?;
+    }
+    let workspace_doc = load_execution_doc(&connection, "workspace3")?;
+    let (execution_aliases, workspace) = execution_plan(
+        ids.iter().filter(|id| !id.starts_with("recovery-original/") && !excluded.contains(*id)).map(String::as_str),
+        &workspace_doc, manifest, principal)?;
+    drop(workspace_doc);
+    if !execution_aliases.is_empty() {
+        for canonical in execution_aliases.values().collect::<BTreeSet<_>>() {
+            let merged = reconcile_execution_group(canonical, &execution_aliases, &workspace, manifest, principal, |id| {
+                use rusqlite::OptionalExtension;
+                let bytes: Option<Vec<u8>> = connection.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [id], |row| row.get(0)).optional()?;
+                bytes.map(|bytes| execution_root(&decode_execution_doc(&bytes)?)).transpose()
+            })?;
+            let bytes = merged.export(loro::ExportMode::Snapshot).map_err(|error| zeron_doc::DocError::Schema(error.to_string()))?;
+            connection.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id=?2", rusqlite::params![bytes, canonical])?;
+            for (alias, target) in &execution_aliases {
+                if target == canonical { connection.execute("DELETE FROM snapshots WHERE doc_id=?1", [alias])?; }
+            }
+        }
+        let bytes = materialize_workspace(&workspace)?.export(loro::ExportMode::Snapshot)
+            .map_err(|error| zeron_doc::DocError::Schema(error.to_string()))?;
+        connection.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id='workspace3'", [bytes])?;
+    }
+    Ok(PreparedExecutionSnapshots { _file: file, connection, execution_aliases })
+}
+
+pub(crate) fn load_execution_doc(db: &rusqlite::Connection, id: &str) -> Result<LoroDoc> {
+    let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [id], |row| row.get(0))?;
+    decode_execution_doc(&bytes)
+}
+
+fn decode_execution_doc(bytes: &[u8]) -> Result<LoroDoc> {
+    let doc = LoroDoc::new();
+    let status = doc.import(bytes).map_err(|error| zeron_doc::DocError::Schema(error.to_string()))?;
+    if status.pending.is_some() { return Err(unsafe_data("snapshot has unresolved causal dependencies")); }
+    complete(&doc)?;
+    Ok(doc)
+}
+
+fn execution_root(doc: &LoroDoc) -> Result<Value> {
+    complete(doc)?;
+    Ok(doc.get_deep_value().to_json_value())
+}
+
+fn execution_plan<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    workspace_doc: &LoroDoc,
+    manifest: &CrewBackupManifest,
+    principal: &CollaborationPrincipal,
+) -> Result<(BTreeMap<String, String>, Value)> {
+    let mut aliases = BTreeMap::new();
+    for key in ids.into_iter().filter(|key| key.contains("::session::")) {
+        let canonical = canonical_execution_id(key)
+            .ok_or_else(|| unsafe_data(format!("distinct or invalid private execution identity: {key}")))?;
+        aliases.insert(key.to_owned(), canonical.to_owned());
+    }
+    if principal.session_id.is_some() || principal.subject != manifest.owner_subject
+        || principal.project_id != manifest.project_id || principal.deployment_id != manifest.deployment_id {
+        return Err(unsafe_data("private execution import requires verified manifest owner scope"));
+    }
+    let mut workspace = workspace_doc.get_deep_value().to_json_value();
+    normalize_workspace(workspace_doc, &mut workspace, &mut aliases, manifest, principal)?;
+    if !aliases.is_empty() { complete(workspace_doc)?; }
+    Ok((aliases, workspace))
+}
+
+fn reconcile_execution_group(
+    canonical: &str,
+    aliases: &BTreeMap<String, String>,
+    workspace: &Value,
+    manifest: &CrewBackupManifest,
+    principal: &CollaborationPrincipal,
+    mut load: impl FnMut(&str) -> Result<Option<Value>>,
+) -> Result<LoroDoc> {
+    let binding = manifest.chats.get(canonical)
+        .ok_or_else(|| unsafe_data(format!("private execution has no canonical manifest binding: {canonical}")))?;
+    binding.validate().map_err(unsafe_data)?;
+    if binding.session_id != canonical || binding.owner_subject != principal.subject
+        || binding.scope.project_id != principal.project_id || binding.scope.deployment_id != principal.deployment_id {
+        return Err(unsafe_data(format!("private execution canonical owner/scope mismatch: {canonical}")));
+    }
+    let owner_device = workspace.get("chats").and_then(|rows| rows.get(canonical))
+        .and_then(|row| row.get("deviceId")).and_then(Value::as_str).filter(|device| !device.is_empty())
+        .ok_or_else(|| unsafe_data(format!("private execution has no canonical workspace device: {canonical}")))?;
+    let mut root = load(canonical)?
+        .ok_or_else(|| unsafe_data(format!("private execution has no canonical snapshot: {canonical}")))?;
+    validate_source(&mut root, canonical, canonical, principal, owner_device)?;
+    for (alias, target) in aliases {
+        if target != canonical { continue; }
+        let Some(mut source) = load(alias)? else { continue; };
+        validate_source(&mut source, alias, canonical, principal, owner_device)?;
+        merge_root(&mut root, source)?;
+    }
+    materialize(&root)
+}
+
 fn complete(doc: &LoroDoc) -> Result<()> {
-    if doc.is_detached() || doc.state_vv() != doc.oplog_vv() {
+    if doc.is_detached() || !state_matches_oplog(doc, &doc.oplog_vv())? {
         return Err(unsafe_data("incomplete private execution snapshot"));
     }
     Ok(())
@@ -870,6 +1003,189 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn causal_state_walk_preserves_branch_dependencies_partial_frontiers_and_source() {
+        use loro::{ExportMode, Frontiers, ID, VersionVector};
+        let base = LoroDoc::new();
+        base.set_peer_id(1).unwrap();
+        base.get_text("text").insert(0, "abcdef").unwrap();
+        base.commit();
+        let baseline = base.oplog_vv();
+        let left = base.fork();
+        left.set_peer_id(2).unwrap();
+        left.get_map("meta").insert("left", true).unwrap();
+        left.commit();
+        let right = base.fork();
+        right.set_peer_id(3).unwrap();
+        right.get_map("meta").insert("right", true).unwrap();
+        right.commit();
+        let joined = left.fork();
+        joined.set_peer_id(4).unwrap();
+        joined.import(&right.export(ExportMode::updates(&baseline)).unwrap()).unwrap();
+        joined.get_map("meta").insert("joined", true).unwrap();
+        joined.commit();
+        // A newer change on peer 4 must not hide the older change's other-peer deps.
+        joined.set_next_commit_message("separate newer change");
+        joined.get_map("meta").insert("later", true).unwrap();
+        joined.commit();
+        let bytes = joined.export(ExportMode::Snapshot).unwrap();
+        let doc = LoroDoc::new();
+        assert!(doc.import(&bytes).unwrap().pending.is_none());
+        let version = doc.oplog_vv();
+        let mut expected = VersionVector::default();
+        for (peer, end) in [(1, 6), (2, 1), (3, 1), (4, 2)] { expected.insert(peer, end); }
+        assert_eq!(version, expected);
+        let before = doc.export(ExportMode::Snapshot).unwrap();
+        let frontiers = doc.state_frontiers();
+        assert!(state_matches_oplog(&doc, &version).unwrap());
+        assert_eq!(doc.state_vv(), version); // Tiny graph only: native oracle.
+        assert_eq!(doc.state_frontiers(), frontiers);
+        assert_eq!(doc.export(ExportMode::Snapshot).unwrap(), before);
+
+        // Stored aggregate metadata must not be trusted just because frontiers agree.
+        let mut inflated = version.clone();
+        inflated.insert(99, 1);
+        assert!(!state_matches_oplog(&doc, &inflated).unwrap());
+        let mut truncated = version.clone();
+        truncated.insert(1, 2);
+        assert!(state_matches_oplog(&doc, &truncated).is_err());
+
+        // A state frontier inside a multi-atom change is not its whole change.
+        doc.checkout(&Frontiers::from_id(ID::new(1, 2))).unwrap();
+        assert!(!state_matches_oplog(&doc, &version).unwrap());
+        assert!(!state_matches_oplog(&doc, &baseline).unwrap());
+        assert_ne!(doc.state_vv(), version);
+        assert!(complete(&doc).is_err()); // Detached input remains rejected.
+        doc.checkout_to_latest();
+        assert!(state_matches_oplog(&doc, &version).unwrap());
+
+        // Accepted update syntax does not imply its absent dependencies exist.
+        let missing = right.export(ExportMode::updates(&baseline)).unwrap();
+        let incomplete = LoroDoc::new();
+        assert!(incomplete.import(&missing).unwrap().pending.is_some());
+        assert!(decode_execution_doc(&missing).is_err());
+
+        let shallow = LoroDoc::new();
+        shallow.import(&joined.export(ExportMode::shallow_snapshot(&joined.oplog_frontiers())).unwrap()).unwrap();
+        assert!(shallow.is_shallow());
+        assert_eq!(state_matches_oplog(&shallow, &shallow.oplog_vv()).unwrap(),
+            shallow.state_vv() == shallow.oplog_vv());
+
+        // The validator must not implicitly commit caller-owned edits.
+        doc.get_map("meta").insert("uncommitted", true).unwrap();
+        let pending = doc.get_pending_txn_len();
+        assert!(pending > 0);
+        let _ = state_matches_oplog(&doc, &doc.oplog_vv());
+        assert_eq!(doc.get_pending_txn_len(), pending);
+    }
+
+    #[test]
+    fn shallow_causal_walk_preserves_trimmed_baseline_and_partial_retained_frontiers() {
+        use loro::{ExportMode, Frontiers, ID, VersionVector};
+        let source = LoroDoc::new();
+        source.set_peer_id(1).unwrap();
+        source.get_text("text").insert(0, "abcdef").unwrap();
+        source.commit();
+        source.set_peer_id(2).unwrap();
+        source.get_text("text").insert(6, "xyz").unwrap();
+        source.commit();
+        let doc = LoroDoc::new();
+        doc.import(&source.export(ExportMode::shallow_snapshot(&Frontiers::from_id(ID::new(1, 2)))).unwrap()).unwrap();
+        assert!(doc.is_shallow());
+        let version = doc.oplog_vv();
+        let baseline = doc.shallow_since_vv().to_vv();
+        let root = doc.shallow_since_frontiers().as_single().unwrap();
+        assert_eq!(root, ID::new(1, 2));
+        let root_deps = change_meta(&doc, root).unwrap().unwrap().deps;
+        let before = doc.export(ExportMode::Snapshot).unwrap();
+        assert!(state_matches_oplog(&doc, &version).unwrap());
+        assert_eq!(doc.state_vv(), version); // Tiny native oracle only.
+        assert_eq!(doc.export(ExportMode::Snapshot).unwrap(), before);
+        assert_eq!(doc.frontiers_to_vv(&root_deps).unwrap(), baseline);
+        assert!(frontiers_match_oplog(&doc, &root_deps, &baseline).unwrap());
+        assert!(!frontiers_match_oplog(&doc, &root_deps, &version).unwrap());
+        assert!(!frontiers_match_oplog(&doc, &Frontiers::default(), &version).unwrap());
+        assert!(frontiers_match_oplog(&doc, &Frontiers::from_id(ID::new(1, 0)), &version).is_err());
+        for id in [root, ID::new(1, 4), ID::new(2, 1)] {
+            doc.checkout(&Frontiers::from_id(id)).unwrap();
+            assert!(!state_matches_oplog(&doc, &version).unwrap());
+            let expected = doc.state_vv();
+            // A supplied prefix can end within a retained change, but the
+            // existing full-change span guard still rejects understated history.
+            assert_ne!(expected, version);
+            assert!(baseline.iter().all(|(peer, end)| expected.get(peer).copied().unwrap_or(0) >= *end));
+            assert!(complete(&doc).is_err());
+        }
+        doc.checkout_to_latest();
+        assert!(state_matches_oplog(&doc, &version).unwrap());
+        let mut inflated = version.clone();
+        inflated.insert(99, 1);
+        assert!(!state_matches_oplog(&doc, &inflated).unwrap());
+        let missing = ID::new(2, *version.get(&2).unwrap());
+        let mut missing_version = version.clone();
+        missing_version.extend_to_include_last_id(missing);
+        assert!(frontiers_match_oplog(&doc, &Frontiers::from_id(missing), &missing_version).is_err());
+        assert!(frontiers_match_oplog(&doc, &root_deps, &VersionVector::default()).is_err());
+    }
+
+    #[test]
+    fn streamed_inert_classification_matches_loaded_references_and_keeps_source_bytes() {
+        use loro::ExportMode;
+        let id = "a-generic-bootstrap";
+        for scenario in ["orphan", "later-deleted-reference", "typed-physical", "sql", "recovery", "opaque-recovery"] {
+            let db = rusqlite::Connection::open_in_memory().unwrap();
+            db.execute_batch("CREATE TABLE snapshots(doc_id TEXT PRIMARY KEY,bytes BLOB NOT NULL)").unwrap();
+            let candidate = LoroDoc::new();
+            candidate.get_map("meta").insert("chatId", id).unwrap();
+            candidate.get_map("meta").insert("schemaVersion", 2).unwrap();
+            candidate.commit();
+            let bytes = candidate.export(ExportMode::Snapshot).unwrap();
+            db.execute("INSERT INTO snapshots VALUES (?1,?2)", rusqlite::params![id, &bytes]).unwrap();
+            let mut documents = BTreeMap::from([(id.into(), candidate)]);
+            let later = LoroDoc::new();
+            if scenario == "later-deleted-reference" {
+                later.get_map("sessionRefs").insert("prior", LoroValue::from(json!({"chatId":id}))).unwrap();
+                later.commit();
+                later.get_map("sessionRefs").delete("prior").unwrap();
+            } else if scenario == "typed-physical" {
+                later.get_map("sessionRefs").insert("actual", LoroValue::from(json!({"chatId":"actual",
+                    "environment":{"ownerPrincipal":"owner","scope":{"projectId":"project","sessionId":"actual"},
+                        "source":{"kind":"scaffold","sandbox_id":id,"lifecycle":"stopped"}}}))).unwrap();
+            }
+            later.commit();
+            db.execute("INSERT INTO snapshots VALUES ('z-later',?1)", [later.export(ExportMode::Snapshot).unwrap()]).unwrap();
+            documents.insert("z-later".into(), later);
+            if scenario == "sql" {
+                db.execute_batch("CREATE TABLE semantic_intents(doc_id TEXT,value BLOB)").unwrap();
+                db.execute("INSERT INTO semantic_intents VALUES ('other',?1)", [serde_json::to_vec(&json!({"chatId":id})).unwrap()]).unwrap();
+            }
+            if matches!(scenario, "recovery" | "opaque-recovery") {
+                let recovered = if scenario == "recovery" { bytes.clone() } else { b"opaque".to_vec() };
+                db.execute("INSERT INTO snapshots VALUES ('recovery-original/old',?1)", [recovered]).unwrap();
+            }
+            let before: Vec<(String, Vec<u8>)> = db.prepare("SELECT doc_id,bytes FROM snapshots ORDER BY doc_id").unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
+            let loaded = inert_bootstrap_snapshots(&db, &documents, &BTreeSet::new()).unwrap();
+            let streamed = inert_bootstrap_snapshots_from_store(&db, &BTreeSet::new()).unwrap();
+            assert_eq!(streamed, loaded, "{scenario}");
+            assert_eq!(streamed.contains_key(id), matches!(scenario, "orphan" | "typed-physical"), "{scenario}");
+            let after: Vec<(String, Vec<u8>)> = db.prepare("SELECT doc_id,bytes FROM snapshots ORDER BY doc_id").unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
+            assert_eq!(before, after);
+        }
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE snapshots(doc_id TEXT,bytes BLOB)").unwrap();
+        let source = LoroDoc::new();
+        source.get_map("old").insert("value", "trimmed").unwrap();
+        source.commit();
+        let shallow = source.export(ExportMode::shallow_snapshot(&source.oplog_frontiers())).unwrap();
+        db.execute("INSERT INTO snapshots VALUES ('a-shallow',?1)", [shallow]).unwrap();
+        db.execute("INSERT INTO snapshots VALUES ('z-malformed',?1)", [b"invalid".as_slice()]).unwrap();
+        assert!(inert_bootstrap_snapshots_from_store(&db, &BTreeSet::new()).is_err());
+        db.execute("INSERT INTO snapshots VALUES ('a-shallow',?1)", [b"duplicate".as_slice()]).unwrap();
+        assert!(inert_bootstrap_snapshots_from_store(&db, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
     fn inert_bootstrap_rejects_deleted_cross_document_references_and_unknown_history() {
         use loro::ExportMode;
         let id = "generic-historically-referenced-bootstrap";
@@ -1220,6 +1536,62 @@ mod tests {
         private["meta"]["chatId"] = alias.clone().into();
         documents.insert(alias.clone(), materialize(&private).unwrap());
         (documents, manifest, principal, alias)
+    }
+
+    #[test]
+    fn disk_execution_reconciliation_matches_memory_and_preserves_source() {
+        use loro::ExportMode;
+        use sha2::{Digest, Sha256};
+        for foreign in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source_path = temp.path().join("source.sqlite3");
+            let source = rusqlite::Connection::open(&source_path).unwrap();
+            source.execute_batch("CREATE TABLE snapshots(doc_id TEXT PRIMARY KEY,bytes BLOB NOT NULL)").unwrap();
+            let (mut documents, manifest, principal, alias) = fixture();
+            let mut private = documents[&alias].get_deep_value().to_json_value();
+            private["messages"] = json!([{"id":"answer","role":"assistant","deviceId":if foreign {"foreign"} else {"device"},
+                "parts":[{"id":"text","kind":"text","text":"retained private output"}]}]);
+            private["commands"] = json!([{"id":"accepted","status":"applied","payload":{"kind":"interrupt"}}]);
+            private["meta"]["harnessSessionId"] = json!("native-history");
+            documents.insert(alias.clone(), materialize(&private).unwrap());
+            for (id, doc) in &documents {
+                source.execute("INSERT INTO snapshots VALUES (?1,?2)", rusqlite::params![id, doc.export(ExportMode::Snapshot).unwrap()]).unwrap();
+            }
+            source.execute("INSERT INTO snapshots VALUES ('recovery-original/retained',?1)", [b"raw evidence".as_slice()]).unwrap();
+            let excluded = LoroDoc::new();
+            excluded.get_map("meta").insert("chatId", "inert").unwrap();
+            excluded.get_map("meta").insert("schemaVersion", 2).unwrap();
+            excluded.commit();
+            source.execute("INSERT INTO snapshots VALUES ('inert',?1)", [excluded.export(ExportMode::Snapshot).unwrap()]).unwrap();
+            let inert_id = "00000000-0000-4000-8000-000000000999";
+            let inert_alias = format!("{inert_id}::session::{inert_id}");
+            let inert_doc = LoroDoc::new();
+            inert_doc.get_map("meta").insert("chatId", inert_alias.as_str()).unwrap();
+            inert_doc.get_map("meta").insert("schemaVersion", 2).unwrap();
+            inert_doc.commit();
+            source.execute("INSERT INTO snapshots VALUES (?1,?2)", rusqlite::params![&inert_alias, inert_doc.export(ExportMode::Snapshot).unwrap()]).unwrap();
+            let before = Sha256::digest(std::fs::read(&source_path).unwrap());
+            let staged = prepare_execution_snapshots(&source, temp.path(), &manifest, &principal, &BTreeSet::from(["inert".into(), inert_alias.clone()]));
+            let memory = reconcile_execution_snapshots(&mut documents, &manifest, &principal);
+            if foreign {
+                assert!(staged.is_err());
+                assert!(memory.is_err());
+            } else {
+                let staged = staged.unwrap();
+                assert_eq!(staged.execution_aliases, memory.unwrap());
+                assert!(!staged.execution_aliases.contains_key(&inert_alias));
+                assert!(staged._file.path().exists());
+                let ids: BTreeSet<String> = staged.connection.prepare("SELECT doc_id FROM snapshots").unwrap()
+                    .query_map([], |row| row.get(0)).unwrap().collect::<std::result::Result<_, _>>().unwrap();
+                assert_eq!(ids, documents.keys().cloned().collect());
+                for (id, expected) in &documents {
+                    assert_eq!(load_execution_doc(&staged.connection, id).unwrap().get_deep_value(), expected.get_deep_value());
+                }
+            }
+            assert_eq!(Sha256::digest(std::fs::read(&source_path).unwrap()), before);
+            source.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id='inert'", [b"invalid excluded snapshot".as_slice()]).unwrap();
+            assert!(prepare_execution_snapshots(&source, temp.path(), &manifest, &principal, &BTreeSet::from(["inert".into()])).is_err());
+        }
     }
 
     #[test]

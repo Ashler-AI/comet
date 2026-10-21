@@ -359,6 +359,119 @@ fn durable_terminal_journal_outcome_reconciles_a_pending_snapshot() {
 }
 
 #[test]
+fn bounded_import_preserves_ordered_cross_document_outcomes_and_never_publishes_late_failures() {
+    use loro::ToJson;
+    use zeron_sync::crew_import::{validate_legacy_crew_backup, verify_legacy_crew_import, verify_imported_profile};
+    const SECOND: &str = "22222222-2222-4222-8222-222222222222";
+    for failure in ["none", "journal", "conversion"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("backup");
+        std::fs::create_dir(&source).unwrap();
+        let principal = backup(&source, true);
+        let db = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+        let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [CHAT], |row| row.get(0)).unwrap();
+        let first = LoroDoc::new();
+        first.import(&bytes).unwrap();
+        push_row(&first, "commands", &legacy_command("command-later", "pending"));
+        first.commit();
+        db.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id=?2", rusqlite::params![first.export(ExportMode::Snapshot).unwrap(), CHAT]).unwrap();
+        let second = LoroDoc::new();
+        second.get_map("meta").insert("chatId", SECOND).unwrap();
+        second.get_map("meta").insert("schemaVersion", if failure == "conversion" { 99i64 } else { 2i64 }).unwrap();
+        for message in legacy_messages() { push_row(&second, "messages", &message); }
+        push_row(&second, "commands", &legacy_command("command-2", "pending"));
+        second.commit();
+        db.execute("INSERT INTO snapshots VALUES (?1,?2)", rusqlite::params![SECOND, second.export(ExportMode::Snapshot).unwrap()]).unwrap();
+        let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id='workspace3'", [], |row| row.get(0)).unwrap();
+        let workspace = LoroDoc::new();
+        workspace.import(&bytes).unwrap();
+        let first_row = workspace.get_map("chats").get(CHAT).unwrap().get_deep_value().to_json_value();
+        let mut second_row = first_row.clone();
+        second_row["id"] = SECOND.into();
+        second_row.as_object_mut().unwrap().remove("harnessSessionId");
+        workspace.get_map("chats").insert(SECOND, LoroValue::from(second_row)).unwrap();
+        workspace.get_map("sessionRefs").insert(&format!("5:owner:{SECOND}"), LoroValue::from(serde_json::json!({
+            "userId":"owner", "chatId":SECOND, "addedAt":1
+        }))).unwrap();
+        workspace.commit();
+        db.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id='workspace3'", [workspace.export(ExportMode::Snapshot).unwrap()]).unwrap();
+        db.execute_batch("CREATE TABLE semantic_intents(doc_id TEXT,container TEXT,record_id TEXT,value BLOB);
+            CREATE TABLE document_scopes(doc_id TEXT PRIMARY KEY,scope TEXT NOT NULL);").unwrap();
+        let scope = serde_json::json!({"project":"project","principal":"owner","deployment":"canary","session":CHAT}).to_string();
+        db.execute("INSERT INTO document_scopes VALUES (?1,?2)", rusqlite::params![CHAT, scope]).unwrap();
+        let mut late = legacy_command("command-later", "expired");
+        if failure == "journal" { late["issuedBy"] = "foreign".into(); }
+        let journals = [
+            (CHAT, CHAT, "commands", "command-1", legacy_command("command-1", "applied")),
+            (SECOND, SECOND, "commands", "command-2", legacy_command("command-2", "rejected")),
+            ("workspace3", "workspace3", "chats", CHAT, first_row),
+            (scope.as_str(), CHAT, "commands", "command-later", late),
+        ].map(|(source_id, canonical, container, key, value)| {
+            let bytes = serde_json::to_vec(&serde_json::json!({"acknowledged":false,"value":value})).unwrap();
+            db.execute("INSERT INTO semantic_intents VALUES (?1,?2,?3,?4)", rusqlite::params![source_id, container, key, bytes]).unwrap();
+            (canonical, container, key, bytes)
+        });
+        drop(db);
+        let manifest_path = source.join("crew-backup.json");
+        let mut manifest: CrewBackupManifest = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let mut metadata = manifest.chats[CHAT].clone();
+        metadata.session_id = SECOND.into();
+        metadata.scope.session_id = Some(SECOND.into());
+        manifest.chats.insert(SECOND.into(), metadata);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        refresh_database_hash(&source);
+        let original = std::fs::read(source.join("docs.sqlite3")).unwrap();
+        let original_manifest = std::fs::read(&manifest_path).unwrap();
+        let target = root.path().join("new-profile");
+        let validation = validate_legacy_crew_backup(&source, &target, &principal, "controller");
+        assert!(!target.exists(), "validation published a destination");
+        let imported = import_legacy_crew_backup(&source, &target, &principal, "controller");
+        assert_eq!(std::fs::read(source.join("docs.sqlite3")).unwrap(), original);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_manifest);
+        if failure != "none" {
+            let expected = if failure == "journal" { "command outcome conflicts" } else { "unsupported legacy transcript schema" };
+            assert!(validation.unwrap_err().to_string().contains(expected));
+            assert!(imported.unwrap_err().to_string().contains(expected));
+            assert!(!target.exists(), "late failure published a destination");
+            continue;
+        }
+        let report = imported.unwrap();
+        assert_eq!(serde_json::to_value(validation.unwrap()).unwrap(), serde_json::to_value(&report).unwrap());
+        assert_eq!(report.chat_ids, [CHAT, SECOND]);
+        assert_eq!(report.source_table_rows["snapshots"], 3);
+        assert_eq!(report.source_table_rows["semantic_intents"], 4);
+        for (command, outcome) in [("command-1", "applied"), ("command-2", "rejected"), ("command-later", "expired")] {
+            assert_eq!(report.command_outcomes[command], outcome);
+        }
+        let mut verified = verify_legacy_crew_import(&source, &target, &principal, "controller").unwrap();
+        assert_eq!(verified.destination_snapshots_sha256.len(), 3);
+        verified.destination_snapshots_sha256.clear();
+        assert_eq!(serde_json::to_value(&verified).unwrap(), serde_json::to_value(&report).unwrap());
+        let store = DocsStore::open(&target).unwrap();
+        for (id, container, key, expected) in &journals {
+            let records = store.legacy_crew_records(id).unwrap();
+            let saved = records.iter().find(|(kind, record, _)| kind == &format!("journal/{container}") && record.as_str() == *key).unwrap();
+            assert_eq!(&saved.2, expected, "original journal bytes changed");
+        }
+        for id in [CHAT, SECOND] {
+            let raw = LoroDoc::new();
+            raw.import(&store.load_snapshot(id).unwrap().unwrap()).unwrap();
+            let doc = zeron_doc::SessionDoc::from_doc(raw);
+            for command in doc.read_commands().unwrap() {
+                assert_eq!(serde_json::to_value(command.status).unwrap().as_str(), Some(report.command_outcomes[&command.id].as_str()));
+                assert!(store.is_processed(&command.id).unwrap());
+            }
+            let selected = verify_imported_profile(&target, &principal, "controller", id).unwrap();
+            assert_eq!(selected.chat_ids, [id]);
+            assert_eq!(selected.selected_chat_id.as_deref(), Some(id));
+            assert_eq!(selected.commands_retained, if id == CHAT { 2 } else { 1 });
+        }
+        assert_eq!(std::fs::read(source.join("docs.sqlite3")).unwrap(), original);
+        assert_eq!(std::fs::read(target.join("legacy-crew.sqlite3")).unwrap(), original);
+    }
+}
+
+#[test]
 fn non_omp_native_history_requires_isolated_restore_before_any_destination_write() {
     use loro::ToJson;
     let root = tempfile::tempdir().unwrap();

@@ -56,7 +56,7 @@ impl Dirty {
                     None => self.list = true,
                 },
                 "queue" => self.queue = true,
-                "commands" => self.commands = true,
+                "commands" | "commandReceipts" => self.commands = true,
                 "meta" => self.meta = true,
                 _ => {}
             }

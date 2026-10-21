@@ -303,9 +303,33 @@ sidecar without modifying it. Any startup row still requires legacy reconciliati
 before snapshot loading or destination creation. Every stored scope must match
 the verified importing principal as-is;
 missing or mixed deployment bindings are not relabeled to make import succeed.
-Validation currently materializes snapshot blobs and decoded documents. Qualify
-peak memory on a representative immutable copy before authorizing a real-profile
-import; synthetic fixture success is not that qualification.
+Inspection and source-evidence classification stream SQLite snapshots through the
+same historical-reference checks, retaining snapshot identities and one decoded
+document rather than every transcript. The repository pins a native-only
+`loro-internal` 1.13.9 patch for read-only change metadata and per-operation visitors;
+`vendor/loro-internal-1.13.9/UPSTREAM.json` records archive provenance and local changes.
+Causal validation walks metadata with the native shallow-root baseline instead of
+materializing ancestor version-vector caches. Retained-operation comparison hashes
+canonical framed values without exporting the entire history. A shallow or incomplete
+source still cannot prove that a bootstrap document has no historical associations.
+Export and import reconcile one canonical chat and its private execution aliases at
+a time in a private temporary SQLite worktable. Import also spools converted snapshots
+and original evidence there, preserves the original semantic-journal order, and reads
+back expected/actual records incrementally. No source or live profile is modified;
+the destination is created only after all semantic validation succeeds.
+Memory still depends on the largest workspace, canonical alias group, individual
+document/change and compact identity/outcome indexes; there is no content-dropping
+size limit. Qualify peak memory on a representative immutable copy before authorizing
+a real-profile import. A database-only observation without native archives or verified
+source authority is not a complete backup, and fixture success is not that qualification.
+
+The public inspection API completed on an immutable 3,037-snapshot, 715,402,552-byte
+database copy in 95.83 s: 254.94 MiB lifetime peak footprint, 236.17 MiB sampled RSS,
+and identical source database SHA-256 before/after. The watchdog retained its 1 GiB
+stop threshold; the full-corpus allowance was 120 s after the 15 s diagnostic expired.
+It conservatively returned zero inert-bootstrap proofs because shallow history was
+present. This verifies bounded copied-database inspection, not authenticated source
+capture, native archive completeness, real-profile import, or cutover readiness.
 
 A successful import writes `crew-import-report.json` with preserved IDs and
 checksums. Failed writes retain `crew-import-incomplete`; `DocsStore::open`

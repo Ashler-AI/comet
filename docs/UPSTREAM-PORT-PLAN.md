@@ -844,6 +844,16 @@ unqualified real-profile import memory remain cutover blockers, not permission
 to relabel profiles or retire other owners' records. Production remains gated
 on the captain's installed-app restart and manual acceptance.
 
+Copied-database inspection now completes without dataset-wide history retention.
+The actual public API inspected 3,037 snapshots (715,402,552 encoded bytes) in
+95.83 s at 254.94 MiB lifetime peak footprint and preserved the database hash.
+The same shallow workspace that exceeded 1 GiB now completes at 41.61 MiB;
+full-corpus timing used a 120 s watchdog, not the earlier 15 s diagnostic window.
+Six native codec, 23 migration-library, 32 backup/import and one portable runtime
+fixture checks passed locally. Shallow history still yields no inert-bootstrap
+proof; complete authenticated backup/import and current-source remote CI remain
+separate cutover gates.
+
 Status: implementation and verification in progress; no production cutover.
 
 ## Decision
@@ -928,6 +938,12 @@ Acceptance: browser and headless login; restart persistence; sign-out and identi
 OMP, Claude, and Codex are the initial managed routes to port from current Crew. Inventory every other enabled harness and auxiliary inference path: titles, reviews/subagents, model probes that perform inference, and voice/realtime features.
 
 In Crew-managed execution, each enabled path must use Agent Auth or be visibly unavailable until it has a compatible adapter. No silent fallback to inherited provider credentials. An explicitly selected user-owned/local-provider mode remains separate and labeled; signing out of Crew must not silently select it. Existing sessions using unsupported routes need an explicit migration disposition.
+
+Managed OMP pins `PI_SMOL_MODEL`, `PI_SLOW_MODEL`, and `PI_PLAN_MODEL` to the parent’s qualified Crew model for that process only; saved preferences and explicit agent overrides are unchanged. The inherited provider hook still rejects unmanaged inference. Crew’s OpenAI models declare `supportsStrictMode: true` so OMP preserves the task tool’s explicit `strict: false`; otherwise Responses can require optional seance-only fields and reject ordinary scouts before launch.
+
+Native OMP receives only its run-scoped `OMP_AUTH_GATEWAY_URL`/`OMP_AUTH_GATEWAY_TOKEN`; the Codex/legacy `COMET_INFERENCE_TOKEN` alias is removed after common context setup. This prevents an installed legacy global loader from contacting its localhost fallback before OMP becomes ready. An isolated run through the actual harness and installed OMP completed in 2.354 s with that loader present, one catalog request, one inference request, and no request outside the assigned loopback gateway. No live Agent Auth or installed-profile activation is implied.
+
+Run `node scripts/omp-gateway-smoke.mjs /path/to/omp` for the installed-runtime regression: an isolated profile and loopback inference exercise the actual advertised schema, direct scout launch, managed role selection, and completed child result. This is not a live Agent Auth receipt check. Failed tool cards retain the existing 160-character diagnostic summary plus a truncation marker when needed; successful output and full diagnostics remain journal-only, with no historical backfill.
 
 Acceptance: real streamed runs for both provider protocols; observed Agent Auth route/account receipts; tool continuation and cancellation; authority refresh; expired or wrong-owner route rejection; no duplicate run after reconnect; no provider-secret persistence; auxiliary calls cannot bypass the managed route. Do not replay an inference POST after an ambiguous disconnect unless the server's idempotency contract explicitly permits it.
 

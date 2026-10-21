@@ -7,6 +7,7 @@ use loro::{ExportMode, IdSpan, LoroDoc, ToJson};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use zeron_proto::CollaborationPrincipal;
 
 use crate::crew_import::CrewImportError;
@@ -264,10 +265,8 @@ impl DesktopSourceProof {
                 &backup.join(relative),
             )?);
         }
-        let classified = crate::crew_import_aliases::inert_bootstrap_snapshots(
-            &db,
-            &read_documents(&db)?,
-            &associated_ids,
+        let classified = crate::crew_import_aliases::inert_bootstrap_snapshots_from_store(
+            &db, &associated_ids,
         )?;
         if classified != self.inert_bootstrap_snapshots {
             return Err(unsafe_data(
@@ -280,7 +279,6 @@ impl DesktopSourceProof {
             }
             self.validate_source_scope(id, scope, principal)?;
             if let Some(path) = raw_path(id) {
-                use sha2::{Digest, Sha256};
                 let raw = read_bytes(&backup.join(&path))?;
                 if format!("{:x}", Sha256::digest(&raw)) != self.source_files[&path] {
                     return Err(unsafe_data(format!(
@@ -387,24 +385,6 @@ fn read_scopes(db: &Connection) -> Result<BTreeMap<String, Value>, CrewImportErr
     Ok(scopes)
 }
 
-fn read_documents(db: &Connection) -> Result<BTreeMap<String, LoroDoc>, CrewImportError> {
-    let mut documents = BTreeMap::new();
-    for row in db
-        .prepare("SELECT doc_id,bytes FROM snapshots")?
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?
-    {
-        let (id, bytes) = row?;
-        if id.starts_with("recovery-original/") {
-            continue;
-        }
-        if documents.insert(id, load_complete_state(&bytes)?).is_some() {
-            return Err(unsafe_data("duplicate original snapshot identity"));
-        }
-    }
-    Ok(documents)
-}
 
 fn decode_source(
     id: &str,
@@ -440,7 +420,7 @@ fn load_complete_state(bytes: &[u8]) -> Result<LoroDoc, CrewImportError> {
     let status = doc.import(bytes)?;
     if status.pending.is_some()
         || doc.is_detached()
-        || doc.state_vv() != doc.oplog_vv()
+        || !crate::crew_import_aliases::state_matches_oplog(&doc, &doc.oplog_vv())?
         || doc.oplog_vv().is_empty()
     {
         return Err(unsafe_data(
@@ -456,6 +436,65 @@ fn complete(bytes: &[u8]) -> Result<LoroDoc, CrewImportError> {
         return Err(unsafe_data("source has no full retained history"));
     }
     Ok(doc)
+}
+
+fn hash_json_value(digest: &mut Sha256, mut value: Value) -> Result<(), CrewImportError> {
+    fn canonicalize(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.sort_keys();
+                for value in object.values_mut() {
+                    canonicalize(value);
+                }
+            }
+            Value::Array(array) => array.iter_mut().for_each(canonicalize),
+            // Value equality treats signed floating zeroes as equal, but keeps
+            // floating-point numbers distinct from integer numbers.
+            Value::Number(number)
+                if *number == serde_json::Number::from_f64(0.0).unwrap() =>
+            {
+                *number = serde_json::Number::from_f64(0.0).unwrap();
+            }
+            _ => {}
+        }
+    }
+    canonicalize(&mut value);
+    serde_json::to_writer(digest, &value)?;
+    Ok(())
+}
+
+/// Hash the exact exported JsonChange sequence without retaining peer history.
+/// JSON objects are self-delimiting; domain tags distinguish headers, operations
+/// and the span end. Memory is bounded by one native operation and its JSON value.
+fn overlap_digest(doc: &LoroDoc, span: IdSpan) -> Result<[u8; 32], CrewImportError> {
+    let mut digest = Sha256::new();
+    digest.update(b"crew-desktop-overlap-v1\0");
+    let mut change_id = None;
+    doc.with_oplog(|oplog| {
+        oplog.change_store().try_visit_json_ops::<CrewImportError>(span, |meta, op| {
+            if change_id != Some(meta.id) {
+                change_id = Some(meta.id);
+                // Match native JsonChange export, including its sorted deps
+                // array. Do not use ChangeMeta equality: it omits most fields.
+                let mut deps: Vec<_> = meta.deps.iter().collect();
+                deps.sort_unstable();
+                let header = loro::JsonChange {
+                    id: meta.id,
+                    timestamp: meta.timestamp,
+                    deps,
+                    lamport: meta.lamport,
+                    msg: meta.message.as_deref().map(str::to_owned),
+                    ops: Vec::new(),
+                };
+                digest.update(b"\0change\0");
+                hash_json_value(&mut digest, serde_json::to_value(header)?)?;
+            }
+            digest.update(b"\0op\0");
+            hash_json_value(&mut digest, serde_json::to_value(op)?)
+        })
+    })?;
+    digest.update(b"\0end-span\0");
+    Ok(digest.finalize().into())
 }
 
 /// Recover shallow sources only against full retained history, corroborating both
@@ -491,9 +530,7 @@ pub(crate) fn merge(cache: &[u8], authoritative: &[u8]) -> Result<Vec<u8>, CrewI
         if overlap > start {
             shared = true;
             let span = IdSpan::new(*peer, start, overlap);
-            if serde_json::to_value(left.export_json_in_id_span(span))?
-                != serde_json::to_value(right.export_json_in_id_span(span))?
-            {
+            if overlap_digest(&left, span)? != overlap_digest(&right, span)? {
                 return Err(unsafe_data("conflicting source operation identities"));
             }
         }
@@ -503,15 +540,15 @@ pub(crate) fn merge(cache: &[u8], authoritative: &[u8]) -> Result<Vec<u8>, CrewI
             "cache and authority have no common causal operations",
         ));
     }
-    // A shallow snapshot cannot fill its own trimmed history. Import its actual
-    // retained operations into the full source instead of importing snapshot state.
+    // A shallow snapshot cannot fill its own trimmed history. After checking all
+    // overlap, import only the missing retained operations, never snapshot state.
     let updates = right
-        .export(ExportMode::updates(&retained_floor))
+        .export(ExportMode::updates(&left_version))
         .map_err(|error| zeron_doc::DocError::Schema(error.to_string()))?;
     let status = left.import(&updates)?;
     if status.pending.is_some()
         || left.is_detached()
-        || left.state_vv() != left.oplog_vv()
+        || !crate::crew_import_aliases::state_matches_oplog(&left, &left.oplog_vv())?
         || left.is_shallow()
     {
         return Err(unsafe_data(
@@ -586,10 +623,8 @@ pub fn prepare_desktop_database(
     }
     let mut associated_ids = native_ids.clone();
     associated_ids.extend(context.source_witnesses.keys().cloned());
-    let inert_bootstrap_snapshots = crate::crew_import_aliases::inert_bootstrap_snapshots(
-        &original,
-        &read_documents(&original)?,
-        &associated_ids,
+    let inert_bootstrap_snapshots = crate::crew_import_aliases::inert_bootstrap_snapshots_from_store(
+        &original, &associated_ids,
     )?;
     let mut evidence = BTreeMap::from([(DATABASE.into(), database.to_owned())]);
     for (id, scope) in &scopes {
@@ -1111,6 +1146,94 @@ mod tests {
         left.commit();
         let incomplete = left.export(ExportMode::updates(&before)).unwrap();
         assert!(complete(&incomplete).is_err());
+    }
+
+    #[test]
+    fn overlap_hash_matches_value_equality_and_native_partial_change_export() {
+        let value_digest = |value| {
+            let mut digest = Sha256::new();
+            hash_json_value(&mut digest, value).unwrap();
+            <[u8; 32]>::from(digest.finalize())
+        };
+        let first: Value = serde_json::from_str(r#"{"b":[{"y":-0.0,"x":1}],"a":null}"#).unwrap();
+        let reordered: Value = serde_json::from_str(r#"{"a":null,"b":[{"x":1,"y":0.0}]}"#).unwrap();
+        assert_eq!(first, reordered);
+        assert_eq!(value_digest(first), value_digest(reordered));
+        assert_ne!(value_digest(json!([1, 2])), value_digest(json!([2, 1])));
+        assert_ne!(value_digest(json!(0)), value_digest(json!(0.0)));
+
+        let make_doc = |timestamp, message: Option<&str>, split| {
+            let doc = LoroDoc::new();
+            doc.set_peer_id(7).unwrap();
+            doc.set_change_merge_interval(-1);
+            doc.set_next_commit_timestamp(timestamp);
+            if let Some(message) = message {
+                doc.set_next_commit_message(message);
+            }
+            doc.get_text("text").insert(0, "a").unwrap();
+            if split {
+                doc.commit();
+                doc.set_next_commit_timestamp(timestamp);
+                if let Some(message) = message {
+                    doc.set_next_commit_message(message);
+                }
+            }
+            doc.get_text("text").insert(1, "bc").unwrap();
+            doc.commit();
+            doc
+        };
+        let source = make_doc(123, Some("commit"), false);
+        let same = complete(&snapshot(&source)).unwrap();
+        let full = IdSpan::new(7, 0, 3);
+        assert_eq!(overlap_digest(&source, full).unwrap(), overlap_digest(&same, full).unwrap());
+        for changed in [
+            make_doc(124, Some("commit"), false),
+            make_doc(123, Some("different"), false),
+            make_doc(123, None, false),
+            make_doc(123, Some(""), false),
+            make_doc(123, Some("commit"), true),
+        ] {
+            assert_ne!(
+                serde_json::to_value(source.export_json_in_id_span(full)).unwrap(),
+                serde_json::to_value(changed.export_json_in_id_span(full)).unwrap(),
+            );
+            assert_ne!(overlap_digest(&source, full).unwrap(), overlap_digest(&changed, full).unwrap());
+        }
+        let dependency = LoroDoc::new();
+        dependency.set_peer_id(8).unwrap();
+        dependency.get_map("meta").insert("independent", true).unwrap();
+        dependency.commit();
+        let joined = complete(&snapshot(&source)).unwrap();
+        joined.import(&snapshot(&dependency)).unwrap();
+        joined.set_peer_id(9).unwrap();
+        joined.get_map("meta").insert("joined", true).unwrap();
+        joined.commit();
+        let split = make_doc(123, Some("commit"), true);
+        // Reference the old exporter for whole and sliced changes, including
+        // adjusted ID/lamport, multi-peer deps order and operation boundaries.
+        for (doc, peer, end) in [(&source, 7, 3), (&split, 7, 3), (&joined, 9, 1)] {
+            for span in [IdSpan::new(peer, 0, end), IdSpan::new(peer, 0, 1), IdSpan::new(peer, end - 1, end)] {
+                let mut expected = Sha256::new();
+                expected.update(b"crew-desktop-overlap-v1\0");
+                for mut change in doc.export_json_in_id_span(span) {
+                    let ops = std::mem::take(&mut change.ops);
+                    expected.update(b"\0change\0");
+                    hash_json_value(&mut expected, serde_json::to_value(change).unwrap()).unwrap();
+                    for op in ops {
+                        expected.update(b"\0op\0");
+                        hash_json_value(&mut expected, serde_json::to_value(op).unwrap()).unwrap();
+                    }
+                }
+                expected.update(b"\0end-span\0");
+                assert_eq!(overlap_digest(doc, span).unwrap(), <[u8; 32]>::from(expected.finalize()));
+            }
+        }
+        let prefix = LoroDoc::new();
+        prefix.import(&source.export(ExportMode::updates_in_range(vec![IdSpan::new(7, 0, 1)])).unwrap()).unwrap();
+        let merged = complete(&merge(&snapshot(&prefix), &snapshot(&source)).unwrap()).unwrap();
+        assert_eq!(merged.oplog_vv(), source.oplog_vv());
+        assert_eq!(merged.get_deep_value(), source.get_deep_value());
+        assert!(merge(&snapshot(&source), &snapshot(&make_doc(124, Some("commit"), false))).is_err());
     }
 
     #[test]

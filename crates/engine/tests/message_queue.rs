@@ -708,6 +708,7 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
                 based_on: None,
                 expires_at: None,
                 status: zeron_doc::SessionCommandStatus::Pending,
+                accepted_at: None,
                 resolution: None,
             })
             .unwrap();
