@@ -78,7 +78,9 @@ const OMP_SESSION_FORK_RECORD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// The supervisor is a separate process in the OMP process group. It inherits
 /// the engine's RPC stdio unchanged, watches the exact engine parent PID, and
-/// terminates OMP plus its tool descendants when that parent disappears.
+/// terminates OMP plus its tool descendants when that parent disappears or OMP
+/// exits. Shutdown also inspects the private group for children orphaned before
+/// a descendant scan; an empty ancestry snapshot alone does not prove cleanup.
 pub fn run_supervisor_from_env() -> Option<Result<(), HarnessError>> {
     let mut args = std::env::args_os();
     let _program = args.next();
@@ -295,17 +297,60 @@ fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), Ha
                 libc::kill(-(root as i32), libc::SIGTERM);
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            loop {
+            let group_empty_verified = loop {
                 supervised_descendants(root, &mut descendants);
+                // A fast-exiting parent can orphan children before ancestry polling
+                // observes them. Before accepting an empty tree, inspect the private
+                // group, whose ID remains pinned by this live supervisor.
+                // ponytail: shutdown-only host scan; use native group enumeration
+                // if process-count-dependent teardown cost becomes material.
+                let group_empty_verified = if descendants.is_empty() {
+                    match ProcessCommand::new("/bin/ps")
+                        .args(["-A", "-o", "pid=,pgid=,stat="])
+                        // Keep the observer out of the group it must prove empty.
+                        .process_group(0)
+                        .stdin(Stdio::null())
+                        .stderr(Stdio::null())
+                        .output()
+                    {
+                        Ok(output) if output.status.success() => {
+                            let mut empty = true;
+                            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                                let mut fields = line.split_whitespace();
+                                let Some(pid) = fields.next().and_then(|pid| pid.parse::<u32>().ok()) else { continue };
+                                let group = fields.next().and_then(|group| group.parse::<u32>().ok());
+                                let zombie = fields.next().is_some_and(|state| state.starts_with('Z'));
+                                if group != Some(root) || pid == root || zombie {
+                                    continue;
+                                }
+                                // Even if this member exits before identity lookup,
+                                // it may have forked a replacement after the snapshot.
+                                // Only a later empty snapshot can prove the group clean.
+                                empty = false;
+                                if !descendants.iter().any(|(known, _)| *known == pid)
+                                    && let Some(birth) = process_birth(pid)
+                                    // SAFETY: inspect membership again before recording ownership.
+                                    && unsafe { libc::getpgid(pid as i32) } == root as i32
+                                {
+                                    descendants.push((pid, birth));
+                                }
+                            }
+                            empty
+                        }
+                        _ => break false,
+                    }
+                } else {
+                    false
+                };
                 for (pid, birth) in &descendants {
                     signal_owned_process(*pid, birth, libc::SIGTERM);
                 }
                 let _ = child.try_wait();
-                if descendants.is_empty() || std::time::Instant::now() >= deadline {
-                    break;
+                if group_empty_verified || std::time::Instant::now() >= deadline {
+                    break group_empty_verified;
                 }
                 std::thread::sleep(Duration::from_millis(25));
-            }
+            };
             for (pid, birth) in &descendants {
                 signal_owned_process(*pid, birth, libc::SIGKILL);
             }
@@ -313,7 +358,9 @@ fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), Ha
             let _ = child.wait();
             // Keep the leader alive through escalation so this group cannot be reused.
             // The final group signal catches children forked during shutdown too.
-            if !descendants.is_empty() {
+            // Failed or nonempty inspection cannot become a clean exit just because
+            // an observed member vanished before its birth identity could be read.
+            if !group_empty_verified {
                 unsafe {
                     libc::kill(-(root as i32), libc::SIGKILL);
                 }

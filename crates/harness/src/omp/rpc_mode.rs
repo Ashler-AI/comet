@@ -1380,10 +1380,12 @@ mod tests {
     #[ignore = "subprocess helper for the catalog supervisor lifecycle regression"]
     fn command_catalog_supervisor_process() {
         let Some(exit) = std::env::var_os("COMET_TEST_CATALOG_EXIT") else { return };
-        let args = [
-            std::env::var_os("COMET_TEST_CATALOG_PARENT").unwrap(),
-            "/bin/sh".into(), "-c".into(),
-            r#"if [ "$1" = 0 ]; then
+        let pid_file = std::env::var_os("COMET_TEST_CATALOG_PID_FILE").unwrap();
+        // Finish and reap the startup shell before the supervisor's first scan.
+        // Its workload remains in our private group but is no longer a descendant.
+        assert!(std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"if [ "$1" = 0 ]; then
   sleep 60 &
 else
   sh -c 'trap "" TERM; : > "$1"; exec sleep 60' resistant "$2.ready" &
@@ -1391,11 +1393,15 @@ fi
 printf '%s\n' "$!" > "$2"
 if [ "$1" != 0 ]; then
   while [ ! -f "$2.ready" ]; do sleep 0.01; done
-fi
-printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"advisor"}]}'
+fi"#)
+            .arg("catalog-startup-test").arg(&exit).arg(&pid_file)
+            .status().unwrap().success());
+        let args = [
+            std::env::var_os("COMET_TEST_CATALOG_PARENT").unwrap(),
+            "/bin/sh".into(), "-c".into(),
+            r#"printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"advisor"}]}'
 exit "$1""#.into(),
             "catalog-exit-test".into(), exit,
-            std::env::var_os("COMET_TEST_CATALOG_PID_FILE").unwrap(),
             "--comet-command-catalog".into(),
         ];
         super::super::run_omp_supervisor(args.into_iter()).unwrap();
@@ -1434,9 +1440,9 @@ exit "$1""#.into(),
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "catalog child was not reaped");
             assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
             let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
-            // The shell exits without waiting for its startup child. Linux reparents
-            // that child to init, which may leave it as a zombie after cleanup.
-            // Require no live workload, not reaping by an unrelated process.
+            // The startup shell was reaped before supervision began. Its orphan
+            // remains group-owned on both platforms; Linux init may leave a zombie
+            // after cleanup. Require no live workload, not unrelated init reaping.
             let descendant_is_live = || {
                 #[cfg(target_os = "linux")]
                 {

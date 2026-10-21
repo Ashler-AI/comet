@@ -51,6 +51,27 @@ retirement assertions; passive timing observed completion at 6.444 s, beyond
 the old five-second fixture deadline. All 41 workerd checks passed afterward
 without diagnostics, skipped cases or reduced in-test concurrency.
 
+The catalog shutdown regression exposed a real orphan leak on macOS and Linux:
+a startup shell could exit before ancestry polling observed its child. Supervisor
+shutdown now checks its still-owned process group before accepting an empty tree,
+and escalates if group emptiness cannot be verified. A deterministic orphan
+regression preserves success/failure catalog semantics; both catalog checks and
+all ten filesystem-watch checks passed locally. The real rebuilt executable
+emitted the snapshot and left no live startup child for normal exit and a
+TERM-resistant failure (669 ms and 2549 ms respectively). An earlier cold native
+entry hit the five-second smoke deadline; the instrumented attempt did not recur,
+so its cause remains unestablished and no deadline was extended.
+
+Canary Agent Auth failures on October 21 came from staging Worker
+`690c85e0-c774-41a4-b4dd-42cd11cfe479` retiring the private broker at 22:26:15 UTC
+while the isolated Canary still depended on it. The in-flight provider error
+completed at 22:26:36, followed by identity-resolution 503s. Read-only checks
+confirmed matching canonical/Canary identities and retained native history.
+The platform deployment guard now rejects that active dependency before mutation;
+five checks and the live metadata rejection passed. It does not restore the
+retired route or establish live inference recovery: authenticated canonical
+profile/history cutover remains required.
+
 Prior authenticated Apple metadata identified staging app `6808397041` with
 1.0 (36) Testing. Build 1.0 (37) is an unallocated candidate, not a freshly verified
 next upload: the 2026-10-21 metadata attempt redirected to login with

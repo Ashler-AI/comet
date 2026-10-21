@@ -743,11 +743,11 @@ mod tests {
         let (on_b, mut b_rx) = recorder();
         let watch_a = hub.watch(&a, notify::RecursiveMode::Recursive, on_a);
         let watch_b = hub.watch(&b, notify::RecursiveMode::NonRecursive, on_b);
+        settle(&hub).await;
         expect(&mut a_rx, Seen::Rescan).await;
         expect(&mut b_rx, Seen::Rescan).await;
         assert!(watch_a.is_live() && watch_b.is_live());
         assert_eq!(hub.installed().len(), 2);
-        settle(&hub).await;
         drain(&mut a_rx);
         drain(&mut b_rx);
 
@@ -787,8 +787,8 @@ mod tests {
         let hub = FsWatchHub::new();
         let (on_a, mut a_rx) = recorder();
         let _watch_a = hub.watch(&a, notify::RecursiveMode::Recursive, on_a);
-        expect(&mut a_rx, Seen::Rescan).await;
         settle(&hub).await;
+        expect(&mut a_rx, Seen::Rescan).await;
         drain(&mut a_rx);
 
         let watch_b = hub.watch(&b, notify::RecursiveMode::Recursive, |_| {});
