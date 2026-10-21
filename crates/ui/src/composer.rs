@@ -7881,6 +7881,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (composer, path) = retained_test_composer(cx, EngineHandle::for_test(rpc.clone()), dir.path());
         let state = composer.read_with(cx, |composer, _| composer.state.clone());
+        // Finish initial recovery before admission can write the journal. Otherwise
+        // the first echo's state notification can recover this new send as an old one.
+        state.update(cx, |_, cx| cx.notify());
+        cx.condition(&composer, |composer, _| composer.recovered_send_scopes.contains(path.as_ref().unwrap())
+            && composer.refreshing_send_scopes.is_empty()).await;
         for (turn, (delivery, metadata_error)) in [("notified", None), ("pending", None), ("notified", Some("metadata projection failed"))].into_iter().enumerate() {
             *rpc.status.lock() = "pending"; *rpc.metadata_error.lock() = metadata_error; *rpc.delivery.lock() = delivery;
             let warns = delivery == "pending" || metadata_error.is_some();
