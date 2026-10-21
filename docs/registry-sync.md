@@ -247,6 +247,13 @@ startup/native-fork state, delayed worktree deletion, unknown tables or workspac
 containers, malformed rows, mismatched scope and unlisted/tampered files are
 explicit errors. Reconcile those in the legacy lane, then take a new backup.
 There is no automatic unsafe replay or silent record dropping.
+The known `session_startups` table is accepted only when empty; any startup row
+still requires legacy reconciliation before snapshot loading or destination
+creation. Every stored scope must match the verified importing principal as-is;
+missing or mixed deployment bindings are not relabeled to make import succeed.
+Validation currently materializes snapshot blobs and decoded documents. Qualify
+peak memory on a representative immutable copy before authorizing a real-profile
+import; synthetic fixture success is not that qualification.
 
 A successful import writes `crew-import-report.json` with preserved IDs and
 checksums. Failed writes retain `crew-import-incomplete`; `DocsStore::open`

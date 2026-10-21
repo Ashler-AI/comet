@@ -295,6 +295,7 @@ pub fn import_legacy_crew_backup(
     for table in &tables {
         if !matches!(table.as_str(), "snapshots" | "processed_commands" | "schema_migrations"
             | "trusted_local_commands" | "local_migrations" | "crew_directory_jobs"
+            | "session_startups"
             | "semantic_intents" | "document_scopes" | "pending_nudges") {
             return Err(unsafe_data(format!("unknown legacy table {table}")));
         }
@@ -302,6 +303,10 @@ pub fn import_legacy_crew_backup(
     if tables.contains("pending_nudges") {
         let count: i64 = db.query_row("SELECT COUNT(*) FROM pending_nudges", [], |row| row.get(0))?;
         if count != 0 { return Err(unsafe_data("accepted pending nudges require legacy reconciliation before import")); }
+    }
+    if tables.contains("session_startups") && db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_startups)", [], |row| row.get::<_, bool>(0))? {
+        return Err(unsafe_data("session startups require legacy reconciliation before import"));
     }
     let snapshots = db.prepare("SELECT doc_id,bytes FROM snapshots ORDER BY doc_id")?
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?

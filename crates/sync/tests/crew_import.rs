@@ -147,6 +147,39 @@ fn backup(path: &std::path::Path, pending: bool) -> CollaborationPrincipal {
 }
 
 #[test]
+fn backup_import_accepts_only_empty_known_startup_table() {
+    for (table, populated, accepted) in [
+        ("session_startups", false, true),
+        ("session_startups", true, false),
+        ("unknown_startups", false, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("backup");
+        std::fs::create_dir(&source).unwrap();
+        let principal = backup(&source, false);
+        let db = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+        db.execute_batch(&format!("CREATE TABLE {table}(id TEXT PRIMARY KEY)")).unwrap();
+        if populated {
+            db.execute("INSERT INTO session_startups VALUES ('unresolved-startup')", []).unwrap();
+        }
+        drop(db);
+        refresh_database_hash(&source);
+        let target = root.path().join("new-profile");
+        let result = import_legacy_crew_backup(&source, &target, &principal, "controller");
+        if accepted {
+            let report = result.unwrap();
+            assert_eq!(report.chat_ids, [CHAT]);
+            assert_eq!(report.command_outcomes["command-1"], "applied");
+            let store = DocsStore::open(&target).unwrap();
+            assert!(store.is_processed("command-1").unwrap());
+        } else {
+            assert!(result.is_err(), "import accepted {table}, populated={populated}");
+            assert!(!target.exists());
+        }
+    }
+}
+
+#[test]
 fn backup_import_preserves_ids_assets_and_terminal_outcomes_without_replay() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("backup");

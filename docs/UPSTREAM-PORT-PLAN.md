@@ -750,6 +750,26 @@ Local typechecks are intentionally not run to preserve workstation resources.
 Remaining gates below are requirements, not claims of completed testing.
 
 
+### Scoped sidebar links and staged source delivery (0.2.114)
+
+The selected Scaffold session exposes **Web** and **Tilt** in session details
+from its canonical environment links. Owner, project, deployment and session
+must match the chat; each missing or unsafe URL hides independently. Activation
+rechecks the current selection. Local/Devbox rows do not expose these actions.
+An owned headed fixture exercised both native actions against loopback pages;
+a separately initialized local-session window hid both. The focused scope/URL
+regression and native browser contracts passed; no sandbox was allocated.
+
+Release adapters preserve canonical signed artifacts and immutable GCS publication.
+Build-only reviewed source cannot publish; GCS candidates require merged-main
+ancestry. Shared Edge deployment is manual-only, and immutable candidate
+publication does not move channels or activate a controller. Fresh staging uses
+its own `~/.crew-staging` profile and IPC 27957, independently authenticated.
+Legacy mixed/unscoped deployments, pending work, unsupported consumer access and
+unqualified real-profile import memory remain cutover blockers, not permission
+to relabel profiles or retire other owners' records. Production remains gated
+on the captain's installed-app restart and manual acceptance.
+
 Status: implementation and verification in progress; no production cutover.
 
 ## Decision
