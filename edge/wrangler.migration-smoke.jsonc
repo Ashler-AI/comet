@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // LOCAL TEST ONLY. Never deploy; no account, routes, cloud resources, or secrets.
+  "name": "crew-migration-smoke-local-only",
+  "main": "test/migration-retirement.fixture.ts",
+  "compatibility_date": "2026-08-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "vars": { "MIGRATION_SMOKE_LOCAL_ONLY": "true", "AUTH_MODE": "dev", "ENVIRONMENT": "local" },
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "FixtureSessionRoom" }]
+  },
+  "migrations": [{ "tag": "local-smoke-v1", "new_sqlite_classes": ["FixtureSessionRoom"] }]
+}

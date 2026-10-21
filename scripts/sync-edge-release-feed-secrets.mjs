@@ -5,7 +5,6 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const supportedTargets = new Set(["staging", "production"]);
 
 const required = (env, name, target) => {
   const value = env[name]?.trim();
@@ -14,11 +13,10 @@ const required = (env, name, target) => {
 };
 
 export function releaseFeedSecrets(target, env) {
-  if (!supportedTargets.has(target)) throw new Error(`unsupported Crew edge environment: ${target}`);
+  if (target !== "staging") throw new Error(`unsupported Crew edge environment: ${target}`);
 
   const email = env.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL?.trim() ?? "";
   const privateKey = env.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY?.trim() ?? "";
-  if (!email && !privateKey) return undefined;
   if (!email || !privateKey) {
     throw new Error(`${target} release-feed synchronization requires the reader email and private key together`);
   }
@@ -30,7 +28,9 @@ export function releaseFeedSecrets(target, env) {
   }
 
   required(env, "CLOUDFLARE_API_TOKEN", target);
-  required(env, "CLOUDFLARE_ACCOUNT_ID", target);
+  if (required(env, "CLOUDFLARE_ACCOUNT_ID", target) !== "dd15bb23eb5c14365fe2621acc049e01") {
+    throw new Error("staging release-feed synchronization requires the existing staging Cloudflare account");
+  }
   const bucket = required(env, "COMET_RELEASES_GCS_BUCKET", target);
   return {
     COMET_RELEASES_GCS_BUCKET: bucket,
@@ -39,14 +39,10 @@ export function releaseFeedSecrets(target, env) {
   };
 }
 
-const runWrangler = (edgeDir, target, secretsFile, env) =>
+const runWrangler = (edgeDir, args, env) =>
   new Promise((resolve, reject) => {
     const wrangler = path.join(edgeDir, "node_modules", ".bin", "wrangler");
-    const child = spawn(
-      wrangler,
-      ["secret", "bulk", secretsFile, "--config", "wrangler.jsonc", "--env", target],
-      { cwd: edgeDir, env, stdio: "inherit" },
-    );
+    const child = spawn(wrangler, args, { cwd: edgeDir, env, stdio: "inherit" });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (code === 0) resolve();
@@ -60,16 +56,12 @@ export async function syncReleaseFeedSecrets(
   { edgeDir = path.join(root, "edge"), upload = runWrangler } = {},
 ) {
   const secrets = releaseFeedSecrets(target, env);
-  if (!secrets) {
-    console.log(`No environment-owned ${target} release-reader credentials are configured; preserving existing Worker secrets.`);
-    return false;
-  }
 
   const directory = await mkdtemp(path.join(os.tmpdir(), "crew-release-feed-secrets-"));
   const secretsFile = path.join(directory, "secrets.json");
   try {
     await writeFile(secretsFile, `${JSON.stringify(secrets)}\n`, { mode: 0o600 });
-    await upload(edgeDir, target, secretsFile, env);
+    await upload(edgeDir, ["secret", "bulk", secretsFile, "--config", "wrangler.migration-staging.jsonc"], env);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

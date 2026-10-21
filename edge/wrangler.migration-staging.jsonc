@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Migration-only replacement of the EXISTING staging Worker and namespaces.
+  // Activate at 100% new version; never roll back while frozen migrations remain.
+  // Keep the original migration history: no new namespace or deleted_classes.
+  "name": "ashler-comet-edge-staging",
+  "main": "src/migration-retirement.ts",
+  "compatibility_date": "2026-08-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "comet-staging.internal.ashler.com", "custom_domain": true }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SessionRoom", "DeviceRoom"] },
+    { "tag": "v2", "new_sqlite_classes": ["AuthGrant"] }
+  ],
+  "r2_buckets": [
+    { "binding": "BLOBS", "bucket_name": "ashler-comet-staging-blobs" }
+  ],
+  // Existing private release-feed secrets must remain bound; no public fallback.
+  "vars": {
+    "AUTH_MODE": "scaffold",
+    "ENVIRONMENT": "staging",
+    "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
+    "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
+    "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
+  }
+}
