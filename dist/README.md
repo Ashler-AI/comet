@@ -55,12 +55,15 @@ the app and the extracted updater archive without repairing signatures.
 Building production-identity candidate bytes does not publish production.
 `COMET_PACKAGE_ENVIRONMENT` defaults to `production` for legacy release
 compatibility; always specify `staging` for standalone staging builds. A conflicting
-`COMET_DEFAULT_ENVIRONMENT` is rejected. Staging keeps its independent data root
-`~/.comet-native-staging`, managed worktrees, IPC port `27655` and permission
-identity. Packaging never reads, imports or launches an existing profile. The
-native-format cutover requires the separately verified offline, copy-first
-profile migration before opening legacy data; do not point a new engine blindly
-at an old store. Explicit data/worktree/IPC overrides remain runtime policy.
+`COMET_DEFAULT_ENVIRONMENT` is rejected. The native staging app uses
+`~/.crew-staging` and IPC port `27957`, retaining the staging bundle and permission
+identity. Legacy `~/.comet-native-staging` / `27655` remains the migration source,
+not the new app's active store. Authenticate the fresh native root with `login`,
+then import and verify its owner-scoped `profiles/scaffold/<profile-key>` store
+before the first headed launch. Packaging never imports or launches a profile.
+Packaged headed startup pins these compiled coordinates; CLI, environment and
+saved runtime overrides cannot redirect it. Explicit coordinates remain available
+to the separate `login` and `headless` operator commands.
 
 Credential-free release verification on macOS:
 
