@@ -1323,12 +1323,19 @@ mod maintenance_tests {
             let other = Connection::open(dir.path().join("docs.sqlite3")).unwrap();
             other.execute_batch(lock).unwrap();
 
-            let started = Instant::now();
             let store = DocsStore::open(dir.path()).expect("maintenance never fails open");
             store.reclaim_free_space();
+            // Returning while the other transaction is still held proves
+            // maintenance defers contention. Total open/reclaim wall time also
+            // includes filesystem work and host scheduling, not just busy waits.
             assert!(
-                started.elapsed() < Duration::from_secs(3),
-                "{lock}: maintenance waited on the store busy timeout"
+                !other.is_autocommit(),
+                "{lock}: the competing lock is still held"
+            );
+            assert_eq!(
+                pragma(&store.conn(), "busy_timeout"),
+                STORE_BUSY_TIMEOUT.as_millis() as i64,
+                "{lock}: maintenance restores the normal write timeout"
             );
             assert_eq!(store.load_snapshot("d47").unwrap().unwrap().len(), MIB);
             assert_eq!(

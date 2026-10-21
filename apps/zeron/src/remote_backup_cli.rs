@@ -198,6 +198,7 @@ mod tests {
     use super::*;
     #[test]
     fn offline_destination_matches_runtime_origins_and_rejects_unsafe_authority() {
+        let native_root = tempfile::tempdir().unwrap();
         let context = RemoteBackupContext {
             migration_id: "migration".into(),
             owner_subject: "owner".into(),
@@ -213,7 +214,7 @@ mod tests {
         let mut args = ImportArgs {
             context_file: "/context".into(),
             backup: "/backup".into(),
-            destination_root: "/native-data".into(),
+            destination_root: native_root.path().to_path_buf(),
             resource: "https://control.example/".into(),
             edge_origin: "https://edge.example/".into(),
         };

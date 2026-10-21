@@ -6409,11 +6409,14 @@ mod tests {
         materializer_process_at(true);
     }
 
+    #[cfg(unix)]
     #[test]
     fn materializer_process_is_exact_idempotent_and_rejects_mismatch() {
         materializer_process_at(false);
     }
 
+    // Executes the sandbox's POSIX materializer, including private modes and symlink guards.
+    #[cfg(unix)]
     fn materializer_process_at(session_only: bool) {
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Command;

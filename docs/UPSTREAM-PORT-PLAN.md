@@ -27,6 +27,13 @@ native composer and rendered the completed streamed mock reply. This used fresh,
 isolated data; installed profiles were not replaced. Historical-import and
 authentication-redirect review cleared, but none of this is live cutover acceptance.
 
+The backup destination fixture now uses a host-native absolute temporary path.
+Sandbox materializer process checks run on Unix, matching the sandbox's POSIX
+Python contract; portable archive and handoff checks still run on Windows.
+The SQLite contention check covers deferred reclamation, retained data and restored
+write timeouts, not an aggregate open/reclaim wall-clock deadline. The macOS CI
+deadline failure did not establish a production busy-timeout defect.
+
 Prior authenticated Apple metadata identified staging app `6808397041` with
 1.0 (36) Testing. Build 1.0 (37) is an unallocated candidate, not a freshly verified
 next upload: the 2026-10-21 metadata attempt redirected to login with
