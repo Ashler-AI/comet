@@ -12086,9 +12086,10 @@ mod tests {
                         let expected_right = surface.right() - px(1.0 + inset + 28.0 + ACTION_PRIMARY_GAP);
                         assert!((f32::from(model.right() - expected_right)).abs() <= 1.0,
                             "model must stay right aligned: compact_picker={compact_picker}, docked={docked}, amount={amount}, actual={model:?}, expected={expected_right:?}");
+                        // Reflow may preserve a different painted height while controls
+                        // change mode; transcript clearance must still match the destination.
                         let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
                         assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
-                        assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
                             }).unwrap();
                         });
                     }

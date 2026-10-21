@@ -757,31 +757,6 @@ async fn turn_failed_maps_to_errored_done() {
 }
 
 #[tokio::test]
-async fn resume_falls_back_to_fresh_thread() {
-    let (controls, _steer, _token) = controls("Yes");
-    let mut req = request("scenario:resumed");
-    req.resume = Some("resume-fail".into());
-    let events = run_to_end(&harness(), req, controls).await;
-
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh"
-        )),
-        "fresh thread expected: {events:?}"
-    );
-    assert_eq!(
-        events.last(),
-        Some(&AgentEvent::Done {
-            status: DoneStatus::Completed,
-            result: None,
-            error: None,
-            session_id: Some("th-fresh".into()),
-        })
-    );
-}
-
-#[tokio::test]
 async fn resume_reuses_the_existing_thread() {
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:resumed");
@@ -794,6 +769,35 @@ async fn resume_reuses_the_existing_thread() {
             AgentEvent::SessionStarted { session_id, .. } if session_id == "th-resumed"
         )),
         "resumed thread expected: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_resume_does_not_replace_the_native_conversation() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:resumed");
+    req.resume = Some("resume-fail".into());
+    let events = run_to_end(&harness(), req, controls).await;
+
+    // Consumers persist SessionStarted identities; a rejected resume must not
+    // replace the stored conversation or report a successful turn.
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SessionStarted { .. })),
+        "failed resume published a new conversation: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                error: Some(_),
+                session_id: None,
+                ..
+            })
+        ),
+        "failed resume must surface an error without a replacement identity: {events:?}"
     );
 }
 

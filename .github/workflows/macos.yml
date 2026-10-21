@@ -278,7 +278,7 @@ jobs:
           # Reuse the core built above instead of rebuilding it in the Xcode build phase.
           ZERON_SKIP_CORE: 1
         run: |
-          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
+          xcodebuild -project Zeron.xcodeproj -scheme "Crew Canary" \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
             -only-testing:ZeronTests CODE_SIGNING_ALLOWED=NO test

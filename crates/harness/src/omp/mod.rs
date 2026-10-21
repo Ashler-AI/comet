@@ -15,7 +15,7 @@ use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt as _;
-use crate::process::Command;
+use crate::process::{Command, Stdio as ManagedStdio};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -1865,9 +1865,9 @@ impl OmpHarness {
             command.current_dir(cwd);
         }
         command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdin(ManagedStdio::piped())
+            .stdout(ManagedStdio::piped())
+            .stderr(ManagedStdio::piped())
             .kill_on_drop(!(supervised && self.supervisor_executable.is_some()));
         command
     }
@@ -2117,7 +2117,7 @@ impl Harness for OmpHarness {
         }
         let output = command
             .args(["models", "--json"])
-            .stdin(Stdio::null())
+            .stdin(ManagedStdio::null())
             .output()
             .await?;
         if !output.status.success() {
