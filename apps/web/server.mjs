@@ -66,9 +66,9 @@ export function loadConfig(env = process.env) {
   const port = Number(env.CREW_WEB_PORT || 4096);
   const ipcPort = Number(env.COMET_IPC_PORT);
   requireValue(Number.isInteger(port) && port > 0 && port <= 65535, 'Invalid HTTP port');
-  requireValue(ipcPort === 27954, 'Canary COMET_IPC_PORT must be 27954');
+  requireValue(ipcPort === 39400, 'Native COMET_IPC_PORT must be 39400');
   requireValue(typeof env.CREW_WEB_AUTH_TOKEN === 'string' && env.CREW_WEB_AUTH_TOKEN.length >= 32, 'Trusted proxy token required');
-  requireValue(env.COMET_DATA_DIR?.startsWith('/') && env.COMET_DATA_DIR.endsWith('/.scaffold/crew-upstream-canary/data') && env.SCAFFOLD_RUNTIME_DIR?.startsWith('/'), 'Canonical canary data and runtime directories required');
+  requireValue(env.COMET_DATA_DIR?.startsWith('/') && env.COMET_DATA_DIR.endsWith('/.scaffold/crew-data') && env.SCAFFOLD_RUNTIME_DIR?.startsWith('/'), 'Canonical native data and runtime directories required');
   return { sessionId, sandboxId: profile.sandboxId, projectId: profile.projectId, deploymentId: profile.deploymentId,
     deviceId: profile.targetDeviceId, ownerSubject: profile.actor.sub, lifecycleEpoch: profile.lifecycleEpoch,
     host: env.CREW_WEB_HOST || '127.0.0.1', port, ipcPort,
@@ -534,7 +534,7 @@ export async function createServer(config, viewport = new Viewport(config)) {
         requireValue(segments.every(value => typeof value === 'string' && /^[A-Za-z0-9._-]{1,256}$/.test(value))
           && scope.sessionId === config.sessionId && authority.sandboxId === config.sandboxId,
         'Crew native session binding unavailable', 503);
-        return respond(res, 200, { url: `crew-upstream-canary://scaffold/${segments.join('/')}` });
+        return respond(res, 200, { url: `comet-staging://scaffold/${segments.join('/')}` });
       }
       if (req.method === 'GET' && path === '/api/models') {
         await viewport.readAuthority();

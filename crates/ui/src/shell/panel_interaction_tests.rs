@@ -42,7 +42,7 @@ fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut Vis
         });
         let mut shell = Shell::new(
             state,
-            EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+            EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
             ipc_port: 0,
             edge_url: String::new(),
             edge_token: None,
