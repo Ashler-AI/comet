@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "ae2e4a94d909a3036ec5608e349140d7fc3d5168",
+  "canonicalBaselineCommit": "79ce43e38fd0ffb53642c31a4021e7cd2baa744f",
+  "liveVersionId": "be220cb6-052c-4646-b92b-1401c8a29a50",
+  "workflowRun": "https://github.com/Ashler-AI/comet/actions/runs/38926146529",
+  "stagingJobId": 117065247351,
+  "artifact": {
+    "id": 12056894434,
+    "name": "comet-edge-candidate-ae2e4a94d909a3036ec5608e349140d7fc3d5168",
+    "githubArchiveSha256": "6f8cac24c84284d8a05e74e077ee3027061025b5675457c1f4ef591dfb8111a2",
+    "candidateTarSha256": "fb02af340379cb965b01ffe301f4d059fba26a7034c39abe0cc7be24627dc07b",
+    "files": {
+      "index.js": "90eec863218b90ac58e35ab3ccc5b4a9f94e8126fbd3bea4dff826b2d26bc36c",
+      "2f0f4e9e57402ed68e2f85508ca0967828e35738-loro_wasm_bg.wasm": "525d62b10e3b346a2e87af6766dba51e97af482164d984a085d8268b5632951e"
+    },
+    "sourceToLiveEvidence": "Original staging job logged sourceCommit, this artifact download digest, script/domain deployment, and liveVersionId. Recovery receipt separately verified source-map equality to exact ae2 source for session-room.ts, device-room.ts, auth-routes.ts and index.ts.",
+    "preservation": "index.js and companion WASM are recovered immutable deployed bytes, not rebuilt source or substituted constructors. index.d.ts is types only. New deployment source maps must embed byte-identical index.js and emit byte-identical companion WASM."
+  },
+  "canonicalResources": {
+    "accountId": "dd15bb23eb5c14365fe2621acc049e01",
+    "scriptName": "ashler-comet-edge-staging",
+    "customDomain": "comet-staging.internal.ashler.com",
+    "customDomainId": "b4748220e693bbb9187a4472918db8a2c8ef6920",
+    "zoneId": "8c4d16c188a84758febf053bf3c868e4",
+    "workersDev": false,
+    "previewUrls": false,
+    "compatibilityDate": "2026-08-04",
+    "compatibilityFlags": ["nodejs_compat"],
+    "legacyNamespaces": {
+      "SESSION_ROOMS": { "className": "SessionRoom", "namespaceId": "8b0bbbc752d84c73b7232654987e1f75" },
+      "DEVICE_ROOMS": { "className": "DeviceRoom", "namespaceId": "49e1cfac2aac4ccdb749254a7a817691" },
+      "AUTH_GRANTS": { "className": "AuthGrant", "namespaceId": "46e81f4662fe4065ab78581d316206a5" }
+    },
+    "r2": { "binding": "BLOBS", "bucketName": "ashler-comet-staging-blobs" },
+    "gcs": {
+      "bucketSecretBinding": "COMET_RELEASES_GCS_BUCKET",
+      "readerSecretBindings": ["GCP_RELEASE_SERVICE_ACCOUNT_EMAIL", "GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY"],
+      "bucketIdentifier": null,
+      "reason": "Existing secret value is retained in place; no value copied, decrypted, provisioned or guessed."
+    }
+  },
+  "migrationLineage": [
+    { "tag": "v1", "new_sqlite_classes": ["SessionRoom", "DeviceRoom"] },
+    { "tag": "v2", "new_sqlite_classes": ["AuthGrant"] },
+    { "tag": "native-v2", "new_sqlite_classes": ["NativeAuthGrant", "NativeDeviceRoom", "NativePreviewRoom", "NativeRegistryRoom", "NativeChatRoom"] }
+  ],
+  "nativeBindings": {
+    "NATIVE_AUTH_GRANTS": "NativeAuthGrant",
+    "NATIVE_DEVICE_ROOMS": "NativeDeviceRoom",
+    "NATIVE_PREVIEW_ROOMS": "NativePreviewRoom",
+    "NATIVE_REGISTRY_ROOMS": "NativeRegistryRoom",
+    "NATIVE_CHAT_ROOMS": "NativeChatRoom"
+  },
+  "storageDisjointness": {
+    "legacyKeyForms": ["att/${identity.projectScope}/${sha256}", "backup/rooms/${durableObjectId}/latest.loro"],
+    "legacyBundleReferences": ["index.js:10812", "index.js:11281-11292"],
+    "nativePrefix": "native-v2/",
+    "nativeKeyForms": ["native-v2/blob/${userId}/${chatId}/${partId}", "native-v2/backup/chat2/${durableObjectId}/latest.json", "native-v2/backup/registry/${durableObjectId}/latest.json"],
+    "proof": "Every native HTTP/new DO get/head/put is wrapped at construction by nativeBlobStore. Fixed first path segment native-v2 is disjoint from both fixed legacy first segments att and backup. No list/delete/multipart capability is exposed. Legacy classes and rollback receive the original unwrapped bucket."
+  },
+  "retainedReleaseRoute": {
+    "methods": ["GET", "HEAD"],
+    "path": "/api/releases/<filename>",
+    "filenamePattern": "^[A-Za-z0-9._-]{1,200}$",
+    "handler": "Recovered legacy default.fetch(request, rawEnv)",
+    "legacyBundleReferences": ["index.js:11075-11095", "index.js:263-282", "index.js:294-323", "index.js:404-420", "index.js:570-655"],
+    "noWriteEvidence": "On this exact path public/authenticated grant mutation routes return without action; Scaffold auth uses read-only authority fetch, or old device /authenticate reads grant storage without put/delete. Release reader requests devstorage.read_only OAuth scope and issues only GCS GET/HEAD. No R2 or session/device namespace operation is reached. OAuth token exchange POST is not a resource/data write.",
+    "notAliases": ["/releases/*", "/install.sh"],
+    "channelMutation": false,
+    "releasesR2Binding": false
+  },
+  "authorityProfile": {
+    "wireVersion": "scaffold.comet-runtime.v1",
+    "implementation": "src/auth-routes.ts fixed SCAFFOLD_AUTHORITY_PROFILE_VERSION; no environment override or accept-both admission",
+    "publishedPlatformCommit": "d9843237f17f1312559a4d7c654138d72fab8b2c",
+    "publishedPlatformSources": ["control-plane/worker/src/index.ts:10103", "control-plane/worker/src/index.ts:10161-10186", "control-plane/worker/src/index.ts:10205-10223", "control-plane/worker/src/index.ts:10314-10347", "native-crew-runner.mjs:51"],
+    "archiveCompatibility": "scaffold.comet-runtime.v2 is the independent archive/install/status marker, not the authority HTTP profile version",
+    "consumerCoverage": "test/staging/retention.test.ts uses published v1 profiles for native issuance and epoch retirement, rejecting v2 and unsupported profile versions; checks not run for this source correction"
+  },
+  "nativeEpochFence": {
+    "implementation": "src/native-grant-epoch.ts plus shared AuthGrant transitions in src/auth-routes.ts",
+    "namespace": "Existing NATIVE_AUTH_GRANTS only, exposed internally as activeNativeEnv.NATIVE_GRANT_EPOCHS; property presence requires the fence and an unavailable binding fails closed. No new binding, class, resource, migration or external configuration knob",
+    "objectName": "native-epoch/<JSON tuple of verified ownerUserId, projectId, deploymentId, sessionId, logical sandboxId>",
+    "storageKey": "native-epoch",
+    "value": "Complete scope tuple plus monotonic lifecycleEpoch and exact targetDeviceId for that epoch; no bearer/access secret stored in coordinator",
+    "advanceAuthority": "Only server-verified v1 profile issuance sets the internal issuer header after verifiedSandboxTarget and ownership checks. No public header is forwarded; direct dev issuance cannot pass verifiedSandboxTarget. Coordinator calls additionally require their deterministic scope object ID, never an ordinary 32-hex grant object ID.",
+    "ordering": "AuthGrant blockConcurrencyWhile serializes coordinator compare/write operations. Higher verified epochs advance durably; lower epochs and equal-epoch conflicting devices fail closed. Per-grant issue rechecks after local storage so a concurrent newer issue cannot publish an older usable grant. Failed stores never roll the fence back.",
+    "consumers": "Shared exchange/authenticate/refresh check the current fence before transitions and again after hash/storage awaits. Existing HTTP authentication and socket receive/silent-delivery revalidation inherit this rejection without per-endpoint guards. Missing/corrupt state or authority failures fail closed; checks never create authority.",
+    "legacyPreservation": "Exact recovered legacy classes/raw env and independent canary do not enable this internal native-only view; their grant records, namespaces and alarms remain unchanged.",
+    "linearization": "Authorization linearizes at the final coordinator check. Work already authorized before a newer epoch commits is not retroactively retracted; no cross-operation lease/global transaction protocol is claimed."
+  },
+  "forwardRollback": {
+    "entry": "src/staging-rollback.ts",
+    "defaultHandler": "Exact recovered legacy HTTP with raw original env",
+    "retainedExports": ["AuthGrant", "DeviceRoom", "SessionRoom", "sessionRoomKey", "NativeAuthGrant", "NativeDeviceRoom", "NativePreviewRoom", "NativeRegistryRoom", "NativeChatRoom"],
+    "configuration": "Same complete env.staging bindings/resources/vars/migration history as candidate; CLI entry override only",
+    "artifactBuild": "node edge/scripts/staging-artifacts.mjs build OUTPUT_DIRECTORY",
+    "artifactVerification": "node edge/scripts/staging-artifacts.mjs verify OUTPUT_DIRECTORY",
+    "activationRequirement": "Both sealed candidate and forward-retained rollback archives and shared config proof must verify before activation. No direct Worker version rollback after native-v2 class additions.",
+    "deployed": false
+  }
+}

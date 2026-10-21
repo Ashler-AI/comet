@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // Root is deliberately undeployable: only the reviewed staging workflow may publish.
-  // No production environment or custom domain is claimed by this cutover config.
+  // Root deployment stays disabled. Canonical staging retains the captured
+  // account/domain/bucket and original v1/v2 DO lineage; production is absent.
   "name": "ashler-comet-edge-local-only",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
@@ -11,12 +11,11 @@
   "alias": { "loro-crdt": "loro-crdt/base64" },
   "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" },
   "env": {
-    "staging": {
-      "name": "ashler-comet-edge-staging-native",
+    // Local simulation of the same native entry, never a second deployed product.
+    "local": {
+      "name": "ashler-comet-edge-local-only",
       "workers_dev": false,
       "preview_urls": false,
-      // The migration gate transfers the stable custom domain separately, never during candidate deploy.
-      // CLOUDFLARE_ACCOUNT_ID comes from the existing protected staging CI environment.
       "routes": [],
       "durable_objects": {
         "bindings": [
@@ -28,23 +27,50 @@
           { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
         ]
       },
-      // Fresh Worker-local namespaces; never import or delete the legacy Worker's classes/data.
       "migrations": [{
-        "tag": "crew-staging-native-v1",
+        "tag": "local-v1",
         "new_sqlite_classes": ["SessionRoom", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom", "AuthGrant"]
       }],
-      "r2_buckets": [
-        { "binding": "BLOBS", "bucket_name": "ashler-comet-staging-native-blobs" }
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "crew-local-blobs" }],
+      "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" }
+    },
+    "staging": {
+      "name": "ashler-comet-edge-staging",
+      "account_id": "dd15bb23eb5c14365fe2621acc049e01",
+      "main": "src/staging.ts",
+      "compatibility_date": "2026-08-04",
+      "compatibility_flags": ["nodejs_compat"],
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [{ "pattern": "comet-staging.internal.ashler.com", "custom_domain": true }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
+          { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+          { "name": "AUTH_GRANTS", "class_name": "AuthGrant" },
+          { "name": "NATIVE_AUTH_GRANTS", "class_name": "NativeAuthGrant" },
+          { "name": "NATIVE_DEVICE_ROOMS", "class_name": "NativeDeviceRoom" },
+          { "name": "NATIVE_PREVIEW_ROOMS", "class_name": "NativePreviewRoom" },
+          { "name": "NATIVE_REGISTRY_ROOMS", "class_name": "NativeRegistryRoom" },
+          { "name": "NATIVE_CHAT_ROOMS", "class_name": "NativeChatRoom" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["SessionRoom", "DeviceRoom"] },
+        { "tag": "v2", "new_sqlite_classes": ["AuthGrant"] },
+        { "tag": "native-v2", "new_sqlite_classes": ["NativeAuthGrant", "NativeDeviceRoom", "NativePreviewRoom", "NativeRegistryRoom", "NativeChatRoom"] }
       ],
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "ashler-comet-staging-blobs" }],
+      // ORIGINAL legacy values; native-only v2 scope/capabilities live in the adapter.
+      // Existing GCS/APNs secrets remain in place; no new release R2 binding.
       "vars": {
         "AUTH_MODE": "scaffold",
         "ENVIRONMENT": "staging",
+        "APNS_TOPIC": "ai.ashler.crew.staging",
+        "APNS_TEAM_ID": "825LYXGJR6",
         "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
         "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
-        "SCAFFOLD_DEPLOYMENT_ID": "ashler-staging",
-        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment",
-        "APNS_TOPIC": "ai.ashler.crew.staging",
-        "APNS_TEAM_ID": "825LYXGJR6"
+        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
       }
     }
   },

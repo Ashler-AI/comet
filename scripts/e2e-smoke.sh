@@ -89,7 +89,7 @@ echo "edge: starting isolated local worker on :$EDGE_PORT"
 set -m
 (
   cd "$ROOT/edge"
-  exec node_modules/.bin/wrangler dev --env canary --local --ip 127.0.0.1 \
+  exec node_modules/.bin/wrangler dev --env local --local --ip 127.0.0.1 \
     --port "$EDGE_PORT" --persist-to "$LOG_DIR/edge" \
     --var AUTH_MODE:dev --var ENVIRONMENT:local \
     --var "SCAFFOLD_PROJECT_SCOPE:$ORG" --var "SCAFFOLD_DEPLOYMENT_ID:$ORG" \

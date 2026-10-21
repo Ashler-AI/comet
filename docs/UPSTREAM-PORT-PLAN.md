@@ -1,6 +1,6 @@
 # Crew on current upstream: port and update plan
 
-## Current delivery: staging native cutover 0.2.114
+## Current delivery: staging native cutover 0.2.116
 
 The staging cutover replaces the maintained legacy implementation with this
 upstream-based source. Production deployment, release channels and profiles remain
@@ -12,6 +12,10 @@ establish authoritative old-writer fences and verify retained-history migration,
 then activate the native runtime and promote the exact candidate. Follow
 [`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md); candidate publication
 alone is not activation or a successful migration.
+
+The earlier [0.2.115 candidate](https://github.com/Ashler-AI/comet/actions/runs/39643038860)
+was published immutably from `2aa451d1` without moving channels. These follow-on
+repairs use 0.2.116; they must not replace the already-published 0.2.115 objects.
 
 Integration with native main `79ce43e3` passed 48 release/packaging/privacy/signature
 checks, nine native web contracts, and the real Linux tarball, release-install and
@@ -854,7 +858,37 @@ fixture checks passed locally. Shallow history still yields no inert-bootstrap
 proof; complete authenticated backup/import and current-source remote CI remain
 separate cutover gates.
 
-Status: implementation and verification in progress; no production cutover.
+The earlier 0.2.114 integration source is merged; these follow-on repairs require
+current-source CI. Canonical staging activation follows the gate below.
+No production cutover is authorized.
+
+### Canonical staging native runtime (0.2.115)
+
+Archive compatibility `scaffold.comet-runtime.v2` packages the native binary with `crew-web` and the
+`crew.native.web.v1` contract. Platform installs and verifies the immutable archive;
+the controller no longer uploads or reinstalls a caller-selected runtime. Native
+DATA is `.scaffold/crew-data`, web assets are `.scaffold/crew/web`, and IPC is 39400.
+This archive version is not the authority wire schema: create, inspect and target
+proof retain Platform's independently versioned `scaffold.comet-runtime.v1` envelope.
+Attachment reuses matching live authority or makes one supervised launch, then
+confirms owner, scope, sandbox, device, epoch and capabilities. Every outcome after
+bootstrap upload is attempted gets one independent, bounded cleanup attempt;
+transport failure can prevent removal, without replacing the original result.
+
+Canonical staging retains the exact deployed ae2 legacy classes, WASM, raw bindings
+and alarm implementation. New native classes use separate namespaces and the
+`native-v2/` blob prefix. A newer verified native admission fences older credentials
+and connected readers/writers; it is not a separate stop/pause revocation feed or
+retroactive cancellation of already-authorized operations.
+
+Candidate and forward-retained rollback artifacts bind the complete staging config
+and exact legacy bytes. Rollback is a forward deployment retaining both generations,
+not a Cloudflare version rollback across new Durable Object classes. Publish only a
+merged-main `release.yml` `desktop-and-scaffold` / `staging-candidate` tuple first;
+this does not move release channels. A fresh independently signed-in controller uses
+its own DATA and IPC 27957. Hold the single `deploy.yml` staging switch for matched
+Platform fresh-image readiness and the verified rollback pair. No profile import,
+old-data migration, production deployment or independent channel movement is allowed.
 
 ## Decision
 

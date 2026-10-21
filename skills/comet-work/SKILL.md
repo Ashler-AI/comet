@@ -19,17 +19,17 @@ Use the repository's reviewed merge controls. Record the exact merged commit and
 
 ## 3. Publish and verify staging
 
-The 0.2.114 cutover requires release compatibility marker `scaffold.comet-runtime.v2` in both repositories. First build, sign, verify and publish the immutable staging candidate without claiming Platform deployment:
+The 0.2.116 cutover requires release compatibility marker `scaffold.comet-runtime.v2` in both repositories. First build, sign, verify and publish the immutable staging candidate without claiming Platform deployment:
 
 ```sh
 gh workflow run release.yml --repo Ashler-AI/comet --ref main \
-  -f version=0.2.114 \
+  -f version=0.2.116 \
   -f release_surface=desktop-and-scaffold \
   -f promotion_target=staging-candidate \
   -f scaffold_runtime_deployment=unchanged
 ```
 
-Wait for that run to succeed and record its run ID as `candidate_run_id`. This phase publishes only `releases/0.2.114/*` in the private staging bucket; it does not move channel/installer aliases, latest pointers or Scaffold pins. Signature, checksum, provenance and bucket-privacy gates still apply. `unchanged` here is not a claim that the new runtime is deployed: candidate-only publication stops before the deployment acknowledgement guard.
+Wait for that run to succeed and record its run ID as `candidate_run_id`. This phase publishes only `releases/0.2.116/*` in the private staging bucket; it does not move channel/installer aliases, latest pointers or Scaffold pins. Signature, checksum, provenance and bucket-privacy gates still apply. `unchanged` here is not a claim that the new runtime is deployed: candidate-only publication stops before the deployment acknowledgement guard.
 
 Use the verified immutable versioned manifest and Linux archive tuple to deploy compatible staging Platform support and complete its required migration. Verify the resulting runtime/admission/browser contracts before advancing Crew channels. Preserve existing snapshots and profile/wire v1; do not redirect them blindly to the new runtime.
 
@@ -37,7 +37,7 @@ Only after those Platform deployment/migration checks succeed, promote the exact
 
 ```sh
 gh workflow run release.yml --repo Ashler-AI/comet --ref main \
-  -f version=0.2.114 \
+  -f version=0.2.116 \
   -f release_surface=desktop-and-scaffold \
   -f promotion_target=staging \
   -f scaffold_runtime_deployment=staging-deployed \
@@ -65,7 +65,7 @@ The `comet-release-staging` environment must also bind `CLOUDFLARE_ACCOUNT_ID`, 
 
 Report the staging run and version, then obtain explicit operator approval before any production action. A successful workflow, silence, or a source change is not production authorization. The operator must update/restart the signed Crew Staging app and verify the changed behavior. Keep `Crew.app`, production profiles, production release pointers and production Scaffold pins untouched during a staging-only assignment.
 
-The 0.2.114 native cutover is staging-only: do not promote production or repin production Scaffold.
+The 0.2.116 native cutover is staging-only: do not promote production or repin production Scaffold.
 
 ## 5. Future production promotion (separate authorization required)
 

@@ -68,7 +68,7 @@ export function loadConfig(env = process.env) {
   requireValue(Number.isInteger(port) && port > 0 && port <= 65535, 'Invalid HTTP port');
   requireValue(ipcPort === 39400, 'Native COMET_IPC_PORT must be 39400');
   requireValue(typeof env.CREW_WEB_AUTH_TOKEN === 'string' && env.CREW_WEB_AUTH_TOKEN.length >= 32, 'Trusted proxy token required');
-  requireValue(env.COMET_DATA_DIR?.startsWith('/') && env.COMET_DATA_DIR.endsWith('/.scaffold/crew-data') && env.SCAFFOLD_RUNTIME_DIR?.startsWith('/') && env.SCAFFOLD_RUNTIME_DIR.endsWith('/.scaffold/crew'), 'Canonical native data and runtime directories required');
+  requireValue(env.COMET_DATA_DIR?.startsWith('/') && env.COMET_DATA_DIR.endsWith('/.scaffold/crew-data') && env.SCAFFOLD_RUNTIME_DIR?.startsWith('/'), 'Canonical native data and runtime directories required');
   return { sessionId, sandboxId: profile.sandboxId, projectId: profile.projectId, deploymentId: profile.deploymentId,
     deviceId: profile.targetDeviceId, ownerSubject: profile.actor.sub, lifecycleEpoch: profile.lifecycleEpoch,
     host: env.CREW_WEB_HOST || '127.0.0.1', port, ipcPort,

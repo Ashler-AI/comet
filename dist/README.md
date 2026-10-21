@@ -3,7 +3,7 @@
 One upstream-based implementation produces the native desktop and headless Crew
 runtime. Internal Cargo packages and artwork filenames may remain `zeron`; the
 published compatibility executable is **`comet`**. The workspace release is
-**0.2.114**. This cutover authorizes staging only: do not publish production or
+**0.2.116**. This cutover authorizes staging only: do not publish production or
 repin production Scaffold. The authoritative lifecycle is
 [`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md).
 
@@ -49,8 +49,8 @@ the app and the extracted updater archive without repairing signatures.
 
 | Environment | App / identifier | URL scheme | Artifacts |
 | --- | --- | --- | --- |
-| staging | `Crew Staging.app` / `ai.ashler.comet.staging` | `comet-staging:` | `target/package/staging/comet-staging-0.2.114-macos-arm64.dmg`, `comet-staging-0.2.114-macos-arm64-app.tar.gz` |
-| production identity | `Crew.app` / `ai.ashler.comet` | `comet:` | `target/package/comet-0.2.114-macos-arm64.dmg`, `comet-0.2.114-macos-arm64-app.tar.gz` |
+| staging | `Crew Staging.app` / `ai.ashler.comet.staging` | `comet-staging:` | `target/package/staging/comet-staging-0.2.116-macos-arm64.dmg`, `comet-staging-0.2.116-macos-arm64-app.tar.gz` |
+| production identity | `Crew.app` / `ai.ashler.comet` | `comet:` | `target/package/comet-0.2.116-macos-arm64.dmg`, `comet-0.2.116-macos-arm64-app.tar.gz` |
 
 Building production-identity candidate bytes does not publish production.
 `COMET_PACKAGE_ENVIRONMENT` defaults to `production` for legacy release
@@ -71,7 +71,7 @@ Credential-free release verification on macOS:
 COMET_MACOS_SIGNING_TEAM_ID=ABCDE12345 \
   scripts/verify-macos-app.sh '/path/to/Crew Staging.app' ai.ashler.comet.staging
 COMET_MACOS_SIGNING_TEAM_ID=ABCDE12345 \
-  scripts/verify-macos-release.sh "$CANDIDATE_DIR" 0.2.114
+  scripts/verify-macos-release.sh "$CANDIDATE_DIR" 0.2.116
 ```
 
 The verifier requires one well-formed checksum entry for each expected DMG and
@@ -90,7 +90,7 @@ scripts/package-linux.sh
 # PROFILE=debug scripts/package-linux.sh  # local fixture package
 ```
 
-Produces `target/package/comet-0.2.114-linux-<arch>.tar.gz` for `x86_64` or `aarch64`,
+Produces `target/package/comet-0.2.116-linux-<arch>.tar.gz` for `x86_64` or `aarch64`,
 containing the native `comet` executable, Crew desktop entry/icons, licenses,
 installer, and the complete `crew-web/` fixed-session browser assets. The browser
 contract sidecar travels with these assets. Scaffold supplies Node and selects
@@ -127,18 +127,18 @@ packages. The workflow installs these on Ubuntu 24.04 x86_64 and arm64 runners.
 
 `release.yml` is **workflow_dispatch only**. Merges, pushes and version tags cannot
 publish desktop/Linux releases. Regression tests live in `release-contracts.yml`
-and existing platform workflows, separate from packaging/publication. The 0.2.114
+and existing platform workflows, separate from packaging/publication. The 0.2.116
 cutover uses two phases. First build both signed macOS identities and Linux, then
 publish the verified immutable candidate without advancing channels:
 
 ```sh
 gh workflow run release.yml --repo Ashler-AI/comet --ref main \
-  -f version=0.2.114 -f release_surface=desktop-and-scaffold \
+  -f version=0.2.116 -f release_surface=desktop-and-scaffold \
   -f promotion_target=staging-candidate -f scaffold_runtime_deployment=unchanged
 ```
 
 Wait for success and record that run's ID as `candidate_run_id`. Candidate-only
-publication writes `releases/0.2.114/*` in the private staging bucket and stops
+publication writes `releases/0.2.116/*` in the private staging bucket and stops
 before the deployment guard: no moving channel/installer aliases, latest pointers
 or Scaffold pins change, and no compatible deployment is claimed. All signing,
 checksum, provenance and bucket-privacy gates remain enforced.
@@ -154,7 +154,7 @@ Then promote the exact candidate bytes, without rebuilding or re-signing:
 
 ```sh
 gh workflow run release.yml --repo Ashler-AI/comet --ref main \
-  -f version=0.2.114 -f release_surface=desktop-and-scaffold \
+  -f version=0.2.116 -f release_surface=desktop-and-scaffold \
   -f promotion_target=staging -f scaffold_runtime_deployment=staging-deployed \
   -f candidate_run_id="${candidate_run_id:?Set the successful immutable candidate run ID}"
 ```

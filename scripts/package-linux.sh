@@ -66,12 +66,12 @@ cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
 
 # The sandbox serves this fixed-session viewport from the same immutable release
 # as its Crew engine. No package installation or frontend build runs at boot.
-mkdir -p "$STAGE/crew-web"
-tar -cf - --exclude='*.test.mjs' --exclude=node_modules --exclude=package-lock.json \
-  -C "$ROOT/apps/web" . | tar -xf - -C "$STAGE/crew-web"
-test -f "$STAGE/crew-web/server.mjs"
-test -f "$STAGE/crew-web/public/index.html"
-install -m 644 "$ROOT/apps/web/contract.json" "$STAGE/crew-web-contract.json"
+mkdir -p "$STAGE/crew-web/public"
+for asset in server.mjs rpc.mjs package.json contract.json public/index.html public/app.js public/style.css; do
+  test -s "$ROOT/apps/web/$asset"
+  install -m 644 "$ROOT/apps/web/$asset" "$STAGE/crew-web/$asset"
+done
+install -m 644 "$STAGE/crew-web/contract.json" "$STAGE/crew-web-contract.json"
 
 sed "s/__VERSION__/$VERSION/g" >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash

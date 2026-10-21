@@ -119,7 +119,7 @@ mod tests {
             ipc_port: 0, edge_token: Some("local-update-token".into()),
             default_harness: zeron_engine::HarnessId::Mock, org_id: None,
             workos_client_id: None, scaffold: None, device: None,
-            managed_inference: false, device_bootstrap_file: None, scaffold_runtime_artifact: None,
+            managed_inference: false, device_bootstrap_file: None,
         };
         let (tokens, lock) = update_authentication(&config).await.unwrap();
         assert!(lock.is_some());

@@ -145,8 +145,6 @@ pub struct EngineConfig {
     pub managed_inference: bool,
     /// Consume the private one-use bootstrap only after verified exchange.
     pub device_bootstrap_file: Option<PathBuf>,
-    /// Immutable Linux runtime artifact installed into isolated canary sandboxes.
-    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -907,14 +905,8 @@ impl Engine {
                 &authority.control_origin, &authority.project_scope, tokens.clone(),
             )?;
             let grants = scaffold::EdgeDeviceJoinGrantClient::new(&config.edge_url, tokens.clone())?;
-            let mut runtime = scaffold::ScaffoldRuntime::new(client, &config.edge_url, Arc::new(grants))
-                .with_deployment_id(deployment)
-                .with_remote_executable(".scaffold/crew/bin/comet".into())
-                .with_remote_data_dir(".scaffold/crew-data".into())
-                .with_remote_ipc_port(39400);
-            if let Some((path, sha256)) = &config.scaffold_runtime_artifact {
-                runtime = runtime.with_runtime_artifact(path.clone(), sha256.clone())?;
-            }
+            let runtime = scaffold::ScaffoldRuntime::new(client, &config.edge_url, Arc::new(grants))
+                .with_deployment_id(deployment);
             Some((auth.clone(), runtime))
         } else {
             None
@@ -1446,7 +1438,7 @@ mod device_bootstrap_tests {
                 session_id: "session".into(), deployment_id: "deployment".into(),
                 sandbox_id: "box".into(), lifecycle_epoch: 1,
             }),
-            device_bootstrap_file: None, scaffold_runtime_artifact: None,
+            device_bootstrap_file: None,
         };
         for restart in [false, true] {
             if restart { config.device = None; }

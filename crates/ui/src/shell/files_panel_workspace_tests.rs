@@ -190,7 +190,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
             crate::composer::init(cx, settings.composer_send_behavior);
             crate::terminal::panel::init(cx);
             crate::app_menus::init(cx);
-            let boot = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: data,
+            let boot = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: data,
             ipc_port: port,
             edge_url: String::new(),
             edge_token: None,

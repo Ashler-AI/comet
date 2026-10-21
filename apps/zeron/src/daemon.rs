@@ -42,10 +42,6 @@ pub fn install(config: &zeron_engine::EngineConfig) -> anyhow::Result<()> {
             env.push(("COMET_DEPLOYMENT_ID".into(), deployment.clone()));
         }
     }
-    if let Some((binary, digest)) = &config.scaffold_runtime_artifact {
-        env.push(("COMET_SCAFFOLD_RUNTIME_BINARY".into(), binary.to_string_lossy().into_owned()));
-        env.push(("COMET_SCAFFOLD_RUNTIME_SHA256".into(), digest.clone()));
-    }
     if cfg!(target_os = "macos") {
         let plist = launchd_plist_path()?;
         std::fs::create_dir_all(plist.parent().expect("LaunchAgents parent"))?;

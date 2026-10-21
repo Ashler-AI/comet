@@ -1,8 +1,8 @@
 name: deploy
 
-# Manual native staging candidates only. Configure required reviewers on both
-# comet-staging (Worker deploy) and comet-release-staging (release-reader secrets).
-# Stable domains, landing, and www remain untouched until the migration gate.
+# Canonical staging candidates only. Required reviewers protect Worker deployment
+# and release-reader synchronization. Retained legacy state and rollback are sealed
+# with the native candidate; production has no deployment path here.
 on:
   workflow_dispatch:
     inputs:
@@ -29,12 +29,29 @@ defaults:
     shell: bash
 
 jobs:
+  # Refuse unauthorized targets before checkout, tooling or protected secrets.
+  staging-scope:
+    if: github.repository_owner == 'Ashler-AI'
+    runs-on: ubuntu-24.04
+    steps:
+      - id: target
+        name: Reject targets outside this staging-only authorization
+        env:
+          REQUESTED_TARGET: ${{ inputs.target }}
+        run: |
+          case "$REQUESTED_TARGET" in
+            candidate|staging) ;;
+            *) echo "::error::This native/retained-rollback candidate is staging-only. Production requires independent qualification and authorization."; exit 1 ;;
+          esac
+
   candidate:
     if: github.repository_owner == 'Ashler-AI'
+    needs: staging-scope
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}
       digest: ${{ steps.candidate.outputs.digest }}
+      rollback_digest: ${{ steps.candidate.outputs.rollback_digest }}
     steps:
       - id: source_request
         name: Require reviewed immutable source and staging-only target
@@ -66,6 +83,15 @@ jobs:
         run: npm ci
       - name: Verify native browser contracts
         run: node --test apps/web/server.test.mjs
+      - name: Test staging artifact sealing
+        run: node --test edge/scripts/staging-artifacts.test.mjs
+      - name: Generate Worker binding types
+        working-directory: edge
+        run: npm run types
+      - name: Require current Worker binding declarations
+        run: |
+          git ls-files --error-unmatch -- edge/worker-configuration.d.ts
+          git diff --exit-code -- edge/worker-configuration.d.ts
       - name: Typecheck
         working-directory: edge
         run: npm run typecheck
@@ -74,29 +100,39 @@ jobs:
         run: npm test
       - name: Test release contracts and secret synchronization behavior
         run: node --test scripts/release-workflow.test.mjs
-      - name: Build native staging candidate once
+      - name: Test retained canonical staging boundaries
         working-directory: edge
-        run: npx wrangler deploy --config wrangler.jsonc --env staging --dry-run --outdir "$RUNNER_TEMP/comet-edge-candidate"
+        run: npx vitest run -c vitest.staging.config.ts
+      - name: Build canonical candidate and forward-retained rollback once
+        run: node edge/scripts/staging-artifacts.mjs build "$RUNNER_TEMP/comet-edge-pair"
       - id: candidate
-        name: Seal reviewed candidate
+        name: Seal candidate and forward-retained rollback digests
         env:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
-          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-            -czf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/comet-edge-candidate" .
+          for kind in candidate rollback; do
+            tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -czf "comet-edge-$kind.tar.gz" -C "$RUNNER_TEMP/comet-edge-pair/$kind" .
+            sha256sum "comet-edge-$kind.tar.gz" > "comet-edge-$kind.tar.gz.sha256"
+          done
           digest="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
-          jq -n --arg digest "$digest" --arg commit "$SOURCE_SHA" \
+          rollback_digest="$(sha256sum comet-edge-rollback.tar.gz | cut -d' ' -f1)"
+          jq -n --arg digest "$digest" --arg rollbackDigest "$rollback_digest" --arg commit "$SOURCE_SHA" \
             --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{schemaVersion:1,sha256:$digest,sourceCommit:$commit,workflowRun:$workflowRun}' \
+            '{schemaVersion:2,sha256:$digest,rollbackSha256:$rollbackDigest,sourceCommit:$commit,workflowRun:$workflowRun,proof:"staging-proof.json"}' \
             > comet-edge-candidate.provenance.json
+          echo "rollback_digest=$rollback_digest" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: comet-edge-candidate-${{ steps.source.outputs.sha }}
           path: |
             comet-edge-candidate.tar.gz
+            comet-edge-candidate.tar.gz.sha256
             comet-edge-candidate.provenance.json
+            comet-edge-rollback.tar.gz
+            comet-edge-rollback.tar.gz.sha256
           if-no-files-found: error
 
   sync-staging-release-feed-secrets:
@@ -148,25 +184,29 @@ jobs:
         with:
           name: comet-edge-candidate-${{ needs.candidate.outputs.sha }}
       - id: verify
-        name: Verify candidate bytes and reviewed source
+        name: Verify both candidate bytes and retained rollback against reviewed source
         env:
           SOURCE_SHA: ${{ needs.candidate.outputs.sha }}
           EXPECTED_DIGEST: ${{ needs.candidate.outputs.digest }}
+          EXPECTED_ROLLBACK_DIGEST: ${{ needs.candidate.outputs.rollback_digest }}
         run: |
           set -euo pipefail
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          sha256sum --check comet-edge-candidate.tar.gz.sha256 comet-edge-rollback.tar.gz.sha256
           actual="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          rollback_actual="$(sha256sum comet-edge-rollback.tar.gz | cut -d' ' -f1)"
           test "$actual" = "$EXPECTED_DIGEST"
-          jq -e --arg digest "$actual" --arg commit "$SOURCE_SHA" \
+          test "$rollback_actual" = "$EXPECTED_ROLLBACK_DIGEST"
+          jq -e --arg digest "$actual" --arg rollbackDigest "$rollback_actual" --arg commit "$SOURCE_SHA" \
             --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '.schemaVersion == 1 and .sha256 == $digest and .sourceCommit == $commit and .workflowRun == $workflowRun' \
+            '.schemaVersion == 2 and .sha256 == $digest and .rollbackSha256 == $rollbackDigest and .sourceCommit == $commit and .workflowRun == $workflowRun and .proof == "staging-proof.json"' \
             comet-edge-candidate.provenance.json > /dev/null
-          mkdir "$RUNNER_TEMP/candidate"
-          tar -xzf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/candidate"
-          mapfile -t entries < <(find "$RUNNER_TEMP/candidate" -maxdepth 1 -type f -name '*.js')
-          test "${#entries[@]}" -eq 1
-          echo "entry=${entries[0]}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/verified-edge/candidate" "$RUNNER_TEMP/verified-edge/rollback"
+          tar -xzf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/verified-edge/candidate"
+          tar -xzf comet-edge-rollback.tar.gz -C "$RUNNER_TEMP/verified-edge/rollback"
+          node edge/scripts/staging-artifacts.mjs verify "$RUNNER_TEMP/verified-edge"
+          echo "entry=$RUNNER_TEMP/verified-edge/candidate/staging.js" >> "$GITHUB_OUTPUT"
       - name: Deploy exact candidate to native staging only
         working-directory: edge
         env:

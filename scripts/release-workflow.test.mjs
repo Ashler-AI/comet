@@ -481,6 +481,15 @@ describe("release channel publication", () => {
 });
 
 describe("Crew edge deployment", () => {
+  it("rejects production dispatch before candidate or secret jobs can start", async (t) => {
+    const script = shellStep(await read(".github/workflows/deploy.yml"), "staging-scope", "target");
+    const dir = scratch(t);
+    for (const target of ["candidate", "staging", "production", "", "canary"]) {
+      const result = command(dir, "bash", ["-c", script], { REQUESTED_TARGET: target });
+      assert.equal(result.status === 0, ["candidate", "staging"].includes(target), result.stderr);
+    }
+  });
+
   it("accepts only the dispatched reviewed source before installing candidate tooling", async (t) => {
     const script = shellStep(await read(".github/workflows/deploy.yml"), "candidate", "source_request");
     const dir = scratch(t);

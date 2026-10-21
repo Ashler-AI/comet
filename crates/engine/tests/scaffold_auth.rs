@@ -287,7 +287,7 @@ async fn sandbox_storage_survives_epoch_change_without_reusing_authority() {
                 data_dir:dir.path().into(), edge_url:session.edge_origin.clone(), edge_token:None,
                 ipc_port:0, default_harness:HarnessId::Mock, org_id:None, workos_client_id:None,
                 scaffold:config.scaffold, device:config.device, managed_inference:false,
-                device_bootstrap_file:None, scaffold_runtime_artifact:None,
+                device_bootstrap_file:None,
             };
             assert!(Engine::assemble_runtime(&runtime_config, auth.clone(), old.clone()).await.is_err(), "old auth fingerprint must be rejected even with identical storage");
             let binding = std::fs::read_dir(legacy.parent().unwrap()).unwrap()

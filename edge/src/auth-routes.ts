@@ -1,21 +1,15 @@
 import { bearerFromRequest, credentialTransportAllowed, type Verified } from "./auth";
 import { AUTH_USER_HEADER, type Env } from "./env";
+import { handleNativeGrantEpoch, nativeGrantEpoch, NATIVE_GRANT_ISSUER_HEADER, type NativeGrantEpoch } from "./native-grant-epoch";
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const GRANT_TTL_MS = 15 * 60 * 1000;
 const ACCESS_TTL_MS = 12 * 60 * 60 * 1000;
-const SCAFFOLD_COMET_RUNTIME_VERSION = "scaffold.comet-runtime.v1";
+const SCAFFOLD_AUTHORITY_PROFILE_VERSION = "scaffold.comet-runtime.v1";
 
-interface GrantRecord {
+interface GrantRecord extends NativeGrantEpoch {
   grantId: string;
-  ownerUserId: string;
   email: string;
-  projectId: string;
-  deploymentId: string;
-  sandboxId: string;
-  targetDeviceId: string;
-  sessionId: string;
-  lifecycleEpoch: number;
   capabilities: string[];
   grantHash: string;
   issuedAt: number;
@@ -66,7 +60,7 @@ const grantStub = (env: Env, id: string): DurableObjectStub =>
 
 /** One DO per grant keeps exchange atomic and makes unknown/revoked grants deny. */
 export class AuthGrant implements DurableObject {
-  constructor(private readonly ctx: DurableObjectState, _env: Env) {}
+  constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {}
 
   async fetch(request: Request): Promise<Response> {
     return this.ctx.blockConcurrencyWhile(() => this.handle(request));
@@ -74,17 +68,42 @@ export class AuthGrant implements DurableObject {
 
   private async handle(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    const epochs = this.env.NATIVE_GRANT_EPOCHS;
+    if ("NATIVE_GRANT_EPOCHS" in this.env && !epochs) {
+      return json({ error: "epoch_authority_unavailable" }, 503);
+    }
+    if (epochs) {
+      const response = await handleNativeGrantEpoch(this.ctx, this.env, request);
+      if (response) return response;
+    }
     if (path === "/issue" && request.method === "POST") {
       const record = await bodyJson<GrantRecord>(request);
       if (!record || (await this.ctx.storage.get<GrantRecord>("grant"))) {
         return json({ error: "grant_conflict" }, 409);
       }
+      if (epochs) {
+        // Public issuance reaches this call only after verifiedSandboxTarget and
+        // ownership checks; no client header or unverified target is forwarded.
+        if (request.headers.get(NATIVE_GRANT_ISSUER_HEADER) !== "1" ||
+            !/^[a-f0-9]{32}$/.test(record.grantId) ||
+            this.env.AUTH_GRANTS.idFromName(record.grantId).toString() !== this.ctx.id.toString()) {
+          return json({ error: "forbidden" }, 403);
+        }
+        if (!(await nativeGrantEpoch(epochs, record, "advance"))) return json({ error: "stale_epoch" }, 409);
+      }
       await this.ctx.storage.put("grant", record);
+      // A newer verified issuance may overtake the local store. Never publish
+      // an older grant as usable, and never roll its coordinator backward.
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "stale_epoch" }, 409);
       return json({ ok: true });
     }
 
     const record = await this.ctx.storage.get<GrantRecord>("grant");
     if (!record || record.revokedAt) return json({ error: "invalid_grant" }, 401);
+    if (epochs && (path === "/exchange" || path === "/refresh" || path === "/authenticate") &&
+        !(await nativeGrantEpoch(epochs, record, "check"))) {
+      return json({ error: "invalid_grant" }, 401);
+    }
 
     if (path === "/exchange" && request.method === "POST") {
       const body = await bodyJson<{ secret?: string }>(request);
@@ -101,6 +120,7 @@ export class AuthGrant implements DurableObject {
       record.accessHash = await hash(secret);
       record.accessExpiresAt = Date.now() + ACCESS_TTL_MS;
       await this.ctx.storage.put("grant", record);
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "invalid_grant" }, 401);
       return json({
         accessToken: `cs1.${record.grantId}.${secret}`,
         expiresAt: record.accessExpiresAt,
@@ -131,6 +151,7 @@ export class AuthGrant implements DurableObject {
       record.accessHash = await hash(secret);
       record.accessExpiresAt = Date.now() + ACCESS_TTL_MS;
       await this.ctx.storage.put("grant", record);
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "invalid_token" }, 401);
       return json({
         accessToken: `cs1.${record.grantId}.${secret}`,
         expiresAt: record.accessExpiresAt,
@@ -158,6 +179,7 @@ export class AuthGrant implements DurableObject {
       ) {
         return json({ error: "invalid_token" }, 401);
       }
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "invalid_token" }, 401);
       return json({
         grantId: record.grantId,
         userId: record.ownerUserId,
@@ -358,7 +380,7 @@ const verifiedSandboxTarget = async (
     typeof profile?.actor?.sub === "string" ? profile.actor.sub.trim().toLowerCase() : "";
   if (
     payload?.ok !== true ||
-    profile?.version !== SCAFFOLD_COMET_RUNTIME_VERSION ||
+    profile?.version !== SCAFFOLD_AUTHORITY_PROFILE_VERSION ||
     actorSubject !== identity.userId ||
     typeof profile.projectId !== "string" ||
     profile.projectId !== requested.projectId ||
@@ -501,6 +523,7 @@ export const handleAuthenticatedAuthRoute = async (
     };
     const response = await grantStub(env, id).fetch("https://grant.internal/issue", {
       method: "POST",
+      headers: env.NATIVE_GRANT_EPOCHS ? { [NATIVE_GRANT_ISSUER_HEADER]: "1" } : undefined,
       body: JSON.stringify(record)
     });
     if (!response.ok) return json({ error: "grant_store_unavailable" }, 503);

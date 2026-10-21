@@ -20,7 +20,7 @@ async function fixture(t, publish = true) {
   const env = {
     SCAFFOLD_CREW_SYNC_GENERATION: 'chat2', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify(profile),
     CREW_WEB_AUTH_TOKEN: 'private-token-'.repeat(4), COMET_IPC_PORT: '39400',
-    COMET_DATA_DIR: join(root, '.scaffold/crew-data'), SCAFFOLD_RUNTIME_DIR: join(root, '.scaffold/crew'),
+    COMET_DATA_DIR: join(root, '.scaffold/crew-data'), SCAFFOLD_RUNTIME_DIR: root,
   };
   const config = loadConfig(env);
   await mkdir(join(env.SCAFFOLD_RUNTIME_DIR, 'omp-inference'), { recursive: true });
@@ -76,14 +76,14 @@ async function fixture(t, publish = true) {
   return { env, config, authority, context, commands, calls, watches, rpc, viewport, publishSnapshots, url, headers, get, post };
 }
 
-test('only trusted chat2 configuration enables the isolated bridge', async t => {
+test('only trusted chat2 configuration enables the canonical native bridge', async t => {
   const f = await fixture(t);
-  assert.equal(f.config.ipcPort, 39400);
+  assert.equal(new CrewRpc(f.config.ipcPort).url, 'ws://127.0.0.1:39400');
   for (const change of [
     { SCAFFOLD_CREW_SYNC_GENERATION: '' }, { SCAFFOLD_CREW_SYNC_GENERATION: 'legacy' },
     { COMET_IPC_PORT: '27954' }, { COMET_DATA_DIR: '/tmp/shared-data' },
-    { COMET_DATA_DIR: '/workspace/.scaffold/crew-upstream-canary/data' },
-    { SCAFFOLD_RUNTIME_DIR: '/workspace/.scaffold/crew-upstream-canary' },
+    { COMET_DATA_DIR: '/tmp/.scaffold/crew-upstream-canary/data' },
+    { SCAFFOLD_RUNTIME_DIR: 'relative/runtime' },
     { CREW_WEB_AUTH_TOKEN: 'short' }, { CREW_WEB_SESSION_ID: 'another-session' },
     { SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify({ ...profile, actor: {} }) },
   ]) assert.throws(() => loadConfig({ ...f.env, ...change }));
@@ -102,11 +102,18 @@ test('real health requires authority and all native snapshots; private native op
   assert.equal(state.session.cwd, '/workspace');
   assert.equal(JSON.stringify(state).includes('private-grant'), false);
   assert.equal(JSON.stringify(state).includes('opaque-edge-owner'), false);
-  assert.deepEqual(await (await f.get('/api/native-open')).json(), {
-    url: 'comet-staging://scaffold/ashler-staging/ashler-staging/session-a/sandbox-a',
-  });
+  const native = new URL((await (await f.get('/api/native-open')).json()).url);
+  assert.equal(native.protocol, 'comet-staging:');
+  assert.equal(native.hostname, 'scaffold');
+  assert.equal(native.pathname, '/ashler-staging/ashler-staging/session-a/sandbox-a');
+  assert.equal(native.username + native.password + native.search + native.hash, '');
+  assert.equal(f.commands.size, 0);
+  assert.ok(f.calls.every(({ method }) => ['ScaffoldHostAuthority', 'ListModels'].includes(method)));
   assert.throws(() => f.watches.get('WatchChats').callback([{ ...f.context, deviceId: 'other-device' }]));
   assert.equal(f.viewport.state().capabilities.message, false);
+  assert.equal((await f.get('/health')).status, 503);
+  f.authority.scope.sessionId = 'other-session';
+  assert.equal((await f.get('/api/native-open')).status, 503);
 });
 
 test('proxy authentication, mutation origin, bounded bodies and exact grant binding fail closed', async t => {

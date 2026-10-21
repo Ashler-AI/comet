@@ -90,6 +90,10 @@ jobs:
           cargo test --locked
           -p zeron-sync -p zeron-client -p zeron-update -p zeron-engine -p zeron-harness
           --lib --test scaffold_auth --test omp
+      - name: Read-only migration history codec regressions
+        run: >-
+          cargo test --locked --manifest-path vendor/loro-internal-1.13.9/Cargo.toml
+          --target-dir target --lib --features counter readonly_
       - name: Native application browser suppression and inherited IPC
         if: runner.os == 'macOS'
         run: cargo test --locked -p zeron --test noop_browser

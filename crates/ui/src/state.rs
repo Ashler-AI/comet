@@ -105,7 +105,6 @@ pub struct EngineBootConfig {
     pub workos_client_id: Option<String>,
     pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
     pub managed_inference: bool,
-    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
 }
@@ -314,7 +313,6 @@ impl EngineHandle {
             device: None,
             device_bootstrap_file: None,
             managed_inference: config.managed_inference,
-            scaffold_runtime_artifact: config.scaffold_runtime_artifact,
         };
 
         // Own the data dir before opening anything under it or binding IPC —
@@ -3743,7 +3741,7 @@ mod tests {
             Arc::new(LegacyIdentityRpc),
         ));
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -3771,7 +3769,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_embeds_engine_when_port_is_free() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: free_port().await,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None, // offline
@@ -3807,7 +3805,7 @@ mod tests {
         std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
         let port = free_port().await;
 
-        let error = match EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let error = match EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -3864,7 +3862,7 @@ mod tests {
         ));
 
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -3900,7 +3898,7 @@ mod tests {
         // separate daemon, and no launch ordering.
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None, // offline
@@ -3940,7 +3938,7 @@ mod tests {
         // and turn the other into a plain remote attach.
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
-        let config = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let config = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None, // offline
@@ -3998,7 +3996,7 @@ mod tests {
             .unwrap();
         let port = squatter.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -4023,7 +4021,7 @@ mod tests {
     #[tokio::test]
     async fn production_bootstrap_opens_local_data_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: free_port().await,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -4072,7 +4070,7 @@ mod tests {
             r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
         )
         .unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: free_port().await,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -4128,7 +4126,7 @@ mod tests {
         tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
 
         let ui_dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: ui_dir.path().to_path_buf(),
+        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: ui_dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,

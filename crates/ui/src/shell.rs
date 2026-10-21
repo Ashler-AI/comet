@@ -14734,7 +14734,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let boot = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        let boot = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
         ipc_port: port,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -15283,7 +15283,7 @@ mod tests {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -15585,7 +15585,7 @@ mod exit_regressions {
             cx.set_global(Theme::default());
             crate::app_menus::init(cx);
         });
-        let boot = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+        let boot = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
         ipc_port: 0,
         edge_url: "http://127.0.0.1:1".into(),
         edge_token: None,
@@ -15636,7 +15636,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -15706,7 +15706,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -15813,7 +15813,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -15978,7 +15978,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -16045,7 +16045,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -16117,7 +16117,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -16165,7 +16165,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -16245,7 +16245,7 @@ mod exit_regressions {
                 let state = cx.new(|_| AppState::new());
                 Shell::new(
                     state,
-                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
                     edge_token: None,
@@ -16302,7 +16302,7 @@ mod exit_regressions {
                 let state = cx.new(|_| AppState::new());
                 Shell::new(
                     state,
-                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
                     edge_token: None,
@@ -16366,7 +16366,7 @@ mod exit_regressions {
             });
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir,
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir,
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -16657,7 +16657,7 @@ mod exit_regressions {
             });
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -16840,7 +16840,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -16939,7 +16939,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17022,7 +17022,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17101,7 +17101,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17171,7 +17171,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17251,7 +17251,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17305,7 +17305,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17453,7 +17453,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17570,7 +17570,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17666,7 +17666,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17746,7 +17746,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17822,7 +17822,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -17918,7 +17918,7 @@ mod exit_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -18094,7 +18094,7 @@ mod right_tab_mouse_regressions {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
                     edge_token: None,
@@ -18605,7 +18605,7 @@ mod settings_modal_regressions {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
                 edge_token: None,
@@ -18669,7 +18669,7 @@ mod settings_modal_regressions {
         let state = cx.new(|_| AppState::new());
         Shell::new(
             state,
-            EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.into(),
+            EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.into(),
             ipc_port: 0,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,

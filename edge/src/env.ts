@@ -1,5 +1,7 @@
 export interface Env {
   AUTH_GRANTS: DurableObjectNamespace;
+  /** Native-only internal view: presence requires the NATIVE_AUTH_GRANTS epoch fence. */
+  NATIVE_GRANT_EPOCHS?: DurableObjectNamespace;
   ENVIRONMENT: string;
   SCAFFOLD_CONTROL_PLANE_URL: string;
   SCAFFOLD_PROJECT_SCOPE: string;
@@ -14,7 +16,7 @@ export interface Env {
   /** chat2 session rooms (`chat2/{chatId}`) — dumb authenticated log relays
    * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
   CHAT_ROOMS: DurableObjectNamespace;
-  BLOBS: R2Bucket;
+  BLOBS: Pick<R2Bucket, "get" | "head" | "put">;
   /** Private staging release bucket, accessed only with the CI-provisioned reader credential. */
   COMET_RELEASES_GCS_BUCKET?: string;
   GCP_RELEASE_SERVICE_ACCOUNT_EMAIL?: string;

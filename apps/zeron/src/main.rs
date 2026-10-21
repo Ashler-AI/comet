@@ -45,8 +45,6 @@ enum Command {
     Status,
     #[command(hide = true)]
     ScaffoldAuthority,
-    #[command(hide = true)]
-    ScaffoldInstallWeb,
     /// Coordinate native Crew sessions through the connected engine.
     Session {
         #[command(subcommand)]
@@ -303,7 +301,6 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(crew_cli::scaffold_authority(config.ipc_port))
         }
-        Some(Command::ScaffoldInstallWeb) => crew_cli::install_scaffold_web(),
         Some(Command::Session { command }) => {
             tokio::runtime::Runtime::new()?.block_on(session_cli::run(command, config.ipc_port))
         }
@@ -366,7 +363,6 @@ fn main() -> anyhow::Result<()> {
                 initial_url: cli.open_url,
                 scaffold: config.scaffold,
                 managed_inference: config.managed_inference,
-                scaffold_runtime_artifact: config.scaffold_runtime_artifact,
             });
             Ok(())
         }

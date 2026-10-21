@@ -816,7 +816,7 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
                     edge_token: None,
@@ -882,7 +882,7 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
                     edge_token: None,
@@ -987,7 +987,7 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
                     edge_token: None,
@@ -1074,7 +1074,7 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let shell = Shell::new(
                     state,
-                    EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
                     edge_token: None,

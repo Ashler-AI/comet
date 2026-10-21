@@ -15,7 +15,7 @@ const required = (env, name, target) => {
 export function releaseFeedSecrets(target, env) {
   if (target !== "staging") throw new Error(`unsupported Crew edge environment: ${target}`);
 
-  // A new native Worker has no inherited secrets: missing credentials must fail closed.
+  // The protected staging sync must never replace retained secrets with missing credentials.
   const email = env.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL?.trim() ?? "";
   const privateKey = env.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY?.trim() ?? "";
   if (!email || !privateKey) {
