@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 DEMO_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/crew-demo.XXXXXX")"
 DAEMON_DIR="$DEMO_ROOT/daemon"
 UI_DIR="$DEMO_ROOT/ui"
-IPC=27921
+IPC=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
 
@@ -25,15 +25,19 @@ TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import j
 CREW="$TARGET_DIR/debug/zeron"
 
 echo "▸ starting engine daemon on :$IPC"
-env COMET_DATA_DIR="$DAEMON_DIR" COMET_IPC_PORT=$IPC COMET_HARNESS=mock \
+env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+  ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_HARNESS=mock \
   ${DELAY:+ZERON_MOCK_DELAY_MS=$DELAY} RUST_LOG=warn \
-  "$CREW" headless &
+  "$CREW" --data-dir "$DAEMON_DIR" --ipc-port "$IPC" \
+  --edge-url http://127.0.0.1:27941 headless &
 DAEMON_PID=$!
 trap 'kill "$DAEMON_PID" 2>/dev/null || true; rm -rf "$DEMO_ROOT"' EXIT
 for _ in $(seq 1 40); do
+  kill -0 "$DAEMON_PID" 2>/dev/null || { wait "$DAEMON_PID"; exit 1; }
   (exec 3<>/dev/tcp/127.0.0.1/$IPC) 2>/dev/null && { exec 3>&-; break; }
   sleep 0.25
 done
+kill -0 "$DAEMON_PID" 2>/dev/null || { wait "$DAEMON_PID"; exit 1; }
 
 probe() { cargo run -q -p zeron-rpc --example rpc_probe -- "ws://127.0.0.1:$IPC" "$@"; }
 
@@ -68,4 +72,7 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
 fi
 
 echo "▸ opening Crew (composer is live — type into it; --slow shows streaming)"
-COMET_DATA_DIR="$UI_DIR" COMET_IPC_PORT=$IPC COMET_HARNESS=mock RUST_LOG=warn "$CREW"
+env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+  ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_HARNESS=mock RUST_LOG=warn \
+  "$CREW" --data-dir "$UI_DIR" --ipc-port "$IPC" \
+  --edge-url http://127.0.0.1:27941

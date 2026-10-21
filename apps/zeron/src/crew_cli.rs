@@ -40,25 +40,30 @@ struct RuntimeSettings {
     scaffold_runtime_artifact: Option<(PathBuf, String)>,
 }
 
-
 impl RuntimeArgs {
-    pub fn config(&self, persist: bool, headed: bool) -> anyhow::Result<EngineConfig> {
-        self.config_with_env(persist, headed && option_env!("COMET_PACKAGE_ENVIRONMENT").is_some(), |name| std::env::var_os(name))
+    pub fn config(&self, persist: bool, own_runtime: bool, headed: bool) -> anyhow::Result<EngineConfig> {
+        self.config_with_env(persist, own_runtime, headed && option_env!("COMET_PACKAGE_ENVIRONMENT").is_some(), |name| std::env::var_os(name))
     }
 
     fn config_with_env(
         &self,
         persist: bool,
+        own_runtime: bool,
         pinned: bool,
         mut env: impl FnMut(&str) -> Option<std::ffi::OsString>,
     ) -> anyhow::Result<EngineConfig> {
-        // A packaged desktop launch cannot be redirected by argv, its parent
-        // process, or old runtime settings into another Crew environment.
+        let isolated = !pinned && (persist || own_runtime)
+            && env("COMET_LOCAL_AGENT_RUNTIME").as_deref() == Some(std::ffi::OsStr::new("1"));
+        if isolated && (self.data_dir.as_ref().is_none_or(|dir| dir.as_os_str().is_empty()) || self.ipc_port.is_none()) {
+            bail!("Crew agent launches require explicit --data-dir and --ipc-port for an independent runtime");
+        }
+        // A packaged desktop cannot inherit another environment's authority.
+        // Agent environments describe the parent engine, not an owned runtime.
         let defaults = RuntimeArgs::default();
         let args = if pinned { &defaults } else { self };
         let data_dir = std::path::absolute(args.data_dir.clone().unwrap_or_else(|| crate::paths::resolve_data_dir(&mut env, pinned)))?;
         let mut setting = |name: &str, upstream: &str| {
-            if pinned { return None; }
+            if pinned || isolated { return None; }
             env(name).and_then(|value| value.into_string().ok()).filter(|value| !value.trim().is_empty())
                 .or_else(|| env(upstream).and_then(|value| value.into_string().ok()).filter(|value| !value.trim().is_empty()))
         };
@@ -74,45 +79,54 @@ impl RuntimeArgs {
         };
         let harness_setting = setting("COMET_HARNESS", "ZERON_HARNESS");
         let mock = harness_setting.as_deref() == Some("mock");
-        let (default_edge, default_scaffold, default_project, default_deployment) = crate::paths::release_defaults();
         let edge_token = if mock { None } else { setting("COMET_EDGE_TOKEN", "ZERON_EDGE_TOKEN") };
-        // Explicit source/dev profiles keep their saved authority (or stay local).
-        // Mock mode is offline even if launched from an authenticated Crew shell.
-        let release_authority = !explicit_profile && !mock && edge_token.is_none()
-            && args.edge_url.is_none() && args.scaffold_url.is_none()
-            && args.project_scope.is_none() && args.deployment_id.is_none()
-            && saved.edge_url.is_none() && saved.scaffold_url.is_none()
-            && setting("COMET_EDGE_URL", "ZERON_EDGE_URL").is_none()
-            && setting("COMET_SCAFFOLD_URL", "CREW_CONTROL_ORIGIN").is_none()
-            && setting("COMET_PROJECT_SCOPE", "CREW_PROJECT_SCOPE").is_none()
-            && setting("COMET_DEPLOYMENT_ID", "CREW_DEPLOYMENT_ID").is_none();
-        let edge_url = if mock { "http://127.0.0.1:27941".into() } else {
-            args.edge_url.clone()
-                .or_else(|| setting("COMET_EDGE_URL", "ZERON_EDGE_URL"))
-                .or(saved.edge_url)
-                .unwrap_or_else(|| if explicit_profile { "http://127.0.0.1:27941" } else { default_edge }.into())
-        };
-        let scaffold_url = if mock { None } else {
-            args.scaffold_url.clone()
-                .or_else(|| setting("COMET_SCAFFOLD_URL", "CREW_CONTROL_ORIGIN"))
-                .or(saved.scaffold_url)
-                .or_else(|| release_authority.then(|| default_scaffold.into()))
-        };
-        let project_scope = if mock { None } else {
-            args.project_scope.clone()
-                .or_else(|| setting("COMET_PROJECT_SCOPE", "CREW_PROJECT_SCOPE"))
-                .or(saved.project_scope)
-                .or_else(|| release_authority.then(|| default_project.into()))
-        };
-        let deployment_id = if mock { None } else {
-            args.deployment_id.clone()
-                .or_else(|| setting("COMET_DEPLOYMENT_ID", "CREW_DEPLOYMENT_ID"))
-                .or(saved.deployment_id)
-                .or_else(|| release_authority.then_some(default_deployment).flatten().map(str::to_owned))
-        };
+        let mut edge_url = args.edge_url.clone()
+            .or_else(|| setting("COMET_EDGE_URL", "ZERON_EDGE_URL"))
+            .or(saved.edge_url);
+        let mut scaffold_url = args.scaffold_url.clone()
+            .or_else(|| setting("COMET_SCAFFOLD_URL", "CREW_CONTROL_ORIGIN"))
+            .or(saved.scaffold_url);
+        let mut project_scope = args.project_scope.clone()
+            .or_else(|| setting("COMET_PROJECT_SCOPE", "CREW_PROJECT_SCOPE"))
+            .or(saved.project_scope);
+        let mut deployment_id = args.deployment_id.clone()
+            .or_else(|| setting("COMET_DEPLOYMENT_ID", "CREW_DEPLOYMENT_ID"))
+            .or(saved.deployment_id);
+        if mock {
+            edge_url = Some("http://127.0.0.1:27941".into());
+            scaffold_url = None;
+            project_scope = None;
+            deployment_id = None;
+        } else if edge_url.is_none() && scaffold_url.is_none() && project_scope.is_none()
+            && deployment_id.is_none() && edge_token.is_none()
+        {
+            if explicit_profile {
+                // Explicit source/dev profiles stay local without saved authority.
+                edge_url = Some("http://127.0.0.1:27941".into());
+            } else {
+                let defaults = &crate::environment::DEFAULTS;
+                edge_url = Some(defaults.edge_url.into());
+                scaffold_url = defaults.scaffold_url.map(Into::into);
+                project_scope = defaults.project_scope.map(Into::into);
+                deployment_id = defaults.deployment_id.map(Into::into);
+            }
+        }
+        // Canary's standalone development bearer historically uses local Edge.
+        if edge_url.is_none() && edge_token.is_some() && scaffold_url.is_none()
+            && crate::environment::DEFAULTS.scaffold_url.is_none()
+        {
+            edge_url = Some(crate::environment::DEFAULTS.edge_url.into());
+        }
+        let edge_url = edge_url.context("custom Crew authority requires --edge-url")?;
+        if scaffold_url.is_none() && edge_token.is_none()
+            && (project_scope.is_some() || deployment_id.is_some())
+        {
+            bail!("custom Crew project or deployment requires --scaffold-url");
+        }
         let environment_port = setting("COMET_IPC_PORT", "ZERON_IPC_PORT")
             .map(|port| port.parse::<u16>().context("invalid Crew IPC port")).transpose()?;
-        let ipc_port = args.ipc_port.or(environment_port).or(saved.ipc_port).unwrap_or_else(crate::paths::ipc_port);
+        let ipc_port = args.ipc_port.or(environment_port).or(saved.ipc_port)
+            .unwrap_or(crate::environment::DEFAULTS.ipc_port);
         if ipc_port == 0 { bail!("Crew IPC port must be nonzero"); }
         if edge_token.is_some() && scaffold_url.is_some() {
             bail!("development bearer and Scaffold authority cannot be configured together");
@@ -159,7 +173,7 @@ impl RuntimeArgs {
         }
         Ok(EngineConfig {
             data_dir, edge_url, edge_token, ipc_port, default_harness: harness,
-            org_id: project_scope,
+            org_id: None,
             workos_client_id: None, scaffold, device: None, managed_inference,
             device_bootstrap_file: None,
             scaffold_runtime_artifact,
@@ -323,6 +337,124 @@ fn install_runtime_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    fn resolve(args: &RuntimeArgs, persist: bool, own_runtime: bool, vars: &[(&str, &str)]) -> anyhow::Result<EngineConfig> {
+        args.config_with_env(persist, own_runtime, false, |name| {
+            vars.iter().find(|(key, _)| *key == name).map(|(_, value)| (*value).into())
+        })
+    }
+
+    #[test]
+    fn custom_authority_is_not_completed_from_compiled_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crew-runtime.json");
+        let mut args = RuntimeArgs {
+            data_dir: Some(dir.path().to_owned()), scaffold_url: Some("https://own-control.example.test".into()),
+            project_scope: Some("own-project".into()), ..Default::default()
+        };
+        assert!(resolve(&args, true, true, &[]).is_err());
+        assert!(!path.exists());
+        args.edge_url = Some("https://own-edge.example.test".into());
+        resolve(&args, true, true, &[]).unwrap();
+        let config = resolve(&RuntimeArgs { data_dir: args.data_dir.clone(), ..Default::default() }, true, true, &[]).unwrap();
+        assert_eq!(config.edge_url, "https://own-edge.example.test");
+        let authority = config.scaffold.unwrap();
+        assert_eq!(authority.control_origin, "https://own-control.example.test");
+        assert_eq!(authority.project_scope, "own-project");
+        assert!(authority.deployment_id.is_none());
+        let saved: RuntimeSettings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(saved.deployment_id.is_none());
+        assert!(resolve(&args, true, true, &[("COMET_EDGE_TOKEN", "dev@own")]).is_err());
+        args.ipc_port = Some(0);
+        assert!(resolve(&args, true, true, &[]).is_err());
+    }
+
+    #[cfg(comet_default_environment = "canary")]
+    #[test]
+    fn canary_standalone_development_bearer_still_needs_no_authority_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = RuntimeArgs { data_dir: Some(dir.path().to_owned()), ..Default::default() };
+        let config = resolve(&args, false, true, &[("ZERON_EDGE_TOKEN", "dev@own")]).unwrap();
+        assert_eq!(config.edge_token.as_deref(), Some("dev@own"));
+        assert!(config.scaffold.is_none());
+        assert!(!dir.path().join("crew-runtime.json").exists());
+    }
+
+    #[test]
+    fn standalone_environment_and_flags_keep_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("crew-runtime.json"), br#"{"edgeUrl":"http://saved.example.test","ipcPort":39011}"#).unwrap();
+        let mut args = RuntimeArgs { data_dir: Some(dir.path().to_owned()), ..Default::default() };
+        let vars = [("COMET_EDGE_URL", "http://native.example.test"), ("ZERON_EDGE_URL", "http://upstream.example.test"),
+            ("COMET_IPC_PORT", "39012"), ("ZERON_IPC_PORT", "39013"), ("ZERON_EDGE_TOKEN", "dev@own")];
+        let config = resolve(&args, false, true, &vars).unwrap();
+        assert_eq!(config.edge_url, "http://native.example.test");
+        assert_eq!(config.ipc_port, 39012);
+        assert_eq!(config.edge_token.as_deref(), Some("dev@own"));
+        assert!(config.scaffold.is_none());
+        assert_eq!(config.default_harness, HarnessId::ClaudeCode);
+        args.edge_url = Some("http://flag.example.test".into());
+        args.ipc_port = Some(39014);
+        let config = resolve(&args, false, true, &vars).unwrap();
+        assert_eq!(config.edge_url, "http://flag.example.test");
+        assert_eq!(config.ipc_port, 39014);
+    }
+
+    #[test]
+    fn agent_runtime_uses_own_profile_but_ipc_clients_keep_parent_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let own = dir.path().join("own");
+        let vars = [("COMET_LOCAL_AGENT_RUNTIME", "1"), ("COMET_DATA_DIR", parent.to_str().unwrap()),
+            ("ZERON_DATA_DIR", parent.to_str().unwrap()), ("COMET_IPC_PORT", "39016"), ("ZERON_IPC_PORT", "39016"),
+            ("COMET_EDGE_URL", "https://parent-edge.example.test"), ("ZERON_EDGE_URL", "https://parent-edge.example.test"),
+            ("COMET_SCAFFOLD_URL", "https://parent-control.example.test"), ("CREW_CONTROL_ORIGIN", "https://parent-control.example.test"),
+            ("COMET_PROJECT_SCOPE", "parent-project"), ("CREW_PROJECT_SCOPE", "parent-project"),
+            ("COMET_DEPLOYMENT_ID", "parent-deployment"), ("CREW_DEPLOYMENT_ID", "parent-deployment"),
+            ("COMET_EDGE_TOKEN", "parent-secret"), ("ZERON_EDGE_TOKEN", "parent-secret"),
+            ("COMET_HARNESS", "mock"), ("ZERON_HARNESS", "mock"), ("COMET_INFERENCE_MODE", "local"),
+            ("COMET_SCAFFOLD_RUNTIME_BINARY", "/parent/runtime"), ("CREW_RUNTIME_BINARY", "/parent/runtime"),
+            ("COMET_SCAFFOLD_RUNTIME_SHA256", "parent-hash"), ("CREW_RUNTIME_SHA256", "parent-hash"), ("ZERON_ORG_ID", "parent-org")];
+        for args in [RuntimeArgs::default(), RuntimeArgs { data_dir: Some(own.clone()), ..Default::default() },
+            RuntimeArgs { ipc_port: Some(39017), ..Default::default() }]
+        {
+            assert!(resolve(&args, true, true, &vars).is_err());
+            assert!(!own.exists());
+            assert!(!parent.exists());
+        }
+        std::fs::create_dir(&own).unwrap();
+        let path = own.join("crew-runtime.json");
+        let saved = br#"{"edgeUrl":"https://own-edge.example.test","scaffoldUrl":"https://own-control.example.test","projectScope":"own-project","ipcPort":39011}"#;
+        std::fs::write(&path, saved).unwrap();
+        let args = RuntimeArgs { data_dir: Some(own.clone()), ipc_port: Some(39017), ..Default::default() };
+        let config = resolve(&args, true, true, &vars).unwrap();
+        assert_eq!(config.data_dir, own);
+        assert_eq!(config.ipc_port, 39017);
+        assert_eq!(config.edge_url, "https://own-edge.example.test");
+        assert!(config.edge_token.is_none());
+        assert!(config.org_id.is_none());
+        assert!(config.scaffold_runtime_artifact.is_none());
+        assert_eq!(config.default_harness, HarnessId::Omp);
+        assert!(config.managed_inference);
+        let authority = config.scaffold.unwrap();
+        assert_eq!(authority.control_origin, "https://own-control.example.test");
+        assert_eq!(authority.project_scope, "own-project");
+        assert!(authority.deployment_id.is_none());
+        let persisted = std::fs::read(&path).unwrap();
+        let settings: RuntimeSettings = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(settings.ipc_port, Some(39017));
+        assert!(settings.deployment_id.is_none());
+        assert!(settings.scaffold_runtime_artifact.is_none());
+        let client = RuntimeArgs { ipc_port: None, ..args };
+        assert_eq!(resolve(&client, false, false, &[("COMET_LOCAL_AGENT_RUNTIME", "1"), ("COMET_IPC_PORT", "39016")]).unwrap().ipc_port, 39016);
+        assert_eq!(std::fs::read(path).unwrap(), persisted);
+        assert!(!parent.exists());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -359,18 +491,19 @@ mod tests {
             scaffold_url: Some("https://argument-control.invalid".into()),
             project_scope: Some("argument".into()), deployment_id: Some("argument".into()),
         };
-        let headed = args.config_with_env(false, true, env).unwrap();
-        let (edge, control, project, deployment) = crate::paths::release_defaults();
+        let headed = args.config_with_env(false, true, true, env).unwrap();
+        let defaults = &crate::environment::DEFAULTS;
         assert_eq!(headed.data_dir, crate::paths::resolve_data_dir(env, true));
         assert_ne!(headed.data_dir, profile);
-        assert_eq!(headed.ipc_port, crate::paths::ipc_port());
-        assert_eq!(headed.edge_url, edge);
-        let authority = headed.scaffold.unwrap();
-        assert_eq!((authority.control_origin.as_str(), authority.project_scope.as_str(), authority.deployment_id.as_deref()), (control, project, deployment));
+        assert_eq!(headed.ipc_port, defaults.ipc_port);
+        assert_eq!(headed.edge_url, defaults.edge_url);
+        assert_eq!(headed.scaffold.as_ref().map(|authority| authority.control_origin.as_str()), defaults.scaffold_url);
+        assert_eq!(headed.scaffold.as_ref().map(|authority| authority.project_scope.as_str()), defaults.project_scope);
+        assert_eq!(headed.scaffold.as_ref().and_then(|authority| authority.deployment_id.as_deref()), defaults.deployment_id);
         assert!(headed.edge_token.is_none() && headed.managed_inference);
         assert!(headed.scaffold_runtime_artifact.is_none());
 
-        let cli = RuntimeArgs::default().config_with_env(false, false, env).unwrap();
+        let cli = RuntimeArgs::default().config_with_env(false, false, false, env).unwrap();
         assert_eq!(cli.ipc_port, 12346);
         assert_eq!(cli.data_dir, profile);
         assert!(cli.scaffold.is_none() && cli.edge_token.is_none() && !cli.managed_inference);
@@ -381,13 +514,13 @@ mod tests {
             "COMET_IPC_PORT" => Some("12346".into()), _ => None,
         };
         let source = RuntimeArgs { data_dir: Some(profile.clone()), ..Default::default() }
-            .config_with_env(true, false, source_env).unwrap();
+            .config_with_env(true, true, false, source_env).unwrap();
         assert_eq!(source.edge_url, "https://saved.invalid");
         assert_eq!(source.scaffold.unwrap().project_scope, "saved");
         assert_eq!(source.ipc_port, 12346);
         let persisted: RuntimeSettings = serde_json::from_slice(&std::fs::read(profile.join("crew-runtime.json")).unwrap()).unwrap();
         assert_eq!(persisted.ipc_port, Some(12345));
-        assert_eq!(args.config_with_env(false, false, env).unwrap().ipc_port, 12348);
+        assert_eq!(args.config_with_env(false, false, false, env).unwrap().ipc_port, 12348);
     }
 
     #[test]
@@ -397,7 +530,7 @@ mod tests {
         std::fs::write(&source, b"private-bootstrap").unwrap();
         let link = dir.path().join("link");
         symlink(&source, &link).unwrap();
-        let mut config = RuntimeArgs { data_dir: Some(dir.path().join("profile")), ..Default::default() }.config_with_env(false, false, |_| None).unwrap();
+        let mut config = RuntimeArgs { data_dir: Some(dir.path().join("profile")), ..Default::default() }.config_with_env(false, false, false, |_| None).unwrap();
         assert!(configure_device(&mut config, &link).is_err());
         assert_eq!(std::fs::read(source).unwrap(), b"private-bootstrap");
     }
@@ -412,7 +545,7 @@ mod tests {
             project_scope: Some("project".into()),
             deployment_id: Some("expected".into()),
             ..Default::default()
-        }.config_with_env(false, false, |_| None).unwrap();
+        }.config_with_env(false, false, false, |_| None).unwrap();
         let mut bootstrap = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
         let mut value = serde_json::json!({
             "deviceJoinGrant":"private", "projectId":"project", "deploymentId":"other",

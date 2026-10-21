@@ -75,7 +75,7 @@ pub async fn update(config: &EngineConfig, check_only: bool) -> anyhow::Result<(
             // No more authenticated requests; the restarted engine must own the profile.
             drop(access_tokens);
             drop(_lock);
-            match crate::daemon::restart(config) {
+            match crate::daemon::restart() {
                 Ok(()) => println!("engine service restarted."),
                 Err(err) => println!(
                     "note: service restart failed ({err:#}) — restart the engine manually to finish."

@@ -15,11 +15,6 @@ function probe(overrides, certificateTeam) {
   try {
     const cargo = path.join(bin, "cargo");
     writeFileSync(cargo, `#!/bin/sh
-if [ "$1" = metadata ]; then
-  [ "$*" = 'metadata --locked --no-deps --format-version 1' ] || exit 89
-  printf '{"target_directory":"%s/target"}\\n' "$PROBE_TARGET_DIR"
-  exit 0
-fi
 printf 'BUILD_BOUNDARY %s %s\\n' "$COMET_PACKAGE_ENVIRONMENT" "$COMET_DEFAULT_ENVIRONMENT"
 printf 'CARGO_ARGS %s\\n' "$*"
 exit 86
@@ -45,6 +40,8 @@ exit 86
       overrides = { ...overrides, CODESIGN_IDENTITY: hash };
     }
     const env = { ...process.env };
+    // The preflight owns no real user's global Cargo gate or profile.
+    env.HOME = bin;
     for (const key of [
       "CI", "CODESIGN_IDENTITY", "CODESIGN_KEYCHAIN", "NOTARYTOOL_KEYCHAIN_PROFILE",
       "COMET_MACOS_SIGNING", "COMET_PACKAGE_ENVIRONMENT", "COMET_DEFAULT_ENVIRONMENT",
@@ -54,7 +51,7 @@ exit 86
     // Exercise the packaging policy, not the earlier host-architecture guard.
     return spawnSync("/usr/bin/arch", ["-arm64", "/bin/bash", "scripts/package-macos.sh"], {
       cwd: root,
-      env: { ...env, PATH: `${bin}${path.delimiter}${env.PATH}`, ASHLER_INCREMENTAL_TSC_CHECKS: "false", PROBE_TARGET_DIR: bin, ...overrides },
+      env: { ...env, PATH: `${bin}${path.delimiter}${env.PATH}`, ASHLER_INCREMENTAL_TSC_CHECKS: "false", CARGO_TARGET_DIR: path.join(bin, "target"), CARGO_BUILD_JOBS: "2", ...overrides },
       encoding: "utf8",
       timeout: 10_000,
     });
@@ -101,7 +98,18 @@ test("ad-hoc packaging is forbidden in CI but accepts an explicitly local CI=fal
   assert.ifError(local.error);
   assert.equal(local.status, 86, local.stderr + local.stdout);
   assert.match(local.stdout, /BUILD_BOUNDARY staging staging/);
-  assert.match(local.stdout, /CARGO_ARGS build --release --locked -p zeron --bin zeron --target-dir .+\/target\/staging\n/);
+  assert.match(local.stdout, /CARGO_ARGS build --locked --release -p zeron --bin zeron --target-dir .+\/target\/staging --jobs=2\n/);
+});
+
+test("unselected local packaging retains Canary and explicit production stays production", { skip: !nativeHost }, () => {
+  for (const [environment, expected] of [[undefined, "canary"], ["production", "production"]]) {
+    const result = probe({ CI: "false", COMET_MACOS_SIGNING: "adhoc", ...(environment ? { COMET_PACKAGE_ENVIRONMENT: environment } : {}) });
+    assert.ifError(result.error);
+    assert.equal(result.status, 86, result.stderr + result.stdout);
+    assert.ok(result.stdout.includes(`BUILD_BOUNDARY ${expected} ${expected}`));
+    const targetSuffix = expected === "canary" ? "/canary" : "";
+    assert.match(result.stdout, new RegExp(`CARGO_ARGS build --locked --release -p zeron --bin zeron --target-dir .+/target${targetSuffix} --jobs=2\\n`));
+  }
 });
 
 test("distribution verification rejects wrong bundle metadata and unsigned executables", { skip: !nativeHost }, () => {
@@ -130,16 +138,8 @@ test("distribution verification rejects wrong bundle metadata and unsigned execu
   }
 });
 
-test("production builds the upstream binary without changing its release identity", { skip: !nativeHost }, () => {
-  const result = probe({ COMET_MACOS_SIGNING: "adhoc" });
-  assert.ifError(result.error);
-  assert.equal(result.status, 86, result.stderr + result.stdout);
-  assert.match(result.stdout, /BUILD_BOUNDARY production production/);
-  assert.match(result.stdout, /CARGO_ARGS build --release --locked -p zeron --bin zeron --target-dir .+\/target\n/);
-});
-
 test("invalid package environments, signing modes, and release versions fail before compilation", { skip: !nativeHost }, () => {
-  rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "adhoc", COMET_PACKAGE_ENVIRONMENT: "canary" }));
+  rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "adhoc", COMET_PACKAGE_ENVIRONMENT: "invalid" }));
   rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "unsigned" }));
   rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "adhoc", COMET_RELEASE_VERSION: "0.0.0" }));
   rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "adhoc", CODESIGN_IDENTITY: "unused" }));

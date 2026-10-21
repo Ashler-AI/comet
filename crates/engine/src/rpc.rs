@@ -6,7 +6,9 @@
 //! - `ListModels {harness}` → `[Model]`
 //! - `QueueCommand {chatId, command}` → `{commandId}` (durable doc command)
 //! - `WatchDocMessages {chatId}` → stream of joined `SessionMessageEntry[]`,
-//!   re-emitted on every doc change
+//!   re-emitted on every doc change. Unscoped local reads use the known-live
+//!   host when routing is available, otherwise retained synchronized history;
+//!   an explicit `targetDeviceId` is authoritative and never falls back.
 //! - `WatchChats` / `WatchDevices` → streams of the workspace doc's entity rows
 //! - `WatchSessions` → stream of `Session[]`: this engine's live statuses merged with
 //!   remote devices' workspace session rows
@@ -1901,6 +1903,23 @@ impl RpcService for EngineRpc {
             return Err(RpcError::Failed("Update authentication requires local IPC".into()));
         }
         self.crew_guard(method, &params)?;
+        // Prefer a positively live host over its asynchronously synced mirror.
+        // Unscoped reads still serve retained history when the host is offline
+        // or its presence is unknown; explicitly targeted reads never fall back.
+        if method == methods::WATCH_DOC_MESSAGES
+            && !self.relay
+            && params.get("targetDeviceId").is_none()
+            && self.links.is_some()
+            && let Some(chat_id) = params.get("chatId").and_then(|value| value.as_str())
+            && let Some(chat) = self.workspace.chat(chat_id)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+            && chat.device_id != self.doc_host.device_id()
+            && self.workspace.peer_liveness(&chat.device_id) == zeron_rpc::PeerLiveness::Live
+        {
+            let mut params = params;
+            params["targetDeviceId"] = serde_json::json!(chat.device_id);
+            return self.forward(&chat.device_id, method, params).await;
+        }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if forwardable(method)

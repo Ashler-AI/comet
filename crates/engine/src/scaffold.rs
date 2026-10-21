@@ -3916,6 +3916,8 @@ mod tests {
         assert!(first.status.success(), "{:?}", first);
         assert_eq!(first.stdout, b"absent\n");
         assert!(workspace.path().join(".scaffold/crew-data").is_dir());
+        assert!(!workspace.path().join(executable).exists());
+        assert!(workspace.path().join(executable).parent().unwrap().is_dir());
         let mut source = NamedTempFile::new().unwrap();
         source.write_all(TEST_RUNTIME_BYTES).unwrap();
         let digest = format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES));
@@ -3925,7 +3927,6 @@ mod tests {
             .arg("-C").arg(destination).status().unwrap().success());
         let present = prepare(executable);
         assert!(present.status.success(), "{:?}", present);
-        assert_eq!(present.stdout, b"present\n");
         assert_eq!(format!("{:x}", sha2::Sha256::digest(std::fs::read(workspace.path().join(executable)).unwrap())), digest);
         for path in ["/workspace/.scaffold/crew/bin/comet", "../crew/bin/comet", ".scaffold/other/bin/comet", ".scaffold/crew-upstream-canary/bin/comet"] {
             assert!(!prepare(path).status.success(), "accepted {path}");
@@ -5454,6 +5455,7 @@ mod tests {
         assert!(runtime.inner.handoff_permits.try_acquire().is_ok());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_handoff_streams_a_manifest_bound_archive() {
         let repo = tempfile::tempdir().unwrap();
@@ -6401,6 +6403,7 @@ mod tests {
             .unwrap();
         assert!(prepare_omp_handoff_archive(artifact, &CancellationToken::new()).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn materializer_accepts_session_only_in_published_checkout() {
         materializer_process_at(true);

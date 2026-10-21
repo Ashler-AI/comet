@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Native macOS bundles. Production preserves Crew.app and comet-<version>-macos-arm64*.
 # COMET_PACKAGE_ENVIRONMENT=staging builds an independent Crew Staging.app.
+# Unselected local packaging retains the isolated Canary flavor.
 # Distribution requires Developer ID signing and a notarytool keychain profile.
 # COMET_MACOS_SIGNING=adhoc explicitly opts into local-only, non-distribution output.
 set -euo pipefail
@@ -23,9 +24,17 @@ if [[ "$ARCH" != "arm64" ]]; then
   exit 1
 fi
 
-PACKAGE_ENVIRONMENT="${COMET_PACKAGE_ENVIRONMENT:-production}"
+PACKAGE_ENVIRONMENT="${COMET_PACKAGE_ENVIRONMENT:-canary}"
 OUT_DIR="$ROOT/target/package"
+BUILD_DIR="$(python3 "$ROOT/scripts/local-cargo.py" --print-target-dir)"
 case "$PACKAGE_ENVIRONMENT" in
+  canary)
+    APP_NAME="Crew Canary"
+    BUNDLE_ID="ai.ashler.crew.upstream-canary"
+    ARTIFACT_PREFIX="crew-upstream-canary"
+    OUT_DIR="$OUT_DIR/canary"
+    BUILD_DIR="$BUILD_DIR/canary"
+    ;;
   production)
     APP_NAME="Crew"
     BUNDLE_ID="ai.ashler.comet"
@@ -36,8 +45,9 @@ case "$PACKAGE_ENVIRONMENT" in
     BUNDLE_ID="ai.ashler.comet.staging"
     ARTIFACT_PREFIX="comet-staging"
     OUT_DIR="$OUT_DIR/staging"
+    BUILD_DIR="$BUILD_DIR/staging"
     ;;
-  *) echo "COMET_PACKAGE_ENVIRONMENT must be production or staging" >&2; exit 1 ;;
+  *) echo "COMET_PACKAGE_ENVIRONMENT must be canary, production or staging" >&2; exit 1 ;;
 esac
 if [[ -n "${COMET_DEFAULT_ENVIRONMENT:-}" && "$COMET_DEFAULT_ENVIRONMENT" != "$PACKAGE_ENVIRONMENT" ]]; then
   echo "COMET_DEFAULT_ENVIRONMENT must match COMET_PACKAGE_ENVIRONMENT" >&2
@@ -143,40 +153,48 @@ DMG="$OUT_DIR/$ARTIFACT_PREFIX-$VERSION-macos-$ARCH.dmg"
 APP_TARBALL="$OUT_DIR/$ARTIFACT_PREFIX-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
-command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
-TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
-if [[ "$PACKAGE_ENVIRONMENT" == staging ]]; then
-  TARGET_DIR="$TARGET_DIR/staging"
-fi
-cargo build --release --locked -p zeron --bin zeron --target-dir "$TARGET_DIR"
+BUILD_BIN="$(mktemp)"
+trap 'rm -f "$BUILD_BIN"' EXIT
+python3 scripts/local-cargo.py build --locked --release -p zeron --bin zeron --target-dir "$BUILD_DIR" \
+  --copy-binary release/zeron "$BUILD_BIN"
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-install -m 755 "$TARGET_DIR/release/zeron" "$APP/Contents/MacOS/comet"
+install -m 755 "$BUILD_BIN" "$APP/Contents/MacOS/comet"
+rm -f "$BUILD_BIN"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.invitation" "$APP/Contents/Info.plist"
 if [[ "$PACKAGE_ENVIRONMENT" == staging ]]; then
   # Keep production and staging app links bound to their respective installs.
   /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 comet-staging" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:ZERON_CALLBACK_PORT string 0" "$APP/Contents/Info.plist"
+elif [[ "$PACKAGE_ENVIRONMENT" == canary ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 crew-upstream-canary" "$APP/Contents/Info.plist"
+else
+  /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 comet" "$APP/Contents/Info.plist"
 fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.invitation" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile comet.icns" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
+
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
 cp "$ROOT/THIRD_PARTY_NOTICES.md" "$ROOT/LICENSE" "$APP/Contents/Resources/licenses/"
 cp "$ROOT/crates/voice/NOTICE.md" "$APP/Contents/Resources/licenses/parakeet-v3.txt"
 
-# Preserve the upstream brand artwork and macOS safe area.
-ICONSET="$OUT_DIR/zeron.iconset"
+# The Dock icon uses the brand's Apple-squircle variant.
+ICON_SRC="$ROOT/dist/macos/icon-1024.png"
+ICONSET="$OUT_DIR/comet.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
-  sips -z "$size" "$size" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
   retina=$((size * 2))
-  sips -z "$retina" "$retina" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z "$retina" "$retina" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
 done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/zeron.icns"
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/comet.icns"
 rm -rf "$ICONSET"
 
 # Sign inside-out rather than relying on --deep to repair nested signatures.
@@ -185,7 +203,7 @@ codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/dist/macos/Zeron.entitlements" 
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 NOTARY_DIR="$(mktemp -d)"
-trap 'rm -rf "$NOTARY_DIR"' EXIT
+trap 'rm -f "$BUILD_BIN"; rm -rf "$NOTARY_DIR"' EXIT
 notarize() {
   xcrun notarytool submit "$1" --keychain-profile "$NOTARYTOOL_KEYCHAIN_PROFILE" \
     ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} --wait --output-format json >"$NOTARY_DIR/result.json"
@@ -222,7 +240,7 @@ dmgbuild.build_dmg(
         "format": "UDZO",
         "files": [app],
         "symlinks": {"Applications": "/Applications"},
-        "icon": os.path.join(app, "Contents/Resources/zeron.icns"),
+        "icon": os.path.join(app, "Contents/Resources/comet.icns"),
         "background": os.environ["BG_TIFF"],
         "show_status_bar": False,
         "show_tab_view": False,

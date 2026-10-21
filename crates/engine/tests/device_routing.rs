@@ -1983,6 +1983,19 @@ async fn workspace_entry_mutations_are_forwarded_to_the_owning_plain_folder() {
 /// registry and the same device relay used by the routing tests above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mcp_standalone_session_executes_on_the_selected_device() {
+    // Poll phases separately: nesting their debug poll frames exhausted the
+    // test stack before the MCP snapshot call could finish.
+    let (dirs, b, chat, retained) = Box::pin(mcp_selected_device_online()).await;
+    assert_mcp_retained_history(&dirs, &b, &chat, &retained).await;
+    b.shutdown().await;
+}
+
+async fn mcp_selected_device_online() -> (
+    tempfile::TempDir,
+    EngineCore,
+    zeron_proto::Chat,
+    serde_json::Value,
+) {
     use serde_json::json;
     use zeron_mcp::{Origin, Tools, Zeron};
 
@@ -2050,6 +2063,7 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
                 .call("list_harnesses", json!({"device":"device-b"}))
                 .await
                 .is_ok()
+            && a.workspace.peer_liveness("device-b") == zeron_rpc::PeerLiveness::Live
         {
             break;
         }
@@ -2120,6 +2134,7 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         .call("get_chat", json!({"chat":chat_id}))
         .await
         .unwrap();
+    assert_eq!(summary["messageCount"], read["total"]);
     assert_eq!(summary["lastMessage"]["text"], "remote reply");
     assert_eq!(summary["lastMessage"]["deviceId"], "device-b");
     let sent = tools
@@ -2161,8 +2176,77 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // Retain the real host's completed transcript, as session-doc sync does.
+    let retained = tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
     a.shutdown().await;
-    b.shutdown().await;
     drop(host);
     relay.abort();
+    (dirs, b, chat, retained)
+}
+
+async fn assert_mcp_retained_history(
+    dirs: &tempfile::TempDir,
+    b: &EngineCore,
+    chat: &zeron_proto::Chat,
+    retained: &serde_json::Value,
+) {
+    use serde_json::json;
+    use zeron_mcp::{Origin, Tools, Zeron};
+
+    let chat_id = chat.id.as_str();
+    let snapshot = b.doc_host.open(chat_id).unwrap().doc().export_snapshot().unwrap();
+    let offline = assemble(&dirs.path().join("offline"), "device-offline");
+    offline.workspace.import_chat_row(chat).unwrap();
+    offline.doc_host.open(chat_id).unwrap().doc().doc().import(&snapshot).unwrap();
+    let mut offline_links = LinkCacheConfig::new(
+        "http://127.0.0.1:1",
+        Arc::new(StaticToken("test-user".into())),
+    );
+    offline_links.liveness = Some(Arc::new(|_| zeron_rpc::PeerLiveness::Dark));
+    offline.set_links(LinkCache::new(offline_links));
+    let offline_client = zeron_rpc::memory_client(offline.rpc_service());
+    let offline_zeron = Arc::new(Zeron::with_client(offline_client, Origin::default()));
+    let offline_tools = Tools::new(offline_zeron.clone());
+    assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
+    let unknown = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(unknown["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+
+    // A stale heartbeat is positive Dark evidence, not a read failure to hide.
+    let dark_registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
+    let (mut presence, _) = tokio_tungstenite::connect_async(dark_registry.url()).await.unwrap();
+    presence.send(WsMessage::Text(json!({"t":"hello","device":"device-b"}).to_string())).await.unwrap();
+    presence.next().await.unwrap().unwrap();
+    presence.send(WsMessage::Text(json!({
+        "t":"presence", "at":chrono::Utc::now().timestamp_millis() - 10 * 60_000,
+    }).to_string())).await.unwrap();
+    presence.next().await.unwrap().unwrap();
+    let mut remote_device = b.workspace.watch_devices().borrow().iter()
+        .find(|device| device.id == "device-b").unwrap().clone();
+    remote_device.last_seen_at = None;
+    offline.workspace.upsert_device_row(&remote_device);
+    let mut devices = offline.workspace.watch_devices();
+    offline.workspace.connect_registry_url(&dark_registry.url());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while offline.workspace.peer_liveness("device-b") != zeron_rpc::PeerLiveness::Dark {
+            devices.changed().await.unwrap();
+        }
+    }).await.expect("stale host presence converges");
+    let dark = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(dark["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+    assert!(offline_zeron.transcript_on(chat_id, Some("device-b")).await.is_err(),
+        "an explicit offline host must not fall back to retained history");
+    offline.workspace.disconnect_edge();
+    assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
+    let disconnected = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(disconnected["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+    offline.shutdown().await;
 }

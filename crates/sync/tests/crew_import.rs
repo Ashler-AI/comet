@@ -149,6 +149,56 @@ fn backup(path: &std::path::Path, pending: bool) -> CollaborationPrincipal {
 }
 
 #[test]
+fn backup_import_accepts_only_empty_known_startup_table() {
+    for (table, populated, accepted) in [
+        ("session_startups", false, true),
+        ("session_startups", true, false),
+        ("unknown_startups", false, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("backup");
+        std::fs::create_dir(&source).unwrap();
+        let principal = backup(&source, false);
+        let db = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+        db.execute_batch(&format!("CREATE TABLE {table}(id TEXT PRIMARY KEY)")).unwrap();
+        if populated {
+            db.execute("INSERT INTO session_startups VALUES ('unresolved-startup')", []).unwrap();
+        }
+        drop(db);
+        refresh_database_hash(&source);
+        let target = root.path().join("new-profile");
+        let source_bytes = std::fs::read(source.join("docs.sqlite3")).unwrap();
+        let preflight = zeron_sync::crew_import::preflight_legacy_crew_backup(
+            &source, &target, &principal, "controller").unwrap();
+        assert_eq!(preflight["valid"], accepted);
+        assert!(!target.exists());
+        let result = import_legacy_crew_backup(&source, &target, &principal, "controller");
+        if accepted {
+            let report = result.unwrap();
+            assert_eq!(report.chat_ids, [CHAT]);
+            assert_eq!(report.command_outcomes["command-1"], "applied");
+            assert_eq!(report.source_table_rows["session_startups"], 0);
+            let verified = zeron_sync::crew_import::verify_legacy_crew_import(
+                &source, &target, &principal, "controller").unwrap();
+            assert_eq!(verified.source_table_rows, report.source_table_rows);
+            assert_eq!(preflight["report"], serde_json::to_value(&report).unwrap());
+            zeron_sync::crew_import::verify_imported_profile(
+                &target, &principal, "controller", CHAT).unwrap();
+            assert_eq!(std::fs::read(target.join("legacy-crew.sqlite3")).unwrap(), source_bytes);
+            let store = DocsStore::open(&target).unwrap();
+            assert!(store.is_processed("command-1").unwrap());
+        } else {
+            let expected = if populated { "session startups require legacy reconciliation" }
+                else { "unknown legacy table" };
+            assert!(result.unwrap_err().to_string().contains(expected));
+            assert!(preflight["error"].as_str().unwrap().contains(expected));
+            assert!(!target.exists());
+        }
+        assert_eq!(std::fs::read(source.join("docs.sqlite3")).unwrap(), source_bytes);
+    }
+}
+
+#[test]
 fn backup_import_preserves_ids_assets_and_terminal_outcomes_without_replay() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("backup");

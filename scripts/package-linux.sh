@@ -3,7 +3,7 @@
 #   target/package/comet-<version>-linux-<arch>.tar.gz
 # containing comet, the matching crew-web bundle and contract, desktop assets,
 # and an install.sh. The browser bundle requires Node 22.4 or newer.
-# Installs immutable releases under ~/.comet-native/app with a comet launcher.
+# Installs immutable releases under ~/.crew/app with a comet launcher.
 #
 # Usage: scripts/package-linux.sh
 # Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
@@ -24,7 +24,6 @@ if [[ "${COMET_PACKAGE_ENVIRONMENT:-production}" != production || "${COMET_DEFAU
 fi
 export COMET_PACKAGE_ENVIRONMENT=production
 export COMET_DEFAULT_ENVIRONMENT=production
-command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 PROFILE="${PROFILE:-release}"
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -44,40 +43,43 @@ STAGE="$OUT_DIR/comet-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"
-TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+BIN="$(mktemp)"
+trap 'rm -f "$BIN"' EXIT
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build --locked --release -p zeron
-  BIN="$TARGET_DIR/release/zeron"
-elif [[ "$PROFILE" == "debug" ]]; then
-  cargo build --locked -p zeron
-  BIN="$TARGET_DIR/debug/zeron"
+  python3 scripts/local-cargo.py build --release --locked -p zeron --copy-binary release/zeron "$BIN"
 else
-  echo "PROFILE must be release or debug" >&2
-  exit 1
+  python3 scripts/local-cargo.py build --locked -p zeron --copy-binary debug/zeron "$BIN"
 fi
 
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/comet"
-install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/comet.desktop"
+rm -f "$BIN"
+install -m 644 "$ROOT/dist/comet.desktop" "$STAGE/comet.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/comet.png"
 install -m 644 "$ROOT/dist/zeron.svg" "$STAGE/comet.svg"
+
 install -m 644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
-mkdir -p "$STAGE/crew-web/public"
-install -m 644 "$ROOT/apps/web/server.mjs" "$ROOT/apps/web/rpc.mjs" "$ROOT/apps/web/package.json" "$ROOT/apps/web/contract.json" "$STAGE/crew-web/"
-install -m 644 "$ROOT/apps/web/public/app.js" "$ROOT/apps/web/public/index.html" "$ROOT/apps/web/public/style.css" "$STAGE/crew-web/public/"
+
+# The sandbox serves this fixed-session viewport from the same immutable release
+# as its Crew engine. No package installation or frontend build runs at boot.
+mkdir -p "$STAGE/crew-web"
+tar -cf - --exclude='*.test.mjs' --exclude=node_modules --exclude=package-lock.json \
+  -C "$ROOT/apps/web" . | tar -xf - -C "$STAGE/crew-web"
+test -f "$STAGE/crew-web/server.mjs"
+test -f "$STAGE/crew-web/public/index.html"
 install -m 644 "$ROOT/apps/web/contract.json" "$STAGE/crew-web-contract.json"
 
-cat >"$STAGE/install.sh" <<'INSTALL'
+sed "s/__VERSION__/$VERSION/g" >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
 # Install Crew for this user without replacing a running release in place.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="__VERSION__"
-APP_ROOT="$HOME/.comet-native/app"
+APP_ROOT="$HOME/.crew/app"
 # Include web and desktop assets: a same-version bundle can change without
 # changing the native executable. The raw executable checksum remains separate.
 DIGEST="$(cd "$HERE" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
@@ -168,7 +170,6 @@ case ":$PATH:" in
   *) echo "Add ~/.local/bin to your PATH to run \`comet\` from a terminal." ;;
 esac
 INSTALL
-sed -i "s/__VERSION__/$VERSION/" "$STAGE/install.sh"
 chmod 755 "$STAGE/install.sh"
 
 GZIP=-n tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 \

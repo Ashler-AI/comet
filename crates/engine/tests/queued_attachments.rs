@@ -103,9 +103,10 @@ where
 fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
     core.doc_host
         .open(CHAT)
-        .ok()
-        .and_then(|h| h.doc().read_entries().ok())
-        .unwrap_or_default()
+        .expect("open attachment test chat")
+        .doc()
+        .read_entries()
+        .expect("read attachment test transcript")
 }
 
 fn complete_assistant_count(core: &EngineCore) -> usize {
@@ -333,6 +334,12 @@ async fn run_with_a_non_image_file_defers_executes_and_reads_back() {
 /// files, exactly like a Run command — never the raw refs.
 #[tokio::test(flavor = "multi_thread")]
 async fn queued_row_waits_for_attachment_bytes_then_sends_resolved_paths() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    }
     let tmp = tempfile::tempdir().unwrap();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(AckHarness));

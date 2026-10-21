@@ -876,7 +876,7 @@ impl Tools {
         let (spaces, sessions, entries) = tokio::try_join!(
             self.zeron.spaces(),
             self.zeron.sessions(),
-            self.zeron.transcript_on(&chat.id, Some(&chat.device_id))
+            self.zeron.transcript(&chat.id)
         )?;
         let rendered = render_entries(&entries, RenderOptions::default());
         let mut summary = summarize_chat(&chat, &spaces, &sessions);
@@ -1092,7 +1092,7 @@ impl Tools {
         let chat = self.zeron.resolve_chat(&args.chat).await?;
         let entries = self
             .zeron
-            .transcript_on(&chat.id, Some(&chat.device_id))
+            .transcript(&chat.id)
             .await?;
         let rendered = render_entries(
             &entries,

@@ -1,4 +1,4 @@
-//! Crew Canary — headed by default; `comet headless` runs the engine alone.
+//! Crew — headed by default; `comet headless` runs the engine alone.
 //! Runtime coordinates and data are isolated from installed Crew clients.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -6,6 +6,7 @@
 mod auth_cli;
 mod crew_cli;
 mod daemon;
+mod environment;
 mod paths;
 mod update_cli;
 mod session_cli;
@@ -97,7 +98,7 @@ enum Command {
     /// proxying to the running engine's IPC. Agents use it to create, read,
     /// and message chats. Logs go to stderr; stdout is the protocol.
     Mcp,
-    /// Manage the isolated Crew Canary engine as a background service.
+    /// Manage the build-selected Crew engine as a background service.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -195,7 +196,9 @@ fn main() -> anyhow::Result<()> {
     let persist_runtime = matches!(&cli.command,
         None | Some(Command::Headless(_) | Command::Login | Command::Logout)
         | Some(Command::Daemon { command: DaemonCommand::Install | DaemonCommand::Start | DaemonCommand::Restart }));
-    let mut config = cli.runtime.config(persist_runtime, cli.command.is_none())?;
+    let own_runtime = persist_runtime || matches!(&cli.command,
+        Some(Command::Status | Command::Daemon { .. }));
+    let mut config = cli.runtime.config(persist_runtime, own_runtime, cli.command.is_none())?;
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;
@@ -345,11 +348,11 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&config),
-            DaemonCommand::Uninstall => daemon::uninstall(&config),
-            DaemonCommand::Start => daemon::start(&config),
-            DaemonCommand::Stop => daemon::stop(&config),
-            DaemonCommand::Restart => daemon::restart(&config),
-            DaemonCommand::Status => daemon::status(&config),
+            DaemonCommand::Uninstall => daemon::uninstall(),
+            DaemonCommand::Start => daemon::start(),
+            DaemonCommand::Stop => daemon::stop(),
+            DaemonCommand::Restart => daemon::restart(),
+            DaemonCommand::Status => daemon::status(),
         },
         None => {
             zeron_ui::run_app(zeron_ui::UiConfig {

@@ -17,7 +17,7 @@ const SHA256 = "a".repeat(64);
 const RUN_SHA = "b".repeat(40);
 const RUN_ID = "32313877342";
 const REPOSITORY = "Ashler-AI/comet";
-const VERSION = "0.2.114";
+const VERSION = "0.1.57";
 const RUN_URL = `https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}`;
 
 function releaseManifest(releaseSurface, files, schemaVersion = 2) {
@@ -95,7 +95,6 @@ function shellStep(workflow, job, id) {
   return script.replace(/^          /gm, "");
 }
 
-
 const fixtureEnv = {
   ...process.env,
   ASHLER_INCREMENTAL_TSC_CHECKS: "false",
@@ -137,6 +136,7 @@ function releaseCheckout(t, merged) {
   fixtureCommand(dir, "git", "init", "-b", "main", upstream);
   writeFileSync(path.join(upstream, "Cargo.toml"), `[workspace]\nmembers = ["."]\n[workspace.package]\nversion = "${VERSION}"\n[package]\nname = "zeron"\nversion.workspace = true\nedition = "2024"\n[lib]\npath = "lib.rs"\n`);
   writeFileSync(path.join(upstream, "lib.rs"), "");
+  writeFileSync(path.join(upstream, "Cargo.lock"), `version = 4\n\n[[package]]\nname = "zeron"\nversion = "${VERSION}"\n`);
   fixtureCommand(upstream, "git", "add", ".");
   fixtureCommand(upstream, "git", "commit", "-m", "main baseline");
   fixtureCommand(upstream, "git", "checkout", "-b", "release-fixture");
@@ -231,17 +231,31 @@ describe("executable release gates", () => {
     assert.notEqual(command(checkout.checkout, "git", ["rev-parse", "--verify", "refs/remotes/origin/main"]).status, 0);
   });
 
-  it("rejects unmerged production source but still permits private candidates", async (t) => {
+  it("rejects unmerged publication even when its exact source was reviewed", async (t) => {
     const checkout = releaseCheckout(t, false);
     const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
-    const production = runVersion(script, checkout);
-    assert.notEqual(production.status, 0);
-    assert.equal(production.output, "");
-    const privateCandidate = runVersion(script, checkout, {
-      REQUESTED_PROMOTION_TARGET: "none", REQUESTED_CANDIDATE_RUN_ID: "",
-    });
-    assert.equal(privateCandidate.status, 0, privateCandidate.stderr);
-    assert.ok(privateCandidate.output.includes("promotion_target=none\n"));
+    for (const target of ["staging-candidate", "staging", "production"]) {
+      const result = runVersion(script, checkout, {
+        REQUESTED_PROMOTION_TARGET: target, REQUESTED_CANDIDATE_RUN_ID: "",
+        REQUESTED_REVIEWED_SHA: checkout.sha,
+      });
+      assert.notEqual(result.status, 0);
+      assert.equal(result.output, "");
+    }
+  });
+
+  it("builds unmerged private artifacts only for the exact reviewed SHA", async (t) => {
+    const checkout = releaseCheckout(t, false);
+    const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
+    for (const reviewed of ["", "c".repeat(40), checkout.sha]) {
+      const result = runVersion(script, checkout, {
+        REQUESTED_PROMOTION_TARGET: "none", REQUESTED_CANDIDATE_RUN_ID: "",
+        REQUESTED_REVIEWED_SHA: reviewed,
+      });
+      assert.equal(result.status === 0, reviewed === checkout.sha, result.stderr);
+      if (reviewed === checkout.sha) assert.match(result.output, /^promotion_target=none$/m);
+      else assert.equal(result.output, "");
+    }
   });
 
   it("accepts desktop staging reuse of a full candidate without changing its archive digest", async (t) => {
@@ -593,4 +607,48 @@ describe("release candidate reuse validation", () => {
     delete wrongFiles.unifiedManifest.files[`comet-${VERSION}-linux-aarch64.tar.gz`];
     assert.throws(() => validateReleaseCandidateReuse(wrongFiles));
   });
+});
+
+describe("release bucket privacy", () => {
+  for (const job of ["publish-staging", "publish-production"]) {
+    it(`${job} requires uniform access, public-access prevention and private IAM`, async (t) => {
+      const script = shellStep(await read(".github/workflows/release.yml"), job, "privacy");
+      const privateConfig = { iamConfiguration: {
+        uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "enforced",
+      } };
+      for (const [config, publicIam, accepted] of [
+        [privateConfig, false, true],
+        [{ iamConfiguration: { uniformBucketLevelAccess: { enabled: false }, publicAccessPrevention: "enforced" } }, false, false],
+        [{ iamConfiguration: { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "inherited" } }, false, false],
+        [privateConfig, true, false],
+        [{}, false, false],
+      ]) {
+        const dir = scratch(t);
+        const bin = path.join(dir, "bin");
+        mkdirSync(bin);
+        writeFileSync(path.join(bin, "gcloud"), `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "auth" && args[1] === "print-access-token") console.log("test-only-no-authority");
+else if (args[0] === "storage" && args[1] === "buckets" && args[2] === "get-iam-policy") {
+  console.log(JSON.stringify({ bindings: process.env.FIXTURE_PUBLIC_IAM === "1"
+    ? [{ role: "roles/storage.objectViewer", members: ["allUsers"] }] : [] }));
+} else process.exit(90);
+`, { mode: 0o755 });
+        writeFileSync(path.join(bin, "curl"), `#!${process.execPath}
+require("node:fs").readFileSync(0);
+const url = process.argv.at(-1);
+if (url.includes("/iam/testPermissions?")) console.log(JSON.stringify({ permissions:
+  ["storage.buckets.get", "storage.buckets.getIamPolicy", "storage.objects.create", "storage.objects.delete", "storage.objects.get", "storage.objects.list"] }));
+else if (url.endsWith("?fields=iamConfiguration")) console.log(process.env.FIXTURE_BUCKET_CONFIG);
+else process.exit(91);
+`, { mode: 0o755 });
+        const result = command(dir, "bash", ["-c", script], {
+          PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          COMET_RELEASES_GCS_BUCKET: "test-private-release",
+          FIXTURE_BUCKET_CONFIG: JSON.stringify(config), FIXTURE_PUBLIC_IAM: publicIam ? "1" : "0",
+        });
+        assert.equal(result.status === 0, accepted, result.stderr);
+      }
+    });
+  }
 });

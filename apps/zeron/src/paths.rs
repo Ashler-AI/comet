@@ -3,22 +3,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub fn production() -> bool {
-    option_env!("COMET_PACKAGE_ENVIRONMENT")
-        .or(option_env!("COMET_DEFAULT_ENVIRONMENT")) == Some("production")
-}
-
-pub fn ipc_port() -> u16 {
-    if production() { 27654 } else { 27655 }
-}
-
-pub fn release_defaults() -> (&'static str, &'static str, &'static str, Option<&'static str>) {
-    if production() {
-        ("https://comet.internal.ashler.com", "https://scaffold.internal.ashler.com", "ashler-production", None)
-    } else {
-        ("https://comet-staging.internal.ashler.com", "https://scaffold-staging.internal.ashler.com", "ashler-staging", Some("ashler-staging"))
-    }
-}
 
 pub fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>, pinned: bool) -> PathBuf {
     if let Some(dir) = (!pinned).then(|| env("COMET_DATA_DIR")
@@ -41,12 +25,14 @@ pub fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>, pinned: b
                     .map(|home| PathBuf::from(home).join("AppData").join("Local"))
             })
             .expect("LOCALAPPDATA and USERPROFILE not set; set COMET_DATA_DIR");
-        local.join(if production() { "Crew" } else { "Crew Staging" })
+        local.join(crate::environment::DEFAULTS.windows_data_dir)
     }
     #[cfg(not(windows))]
     {
         let home = PathBuf::from(env("HOME").expect("HOME not set"));
-        home.join(if production() { ".comet-native" } else { ".comet-native-staging" })
+        // Never migrate or adopt an installed profile when selecting a flavor.
+        // Importing an existing profile is a separate, explicit operation.
+        home.join(crate::environment::DEFAULTS.data_dir)
     }
 }
 
@@ -78,5 +64,34 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn starting_selected_flavor_does_not_adopt_an_installed_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let installed = [".comet-native", ".comet-native-staging", ".zeron"];
+        for name in installed {
+            let profile = home.path().join(name);
+            std::fs::create_dir(&profile).unwrap();
+            std::fs::write(profile.join("sentinel"), b"retained-session").unwrap();
+        }
+        let selected = resolve(&[("HOME", home.path().to_str().unwrap())]);
+        assert_eq!(selected, home.path().join(crate::environment::DEFAULTS.data_dir));
+        assert!(!selected.exists());
+        for name in installed {
+            assert_eq!(
+                std::fs::read(home.path().join(name).join("sentinel")).unwrap(),
+                b"retained-session"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selected_flavor_uses_native_local_app_data() {
+        assert_eq!(
+            resolve(&[("LOCALAPPDATA", "local"), ("HOME", "ignored")]),
+            PathBuf::from("local").join(crate::environment::DEFAULTS.windows_data_dir)
+        );
+    }
 
 }

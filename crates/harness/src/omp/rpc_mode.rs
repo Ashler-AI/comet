@@ -354,7 +354,9 @@ async fn kill_rpc_process(
         let _ = child.wait().await;
         return;
     }
-    let _ = child.kill().await;
+    if child.start_kill().is_ok() {
+        let _ = child.wait().await;
+    }
 }
 
 fn rpc_assistant_message_id(session_id: &str, nonce: &uuid::Uuid, turn: u64) -> String {

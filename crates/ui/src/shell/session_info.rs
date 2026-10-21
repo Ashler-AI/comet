@@ -51,6 +51,34 @@ fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+#[derive(Clone, Copy)]
+enum SessionEnvironmentLink {
+    Web,
+    Tilt,
+}
+
+fn session_environment_url(
+    chat_id: &str,
+    crew: Option<&zeron_proto::CrewChatMetadata>,
+    link: SessionEnvironmentLink,
+) -> Option<String> {
+    let crew = crew?;
+    crew.validate().ok()?;
+    if crew.session_id != chat_id {
+        return None;
+    }
+    let zeron_proto::SessionEnvironmentSource::Scaffold { links, .. } =
+        &crew.environment.as_ref()?.source
+    else {
+        return None;
+    };
+    let url = match link {
+        SessionEnvironmentLink::Web => links.web.as_deref(),
+        SessionEnvironmentLink::Tilt => links.tilt.as_deref(),
+    }?;
+    crate::browser::model::transcript_address(url).ok()
+}
+
 impl Shell {
     /// The card's reserve at the main column's LIVE width (see
     /// [`session_card_reserve`]): while the sidebar or a pane animates, the
@@ -107,6 +135,21 @@ impl Shell {
         if self.session_info_overlay {
             self.session_info_overlay = false;
             cx.notify();
+        }
+    }
+
+    fn open_session_environment_link(
+        &mut self,
+        chat_id: &str,
+        link: SessionEnvironmentLink,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.state.read(cx).selected_chat_row()
+            .filter(|chat| chat.id == chat_id)
+            .and_then(|chat| session_environment_url(&chat.id, chat.crew.as_ref(), link));
+        if let Some(url) = url {
+            self.close_session_info_overlay(cx);
+            cx.open_url(&url);
         }
     }
 
@@ -217,6 +260,32 @@ impl Shell {
                 .tooltip(crate::settings::widgets::text_tooltip(branch))
         });
 
+        let environment_links = [
+            ("crew-session-web", "Web", "Open Web in browser", SessionEnvironmentLink::Web),
+            ("crew-session-tilt", "Tilt", "Open Tilt in browser", SessionEnvironmentLink::Tilt),
+        ].map(|(id, label, aria_label, link)| {
+            session_environment_url(&chat.id, chat.crew.as_ref(), link)?;
+            let click_chat = chat.id.clone();
+            let key_chat = chat.id.clone();
+            Some(popover::picker_row(&theme, false, false, id)
+                .id(id)
+                .role(gpui::Role::Link)
+                .aria_label(aria_label)
+                .tab_index(0)
+                .focus_visible(|style| style.border_2().border_color(theme.accent))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_session_environment_link(&click_chat, link, cx);
+                }))
+                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                    if !event.is_held && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        this.open_session_environment_link(&key_chat, link, cx);
+                    }
+                }))
+                .child(popover::picker_icon_slot(row_glyph(icons::GLOBE, &theme)))
+                .child(div().flex_1().child(label)))
+        });
+
         // ── This conversation.
         let busy = self.side_chat_creating;
         let side_chat = popover::picker_row(&theme, false, false, "session-info-side-chat")
@@ -265,6 +334,7 @@ impl Shell {
                     .id("crew-session-environment")
                     .tooltip(crate::settings::widgets::text_tooltip(format!("Owner {}\nProject {}\nDeployment {}\nSession {}", crew.owner_subject, crew.scope.project_id, crew.scope.deployment_id.as_deref().unwrap_or("none"), crew.session_id))))
             })
+            .children(environment_links.into_iter().flatten())
             .when(!online, |body| body.child(crate::settings::widgets::page_subtitle(&theme,
                 "Host offline. Synced history remains available; continuing requires its host.")))
             .when(self.state.read(cx).managed_inference, |body| body.child(
@@ -498,6 +568,47 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_links_require_matching_identity_and_safe_independent_urls() {
+        use SessionEnvironmentLink::{Tilt, Web};
+        let scope = serde_json::json!({
+            "projectId": "project", "deploymentId": "deployment", "sessionId": "session"
+        });
+        let mut crew: zeron_proto::CrewChatMetadata = serde_json::from_value(serde_json::json!({
+            "ownerSubject": "owner", "scope": scope, "sessionId": "session",
+            "environment": {
+                "ownerPrincipal": "owner", "scope": scope,
+                "source": { "kind": "scaffold", "sandbox_id": "sandbox", "lifecycle": "ready",
+                    "links": { "web": "https://example.com/app", "tilt": "http://localhost:10350/" } }
+            }
+        })).unwrap();
+        assert_eq!(session_environment_url("session", Some(&crew), Web).as_deref(), Some("https://example.com/app"));
+        assert_eq!(session_environment_url("session", Some(&crew), Tilt).as_deref(), Some("http://localhost:10350/"));
+        assert!(session_environment_url("other-session", Some(&crew), Web).is_none());
+        assert!(session_environment_url("session", None, Web).is_none());
+
+        for url in [None, Some("javascript:alert(1)"), Some("https://user:pass@example.com/"),
+            Some("https:///missing-authority"), Some("https://example.com/\npath"), Some("example.com")] {
+            if let zeron_proto::SessionEnvironmentSource::Scaffold { links, .. } =
+                &mut crew.environment.as_mut().unwrap().source
+            {
+                links.web = url.map(str::to_owned);
+            }
+            assert!(session_environment_url("session", Some(&crew), Web).is_none(), "{url:?}");
+            assert!(session_environment_url("session", Some(&crew), Tilt).is_some());
+        }
+        crew.environment.as_mut().unwrap().owner_principal = "other-owner".into();
+        assert!(session_environment_url("session", Some(&crew), Tilt).is_none());
+        crew.environment.as_mut().unwrap().owner_principal = "owner".into();
+        crew.environment.as_mut().unwrap().scope.deployment_id = Some("other-deployment".into());
+        assert!(session_environment_url("session", Some(&crew), Tilt).is_none());
+        crew.environment.as_mut().unwrap().scope = crew.scope.clone();
+        crew.environment.as_mut().unwrap().source = zeron_proto::SessionEnvironmentSource::Local;
+        assert!(session_environment_url("session", Some(&crew), Tilt).is_none());
+        crew.environment = None;
+        assert!(session_environment_url("session", Some(&crew), Tilt).is_none());
+    }
 
     #[test]
     fn a_wide_column_keeps_the_transcript_centered_beside_the_card() {

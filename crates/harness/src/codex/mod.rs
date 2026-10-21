@@ -9,9 +9,9 @@
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
 //!   the `initialized` notification; unknown notification methods tolerated.
-//! - `thread/start` (or identity-preserving `thread/resume`) →
-//!   `SessionStarted`; a failed resume ends the run without starting a thread.
-//!   `turn/start` carries the prompt, model, effort, `sandboxPolicy`, and approval policy.
+//! - `thread/start` or identity-preserving `thread/resume` → `SessionStarted`;
+//!   a rejected resume is terminal, never a fresh conversation. `turn/start`
+//!   carries the prompt, model, effort, `sandboxPolicy`, and approval policy.
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.

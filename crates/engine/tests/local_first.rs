@@ -478,6 +478,9 @@ async fn explicit_dev_bearer_keeps_online_routing_enabled() {
 
 #[tokio::test]
 async fn headless_stop_rpc_drains_the_daemon_and_releases_ipc() {
+    // Provider discovery starts real login-shell/version probes even with Mock.
+    // Keep that cold catalog work outside the shutdown/IPC lifecycle deadline.
+    let _ = zeron_engine::default_registry().descriptors();
     let dir = tempfile::tempdir().unwrap();
     let port = {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -490,18 +493,27 @@ async fn headless_stop_rpc_drains_the_daemon_and_releases_ipc() {
         None,
     );
     engine_config.ipc_port = port;
-    let daemon = tokio::spawn(Engine::new(engine_config).run());
+    let mut daemon = tokio::spawn(Engine::new(engine_config).run());
+    let mut last_connect_error = None;
 
     let client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Ok(client) = connect_ws(&format!("ws://127.0.0.1:{port}")).await {
-                break client;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::select! {
+            result = &mut daemon => panic!("headless engine exited before IPC connected: {result:?}"),
+            client = async {
+                loop {
+                    match connect_ws(&format!("ws://127.0.0.1:{port}")).await {
+                        Ok(client) => break client,
+                        Err(error) => last_connect_error = Some(error),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            } => client,
         }
     })
     .await
-    .expect("headless IPC did not start");
+    .unwrap_or_else(|error| {
+        panic!("headless IPC did not start: {error}; last connection error: {last_connect_error:?}")
+    });
 
     assert_eq!(
         client

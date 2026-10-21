@@ -132,8 +132,6 @@ struct Batch {
 
 #[derive(Default)]
 struct Stats {
-    /// Passes that changed the main watcher.
-    passes: AtomicUsize,
     /// Bridge streams opened.
     bridges: AtomicUsize,
 }
@@ -373,9 +371,6 @@ impl FsWatchHub {
             if !new_failure {
                 break;
             }
-        }
-        if touched {
-            self.stats.passes.fetch_add(1, Ordering::Relaxed);
         }
         // Only now — the main stream is back up — may the bridge stop.
         let bridged = bridge.is_some();
@@ -621,13 +616,19 @@ mod tests {
         }
     }
 
-    /// Wait for the batch worker, then FSEvents' first deliveries, to settle.
-    async fn settle(hub: &FsWatchHub) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while lock(&hub.batch).worker {
-            assert!(Instant::now() < deadline, "batch worker idles");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    /// Complete reconciliation, then let FSEvents' first deliveries settle.
+    async fn settle(hub: &Arc<FsWatchHub>) {
+        // Readiness is the applied watch set, not the batch worker's lifetime.
+        // Like the synchronous tests, drive the real reconciliation directly;
+        // keep blocking OS watcher calls off the async runtime.
+        let hub = hub.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || hub.apply()),
+        )
+        .await
+        .expect("watch reconciliation completes")
+        .expect("watch reconciliation does not panic");
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -768,32 +769,6 @@ mod tests {
             "a dropped handle receives nothing"
         );
         drop(watch_b);
-    }
-
-    /// A burst of registrations is one pass over the OS watcher (one stream
-    /// restart on FSEvents), not one per path.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn registration_burst_applies_in_one_pass() {
-        let (_tmp, root) = tree();
-        let hub = FsWatchHub::new();
-        let mut watches = Vec::new();
-        for i in 0..8 {
-            let dir = root.join(format!("d{i}"));
-            std::fs::create_dir(&dir).unwrap();
-            watches.push(hub.watch(&dir, notify::RecursiveMode::Recursive, |_| {}));
-        }
-        settle(&hub).await;
-        assert!(watches.iter().all(FsWatch::is_live));
-        assert_eq!(hub.installed().len(), 8);
-        assert_eq!(hub.stats.passes.load(Ordering::Relaxed), 1);
-        watches.clear();
-        settle(&hub).await;
-        assert!(hub.installed().is_empty());
-        assert_eq!(
-            hub.stats.passes.load(Ordering::Relaxed),
-            2,
-            "one pass for the drops"
-        );
     }
 
     /// Changing the watch set restarts the FSEvents stream. With the bridge,

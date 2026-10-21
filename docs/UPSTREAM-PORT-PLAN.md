@@ -13,18 +13,19 @@ then activate the native runtime and promote the exact candidate. Follow
 [`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md); candidate publication
 alone is not activation or a successful migration.
 
-Current source checks: 44 release/packaging contract checks, nine native web
-contract checks, three iOS release-helper checks and the iOS metadata self-check
-passed locally. These are not native-app, migration, signing or deployment proof.
+Integration with native main `79ce43e3` passed 48 release/packaging/privacy/signature
+checks, nine native web contracts, and the real Linux tarball, release-install and
+integrity/rollback smoke. After corrections, the five previously failing targets
+passed 63 focused checks: filesystem watching (10), device routing (11), local-first
+lifecycle (9), queued attachments (3), backup (9), and import (21). These are combined
+results from integrated runs and focused reruns, not one all-pass global invocation.
+The first attachment timeout remains unexplained; single-case, concurrent diagnostic,
+and final uninstrumented checks passed without a speculative product change.
 
-The integration owner subsequently recorded passing results across separate native
-runs: 193 Sync/Client tests plus nine `local_first` tests, the exact relay regression
-(0.25 seconds), and the actual 94 MB history-copy check (2.50 seconds). Eight other
-targets passed in the earlier integrated run. The actual Linux installer container
-check also passed all three status cases (2.5 seconds). These are combined results
-from the integrated run and focused reruns after fixes, not one uninterrupted
-all-pass global invocation. The historical-import and authentication-redirect
-review also cleared; none of these results substitutes for live cutover acceptance.
+The rebuilt `scripts/dev-demo.sh --slow` instance accepted a prompt through the
+native composer and rendered the completed streamed mock reply. This used fresh,
+isolated data; installed profiles were not replaced. Historical-import and
+authentication-redirect review cleared, but none of this is live cutover acceptance.
 
 Prior authenticated Apple metadata identified staging app `6808397041` with
 1.0 (36) Testing. Build 1.0 (37) is an unallocated candidate, not a freshly verified
@@ -49,7 +50,18 @@ pass. The reproducible isolated commands are in [`apps/ios/README.md`](../apps/i
 Activation remains gated on complete migration and actual runtime verification.
 The running legacy engine kills its supervised OMP processes during shutdown;
 durable-history recovery must not be described as uninterrupted live-job transfer.
-Do not stop current jobs or activate an incompletely reconciled profile.
+Do not activate an incompletely reconciled profile or claim a live copy is frozen.
+
+The canonical native staging profile is `~/.crew-staging`; its owner controller
+must be independently authenticated for `scaffold-staging.internal.ashler.com`,
+`comet-staging.internal.ashler.com`, and project/deployment `ashler-staging`.
+No such local controller record is currently present. Retirement source `320a9ef2`
+globally fences legacy connections; it is not a harmless `/auth/session` preflight
+deployment. Prepare the candidate and compatible services first, then establish a
+real cross-store writer barrier, capture the legacy originals, and activate native
+Edge at the canonical origin. Only then use login-only to authenticate the native
+controller and verify the offline import before starting its session engine.
+Do not manufacture identity fields or mark live writers stopped.
 
 ## Historical verification: isolated upstream canary
 
@@ -804,6 +816,26 @@ isolated dogfooding. No production promotion or live-profile migration occurred.
 Local typechecks are intentionally not run to preserve workstation resources.
 Remaining gates below are requirements, not claims of completed testing.
 
+
+### Scoped sidebar links and staged source delivery (0.2.114)
+
+The selected Scaffold session exposes **Web** and **Tilt** in session details
+from its canonical environment links. Owner, project, deployment and session
+must match the chat; each missing or unsafe URL hides independently. Activation
+rechecks the current selection. Local/Devbox rows do not expose these actions.
+An owned headed fixture exercised both native actions against loopback pages;
+a separately initialized local-session window hid both. The focused scope/URL
+regression and native browser contracts passed; no sandbox was allocated.
+
+Release adapters preserve canonical signed artifacts and immutable GCS publication.
+Build-only reviewed source cannot publish; GCS candidates require merged-main
+ancestry. Shared Edge deployment is manual-only, and immutable candidate
+publication does not move channels or activate a controller. Fresh staging uses
+its own `~/.crew-staging` profile and IPC 27957, independently authenticated.
+Legacy mixed/unscoped deployments, pending work, unsupported consumer access and
+unqualified real-profile import memory remain cutover blockers, not permission
+to relabel profiles or retire other owners' records. Production remains gated
+on the captain's installed-app restart and manual acceptance.
 
 Status: implementation and verification in progress; no production cutover.
 

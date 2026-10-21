@@ -10,8 +10,8 @@ export ASHLER_INCREMENTAL_TSC_CHECKS=false
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-VERSION=9.9.9
 fail() { echo "FAIL: $*" >&2; exit 1; }
+VERSION=9.9.9
 
 # Exercise Linux packaging preflight with a Linux host fixture, stopping at Cargo.
 mkdir -p "$WORK/build-bin"
@@ -38,7 +38,8 @@ for selectors in default production package-staging default-staging conflict; do
     conflict) args=(COMET_PACKAGE_ENVIRONMENT=production COMET_DEFAULT_ENVIRONMENT=staging) ;;
   esac
   status=0
-  env -i HOME="$WORK/build-home" PATH="$WORK/build-bin:/usr/bin:/bin" "${args[@]}" \
+  env -i HOME="$WORK/build-home" PATH="$WORK/build-bin:/usr/bin:/bin" CI=true \
+    CARGO_TARGET_DIR="$WORK/build-target" "${args[@]}" \
     bash "$ROOT/scripts/package-linux.sh" >"$WORK/preflight.log" 2>&1 || status=$?
   case "$selectors" in
     default|production)
@@ -58,7 +59,7 @@ PKG="comet-$VERSION-linux-$(uname -m)"
 mkdir -p "$WORK/pkg/$PKG"
 printf '#!/bin/sh\nexit 0\n' >"$WORK/pkg/$PKG/comet"
 chmod 755 "$WORK/pkg/$PKG/comet"
-cp "$ROOT/dist/zeron.desktop" "$WORK/pkg/$PKG/comet.desktop"
+cp "$ROOT/dist/comet.desktop" "$WORK/pkg/$PKG/comet.desktop"
 printf 'not-really-a-png' >"$WORK/pkg/$PKG/comet.png"
 printf '<svg xmlns="http://www.w3.org/2000/svg"/>' >"$WORK/pkg/$PKG/comet.svg"
 
@@ -86,14 +87,18 @@ set -euo pipefail
 case "$*" in *fixture-token*) exit 92 ;; esac
 IFS= read -r header
 [ "$header" = 'Authorization: Bearer fixture-token' ] || exit 93
-output= url=
+output= url= proto= redirects= tls=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) output="$2"; shift ;;
+    --proto) proto="$2"; shift ;;
+    --proto-redir) redirects="$2"; shift ;;
+    --tlsv1.2) tls=yes ;;
     https://fixture.invalid/*) url="$1" ;;
   esac
   shift
 done
+[ "$proto" = '=https' ] && [ "$redirects" = '=https' ] && [ "$tls" = yes ] || exit 94
 file="$FIXTURE_FEED/${url##*/}"
 if [ -n "$output" ]; then cp "$file" "$output"; else cat "$file"; fi
 CURL
@@ -122,12 +127,16 @@ check() {
   [ -f "$entry" ] || fail "missing $entry"
   [ -f "$data/icons/hicolor/1024x1024/apps/comet.png" ] || fail "missing hicolor icon"
   [ -f "$data/icons/hicolor/scalable/apps/comet.svg" ] || fail "missing scalable icon"
-  grep -qxF "TryExec=$home/.comet-native/app/current/comet" "$entry" || fail "TryExec"
-  grep -qxF "Icon=$home/.comet-native/app/current/comet.png" "$entry" || fail "Icon"
+  grep -qxF "TryExec=$home/.crew/app/current/comet" "$entry" || fail "TryExec"
+  grep -qxF "Icon=$home/.crew/app/current/comet.png" "$entry" || fail "Icon"
   grep -qxF "MimeType=x-scheme-handler/comet;" "$entry" || fail "scheme"
   [ -L "$home/.local/bin/comet" ] || fail "comet launcher missing"
-  [ "$(readlink "$home/.local/bin/comet")" = "$home/.comet-native/app/current/comet" ] || fail "launcher target"
-  grep -qxF "StartupWMClass=zeron" "$entry" || fail "StartupWMClass changed"
+  [ "$(readlink "$home/.local/bin/comet")" = "$home/.crew/app/current/comet" ] || fail "launcher target"
+  cmp "$WORK/pkg/$PKG/comet" "$home/.local/bin/comet" || fail "executable differs"
+  [ -x "$home/.local/bin/comet" ] || fail "executable mode"
+  cmp "$WORK/pkg/$PKG/comet.png" "$data/icons/hicolor/1024x1024/apps/comet.png" || fail "PNG icon differs"
+  cmp "$WORK/pkg/$PKG/comet.svg" "$data/icons/hicolor/scalable/apps/comet.svg" || fail "SVG icon differs"
+  grep -qxF "StartupWMClass=comet" "$entry" || fail "StartupWMClass changed"
   [ "$(grep -c '^\[Desktop Entry\]' "$entry")" = 1 ] || fail "duplicated entry"
   [ "$(grep -c '^Exec=' "$entry")" = 1 ] || fail "Exec lines"
   [ -z "$(find "$data" -name '.comet*')" ] || fail "temp files left behind"
@@ -143,31 +152,32 @@ for installer in tarball release; do
 
   # Default XDG location, then a re-run (how updates are installed) is stable.
   home="$WORK/$installer-a/home"; mkdir -p "$home"
-  mkdir -p "$home/.crew" "$home/.zeron" "$home/.comet-native" "$home/.local/bin"
-  printf 'preserve' >"$home/.crew/sentinel"
-  printf 'preserve' >"$home/.zeron/sentinel"
-  printf 'preserve' >"$home/.comet-native/sentinel"
+  mkdir -p "$home/.local/bin"
+  for profile in .comet-native .comet-native-staging .crew-upstream-canary .crew-staging .crew .zeron; do
+    mkdir -p "$home/$profile"
+    printf 'preserve' >"$home/$profile/sentinel"
+  done
   printf 'old launcher' >"$home/.local/bin/comet"
   run "$home"
   check "$home" "$home/.local/share"
   entry="$home/.local/share/applications/comet.desktop"
-  grep -qxF "Exec=$home/.comet-native/app/current/comet %u" "$entry" || fail "Exec line"
+  grep -qxF "Exec=$home/.crew/app/current/comet %u" "$entry" || fail "Exec line"
   before="$(cat "$entry")"
-  first="$(readlink "$home/.comet-native/app/current")"
+  first="$(readlink "$home/.crew/app/current")"
   run "$home"
   check "$home" "$home/.local/share"
   [ "$before" = "$(cat "$entry")" ] || fail "re-run changed the entry"
   printf '# changed build, same version\n' >>"$WORK/pkg/$PKG/comet"
   run "$home"
-  second="$(readlink "$home/.comet-native/app/current")"
+  second="$(readlink "$home/.crew/app/current")"
   [ "$first" != "$second" ] || fail "same-version new artifact not installed"
   [ -x "$first/comet" ] || fail "old artifact was deleted"
-  [ "$(cat "$home/.crew/sentinel")" = preserve ] || fail "Crew changed"
-  [ "$(cat "$home/.zeron/sentinel")" = preserve ] || fail "Zeron changed"
-  [ "$(cat "$home/.comet-native/sentinel")" = preserve ] || fail "Crew profile changed"
+  for profile in .comet-native .comet-native-staging .crew-upstream-canary .crew-staging .crew .zeron; do
+    [ "$(cat "$home/$profile/sentinel")" = preserve ] || fail "changed $profile"
+  done
   printf 'changed web bundle for %s' "$installer" >"$WORK/pkg/$PKG/crew-web-contract.json"
   run "$home"
-  third="$(readlink "$home/.comet-native/app/current")"
+  third="$(readlink "$home/.crew/app/current")"
   [ "$second" != "$third" ] || fail "same-binary new bundle not installed"
   [ -x "$second/comet" ] || fail "previous bundle was deleted"
 
@@ -186,7 +196,7 @@ for installer in tarball release; do
   check "$home" "$home/.local/share"
   # Spec: quote the argument, `\` before " and $ (doubled again for the file's
   # string escaping), and `%%` for a literal `%`.
-  want="Exec=\"$WORK/$installer-d/"'h o\\$me\\"x%%y'"/.comet-native/app/current/comet\" %u"
+  want="Exec=\"$WORK/$installer-d/"'h o\\$me\\"x%%y'"/.crew/app/current/comet\" %u"
   grep -qxF "$want" "$home/.local/share/applications/comet.desktop" \
     || fail "$installer: Exec quoting"
   echo "ok: $installer installer"
@@ -201,28 +211,28 @@ set -euo pipefail
 /bin/cp "$@"
 if [[ "$1" == -R ]]; then
   PATH=/usr/bin:/bin bash "$FIXTURE_INSTALLER"
-  touch "$(readlink "$HOME/.comet-native/app/current")/race-winner"
+  touch "$(readlink "$HOME/.crew/app/current")/race-winner"
 fi
 COPY
 chmod 755 "$WORK/race-bin/cp"
 home="$WORK/concurrent/home"
 mkdir -p "$home"
 run_tarball "$home" PATH="$WORK/race-bin:/usr/bin:/bin" FIXTURE_INSTALLER="$WORK/pkg/$PKG/install.sh"
-winner="$(readlink "$home/.comet-native/app/current")"
+winner="$(readlink "$home/.crew/app/current")"
 [ -f "$winner/race-winner" ] || fail "concurrent installer replaced the winning release"
-[ -z "$(find "$home/.comet-native/app" -name '.install-*')" ] || fail "concurrent installer left or nested its stage"
+[ -z "$(find "$home/.crew/app" -name '.install-*')" ] || fail "concurrent installer left or nested its stage"
 
 # A corrupt download cannot relink current, and credentials never reach curl's
 # argv/environment (enforced by the fake above).
 home="$WORK/release-a/home"
-current="$(readlink "$home/.comet-native/app/current")"
+current="$(readlink "$home/.crew/app/current")"
 prepare_feed
 printf 'corrupt' >>"$WORK/feed/$PKG.tar.gz"
 if invoke_release "$home" >"$WORK/out.log" 2>&1; then
   fail "release installer accepted a checksum mismatch"
 fi
 grep -q 'checksum mismatch' "$WORK/out.log" || fail "missing checksum error"
-[ "$(readlink "$home/.comet-native/app/current")" = "$current" ] || fail "corrupt release changed current"
+[ "$(readlink "$home/.crew/app/current")" = "$current" ] || fail "corrupt release changed current"
 
 # An ambiguous checksum manifest cannot authorize installer replacement either.
 prepare_feed
@@ -232,7 +242,7 @@ if invoke_release "$home" >"$WORK/out.log" 2>&1; then
   fail "release installer accepted duplicate checksum entries"
 fi
 grep -q 'expected one SHA-256 entry' "$WORK/out.log" || fail "missing duplicate checksum error"
-[ "$(readlink "$home/.comet-native/app/current")" = "$current" ] || fail "ambiguous release changed current"
+[ "$(readlink "$home/.crew/app/current")" = "$current" ] || fail "ambiguous release changed current"
 
 # A verified package whose executable cannot load must not replace current.
 printf '#!/bin/sh\nexit 1\n' >"$WORK/pkg/$PKG/comet"
@@ -241,6 +251,6 @@ if invoke_release "$home" >"$WORK/out.log" 2>&1; then
   fail "release installer accepted an unloadable executable"
 fi
 grep -q 'Crew could not start' "$WORK/out.log" || fail "missing loader error"
-[ "$(readlink "$home/.comet-native/app/current")" = "$current" ] || fail "unloadable release changed current"
+[ "$(readlink "$home/.crew/app/current")" = "$current" ] || fail "unloadable release changed current"
 [ -z "$(ls -A "$WORK/tmp")" ] || fail "failed install left files in TMPDIR"
 echo 'ok: release integrity and rollback'

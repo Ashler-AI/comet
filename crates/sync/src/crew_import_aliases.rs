@@ -170,6 +170,16 @@ pub fn inert_bootstrap_snapshots(
         )? {
             continue;
         }
+        // Import accepts an empty startup sidecar without requiring its legacy
+        // schema. It cannot associate a snapshot; populated tables still must
+        // expose their identities for backup and desktop-source classification.
+        if table == "session_startups"
+            && !db.query_row("SELECT EXISTS(SELECT 1 FROM session_startups)", [], |row| {
+                row.get::<_, bool>(0)
+            })?
+        {
+            continue;
+        }
         // Fixed schema identifiers only. Missing/wrong columns or payload types fail closed.
         let sql = format!(
             "SELECT {identity}{} FROM {table}",
@@ -1154,6 +1164,16 @@ mod tests {
             );
             db.execute_batch(&format!("DROP TABLE {table}")).unwrap();
         }
+        db.execute_batch("CREATE TABLE session_startups(id TEXT PRIMARY KEY);")
+            .unwrap();
+        assert_eq!(
+            inert_bootstrap_snapshots(&db, &docs, &BTreeSet::new()).unwrap(),
+            expected
+        );
+        db.execute("INSERT INTO session_startups VALUES (?1)", [id])
+            .unwrap();
+        assert!(inert_bootstrap_snapshots(&db, &docs, &BTreeSet::new()).is_err());
+        db.execute_batch("DROP TABLE session_startups").unwrap();
         let retained: Vec<u8> = db
             .query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [id], |row| {
                 row.get(0)
