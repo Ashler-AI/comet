@@ -127,6 +127,26 @@ status or actual streamed output. The iOS composer explicitly says “Sending to
 host…” during unadopted delivery; the existing echo retains Sending/Queued/Failed.
 This does not treat a pending first Run as permission to start duplicate turns.
 
+## Provider turn protection
+
+The execution host admits local sends and remotely delivered Run/Steer commands
+through the same native session path. Boat protection must be confirmed before
+a turn reaches a harness or parked mailbox; Namespace task markers must be
+created before admission. A wake or a retained warm harness is not active work.
+Logical completion releases protection once accepted steers and in-flight
+inference streams have drained. Shutdown and failed startup also clean up the
+exact run's provider ownership.
+
+Managed inference routes bind to that exact native run. Autonomous inference
+from a parked harness reacquires provider protection before any request body is
+forwarded, retains it through response completion/drop, and blocks idle reaping
+while active. Model discovery does not acquire protection. Retired run tokens
+cannot rebind to a replacement run, even for the same chat and provider.
+
+Focused engine regressions cover Boat admission, Namespace markers, terminal
+mailbox races, and relay denial/cancellation/stale-token fencing. These changes
+do not alter delivery receipts, provider credentials, or deployment defaults.
+
 ## Regression coverage
 
 - Real workerd/SQLite chat-room tests accept a prompt via HTTPS or WebSocket,

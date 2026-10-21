@@ -95,6 +95,48 @@ fn request(resume: Option<&str>) -> RunRequest {
     }
 }
 #[tokio::test]
+async fn state_refresh_drains_burst_events_before_the_response() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv"));
+        std::env::set_var("OMP_STATE_BURST", "1");
+        std::env::set_var("OMP_OMIT_GOAL_EVENTS", "1");
+    }
+    let mut run_request = request(None);
+    run_request.prompt = "/goal set Persistent editor indicator".into();
+    let harness = OmpHarness::new().with_executable(fixture_path());
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = harness.run(run_request, controls()).await.unwrap();
+        let mut text = String::new();
+        let mut refreshed = false;
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::ToolCall {
+                    call: zeron_proto::ToolCall::Unknown { input: Some(input), .. }, ..
+                } => {
+                    refreshed = input["goal"]["objective"] == "Persistent editor indicator";
+                }
+                AgentEvent::Done { status: DoneStatus::Completed, .. } => completed = true,
+                _ => {}
+            }
+        }
+        (text, refreshed, completed)
+    }).await;
+    unsafe {
+        std::env::remove_var("OMP_STATE_BURST");
+        std::env::remove_var("OMP_OMIT_GOAL_EVENTS");
+        std::env::remove_var("OMP_ARGV_LOG");
+    }
+    let (text, refreshed, completed) = result.expect("state refresh must drain the full event queue");
+    assert_eq!(text, "queued event\n".repeat(512));
+    assert!(refreshed, "goal state response was lost");
+    assert!(completed, "turn completion was lost");
+}
+
+#[tokio::test]
 async fn resume_path_and_id_use_the_same_canonical_handshake() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();

@@ -6,6 +6,40 @@
 use super::*;
 use zeron_proto::{HarnessId, SandboxLevel, SessionStatus};
 
+#[test]
+fn imported_local_history_survives_registry_sync_without_publication() {
+    let id = "local-chat-0123456789abcdef";
+    let mut doc = RegistryDoc::new("dev-a");
+    let mut imported = chat(id, "dev-a");
+    imported.harness_session_id = Some("native-original".into());
+    imported.cwd = Some("/repo".into());
+    doc.upsert_chat(&imported).unwrap();
+    doc.upsert_session(&session(id, "dev-a", SessionStatus::Idle)).unwrap();
+    assert!(doc.take_pushable().is_empty());
+    doc.change_sidebar_pin(&zeron_proto::SidebarPinChange::Pin {
+        session_id: id.into(), after: None, before: None,
+    }).unwrap();
+    assert!(doc.take_pushable().iter().flat_map(|batch| &batch.ops).all(|op| op.id != id));
+    let mut doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
+    let mut forged = doc.acknowledged_row(KIND_CHATS, id).unwrap().clone();
+    forged.deleted = true;
+    forged.seq = 50;
+    doc.apply_state(50, true, 0, vec![forged.clone()]);
+    assert!(doc.apply_rows(51, vec![forged]));
+    doc.apply_state(0, true, 0, vec![]); // server rollback/reseed
+    doc.set_local_only(true);
+    doc.rename_chat(id, "continued locally").unwrap();
+    doc.set_local_only(false);
+    let actual = doc.chat(id).unwrap().unwrap();
+    assert_eq!(actual.harness_session_id, imported.harness_session_id);
+    assert_eq!(actual.cwd, imported.cwd);
+    assert_eq!(actual.title.as_deref(), Some("continued locally"));
+    assert!(actual.crew.is_none());
+    assert_eq!(doc.read_sessions().unwrap().len(), 1);
+    assert!(doc.sidebar_preferences().unwrap().pinned_session_ids.contains(&id.to_string()));
+    assert!(doc.take_pushable().iter().flat_map(|batch| &batch.ops).all(|op| op.id != id));
+}
+
 fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
 }
@@ -242,6 +276,8 @@ fn device(id: &str, name: &str) -> Device {
         id: id.into(),
         name: name.into(),
         platform: "linux".into(),
+        devbox_provider: None,
+        devbox_id: None,
         last_seen_at: Some(ts(1_000)),
         created_at: Some(ts(500)),
         version: Some("0.1.0".into()),
@@ -341,6 +377,43 @@ fn server_round(
     }
     for (i, batch) in acks {
         docs[i].ack_batch(&batch, *seq);
+    }
+}
+
+#[test]
+fn immutable_provider_identity_survives_workspace_migration_sync_and_restart() {
+    for (provider, id) in [
+        (zeron_proto::DeviceEnvironment::Namespace, "ofpf7g22n4412"),
+        (zeron_proto::DeviceEnvironment::Boat, "bx_jdyh7avc"),
+    ] {
+        let mut row = device("remote", "A display name is not an identity");
+        row.devbox_provider = Some(provider);
+        row.devbox_id = Some(id.into());
+        assert_eq!(row.devbox_binding(), Some((provider, id)));
+        let legacy = crate::WorkspaceDoc::new();
+        legacy.upsert_device(&row).unwrap();
+        let imported = crate::WorkspaceDoc::new();
+        imported.doc().import(&legacy.export_snapshot().unwrap()).unwrap();
+        let mut owner = RegistryDoc::new("remote");
+        owner.seed_from_workspace(&imported.read_all().unwrap()).unwrap();
+        let mut peer = RegistryDoc::new("peer");
+        let mut server = HashMap::new();
+        let mut seq = 0;
+        server_round(&mut server, &mut seq, &mut [&mut owner, &mut peer]);
+        assert_eq!(peer.read_devices().unwrap(), vec![row.clone()]);
+        row.name = "Renamed remote".into();
+        owner.upsert_device(&row).unwrap();
+        server_round(&mut server, &mut seq, &mut [&mut owner, &mut peer]);
+        let reopened = RegistryDoc::from_bytes(&peer.to_bytes().unwrap(), "peer").unwrap();
+        assert_eq!(reopened.read_devices().unwrap(), vec![row]);
+    }
+    let old = device("old", "bx_jdyh7avc");
+    assert_eq!(old.devbox_binding(), None);
+    let mut invalid = old;
+    invalid.devbox_provider = Some(zeron_proto::DeviceEnvironment::Boat);
+    for id in ["ofpf7g22n4412", "bx_jdyh7av0", "bx_jdyh7avc\n", ""] {
+        invalid.devbox_id = Some(id.into());
+        assert_eq!(invalid.devbox_binding(), None);
     }
 }
 

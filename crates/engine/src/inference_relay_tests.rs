@@ -282,21 +282,38 @@ mod tests {
         origin
     }
 
-    async fn streaming_control_plane(captured: mpsc::UnboundedSender<CapturedRequest>) -> String {
+    async fn streaming_control_plane(captured: mpsc::UnboundedSender<CapturedRequest>)
+        -> (String, mpsc::UnboundedReceiver<Result<(), hyper::Error>>, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
+        let (connections, streaming_connections) = mpsc::unbounded_channel::<Result<(), hyper::Error>>();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::<(bool, Result<(), hyper::Error>)>::new();
             loop {
-                let (stream, _) = listener.accept().await.unwrap();
+                let stream = tokio::select! {
+                    biased;
+                    result = tasks.join_next(), if !tasks.is_empty() => {
+                        let (streaming, result) = result.unwrap().expect("fixture connection task must not panic");
+                        if streaming { connections.send(result).unwrap(); } else { result.unwrap(); }
+                        continue;
+                    }
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => accepted.unwrap().0,
+                };
                 let captured = captured.clone();
-                tokio::spawn(async move {
+                tasks.spawn(async move {
+                    let streaming = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let serving_stream = streaming.clone();
                     let service = service_fn(move |request: Request<Incoming>| {
                         let captured = captured.clone();
+                        let streaming = serving_stream.clone();
                         async move {
                             let path = request.uri().path().to_string();
                             let headers = request.headers().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
                             if path == "/api/agent-auth/v2/responses" {
+                                streaming.store(true, Ordering::Release);
                                 captured
                                     .send(CapturedRequest {
                                         path: path.clone(),
@@ -343,14 +360,79 @@ mod tests {
                             Ok(Response::new(BodyExt::boxed(StreamBody::new(body))))
                         }
                     });
-                    hyper::server::conn::http1::Builder::new()
+                    let result = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
-                        .await
-                        .unwrap();
+                        .await;
+                    (streaming.load(Ordering::Acquire), result)
                 });
             }
+            tasks.abort_all();
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok((_, result)) => result.unwrap(),
+                    Err(error) => assert!(error.is_cancelled(), "fixture connection task panicked: {error}"),
+                }
+            }
         });
-        origin
+        (origin, streaming_connections, shutdown_tx, server)
+    }
+
+    #[tokio::test]
+    async fn bound_route_admission_blocks_forwarding_and_never_rebinds_stale_credentials() {
+        let (captured_tx, mut captured) = mpsc::unbounded_channel();
+        let origin = test_control_plane(captured_tx).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let (attempts_tx, mut attempts) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let deny = release.clone();
+        let gate = RunInferenceAdmission {
+            cancellation: zeron_harness::CancellationToken::new(),
+            check: Arc::new(move || {
+                attempts_tx.send(()).unwrap();
+                let release = release.clone();
+                Box::pin(async move {
+                    release.notified().await;
+                    Err(EngineError::Other("Boat authorization denied".into()))
+                })
+            }),
+        };
+        let cancellation = gate.cancellation.clone();
+        let first = relay.prepare_with_admission("same-chat", HarnessId::Omp, Some("openai-codex/gpt-5.6-sol"), None, Some(gate)).await.unwrap().unwrap();
+        let http = reqwest::Client::new();
+        assert!(http.get(format!("{}/v1/models", first.base_url)).bearer_auth(&first.token).send().await.unwrap().status().is_success());
+        assert!(attempts.try_recv().is_err(), "model discovery must not admit work");
+        let request = http.post(format!("{}/v1/responses", first.base_url)).bearer_auth(&first.token)
+            .json(&json!({ "model": "gpt-5.6-sol", "input": "autonomous continuation" })).send();
+        tokio::pin!(request);
+        tokio::select! {
+            attempt = attempts.recv() => attempt.unwrap(),
+            _ = &mut request => panic!("request bypassed admission"),
+        }
+        assert!(captured.try_recv().is_err(), "inference reached upstream before protection");
+        deny.notify_one();
+        assert_eq!(request.await.unwrap().status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(captured.try_recv().is_err(), "denied inference reached upstream");
+        let cancelled = http.post(format!("{}/v1/responses", first.base_url)).bearer_auth(&first.token)
+            .json(&json!({ "model": "gpt-5.6-sol", "input": "cancelled continuation" })).send();
+        tokio::pin!(cancelled);
+        tokio::select! {
+            attempt = attempts.recv() => attempt.unwrap(),
+            _ = &mut cancelled => panic!("request bypassed admission"),
+        }
+        cancellation.cancel();
+        assert_eq!(cancelled.await.unwrap().status(), reqwest::StatusCode::GONE);
+        assert!(captured.try_recv().is_err());
+        relay.remove(&first.token);
+        let replacement_gate = RunInferenceAdmission {
+            cancellation: zeron_harness::CancellationToken::new(),
+            check: Arc::new(|| Box::pin(async { Err(EngineError::Other("replacement gate".into())) })),
+        };
+        let replacement = relay.prepare_with_admission("same-chat", HarnessId::Omp, Some("openai-codex/gpt-5.6-sol"), None, Some(replacement_gate)).await.unwrap().unwrap();
+        assert_ne!(first.token, replacement.token);
+        let stale = http.post(format!("{}/v1/responses", first.base_url)).bearer_auth(&first.token)
+            .json(&json!({ "model": "gpt-5.6-sol", "input": "stale runtime" })).send().await.unwrap();
+        assert_eq!(stale.status(), reqwest::StatusCode::GONE);
+        assert!(captured.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -368,6 +450,7 @@ mod tests {
         drop(state);
         let changed_owner = Route {
             request: route.request.clone(),
+            admission: None,
             local_session_id: None,
             owner_subject: "identity:someone-else".into(),
             cancellation: zeron_harness::CancellationToken::new(),
@@ -659,6 +742,7 @@ mod tests {
                 "persistent-worker-token".into(),
                 RetiredRoute {
                     logical_session_id: "persistent-session".into(),
+                    run_bound: false,
                     local_session_id: None,
                     owner_subject: "identity:owner-1".into(),
                     provider: "anthropic".into(),
@@ -708,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn route_removal_ends_an_active_inference_stream() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
-        let origin = streaming_control_plane(captured_tx).await;
+        let (origin, mut streaming_connections, shutdown, server) = streaming_control_plane(captured_tx).await;
         let client = ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap();
         let relay = InferenceRelay::start(client).unwrap();
         let route = relay
@@ -733,6 +817,14 @@ mod tests {
             response.bytes().await.unwrap(),
             Bytes::from_static(b"data: first\n\n")
         );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), streaming_connections.recv())
+            .await.expect("route removal must close the upstream stream")
+            .expect("streaming fixture server must not terminate early");
+        if let Err(error) = result {
+            assert!(error.is_incomplete_message(), "unexpected upstream connection error: {error}");
+        }
+        shutdown.send(()).unwrap();
+        server.await.expect("fixture server must not panic");
     }
 
     #[tokio::test]

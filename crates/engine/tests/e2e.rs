@@ -3250,7 +3250,8 @@ async fn admission_failure_is_visible_and_recovers_with_same_message() {
     assert_eq!(failed.iter().filter(|e| e.role == MessageRole::User).count(), 1);
     assert!(failed.iter().any(|e| e.role == MessageRole::Assistant
         && e.status == Some(MessageStatus::Complete)
-        && matches!(e.parts.as_slice(), [MessagePart::Error { message, .. }] if message == &reason)));
+        && matches!(e.parts.as_slice(), [MessagePart::Error { message, .. }] if message == &reason)),
+        "admission reason {reason:?} must match the completed error entry: {failed:?}");
     assert_eq!(core.sessions.session_status(CHAT).unwrap().status, SessionStatus::Errored);
     assert_eq!(handle.doc().read_commands().unwrap().len(), 1);
 

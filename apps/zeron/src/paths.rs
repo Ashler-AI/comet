@@ -3,14 +3,27 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub fn data_dir() -> PathBuf {
-    resolve_data_dir(|name| std::env::var_os(name))
+pub fn production() -> bool {
+    option_env!("COMET_PACKAGE_ENVIRONMENT")
+        .or(option_env!("COMET_DEFAULT_ENVIRONMENT")) == Some("production")
 }
 
-fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
-    if let Some(dir) = env("COMET_DATA_DIR")
-        .or_else(|| env("ZERON_DATA_DIR"))
+pub fn ipc_port() -> u16 {
+    if production() { 27654 } else { 27655 }
+}
+
+pub fn release_defaults() -> (&'static str, &'static str, &'static str, Option<&'static str>) {
+    if production() {
+        ("https://comet.internal.ashler.com", "https://scaffold.internal.ashler.com", "ashler-production", None)
+    } else {
+        ("https://comet-staging.internal.ashler.com", "https://scaffold-staging.internal.ashler.com", "ashler-staging", Some("ashler-staging"))
+    }
+}
+
+pub fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>, pinned: bool) -> PathBuf {
+    if let Some(dir) = (!pinned).then(|| env("COMET_DATA_DIR")
         .filter(|value| !value.is_empty())
+        .or_else(|| env("ZERON_DATA_DIR").filter(|value| !value.is_empty()))).flatten()
     {
         return PathBuf::from(dir);
     }
@@ -28,14 +41,12 @@ fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
                     .map(|home| PathBuf::from(home).join("AppData").join("Local"))
             })
             .expect("LOCALAPPDATA and USERPROFILE not set; set COMET_DATA_DIR");
-        local.join("Crew Canary")
+        local.join(if production() { "Crew" } else { "Crew Staging" })
     }
     #[cfg(not(windows))]
     {
         let home = PathBuf::from(env("HOME").expect("HOME not set"));
-        // Canary startup never renames or opens the installed Crew profile.
-        // Importing an existing profile is a separate, explicit operation.
-        home.join(".crew-upstream-canary")
+        home.join(if production() { ".comet-native" } else { ".comet-native-staging" })
     }
 }
 
@@ -48,7 +59,7 @@ mod tests {
             vars.iter()
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.into())
-        })
+        }, false)
     }
 
     #[test]
@@ -62,25 +73,10 @@ mod tests {
     #[test]
     fn native_runtime_data_dir_takes_precedence() {
         assert_eq!(
-            resolve(&[("COMET_DATA_DIR", "canary"), ("ZERON_DATA_DIR", "upstream")]),
-            PathBuf::from("canary")
+            resolve(&[("COMET_DATA_DIR", "explicit"), ("ZERON_DATA_DIR", "upstream")]),
+            PathBuf::from("explicit")
         );
     }
 
-    #[cfg(not(windows))]
-    #[test]
-    fn starting_canary_does_not_adopt_an_installed_profile() {
-        let home = tempfile::tempdir().unwrap();
-        let installed = home.path().join(".comet-native");
-        std::fs::create_dir(&installed).unwrap();
-        std::fs::write(installed.join("sentinel"), b"retained-session").unwrap();
-        let selected = resolve(&[("HOME", home.path().to_str().unwrap())]);
-        assert_ne!(selected, installed);
-        assert!(!selected.exists());
-        assert_eq!(
-            std::fs::read(installed.join("sentinel")).unwrap(),
-            b"retained-session"
-        );
-    }
 
 }

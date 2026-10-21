@@ -4,10 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --env canary --port 27640 --var AUTH_MODE:dev --var ENVIRONMENT:local --var SCAFFOLD_PROJECT_SCOPE:local --var SCAFFOLD_DEPLOYMENT_ID:local",
-    "deploy": "node -e \"throw new Error('Use the authorized canary workflow; default deployment is disabled')\"",
-    "deploy:canary": "wrangler deploy --env canary",
-    "build": "wrangler deploy --env canary --dry-run --outdir dist",
+    "dev": "wrangler dev --env staging --port 27640 --var AUTH_MODE:dev --var ENVIRONMENT:local --var SCAFFOLD_PROJECT_SCOPE:local --var SCAFFOLD_DEPLOYMENT_ID:local",
+    "deploy": "node -e \"throw new Error('Use the reviewed staging deployment workflow; default deployment is disabled')\"",
+    "build": "wrangler deploy --env staging --dry-run --outdir dist",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:unit && npm run test:workerd",
     "test:unit": "vitest run",

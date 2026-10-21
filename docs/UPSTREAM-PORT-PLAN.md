@@ -1,6 +1,57 @@
 # Crew on current upstream: port and update plan
 
-## Implementation status: isolated upstream canary
+## Current delivery: staging native cutover 0.2.114
+
+The staging cutover replaces the maintained legacy implementation with this
+upstream-based source. Production deployment, release channels and profiles remain
+unchanged. The earlier Canary-only constraints below describe historical testing,
+not the current staging authorization.
+
+Publish an immutable `staging-candidate` first; deploy compatible staging services,
+establish authoritative old-writer fences and verify retained-history migration,
+then activate the native runtime and promote the exact candidate. Follow
+[`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md); candidate publication
+alone is not activation or a successful migration.
+
+Current source checks: 44 release/packaging contract checks, nine native web
+contract checks, three iOS release-helper checks and the iOS metadata self-check
+passed locally. These are not native-app, migration, signing or deployment proof.
+
+The integration owner subsequently recorded passing results across separate native
+runs: 193 Sync/Client tests plus nine `local_first` tests, the exact relay regression
+(0.25 seconds), and the actual 94 MB history-copy check (2.50 seconds). Eight other
+targets passed in the earlier integrated run. The actual Linux installer container
+check also passed all three status cases (2.5 seconds). These are combined results
+from the integrated run and focused reruns after fixes, not one uninterrupted
+all-pass global invocation. The historical-import and authentication-redirect
+review also cleared; none of these results substitutes for live cutover acceptance.
+
+Prior authenticated Apple metadata identified staging app `6808397041` with
+1.0 (36) Testing. Build 1.0 (37) is an unallocated candidate, not a freshly verified
+next upload: the 2026-10-21 metadata attempt redirected to login with
+`authResult=FAILED`. Revalidate current build/upload metadata before allocation.
+No new staging build was uploaded; the staging LiveActivity distribution-profile
+requirement also remains unresolved.
+
+The integration owner's arm64, ad-hoc-signed iOS Debug `build-for-testing` passed,
+including Rust core compilation, UniFFI regeneration and Swift linking. The
+generic simulator caller initially requested unsupported x86_64 as well; explicit
+`ARCHS=arm64 ONLY_ACTIVE_ARCH=YES` corrected it without global architecture changes.
+A fresh iPhone 17 Pro/iOS 26.5 simulator passed seven `CrewIsolationTests` and
+`SessionFlowTests/testSendEchoesAndStreamsReply` (eight tests, zero failures).
+Evidence: `/tmp/Crew-Staging-Native-Smoke.tT9JjF/OfflineSmoke.xcresult` and sibling
+`Attachments/`. Both inspected screenshots show completed reply rendering, not
+mid-stream visuals. No existing simulator profile was modified or credential
+imported. This is offline mobile build/runtime proof, not authenticated same-bundle
+migration, physical-device acceptance, TestFlight delivery or a global native-suite
+pass. The reproducible isolated commands are in [`apps/ios/README.md`](../apps/ios/README.md).
+
+Activation remains gated on complete migration and actual runtime verification.
+The running legacy engine kills its supervised OMP processes during shutdown;
+durable-history recovery must not be described as uninterrupted live-job transfer.
+Do not stop current jobs or activate an incompletely reconciled profile.
+
+## Historical verification: isolated upstream canary
 
 The port is under implementation on `crew/upstream-canary`, based on upstream
 `3b2f78027a2c31622c39c35716da4d6e1af8de15` (v0.2.113). The legacy Crew source
@@ -687,6 +738,10 @@ underlying service is restored, explicitly recover a confirmed rejected command
 with a fresh command ID and the original Run payload/message ID; the user entry
 is deduplicated. Do not automatically retry, replace the message ID, or use
 RetryDelivery for an already-saved message (it only reissues undelivered entries).
+Crash recovery reads pending commands and in-flight claims under the same
+existing execution mutex, released before asynchronous dispatch. A concurrent
+control drain must not overwrite a terminal outcome or its admission reason
+using a stale pending snapshot after the executing claim retires.
 The admission/recovery and existing startup-failure regressions passed. The actual
 offline headed demo displayed the durable error and **Run failed** state. Reported
 chat `379bf65b-4542-4630-be24-a36051dcb913` recovered through an explicit new command:
@@ -860,6 +915,13 @@ Expose these as typed engine operations used by both UI and CLI. UI buttons disp
 - Verify Platform's actual create-idempotency and lifecycle contracts before enabling automatic retries. If creation outcome is unknown, inspect/reconcile; do not issue another create on the assumption that the first failed.
 - Preserve lifecycle epochs, native OMP session/history/cwd, writer ownership, and exact child-process identity. Reject stale recovery after Stop. A restarted controller must attach to the existing execution, not start a duplicate writer.
 - Retain the required native CLI/environment interface, including `COMET_EXECUTABLE`, `COMET_SESSION_ID`, and `COMET_IPC_PORT`. Preserve the checked-in native handoff contract where consumed; do not introduce a second handoff protocol as part of this port.
+- `comet session supervise` uses the host-minted `COMET_SUPERVISION_TOKEN` with `COMET_SESSION_ID` over local IPC. Its single JSON receipt identifies the retained exact run. Keep the child attached; terminate/reap it to release. The checked subscription blocks idle/update retirement only: cancellation, stream death and engine shutdown still end it, and the last release restores the original idle deadline. Old tokens or old subscription drops cannot retain/release a replacement run. Tokens stay out of serialized documents and debug output.
+- Legacy cutover recovery is **interrupted-request continuation, not live-process adoption**. The importer retains and revalidates the exact `PendingRun`/`.recovery` bytes, source identity, native history and final journal evidence. Only an unblocked pending request with a later known `Done: interrupted` outcome can become a recovery intent; completed, errored, missing/unknown outcomes and mismatched authority remain gated. A `writerStopped` field is not OS liveness proof: the operator/local stop boundary or cloud source fence must establish that the old writer really stopped before export and activation.
+- After attachment aliases, repositories and turn hooks are wired, the engine binds each imported intent to the freshly verified controller owner/project/deployment and destination device, checks the original native ID/cwd/model/account and user entry, then admits its exact request through the existing immutable native command ID. Original attachments, approval settings and user-message identity are retained; account selection maps to the existing `crewAccountId` route without selecting a default. Archived native bytes stay immutable; execution uses the existing `native-resumes` working copy. Existing commands and unknown processed claims are never re-admitted, and these chats never use generic last-user-prompt reconstruction. A new execution receives a new supervision token; the old subscription does not survive engine exit.
+- Server-proven extinct original epochs retain `crew.originalEpochHistory` and their original native ID as provenance, not execution authority. Runtime admission loads the importer's hash-verified history map; editing or dropping index metadata cannot unlock it. Run, steering, idle startup, native/side-chat fork, handoff retries and imported recovery share the execution fence. An explicit verified Start may release only its exact new sandbox/epoch/device through the immutable `original-epoch-start:<chat>:<originalEpoch>:<newEpoch>` receipt and reset native association to the empty tombstone. Generic refresh, a larger client-projected epoch, unknown command outcomes and the original native ID never grant execution. Preserved transcript reads remain available; original pending requests are inert, not replayed as new-epoch work.
+- Focused admission regression (not run during implementation): `cargo test --locked -p zeron-engine original_epoch_requires_trusted_start_and_never_reuses_old_native_identity`. It rejects original/raw-native resume and unverified/unknown starts, accepts the exact trusted new-epoch association, and retains the source message ID and receipt.
+- A fresh device host fetches `/api/code-sandboxes/:sandbox/original-epoch-history` with its current verified `cs1` grant before engine/document-sync construction, under the profile lock. The authenticated response carries exact original proof JSON bytes and the complete original command-status map. Shared validation preserves the raw receipt hash; the host marks every original command processed and commits `original-epoch-bootstrap:<chat>:<originalEpoch>` before admission. No whole-profile restore, manufactured native journal, or client-projected marker is an authority substitute. A missing/incomplete proof fails closed; an authenticated explicit null applies only to sessions without original terminal migration.
+- Terminal original-epoch transcript rows retain legacy `queued` and `steered` delivery statuses through snapshot/JSON round trips. These are historical message metadata, not live queue entries, streaming state, execution claims or recovery instructions. Desktop/mobile render them as non-streaming history; importing them never creates a command or queued message. The importer’s terminal-scope restrictions and runtime original-epoch execution fence remain authoritative.
 
 Acceptance: start → stream → pause → resume same ID → continue → stop; repeated actions; lost HTTP response; controller restart during creation and attachment; expired grants; terminal sandbox reconnect; stale lifecycle completion after Stop; native history continuity and absence of duplicate execution.
 
@@ -922,6 +984,286 @@ This is not an in-place binary upgrade over the old store. Current Crew's projec
 5. Use versioned Edge bindings/routes for the new topology. No old/new dual writers to the same logical session. Keep old clients on an isolated legacy lane until compatible clients or an approved retirement path exist.
 6. Dry-run representative copied profiles, including shared/granted sessions and interrupted work. Produce a reconciliation report with IDs, content integrity, unsupported records, and outcomes; unexplained loss blocks cutover.
 7. At authorized cutover, establish one active writer per migrated session and take a consistent backup. Rollback before new writes can restore the old binary plus old store. After new writes, stopping and reconciling/exporting them is required; restoring a stale backup is not a lossless rollback.
+
+### Staging cloud migration operator
+
+`scripts/migrate-staging-cloud.mjs` is staging-only. It reads the existing user auth
+file with `--auth-file` (JSON `accessToken`/`access_token` or a raw token file), or the
+existing `SCAFFOLD_ACCESS_TOKEN` environment variable. It never prints credentials or
+passes them in process arguments, follows no redirects, and cannot select a production
+origin. Run it from the Crew repository:
+
+```sh
+node scripts/migrate-staging-cloud.mjs --dry-run --via-staging-bridge --auth-file /private/path/existing-staging-auth.json --report /private/path/cloud-plan.json
+node scripts/migrate-staging-cloud.mjs --apply /private/path/cloud-plan.json --prepare-only --via-staging-bridge --auth-file /private/path/existing-staging-auth.json --report /private/path/cloud-prepare.json --platform-checkout /path/to/reviewed-platform --compatibility-receipt /private/path/compatible-services.json
+node scripts/migrate-staging-cloud.mjs --recover /private/path/cloud-plan.json --via-staging-bridge --destination-device-id OWNER_CONTROLLER_ID --auth-file /private/path/existing-staging-auth.json --report /private/path/cloud-recovery.json --platform-checkout /path/to/reviewed-platform --compatibility-receipt /private/path/compatible-services.json
+```
+
+Keep an operator-owned staging port-forward open in another terminal:
+`kubectl --context "$SCAFFOLD_KUBE_CONTEXT" -n scaffold-staging port-forward --address 127.0.0.1 deployment/scaffold-control-plane 18081:8080`.
+The existing bridge injects its service credential inside the pod; never extract it.
+`--via-staging-bridge` checks the established bridge health contract, then verifies the
+same owner and exact staging resource through its upstream owner-auth route. Generic
+`/api/sessions` requires that existing service boundary; a valid owner bearer alone
+does not replace it. HTTP diagnostics name the safe phase without credentials or URLs.
+
+Use `--prepare-only` while the one-time legacy source exporter is serving. It returns
+`prepared:true, complete:false` after source preparation; for a terminal original epoch,
+that is frozen source plus server eligibility, **not** native import or publication.
+It never calls generation CAS or native activation. Keep those server-owned frozen
+source artifacts and claims, switch to the reviewed native Edge deployment only at the
+authorized operator gate, then use `--recover` to commit/activate. Repeated recovery
+uses the retained immutable source, not a now-unavailable legacy route.
+
+Every report path must be new; files are mode `0600`. Dry-run is the default and uses
+only existing routes: `GET /api/code-sandboxes/auth/session` verifies the current owner,
+then all pages of `GET /api/sessions?showStopped=true&user=<verified-owner>`, followed by
+the explicit `inventoryRecord` projection from `GET /api/sessions/:id/crew-migration`,
+and a repeated complete ID listing to detect drift. This phase-one GET reads raw
+stored authority without lifecycle normalization, but exposes only selected safe
+fields: no arbitrary session properties, credentials, auth routes or prompt content.
+Exact stored profile-version/runtime-profile values remain diagnostic, not trust defaults.
+The plan names that authenticated owner and includes status counts plus every retained
+ID and blocker; unknown or mismatched ownership is not silently filtered.
+It does not request live reconciliation, probe a remote runtime, resume a sandbox,
+stop a writer, import files, or change generation. The deterministic version-1 plan
+includes every retained record (including stopped and explicitly non-Crew records),
+original owner/project/deployment/logical-session/sandbox/device/epoch, the separate
+`coordinatorLifecycleEpoch`, generation, record/preservation SHA-256, and blockers. Unknown owner, scope, generation, duplicate
+logical identity, incomplete pagination, and unclassified records are hard gates.
+An absent generation uses the existing server's **legacy `session`** contract, never
+`chat2`. A dry-run candidate means “requires fenced import,” not verified migration.
+Operator record/preservation digests cover this safe public projection; they are not
+full private-record digests. The server independently compares the complete stored
+source record for CAS. Missing `inventoryRecord` fails closed without falling back
+to the normalizing session-detail route.
+
+Phase one deploys the compatible Worker with creation frozen, then immediately
+captures the pure-read inventory baseline **before** provider changes or migration.
+This is a post-Worker, pre-migration baseline—not a reconstruction of old raw DO
+records. The compatibility verifier must validate that retained artifact and its
+unclaimed/uncommitted state, rejecting unexpected native generations, before the
+operator can dispatch a claim. Unknown source metadata remains explicit. No
+provider or migration action may fill a missing baseline by normalizing old records.
+A missing, failed or truncated baseline is unknown, not evidence that no migration
+occurred: retain creation freeze and do not restore the old Worker. Application
+rollback must pass its guard before replacing services, and Worker restoration
+requires verified health of the restored prior Application. These gates are not a
+claim that compatibility deployment or live migration is ready.
+The operator's receipt check is defense in depth, not server authority. A per-deployment
+DO-backed migration admission barrier defaults closed; only the trusted workflow
+opens it after baseline and readiness verification. Direct prepare requests hold an
+admission ticket through durable claim persistence. Recovery closes admission and
+requires no outstanding tickets before the complete inventory and any old-service
+or Worker restoration. Unknown tickets remain blocking; no timeout opens admission.
+The owner operator neither opens the barrier nor receives broader permissions.
+
+Apply first re-inventories and requires an exact plan match. It prepares every legacy
+candidate before committing any generation. Each mutation carries
+`expected: {scope, coordinatorLifecycleEpoch, sourceGeneration: "session"}` to the owner-authenticated
+`/api/sessions/:id/crew-migration/{prepare,recover,commit}` APIs. A plan or caller receipt
+is not import proof. The coordinator persists a private migration claim before any
+provider action; ordinary lifecycle and provider ingress are fenced. The provider uses
+the existing authenticated SDK command transport, not the legacy supervisor's exec
+channel, to preserve the same sandbox and epoch. The native runtime is installed from
+the pinned staging candidate without replacing the old profile. A stopped-writer copy
+feeds the existing backup converter and native importer; original SQLite/Loro evidence,
+native journals, attachments, configuration, worktree/model bindings and durable
+command outcomes remain inventoried. The provider-local remote-context file binds
+these files to the server-derived identity; it is **not** authentication or proof that
+a writer stopped.
+
+`scope` preserves the exact known-v1 profile's original `targetDeviceId` and
+`lifecycleEpoch`; neither is synthesized from the coordinator record. The retained
+device must match the same sandbox's proven producer format, `comet-scaffold-{sandboxId}`
+or `comet-scaffold-{sandboxId}-e{originalEpoch}`; an arbitrary device is not accepted. A stopped
+writer at E1 with a coordinator stop at E2 therefore retains scope E1 and carries
+`coordinatorLifecycleEpoch: 2`; an active E1 writer carries 1/1. Claims, recovery,
+CAS and ingress fencing check the coordinator epoch. Source capture and native
+readback check the original scope. The separate coordinator field is mandatory
+through terminal authority, native proof and history marker; missing/stale fields
+fail closed, with no old-receipt fallback. This identity split does not admit an
+observed-revocation terminal path or relax the existing terminal evidence gates.
+
+Provider `prepare`/`verify` are service-only and accept the exact private coordinator
+claim, independently checked against readiness. Durable ingress leases cover all
+replicas, sockets, and detached SDK operations. A missing release is unknown and never
+expires into a fictitious stopped-writer proof. Drain leases before copying; stop
+legacy watchdog/supervisor execution and its writer descendants. SQLite source capture
+uses a read-only backup, not a checkpoint or rewrite of the original. Compatibility
+rollout must also drain old, pre-lease provider revisions before preparing any source.
+
+Verification reads actual destination storage and retained source bytes, compares
+semantic native snapshots, file/native-journal hashes, counts, and durable outcomes.
+The coordinator fetches this proof through its private provider path and compares the
+unchanged source record before generation CAS. Pending/unknown execution stays intact
+and cannot activate or replay. Metadata replication intents may be retained or
+compacted only when the authoritative snapshot proves the same effect. New generation
+does not authorize a second writer; keep admission fenced through same-epoch native
+activation and retain the committed proof. Legacy Durable Object data remains offline
+backup, not an active parallel runtime.
+Inactive records retain their original status and epoch: do not start a writer merely
+to finish migration. Their imported bytes must be persisted in the original retained
+sandbox/snapshot used by a later explicit resume; an unbound copy is not sufficient.
+The guest-copy path rejects paused/stopped records before SDK connect: auto-waking
+the VM could resume unknown legacy work before its writer is fenced. Resumable paused
+sources require a preserving offline filesystem or pre-resume writer-fence path; they
+remain explicit inventory blockers, not successful imports. Proven extinct original
+epochs use the separate owner-profile preparation below, never a replacement guest.
+The pinned E2B SDK is `2.50.0`. Its file/download operations use the running guest;
+the official [persistence contract](https://docs.e2b.dev/sandbox/persistence.md) says
+`connect` resumes paused processes and killed sandboxes cannot resume. The
+[snapshot API](https://docs.e2b.dev/sandbox/snapshots.md) captures a running source and
+spawns new sandbox IDs, not an offline writable view of the original. A
+[reboot resume](https://docs.e2b.dev/sandbox/resume-without-memory.md) explicitly loses
+unflushed writes. None is a safe substitute for a provider-supported offline
+filesystem/memory-preserving export-and-writeback or pre-resume process barrier;
+recoverable killed-source data still requires its retained original checkpoint.
+Active records use the existing native launcher and freshly verified, exact-scope
+authentication at the same epoch, not imported credentials or expanded permissions.
+
+An original-epoch terminal **candidate** requires persisted stopped/failed, kill action,
+termination timestamp and reason. Those metadata fields do not prove completion:
+the server must independently attest the exact registered physical VM's genuine 404,
+exhaust all retained physical snapshots, and capture the frozen authoritative source.
+Unknown timestamps, surviving work, inaccessible extant data, and duplicate physical
+records for one logical ID stay blocked. The report retains every duplicate and its
+exact tuple; it never chooses the newest record or silently deduplicates history.
+
+The retained staging inventory and bounded read-only investigation on 2026-10-21
+do not establish that legacy histories are corrupt or safely discardable. The
+811-record report retains 669 blocked records, 141 explicit non-Crew records and
+one fenced-import candidate; this is not a fresh post-compatibility inventory.
+Fourteen exact raw profile-version values remain unavailable from retained DTOs:
+the ordinary read-only list omits the runtime-profile object, while detail reads
+normalize stored lifecycle state. Twelve of the 27 investigated records still
+lack historical physical identity. For the other 15, exact-ID reads returned 404
+and complete snapshot inventories were empty in both documented provider realms;
+these are current, realm/credential-scoped observations, not invented kill times
+or completed migration receipts. The two duplicate logical groups still lack
+authoritative current/superseding workspace bindings; no history is selected by age.
+Offline source capture and the actual source-history backup remain incomplete.
+The parent journal's trusted native-ID/cwd association is present, but its pending
+nudge and active writers must be reconciled before taking the final consistent copy.
+These unresolved inputs remain gates; the epoch separation above does not bypass them.
+
+Desktop bulk capture reuses that same source rather than refreezing overlapping rooms:
+
+```sh
+python3 scripts/capture-staging-desktop.py --database /ABS/COPY/docs.sqlite3 --auth-file /PRIVATE/auth.json --output /PRIVATE/capture --migration-id EXPLICIT_BATCH --cloud-plan /PRIVATE/cloud-plan.json --via-staging-bridge
+```
+
+This defaults to authenticated read-only planning. Add `--apply` for authorized capture
+or `--resume` for explicit recovery using persisted IDs. Every s3/s4/workspace scope is
+inventoried. Matching prepared cloud scopes use authenticated coordinator receipts and
+raw-source GETs, not a second POST; ambiguous physical groups require an exact retained
+source receipt and still cannot invent terminal authority. Bodies are streamed with
+identity encoding, exact Content-Length and SHA-256; no whole-response JSON buffering.
+`complete.json` is written only after all required source/terminal checks succeed.
+
+For scope-less bootstrap candidates, add `--native-cli /ABS/COMET`
+`--source-backup-root /ABS/COPY --writers-stopped` and repeat
+`--native-history-root /ABS/COPY/OMP_HOME` for every disjoint copied native root.
+The collector invokes the native read-only `inspect-backup` classifier itself,
+binding its report to the exact SQLite hash and each streamed snapshot hash.
+Only that native-proven inert disposition requires no remote room; arbitrary
+classification JSON, an empty-looking row, or a special-cased ID is not proof.
+Original IDs, bytes and hashes remain in the plan and unchanged SQLite copy;
+unknown, nonempty or referenced candidates remain blocked.
+
+The output `raw/` and `context.json` feed the existing offline export command:
+
+```sh
+comet export-backup --source-profile-root /ABS/ORIGINAL --source-backup-root /ABS/COPY --database-relative docs.sqlite3 --destination /PRIVATE/import-backup --writers-stopped --identity-session /PRIVATE/EXISTING_OWNER_SESSION.json --source-context /PRIVATE/capture/context.json --source-storage-directory /PRIVATE/capture/raw --native-history-root /ABS/COPY/OMP_HOME
+```
+
+Repeat `--native-history-root` for every copied native root. If attachment blobs
+are required, use `--inventory-attachments-only` first, retain the exact requested
+blobs, and pass their directory with `--attachment-root` to the final export.
+`sourceWitnesses` is required for every non-inert document and contains its
+actual `{migrationId, sha256}`; a batch ID is not per-room authority. Add
+`--terminal-authority-root /PRIVATE/capture/terminal-authority` when the capture includes
+server-attested original epochs. The existing exporter derives their native identity
+and original command map from real frozen source plus retained owner replica/config,
+retains all evidence, and exempts a missing journal only for that verified old epoch.
+It never creates a replacement journal or converts unknown outcomes into success.
+
+Import into a fresh, authenticated owner-controller profile with the existing importer,
+verify it, and start that same isolated native controller. Publish selected histories:
+`comet --data-dir "$OWNER_DATA" --ipc-port "$PORT" session publish-imported "$UUID1" "$UUID2"`.
+This owner-only RPC posts actual stored snapshots and awaits registry acknowledgments;
+it launches no agent. Terminal commit selects `--destination-device-id` only as an
+address: the coordinator fetches `VerifyImportedCrewSession` from that authenticated
+controller, hashes its exact raw proof, and independently reads native Edge checkpoints
+and registry rows. The verifier's device is distinct from the original absent guest.
+Only verified readback permits CAS, preserving the original record's status and epoch.
+Old pending/unknown commands remain visible and inert. A later explicit `starting`
+creates a genuinely new epoch strictly greater than the retained coordinator epoch;
+its verified bootstrap carries the original proof and
+inert command map before sync, and establishes a fresh native association without
+replaying or silently resuming the old one.
+
+A failed or lost response stops the operator without retries or automatic rollback;
+the report persists an `unknown` intent **before** dispatch. Keep all source/destination
+copies and the server claim. Explicit recovery reads the existing claim and reruns only
+the same fenced preparation/readback. An untouched, authoritatively `unprepared` record
+uses serialized `prepare`; a delayed original request reuses that same claim rather
+than creating a second token. Unknown claim state, changed identity, unresolved lease,
+incomplete import, or changed preserved state remains blocked. Abort is not permission
+to clear a fence: it needs independently verified source restoration. After native
+writes, restoring a stale legacy backup is not lossless recovery.
+If generation CAS succeeded but native activation did not, recovery continues the
+fenced native activation; it does not re-import, clear the claim, or revive legacy
+writers. The committed server proof remains available for the later activation gate.
+
+Deployment order is immutable candidate publication, compatible staging Worker/provider
+with the legacy template retained and old provider ingress drained, full-inventory
+migration, then the native-template activation gate. That gate must fetch current
+authority and durable server import proofs; a self-hashed report or operator boolean
+is insufficient. No production redeploy or production state mutation is part of this
+operator. Focused operator regressions are runnable with
+`node --test scripts/migrate-staging-cloud.test.mjs`; this implementation task does not
+execute that check or any live apply.
+Before every apply/recovery mutation, the operator executes the reviewed Platform
+`internal/scaffold/scripts/deploy-staging-compatible-services.mjs --verify-receipt`
+read-only subcommand. It re-fetches actual provider pods/deployment and Cloudflare
+Worker versions, requiring the recorded immutable controller commit and original
+drain identity. It uses the existing kube context and
+`CLOUDFLARE_API_TOKEN_SCAFFOLD`/`CLOUDFLARE_ACCOUNT_ID`; credentials are not reported.
+A stale receipt or failed live verification blocks dispatch, not merely final promotion.
+
+Shared records are inventoried, not discarded or presumed migratable. For each actual
+record, revalidate any reachable existing live authority. A copied publication alone
+cannot establish a contributor's current grant, expiry/revocation, original
+sandbox/device/epoch, or native-journal association: legacy grant envelopes were
+socket-local rather than persisted in Loro. Where those facts are absent from both
+retained records and existing authenticated authority, report the exact missing
+contributor/binding and keep bytes offline; do not invent a historical-membership
+predicate or issue a broad replacement grant.
+
+The legacy source also requires a real Edge write barrier plus its authoritative raw
+Loro snapshot, merged with the copied host snapshot while retaining both originals.
+Host shutdown alone does not capture later mobile commands or remote annotations.
+The existing legacy routes have no all-writer freeze: workspace `reset-log` is
+destructive, and grant revocation does not close non-grant Scaffold sockets. An HTTP
+route switch or equal repeated snapshot hashes is not a fence for existing sockets.
+Without a trusted source barrier producer covering HTTP and existing WebSockets,
+provider preparation and generation activation fail closed with
+`legacy_edge_writer_barrier_required`; no caller receipt can satisfy that prerequisite.
+The authorized one-time source adapter is built separately from the observed legacy
+staging revision in a disposable migration worktree; it is not a second maintained
+runtime. It retires all legacy writes, closes existing sockets, and exports raw
+`legacy-session-sql-v1` storage under the original exact owner/read/control authority.
+The coordinator fetches the persisted bytes itself, validates their digest and room
+scope, and binds them to its original sandbox/device/epoch claim. The native offline
+decoder reconstructs the snapshot plus ordered update log, verifies causal
+completeness, and preserves the original raw envelope. Only that real frozen-source
+proof can satisfy the barrier gate; deployment acknowledgment alone cannot.
+Cloudflare documents [Durable Object global uniqueness and eventual code updates](https://developers.cloudflare.com/durable-objects/platform/known-issues/):
+uniqueness is enforced on events and storage access, so a replaced instance's later
+storage access throws. Therefore require a successful persisted freeze/export receipt
+from the replacement class for each room, not a deployment timestamp. Use one migration
+version at 100%, no gradual split, and never roll back to source writer code after capture.
 
 ## 7. Keeping the fork updateable
 

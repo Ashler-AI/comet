@@ -15,7 +15,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::WorkspaceScope;
 
@@ -196,6 +195,19 @@ struct ScaffoldStoreBinding {
     legacy_device_id: Option<String>,
 }
 
+/// Pure destination derivation for authenticated runtime and fenced offline
+/// import. The caller supplies verified bindings; this path grants no authority.
+#[allow(clippy::too_many_arguments)]
+pub fn scaffold_profile_directory(
+    data_dir: &Path, resource: &str, edge_origin: &str, user_id: &str, project_id: &str,
+    deployment_id: Option<&str>, device_deployment_id: &str, session_id: &str, sandbox_id: &str,
+) -> PathBuf {
+    data_dir.join("profiles").join("scaffold").join(zeron_sync::scaffold_auth::sandbox_storage_key(
+        resource, edge_origin, user_id, project_id, deployment_id, device_deployment_id, session_id, sandbox_id,
+    ))
+}
+
+
 /// Resolve only verified authority. Never use this storage binding for tokens.
 fn scaffold_store_root(
     data_dir: &Path,
@@ -205,19 +217,12 @@ fn scaffold_store_root(
     let profiles = data_dir.join("profiles").join("scaffold");
     let legacy = profiles.join(auth_key);
     let Some(device) = &session.device else { return Ok(legacy); };
-    let identity = serde_json::to_vec(&(
-        "scaffold-sandbox-storage-v1",
-        &session.resource,
-        &session.edge_origin,
-        &session.identity.user_id,
-        &session.identity.project_scope,
-        &session.identity.deployment_id,
-        &device.deployment_id,
-        &device.session_id,
-        &device.sandbox_id,
-    )).expect("string tuple serializes");
-    let scope_key = format!("{:x}", Sha256::digest(identity));
-    let stable = profiles.join(&scope_key);
+    let stable = scaffold_profile_directory(
+        data_dir, &session.resource, &session.edge_origin, &session.identity.user_id,
+        &session.identity.project_scope, session.identity.deployment_id.as_deref(),
+        &device.deployment_id, &device.session_id, &device.sandbox_id,
+    );
+    let scope_key = stable.file_name().and_then(|name| name.to_str()).expect("storage key is hex").to_owned();
     let binding_path = profiles.join(format!("{scope_key}.store.json"));
     std::fs::create_dir_all(data_dir)?;
     for parent in [data_dir.join("profiles"), profiles.clone()] {
@@ -514,6 +519,25 @@ fn sanitize_path_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_destination_matches_the_existing_verified_storage_tuple() {
+        use sha2::{Digest, Sha256};
+        let data = Path::new("/isolated/crew-data");
+        let binding = serde_json::to_vec(&(
+            "scaffold-sandbox-storage-v1", "https://control", "https://edge", "owner", "project",
+            Some("deployment"), "deployment", "session", "sandbox",
+        )).unwrap();
+        let expected = data.join("profiles/scaffold").join(format!("{:x}", Sha256::digest(binding)));
+        let actual = scaffold_profile_directory(data, "https://control", "https://edge", "owner", "project",
+            Some("deployment"), "deployment", "session", "sandbox");
+        assert_eq!(actual, expected);
+        for (owner, session, sandbox) in [("other", "session", "sandbox"), ("owner", "other", "sandbox"), ("owner", "session", "other")] {
+            assert_ne!(actual, scaffold_profile_directory(data, "https://control", "https://edge", owner, "project",
+                Some("deployment"), "deployment", session, sandbox));
+        }
+    }
+
 
     #[test]
     fn local_profile_id_is_stable_and_not_the_dev_identity() {

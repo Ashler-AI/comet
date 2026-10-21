@@ -43,7 +43,7 @@ export const authorizeRoute = (request: Request, identity: Verified): boolean =>
       !!identity.deploymentId && url.searchParams.get("deploymentId") === identity.deploymentId;
   }
   // Authenticated application artifacts contain no personal registry/session data.
-  if (parts[0] === "releases" || (parts[0] === "api" && parts[1] === "releases")) {
+  if (url.pathname === "/install.sh" || parts[0] === "releases" || (parts[0] === "api" && parts[1] === "releases")) {
     return ["GET", "HEAD"].includes(request.method) && identity.capabilities.includes("session.read");
   }
   if (parts[0] === "chat2" && parts[1] === identity.sessionId) {

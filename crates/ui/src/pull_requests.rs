@@ -3624,6 +3624,8 @@ mod tests {
             version: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            devbox_provider: None,
+            devbox_id: None,
         }
     }
 

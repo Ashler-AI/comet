@@ -108,6 +108,10 @@ pub enum MessageStatus {
     Streaming,
     Complete,
     Aborted,
+    /// Historical user followup accepted for a later turn; not a queue command.
+    Queued,
+    /// Historical user followup delivered to a steering boundary; not a live run.
+    Steered,
 }
 
 /// Lifecycle of a spawned subagent, carried on its spawn chip.

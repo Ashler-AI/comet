@@ -170,6 +170,12 @@ impl RpcClient {
         serde_json::from_value(value).map_err(|e| RpcError::BadParams(e.to_string()))
     }
 
+    /// Borrow the local engine's current authentication for its release origin.
+    pub async fn update_access_token(&self, edge_url: &str) -> Result<String, RpcError> {
+        self.call_as(crate::methods::UPDATE_ACCESS_TOKEN, serde_json::json!({ "edgeUrl": edge_url }))
+            .await
+    }
+
     /// Legacy streaming request. Cancellation on receiver drop is only detected
     /// when another item arrives. Prefer `subscribe_scoped` for owned streams.
     pub async fn subscribe(

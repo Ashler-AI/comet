@@ -8,7 +8,7 @@ import { createServer, Viewport, loadConfig, browserEntry } from './server.mjs';
 import { CrewRpc, applyTranscriptFrame } from './rpc.mjs';
 
 const profile = {
-  projectId: 'crew-upstream-canary', deploymentId: 'crew-upstream-canary', sessionId: 'session-a',
+  projectId: 'ashler-staging', deploymentId: 'ashler-staging', sessionId: 'session-a',
   sandboxId: 'sandbox-a', targetDeviceId: 'device-a', lifecycleEpoch: 1, actor: { sub: 'owner@example.com' },
 };
 const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
@@ -19,12 +19,12 @@ async function fixture(t, publish = true) {
   t.after(() => rm(root, { recursive: true, force: true }));
   const env = {
     SCAFFOLD_CREW_SYNC_GENERATION: 'chat2', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify(profile),
-    CREW_WEB_AUTH_TOKEN: 'private-token-'.repeat(4), COMET_IPC_PORT: '27954',
-    COMET_DATA_DIR: join(root, '.scaffold/crew-upstream-canary/data'), SCAFFOLD_RUNTIME_DIR: root,
+    CREW_WEB_AUTH_TOKEN: 'private-token-'.repeat(4), COMET_IPC_PORT: '39400',
+    COMET_DATA_DIR: join(root, '.scaffold/crew-data'), SCAFFOLD_RUNTIME_DIR: join(root, '.scaffold/crew'),
   };
   const config = loadConfig(env);
-  await mkdir(join(root, 'omp-inference'));
-  await writeFile(join(root, 'omp-inference/profile.json'), JSON.stringify({ profile: 'scaffold-host', model: 'scaffold-openai/gpt-example' }));
+  await mkdir(join(env.SCAFFOLD_RUNTIME_DIR, 'omp-inference'), { recursive: true });
+  await writeFile(join(env.SCAFFOLD_RUNTIME_DIR, 'omp-inference/profile.json'), JSON.stringify({ profile: 'scaffold-host', model: 'scaffold-openai/gpt-example' }));
   const authority = {
     scope: { projectId: profile.projectId, deploymentId: profile.deploymentId, sessionId: profile.sessionId },
     sandboxId: profile.sandboxId, deviceId: profile.targetDeviceId, lifecycleEpoch: 1,
@@ -78,10 +78,12 @@ async function fixture(t, publish = true) {
 
 test('only trusted chat2 configuration enables the isolated bridge', async t => {
   const f = await fixture(t);
-  assert.equal(f.config.ipcPort, 27954);
+  assert.equal(f.config.ipcPort, 39400);
   for (const change of [
     { SCAFFOLD_CREW_SYNC_GENERATION: '' }, { SCAFFOLD_CREW_SYNC_GENERATION: 'legacy' },
-    { COMET_IPC_PORT: '39400' }, { COMET_DATA_DIR: '/tmp/shared-data' },
+    { COMET_IPC_PORT: '27954' }, { COMET_DATA_DIR: '/tmp/shared-data' },
+    { COMET_DATA_DIR: '/workspace/.scaffold/crew-upstream-canary/data' },
+    { SCAFFOLD_RUNTIME_DIR: '/workspace/.scaffold/crew-upstream-canary' },
     { CREW_WEB_AUTH_TOKEN: 'short' }, { CREW_WEB_SESSION_ID: 'another-session' },
     { SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify({ ...profile, actor: {} }) },
   ]) assert.throws(() => loadConfig({ ...f.env, ...change }));
@@ -101,7 +103,7 @@ test('real health requires authority and all native snapshots; private native op
   assert.equal(JSON.stringify(state).includes('private-grant'), false);
   assert.equal(JSON.stringify(state).includes('opaque-edge-owner'), false);
   assert.deepEqual(await (await f.get('/api/native-open')).json(), {
-    url: 'crew-upstream-canary://scaffold/crew-upstream-canary/crew-upstream-canary/session-a/sandbox-a',
+    url: 'comet-staging://scaffold/ashler-staging/ashler-staging/session-a/sandbox-a',
   });
   assert.throws(() => f.watches.get('WatchChats').callback([{ ...f.context, deviceId: 'other-device' }]));
   assert.equal(f.viewport.state().capabilities.message, false);
@@ -256,7 +258,7 @@ test('SSE coalesces backpressure, disconnects oversized backlog, and erases stat
 });
 
 test('native subscriptions cancel their own wire request without closing other streams', () => {
-  const rpc = new CrewRpc(27954);
+  const rpc = new CrewRpc(39400);
   const frames = [];
   rpc.socket = { readyState: WebSocket.OPEN, send: frame => frames.push(JSON.parse(frame)), close: () => assert.fail('Cancellation must not close the engine connection') };
   const cancel = rpc.watch('WatchDocMessages', { chatId: 'session-a' }, () => {});

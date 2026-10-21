@@ -1,350 +1,167 @@
-/**
- * End-to-end smoke test against a running `wrangler dev` instance
- * (AUTH_MODE=dev). Exercises the full design surface:
- *   1. two Loro peers join a session room and converge through the DO
- *   2. streamed text appends propagate live
- *   3. GET /tail returns the materialized L2 tail
- *   4. POST/GET /diff round-trips the sidecar
- *   5. ephemeral (%EPH) presence relays between peers
- *   6. device room relays client↔host frames and serves sidecar slots
- *   7. R2 attachments: PUT (hash verified) then GET
- *   8. workspace room (`ws3/{orgId}/{userId}`): one user's devices converge;
- *      teammates in the same org are isolated (per-user docs); wrong org 403
- *   9. absorbed /auth routes: 501 without WORKOS_API_KEY; cli callback page
- *
- * Usage: node scripts/smoke.mjs [baseUrl]   (default http://127.0.0.1:27640)
- */
-import { LoroDoc } from "loro-crdt";
-import { LoroWebsocketClient } from "loro-websocket";
-import { LoroAdaptor, LoroEphemeralAdaptor } from "loro-adaptors/loro";
-import { randomUUID } from "node:crypto";
+// Native registry/chat2/R2 HTTP smoke against the real Worker. Local-only:
+// wrangler dev --local --env staging --ip 127.0.0.1 --port 27640 \
+//   --var AUTH_MODE:dev --var ENVIRONMENT:local \
+//   --var SCAFFOLD_PROJECT_SCOPE:local --var SCAFFOLD_DEPLOYMENT_ID:local \
+//   --var SCAFFOLD_CONTROL_PLANE_URL:http://127.0.0.1:8788 --persist-to <fresh-dir>
+// node scripts/smoke.mjs http://127.0.0.1:27640
+import assert from "node:assert/strict";
+import { randomUUID, randomBytes } from "node:crypto";
 
-const base = process.argv[2] ?? "http://127.0.0.1:27640";
-const wsBase = base.replace(/^http/, "ws");
-const token = "smoke-user";
-const chatId = `smoke-${randomUUID().slice(0, 8)}`;
-const deviceId = `smokedev-${randomUUID().slice(0, 8)}`;
-const orgId = `org-smoke-${randomUUID().slice(0, 8)}`;
-
-const fail = (msg) => {
-  console.error(`✗ ${msg}`);
-  process.exit(1);
+const base = new URL(process.argv[2] ?? "http://127.0.0.1:27640");
+assert.ok(process.argv.length <= 3, "usage: node scripts/smoke.mjs [loopback-origin]");
+assert.equal(base.protocol, "http:");
+assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(base.hostname), "local smoke refuses remote hosts");
+assert.ok(!base.username && !base.password && !base.search && !base.hash && base.pathname === "/");
+const user = `smoke-${randomUUID()}`;
+const intruder = `other-${randomUUID()}`;
+const chat = randomUUID();
+const sockets = [];
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const FRAME = { hello: 1, state: 2, rowsReq: 3, row: 4, rowsDone: 5, push: 6, ack: 7 };
+const encode = (type, header, payload = new Uint8Array()) => {
+  const h = enc.encode(JSON.stringify(header));
+  const bytes = new Uint8Array(5 + h.length + payload.length);
+  bytes[0] = type;
+  new DataView(bytes.buffer).setUint32(1, h.length, true);
+  bytes.set(h, 5); bytes.set(payload, 5 + h.length);
+  return bytes;
 };
-const ok = (msg) => console.log(`✓ ${msg}`);
-const until = async (fn, what, ms = 8000) => {
-  const start = Date.now();
-  while (Date.now() - start < ms) {
-    if (await fn()) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  fail(`timeout waiting for ${what}`);
+const decode = (value) => {
+  const bytes = new Uint8Array(value);
+  assert.ok(bytes.length >= 5);
+  const length = new DataView(bytes.buffer, bytes.byteOffset).getUint32(1, true);
+  assert.ok(length <= 4096 && 5 + length <= bytes.length);
+  return { type: bytes[0], header: JSON.parse(dec.decode(bytes.subarray(5, 5 + length))), payload: bytes.subarray(5 + length) };
 };
-
-// ── health ────────────────────────────────────────────────────────────────
-{
-  const res = await fetch(`${base}/health`);
-  const body = await res.json();
-  if (!body.ok) fail("health");
-  if (body.auth !== "dev") fail(`expected dev auth mode, got ${body.auth} — run wrangler dev with --var AUTH_MODE:dev`);
-  ok("health (dev auth)");
-}
-
-// ── session room: two peers converge ─────────────────────────────────────
-const sessionUrl = `${wsBase}/session/${chatId}/ws?token=${token}`;
-
-const clientA = new LoroWebsocketClient({ url: sessionUrl });
-await clientA.waitConnected();
-const adaptorA = new LoroAdaptor();
-await clientA.join({ roomId: chatId, crdtAdaptor: adaptorA });
-const docA = adaptorA.getDoc();
-docA.getMap("meta").set("chatId", chatId);
-docA.getMap("meta").set("schemaVersion", 1);
-const messagesA = docA.getList("messages");
-const m1 = messagesA.insertContainer(0, new (await import("loro-crdt")).LoroMap());
-m1.set("id", "m1");
-m1.set("role", "user");
-m1.set("createdAt", Date.now());
-m1.set("deviceId", "peer-a");
-docA.commit();
-ok("peer A joined + wrote");
-
-const clientB = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
-await clientB.waitConnected();
-const adaptorB = new LoroAdaptor();
-await clientB.join({ roomId: chatId, crdtAdaptor: adaptorB });
-const docB = adaptorB.getDoc();
-await until(() => docB.getList("messages").length > 0, "peer B backfill");
-ok("peer B backfilled through DO");
-
-// live propagation A→B
-const t0 = docA.getList("messages").get(0);
-docA.getMap("meta").set("title", "smoke");
-docA.commit();
-await until(() => docB.getMap("meta").get("title") === "smoke", "live A→B");
-ok("live update A→B");
-
-// live propagation B→A
-docB.getMap("meta").set("fromB", true);
-docB.commit();
-await until(() => docA.getMap("meta").get("fromB") === true, "live B→A");
-ok("live update B→A");
-void t0;
-
-// ── wrong user rejected ───────────────────────────────────────────────────
-{
-  const res = await fetch(`${base}/tail/${chatId}?token=intruder`);
-  if (res.status !== 403) fail(`intruder tail expected 403, got ${res.status}`);
-  ok("ownership enforced (intruder 403)");
-}
-
-// ── tail ──────────────────────────────────────────────────────────────────
-await new Promise((r) => setTimeout(r, 100));
-{
-  const res = await fetch(`${base}/tail/${chatId}?token=${token}`);
-  if (res.status !== 200) fail(`tail status ${res.status}`);
-  const tail = await res.json();
-  if (tail.chatId !== chatId) fail(`tail chatId ${tail.chatId}`);
-  if (tail.totalMessages < 1) fail("tail totalMessages");
-  ok(`tail (${tail.totalMessages} messages)`);
-}
-
-// ── diff sidecar ──────────────────────────────────────────────────────────
-{
-  const diff = { chatId, deviceId: "peer-a", checkoutPath: "/tmp/x", patch: "diff --git a b", files: [], additions: 1, deletions: 0, truncated: false, publishedAt: Date.now() };
-  const post = await fetch(`${base}/diff/${chatId}?token=${token}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(diff)
+const http = (path, { method = "GET", token = `${user}@local`, headers = {}, body } = {}) => {
+  const url = new URL(path, base);
+  assert.equal(url.origin, base.origin);
+  return fetch(url, { method, redirect: "error", signal: AbortSignal.timeout(15000),
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers }, body });
+};
+const json = async (response, status = 200) => { assert.equal(response.status, status); return response.json(); };
+async function connect(path, binary = false, token = `${user}@local`) {
+  const url = new URL(path, base);
+  url.protocol = "ws:";
+  url.searchParams.set("token", token);
+  const ws = new WebSocket(url);
+  sockets.push(ws);
+  ws.binaryType = "arraybuffer";
+  const inbox = [];
+  const waiting = new Set();
+  let closed = false;
+  let error;
+  const wake = () => { for (const notify of waiting) notify(); };
+  ws.addEventListener("message", (event) => {
+    try { inbox.push(binary ? decode(event.data) : JSON.parse(event.data)); }
+    catch (failure) { error = failure; }
+    wake();
   });
-  if (post.status !== 200) fail(`diff post ${post.status}`);
-  const get = await fetch(`${base}/diff/${chatId}?token=${token}`);
-  const body = await get.json();
-  if (body.patch !== diff.patch) fail("diff round-trip");
-  ok("diff sidecar round-trip");
-}
-
-// ── ephemeral presence ────────────────────────────────────────────────────
-{
-  const ephA = new LoroEphemeralAdaptor();
-  await clientA.join({ roomId: chatId, crdtAdaptor: ephA });
-  const ephB = new LoroEphemeralAdaptor();
-  await clientB.join({ roomId: chatId, crdtAdaptor: ephB });
-  ephA.getStore().set("presence:peer-a", { status: "busy" });
-  await until(
-    () => ephB.getStore().get("presence:peer-a")?.status === "busy",
-    "ephemeral A→B"
-  );
-  ok("ephemeral presence relay");
-}
-
-// ── workspace room: per-user docs — one user's devices converge, teammates
-//    in the same org are isolated ─────────────────────────────────────────
-{
-  // Dev-mode org claim: token `userId@orgId`. The room id is derived at the
-  // edge from the caller's OWN user claim: `ws3/{orgId}/{userId}`.
-  const roomA = `ws3/${orgId}/alice`;
-  const deviceA1 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=alice@${orgId}`
-  });
-  await deviceA1.waitConnected();
-  const wsAdaptorA1 = new LoroAdaptor();
-  await deviceA1.join({ roomId: roomA, crdtAdaptor: wsAdaptorA1 });
-  const wsDocA = wsAdaptorA1.getDoc();
-  wsDocA.getMap("meta").set("chatId", roomA);
-  wsDocA.getMap("chats").set("chat-1", { title: "hello" });
-  wsDocA.commit();
-
-  // A SECOND DEVICE of the same user joins the same per-user room and
-  // backfills.
-  const deviceA2 = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=alice@${orgId}`
-  });
-  await deviceA2.waitConnected();
-  const wsAdaptorA2 = new LoroAdaptor();
-  await deviceA2.join({ roomId: roomA, crdtAdaptor: wsAdaptorA2 });
-  await until(
-    () => wsAdaptorA2.getDoc().getMap("chats").get("chat-1") !== undefined,
-    "workspace second-device backfill"
-  );
-  ok("workspace room: one user's devices converge");
-
-  // A TEAMMATE (same org, different user) lands in their OWN empty room —
-  // alice's spaces/sessions must be invisible to bob.
-  const memberB = new LoroWebsocketClient({
-    url: `${wsBase}/workspace/${orgId}/ws?token=bob@${orgId}`
-  });
-  await memberB.waitConnected();
-  const wsAdaptorB = new LoroAdaptor();
-  await memberB.join({ roomId: `ws3/${orgId}/bob`, crdtAdaptor: wsAdaptorB });
-  await new Promise((resolve) => setTimeout(resolve, 400)); // any (wrong) backfill gets a beat
-  if (wsAdaptorB.getDoc().getMap("chats").get("chat-1") !== undefined) {
-    fail("teammate must NOT see another user's workspace doc");
-  }
-  ok("workspace room: teammates isolated (per-user docs)");
-  memberB.close();
-  deviceA2.close();
-
-  // Wrong org claim rejected at the Worker.
-  const wrongOrg = await fetch(`${base}/workspace/${orgId}/tail?token=mallory@org-other`);
-  if (wrongOrg.status !== 403) fail(`wrong-org tail expected 403, got ${wrongOrg.status}`);
-  // No org claim at all is rejected too.
-  const noOrg = await fetch(`${base}/workspace/${orgId}/tail?token=${token}`);
-  if (noOrg.status !== 403) fail(`no-org tail expected 403, got ${noOrg.status}`);
-  // A member can read the workspace tail (empty messages — shape only).
-  const memberTail = await fetch(`${base}/workspace/${orgId}/tail?token=alice@${orgId}`);
-  if (memberTail.status !== 200) fail(`member workspace tail ${memberTail.status}`);
-  ok("workspace room: org membership enforced (403 for outsiders)");
-
-  deviceA1.close();
-}
-
-// ── device room ───────────────────────────────────────────────────────────
-{
-  const { encodeDeviceFrame, decodeDeviceFrame } = await import("./device-frame.mjs");
-  const host = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host`);
-  host.binaryType = "arraybuffer";
+  ws.addEventListener("close", () => { closed = true; wake(); });
+  ws.addEventListener("error", () => { error = new Error("WebSocket failed"); wake(); });
   await new Promise((resolve, reject) => {
-    host.onopen = resolve;
-    host.onerror = reject;
+    const timer = setTimeout(() => { ws.close(); reject(new Error("WebSocket open timeout")); }, 10000);
+    ws.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
+    ws.addEventListener("error", () => { clearTimeout(timer); reject(new Error("WebSocket upgrade failed")); }, { once: true });
   });
-  const hostFrames = [];
-  host.onmessage = (e) => {
-    if (typeof e.data === "string") return;
-    const frame = decodeDeviceFrame(new Uint8Array(e.data));
-    hostFrames.push(frame);
-    // echo rpc payloads back to the sender
-    if (frame.header.k === "rpc" && frame.header.from) {
-      host.send(
-        encodeDeviceFrame(
-          { s: frame.header.s, k: "rpc", to: frame.header.from },
-          frame.payload
-        )
-      );
+  return {
+    send: (frame) => ws.send(binary ? frame : JSON.stringify(frame)),
+    async next(predicate) {
+      const deadline = Date.now() + 10000;
+      for (;;) {
+        if (error) throw error;
+        const index = inbox.findIndex(predicate);
+        if (index >= 0) return inbox.splice(index, 1)[0];
+        assert.ok(!closed, "WebSocket closed before expected frame");
+        assert.ok(Date.now() < deadline, "timed out waiting for native frame");
+        await new Promise((resolve) => {
+          const done = () => { clearTimeout(timer); waiting.delete(done); resolve(); };
+          const timer = setTimeout(done, deadline - Date.now());
+          waiting.add(done);
+        });
+      }
     }
   };
-
-  const connId = "conn-1";
-  const client = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=client&connId=${connId}`);
-  client.binaryType = "arraybuffer";
-  await new Promise((resolve, reject) => {
-    client.onopen = resolve;
-    client.onerror = reject;
-  });
-  const clientFrames = [];
-  client.onmessage = (e) => {
-    if (typeof e.data === "string") return;
-    clientFrames.push(decodeDeviceFrame(new Uint8Array(e.data)));
-  };
-  client.send(encodeDeviceFrame({ s: "rpc-1", k: "rpc" }, new TextEncoder().encode("hello-host")));
-  await until(() => clientFrames.length > 0, "device rpc echo");
-  const echoed = new TextDecoder().decode(clientFrames[0].payload);
-  if (echoed !== "hello-host") fail(`device echo got ${echoed}`);
-  ok("device room rpc echo (client→host→client)");
-
-  // intruder cannot join the device room
-  const evil = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=evil&role=client`);
-  const evilResult = await new Promise((resolve) => {
-    evil.onopen = () => resolve("open");
-    evil.onerror = () => resolve("error");
-    setTimeout(() => resolve("timeout"), 3000);
-  });
-  if (evilResult === "open") fail("intruder joined device room");
-  ok("device room ownership enforced");
-
-  // sidecar slot
-  const post = await fetch(`${base}/device/${deviceId}/sidecar/repos?token=${token}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ repos: [{ path: "/x", name: "x" }] })
-  });
-  if (post.status !== 200) fail(`sidecar post ${post.status}`);
-  const got = await (await fetch(`${base}/device/${deviceId}/sidecar/repos?token=${token}`)).json();
-  if (got.repos?.[0]?.name !== "x") fail("sidecar round-trip");
-  ok("device sidecar slot round-trip");
-
-  // nudge: live delivery to the connected host
-  const nudge = await fetch(`${base}/device/${deviceId}/nudge?token=${token}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chatId: "chat-live" })
-  });
-  if ((await nudge.json()).delivered !== true) fail("live nudge not delivered");
-  await until(
-    () => hostFrames.some((f) => f.header.k === "nudge" && new TextDecoder().decode(f.payload).includes("chat-live")),
-    "live nudge frame"
-  );
-  ok("nudge delivered live to connected host");
-
-  host.close();
-  client.close();
-
-  // nudge: queued while host offline, replayed on rejoin
-  await new Promise((r) => setTimeout(r, 200)); // let the close land
-  const queued = await fetch(`${base}/device/${deviceId}/nudge?token=${token}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chatId: "chat-cold" })
-  });
-  if ((await queued.json()).queued !== true) fail("offline nudge not queued");
-  const host2 = new WebSocket(`${wsBase}/device/${deviceId}/ws?token=${token}&role=host`);
-  host2.binaryType = "arraybuffer";
-  const replayed = [];
-  host2.onmessage = (e) => {
-    if (typeof e.data === "string") return;
-    replayed.push(decodeDeviceFrame(new Uint8Array(e.data)));
-  };
-  await until(
-    () => replayed.some((f) => f.header.k === "nudge" && new TextDecoder().decode(f.payload).includes("chat-cold")),
-    "queued nudge replay on host join"
-  );
-  ok("nudge queued offline and replayed on host join");
-  host2.close();
 }
 
-// ── absorbed auth routes ──────────────────────────────────────────────────
-{
-  // Dev instances have no WORKOS_API_KEY: secret-bearing routes answer 501
-  // (matching the old apps/server behavior when WorkOS is unconfigured).
-  const exchange = await fetch(`${base}/auth/exchange`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code: "test" })
-  });
-  if (exchange.status !== 501) fail(`auth exchange expected 501 in dev, got ${exchange.status}`);
-  const refresh = await fetch(`${base}/auth/refresh`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ refreshToken: "test" })
-  });
-  if (refresh.status !== 501) fail(`auth refresh expected 501 in dev, got ${refresh.status}`);
-  ok("auth exchange/refresh answer 501 without WORKOS_API_KEY");
+try {
+  const health = await json(await http("/health", { token: "" }));
+  assert.equal(health.auth, "dev"); assert.equal(health.environment, "local");
+  const identity = await json(await http("/auth/session"));
+  assert.equal(identity.userId, user); assert.equal(identity.projectScope, "local");
+  assert.equal(identity.deploymentId, "local"); assert.equal(identity.credential, "dev");
+  assert.equal((await http("/registry/local/rows", { token: "" })).status, 401);
+  assert.equal((await http("/auth/session", { token: `${user}@foreign` })).status, 401);
+  assert.equal((await http("/registry/foreign/rows")).status, 403);
+  assert.equal((await http("/registry/local/rows?deploymentId=foreign")).status, 403);
+  assert.equal((await http(`/session/${chat}/ws`)).status, 410);
+  assert.equal((await http("/workspace/local/ws")).status, 410);
+  console.log("PASS local identity, auth/scope denial, obsolete protocol denial");
 
-  // The headless callback needs no WorkOS config: it just renders state.code.
-  const cb = await fetch(`${base}/auth/cli/callback?code=abc123&state=xyz789`);
-  if (cb.status !== 200) fail(`cli callback ${cb.status}`);
-  const page = await cb.text();
-  if (!page.includes("xyz789.abc123")) fail("cli callback paste code missing");
-  const cbBad = await fetch(`${base}/auth/cli/callback`);
-  if (cbBad.status !== 400) fail(`cli callback without code expected 400, got ${cbBad.status}`);
-  ok("auth cli callback renders paste code");
+  const a = await connect("/registry/local/ws?device=peer-a");
+  a.send({ t: "hello", cursor: null, device: "peer-a" });
+  assert.deepEqual((await a.next((f) => f.t === "state")).rows, []);
+  const op = (title, tick) => ({ kind: "chats", id: chat, op: "upsert", hlc: `${String(tick).padStart(13, "0")}-000000-smoke`, set: { title } });
+  a.send({ t: "push", batch: "registry-a", ops: [op("from-a", 1)] });
+  assert.equal((await a.next((f) => f.t === "ack" && f.batch === "registry-a")).applied, 1);
+  const b = await connect("/registry/local/ws?device=peer-b");
+  b.send({ t: "hello", cursor: null, device: "peer-b" });
+  assert.equal((await b.next((f) => f.t === "state")).rows.find((r) => r.id === chat).fields.title, "from-a");
+  b.send({ t: "push", batch: "registry-b", ops: [op("from-b", 2)] });
+  assert.equal((await b.next((f) => f.t === "ack" && f.batch === "registry-b")).applied, 1);
+  assert.equal((await a.next((f) => f.t === "rows" && f.rows.some((r) => r.fields.title === "from-b"))).rows.find((r) => r.id === chat).fields.title, "from-b");
+  a.send({ t: "push", batch: "registry-a-live", ops: [op("from-a-live", 3)] });
+  await a.next((f) => f.t === "ack" && f.batch === "registry-a-live");
+  await b.next((f) => f.t === "rows" && f.rows.some((r) => r.fields.title === "from-a-live"));
+  assert.equal((await json(await http("/registry/local/rows"))).rows.find((r) => r.id === chat).fields.title, "from-a-live");
+  assert.deepEqual((await json(await http("/registry/local/rows", { token: `${intruder}@local` }))).rows, []);
+  console.log("PASS registry two-peer backfill/live convergence and private-user isolation");
+
+  const ca = await connect(`/chat2/${chat}/ws?device=peer-a`, true);
+  ca.send(encode(FRAME.hello, { cursor: 0, device: "peer-a" }));
+  assert.equal((await ca.next((f) => f.type === FRAME.state)).header.headSeq, 0);
+  const first = randomBytes(1024);
+  ca.send(encode(FRAME.push, { batchId: "chat-a" }, first));
+  assert.equal((await ca.next((f) => f.type === FRAME.ack)).header.seq, 1);
+  const cb = await connect(`/chat2/${chat}/ws?device=peer-b`, true);
+  cb.send(encode(FRAME.hello, { cursor: 0, device: "peer-b" }));
+  assert.equal((await cb.next((f) => f.type === FRAME.state)).header.headSeq, 1);
+  cb.send(encode(FRAME.rowsReq, { after: 0 }));
+  assert.deepEqual(Buffer.from((await cb.next((f) => f.type === FRAME.row)).payload), first);
+  await cb.next((f) => f.type === FRAME.rowsDone);
+  const second = randomBytes(2048);
+  cb.send(encode(FRAME.push, { batchId: "chat-b" }, second));
+  assert.equal((await cb.next((f) => f.type === FRAME.ack)).header.seq, 2);
+  assert.deepEqual(Buffer.from((await ca.next((f) => f.type === FRAME.row)).payload), second);
+  const third = randomBytes(4096);
+  ca.send(encode(FRAME.push, { batchId: "chat-a-live" }, third));
+  assert.equal((await ca.next((f) => f.type === FRAME.ack)).header.seq, 3);
+  assert.deepEqual(Buffer.from((await cb.next((f) => f.type === FRAME.row)).payload), third);
+  assert.equal((await http(`/chat2/${chat}/stats`, { token: `${intruder}@local` })).status, 403);
+  const checkpoint = randomBytes(4096);
+  await json(await http(`/chat2/${chat}/checkpoint?seqCovered=3`, {
+    method: "POST", headers: { "x-chat2-frontier": Buffer.from([1, 2, 3]).toString("base64") }, body: checkpoint
+  }));
+  assert.deepEqual(Buffer.from(await (await http(`/chat2/${chat}/checkpoint`)).arrayBuffer()), checkpoint);
+  const range = await http(`/chat2/${chat}/checkpoint`, { headers: { range: "bytes=1024-" } });
+  assert.equal(range.status, 206);
+  assert.deepEqual(Buffer.from(await range.arrayBuffer()), checkpoint.subarray(1024));
+  console.log("PASS chat2 two-peer opaque-byte backfill/live relay, ownership, checkpoint/range");
+
+  const blobPath = `/blob/${chat}/${encodeURIComponent("tool#1")}`;
+  const attachment = randomBytes(8192);
+  await json(await http(blobPath, { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: attachment }));
+  assert.deepEqual(Buffer.from(await (await http(blobPath)).arrayBuffer()), attachment);
+  assert.equal((await http(blobPath, { method: "HEAD" })).status, 200);
+  assert.equal((await http(blobPath, { token: `${intruder}@local` })).status, 404);
+  assert.equal((await http(blobPath, { token: "" })).status, 401);
+  assert.equal((await http(`/blob/${chat}/bad%2Fpart`, { method: "PUT", body: "x" })).status, 400);
+  const retired = await http(`/attachments/${"a".repeat(64)}`, { method: "PUT", body: "must not be discarded as success" });
+  assert.equal(retired.status, 410);
+  assert.equal((await retired.json()).error, "legacy_attachments_retired");
+  console.log("PASS native private R2 tool-blob attachments and traversal/auth isolation");
+  console.log("PASS native Edge loopback HTTP/WebSocket smoke");
+} finally {
+  for (const socket of sockets) socket.close();
 }
-
-// ── reconnect: new client with existing state catches up incrementally ───
-{
-  const clientC = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
-  await clientC.waitConnected();
-  const preSeeded = new LoroDoc();
-  preSeeded.import(docA.export({ mode: "snapshot" }));
-  const adaptorC = new LoroAdaptor(preSeeded);
-  await clientC.join({ roomId: chatId, crdtAdaptor: adaptorC });
-  docA.getMap("meta").set("afterC", 1);
-  docA.commit();
-  await until(() => adaptorC.getDoc().getMap("meta").get("afterC") === 1, "peer C incremental");
-  ok("version-vector incremental join");
-  clientC.close();
-}
-
-clientA.close();
-clientB.close();
-console.log("\nALL SMOKE TESTS PASSED");
-process.exit(0);

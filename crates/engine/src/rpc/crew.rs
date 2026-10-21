@@ -62,6 +62,15 @@ struct RelayAuthority {
     peer: Option<PeerAuthority>,
 }
 
+impl RelayAuthority {
+    fn require_import_controller(&self) -> Result<(), RpcError> {
+        if self.session_id.is_some() || self.grant_id.is_some() || self.peer.is_some() {
+            return Err(denied("Imported profile verification requires owner controller authority"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PeerAuthority {
@@ -128,6 +137,9 @@ impl EngineRpc {
                 && !(authority.session_id.is_some() && matches!(method, "ListCrewAnnotations" | "ApplyCrewAnnotation"))
             {
                 return Err(denied("Relay authority belongs to another account"));
+            }
+            if matches!(method, "VerifyImportedCrewSession" | "PublishImportedCrewSession") {
+                authority.require_import_controller()?;
             }
             if let Some(peer) = &authority.peer {
                 if !matches!(method, "DeliverPeerMessage" | methods::LOCAL_DEVICE)
@@ -261,9 +273,16 @@ impl EngineRpc {
             }
             _ => {
                 if let Some(params) = params.as_object_mut() { params.remove("__crewAuthority"); params.remove("targetDeviceId"); }
-                let route = params.get("control").cloned()
-                    .and_then(|value| serde_json::from_value::<ScaffoldEnvironmentControl>(value).ok())
-                    .and_then(|control| match control {
+                let control = params.get("control").cloned()
+                    .map(serde_json::from_value::<ScaffoldEnvironmentControl>).transpose().map_err(failed)?;
+                if let Some(ScaffoldEnvironmentControl::HandoffOmpSession { scope, native_session_id, .. }) = &control {
+                    if native_session_id.contains('/') || native_session_id.contains('\\') {
+                        return Err(denied("Public handoff control requires a native identity, not an artifact path; use session handoff for a verified fork"));
+                    }
+                    let session_id = scope.session_id.as_deref().ok_or_else(|| denied("Native handoff requires its exact target session"))?;
+                    self.sessions.ensure_execution_allowed(session_id, Some(native_session_id)).map_err(failed)?;
+                }
+                let route = control.and_then(|control| match control {
                         ScaffoldEnvironmentControl::Create { agent_route, .. }
                         | ScaffoldEnvironmentControl::UpdateAgentRoute { agent_route, .. } => Some(agent_route),
                         _ => None,
@@ -275,7 +294,8 @@ impl EngineRpc {
                     && let Some(result) = value.get("result").filter(|result| !result.is_null())
                 {
                     let result: ScaffoldEnvironmentControlResult = serde_json::from_value(result.clone()).map_err(failed)?;
-                    let chat = self.publish_crew_environment(result, route).await?;
+                    let command = value.get("commandId").and_then(Value::as_str).map(str::to_owned);
+                    let chat = self.publish_crew_environment_with_start(result, route, command).await?;
                     // Platform uses verified email; every client-facing Crew owner is a subject.
                     value["result"]["environment"]["ownerPrincipal"] =
                         json!(chat.crew.ok_or_else(|| denied("Published Crew identity unavailable"))?.owner_subject);
@@ -323,11 +343,24 @@ impl EngineRpc {
 
     pub(super) async fn publish_crew_environment(&self, result: ScaffoldEnvironmentControlResult,
         route: Option<zeron_proto::AgentRoute>) -> Result<Chat, RpcError> {
+        self.publish_crew_environment_with_start(result, route, None).await
+    }
+
+    async fn publish_crew_environment_with_start(&self, result: ScaffoldEnvironmentControlResult,
+        route: Option<zeron_proto::AgentRoute>, start_command: Option<String>) -> Result<Chat, RpcError> {
         if !self.workspace.registry_synced() { return Err(denied("Sandbox outcome is durable; its session reference awaits registry synchronization")); }
         let services = self.crew_services()?.clone();
         let auth = self.auth()?.clone();
         let workspace = self.workspace.clone();
+        let sessions = self.sessions.clone();
+        let store = self.doc_host.crew_store();
+        let start_gate = match start_command.as_deref() {
+            Some(command) => services.start_publication(command, &result.environment).await?,
+            None => None,
+        };
         tokio::task::spawn_blocking(move || {
+            let explicit_start = start_gate.is_some();
+            let _start_gate = start_gate;
             let session_id = result.environment.scope.session_id.as_deref()
                 .ok_or_else(|| denied("Environment has no stable session identity"))?;
             let mut metadata = services.session_metadata(session_id).map_err(failed)?;
@@ -347,6 +380,33 @@ impl EngineRpc {
                     || projection.session_id != session_id)
             { return Err(denied("Attached room differs from the verified session")); }
             let existing = workspace.chat(session_id).map_err(failed)?;
+            let trusted_history = sessions.original_epoch_history(session_id).cloned();
+            let mut release = None;
+            let mut reset_native = false;
+            if explicit_start {
+                let binding = json!({"sandboxId":sandbox_id,"lifecycleEpoch":epoch,"deviceId":host});
+                let (key, request) = if let Some(history) = &trusted_history {
+                    if history.sandbox_id != *sandbox_id || *epoch <= history.coordinator_lifecycle_epoch {
+                        return Err(denied("Start differs from the immutable original epoch"));
+                    }
+                    (format!("original-epoch-start:{session_id}:{}:{epoch}", history.lifecycle_epoch), serde_json::to_vec(history).map_err(failed)?)
+                } else {
+                    if existing.as_ref().and_then(|chat| chat.crew.as_ref()).and_then(|metadata| metadata.original_epoch_history.as_ref()).is_some() {
+                        return Err(denied("Original epoch receipt is not trusted by this profile"));
+                    }
+                    (format!("start-association:{session_id}:{epoch}"), serde_json::to_vec(&json!({"scope":result.environment.scope,"binding":binding})).map_err(failed)?)
+                };
+                store.claim_crew_command(&key, &request).map_err(failed)?;
+                let prior = store.crew_command(&key).map_err(failed)?.and_then(|(_, outcome)| outcome);
+                if let Some(prior) = prior {
+                    if serde_json::from_slice::<Value>(&prior).map_err(failed)? != binding {
+                        return Err(denied("New epoch association conflicts with its immutable Start receipt"));
+                    }
+                } else {
+                    reset_native = true;
+                    release = Some((key, serde_json::to_vec(&binding).map_err(failed)?));
+                }
+            }
             if let Some(old) = existing.as_ref().and_then(|chat| chat.crew.as_ref()) {
                 if old.owner_subject != metadata.owner_subject || old.scope != metadata.scope {
                     return Err(denied("Session reference belongs to another owner or deployment"));
@@ -356,15 +416,18 @@ impl EngineRpc {
                 {
                     if previous_id != sandbox_id { return Err(denied("Session is already bound to another sandbox")); }
                     if previous_epoch.is_some_and(|old_epoch| old_epoch > *epoch)
-                        || (*previous_lifecycle == ScaffoldLifecycle::Stopped && *lifecycle != ScaffoldLifecycle::Stopped)
+                        || (matches!(previous_lifecycle, ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed)
+                            && !matches!(lifecycle, ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed) && !explicit_start)
                     { return Ok(existing.expect("existing metadata")); }
                 }
                 metadata.agent_route = old.agent_route.clone();
+                metadata.original_epoch_history = trusted_history.clone().or_else(|| old.original_epoch_history.clone());
             }
             let observed: Option<zeron_proto::AgentRoute> = result.environment.unknown.get("agentRoute")
                 .map(|value| serde_json::from_value(value.clone()).map_err(failed)).transpose()?;
-            let update_config = route.is_some() || existing.as_ref().is_none_or(|chat| chat.config.is_none())
-                || observed.as_ref().is_some_and(|route| Some(route) != metadata.agent_route.as_ref());
+            let update_config = existing.as_ref().is_none_or(|chat| chat.config.is_none())
+                || (!explicit_start && (route.is_some()
+                    || observed.as_ref().is_some_and(|route| Some(route) != metadata.agent_route.as_ref())));
             metadata.agent_route = route.or(observed).or(metadata.agent_route);
             let mut environment = result.environment.clone();
             // Platform's sandbox owner is a verified email; the index uses the verified subject.
@@ -372,7 +435,7 @@ impl EngineRpc {
             metadata.environment = Some(environment);
             metadata.validate().map_err(denied)?;
             let device_missing = !workspace.read_devices().map_err(failed)?.iter().any(|device| device.id == host);
-            if !device_missing && !update_config && existing.as_ref().is_some_and(|chat| {
+            if !reset_native && !device_missing && !update_config && existing.as_ref().is_some_and(|chat| {
                 chat.device_id == host && chat.room_gen == Some(2) && chat.cwd.is_some() && chat.crew.as_ref() == Some(&metadata)
                     && result.handoff_cwd.as_ref().is_none_or(|cwd| chat.cwd.as_ref() == Some(cwd) && chat.harness_session_cwd.as_ref() == Some(cwd))
                     && result.handoff_native_session_id.as_ref().is_none_or(|native| chat.harness_session_id.as_ref() == Some(native))
@@ -399,13 +462,23 @@ impl EngineRpc {
             }
             if let Some(cwd) = result.handoff_cwd { chat.cwd = Some(cwd.clone()); chat.harness_session_cwd = Some(cwd); }
             if let Some(native) = result.handoff_native_session_id { chat.harness_session_id = Some(native); }
+            if reset_native {
+                // Empty ID is the durable do-not-resume tombstone; None would fall back to the old journal.
+                chat.harness_session_id = Some(String::new());
+                chat.harness_session_cwd = None;
+            }
             chat.crew = Some(metadata);
             let device = device_missing.then(|| Device {
                 id: host, name: result.environment.name.unwrap_or_else(|| "Crew sandbox".into()),
                 platform: "linux".into(), last_seen_at: None, created_at: None, version: None,
+                devbox_provider: None, devbox_id: None,
                 cursor_sdk_version: None, capabilities: Vec::new(),
             });
             workspace.publish_crew_chat(&chat, device.as_ref()).map_err(failed)?;
+            if let Some((key, outcome)) = release {
+                sessions.reset_original_epoch_native_association(session_id);
+                store.finish_crew_command(&key, &outcome).map_err(failed)?;
+            }
             Ok(chat)
         }).await.map_err(failed)?
     }
@@ -608,6 +681,24 @@ impl EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_profile_proof_never_accepts_session_or_peer_grants() {
+        let owner = json!({"subject": "owner", "projectId": "project",
+            "deploymentId": "deployment", "capabilities": ["session.read"]});
+        let authority: RelayAuthority = serde_json::from_value(owner.clone()).unwrap();
+        assert!(authority.require_import_controller().is_ok());
+        for (key, value) in [("sessionId", json!("session")), ("grantId", json!("grant")),
+            ("peer", json!({"sourceSessionId": "source", "sourceDeviceId": "source-device",
+                "targetSessionId": "target", "targetDeviceId": "target-device"}))] {
+            let mut scoped = owner.clone();
+            scoped[key] = value;
+            let authority: RelayAuthority = serde_json::from_value(scoped).unwrap();
+            assert!(authority.require_import_controller().is_err());
+        }
+        assert!(!scaffold_host_rpc_allowed("VerifyImportedCrewSession",
+            &json!({"logicalSessionId": "session", "chatId": "session"}), "session"));
+    }
 
     #[test]
     fn personal_directory_search_rejects_a_foreign_owner() {

@@ -373,6 +373,11 @@ impl Auth {
         auth
     }
 
+    /// Configured audience for authenticated edge requests, including releases.
+    pub fn edge_url(&self) -> &str {
+        &self.inner.config.edge_url
+    }
+
     pub fn workos_enabled(&self) -> bool {
         self.inner.workos.is_some()
     }

@@ -144,9 +144,9 @@ final class AppModel {
 
     // MARK: Lifecycle
 
-    private static var profilesDir: URL {
+    static var profilesDir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("crew-canary-profiles", isDirectory: true)
+            .appendingPathComponent("profiles/scaffold", isDirectory: true)
     }
 
     @discardableResult
@@ -199,7 +199,7 @@ final class AppModel {
         }
     }
 
-    /// `-edge <url>` points at a local `wrangler dev` edge; otherwise production.
+    /// `-edge <url>` points at a local development edge; otherwise Crew Staging.
     static var edgeURL: String {
         #if DEBUG
         let args = ProcessInfo.processInfo.arguments
@@ -209,7 +209,7 @@ final class AppModel {
     }
 
     static var deviceId: String {
-        if let id = UserDefaults.standard.string(forKey: "deviceId") { return id }
+        if let id = UserDefaults.standard.string(forKey: "deviceId"), !id.isEmpty { return id }
         let id = "ios-" + UUID().uuidString.lowercased().prefix(8)
         UserDefaults.standard.set(id, forKey: "deviceId")
         return id
@@ -225,7 +225,7 @@ final class AppModel {
         var sessionJson: String?
         if case let .scaffold(_, _, _, saved)? = Credentials.stored() { sessionJson = saved }
         #if DEBUG && targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("-import-canary-session") {
+        if ProcessInfo.processInfo.arguments.contains("-import-staging-session") {
             // Consume once; path changes must not retry or fall back to another account.
             restoreSuppressed = true
             do {
@@ -247,7 +247,7 @@ final class AppModel {
             do {
                 let account = try await Endpoints.login().restore(sessionJson: sessionJson)
                 guard generation == authGeneration, client == nil else { return }
-                try signIn(account: account)
+                try await signIn(account: account)
             } catch {
                 guard generation == authGeneration else { return }
                 restoreError = error.localizedDescription
@@ -282,8 +282,22 @@ final class AppModel {
     }
     #endif
 
-    @MainActor func signIn(account: CrewAccount) throws {
+    @MainActor func signIn(account: CrewAccount) async throws {
         client?.shutdown()
+        client = nil
+        let generation = authGeneration
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let legacy = support.appendingPathComponent("CometDocs", isDirectory: true)
+        if FileManager.default.fileExists(atPath: legacy.path) {
+            let config = CoreConfig(edgeUrl: Self.edgeURL,
+                                    dataDir: Self.profilesDir.appendingPathComponent(account.profileKey, isDirectory: true).path,
+                                    deviceId: Self.deviceId, deviceName: UIDevice.current.name, platform: "ios",
+                                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0")
+            _ = try await crewPrepareLegacyBackup(config: config, credentials: account.credentials, sourcePath: legacy.path)
+        }
+        guard generation == authGeneration, client == nil else {
+            throw CoreError.Auth(message: "Sign-in changed while preserving the old profile. No live client was opened.")
+        }
         profileKey = account.profileKey
         AccountProfile(name: account.name, email: account.email, orgName: account.projectScope).save()
         guard start(account.credentials) else {
@@ -725,7 +739,7 @@ extension Credentials {
         return false
     }
 
-    private static let service = "ai.ashler.crew.upstream-canary"
+    private static let service = "ai.ashler.crew.staging"
     private static var account: String { "credentials.\(Endpoints.storageScope)" }
 
     static func stored() -> Credentials? {
@@ -822,7 +836,7 @@ struct AccountProfile: Codable {
     var email: String?
     var orgName: String?
 
-    private static let service = "ai.ashler.crew.upstream-canary"
+    private static let service = "ai.ashler.crew.staging"
     private static var account: String { "profile.\(Endpoints.storageScope)" }
 
     static func load() -> AccountProfile {

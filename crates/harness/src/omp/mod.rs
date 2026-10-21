@@ -1450,14 +1450,23 @@ fn fork_session_file(
 
 /// Copy a completed-turn native branch without stopping its calling agent.
 /// The durable caller supplies a private target and immutable branch identity.
-pub fn fork_native_session(source: &str, target: &Path, id: &str) -> Result<String, HarnessError> {
-    fork_session_to(&omp_session_dirs(false), source, Some((target, id)))
+pub fn fork_native_session(source: &str, target: &Path, id: &str, scaffold_host: bool) -> Result<String, HarnessError> {
+    fork_session_to(&omp_session_dirs(scaffold_host), source, Some((target, id)))
 }
 
-/// Attachment roots follow the exact resolved journal, never an unrelated live store.
-pub fn native_session_blob_dir(source: &str) -> Result<PathBuf, HarnessError> {
-    let (_, path) = resolve_session(&omp_session_dirs(false), source)?;
+/// Archives carry sibling blobs; continued private journals use OMP's runtime store.
+pub fn native_session_blob_dir(source: &str, scaffold_host: bool) -> Result<PathBuf, HarnessError> {
+    let (_, path) = resolve_session(&omp_session_dirs(scaffold_host), source)?;
     let path = path.ok_or_else(|| HarnessError::Protocol("Native journal unavailable".into()))?;
+    if path.parent().and_then(Path::file_name).is_some_and(|name|
+        name == "native-resumes" || name == "native-branches") {
+        // SessionManager always writes to getBlobsDir(), even for --resume /path.
+        // These journals were hydrated before launch; subsequent refs are native
+        // runtime writes, not pointers back into the immutable imported archive.
+        return omp_session_dirs(scaffold_host).first().and_then(|dir| dir.parent())
+            .map(|root| root.join("blobs"))
+            .ok_or_else(|| HarnessError::Protocol("Native runtime blob store unavailable".into()));
+    }
     if let Some(sessions) = path.ancestors().find(|path| path.file_name().is_some_and(|name| name == "sessions")) {
         return Ok(sessions.parent().ok_or_else(|| HarnessError::Protocol("Native store has no parent".into()))?.join("blobs"));
     }
@@ -2386,11 +2395,11 @@ mod tests {
         let bytes = b"{\"type\":\"session\",\"id\":\"source\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n";
         std::fs::write(&source, bytes).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        fork_native_session(source.to_str().unwrap(), &target, &id).unwrap();
+        fork_native_session(source.to_str().unwrap(), &target, &id, false).unwrap();
         assert_eq!(session_file_id(&target).as_deref(), Some(id.as_str()));
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
         let snapshot = std::fs::read(&target).unwrap();
-        assert!(fork_native_session(source.to_str().unwrap(), &target, &id).is_err());
+        assert!(fork_native_session(source.to_str().unwrap(), &target, &id, false).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), snapshot);
         #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;

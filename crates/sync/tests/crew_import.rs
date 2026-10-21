@@ -139,9 +139,11 @@ fn backup(path: &std::path::Path, pending: bool) -> CollaborationPrincipal {
     let manifest = CrewBackupManifest { version:1, writer_stopped:true, owner_subject:principal.subject.clone(),
         source_profile_root:"/original/profile".into(),
         native_histories:BTreeMap::from([("native-unchanged".into(), "native-histories/omp.jsonl".into())]),
+        attachment_aliases:BTreeMap::new(),
+        desktop_source:None, original_epoch_histories:BTreeMap::new(),
         project_id:principal.project_id.clone(), deployment_id:principal.deployment_id.clone(), files,
         chats:BTreeMap::from([(CHAT.into(), CrewChatMetadata { owner_subject:principal.subject.clone(),
-            scope, session_id:CHAT.into(), environment:None, agent_route:None })]) };
+            scope, session_id:CHAT.into(), environment:None, agent_route:None, original_epoch_history:None })]) };
     std::fs::write(path.join("crew-backup.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
     principal
 }
@@ -154,11 +156,18 @@ fn backup_import_preserves_ids_assets_and_terminal_outcomes_without_replay() {
     let principal = backup(&source, false);
     let target = root.path().join("new-profile");
     let report = import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    for (relative, expected) in &report.files_sha256 {
+        assert_eq!(format!("{:x}", Sha256::digest(std::fs::read(source.join(relative)).unwrap())), *expected,
+            "conversion changed original source bytes: {relative}");
+    }
     assert_eq!(report.native_session_ids[CHAT], "native-unchanged");
     assert_eq!(report.command_outcomes["command-1"], "applied");
     assert_eq!(std::fs::read(target.join("attachments/image.png")).unwrap(), b"preserved bytes");
     let aliases = zeron_sync::crew_import::imported_attachment_paths(&target).unwrap();
-    assert_eq!(aliases, vec![(std::path::PathBuf::from("/original/profile/uploads/retained.png"), target.join("uploads/retained.png").canonicalize().unwrap())]);
+    assert_eq!(aliases, vec![
+        (std::path::PathBuf::from("/original/profile/attachments/image.png"), target.join("attachments/image.png").canonicalize().unwrap()),
+        (std::path::PathBuf::from("/original/profile/uploads/retained.png"), target.join("uploads/retained.png").canonicalize().unwrap()),
+    ]);
     let histories = zeron_sync::crew_import::imported_native_histories(&target).unwrap();
     assert_eq!(histories["native-unchanged"], target.join("native-histories/omp.jsonl").canonicalize().unwrap());
     assert_eq!(std::fs::read(&histories["native-unchanged"]).unwrap(), std::fs::read(source.join("native-histories/omp.jsonl")).unwrap());
@@ -229,6 +238,11 @@ fn backup_import_preserves_ids_assets_and_terminal_outcomes_without_replay() {
     original.import(&bytes).unwrap();
     assert_eq!(original.get_list("messages").get_deep_value().to_json_value(), serde_json::json!(legacy_messages()));
     assert!(import_legacy_crew_backup(&source, &target, &principal, "controller").is_err());
+    let archive = target.join("native-histories/omp.jsonl");
+    let mut changed = std::fs::read(&archive).unwrap();
+    changed.extend_from_slice(b"\n");
+    std::fs::write(&archive, changed).unwrap();
+    assert!(zeron_sync::crew_import::imported_native_histories(&target).unwrap_err().to_string().contains("integrity"));
 }
 
 #[test]
@@ -465,4 +479,368 @@ fn shared_agent_membership_and_granted_environment_are_explicit_blockers() {
         assert!(error.contains("membership requires authenticated reattachment"), "{error}");
         assert!(!target.exists());
     }
+}
+
+#[test]
+fn legacy_0162_preflight_matches_import_and_keeps_recovery_evidence_out_of_rooms() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let db = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+    db.execute_batch("CREATE TABLE session_startups(chat_id TEXT PRIMARY KEY,worktree_path TEXT,cancelled INTEGER NOT NULL DEFAULT 0);").unwrap();
+    // This original cache is evidence, not a second chat and not necessarily a
+    // valid current Loro snapshot (the original legacy store retains zeroblobs).
+    db.execute("INSERT INTO snapshots VALUES ('recovery-original/prior-scope',?1)", [b"original evidence".as_slice()]).unwrap();
+    drop(db);
+    refresh_database_hash(&source);
+    let target = root.path().join("new-profile");
+    let before = std::fs::read(source.join("docs.sqlite3")).unwrap();
+    let report = zeron_sync::crew_import::validate_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    assert!(!target.exists());
+    assert_eq!(std::fs::read(source.join("docs.sqlite3")).unwrap(), before);
+    assert_eq!(report.source_table_rows["snapshots"], 3);
+    assert_eq!(report.source_table_rows["session_startups"], 0);
+    assert_eq!(report.recovery_snapshot_ids, ["recovery-original/prior-scope"]);
+    let imported = import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    assert_eq!(serde_json::to_value(report).unwrap(), serde_json::to_value(imported).unwrap());
+    let store = DocsStore::open(&target).unwrap();
+    assert!(store.load_snapshot("recovery-original/prior-scope").unwrap().is_none());
+    let evidence = store.legacy_crew_records("recovery-original/prior-scope").unwrap();
+    assert_eq!(evidence[0].2, b"original evidence");
+}
+
+#[test]
+fn interrupted_startups_and_existing_canary_profiles_are_not_overwritten() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let db = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+    db.execute_batch("CREATE TABLE session_startups(chat_id TEXT PRIMARY KEY,worktree_path TEXT,cancelled INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO session_startups VALUES ('pending','/worktree',1);").unwrap();
+    drop(db);
+    refresh_database_hash(&source);
+    let target = root.path().join("new-profile");
+    let error = zeron_sync::crew_import::validate_legacy_crew_backup(&source, &target, &principal, "controller").unwrap_err();
+    assert!(error.to_string().contains("session startups require legacy reconciliation"));
+    assert!(!target.exists());
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("canary-authority"), b"unchanged").unwrap();
+    assert!(import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap_err().to_string().contains("new separate profile"));
+    assert_eq!(std::fs::read(target.join("canary-authority")).unwrap(), b"unchanged");
+}
+
+#[test]
+fn runtime_rejects_legacy_schema_and_incomplete_import_before_mutating_database() {
+    let root = tempfile::tempdir().unwrap();
+    backup(root.path(), false);
+    let original = std::fs::read(root.path().join("docs.sqlite3")).unwrap();
+    let error = match DocsStore::open(root.path()) { Ok(_) => panic!("legacy profile opened"), Err(error) => error };
+    assert!(error.to_string().contains("legacy Crew database"));
+    assert_eq!(std::fs::read(root.path().join("docs.sqlite3")).unwrap(), original);
+    let target = root.path().join("incomplete");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("crew-import-incomplete"), b"in progress").unwrap();
+    assert!(DocsStore::open(&target).is_err());
+    assert!(!target.join("docs.sqlite3").exists());
+}
+
+#[test]
+fn blocked_preflight_reports_all_records_without_creating_a_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, true);
+    let target = root.path().join("new-profile");
+    let report = zeron_sync::crew_import::preflight_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    assert_eq!(report["valid"], false);
+    assert_eq!(report["sourceTableRows"]["snapshots"], 2);
+    assert_eq!(report["snapshots"][CHAT], "public-session");
+    assert!(report["error"].as_str().unwrap().contains("unclaimed pending command"));
+    assert!(!target.exists());
+}
+
+#[test]
+fn local_history_retains_native_identity_without_cloud_metadata() {
+    use loro::ToJson;
+    const LOCAL: &str = "local-chat-0123456789abcdef";
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let db = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+    let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id='workspace3'", [], |row| row.get(0)).unwrap();
+    let workspace = LoroDoc::new();
+    workspace.import(&bytes).unwrap();
+    let mut row = workspace.get_map("chats").get(CHAT).unwrap().get_deep_value().to_json_value();
+    row["id"] = LOCAL.into();
+    workspace.get_map("chats").delete(CHAT).unwrap();
+    workspace.get_map("chats").insert(LOCAL, LoroValue::from(row)).unwrap();
+    workspace.get_map("sessionRefs").delete(&format!("5:owner:{CHAT}")).unwrap();
+    workspace.commit();
+    db.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id='workspace3'", [workspace.export(ExportMode::Snapshot).unwrap()]).unwrap();
+    let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [CHAT], |row| row.get(0)).unwrap();
+    let chat = LoroDoc::new();
+    chat.import(&bytes).unwrap();
+    chat.get_map("meta").insert("chatId", LOCAL).unwrap();
+    chat.commit();
+    db.execute("UPDATE snapshots SET doc_id=?1,bytes=?2 WHERE doc_id=?3", rusqlite::params![LOCAL, chat.export(ExportMode::Snapshot).unwrap(), CHAT]).unwrap();
+    drop(db);
+    let path = source.join("crew-backup.json");
+    let mut manifest: CrewBackupManifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut metadata = manifest.chats.remove(CHAT).unwrap();
+    metadata.session_id = LOCAL.into();
+    metadata.scope.session_id = Some(LOCAL.into());
+    manifest.chats.insert(LOCAL.into(), metadata);
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    refresh_database_hash(&source);
+    let target = root.path().join("new-profile");
+    let report = import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    assert_eq!(report.chat_ids, [LOCAL]);
+    assert_eq!(report.native_session_ids[LOCAL], "native-unchanged");
+    let store = DocsStore::open(&target).unwrap();
+    let registry = zeron_doc::RegistryDoc::from_bytes(&store.load_snapshot(zeron_doc::REGISTRY_DOC_ID).unwrap().unwrap(), "controller").unwrap();
+    let row = registry.chat(LOCAL).unwrap().unwrap();
+    assert!(row.crew.is_none());
+    assert_eq!(row.harness_session_id.as_deref(), Some("native-unchanged"));
+    assert!(store.load_snapshot(LOCAL).unwrap().is_some());
+}
+
+#[test]
+fn unassociated_bootstrap_is_retained_as_evidence_not_a_conversation() {
+    const ORPHAN: &str = "unassociated-bootstrap";
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let orphan = LoroDoc::new();
+    orphan.get_map("meta").insert("chatId", ORPHAN).unwrap();
+    orphan.get_map("meta").insert("schemaVersion", 2i64).unwrap();
+    orphan.get_list("messages");
+    orphan.get_list("commands");
+    orphan.commit();
+    let bytes = orphan.export(ExportMode::Snapshot).unwrap();
+    let database = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+    database.execute("INSERT INTO snapshots(doc_id,bytes) VALUES (?1,?2)", rusqlite::params![ORPHAN, &bytes]).unwrap();
+    drop(database);
+    refresh_database_hash(&source);
+    let target = root.path().join("native");
+    let report = import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    let disposition = &report.inert_bootstrap_snapshots[ORPHAN];
+    assert_eq!(disposition.disposition, "inert-bootstrap");
+    assert_eq!(disposition.snapshot_sha256, format!("{:x}", Sha256::digest(&bytes)));
+    assert!(!report.chat_ids.iter().any(|id| id == ORPHAN));
+    let store = DocsStore::open(&target).unwrap();
+    assert!(store.load_snapshot(ORPHAN).unwrap().is_none());
+    assert_eq!(store.legacy_crew_records(ORPHAN).unwrap(), vec![("inert-bootstrap".into(), ORPHAN.into(), bytes.clone())]);
+    let registry = zeron_doc::RegistryDoc::from_bytes(&store.load_snapshot(zeron_doc::REGISTRY_DOC_ID).unwrap().unwrap(), "controller").unwrap();
+    assert!(registry.chat(ORPHAN).unwrap().is_none());
+    let retained = rusqlite::Connection::open_with_flags(target.join("legacy-crew.sqlite3"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(retained.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1", [ORPHAN], |row| row.get::<_, Vec<u8>>(0)).unwrap(), bytes);
+    let verified = zeron_sync::crew_import::verify_legacy_crew_import(&source, &target, &principal, "controller").unwrap();
+    assert_eq!(verified.inert_bootstrap_snapshots, report.inert_bootstrap_snapshots);
+}
+
+#[test]
+fn destination_readback_uses_database_not_claimed_report() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let target = root.path().join("new-profile");
+    import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    // Neither a forged operational report nor unchanged claimed receipts can
+    // substitute for the source-derived actual database/asset comparison.
+    let original_report = std::fs::read(target.join("crew-import-report.json")).unwrap();
+    std::fs::write(target.join("crew-import-report.json"), b"{}").unwrap();
+    assert!(zeron_sync::crew_import::verify_legacy_crew_import(&source, &target, &principal, "controller").is_err());
+    std::fs::write(target.join("crew-import-report.json"), original_report).unwrap();
+    let report = zeron_sync::crew_import::verify_legacy_crew_import(&source, &target, &principal, "controller").unwrap();
+    assert_eq!(report.destination_snapshots_sha256.len(), 2);
+    assert_eq!(report.command_outcomes["command-1"], "applied");
+    let db = rusqlite::Connection::open(target.join("docs.sqlite3")).unwrap();
+    db.execute("DELETE FROM processed_commands WHERE command_id='command-1'", []).unwrap();
+    drop(db);
+    let error = zeron_sync::crew_import::verify_legacy_crew_import(&source, &target, &principal, "controller").unwrap_err();
+    assert!(error.to_string().contains("durable command claims differ"));
+}
+
+#[test]
+fn selected_profile_proof_uses_actual_history_and_allows_only_read_marker_progress() {
+    use zeron_sync::crew_import::verify_imported_profile;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let target = root.path().join("new-profile");
+    import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    let store = DocsStore::open(&target).unwrap();
+    assert_eq!(store.profile_root().unwrap(), target.canonicalize().unwrap());
+    let mut registry = zeron_doc::RegistryDoc::from_bytes(
+        &store.load_snapshot(zeron_doc::REGISTRY_DOC_ID).unwrap().unwrap(), "controller").unwrap();
+    registry.set_chat_seen(CHAT, chrono::DateTime::from_timestamp_millis(100).unwrap()).unwrap();
+    store.save_snapshot(zeron_doc::REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+    store.save_snapshot("22222222-2222-4222-8222-222222222222", b"unrelated live snapshot").unwrap();
+    store.mark_processed("unrelated-live-command").unwrap();
+    let proof = verify_imported_profile(&target, &principal, "controller", CHAT).unwrap();
+    assert_eq!(proof.selected_chat_id.as_deref(), Some(CHAT));
+    assert_eq!(proof.chat_ids, [CHAT]);
+    assert_eq!(proof.command_outcomes, BTreeMap::from([("command-1".into(), "applied".into())]));
+    assert_eq!(proof.annotations_retained, 1);
+    assert_eq!(proof.destination_snapshots_sha256.len(), 2);
+    assert!(verify_imported_profile(&target, &principal, "controller", "22222222-2222-4222-8222-222222222222").is_err());
+    let mut foreign = principal.clone(); foreign.subject = "other-owner".into();
+    assert!(verify_imported_profile(&target, &foreign, "controller", CHAT).is_err());
+    let mut chat = registry.chat(CHAT).unwrap().unwrap();
+    chat.cwd = Some("/unrelated-repository".into());
+    registry.upsert_chat(&chat).unwrap();
+    store.save_snapshot(zeron_doc::REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+    assert!(verify_imported_profile(&target, &principal, "controller", CHAT).unwrap_err().to_string().contains("registry identity/config/native"));
+}
+
+#[test]
+fn explicit_legacy_host_provider_binding_survives_import() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let db = rusqlite::Connection::open(source.join("docs.sqlite3")).unwrap();
+    let bytes: Vec<u8> = db.query_row("SELECT bytes FROM snapshots WHERE doc_id='workspace3'", [], |row| row.get(0)).unwrap();
+    let workspace = LoroDoc::new();
+    workspace.import(&bytes).unwrap();
+    workspace.get_map("devices").insert("host", LoroValue::from(serde_json::json!({
+        "id":"host","name":"Preserved host","platform":"linux","environment":"namespace","namespaceDevboxId":"instance-id"
+    }))).unwrap();
+    workspace.commit();
+    db.execute("UPDATE snapshots SET bytes=?1 WHERE doc_id='workspace3'", [workspace.export(ExportMode::Snapshot).unwrap()]).unwrap();
+    drop(db);
+    refresh_database_hash(&source);
+    let target = root.path().join("new-profile");
+    import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    let store = DocsStore::open(&target).unwrap();
+    let registry = zeron_doc::RegistryDoc::from_bytes(&store.load_snapshot(zeron_doc::REGISTRY_DOC_ID).unwrap().unwrap(), "controller").unwrap();
+    let devices = registry.read_devices().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].devbox_id.as_deref(), Some("instance-id"));
+    assert_eq!(devices[0].devbox_provider, Some(zeron_proto::DeviceEnvironment::Namespace));
+}
+
+#[test]
+fn legacy_recovery_requests_are_retained_but_never_replayed_or_silently_retired() {
+    for pending in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("backup");
+        std::fs::create_dir(&source).unwrap();
+        let principal = backup(&source, false);
+        std::fs::create_dir(source.join("legacy-journals")).unwrap();
+        let recovery = format!("legacy-journals/{CHAT}.recovery");
+        let events = format!("legacy-journals/{CHAT}.jsonl");
+        let request = if pending { serde_json::json!({"prompt":"accepted but not reconciled","resume":"native-unchanged"}) } else { serde_json::Value::Null };
+        std::fs::write(source.join(&recovery), serde_json::to_vec(&serde_json::json!([CHAT, request])).unwrap()).unwrap();
+        std::fs::write(source.join(&events), b"{\"seq\":0,\"event\":{\"type\":\"done\",\"status\":\"completed\"}}\n").unwrap();
+        let path = source.join("crew-backup.json");
+        let mut manifest: CrewBackupManifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for relative in [&recovery, &events] {
+            manifest.files.insert(relative.clone(), format!("{:x}", Sha256::digest(std::fs::read(source.join(relative)).unwrap())));
+        }
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let target = root.path().join("new-profile");
+        if pending {
+            let report = zeron_sync::crew_import::preflight_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+            assert_eq!(report["valid"], false);
+            assert_eq!(report["legacyJournals"]["states"][&recovery], "pending-recovery");
+            assert!(import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap_err().to_string().contains("execution journal requires reconciliation"));
+            assert!(!target.exists());
+        } else {
+            let report = import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+            assert_eq!(report.legacy_journal_states[&recovery], "retired");
+            assert_eq!(std::fs::read(target.join(&recovery)).unwrap(), std::fs::read(source.join(&recovery)).unwrap());
+            assert!(!target.join("journals").exists());
+        }
+    }
+}
+
+#[test]
+fn known_interrupted_pending_run_keeps_exact_request_account_and_native_identity() {
+    for case in ["interrupted", "completed", "errored", "unknown", "no-stop", "wrong-context"] {
+        let status = if matches!(case, "no-stop" | "wrong-context") { "interrupted" } else { case };
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("backup");
+        std::fs::create_dir(&source).unwrap();
+        let principal = backup(&source, false);
+        std::fs::create_dir(source.join("legacy-journals")).unwrap();
+        let identity = serde_json::json!({"SignedIn":{"owner_subject":"owner","project_scope":"project"}});
+        let context_request = serde_json::json!({"prompt":"exact accepted request","model":null,"reasoning":null,
+            "agentAccountId":"opaque-account","modelOptions":{"retained":"choice"},"cwd":"/repo",
+            "sandbox":"read-only","autoApprove":false,"resume":null,"attachments":["/original/profile/uploads/retained.png"]});
+        let mut pending_request = context_request.clone();
+        pending_request["resume"] = "native-unchanged".into();
+        let pending = serde_json::json!({"identity":identity,"device_id":"host","harness":"omp","request":pending_request,
+            "user_message_id":"user-1","blocked_session":null,"updated_at":12,"journal_seq":1});
+        let recovery = format!("legacy-journals/{CHAT}.recovery");
+        let context = format!("legacy-journals/{CHAT}.context");
+        let events = format!("legacy-journals/{CHAT}.jsonl");
+        std::fs::write(source.join(&recovery), serde_json::to_vec(&serde_json::json!([CHAT,pending])).unwrap()).unwrap();
+        let context_device = if case == "wrong-context" { "foreign-host" } else { "host" };
+        std::fs::write(source.join(&context), serde_json::to_vec(&serde_json::json!([CHAT,[identity,context_device,"omp",context_request]])).unwrap()).unwrap();
+        std::fs::write(source.join(&events), serde_json::to_vec(&serde_json::json!({"seq":2,"event":{
+            "type":"done","status":status,"sessionId":"native-unchanged"}})).unwrap()).unwrap();
+        let path = source.join("crew-backup.json");
+        let mut manifest: CrewBackupManifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if case == "no-stop" { manifest.writer_stopped = false; }
+        for relative in [&recovery, &context, &events] {
+            manifest.files.insert(relative.clone(), format!("{:x}", Sha256::digest(std::fs::read(source.join(relative)).unwrap())));
+        }
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let target = root.path().join("new-profile");
+        let result = import_legacy_crew_backup(&source, &target, &principal, "controller");
+        if case != "interrupted" {
+            assert!(result.is_err(), "{case} must not become resumable work");
+            assert!(!target.exists());
+            continue;
+        }
+        let report = result.unwrap();
+        assert_eq!(report.legacy_journal_states[&recovery], "validated-interrupted-request");
+        let intents = zeron_sync::crew_import::imported_recovery_intents(&target).unwrap();
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(report.recovery_intent_ids[CHAT], intent.command_id);
+        assert_eq!(intent.request.prompt, "exact accepted request");
+        assert_eq!(intent.request.cwd, "/repo");
+        assert_eq!(intent.request.resume.as_deref(), Some("native-unchanged"));
+        assert_eq!(intent.agent_account_id.as_deref(), Some("opaque-account"));
+        assert_eq!(intent.request.model_options["crewAccountId"], "opaque-account");
+        assert!(!intent.request.auto_approve);
+        assert_eq!(intent.destination_device_id, "controller");
+        assert_eq!(intent.source_device_id, "host");
+        assert_eq!(intent.user_message_id, "user-1");
+        zeron_sync::crew_import::verify_legacy_crew_import(&source, &target, &principal, "controller").unwrap();
+        std::fs::write(target.join(&context), b"changed").unwrap();
+        assert!(zeron_sync::crew_import::imported_recovery_intents(&target).is_err());
+    }
+}
+
+#[test]
+fn explicit_attachment_references_resolve_only_to_inventoried_copies() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let path = source.join("crew-backup.json");
+    let mut manifest: CrewBackupManifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest.attachment_aliases.insert("/attachments/remote-blob".into(), "attachments/image.png".into());
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let target = root.path().join("new-profile");
+    import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap();
+    let aliases = zeron_sync::crew_import::imported_attachment_paths(&target).unwrap();
+    assert!(aliases.contains(&(std::path::PathBuf::from("/attachments/remote-blob"), target.join("attachments/image.png").canonicalize().unwrap())));
+    zeron_sync::crew_import::verify_legacy_crew_import(&source, &target, &principal, "controller").unwrap();
+    std::fs::write(target.join("attachments/image.png"), b"tampered remote bytes").unwrap();
+    assert!(zeron_sync::crew_import::imported_attachment_paths(&target).is_err());
+    manifest.attachment_aliases.insert("/original/profile/uploads/retained.png".into(), "attachments/image.png".into());
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let rejected = root.path().join("conflict");
+    assert!(import_legacy_crew_backup(&source, &rejected, &principal, "controller").unwrap_err().to_string().contains("conflicts with an inventoried original path"));
+    assert!(!rejected.exists());
 }

@@ -1,6 +1,6 @@
 //! Settings → Devices (feature-inventory §1.5): the device registry — name,
 //! platform, last-seen, an Online/Offline badge, a "This device" badge, click-to-copy id,
-//! and a Rename dialog (Mutate renameDevice).
+//! Rename and explicit wake for registered Namespace and Boat hosts.
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -26,6 +26,45 @@ pub const DEVICE_ONLINE_WINDOW_SECS: i64 = 70;
 pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     last_seen
         .is_some_and(|at| now.signed_duration_since(at).num_seconds() <= DEVICE_ONLINE_WINDOW_SECS)
+}
+
+/// Provider operations are only initiated by explicit user actions. The reply
+/// must prove the same immutable binding before its fresh capabilities are used.
+pub(crate) async fn wake_host(
+    engine: &crate::state::EngineHandle,
+    executor: &gpui::BackgroundExecutor,
+    device: &zeron_proto::Device,
+) -> Result<zeron_proto::Device, String> {
+    let request = engine.client().call(methods::WAKE_DEVICE, serde_json::json!({"deviceId": device.id}));
+    let deadline = executor.timer(Duration::from_secs(180));
+    futures::pin_mut!(request, deadline);
+    let value = match futures::future::select(request, deadline).await {
+        futures::future::Either::Left((result, _)) => result.map_err(|error| error.to_string())?,
+        futures::future::Either::Right(_) => return Err("Connection timed out. Your draft is preserved.".into()),
+    };
+    validate_wake_reply(device, value)
+}
+
+fn validate_wake_reply(expected: &zeron_proto::Device, value: serde_json::Value) -> Result<zeron_proto::Device, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Reply {
+        device_id: String,
+        devbox_provider: zeron_proto::DeviceEnvironment,
+        devbox_id: String,
+        device: zeron_proto::Device,
+        ready: bool,
+    }
+    let reply: Reply = serde_json::from_value(value).map_err(|error| format!("Invalid connection response: {error}"))?;
+    if !reply.ready || expected.devbox_binding().is_none()
+        || reply.device_id != expected.id || reply.device.id != expected.id
+        || Some(reply.devbox_provider) != expected.devbox_provider
+        || Some(reply.devbox_id.as_str()) != expected.devbox_id.as_deref()
+        || reply.device.devbox_binding() != expected.devbox_binding()
+    {
+        return Err("The connected device does not match the selected host. Nothing was sent.".into());
+    }
+    Ok(reply.device)
 }
 
 /// Compact last-seen line. Pure.
@@ -70,6 +109,8 @@ pub struct DevicesPage {
     error: Option<SharedString>,
     task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
+    waking: Option<String>,
+    wake_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -84,8 +125,46 @@ impl DevicesPage {
             error: None,
             task: None,
             copy_task: None,
+            waking: None,
+            wake_task: None,
             _observe: observe,
         }
+    }
+
+    pub(crate) fn on_hidden(&mut self) {
+        self.wake_task = None;
+        self.waking = None;
+    }
+
+    fn wake_device(&mut self, device_id: &str, cx: &mut Context<Self>) {
+        if self.wake_task.is_some() { return; }
+        let state = self.state.read(cx);
+        let Some(device) = state.devices.iter().find(|device| device.id == device_id).cloned() else { return; };
+        if state.local_device_id.as_deref() == Some(device_id)
+            || state.device_online(device_id, Utc::now()) || device.devbox_binding().is_none() { return; }
+        let Some(engine) = state.engine().cloned() else { return; };
+        self.waking = Some(device.id.clone());
+        self.wake_task = Some(cx.spawn(async move |this, cx| {
+            let result = wake_host(&engine, cx.background_executor(), &device).await;
+            this.update(cx, |page, cx| {
+                page.waking = None;
+                page.wake_task = None;
+                match result {
+                    Ok(fresh) => page.state.update(cx, |state, cx| {
+                        let mut devices = state.devices.clone();
+                        if let Some(slot) = devices.iter_mut().find(|row| row.id == device.id)
+                            && slot.devbox_binding() == device.devbox_binding() {
+                            *slot = fresh;
+                            state.apply_devices(devices);
+                            cx.notify();
+                        }
+                    }),
+                    Err(error) => page.error = Some(format!("Could not connect: {error}").into()),
+                }
+                cx.notify();
+            }).ok();
+        }));
+        cx.notify();
     }
 
     pub(crate) fn open_rename(
@@ -274,6 +353,8 @@ impl Render for DevicesPage {
             )
         };
         let copied = self.copied.clone();
+        let waking = self.waking.clone();
+        let wake_busy = self.wake_task.is_some();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
         // Split into this device and the rest; each renders as rows in one
         // block, like every other settings page.
@@ -288,6 +369,9 @@ impl Render for DevicesPage {
             let copy_id = device.id.clone();
             let rename_id = device.id.clone();
             let rename_name = device.name.clone();
+            let can_wake = !is_local && !online && device.devbox_binding().is_some();
+            let wake_id = device.id.clone();
+            let is_waking = waking.as_deref() == Some(device.id.as_str());
             let mut meta: Vec<AnyElement> = vec![
                 div()
                     .child(SharedString::from(
@@ -295,6 +379,9 @@ impl Render for DevicesPage {
                     ))
                     .into_any_element(),
             ];
+            if device.devbox_binding().is_some() {
+                meta.push(div().child("Devbox").into_any_element());
+            }
             if let Some(version) = device.version.as_deref().filter(|v| !v.is_empty()) {
                 meta.push(
                     div()
@@ -312,7 +399,8 @@ impl Render for DevicesPage {
                 } else {
                     div()
                         .child(SharedString::from(format!(
-                            "Last seen {}",
+                            "{}Last seen {}",
+                            if can_wake { "Idle · " } else { "" },
                             format_last_seen(device.last_seen_at, now)
                         )))
                         .into_any_element()
@@ -332,6 +420,15 @@ impl Render for DevicesPage {
                         .flex()
                         .items_center()
                         .gap(px(4.0))
+                        .when(can_wake, |el| el.child(
+                            widgets::text_action(&theme, widgets::ActionTone::Filled, if is_waking { "Connecting…" } else { "Wake" })
+                                .id(("device-wake", ix))
+                                .tab_index(0)
+                                .role(gpui::Role::Button)
+                                .aria_label(format!("Wake {}", device.name))
+                                .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                .when(!wake_busy, |el| el.on_click(cx.listener(move |this, _, _, cx| this.wake_device(&wake_id, cx))))
+                        ))
                         .child(
                             widgets::text_action(
                                 &theme,
@@ -438,6 +535,33 @@ impl Render for DevicesPage {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+
+    #[test]
+    fn wake_reply_requires_ready_and_the_exact_registered_binding() {
+        for (provider, id) in [("namespace", "ofpf7g22n4412"), ("boat", "bx_234abcxy")] {
+            let device: zeron_proto::Device = serde_json::from_value(serde_json::json!({
+                "id": "remote", "name": "host", "platform": "linux",
+                "devboxProvider": provider, "devboxId": id,
+            })).unwrap();
+            let reply = serde_json::json!({
+                "deviceId": "remote", "devboxProvider": provider, "devboxId": id,
+                "device": device, "ready": true,
+            });
+            assert!(validate_wake_reply(&device, reply.clone()).is_ok());
+            for (field, value) in [("ready", serde_json::json!(false)), ("deviceId", serde_json::json!("other")),
+                ("devboxId", serde_json::json!("other")), ("devboxProvider", serde_json::json!("unknown"))] {
+                let mut wrong = reply.clone();
+                wrong[field] = value;
+                assert!(validate_wake_reply(&device, wrong).is_err());
+            }
+            let mut wrong = reply.clone();
+            wrong["device"]["devboxId"] = serde_json::json!("other");
+            assert!(validate_wake_reply(&device, wrong).is_err());
+            let mut unbound = device.clone();
+            unbound.devbox_provider = None;
+            assert!(validate_wake_reply(&unbound, reply).is_err());
+        }
+    }
 
     #[test]
     fn presence_window() {

@@ -148,13 +148,27 @@ impl std::fmt::Debug for InferenceRoute {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunContext {
     pub session_id: String,
     pub ipc_port: u16,
+    /// Ephemeral capability for this exact run's native supervision subscription.
+    pub supervision_token: Option<String>,
     pub inference: Option<InferenceRoute>,
     /// One-shot native fork source; never exported to the child environment.
     pub fork_from: Option<String>,
+}
+
+impl std::fmt::Debug for RunContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunContext")
+            .field("session_id", &self.session_id)
+            .field("ipc_port", &self.ipc_port)
+            .field("supervision_token", &"<redacted>")
+            .field("inference", &self.inference)
+            .field("fork_from", &self.fork_from)
+            .finish()
+    }
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.

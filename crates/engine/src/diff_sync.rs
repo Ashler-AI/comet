@@ -926,7 +926,7 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
     // Latest-only sidecar to every syncing chat's session DO slot.
     let chats = lock(&entry.chats).clone();
     if let Some(edge) = &inner.edge {
-        for chat in &chats {
+        for chat in chats.iter().filter(|chat| zeron_proto::chat_allows_sync(&chat.id)) {
             let sidecar = DiffSidecar {
                 chat_id: chat.id.clone(),
                 device_id: inner.device_id.clone(),

@@ -726,9 +726,15 @@ impl EngineRpc {
         agent_accounts: AgentAccounts,
         workspace_scope: WorkspaceScope,
     ) -> Self {
+        let binding = crate::devbox::host_binding()
+            .expect("native host identity must remain valid after engine assembly");
+        let (devbox_provider, devbox_id) = binding.map(|(provider, id)| (Some(provider), Some(id)))
+            .unwrap_or_default();
         let engine_info = EngineInfo {
             device_id: doc_host.device_id().to_string(),
             workspace_scope,
+            devbox_provider,
+            devbox_id,
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
             capabilities: zeron_proto::capabilities::current(),
         };
@@ -1790,6 +1796,7 @@ impl AuthRpc {
         matches!(
             method,
             methods::AUTH_STATUS
+                | methods::UPDATE_ACCESS_TOKEN
                 | methods::SIGN_IN
                 | methods::SIGN_IN_HEADLESS
                 | methods::COMPLETE_SIGN_IN
@@ -1806,6 +1813,20 @@ impl RpcService for AuthRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
             methods::AUTH_STATUS => Ok(RpcReply::Stream(watch_stream(self.auth.watch_state()))),
+            methods::UPDATE_ACCESS_TOKEN => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct P { edge_url: String }
+                let p: P = parse_params(params)?;
+                if self.auth.device_mode()
+                    || p.edge_url.trim_end_matches('/') != self.auth.edge_url().trim_end_matches('/')
+                {
+                    return Err(RpcError::Failed("Update authentication requires the local engine's configured release origin".into()));
+                }
+                let token = self.auth.access_token().await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&token)
+            }
             methods::SIGN_IN => {
                 let url = self
                     .auth
@@ -1876,6 +1897,9 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if method == methods::UPDATE_ACCESS_TOKEN && self.relay {
+            return Err(RpcError::Failed("Update authentication requires local IPC".into()));
+        }
         self.crew_guard(method, &params)?;
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
@@ -2107,6 +2131,7 @@ impl RpcService for EngineRpc {
                     .chat(&p.source_chat_id)
                     .map_err(failed)?
                     .ok_or_else(|| RpcError::Failed("Source chat no longer exists".into()))?;
+                self.sessions.ensure_execution_allowed(&source.id, source.harness_session_id.as_deref()).map_err(failed)?;
                 if source.device_id != self.doc_host.device_id() {
                     return Err(RpcError::Failed(
                         "Fork must be created on the source device".into(),
@@ -2212,6 +2237,27 @@ impl RpcService for EngineRpc {
                     .focus_chat(&p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({}))
+            }
+            methods::RETAIN_SESSION_SUPERVISION => {
+                if self.relay {
+                    return Err(RpcError::Failed("Session supervision requires local IPC".into()));
+                }
+                let p: zeron_rpc::RetainSessionSupervisionParams = parse_params(params)?;
+                let lease = self.sessions.retain_supervision(&p.chat_id, &p.token)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let receipt = serde_json::json!({
+                    "chatId": p.chat_id, "runId": lease.run_id, "retained": true,
+                });
+                Ok(RpcReply::Stream(futures::stream::unfold(
+                    (lease, Some(receipt)), |(lease, receipt)| async move {
+                        if let Some(receipt) = receipt {
+                            Some((receipt, (lease, None)))
+                        } else {
+                            lease.interrupt.cancelled().await;
+                            None
+                        }
+                    },
+                ).boxed()))
             }
             methods::WATCH_DOC_MESSAGES => {
                 // Opt-in: older viewports retain the full-reset contract.
@@ -2532,6 +2578,35 @@ impl RpcService for EngineRpc {
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
+            }
+            methods::WAKE_DEVICE => {
+                if self.relay || params.get("targetDeviceId").is_some()
+                    || self.engine_info.workspace_scope != WorkspaceScope::Synced {
+                    return Err(RpcError::Failed("Devbox wake requires explicit local controller consent".into()));
+                }
+                let (principal, scope) = self.crew_services()?.controller()?;
+                if scope.project_id != "ashler-staging"
+                    || scope.deployment_id.as_deref() != Some("ashler-staging") {
+                    return Err(RpcError::Failed("Devbox wake requires the staging Crew controller".into()));
+                }
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Input { device_id: String }
+                let input: Input = parse_params(params)?;
+                if input.device_id.is_empty() || input.device_id.len() > 128
+                    || input.device_id == self.doc_host.device_id() {
+                    return Err(RpcError::BadParams("Select a registered remote device".into()));
+                }
+                let links = self.links.as_ref().ok_or_else(|| RpcError::Failed("Crew peer routing is unavailable".into()))?;
+                let device = crate::devbox::wake(&self.workspace, links, &input.device_id).await.map_err(RpcError::Failed)?;
+                let (current_principal, current_scope) = self.crew_services()?.controller()?;
+                if current_principal != principal || current_scope.project_id != scope.project_id || current_scope.deployment_id != scope.deployment_id {
+                    return Err(RpcError::Failed("Crew controller scope changed during wake".into()));
+                }
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": device.id, "devboxProvider": device.devbox_provider,
+                    "devboxId": device.devbox_id, "device": device, "ready": true,
+                }))
             }
             methods::LOCAL_IMPORT_STATUS => {
                 let importer = self.local_importer()?.clone();
@@ -3893,6 +3968,65 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn wake_never_runs_for_local_profiles_or_relay_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(HarnessRegistry::new()), HarnessId::Omp, None,
+        ).unwrap();
+        for rpc in [core.build_rpc(), core.build_rpc().for_relay()] {
+            for params in [serde_json::json!({"deviceId":"remote"}),
+                serde_json::json!({"deviceId":"remote", "targetDeviceId":"remote"})] {
+                assert!(rpc.handle(methods::WAKE_DEVICE, params).await.is_err());
+            }
+        }
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn update_token_consumers_require_local_matching_user_authority() {
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let edge = "https://releases.example.test";
+        let mut config = crate::AuthConfig::new(edge, temp.path());
+        config.allow_dev_auth = true;
+        config.dev_user_id = "local-update-token".into();
+        let auth = Auth::new(config.clone());
+        // The deferred desktop service and the assembled IPC service use the
+        // same client call; neither needs to read credentials from disk.
+        let deferred = zeron_rpc::memory_client(Arc::new(AuthRpc::new(auth.clone())));
+        assert_eq!(deferred.update_access_token(edge).await.unwrap(), "local-update-token");
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            Arc::new(HarnessRegistry::new()), HarnessId::Omp, None,
+        ).unwrap();
+        let local = zeron_rpc::memory_client(Arc::new(core.build_rpc().with_auth(auth.clone())));
+        assert_eq!(local.update_access_token(edge).await.unwrap(), "local-update-token");
+        for client in [&deferred, &local] {
+            assert!(client.update_access_token("https://untrusted.example.test").await.is_err());
+            assert!(client.call(methods::UPDATE_ACCESS_TOKEN, serde_json::json!({
+                "edgeUrl": edge, "targetDeviceId": "remote-device"
+            })).await.is_err());
+            assert!(client.call(methods::UPDATE_ACCESS_TOKEN, serde_json::json!({
+                "edgeUrl": edge, "__crewAuthority": {}
+            })).await.is_err());
+        }
+        let relay = zeron_rpc::memory_client(Arc::new(core.build_rpc().with_auth(auth).for_relay()));
+        assert!(relay.update_access_token(edge).await.unwrap_err().to_string().contains("local IPC"));
+
+        config.allow_dev_auth = false;
+        let signed_out = zeron_rpc::memory_client(Arc::new(AuthRpc::new(Auth::new(config.clone()))));
+        assert!(signed_out.update_access_token(edge).await.is_err());
+        config.device = Some(zeron_sync::scaffold_auth::DeviceConfig {
+            join_grant: String::new(), device_id: "device".into(), session_id: "session".into(),
+            deployment_id: "deployment".into(), sandbox_id: "sandbox".into(), lifecycle_epoch: 1,
+        });
+        let scoped = zeron_rpc::memory_client(Arc::new(AuthRpc::new(Auth::new(config))));
+        assert!(scoped.update_access_token(edge).await.unwrap_err().to_string().contains("local engine's configured release origin"));
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn managed_model_picker_works_without_native_harnesses_or_credentials() {
         let temp = tempfile::tempdir().unwrap();
         // An empty registry makes any accidental CLI discovery fail to resolve.
@@ -4427,6 +4561,7 @@ mod tests {
         assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
+        assert!(!forwardable(methods::WAKE_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::SEARCH_GIT_HISTORY));

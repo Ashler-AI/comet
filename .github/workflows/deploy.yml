@@ -1,135 +1,177 @@
 name: deploy
 
-# Autodeploy the edge Worker + Durable Objects (session/device rooms, R2,
-# WorkOS auth routes) on every push to main that touches edge/. Skips
-# gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
-# `npm -C edge run deploy` from a wrangler-authenticated machine).
-#
-# The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
-# Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
-
+# Manual native staging candidates only. Configure required reviewers on both
+# comet-staging (Worker deploy) and comet-release-staging (release-reader secrets).
+# Stable domains, landing, and www remain untouched until the migration gate.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Reviewed full 40-character commit SHA to test and deploy"
+        required: true
+        type: string
+      target:
+        description: "Build a candidate only, or deploy that exact candidate to native staging"
+        required: true
+        default: candidate
+        type: choice
+        options: [candidate, staging]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: deploy-main
+  group: comet-edge-native-staging
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  edge:
-    runs-on: ubuntu-latest
-    env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  candidate:
+    if: github.repository_owner == 'Ashler-AI'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      digest: ${{ steps.candidate.outputs.digest }}
     steps:
+      - name: Require reviewed immutable source and staging-only target
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::source_sha must be a full lowercase 40-character commit SHA'; exit 1; }
+          case "$TARGET" in candidate|staging) ;; *) echo '::error::unsupported deployment target'; exit 1 ;; esac
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          # `github.event.before` may precede several commits in a batched push.
-          fetch-depth: 0
-      - name: detect edge changes
-        id: changed
-        shell: bash
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - id: source
+        name: Verify reviewed checkout
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(edge/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: edge/package-lock.json
-      - name: install
-        if: steps.changed.outputs.changed == 'true'
+      - name: Install locked edge dependencies
         working-directory: edge
         run: npm ci
-      - name: typecheck
-        if: steps.changed.outputs.changed == 'true'
+      - name: Typecheck
         working-directory: edge
         run: npm run typecheck
-      - name: test
-        if: steps.changed.outputs.changed == 'true'
+      - name: Test edge units and native workerd behavior
         working-directory: edge
         run: npm test
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
+      - name: Test release contracts and secret synchronization behavior
+        run: node --test scripts/release-workflow.test.mjs
+      - name: Build native staging candidate once
         working-directory: edge
-        run: npx wrangler deploy
+        run: npx wrangler deploy --config wrangler.jsonc --env staging --dry-run --outdir "$RUNNER_TEMP/comet-edge-candidate"
+      - id: candidate
+        name: Seal reviewed candidate
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -czf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/comet-edge-candidate" .
+          digest="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          jq -n --arg digest "$digest" --arg commit "$SOURCE_SHA" \
+            --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{schemaVersion:1,sha256:$digest,sourceCommit:$commit,workflowRun:$workflowRun}' \
+            > comet-edge-candidate.provenance.json
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: comet-edge-candidate-${{ steps.source.outputs.sha }}
+          path: |
+            comet-edge-candidate.tar.gz
+            comet-edge-candidate.provenance.json
+          if-no-files-found: error
 
-  # Static landing page (zeron.sh) — assets-only worker, no build step.
-  landing:
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  sync-staging-release-feed-secrets:
+    if: inputs.target == 'staging'
+    needs: candidate
+    runs-on: ubuntu-24.04
+    environment: comet-release-staging
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0
-      - name: detect landing changes
-        id: changed
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(apps/landing/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+          ref: ${{ needs.candidate.outputs.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
-      - name: test
-        if: steps.changed.outputs.changed == 'true'
-        working-directory: apps/landing
-        run: node --test *.test.mjs
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
-        working-directory: apps/landing
-        run: npx wrangler@4 deploy
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: Install locked secret synchronization tooling
+        working-directory: edge
+        run: npm ci
+      - name: Synchronize required staging release-reader secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
+          GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL }}
+          GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: ${{ secrets.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY }}
+        run: node scripts/sync-edge-release-feed-secrets.mjs staging
 
-  # www.zeron.sh → zeron.sh 301 (see apps/www-redirect/wrangler.jsonc).
-  www-redirect:
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  staging:
+    if: inputs.target == 'staging'
+    needs: [candidate, sync-staging-release-feed-secrets]
+    runs-on: ubuntu-24.04
+    environment: comet-staging
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0
-      - name: detect www-redirect changes
-        id: changed
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(apps/www-redirect/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+          ref: ${{ needs.candidate.outputs.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
-        working-directory: apps/www-redirect
-        run: npx wrangler@4 deploy
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: Install locked deploy tooling
+        working-directory: edge
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: comet-edge-candidate-${{ needs.candidate.outputs.sha }}
+      - id: verify
+        name: Verify candidate bytes and reviewed source
+        env:
+          SOURCE_SHA: ${{ needs.candidate.outputs.sha }}
+          EXPECTED_DIGEST: ${{ needs.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          actual="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_DIGEST"
+          jq -e --arg digest "$actual" --arg commit "$SOURCE_SHA" \
+            --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '.schemaVersion == 1 and .sha256 == $digest and .sourceCommit == $commit and .workflowRun == $workflowRun' \
+            comet-edge-candidate.provenance.json > /dev/null
+          mkdir "$RUNNER_TEMP/candidate"
+          tar -xzf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/candidate"
+          mapfile -t entries < <(find "$RUNNER_TEMP/candidate" -maxdepth 1 -type f -name '*.js')
+          test "${#entries[@]}" -eq 1
+          echo "entry=${entries[0]}" >> "$GITHUB_OUTPUT"
+      - name: Deploy exact candidate to native staging only
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CANDIDATE_ENTRY: ${{ steps.verify.outputs.entry }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          npx wrangler deploy "$CANDIDATE_ENTRY" --no-bundle --config wrangler.jsonc --env staging

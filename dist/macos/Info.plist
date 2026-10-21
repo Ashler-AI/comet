@@ -1,23 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template for Crew Canary.app/Contents/Info.plist — see dist/README.md for the
-     bundling steps. Replace __VERSION__ before packaging. -->
+<!-- Production defaults. Packaging sets the version and environment-specific
+     display name/identity and URL scheme for standalone staging. -->
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>Crew Canary</string>
+    <string>Crew</string>
     <key>CFBundleExecutable</key>
     <string>comet</string>
     <key>CFBundleIconFile</key>
     <string>zeron.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>ai.ashler.crew.upstream-canary</string>
+    <string>ai.ashler.comet</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Crew Canary</string>
+    <string>Crew</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -28,10 +28,10 @@
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>ai.ashler.crew.upstream-canary.session</string>
+            <string>ai.ashler.comet.invitation</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>crew-upstream-canary</string>
+                <string>comet</string>
             </array>
         </dict>
     </array>

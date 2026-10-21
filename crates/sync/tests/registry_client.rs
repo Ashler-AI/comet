@@ -21,6 +21,8 @@ fn device(id: &str) -> Device {
         id: id.into(),
         name: format!("{id}-name"),
         platform: "linux".into(),
+        devbox_provider: None,
+        devbox_id: None,
         last_seen_at: Some(ts(1_000)),
         created_at: Some(ts(500)),
         version: Some("0.1.0".into()),

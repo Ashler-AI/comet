@@ -1,8 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // No upstream account, custom domain, production route, or shared storage is deployable here.
-  // Provision the isolated resources first; deploy ONLY with --env canary.
-  "name": "crew-upstream-canary-disabled",
+  // Root is deliberately undeployable: only the reviewed staging workflow may publish.
+  // No production environment or custom domain is claimed by this cutover config.
+  "name": "ashler-comet-edge-local-only",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
   "workers_dev": false,
@@ -11,11 +11,12 @@
   "alias": { "loro-crdt": "loro-crdt/base64" },
   "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" },
   "env": {
-    "canary": {
-      "name": "crew-upstream-canary",
-      "account_id": "dd15bb23eb5c14365fe2621acc049e01",
-      "workers_dev": true,
+    "staging": {
+      "name": "ashler-comet-edge-staging-native",
+      "workers_dev": false,
       "preview_urls": false,
+      // The migration gate transfers the stable custom domain separately, never during candidate deploy.
+      // CLOUDFLARE_ACCOUNT_ID comes from the existing protected staging CI environment.
       "routes": [],
       "durable_objects": {
         "bindings": [
@@ -27,23 +28,23 @@
           { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
         ]
       },
+      // Fresh Worker-local namespaces; never import or delete the legacy Worker's classes/data.
       "migrations": [{
-        "tag": "crew-upstream-canary-v1",
+        "tag": "crew-staging-native-v1",
         "new_sqlite_classes": ["SessionRoom", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom", "AuthGrant"]
       }],
       "r2_buckets": [
-        { "binding": "BLOBS", "bucket_name": "crew-upstream-canary-blobs" },
-        { "binding": "RELEASES", "bucket_name": "crew-upstream-canary-releases" }
+        { "binding": "BLOBS", "bucket_name": "ashler-comet-staging-native-blobs" }
       ],
       "vars": {
         "AUTH_MODE": "scaffold",
-        "ENVIRONMENT": "crew-upstream-canary",
-        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-upstream-canary.internal.ashler.com",
-        // Matched by the separately deployed isolated Platform authority, never shared staging.
-        "SCAFFOLD_PROJECT_SCOPE": "crew-upstream-canary",
-        "SCAFFOLD_DEPLOYMENT_ID": "crew-upstream-canary",
-        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.environment",
-        "APNS_TOPIC": "ai.ashler.crew.upstream-canary"
+        "ENVIRONMENT": "staging",
+        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
+        "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
+        "SCAFFOLD_DEPLOYMENT_ID": "ashler-staging",
+        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment",
+        "APNS_TOPIC": "ai.ashler.crew.staging",
+        "APNS_TEAM_ID": "825LYXGJR6"
       }
     }
   },

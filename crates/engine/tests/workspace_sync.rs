@@ -680,6 +680,8 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 id: "dev-a".into(),
                 name: "old laptop".into(),
                 platform: "linux".into(),
+                devbox_provider: None,
+                devbox_id: None,
                 last_seen_at: Some(now),
                 created_at: Some(now),
                 version: Some("0.1.17".into()),

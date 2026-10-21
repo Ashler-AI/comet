@@ -147,6 +147,8 @@ pub(crate) fn http() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // Redirects can replay refresh tokens and exchange codes in POST bodies.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
@@ -633,6 +635,61 @@ mod tests {
             },
         };
         (TokenProvider::new(&credentials, edge, events).unwrap(), collect)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_credentials_never_follow_cross_origin_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn request(socket: &mut tokio::net::TcpStream) -> String {
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "request ended before its body");
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        return String::from_utf8(bytes).unwrap();
+                    }
+                }
+            }
+        }
+
+        for status in [307, 308] {
+            let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let edge = format!("http://{}", origin.local_addr().unwrap());
+            let location = format!("http://{}/capture", destination.local_addr().unwrap());
+            let source = tokio::spawn(async move {
+                let (mut socket, _) = origin.accept().await.unwrap();
+                let received = request(&mut socket).await;
+                assert!(received.starts_with("POST /auth/refresh HTTP/1.1\r\n"));
+                assert!(received.contains(r#""refreshToken":"r1""#));
+                socket.write_all(format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ).as_bytes()).await.unwrap();
+            });
+            let captured = Arc::new(Mutex::new(None));
+            let capture = captured.clone();
+            let sink = tokio::spawn(async move {
+                let (mut socket, _) = destination.accept().await.unwrap();
+                *lock(&capture) = Some(request(&mut socket).await);
+                socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            });
+            let (tokens, _) = provider(&edge);
+            let result = tokens.bearer().await;
+            source.await.unwrap();
+            sink.abort();
+            assert!(lock(&captured).is_none(), "HTTP {status} forwarded refresh credentials to another origin");
+            assert_eq!(result.unwrap(), expired_jwt());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

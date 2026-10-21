@@ -6131,6 +6131,43 @@ impl Shell {
         .detach();
     }
 
+    fn wake_add_space_device(&mut self, device: Device, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if state.local_device_id.as_deref() == Some(device.id.as_str())
+            || state.device_online(&device.id, Utc::now()) || device.devbox_binding().is_none() { return; }
+        let Some(engine) = state.engine().cloned() else { return; };
+        let Some(flow) = self.add_space.as_mut() else { return; };
+        if flow.load_task.is_some() { return; }
+        flow.error = None;
+        flow.load_task = Some(cx.spawn(async move |this, cx| {
+            let result = crate::settings::devices::wake_host(&engine, cx.background_executor(), &device).await;
+            this.update(cx, |shell, cx| {
+                let Some(flow) = shell.add_space.as_mut() else { return; };
+                flow.load_task = None;
+                match result {
+                    Ok(fresh) => {
+                        let valid = shell.state.update(cx, |state, cx| {
+                            let mut devices = state.devices.clone();
+                            let Some(slot) = devices.iter_mut().find(|row| row.id == device.id)
+                                .filter(|row| row.devbox_binding() == device.devbox_binding()) else { return false; };
+                            *slot = fresh.clone();
+                            state.apply_devices(devices);
+                            cx.notify();
+                            true
+                        });
+                        if valid { shell.add_space_pick_device(fresh, cx); }
+                        else if let Some(flow) = shell.add_space.as_mut() {
+                            flow.error = Some("The selected host binding changed. Please select it again.".into());
+                        }
+                    }
+                    Err(error) => flow.error = Some(error.into()),
+                }
+                cx.notify();
+            }).ok();
+        }));
+        cx.notify();
+    }
+
     /// Selecting a device advances to its locations.
     fn add_space_pick_device(&mut self, device: Device, cx: &mut Context<Self>) {
         let Some(flow) = self.add_space.as_mut() else {
@@ -6910,10 +6947,22 @@ impl Shell {
                 for (ix, device) in self.add_space_devices(cx).into_iter().enumerate() {
                     let online = self.state.read(cx).device_online(&device.id, Utc::now());
                     let name = device.name.clone();
+                    let wakeable = !online && device.devbox_binding().is_some();
+                    let wake_device = device.clone();
+                    let waking = self.add_space.as_ref().is_some_and(|flow| flow.load_task.is_some());
                     rows.push(
                         row(ix)
                             .child(glyph_el(device_glyph(&device.platform)))
                             .child(label_el(name))
+                            .when(wakeable, |el| el.child(
+                                div().id(("add-space-wake", ix)).role(gpui::Role::Button).tab_index(0)
+                                    .aria_label(format!("Wake {}", device.name))
+                                    .child(if waking { "Connecting…" } else { "Idle · Wake" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.wake_add_space_device(wake_device.clone(), cx);
+                                    }))
+                            ))
                             .child(
                                 div()
                                     .size(px(5.0))

@@ -73,6 +73,16 @@ Older releases wrote every synced and development attachment to `{data_dir}/uplo
 
 Device identity and machine resources remain device-scoped under the common data directory: `device-id`, repository registration, managed worktrees, agent credentials/accounts, and UI settings. They are available across profiles, but they do not contain or expose another profile's transcripts or attachments.
 
+Remote host identity uses the same optional `devboxProvider` (`namespace` or `boat`) and immutable `devboxId` in device rows and `EngineInfo`. Ordinary and older devices have neither field; names never supply a provider identity. Linux hosts validate `COMET_DEVBOX_PROVIDER`/`COMET_DEVBOX_ID` against their native environment (Namespace task service or matching `BOAT_ID`) before profile registration. Restart rejects changes to an already registered binding. Workspace snapshots, registry migration, sync, and daemon installation preserve the binding; heartbeats update only liveness.
+Session heartbeats also feed the in-memory device freshness overlay when the session's device matches its chat owner. Their original timestamps advance monotonically; replaying a stale row cannot renew presence, and no extra durable device writes are emitted.
+The desktop wakes a registered offline host only on Send or an explicit Wake action in Devices/Add Project; browsing and catalog discovery never wake a provider. Wake replies must match the selected device and immutable provider binding before fresh capabilities and catalogs are used. Cancellation, failure, or target changes leave the draft and routing untouched. Existing threads route to their host even while browse metadata is missing. Background activity continues through newcore's workspace-wide session rows (no legacy session-reference pin layer); elapsed working time uses the current session turn's `started_at`, and idle Devbox cards retain an Idle label alongside recency.
+
+`WakeDevice` is local-controller-only and pinned to project/deployment `ashler-staging`. It never provisions, replaces, or recovers a machine. Namespace uses `devbox exec`; Boat inspects the exact immutable ID and resumes only stopped/archived machines. Both invoke the existing `~/.local/bin/crew-devbox-autostart staging`, then wait for the exact synced peer's `EngineInfo` binding and current capabilities. Provider output is bounded and redacted; failed readiness leaves the original route/draft intact.
+
+Maintained launchers live in `scripts/devbox/`: run `configure-host.sh` on an existing Linux host with `COMET_DEVBOX_PROVIDER`, `COMET_DEVBOX_ID`, `COMET_DEVICE_NAME`, and `CREW_BINARY` (absolute verified staging binary). It installs the staging profile wrapper, autostart and foreground keepalive helpers, without restarting an engine or copying credentials. Namespace requires its native task directory and `tmux`; its declared boot shell must read `.bashrc`. Boat requires matching native `BOAT_ID`, the official authenticated `boat` CLI with TTL-extension permission, and an available user systemd manager; enable user lingering explicitly when boot without a login session is required. Sign in interactively using `crew-devbox-staging login`, then start with `crew-devbox-autostart staging`. The controller separately needs the authenticated `devbox` or `boat` CLI. No legacy rooms or Canary startup helpers are used.
+
+Namespace task markers and finite Boat TTL renewal belong to executing turns and in-flight inference, not parked harnesses. Admission fails before work if protection cannot be established; Boat renewal failure interrupts the exact active run recoverably. Namespace cleanup removes only owned markers and sweeps only provably abandoned process identities. Independent foreground jobs use `crew-devbox-keepalive`; its focused regression is runnable with `python3 -m unittest discover -s scripts/devbox -p 'test_*.py'`.
+
 #### Privacy boundary and follow-ups
 
 This first local-first change does not upload, import, link, or delete local sessions when a user signs in. Local attachments remain jailed under the local upload root and are not readable through the synced attachment cache. Returning to local-only mode reopens the same local identity and data.
@@ -232,6 +242,9 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
   `HarnessShape`; Claude Code via `claude` CLI stream-json in/out (control protocol for
   permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
   `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
+  OMP's persistent RPC loop tracks todo/goal `get_state` refreshes by request ID
+  without blocking frame consumption. Refresh deadlines leave steering, stop,
+  and connection teardown responsive even when the native peer never replies.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches zeron, avoids libgit2 edge
   cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff

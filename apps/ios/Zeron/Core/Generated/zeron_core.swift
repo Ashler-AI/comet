@@ -1239,8 +1239,6 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     
     func crewControl(deviceId: String, commandId: String, controlJson: String, deployment: String) async throws  -> String
     
-    func crewImportLegacyBackup(sourcePath: String) async throws  -> String
-    
     func crewReconcile(deviceId: String, commandId: String) async throws  -> String
     
     func crewRefresh(deviceId: String, deployment: String) async throws  -> String
@@ -2071,22 +2069,6 @@ open func crewControl(deviceId: String, commandId: String, controlJson: String, 
             rustFutureFunc: {
                 uniffi_zeron_mobile_fn_method_coreclient_crew_control(
                         self.uniffiCloneHandle(),FfiConverterString.lower(deviceId),FfiConverterString.lower(commandId),FfiConverterString.lower(controlJson),FfiConverterString.lower(deployment)
-                )
-            },
-            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
-            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
-            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeCoreError_lift
-        )
-}
-    
-open func crewImportLegacyBackup(sourcePath: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_zeron_mobile_fn_method_coreclient_crew_import_legacy_backup(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(sourcePath)
                 )
             },
             pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
@@ -17139,6 +17121,23 @@ public func crewIsSessionLink(url: String) -> Bool  {
 })
 }
 /**
+ * Convert the stopped legacy phone cache before constructing a live client.
+ */
+public func crewPrepareLegacyBackup(config: CoreConfig, credentials: Credentials, sourcePath: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_func_crew_prepare_legacy_backup(FfiConverterTypeCoreConfig_lower(config),FfiConverterTypeCredentials_lower(credentials),FfiConverterString.lower(sourcePath)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
  * The canonical mention link the host understands (`[name](zeron-file:path)`).
  */
 public func fileMentionLink(path: String, isDir: Bool) -> String  {
@@ -17309,6 +17308,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_crew_is_session_link() != 31526) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_func_crew_prepare_legacy_backup() != 27224) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_file_mention_link() != 14340) {
@@ -17516,9 +17518,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_crew_control() != 20236) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_zeron_mobile_checksum_method_coreclient_crew_import_legacy_backup() != 25654) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_crew_reconcile() != 11002) {

@@ -98,6 +98,7 @@ impl Client {
         let scope: &CollaborationScope = match &control {
             ScaffoldEnvironmentControl::Inspect { scope, .. } | ScaffoldEnvironmentControl::Create { scope, .. }
             | ScaffoldEnvironmentControl::Pause { scope, .. } | ScaffoldEnvironmentControl::Resume { scope, .. }
+            | ScaffoldEnvironmentControl::Start { scope, .. }
             | ScaffoldEnvironmentControl::Stop { scope, .. } | ScaffoldEnvironmentControl::Attach { scope, .. }
             | ScaffoldEnvironmentControl::UpdateAgentRoute { scope, .. } => scope,
             ScaffoldEnvironmentControl::HandoffOmpSession { .. } => {
@@ -144,12 +145,33 @@ impl Client {
             json!({"projectId":self.org_id(),"deploymentId":deployment})).await
     }
 
-    pub async fn crew_import_legacy_backup(&self, source: std::path::PathBuf) -> Result<String> {
-        let profile = self.inner.config.data_dir.clone();
+    /// Must complete before constructing a client for this profile. Legacy
+    /// credentials are never inputs; the current Scaffold token is reverified.
+    pub async fn crew_import_legacy_backup(config: crate::config::ClientConfig,
+        credentials: Credentials, source: std::path::PathBuf) -> Result<String> {
+        use zeron_sync::scaffold_auth::{ScaffoldAuth, ScaffoldConfig, ScaffoldSession};
+        let Credentials::Scaffold { user_id, org_id, control_origin, session_json } = credentials else {
+            return Err(ClientError::Auth("Legacy hydration requires current Scaffold sign-in".into()));
+        };
+        let session: ScaffoldSession = serde_json::from_str(&session_json)
+            .map_err(|_| ClientError::Auth("Invalid current Scaffold credential".into()))?;
+        let mut auth_config = ScaffoldConfig::new(control_origin, config.edge_url.clone(), org_id.clone());
+        auth_config.deployment_id = session.identity.deployment_id.clone();
+        let auth = ScaffoldAuth::new(auth_config).map_err(|error| ClientError::Auth(error.to_string()))?;
+        let verified = auth.verify(&session).await.map_err(|error| ClientError::Auth(error.to_string()))?;
+        if verified.device.is_some() || verified.identity.user_id != user_id || verified.identity.project_scope != org_id
+            || verified.identity.deployment_id.is_none() {
+            return Err(ClientError::Auth("Verified Scaffold owner/project/deployment differs from this profile".into()));
+        }
+        let principal = zeron_proto::CollaborationPrincipal {
+            subject: verified.identity.user_id, email: Some(verified.identity.email),
+            project_id: verified.identity.project_scope, deployment_id: verified.identity.deployment_id,
+            session_id: None, capabilities: verified.identity.capabilities, unknown: Default::default(),
+        };
         crate::runtime::shared().spawn_blocking(move || {
-            let report = crate::legacy::preserve_backup(&source, &profile)?;
-            serde_json::to_string(&report).map_err(|e| ClientError::Storage(e.to_string()))
-        }).await.map_err(|e| ClientError::Storage(e.to_string()))?
+            let report = crate::legacy::hydrate_backup(&source, &config.data_dir, &principal, &verified.edge_origin, &config.device_id)?;
+            serde_json::to_string(&report).map_err(|error| ClientError::Storage(error.to_string()))
+        }).await.map_err(|error| ClientError::Storage(error.to_string()))?
     }
 }
 

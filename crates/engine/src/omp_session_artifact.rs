@@ -21,6 +21,9 @@ use crate::EngineError;
 pub const MAX_OMP_SESSION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 const MAX_OMP_SESSION_HEADER_BYTES: usize = 64 * 1024;
+// Local journals have no aggregate handoff limit; bound one parsed/expanded
+// record instead, matching the native fork parser's 64 MiB record ceiling.
+const MAX_LOCAL_OMP_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Resolve a durable native identity within the configured OMP store only.
 /// Capture an inactive journal; native handoff supplies a completed-turn fork
@@ -49,6 +52,48 @@ pub(crate) fn capture_omp_file_for_session(
         }))
         .ok_or_else(|| invalid("OMP session root is unavailable"))?;
     capture_from_root(&root, native_session_id, cwd, cancellation)
+}
+
+/// The inventoried archive is immutable. OMP appends only to this durable,
+/// self-contained launch copy; restarting must never reset it to the archive.
+pub(crate) fn prepare_imported_native_session(
+    archive: &Path, target: &Path, native_id: &str,
+) -> Result<(), EngineError> {
+    let header = |path: &Path| -> Result<(String, String), EngineError> {
+        let file = open_regular_nofollow(path)?;
+        validate_metadata(&file.metadata()?, u64::MAX)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_OMP_SESSION_HEADER_BYTES as u64).read_to_end(&mut bytes)?;
+        parse_session_header(&bytes)
+    };
+    let (id, cwd) = header(archive)?;
+    if id != native_id { return Err(invalid("Imported native archive identity changed")); }
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => {
+            if header(target)? != (id, cwd) {
+                return Err(invalid("Imported native launch identity or worktree changed"));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let cancellation = CancellationToken::new();
+    let blobs = zeron_harness::omp::native_session_blob_dir(&archive.to_string_lossy(), false)
+        .map_err(|error| EngineError::Other(error.to_string()))?;
+    let captured = capture_omp_session_file_with_limit(
+        archive, Path::new("session.jsonl"), &id, &cwd, &cancellation, u64::MAX,
+    )?.prepare_historical_attachments_with_limits(
+        &blobs, &cancellation, u64::MAX, MAX_LOCAL_OMP_RECORD_BYTES,
+    )?;
+    let parent = target.parent().ok_or_else(|| invalid("Native launch copy has no parent"))?;
+    let mut output = NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut captured.reopen()?, &mut output)?;
+    output.as_file().sync_all()?;
+    output.persist_noclobber(target).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Make the copied branch self-contained before its durable preparation receipt.
@@ -135,45 +180,74 @@ impl CapturedOmpSessionFile {
     /// Only the captured prior conversation is normalized. The new remote prompt
     /// is queued separately and never passes through this fail-open boundary.
     pub(crate) fn prepare_historical_attachments(
-        mut self,
+        self,
         blob_dir: &Path,
         cancellation: &CancellationToken,
+    ) -> Result<Self, EngineError> {
+        self.prepare_historical_attachments_with_limits(
+            blob_dir, cancellation, MAX_OMP_SESSION_ARTIFACT_BYTES, MAX_OMP_SESSION_ARTIFACT_BYTES,
+        )
+    }
+
+    fn prepare_historical_attachments_with_limits(
+        mut self, blob_dir: &Path, cancellation: &CancellationToken,
+        total_limit: u64, record_limit: u64,
     ) -> Result<Self, EngineError> {
         use std::io::{BufRead, BufReader};
         let mut output = NamedTempFile::new()?;
         let mut digest = Sha256::new();
         let mut byte_count = 0_u64;
         let mut missing = 0_usize;
-        let mut expansion_budget = MAX_OMP_SESSION_ARTIFACT_BYTES.saturating_sub(self.byte_count);
-        for line in BufReader::new(self.reopen()?).split(b'\n') {
+        let mut total_budget = total_limit.saturating_sub(self.byte_count);
+        let mut reader = BufReader::new(self.reopen()?);
+        let mut line = Vec::new();
+        loop {
             check_cancelled(cancellation)?;
-            let line = line?;
-            if line.is_empty() {
+            line.clear();
+            let read = reader.by_ref().take(record_limit.saturating_add(1)).read_until(b'\n', &mut line)?;
+            if read == 0 { break; }
+            if line.len() as u64 > record_limit {
+                return Err(invalid("OMP historical journal record exceeds the hydration limit"));
+            }
+            let newline = line.last() == Some(&b'\n');
+            let body = if newline { &line[..line.len() - 1] } else { &line[..] };
+            if body.is_empty() {
+                output.write_all(&line)?;
+                digest.update(&line);
+                byte_count += line.len() as u64;
                 continue;
             }
-            let mut entry: Value = serde_json::from_slice(&line)
+            let record_budget = record_limit.saturating_sub(line.len() as u64).min(total_budget);
+            let mut expansion_budget = record_budget;
+            let mut entry: Value = serde_json::from_slice(body)
                 .map_err(|_| invalid("OMP historical session contains invalid JSON"))?;
-            let changed = prepare_history_entry(
+            let mut changed = prepare_history_entry(
                 &mut entry,
                 blob_dir,
                 &mut expansion_budget,
                 &mut missing,
                 cancellation,
             )?;
+            changed |= prepare_native_image_fields(&mut entry, "", blob_dir, &mut expansion_budget, cancellation)?;
+            total_budget = total_budget.saturating_sub(record_budget.saturating_sub(expansion_budget));
+            let encoded;
             let bytes = if changed {
-                serde_json::to_vec(&entry)
-                    .map_err(|_| invalid("Could not encode prepared OMP history"))?
-            } else {
-                line
-            };
-            byte_count = byte_count.saturating_add(bytes.len() as u64 + 1);
-            if byte_count > MAX_OMP_SESSION_ARTIFACT_BYTES {
+                encoded = serde_json::to_vec(&entry)
+                    .map_err(|_| invalid("Could not encode prepared OMP history"))?;
+                encoded.as_slice()
+            } else { body };
+            let record_bytes = bytes.len() as u64 + u64::from(newline);
+            byte_count = byte_count.checked_add(record_bytes)
+                .ok_or_else(|| invalid("Prepared OMP history size overflow"))?;
+            if record_bytes > record_limit || byte_count > total_limit {
                 return Err(invalid("Prepared OMP history exceeds capture limit"));
             }
-            output.write_all(&bytes)?;
-            output.write_all(b"\n")?;
-            digest.update(&bytes);
-            digest.update(b"\n");
+            output.write_all(bytes)?;
+            digest.update(bytes);
+            if newline {
+                output.write_all(b"\n")?;
+                digest.update(b"\n");
+            }
         }
         output.flush()?;
         if missing > 0 {
@@ -196,6 +270,14 @@ pub(crate) fn capture_omp_session_file(
     expected_cwd: &str,
     cancellation: &CancellationToken,
 ) -> Result<CapturedOmpSessionFile, EngineError> {
+    capture_omp_session_file_with_limit(path, storage_relative_path,
+        expected_native_session_id, expected_cwd, cancellation, MAX_OMP_SESSION_ARTIFACT_BYTES)
+}
+
+fn capture_omp_session_file_with_limit(
+    path: &Path, storage_relative_path: &Path, expected_native_session_id: &str,
+    expected_cwd: &str, cancellation: &CancellationToken, total_limit: u64,
+) -> Result<CapturedOmpSessionFile, EngineError> {
     if expected_native_session_id.trim().is_empty() || expected_cwd.trim().is_empty() {
         return Err(invalid("OMP native session id and cwd are required"));
     }
@@ -204,7 +286,7 @@ pub(crate) fn capture_omp_session_file(
 
     let mut input = open_regular_nofollow(path)?;
     let before = input.metadata()?;
-    validate_metadata(&before, MAX_OMP_SESSION_ARTIFACT_BYTES)?;
+    validate_metadata(&before, total_limit)?;
     let mut output = NamedTempFile::new()?;
     let mut digest = Sha256::new();
     let mut byte_count = 0_u64;
@@ -218,7 +300,7 @@ pub(crate) fn capture_omp_session_file(
             break;
         }
         byte_count = byte_count.saturating_add(read as u64);
-        if byte_count > MAX_OMP_SESSION_ARTIFACT_BYTES || byte_count > before.len() {
+        if byte_count > total_limit || byte_count > before.len() {
             return Err(invalid("OMP session file changed during capture"));
         }
         if header.len() < MAX_OMP_SESSION_HEADER_BYTES {
@@ -233,7 +315,7 @@ pub(crate) fn capture_omp_session_file(
         return Err(invalid("OMP session file changed during capture"));
     }
     let after = input.metadata()?;
-    validate_metadata(&after, MAX_OMP_SESSION_ARTIFACT_BYTES)?;
+    validate_metadata(&after, total_limit)?;
     if !same_file_state(&before, &after) {
         return Err(invalid("OMP session file changed during capture"));
     }
@@ -259,6 +341,53 @@ pub(crate) fn capture_omp_session_file(
         sha256: format!("{:x}", digest.finalize()),
         byte_count,
     })
+}
+
+/// Match OMP session-loader's additional persisted image positions, including
+/// tool images and provider image-generation results (not arbitrary text refs).
+fn prepare_native_image_fields(
+    value: &mut Value, key: &str, blobs: &Path, budget: &mut u64,
+    cancellation: &CancellationToken,
+) -> Result<bool, EngineError> {
+    check_cancelled(cancellation)?;
+    let mut changed = false;
+    match value {
+        Value::Array(items) => for item in items {
+            changed |= prepare_native_image_fields(item, key, blobs, budget, cancellation)?;
+        },
+        Value::Object(fields) => {
+            let image = key == "images" || (key == "content" && fields.get("type").and_then(Value::as_str) == Some("image"));
+            let generated = fields.get("type").and_then(Value::as_str) == Some("image_generation_call");
+            for (field, value) in fields {
+                let native_data = (image && field == "data") || (generated && field == "result");
+                if (native_data || field == "image_url") && value.as_str().is_some_and(|data| data.starts_with("blob:sha256:")) {
+                    let hash = value.as_str().unwrap().strip_prefix("blob:sha256:").unwrap();
+                    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+                        return Err(invalid("Malformed native historical image reference"));
+                    }
+                    let bytes = read_historical_blob(blobs, hash, *budget)
+                        .ok_or_else(|| invalid("Native historical image blob missing, corrupt, or exceeds capture limit"))?;
+                    let data = if native_data {
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    } else {
+                        let data = String::from_utf8(bytes).map_err(|_| invalid("Native image URL is not UTF-8"))?;
+                        if !data.strip_prefix("data:image/").and_then(|rest| rest.split_once(";base64,"))
+                            .is_some_and(|(_, data)| valid_attachment_base64(data)) {
+                            return Err(invalid("Native image URL blob is invalid"));
+                        }
+                        data
+                    };
+                    *budget = budget.saturating_sub(data.len() as u64 + 128);
+                    *value = Value::String(data);
+                    changed = true;
+                } else {
+                    changed |= prepare_native_image_fields(value, field, blobs, budget, cancellation)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(changed)
 }
 
 fn prepare_history_entry(
@@ -427,17 +556,27 @@ fn prepare_history_block(
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 {
                     if let Some(bytes) = read_historical_blob(blob_dir, hash, *budget) {
-                        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                        *budget = budget.saturating_sub(encoded.len() as u64 + 128);
-                        let replacement = if url {
-                            let media_type = data
-                                .strip_prefix("data:")
-                                .and_then(|rest| rest.split_once(';'))
-                                .map(|(mime, _)| mime)
-                                .unwrap_or("image/png");
-                            format!("data:{media_type};base64,{encoded}")
+                        // OMP externalizeImageDataUrl stores the entire UTF-8
+                        // data URL, unlike image.data blobs (raw binary).
+                        let replacement = if url && encoded.is_none() {
+                            let data_url = String::from_utf8(bytes)
+                                .map_err(|_| invalid("Native provider image URL blob is not UTF-8"))?;
+                            if !data_url.strip_prefix("data:image/")
+                                .and_then(|rest| rest.split_once(";base64,"))
+                                .is_some_and(|(_, data)| valid_attachment_base64(data)) {
+                                return Err(invalid("Native provider image URL blob is invalid"));
+                            }
+                            *budget = budget.saturating_sub(data_url.len() as u64 + 128);
+                            data_url
                         } else {
-                            encoded
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                            *budget = budget.saturating_sub(encoded.len() as u64 + 128);
+                            if url {
+                                let media_type = data.strip_prefix("data:")
+                                    .and_then(|rest| rest.split_once(';'))
+                                    .map(|(mime, _)| mime).unwrap_or("image/png");
+                                format!("data:{media_type};base64,{encoded}")
+                            } else { encoded }
                         };
                         *field = Value::String(replacement);
                         return Ok(true);
@@ -588,7 +727,7 @@ fn open_regular_nofollow(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
 }
 
@@ -664,6 +803,254 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn local_import_streams_past_total_limit_but_bounds_each_record() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("session.jsonl");
+        let mut bytes = session_bytes("native", "/repo");
+        for _ in 0..16 { bytes.extend_from_slice(b"{\"type\":\"custom\",\"data\":\"retained\"}\n"); }
+        bytes.extend_from_slice(b"\n");
+        std::fs::write(&source, &bytes).unwrap();
+        let cancellation = CancellationToken::new();
+        let capture = |limit| capture_omp_session_file_with_limit(
+            &source, Path::new("session.jsonl"), "native", "/repo", &cancellation, limit,
+        );
+        // Small parameters exercise the same aggregate-vs-record boundary
+        // without allocating a 64 MiB fixture in the normal test suite.
+        assert!(capture(256).is_err());
+        let captured = capture(u64::MAX).unwrap();
+        assert_eq!(captured.sha256, hex_sha256(&bytes));
+        let prepared = captured.prepare_historical_attachments_with_limits(
+            temp.path(), &cancellation, u64::MAX, 128,
+        ).unwrap();
+        assert_eq!(prepared.byte_count, bytes.len() as u64);
+        assert_eq!(prepared.sha256, hex_sha256(&bytes));
+        assert!(capture(u64::MAX).unwrap().prepare_historical_attachments_with_limits(
+            temp.path(), &cancellation, 256, 128,
+        ).is_err());
+        let target = temp.path().join("launch.jsonl");
+        prepare_imported_native_session(&source, &target, "native").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        let oversized = format!("{{\"type\":\"custom\",\"data\":\"{}\"}}\n", "x".repeat(128));
+        std::fs::OpenOptions::new().append(true).open(&source).unwrap()
+            .write_all(oversized.as_bytes()).unwrap();
+        assert!(capture(u64::MAX).unwrap().prepare_historical_attachments_with_limits(
+            temp.path(), &cancellation, u64::MAX, 128,
+        ).is_err());
+        // The public remote handoff entry point retains its exact 64 MiB cap.
+        let remote = temp.path().join("remote.jsonl");
+        File::create(&remote).unwrap().set_len(MAX_OMP_SESSION_ARTIFACT_BYTES + 1).unwrap();
+        assert!(capture_omp_session_file(&remote, Path::new("remote.jsonl"),
+            "native", "/repo", &cancellation).is_err());
+    }
+
+    /// Supply only a stopped-writer throwaway archive copy with sibling blobs,
+    /// never the live source journal. This checks the actual oversized history;
+    /// real inference/identity continuity remains the separate native OMP smoke.
+    #[test]
+    #[ignore = "actual >64 MiB imported journal copy via COMET_TEST_LARGE_OMP_ARCHIVE"]
+    fn local_import_large_archive_copy() {
+        fn digest(path: &Path) -> (u64, String) {
+            let mut input = File::open(path).unwrap();
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut size = 0;
+            loop {
+                let read = input.read(&mut buffer).unwrap();
+                if read == 0 { break; }
+                size += read as u64;
+                digest.update(&buffer[..read]);
+            }
+            (size, format!("{:x}", digest.finalize()))
+        }
+        let archive = std::path::PathBuf::from(std::env::var_os("COMET_TEST_LARGE_OMP_ARCHIVE")
+            .expect("stopped-writer throwaway archive copy required"));
+        let before = digest(&archive);
+        assert!(before.0 > MAX_OMP_SESSION_ARTIFACT_BYTES);
+        let mut header = Vec::new();
+        File::open(&archive).unwrap().take(MAX_OMP_SESSION_HEADER_BYTES as u64)
+            .read_to_end(&mut header).unwrap();
+        let (id, cwd) = parse_session_header(&header).unwrap();
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("launch.jsonl");
+        prepare_imported_native_session(&archive, &target, &id).unwrap();
+        let launch = digest(&target);
+        assert!(launch.0 > MAX_OMP_SESSION_ARTIFACT_BYTES);
+        header.clear();
+        File::open(&target).unwrap().take(MAX_OMP_SESSION_HEADER_BYTES as u64)
+            .read_to_end(&mut header).unwrap();
+        assert_eq!(parse_session_header(&header).unwrap(), (id.clone(), cwd));
+        prepare_imported_native_session(&archive, &target, &id).unwrap();
+        assert_eq!(digest(&target), launch);
+        assert_eq!(digest(&archive), before);
+    }
+
+    #[test]
+    fn imported_native_blobs_keep_archive_and_continued_launch_journal() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join("native-histories/0");
+        std::fs::create_dir_all(store.join("sessions/project")).unwrap();
+        std::fs::create_dir(store.join("blobs")).unwrap();
+        let archive = store.join("sessions/project/original.jsonl");
+        let bytes = b"exact binary image bytes";
+        let hash = hex_sha256(bytes);
+        std::fs::write(store.join("blobs").join(&hash), bytes).unwrap();
+        let data_url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        let url_hash = hex_sha256(data_url.as_bytes());
+        std::fs::write(store.join("blobs").join(&url_hash), &data_url).unwrap();
+        let mut raw = session_bytes("exact-native", "/original/repo");
+        let record = serde_json::json!({"type":"message","message":{"role":"user","content":[
+            {"type":"image","mimeType":"image/png","data":format!("blob:sha256:{hash}")}
+        ],"providerPayload":{"type":"openaiResponsesHistory","items":[
+            {"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("blob:sha256:{url_hash}")}]},
+            {"type":"image_generation_call","result":format!("blob:sha256:{hash}")}
+        ]},"images":[{"data":format!("blob:sha256:{hash}"),"mimeType":"image/png"}]}});
+        raw.extend(serde_json::to_vec(&record).unwrap());
+        raw.push(b'\n');
+        std::fs::write(&archive, &raw).unwrap();
+        let target = temp.path().join("launch.jsonl");
+        prepare_imported_native_session(&archive, &target, "exact-native").unwrap();
+        let hydrated = std::fs::read(&target).unwrap();
+        let last: Value = serde_json::from_slice(hydrated.split(|b| *b == b'\n').filter(|line| !line.is_empty()).last().unwrap()).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert_eq!(last["message"]["content"][0]["data"], encoded);
+        assert_eq!(last["message"]["images"][0]["data"], encoded);
+        assert_eq!(last["message"]["providerPayload"]["items"][0]["content"][0]["image_url"], data_url);
+        assert_eq!(last["message"]["providerPayload"]["items"][1]["result"], encoded);
+        let mut continued = hydrated;
+        continued.extend_from_slice(b"{\"type\":\"custom\",\"data\":\"native followup\"}\n");
+        std::fs::write(&target, &continued).unwrap();
+        prepare_imported_native_session(&archive, &target, "exact-native").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), continued);
+        assert_eq!(std::fs::read(&archive).unwrap(), raw);
+        std::fs::write(store.join("blobs").join(&hash), b"corrupt").unwrap();
+        let rejected = temp.path().join("corrupt.jsonl");
+        assert!(prepare_imported_native_session(&archive, &rejected, "exact-native").is_err());
+        assert!(!rejected.exists());
+        assert_eq!(std::fs::read(&archive).unwrap(), raw);
+    }
+
+    /// Run with an isolated browser-authenticated Crew profile, never provider credentials.
+    /// The PNG must contain a visual nonce absent from all prompt/journal text.
+    #[tokio::test]
+    #[ignore = "real installed OMP + managed vision inference; needs isolated Crew auth root, HOME/PI_CODING_AGENT_DIR, executable, model and visual-nonce PNG"]
+    async fn imported_native_blobs_resume_in_real_omp() {
+        use futures::StreamExt;
+        use zeron_harness::{Harness, OmpHarness, RunContext, RunControls};
+        use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel};
+        let executable = std::env::var_os("COMET_TEST_OMP_EXECUTABLE").expect("native OMP executable required");
+        let model = std::env::var("COMET_TEST_OMP_MODEL").expect("authenticated vision model required");
+        let png = std::fs::read(std::env::var_os("COMET_TEST_OMP_BLOB_PNG").expect("visual nonce PNG required")).unwrap();
+        assert!(png.len() >= 1024, "use a PNG large enough for OMP's 1024-base64-character blob externalization threshold");
+        let visual_nonce = std::env::var("COMET_TEST_OMP_VISUAL_NONCE").expect("expected visual nonce required");
+        assert!(!visual_nonce.is_empty());
+        assert!(std::env::var_os("PI_CODING_AGENT_DIR").is_some(), "use a disposable native store, never installed histories");
+        assert!(std::env::var_os("OMP_PROFILE").is_none() && std::env::var_os("PI_PROFILE").is_none(), "profiles override isolated agent dir");
+        let temp = TempDir::new().unwrap();
+        assert!(crate::devbox::host_binding().unwrap().is_none(), "this local smoke must not bypass managed sandbox inference admission");
+        let auth_root = std::path::PathBuf::from(std::env::var_os("COMET_TEST_CREW_AUTH_ROOT")
+            .expect("normally signed-in isolated Crew auth root required; do not copy provider credentials"));
+        let saved = zeron_sync::scaffold_auth::load_session(&auth_root.join("scaffold-session.json"))
+            .unwrap().expect("complete normal browser login in the isolated Crew profile first");
+        assert!(saved.device.is_none(), "local smoke requires user authority, not a sandbox grant");
+        let mut authority = zeron_sync::scaffold_auth::ScaffoldConfig::new(
+            saved.resource.clone(), saved.edge_origin.clone(), saved.identity.project_scope.clone());
+        authority.deployment_id = saved.identity.deployment_id.clone();
+        let mut config = crate::AuthConfig::new(&saved.edge_origin, &auth_root);
+        config.scaffold = Some(authority.clone());
+        drop(saved);
+        let auth = crate::Auth::detect(config).await;
+        assert!(auth.state().is_signed_in(), "isolated Crew authority must reverify successfully");
+        let deployment = auth.verified_scope().and_then(|scope| scope.deployment_id)
+            .expect("verified deployment required");
+        let client = crate::scaffold::ScaffoldClient::new(&authority.control_origin,
+            &authority.project_scope, auth.for_profile_tokens()).unwrap();
+        let grants = crate::scaffold::EdgeDeviceJoinGrantClient::new(&authority.edge_origin,
+            auth.for_profile_tokens()).unwrap();
+        let runtime = crate::scaffold::ScaffoldRuntime::new(client, &authority.edge_origin,
+            std::sync::Arc::new(grants)).with_deployment_id(deployment);
+        let crew = crate::crew::CrewServices::new(auth, runtime,
+            std::sync::Arc::new(zeron_sync::DocsStore::open(temp.path().join("managed-docs")).unwrap())).unwrap();
+        let cwd = temp.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let new_image = temp.path().join("new-native-image.png");
+        std::fs::write(&new_image, &png).unwrap();
+        let store = temp.path().join("native-histories/0");
+        std::fs::create_dir_all(store.join("sessions/project")).unwrap();
+        std::fs::create_dir(store.join("blobs")).unwrap();
+        let hash = hex_sha256(&png);
+        std::fs::write(store.join("blobs").join(&hash), &png).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let memory = uuid::Uuid::new_v4().to_string();
+        let followup = uuid::Uuid::new_v4().to_string();
+        let header = serde_json::json!({"type":"session","version":3,"id":id,"cwd":cwd,"timestamp":"2026-10-20T00:00:00.000Z"});
+        let message = serde_json::json!({"type":"message","id":"abcd1234","parentId":null,"timestamp":"2026-10-20T00:00:01.000Z",
+            "message":{"role":"user","timestamp":1792454401000_u64,"content":[
+                {"type":"text","text":format!("Remember archive token {memory} and the text in this image.")},
+                {"type":"image","mimeType":"image/png","data":format!("blob:sha256:{hash}")}
+            ]}});
+        let raw = format!("{header}\n{message}\n");
+        let archive = store.join("sessions/project/original.jsonl");
+        std::fs::write(&archive, &raw).unwrap();
+        let launches = temp.path().join("native-resumes");
+        std::fs::create_dir(&launches).unwrap();
+        let target = launches.join(format!("{id}.jsonl"));
+        let branch_dir = temp.path().join("native-branches");
+        std::fs::create_dir(&branch_dir).unwrap();
+        let branch_id = uuid::Uuid::new_v4().to_string();
+        let branch = branch_dir.join(format!("{branch_id}.jsonl"));
+        let harness = OmpHarness::new().with_executable(executable);
+        for turn in 0..3 {
+            prepare_imported_native_session(&archive, &target, &id).unwrap();
+            let (journal, expected_id) = if turn == 2 {
+                assert!(std::fs::read_to_string(&target).unwrap().contains("blob:sha256:"), "second native turn must persist a real blob reference");
+                zeron_harness::omp::fork_native_session(target.to_str().unwrap(), &branch, &branch_id, false).unwrap();
+                let blobs = zeron_harness::omp::native_session_blob_dir(target.to_str().unwrap(), false).unwrap();
+                prepare_native_branch_attachments(&branch, &branch_id, &cwd, &blobs).unwrap();
+                let prepared = std::fs::read_to_string(&branch).unwrap();
+                assert!(!prepared.contains("blob:sha256:") && !prepared.contains("Historical attachment unavailable"), "fork must carry the native-written blob bytes, not a missing-attachment marker");
+                (&branch, &branch_id)
+            } else { (&target, &id) };
+            let prompt = if turn == 0 {
+                format!("Reply with the archive token and exact text visible in the earlier image. Also remember continuation token {followup}. Do not use tools.")
+            } else { "Reply with the archive token, continuation token, and exact text visible in the original image. Do not use tools.".into() };
+            let (_, steering) = tokio::sync::mpsc::channel(1);
+            let route = crew.prepare_inference(expected_id, HarnessId::Omp, Some(&model), None, None)
+                .await.expect("real Crew Agent Auth route issuance");
+            let controls = RunControls { request_input: Box::new(|_| {
+                let (tx, rx) = tokio::sync::oneshot::channel(); let _ = tx.send(Vec::new()); rx
+            }), steering, interrupt: CancellationToken::new(),
+                context: Some(RunContext { session_id: expected_id.clone(), ipc_port: 0,
+                    supervision_token: None, inference: Some(route.clone()), fork_from: None }), realtime: None,
+                execution_lease: None, turn: Default::default() };
+            let request = RunRequest { prompt, model: Some(model.clone()), harness: None, worktree: None,
+                mcp: None, reasoning: None, model_options: serde_json::Map::new(), cwd: cwd.clone(),
+                sandbox: SandboxLevel::DangerFullAccess, auto_approve: false,
+                resume: Some(journal.to_string_lossy().into_owned()),
+                attachments: if turn == 1 { vec![new_image.to_string_lossy().into_owned()] } else { Vec::new() } };
+            let mut events = harness.run(request, controls).await.expect("real native resume starts");
+            let (mut text, mut identity, mut completed) = (String::new(), false, false);
+            tokio::time::timeout(std::time::Duration::from_secs(180), async {
+                while let Some(event) = events.next().await {
+                    match event.expect("real native event") {
+                        AgentEvent::SessionStarted { harness: HarnessId::Omp, session_id, .. } => {
+                            assert_eq!(&session_id, expected_id); identity = true;
+                        }
+                        AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                        AgentEvent::Done { status, .. } => { assert_eq!(status, DoneStatus::Completed); completed = true; }
+                        AgentEvent::Error { message } => panic!("native error: {message}"),
+                        _ => {}
+                    }
+                }
+            }).await.expect("real native turn completes");
+            crew.retire_inference(&route);
+            assert!(identity && completed);
+            assert!(text.contains(&memory) && text.contains(&visual_nonce), "turn {turn}: {text}");
+            if turn > 0 { assert!(text.contains(&followup), "native continuation lost: {text}"); }
+            assert_eq!(std::fs::read_to_string(&archive).unwrap(), raw);
+        }
+    }
 
     #[test]
     fn historical_attachments_snapcompact_frames_hydrate_or_disclose_missing_archive() {

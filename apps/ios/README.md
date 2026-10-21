@@ -1,6 +1,6 @@
-# Crew Canary for iOS
+# Crew Staging for iOS
 
-An isolated UIKit viewport built on upstream's Rust client, registry/chat2
+A native UIKit viewport built on upstream's Rust client, registry/chat2
 transport, reconnect/network/background handling, and incremental transcript
 layout. No engine or provider credential runs on the phone. Crew-specific
 authentication and typed controller operations use the shared Rust core.
@@ -15,45 +15,53 @@ Requires Xcode 26+, an iOS 26+ simulator/device, and Rust with the
 `aarch64-apple-ios` and `aarch64-apple-ios-sim` targets. Internal Xcode target,
 module, and Rust library names remain upstream `Zeron`/`zeron_*`.
 
-The shared scheme is **Crew Canary**, bundle ID **ai.ashler.crew.upstream-canary**.
-The widget/tests use child bundle IDs. No production/staging app ID or URL
-handler is replaced. Signing team is deliberately unset; an authorized device
-build must supply its own team and canary provisioning profiles.
+The shared scheme is **Crew Staging**, bundle ID **ai.ashler.crew.staging**,
+signing team **825LYXGJR6**, version **1.0**. This replaces the existing staging
+app while retaining its sandbox and default team/bundle Keychain access group.
+Legacy has no explicit app-group entitlement; none is invented. The upstream
+LiveActivity extension uses `ai.ashler.crew.staging.LiveActivity` and needs an
+authorizing team distribution profile, which may be an existing matching wildcard
+profile because the extension requests no app-specific capabilities. Production
+`ai.ashler.crew` is not built or uploaded.
 
-Supply all four Xcode build settings (substituted into Info.plist):
+Checked-in staging settings (substituted into Info.plist):
 
-| Setting | Required value |
+| Setting | Value |
 | --- | --- |
-| `CREW_CONTROL_ORIGIN` | Exact trusted Scaffold authority origin |
-| `CREW_EDGE_ORIGIN` | Dedicated upstream-canary Edge origin |
-| `CREW_PROJECT_SCOPE` | Project actually verified by that Edge/authority |
-| `CREW_DEPLOYMENT_ID` | Deployment actually returned by `/auth/session` |
+| `CREW_CONTROL_ORIGIN` | `https://scaffold-staging.internal.ashler.com` |
+| `CREW_EDGE_ORIGIN` | `https://comet-staging.internal.ashler.com` |
+| `CREW_PROJECT_SCOPE` | `ashler-staging` |
+| `CREW_DEPLOYMENT_ID` | `ashler-staging` |
 
-Missing settings fail closed; there is no production fallback. Scaffold must
-permit public-client PKCE OAuth with redirect
-`crew-upstream-canary://callback`. The helper verifies discovery, resource,
-callback state/expiry, user/project/deployment, and exact configured origins.
-The authority accepts this exact callback only when its Crew link scheme,
-project and deployment are configured; registration, authorization and exchange
-share that validator. The app uses `Crew Canary` for both its display name and
-native authentication consent, while executable/module names stay upstream.
-On cold launch credentials are reverified before opening the profile. A
-transient authority outage retains credentials and all local data.
+Scaffold public-client PKCE uses `comet-staging://callback`. The shared Rust
+helper verifies discovery, resource, state/expiry, user/project/deployment and
+exact origins. Credentials are reverified before opening a profile; a transient
+authority outage retains local data. Debug-only endpoint overrides remain for
+the existing demo/test harness, not a second production runtime.
 
-For an authorized simulator build, use `-project Zeron.xcodeproj -scheme
-'Crew Canary' -destination 'platform=iOS Simulator,name=iPhone 17 Pro'` plus
-the four settings above and `CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-`.
-Use Xcode's local simulator signing: disabling signing omits the simulated
-application identity and Keychain rejects writes with OSStatus `-34018`.
-No device provisioning is needed for this simulator build. Do not run an install,
-archive, signing, or TestFlight operation against an existing app identity.
+Simulator build from this worktree (does not install or launch an app):
+
+```sh
+xcodebuild -project apps/ios/Zeron.xcodeproj -scheme 'Crew Staging' \
+  -configuration Debug -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /tmp/Crew-Staging-Native-Cutover-DerivedData \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+  ZERON_SKIP_CORE=0 CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- build
+```
+
+Use ad-hoc simulator signing: disabling signing omits simulated identity and
+Keychain rejects writes with OSStatus `-34018`. Derived data is separate from
+the user's normal Xcode build; Rust artifacts remain in this worktree's `target/`.
+These simulator commands target Apple Silicon: the Rust build phase emits only
+`aarch64-apple-ios-sim`. Pin `ARCHS=arm64` for a generic simulator destination;
+otherwise Xcode also attempts x86_64 and cannot link the arm64-only Rust library.
+`ONLY_ACTIVE_ARCH=YES` alone does not constrain a generic destination.
 
 The Zeron target's **Rust core** build phase runs `scripts/ios/build-core.sh`,
 which builds `crates/mobile` for the active platform (always optimized — the
 `mobile` cargo profile) and refreshes the committed UniFFI bindings in
-`Zeron/Core/Generated/`. Regenerate these bindings as part of the first
-integrated build: the new `CrewLogin`, `CrewAccount`, Scaffold credential case,
-and `CoreClient.crew*` APIs are not in the old generated Swift file.
+`Zeron/Core/Generated/`. Regenerate bindings during the integrated build after
+changes to `CrewLogin`, `CrewAccount`, or `crewPrepareLegacyBackup`.
 `ZERON_SKIP_CORE=1` is only safe after rebuilding matching bindings/library.
 `crates/mobile/uniffi.toml` leaves native error presentation to
 `Core/CoreError.swift`, preserving the message instead of reflecting enum names.
@@ -61,11 +69,11 @@ and `CoreClient.crew*` APIs are not in the old generated Swift file.
 ### Explicit simulator session import
 
 For an approved local test only, a **Debug simulator** build accepts
-`-import-canary-session`. Put the existing canary desktop's `scaffold-session.json`
+`-import-staging-session`. Put the staging desktop's `scaffold-session.json`
 at `<simulator app data container>/tmp/crew-scaffold-session.json` with mode `0600`,
-then launch only `ai.ashler.crew.upstream-canary` with that flag. Discover the
-current container with `xcrun simctl get_app_container <simulator-udid>
-ai.ashler.crew.upstream-canary data`; installing a build can change its path.
+then launch only `ai.ashler.crew.staging` with that flag. Discover the container
+with `xcrun simctl get_app_container <simulator-udid> ai.ashler.crew.staging data`;
+installing a build can change its path.
 Never put a bearer in launch arguments, environment variables, logs or chat.
 
 The one-shot reader rejects symlinks, hard links, non-private/non-owned files and
@@ -80,18 +88,17 @@ passwords, passkeys or provider credentials. Desktop and simulator share its
 revocation. It verifies authenticated mobile behavior, not independent Google
 sign-in. The hook is absent from device and Release builds.
 
-The four `CrewIsolationTests` passed, including native error presentation,
-private-file consumption and symlink/hard-link/size/encoding rejection. Live
-simulator checks rejected a wrong-project import, consumed both real and rejected
-transfer files, displayed
-the authorized account and synchronized sessions, and restored from Keychain
-after a subsequent rejected import and normal cold launch.
+The existing `CrewIsolationTests` cover native error presentation, private-file
+consumption and symlink/hard-link/size/encoding rejection. Staging cutover
+verification must be run against the exact integrated source; earlier Canary
+results are not release evidence for this build.
 
 
 ## Crew integration
 
 - `CrewLogin` wraps `zeron_sync::scaffold_auth`; no Swift OAuth/sync stack is
-  copied. Keychain uses a canary service plus configured-origin/scope hash.
+  copied. Keychain retains `ai.ashler.crew.staging` service with new scoped accounts;
+  legacy account entries remain untouched and are not trusted as new credentials.
   The verified profile hash includes user, project, deployment, Edge, and
   authority. Drafts, cache, commands and migration records are profile-scoped.
   Sign-out removes credentials, not cached-only history or pending work.
@@ -99,10 +106,9 @@ after a subsequent rejected import and normal cold launch.
   execution host belonging to the same user. A host's offline presence does
   not delete its rows/history.
 - Cold/warm/signed-out URL handling retains pending route hints. The parser
-  accepts existing `comet`/`comet-staging` session-directory and Scaffold
-  routes as well as `crew-upstream-canary`; only the latter is registered
-  with iOS. Settings → Open existing Crew link allows testing old links
-  without stealing the installed app's handlers.
+  accepts existing `comet`/`comet-staging` session-directory and Scaffold routes;
+  only `comet-staging` is registered with this staging app. Settings → Open
+  existing Crew link validates route hints against the authenticated scope.
 - Cached links validate `Chat.crew` owner, project, deployment, session and
   sandbox identity. Missing rows resolve via a desktop controller's
   `ResolveCrewSessionLink {url} -> {chatId}` and normal registry publication.
@@ -114,7 +120,16 @@ after a subsequent rejected import and normal cold launch.
   region, local/staging-snapshot database selection, provider/model, and an
   optional opaque Agent Auth account. The configured host owns runtime
   version selection and validates scope. Attach explicitly resumes a paused
-  sandbox. Stop is terminal; composer Stop remains single-turn cancellation.
+  sandbox. Stop is terminal for its execution epoch; a stopped/failed sandbox
+  exposes a separate **Start new epoch** action with explicit confirmation.
+  It retains the logical session/control-record IDs and history while replacing
+  physical execution and its native association. Old requests are not replayed.
+  The typed `start` uses the selected `sandbox_id` control record, scope and
+  `expectedLifecycleEpoch` from the observed environment's `lifecycle_epoch`.
+  Missing or malformed epochs block Start; the control plane rejects a stale
+  epoch after a concurrent start/stop. It never substitutes Resume, Attach or
+  Create or promises the same physical VM.
+  Composer Stop remains single-turn cancellation.
   Commands are persisted atomically before dispatch, sent once, and retained
   with confirmed/rejected/unknown outcomes. Reconciliation never creates a
   replacement sandbox or automatically replays an unknown operation.
@@ -123,31 +138,104 @@ after a subsequent rejected import and normal cold launch.
   and rejected in the shared client rather than falling back to host CLI
   credentials. Upstream dev/demo voice code remains intact.
 
-## Legacy iOS preservation
+## Legacy iOS native migration
 
-The distinct canary app cannot and must not read another installed app's
-sandbox or Keychain. Export a consistent **copy** of its Application
-Support/CometDocs folder through an authorized backup/export process, keep the
-old installation, then select that folder in Settings → Legacy iOS backup.
+Same-bundle upgrades retain `Application Support/CometDocs`. After online
+Scaffold identity verification, before constructing `CoreClient` or starting any
+writer, `crewPrepareLegacyBackup` imports the matching scoped cache into
+`Application Support/profiles/scaffold/<verified-profile-key>`. The legacy
+frontend/transport is not linked or run. Foreign scopes fail closed, originals
+remain untouched, and a matching receipt makes reopening idempotent.
 
-The version-1 importer inventories bounded regular files, rejects symlinks
-and nested folders, copies every file, records sizes/SHA-256 in a manifest,
-and exports materialized Loro snapshots as offline JSON. Intents/outcomes
-remain immutable evidence and are never replayed. Unknown or unreadable
-records remain byte-for-byte preserved and are explicitly reported.
-The native export picker exports the complete preservation archive.
+| Legacy data | Native cutover contract |
+| --- | --- |
+| Scoped workspace/chat Loro | Validate owner/project/deployment, convert into native registry/session documents; never feed old raw Loro to live sync |
+| Public/native session IDs, models, checkout/worktree | Retain exact recorded identities and configuration; never invent missing host state |
+| Intents/outcomes, recovery snapshots | Preserve bytes/hashes and exact command IDs; unknown outcomes are not replay permission |
+| Pending images | Preserve decoded local attachment copies alongside originals |
+| Pruned phone history / host-native journals | Report missing data explicitly; owning host migration remains required |
+| Legacy Keychain entries | Retain under existing service/access group, require fresh sign-in |
 
-This is a safe quarantine/data-preservation migration, **not** a claim that
-pending operations are reconciled or cache-only history has been published.
-An authenticated desktop migration/reconciliation must account for every
-retained ID and pending outcome before cutover; do not delete the old app or
-backup while `requiresReconciliation` is true. Legacy credentials are not
-imported; sign in again. Existing appearance preferences remain native,
-while new-session selections and composer drafts use the new profile.
+`legacy-ios-import.json` records file hashes, native IDs, retained intents,
+outcomes, missing data and reconciliation status. Settings → Legacy iOS migration
+shows the receipt and exports immutable originals, never a live SQLite store.
+Do not remove originals while reconciliation is outstanding. Appearance
+preferences stay native; new drafts and commands are scoped to the verified
+profile. Native importer tests and exact-device acceptance remain release gates.
+
+`CrewChatMetadata.originalEpochHistory` also retains the required
+`coordinatorLifecycleEpoch` separately from the original writer's `lifecycleEpoch`.
+This is Rust-owned JSON metadata, not a new UniFFI record or a Swift migration.
+The coordinator epoch must be at least the original epoch; missing provenance
+must not be filled from a current session or another device.
+
+### Isolated offline smoke (integration owner only)
+
+Run after the final Rust changes land. This is an alternative to the build-only
+command above: build once for testing, then execute against a newly created
+simulator. It never installs over an existing simulator app, imports credentials,
+uses `-signedout`, or erases a simulator. Do not substitute a prior Canary login
+for staging authentication evidence.
+
+```sh
+# From the repository root. Integration-owner commands for a fresh isolated smoke.
+set -eu
+SMOKE_ROOT=$(mktemp -d /tmp/Crew-Staging-Native-Smoke.XXXXXX)
+
+# Pure importer fixture: unique temporary source/profile directories; no network.
+cargo test --locked -p zeron-client --lib \
+  legacy::tests::native_hydration_preserves_identity_and_unknown_commands_without_replay \
+  -- --exact
+
+xcodebuild -project apps/ios/Zeron.xcodeproj -scheme 'Crew Staging' \
+  -configuration Debug -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath "$SMOKE_ROOT/DerivedData" \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+  -only-testing:ZeronTests/CrewIsolationTests \
+  -only-testing:ZeronUITests/SessionFlowTests/testSendEchoesAndStreamsReply \
+  ZERON_SKIP_CORE=0 CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- build-for-testing
+
+SMOKE_UDID=$(xcrun simctl create "Crew Native Offline ${SMOKE_ROOT##*/}" 'iPhone 17 Pro')
+printf 'Smoke evidence: %s\nFresh simulator: %s\n' "$SMOKE_ROOT" "$SMOKE_UDID"
+xcrun simctl boot "$SMOKE_UDID"
+xcrun simctl bootstatus "$SMOKE_UDID" -b
+xcodebuild -project apps/ios/Zeron.xcodeproj -scheme 'Crew Staging' \
+  -configuration Debug -destination "platform=iOS Simulator,id=$SMOKE_UDID" \
+  -derivedDataPath "$SMOKE_ROOT/DerivedData" \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+  -resultBundlePath "$SMOKE_ROOT/OfflineSmoke.xcresult" \
+  -parallel-testing-enabled NO \
+  -only-testing:ZeronTests/CrewIsolationTests \
+  -only-testing:ZeronUITests/SessionFlowTests/testSendEchoesAndStreamsReply \
+  CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- test-without-building
+```
+
+The importer check preserves exact native IDs, worktree/model, both epoch fields,
+attachment bytes and original snapshots; verifies idempotent reopen and foreign
+deployment rejection; and leaves unknown commands out of the send queue. The
+simulator checks staging identity/profile isolation and demo echo/streaming through
+the generated bridge. They do **not** prove authenticated same-bundle migration:
+`crewPrepareLegacyBackup` deliberately reverifies Scaffold identity online before
+hydration. That separate acceptance requires authorized staging credentials and
+retained matching legacy data; do not add an offline authentication bypass.
+
+The integration owner completed an ad-hoc-signed arm64 Debug `build-for-testing`,
+including Rust core compilation, UniFFI regeneration and Swift linking. The first
+generic-destination attempt failed by requesting x86_64 against the arm64-only
+Rust library; the explicit architecture settings above corrected the caller.
+On a newly created iPhone 17 Pro simulator running iOS 26.5, all seven
+`CrewIsolationTests` and `SessionFlowTests/testSendEchoesAndStreamsReply` passed
+(eight tests, zero failures). Evidence is retained at
+`/tmp/Crew-Staging-Native-Smoke.tT9JjF/OfflineSmoke.xcresult`, with exported images
+under its sibling `Attachments/` directory. The owner inspected both images:
+they show completed reply markdown/code/table rendering and the composer, not
+mid-stream visual evidence. Existing simulator profiles were untouched and no
+credentials were imported. This run does not establish authenticated same-bundle
+migration, physical-device acceptance, distribution signing or TestFlight upload.
 
 ## Integration acceptance
 
-Run the Rust client tests for Crew link parsing and copy-only legacy import,
+Run Rust client Crew link and native legacy import tests,
 and `ZeronTests/CrewIsolationTests`. Exercise two desktops plus iOS with the
 same verified identity: local/remote session discovery, offline-host history,
 cold/warm/signed-out links, denied cross-project/deployment/sandbox links,
@@ -261,16 +349,94 @@ time a session is started from the phone (or from Settings → Notifications),
 registers its APNs token with the choices from Settings, stays quiet while
 open, and opens the session a notification is tapped for.
 
-Setup once per deployment: an APNs auth key (Apple Developer → Keys →
-Apple Push Notifications service), then `wrangler secret put APNS_KEY_P8` (the
-`.p8` contents) and `wrangler secret put APNS_KEY_ID` in `edge/`. The
-TestFlight workflow enables the Push capability on the App ID itself.
-`/registry/:org/stats` shows registered phones and recent deliveries.
+Tapped notifications must carry matching `userId` and `projectScope`; new Edge
+payloads also carry matching `deploymentId`. Existing two-field legacy payloads
+remain valid only for that same verified account/project. Bare session IDs and
+foreign or malformed scopes are rejected. Cold-start taps retain their scope;
+sign-out discards pending notification routes.
 
-## Canary distribution boundary
+APNs uses the existing staging topic `ai.ashler.crew.staging` and team
+`825LYXGJR6`. Debug signs with development APNs; Release/archive/distribution
+uses production APNs. Existing deployment secrets and App ID capabilities must
+already match. The release workflow does not create capabilities, tester groups,
+testers, permissions, or public App Store submissions.
 
-This work does not authorize App Store/TestFlight release, physical-device
-installation, signing, or production/staging replacement. The parent canary
-workflow must supply the explicit identity/configuration above. APNs requires
-the separate `ai.ashler.crew.upstream-canary` topic and authorized canary
-credentials/provisioning; do not reuse an installed production topic.
+## Staging archive, export, upload and readback
+
+The candidate staging release is **1.0 (37)**, not an allocated build number.
+The prior authenticated App Store Connect read for app **6808397041**, Crew
+Staging by Ashler, showed **1.0 (36) Testing** in **Ashler Internal** (35 and 34
+also Testing), and Build Uploads with **All Statuses** showed 36 Complete,
+Oct 15 02:55, with no higher upload. The integration owner's fresh read attempt
+on 2026-10-21 redirected to login with `authResult=FAILED`; the current browser
+session did not authenticate. Build 36/next 37 therefore remains unvalidated
+against current metadata. Obtain a fresh authenticated read before allocating
+a number or uploading; do not import credentials or bypass authentication.
+Existing Xcode account/team signing access was observed;
+the LiveActivity profile inventory remains a separate release prerequisite.
+`testflight.yml` accepts exact `reviewed_sha` and this explicit `build_number`.
+It creates an ad-hoc archive without Apple credentials, never uploads or changes
+App IDs/capabilities/groups. Production is not a selectable environment.
+
+Distribution follows the established non-compiling **local Xcode account** flow,
+team `825LYXGJR6`, cloud-managed signing. API keys are not a prerequisite. Verify
+the exact archive checksum/source/build before export. Both main app and upstream
+LiveActivity extension require matching team distribution profiles; inspect actual
+account inventory rather than silently creating an App ID or granting capabilities.
+The authenticated App ID inventory contains the staging main app and `XCWildcard *`,
+but no explicit staging LiveActivity App ID. The extension has no custom signing
+entitlements, app groups, shared Keychain or APNs capability; ActivityKit uses
+`pushType: nil`. Per [Apple TN3125](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles),
+an extension's concrete signed application identifier may be authorized by a
+matching wildcard profile. The verifier allows this only for the capability-free
+extension, retaining exact main-app/APNs checks. An existing App Store distribution
+profile and successful Apple export still need verification; a wildcard App ID
+alone is not proof of distribution readiness.
+Read-only local Xcode cache inspection found four unexpired Xcode-managed Team
+Store profiles: production, staging, Canary and Canary LiveActivity. All use team
+`825LYXGJR6`, expire `2027-09-02 21:36:25`, have no device allowlist and disable
+`get-task-allow`. None authorizes staging LiveActivity or a wildcard. The portal
+Profiles page listed no manual profiles; neither observation proves that a usable
+cloud-managed wildcard profile exists. Do not invoke `-allowProvisioningUpdates`
+until the release owner confirms the precise permitted signing/profile changes.
+
+Commands from repository root, only after explicit staging release authorization:
+
+```sh
+# BUILD_NUMBER is the next number read from the existing authenticated Apple account.
+gh workflow run testflight.yml --ref crew/staging-native-cutover \
+  -f reviewed_sha="$REVIEWED_SHA" -f build_number="$BUILD_NUMBER"
+# CI executes this archive command; no local compilation is required:
+xcodebuild -project apps/ios/Zeron.xcodeproj -scheme 'Crew Staging' \
+  -configuration Release -destination 'generic/platform=iOS' \
+  -archivePath /tmp/Crew-Staging.xcarchive archive \
+  CODE_SIGNING_ALLOWED=NO CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+scripts/ios/prepare-staging-archive.sh /tmp/Crew-Staging.xcarchive "$BUILD_NUMBER"
+# Download/extract the verified CI archive before the following local-only steps.
+xcodebuild -exportArchive -archivePath /tmp/Crew-Staging.xcarchive \
+  -exportPath /tmp/StagingInspection -exportOptionsPlist scripts/ios/ExportOptions-Staging.plist \
+  -allowProvisioningUpdates
+python3 scripts/ios/verify-staging-ipa.py /tmp/StagingInspection/Zeron.ipa "$BUILD_NUMBER"
+# Upload uses the same reviewed archive and existing Xcode account; internal only.
+xcodebuild -exportArchive -archivePath /tmp/Crew-Staging.xcarchive \
+  -exportPath /tmp/StagingUpload -exportOptionsPlist scripts/ios/UploadOptions-Staging.plist \
+  -allowProvisioningUpdates
+python3 scripts/ios/verify-staging-ipa.py /tmp/StagingUpload/Zeron.ipa "$BUILD_NUMBER"
+```
+
+Record the upload receipt and exact uploaded IPA hash, then read App Store Connect
+for this exact bundle/version/build: processing `VALID`, internal beta state and
+existing Ashler Internal assignment. Processing alone is not Testing availability.
+No tester, group, account-permission or public App Store changes are part of this flow.
+If an existing ASC API credential is separately available, the optional read-only
+`staging-metadata.py next 37` and `readback BUILD` helpers paginate metadata using
+`AC_KEY_PATH`, `AC_API_KEY_ID`, `AC_API_ISSUER_ID` and PyJWT[crypto]. They never
+create credentials or change Apple state. Offline checks:
+`python3 scripts/ios/staging-metadata.py self-check` and
+`python3 scripts/ios/test-staging-release.py`.
+The parent integration owner ran the metadata self-check and all three release
+contract tests successfully, including wildcard profile matching. The isolated
+simulator build and eight tests above also passed. Distribution signing and
+upload have not run; current Apple authentication, build-number availability and
+the LiveActivity distribution profile remain release gates. This mobile smoke
+does not establish that every native suite or the full staging cutover has passed.

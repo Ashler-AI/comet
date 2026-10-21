@@ -132,13 +132,39 @@ pub struct DocsStore {
 impl DocsStore {
     /// Open (creating directory, database, and schema as needed).
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let data_dir = data_dir.as_ref();
-        if data_dir.join("crew-import-incomplete").exists() {
+        Self::open_inner(data_dir.as_ref(), false)
+    }
+
+    /// Only the copy-only importer may initialize its marked, unpublished store.
+    pub(crate) fn open_import_destination(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::open_inner(data_dir, true)
+    }
+
+    fn open_inner(data_dir: &Path, importing: bool) -> Result<Self, StoreError> {
+        if !importing && data_dir.join("crew-import-incomplete").exists() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
                 "incomplete Crew import: retain it for diagnosis and import into a fresh profile").into());
         }
-        std::fs::create_dir_all(data_dir)?;
+        // Inspect before opening read/write or applying any schema migration.
+        // Crew 0.1 and upstream both number migrations from one; numbers alone
+        // are not a schema identity and must never authorize an in-place upgrade.
         let path = data_dir.join("docs.sqlite3");
+        if path.exists() {
+            let existing = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let legacy: bool = existing.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('document_scopes','semantic_intents','trusted_local_commands','session_startups','crew_directory_jobs'))",
+                [], |row| row.get(0))?;
+            let snapshots: bool = existing.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshots')",
+                [], |row| row.get(0))?;
+            let workspace = snapshots && existing.query_row(
+                "SELECT EXISTS(SELECT 1 FROM snapshots WHERE doc_id='workspace3')", [], |row| row.get::<_, bool>(0))?;
+            if legacy || workspace {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                    "legacy Crew database: use import-backup with a consistent copied backup and a new separate destination; in-place opening is forbidden").into());
+            }
+        }
+        std::fs::create_dir_all(data_dir)?;
         let mut conn = Connection::open(&path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -160,11 +186,21 @@ impl DocsStore {
         })
     }
 
+    /// The actual opened SQLite parent, for fixed-profile read-only migration
+    /// proof. RPC callers never supply or select this filesystem path.
+    pub fn profile_root(&self) -> Result<std::path::PathBuf, StoreError> {
+        let conn = self.conn();
+        let parent = conn.path().and_then(|path| Path::new(path).parent()).ok_or_else(||
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "profile database has no filesystem parent"))?;
+        Ok(parent.canonicalize()?)
+    }
+
     pub fn watch_directory(&self) -> tokio::sync::watch::Receiver<u64> {
         self.directory_changed.subscribe()
     }
 
     pub fn queue_directory(&self, id: &str) -> Result<(), StoreError> {
+        if !zeron_proto::is_cloud_session_id(id) { return Ok(()); }
         self.schedule_sync_job(id, "crew-directory")?;
         self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
@@ -203,7 +239,7 @@ impl DocsStore {
     }
 
     fn queue_directory_in(&self, tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), StoreError> {
-        if uuid::Uuid::parse_str(id).is_ok() {
+        if zeron_proto::is_cloud_session_id(id) {
             tx.execute("UPDATE sync_job_clock SET value=value+1 WHERE id=1", [])?;
             tx.execute(
                 "INSERT INTO chat_sync_jobs(doc_id,kind,version)

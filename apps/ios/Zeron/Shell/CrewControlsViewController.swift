@@ -1,4 +1,5 @@
 import UIKit
+import CoreFoundation
 
 /// All operations go through a verified desktop controller; the phone never owns execution credentials.
 final class CrewControlsViewController: UIViewController {
@@ -7,6 +8,16 @@ final class CrewControlsViewController: UIViewController {
     private let status = UILabel()
     private let hostButton = UIButton(type: .system)
     private let sandboxButton = UIButton(type: .system)
+    private let startButton = UIButton(type: .system)
+    private var selectedLifecycle: String? {
+        didSet { updateStartVisibility() }
+    }
+    private var selectedLifecycleEpoch: UInt64? {
+        didSet { updateStartVisibility() }
+    }
+    private func updateStartVisibility() {
+        startButton.isHidden = !Self.canStartNewEpoch(lifecycle: selectedLifecycle, epoch: selectedLifecycleEpoch)
+    }
     private let modelButton = UIButton(type: .system)
     private let advancedButton = UIButton(type: .system)
     private let advanced = UIStackView()
@@ -30,8 +41,7 @@ final class CrewControlsViewController: UIViewController {
 
     init(app: AppModel) {
         self.app = app
-        self.storageURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("crew-canary-profiles", isDirectory: true)
+        self.storageURL = AppModel.profilesDir
             .appendingPathComponent(app.crewStorageKey ?? "signed-out", isDirectory: true)
             .appendingPathComponent("scaffold-commands.json")
         super.init(nibName: nil, bundle: nil)
@@ -76,6 +86,11 @@ final class CrewControlsViewController: UIViewController {
         stack.addArrangedSubview(sandboxButton)
         addButton("Open history") { [weak self] in self?.browse() }
         addButton("Use sandbox") { [weak self] in self?.confirm("attach") }
+        startButton.setTitle("Start new epoch", for: .normal)
+        startButton.accessibilityIdentifier = "crew-control-start-epoch"
+        startButton.isHidden = true
+        startButton.addAction(UIAction { [weak self] _ in self?.confirm("start") }, for: .touchUpInside)
+        stack.addArrangedSubview(startButton)
         let manageButton = UIButton(type: .system)
         manageButton.setTitle("Manage sandbox", for: .normal)
         manageButton.showsMenuAsPrimaryAction = true
@@ -102,7 +117,13 @@ final class CrewControlsViewController: UIViewController {
         }
         sandbox.addAction(UIAction { [weak self] _ in
             guard let self else { return }
+            self.selectedLifecycle = nil
+            self.selectedLifecycleEpoch = nil
             self.sandboxButton.setTitle(self.sandbox.text?.nonEmpty.map { "Selected sandbox: \($0)" } ?? "Choose sandbox", for: .normal)
+        }, for: .editingChanged)
+        session.addAction(UIAction { [weak self] _ in
+            self?.selectedLifecycle = nil
+            self?.selectedLifecycleEpoch = nil
         }, for: .editingChanged)
         model.addAction(UIAction { [weak self] _ in
             guard let self else { return }
@@ -132,7 +153,7 @@ final class CrewControlsViewController: UIViewController {
         explanation.numberOfLines = 0
         explanation.font = .preferredFont(forTextStyle: .footnote)
         explanation.adjustsFontForContentSizeCategory = true
-        explanation.text = "Project: \(app.client?.orgId() ?? "")\nDeployment: \(Endpoints.deploymentId ?? "not configured")\nOpen history does not resume a sandbox. Use sandbox attaches to or resumes the same sandbox; Stop is terminal. Stop a single agent turn from its composer instead. Source and region use deployment defaults. Inference always uses host Agent Auth."
+        explanation.text = "Project: \(app.client?.orgId() ?? "")\nDeployment: \(Endpoints.deploymentId ?? "not configured")\nOpen history never starts execution. Use sandbox attaches to or resumes a nonterminal sandbox. Stop ends its current epoch. Start new epoch retains the logical session and history but replaces physical execution and its native association; old requests are not replayed. Stop a single agent turn from its composer instead. Source and region use deployment defaults. Inference always uses host Agent Auth."
         stack.addArrangedSubview(explanation)
         do {
             if FileManager.default.fileExists(atPath: storageURL.path) {
@@ -176,6 +197,8 @@ final class CrewControlsViewController: UIViewController {
                     self.modelButton.setTitle("Choose model", for: .normal)
                     self.session.text = nil
                     self.sandbox.text = nil
+                    self.selectedLifecycle = nil
+                    self.selectedLifecycleEpoch = nil
                     self.sandboxButton.setTitle("Choose sandbox", for: .normal)
                 }
                 self.hostId = host.id
@@ -225,6 +248,8 @@ final class CrewControlsViewController: UIViewController {
                     let label = "\(environment["name"] as? String ?? id) · \(source["lifecycle"] as? String ?? "unknown")"
                     menu.addAction(UIAlertAction(title: label, style: .default) { [weak self] _ in
                         self?.sandbox.text = id; self?.session.text = sessionId
+                        self?.selectedLifecycle = source["lifecycle"] as? String
+                        self?.selectedLifecycleEpoch = Self.lifecycleEpoch(from: source["lifecycle_epoch"])
                         self?.sandboxButton.setTitle("Selected: \(label)", for: .normal)
                     })
                 }
@@ -233,6 +258,15 @@ final class CrewControlsViewController: UIViewController {
             } catch { status.text = error.localizedDescription }
         }
     }
+    static func canStartNewEpoch(lifecycle: String?, epoch: UInt64?) -> Bool {
+        epoch != nil && (lifecycle == "stopped" || lifecycle == "failed")
+    }
+
+    static func lifecycleEpoch(from value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        return UInt64(number.stringValue)
+    }
+
     static func sessionID(for operation: String, selected: String?) throws -> String {
         if operation == "create" { return UUID().uuidString.lowercased() }
         guard let selected, UUID(uuidString: selected) != nil else {
@@ -259,18 +293,31 @@ final class CrewControlsViewController: UIViewController {
         } else {
             guard let id = sandbox.text?.nonEmpty else { throw CoreError.InvalidArgument(message: "Choose an existing sandbox.") }
             control["sandbox_id"] = id
+            if operation == "start" {
+                guard let epoch = selectedLifecycleEpoch else {
+                    throw CoreError.InvalidArgument(message: "Refresh the sandbox to obtain its current lifecycle epoch before starting.")
+                }
+                control["expectedLifecycleEpoch"] = epoch
+            }
         }
         return String(decoding: try JSONSerialization.data(withJSONObject: control), as: UTF8.self)
     }
     private func confirm(_ operation: String) {
         guard !busy, let hostId, let client = app.client, let deployment = Endpoints.deploymentId else { status.text = "Select an online desktop controller."; return }
         do {
+            if operation == "start", !Self.canStartNewEpoch(lifecycle: selectedLifecycle, epoch: selectedLifecycleEpoch) {
+                throw CoreError.InvalidArgument(message: "Choose a stopped or failed sandbox with a verified lifecycle epoch from the refreshed list.")
+            }
             // Create allocates a distinct identity once per confirmation. The exact
             // payload is then journaled and reconciliation never regenerates it.
             let sessionId = try Self.sessionID(for: operation, selected: session.text)
             let control = try control(operation, sessionId: sessionId)
             let menu = sheet("\(operation.capitalized) this sandbox?", message: "Controller: \(hostButton.title(for: .normal) ?? hostId)\nSession: \(sessionId)\nSandbox: \(operation == "create" ? "new" : sandbox.text ?? "")\nDeployment: \(deployment)" + (operation == "create" ? "\nSource: Deployment default\nRegion: Deployment default\nModel: \(model.text ?? "")\nDB: \(database.titleForSegment(at: database.selectedSegmentIndex) ?? "")\nAccount: \(account.text?.nonEmpty ?? "Automatic host selection")" : ""))
-            menu.addAction(UIAlertAction(title: operation.capitalized, style: operation == "stop" ? .destructive : .default) { [weak self] _ in
+            if operation == "start" {
+                menu.title = "Start a new execution epoch?"
+                menu.message = "Controller: \(hostButton.title(for: .normal) ?? hostId)\nSession: \(sessionId)\nControl record: \(sandbox.text ?? "")\nDeployment: \(deployment)\nObserved epoch: \(selectedLifecycleEpoch.map(String.init) ?? "unavailable")\n\nStart a new execution epoch for this session. Existing history is retained; old requests are not replayed. Physical execution and its native association are replaced, not resumed."
+            }
+            menu.addAction(UIAlertAction(title: operation == "start" ? "Start new epoch" : operation.capitalized, style: operation == "stop" ? .destructive : .default) { [weak self] _ in
                 guard let self else { return }
                 let command = Command(id: UUID().uuidString.lowercased(), deviceId: hostId, controlJSON: control, status: "pending", result: nil)
                 self.records.append(command)
@@ -317,6 +364,8 @@ final class CrewControlsViewController: UIViewController {
                 status.text = "\(records[index].status.capitalized): \(command.id)\n\(value["error"] as? String ?? "")"
                 if let result = value["result"] as? [String: Any], let env = result["environment"] as? [String: Any], let source = env["source"] as? [String: Any] {
                     sandbox.text = source["sandbox_id"] as? String ?? sandbox.text
+                    selectedLifecycle = source["lifecycle"] as? String
+                    selectedLifecycleEpoch = Self.lifecycleEpoch(from: source["lifecycle_epoch"])
                     session.text = (env["scope"] as? [String: Any])?["sessionId"] as? String
                     sandboxButton.setTitle("Selected: \(env["name"] as? String ?? sandbox.text ?? "Sandbox") · \(source["lifecycle"] as? String ?? "unknown")", for: .normal)
                     status.text = (status.text ?? "") + "\nObserved lifecycle: \(source["lifecycle"] as? String ?? "unknown")"

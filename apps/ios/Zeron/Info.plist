@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Crew Canary</string>
+	<string>Crew Staging</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Crew Canary</string>
+	<string>Crew Staging</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
@@ -26,10 +26,10 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>ai.ashler.crew.upstream-canary.auth</string>
+			<string>ai.ashler.crew.staging.auth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>crew-upstream-canary</string>
+				<string>comet-staging</string>
 			</array>
 		</dict>
 	</array>

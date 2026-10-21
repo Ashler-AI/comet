@@ -81,6 +81,7 @@ finish_turn() {
 }
 
 turn_open=0
+state_requests=0
 while IFS= read -r line; do
   type=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -89,6 +90,14 @@ while IFS= read -r line; do
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"negotiate_protocol\",\"success\":true}"
       ;;
     get_state)
+      state_requests=$((state_requests + 1))
+      if [ "$state_requests" -gt 1 ] && [ -n "${OMP_STATE_BURST:-}" ]; then
+        i=0
+        while [ "$i" -lt 512 ]; do
+          printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"queued event\n"}}'
+          i=$((i + 1))
+        done
+      fi
       if [ -n "${OMP_SESSION_LOG:-}" ]; then
         printf 'config:%s\n' "$CONFIG_PATH" >> "$OMP_SESSION_LOG"
         printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"

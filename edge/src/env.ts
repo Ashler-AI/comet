@@ -15,15 +15,17 @@ export interface Env {
    * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
   CHAT_ROOMS: DurableObjectNamespace;
   BLOBS: R2Bucket;
-  /** Isolated authenticated release artifacts; never an upstream or shared Crew bucket. */
-  RELEASES: R2Bucket;
+  /** Private staging release bucket, accessed only with the CI-provisioned reader credential. */
+  COMET_RELEASES_GCS_BUCKET?: string;
+  GCP_RELEASE_SERVICE_ACCOUNT_EMAIL?: string;
+  GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY?: string;
   /** Scaffold resource-bound tokens, or local-only development credentials. */
   AUTH_MODE: string;
   /** APNs auth key (contents of AuthKey_XXXX.p8, wrangler secret) and its
    * key id. Unset ⇒ session notifications are decided and logged, not sent. */
   APNS_KEY_P8?: string;
   APNS_KEY_ID?: string;
-  /** Explicit Apple team and canary bundle id; no upstream credential fallback. */
+  /** Explicit Apple team and deployment bundle id; no upstream credential fallback. */
   APNS_TEAM_ID?: string;
   APNS_TOPIC?: string;
 }

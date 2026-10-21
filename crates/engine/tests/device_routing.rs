@@ -2116,6 +2116,12 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
                 && m["text"] == "remote reply"
                 && m["deviceId"] == "device-b")
     );
+    let summary = tools
+        .call("get_chat", json!({"chat":chat_id}))
+        .await
+        .unwrap();
+    assert_eq!(summary["lastMessage"]["text"], "remote reply");
+    assert_eq!(summary["lastMessage"]["deviceId"], "device-b");
     let sent = tools
         .call(
             "send_message",

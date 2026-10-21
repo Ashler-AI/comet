@@ -6044,6 +6044,9 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// Pre-admission only: dropping this task cannot discard an accepted send.
+    host_wake_task: Option<Task<()>>,
+    host_wake_target: Option<String>,
     scaffold_command: Option<String>,
     scaffold_recovery_key: Option<String>,
     scaffold_admission: Option<String>,
@@ -6356,6 +6359,8 @@ impl Composer {
             action_task: None,
             advance_task: None,
             send_task: None,
+            host_wake_task: None,
+            host_wake_target: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
@@ -7445,7 +7450,7 @@ impl Composer {
     fn catalog_params(&self, cx: &App) -> serde_json::Value {
         let mut params = self.completion_workspace_params(cx).unwrap_or_else(|| {
             let mut params = serde_json::json!({});
-            if let Some(device) = self.state.read(cx).effective_device_id() {
+            if let Some(device) = self.state.read(cx).active_device_id() {
                 params["targetDeviceId"] = device.into();
             }
             params
@@ -7461,15 +7466,7 @@ impl Composer {
         let engine = state
             .engine()
             .map(|engine| engine.client() as *const _ as usize);
-        let target = state
-            .selected_chat_row()
-            .map(|chat| chat.device_id.clone())
-            .or_else(|| {
-                state
-                    .selected_space_row()
-                    .map(|space| space.device_id.clone())
-            })
-            .or_else(|| state.effective_device_id());
+        let target = state.active_device_id();
         let online = target
             .as_deref()
             .is_none_or(|device| state.device_online(device, chrono::Utc::now()));
@@ -8428,6 +8425,13 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        if self.host_wake_target.as_ref().is_some_and(|target| {
+            let state = self.state.read(cx);
+            state.active_device_id().as_ref() != Some(target)
+                || state.selected_chat.as_deref().unwrap_or_default() != self.current_key
+        }) {
+            self.cancel_host_wake(cx);
+        }
         let delivered = {
             let state = self.state.read(cx);
             state.selected_chat.as_ref().filter(|chat| {
@@ -8658,10 +8662,7 @@ impl Composer {
 
     fn reference_delivery_supported(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
-        let target = state
-            .selected_chat_row()
-            .map(|chat| chat.device_id.clone())
-            .or_else(|| state.effective_device_id());
+        let target = state.active_device_id();
         target.is_some_and(|device| {
             state.device_supports(&device, capabilities::COMPOSER_REFERENCES_V1)
         })
@@ -8954,12 +8955,104 @@ impl Composer {
         }).detach();
     }
 
+    fn wakeable_host(&self, cx: &App) -> Option<zeron_proto::Device> {
+        let state = self.state.read(cx);
+        let target = state.active_device_id()?;
+        if state.local_device_id.as_deref() == Some(target.as_str())
+            || state.device_online(&target, chrono::Utc::now()) { return None; }
+        state.devices.iter().find(|device| device.id == target && device.devbox_binding().is_some()).cloned()
+    }
+
+    fn cancel_host_wake(&mut self, cx: &mut Context<Self>) {
+        self.host_wake_task = None;
+        self.host_wake_target = None;
+        self.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); });
+        cx.notify();
+    }
+
+    fn wake_before_send(&mut self, device: zeron_proto::Device, text: String, queue: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.show_error("Engine not connected", cx);
+            return;
+        };
+        let key = self.current_key.clone();
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        self.host_wake_target = Some(device.id.clone());
+        self.input.update(cx, |input, cx| { input.read_only = true; cx.notify(); });
+        self.host_wake_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                let fresh = crate::settings::devices::wake_host(&engine, cx.background_executor(), &device).await?;
+                let (refresh, _observe) = this.update(cx, |composer, cx| {
+                    composer.state.update(cx, |state, cx| {
+                        let mut devices = state.devices.clone();
+                        let slot = devices.iter_mut().find(|row| row.id == device.id)
+                            .filter(|row| row.devbox_binding() == device.devbox_binding())
+                            .ok_or_else(|| "The selected host binding changed. Nothing was sent.".to_string())?;
+                        *slot = fresh;
+                        state.apply_devices(devices);
+                        cx.notify();
+                        Ok::<(), String>(())
+                    })?;
+                    let (send, receive) = futures::channel::oneshot::channel();
+                    let mut send = Some(send);
+                    let target = device.id.clone();
+                    let observe = cx.observe(&composer.pickers, move |composer, _, cx| {
+                        if let Some(result) = composer.pickers.read(cx).wake_refresh_result(&target, harness, cx)
+                            && let Some(send) = send.take() { let _ = send.send(result); }
+                    });
+                    composer.pickers.update(cx, |pickers, cx| pickers.refresh_after_wake(&device.id, harness, cx));
+                    Ok::<_, String>((receive, observe))
+                }).map_err(|error| error.to_string())??;
+                let deadline = cx.background_executor().timer(Duration::from_secs(30));
+                futures::pin_mut!(refresh, deadline);
+                match futures::future::select(refresh, deadline).await {
+                    futures::future::Either::Left((result, _)) => result.map_err(|_| "Connection refresh cancelled".to_string())?,
+                    futures::future::Either::Right(_) => Err("Refreshing the connected host timed out. Your draft is preserved.".into()),
+                }
+            }.await;
+            this.update(cx, |composer, cx| {
+                composer.host_wake_target = None;
+                composer.host_wake_task = None;
+                composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); });
+                match result {
+                    Ok(()) if composer.current_key == key && composer.state.read(cx).active_device_id().as_deref() == Some(device.id.as_str()) => {
+                        composer.slash_cache.clear();
+                        composer.slash_task = None;
+                        composer.mention_task = None;
+                        composer.reset_slash(None, cx);
+                        composer.reset_mention(None, cx);
+                        composer.send_ready(text, queue, cx);
+                    }
+                    Ok(()) => {}
+                    Err(error) => composer.show_error(error, cx),
+                }
+                cx.notify();
+            }).ok();
+        }));
+        cx.notify();
+    }
+
+    fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        if self.sending || self.host_wake_task.is_some() { return; }
+        if self.pickers.read(cx).draft().scaffold_database.is_some()
+            || self.scaffold_admission.is_some()
+            || self.state.read(cx).selected_chat.as_ref().is_some_and(|chat| crate::settings::current(cx).crew_pending_prompts.contains_key(chat)) {
+            self.send_ready(text, queue, cx);
+            return;
+        }
+        if let Some(device) = self.wakeable_host(cx) {
+            self.wake_before_send(device, text, queue, cx);
+        } else {
+            self.send_ready(text, queue, cx);
+        }
+    }
+
     /// Queue a Run doc command with an optimistic echo — or, with the agent
     /// busy, park the message on the chat's pending queue instead. New chats
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+    fn send_ready(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
         if (self.scaffold_admission.as_ref() == self.state.read(cx).selected_chat.as_ref() && self.scaffold_admission.is_some())
             || self.state.read(cx).selected_chat.as_ref().is_some_and(|chat| crate::settings::current(cx).crew_pending_prompts.contains_key(chat)) {
             self.show_error("The initial Crew command has an uncertain outcome. Check session history and delivery status; it will not be replayed.", cx);
@@ -9013,7 +9106,7 @@ impl Composer {
         // the host and the session runs from `~` there.
         let space = self.state.read(cx).selected_space_row().cloned();
         let local_device_id = self.state.read(cx).local_device_id.clone();
-        let target_device_id = self.state.read(cx).effective_device_id();
+        let target_device_id = self.state.read(cx).active_device_id();
         let device_id = if is_new {
             target_device_id
                 .clone()
@@ -9023,7 +9116,7 @@ impl Composer {
                 .read(cx)
                 .selected_chat_row()
                 .map(|c| c.device_id.clone())
-                .or_else(|| local_device_id.clone())
+                .or_else(|| target_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
         };
         // Uploads/read-backs target the chat's HOST device (forwardable RPCs);
@@ -9037,6 +9130,7 @@ impl Composer {
                 .read(cx)
                 .selected_chat_row()
                 .map(|c| c.device_id.clone())
+                .or_else(|| target_device_id.clone())
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
@@ -9586,6 +9680,7 @@ impl Composer {
                         "chatId": chat_id,
                         "text": queue_text,
                         "attachments": attachment_paths,
+                        "targetDeviceId": host_device_id,
                         "holdForTurnEnd": true,
                     });
                     let reply = engine
@@ -9625,6 +9720,9 @@ impl Composer {
                 let command = serde_json::to_value(&command)
                     .map_err(|e| format!("Send failed: {e}"))?;
                 let mut params = serde_json::json!({ "chatId": chat_id, "command": command });
+                if let Some(target) = &host_device_id {
+                    params["targetDeviceId"] = target.clone().into();
+                }
                 if !transfers.is_empty() {
                     params["transfers"] = serde_json::Value::Array(transfers);
                 }
@@ -11086,6 +11184,13 @@ impl Render for Composer {
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
+            .when(self.host_wake_task.is_some(), |el| el.child(
+                div().id("host-wake-cancel").role(gpui::Role::Button).tab_index(0)
+                    .aria_label("Cancel host connection")
+                    .child("Connecting to host… Cancel")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_host_wake(cx)))
+            ))
             .when_some(failure, |el, message| {
                 // Amber with "Warning" for the offline-ish case (engine not
                 // connected), red with "Error" for send/run failures. Click
@@ -12926,6 +13031,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[gpui::test]
+    fn cancelling_host_wake_preserves_draft_and_remote_target(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel::<String>(16);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(16);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
+            state.local_device_id = Some("local".into());
+            state.selected_device = Some("remote".into());
+            state.devices = vec![serde_json::from_value(serde_json::json!({
+                "id": "remote", "name": "host", "platform": "linux",
+                "devboxProvider": "boat", "devboxId": "bx_234abcxy",
+            })).unwrap()];
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.input.update(cx, |input, cx| input.set_text("keep this draft", cx));
+            composer.send("keep this draft".into(), false, cx);
+            assert!(composer.host_wake_task.is_some());
+            assert!(!composer.sending);
+            assert!(composer.state.read(cx).selected_chat.is_none());
+            assert_eq!(composer.input.read(cx).text(), "keep this draft");
+            composer.cancel_host_wake(cx);
+            assert!(composer.host_wake_task.is_none());
+            assert!(!composer.input.read(cx).read_only);
+            assert_eq!(composer.input.read(cx).text(), "keep this draft");
+            assert_eq!(composer.state.read(cx).active_device_id().as_deref(), Some("remote"));
+        });
     }
 
     /// Issue #406: Enter submits — it must never stop a run. Stop mode only

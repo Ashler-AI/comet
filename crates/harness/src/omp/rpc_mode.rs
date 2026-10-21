@@ -895,6 +895,10 @@ pub(crate) async fn run_rpc(
     let mut turn_error: Option<String> = None;
     let mut done_emitted = false;
     let mut stopped = false;
+    let mut todo_state_request: Option<String> = None;
+    let mut goal_state_request: Option<String> = None;
+    let state_deadline = tokio::time::sleep(STATE_DEADLINE);
+    tokio::pin!(state_deadline);
     let inactivity = tokio::time::sleep(INACTIVITY_LOG_INTERVAL);
     tokio::pin!(inactivity);
 
@@ -967,23 +971,11 @@ pub(crate) async fn run_rpc(
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
                             return Ok(());
                         }
-                        // The todo tool mutates session-held state; the frame
-                        // carries only the op. Snapshot the resulting phases so
-                        // Comet renders the plan like the ACP lane's `plan`
-                        // updates did.
-                        if todo_tool && let Ok(state) = client.request("get_state", Map::new()).await {
-                            let items = todo_items_from_state(&state);
-                            if events
-                                .send(Ok(AgentEvent::ToolCall {
-                                    id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
-                                    call: ToolCall::Todo { items },
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                                return Ok(());
-                            }
+                        // Keep draining frames while state refreshes: the child can
+                        // emit more than a channel's worth before its response.
+                        if todo_tool && todo_state_request.is_none() {
+                            todo_state_request = Some(client.send_command("get_state", Map::new()));
+                            state_deadline.as_mut().reset(Instant::now() + STATE_DEADLINE);
                         }
                     }
                     "goal_updated" => {
@@ -1053,6 +1045,30 @@ pub(crate) async fn run_rpc(
                     }
                     "response" => {
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+                        let todo_refresh = todo_state_request.as_deref() == Some(id);
+                        let goal_refresh = goal_state_request.as_deref() == Some(id);
+                        if todo_refresh || goal_refresh {
+                            if todo_refresh { todo_state_request = None; }
+                            if goal_refresh { goal_state_request = None; }
+                            if frame.get("success").and_then(Value::as_bool) == Some(true) {
+                                let state = frame.get("data").unwrap_or(&Value::Null);
+                                let event = if todo_refresh {
+                                    AgentEvent::ToolCall {
+                                        id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                                        call: ToolCall::Todo { items: todo_items_from_state(state) },
+                                    }
+                                } else {
+                                    goal_state_event_from_session_state(state)
+                                        .unwrap_or_else(|| goal_state_event(Value::Null, None))
+                                };
+                                if events.send(Ok(event)).await.is_err() {
+                                    kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                                    return Ok(());
+                                }
+                            } else {
+                                tracing::warn!(target: "zeron_harness::omp", "RPC state refresh failed");
+                            }
+                        }
                         if let Some(index) = outstanding_prompts.iter().position(|prompt| prompt.id == id) {
                             let prompt = outstanding_prompts.swap_remove(index);
                             if frame.get("success").and_then(Value::as_bool) != Some(true) {
@@ -1072,21 +1088,8 @@ pub(crate) async fn run_rpc(
                             // Snapshot after the ack so the editor indicator appears
                             // immediately and `/goal drop` clears persisted state.
                             if prompt.refresh_goal_state {
-                                match client.request("get_state", Map::new()).await {
-                                    Ok(state) => {
-                                        let event = goal_state_event_from_session_state(&state)
-                                            .unwrap_or_else(|| goal_state_event(Value::Null, None));
-                                        if events.send(Ok(event)).await.is_err() {
-                                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                                            return Ok(());
-                                        }
-                                    }
-                                    Err(error) => tracing::warn!(
-                                        target: "zeron_harness::omp",
-                                        %error,
-                                        "goal command state refresh failed"
-                                    ),
-                                }
+                                goal_state_request = Some(client.send_command("get_state", Map::new()));
+                                state_deadline.as_mut().reset(Instant::now() + STATE_DEADLINE);
                             }
                             // Local-only prompt: completed without agent events.
                             if frame.pointer("/data/agentInvoked").and_then(Value::as_bool)
@@ -1194,6 +1197,11 @@ pub(crate) async fn run_rpc(
                     .ok();
                 return Ok(());
             }
+            _ = &mut state_deadline, if todo_state_request.is_some() || goal_state_request.is_some() => {
+                todo_state_request = None;
+                goal_state_request = None;
+                tracing::warn!(target: "zeron_harness::omp", "RPC state refresh timed out");
+            }
             _ = &mut inactivity => {
                 if streaming {
                     tracing::warn!(
@@ -1213,7 +1221,9 @@ pub(crate) async fn run_rpc(
         // The run ends only once the mailbox is closed AND the current turn
         // has fully settled: an early mailbox close (engine teardown racing
         // agent_start) must never kill a turn that is still owed its Done.
-        if !steering_open && !streaming && done_emitted && outstanding_prompts.is_empty() {
+        if !steering_open && !streaming && done_emitted && outstanding_prompts.is_empty()
+            && todo_state_request.is_none() && goal_state_request.is_none()
+        {
             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
             return Ok(());
         }

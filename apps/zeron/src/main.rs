@@ -9,6 +9,7 @@ mod daemon;
 mod paths;
 mod update_cli;
 mod session_cli;
+mod remote_backup_cli;
 
 use clap::{Parser, Subcommand};
 
@@ -61,7 +62,31 @@ enum Command {
         backup: std::path::PathBuf,
         #[arg(long)]
         destination: std::path::PathBuf,
+        /// Perform the same complete validation and report without writing a profile.
+        #[arg(long)]
+        validate_only: bool,
+        /// Read back an existing imported destination against the immutable source.
+        #[arg(long, conflicts_with = "validate_only")]
+        verify_only: bool,
+        /// Read-only current controller authentication; do not connect to an engine.
+        #[arg(long, requires_all = ["source_context", "device_id"])]
+        identity_session: Option<std::path::PathBuf>,
+        #[arg(long, requires = "identity_session")]
+        source_context: Option<std::path::PathBuf>,
+        /// Preserved owner controller device ID for this destination.
+        #[arg(long, requires = "identity_session")]
+        device_id: Option<String>,
     },
+    /// Build an importer manifest from a consistent stopped-writer profile copy.
+    ExportBackup(session_cli::ExportBackupArgs),
+    /// Inspect immutable copied bootstrap evidence without starting a runtime.
+    InspectBackup(session_cli::InspectBackupArgs),
+    /// Export a fenced remote profile copy using provider-supplied exact context.
+    ExportRemoteBackup(remote_backup_cli::Args),
+    /// Import a fenced remote backup offline; never starts a runtime.
+    ImportRemoteBackup(remote_backup_cli::ImportArgs),
+    /// Read back a remote import against its immutable source offline.
+    VerifyRemoteBackup(remote_backup_cli::ImportArgs),
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
@@ -148,12 +173,29 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     attach_parent_console();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // Provider migration must never initialize auth, paths, locks or a runtime
+    // against its old profile. Context files are bindings, not cloud authority.
+    cli.command = match cli.command {
+        Some(Command::ExportRemoteBackup(args)) => return remote_backup_cli::run(args),
+        Some(Command::ImportRemoteBackup(args)) => return remote_backup_cli::import(args),
+        Some(Command::VerifyRemoteBackup(args)) => return remote_backup_cli::verify(args),
+        Some(Command::InspectBackup(args)) => return session_cli::inspect(args),
+        Some(Command::ExportBackup(args)) if args.offline() => {
+            return tokio::runtime::Runtime::new()?.block_on(session_cli::export(args, 0));
+        }
+        Some(Command::ImportBackup { backup, destination, validate_only, verify_only,
+            identity_session: Some(identity), source_context: Some(context), device_id: Some(device) }) => {
+            return tokio::runtime::Runtime::new()?.block_on(session_cli::import_offline(
+                backup, destination, validate_only, verify_only, identity, context, device));
+        }
+        command => command,
+    };
     // IPC clients may inherit another engine's port without changing future app launches.
     let persist_runtime = matches!(&cli.command,
         None | Some(Command::Headless(_) | Command::Login | Command::Logout)
         | Some(Command::Daemon { command: DaemonCommand::Install | DaemonCommand::Start | DaemonCommand::Restart }));
-    let mut config = cli.runtime.config(persist_runtime)?;
+    let mut config = cli.runtime.config(persist_runtime, cli.command.is_none())?;
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;
@@ -265,9 +307,13 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Scaffold { command }) => {
             tokio::runtime::Runtime::new()?.block_on(session_cli::scaffold(command, config.ipc_port))
         }
-        Some(Command::ImportBackup { backup, destination }) => {
-            tokio::runtime::Runtime::new()?.block_on(session_cli::import(backup, destination, config.ipc_port))
+        Some(Command::ImportBackup { backup, destination, validate_only, verify_only, .. }) => {
+            tokio::runtime::Runtime::new()?.block_on(session_cli::import(backup, destination, validate_only, verify_only, config.ipc_port))
         }
+        Some(Command::ExportBackup(args)) => {
+            tokio::runtime::Runtime::new()?.block_on(session_cli::export(args, config.ipc_port))
+        }
+        Some(Command::ExportRemoteBackup(_) | Command::ImportRemoteBackup(_) | Command::VerifyRemoteBackup(_) | Command::InspectBackup(_)) => unreachable!("offline migration dispatched before runtime configuration"),
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(config.ipc_port))
@@ -295,15 +341,15 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&config.edge_url, check))
+            runtime.block_on(update_cli::update(&config, check))
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&config),
-            DaemonCommand::Uninstall => daemon::uninstall(),
-            DaemonCommand::Start => daemon::start(),
-            DaemonCommand::Stop => daemon::stop(),
-            DaemonCommand::Restart => daemon::restart(),
-            DaemonCommand::Status => daemon::status(),
+            DaemonCommand::Uninstall => daemon::uninstall(&config),
+            DaemonCommand::Start => daemon::start(&config),
+            DaemonCommand::Stop => daemon::stop(&config),
+            DaemonCommand::Restart => daemon::restart(&config),
+            DaemonCommand::Status => daemon::status(&config),
         },
         None => {
             zeron_ui::run_app(zeron_ui::UiConfig {
@@ -595,5 +641,28 @@ fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_cli_tests {
+    use super::*;
+
+    #[test]
+    fn migration_commands_require_explicit_source_destination_and_writer_confirmation() {
+        let args = ["comet", "export-backup", "--source-profile-root", "/original",
+            "--source-backup-root", "/copy", "--database-relative", "projects/project/account/docs.sqlite3",
+            "--destination", "/export"];
+        assert!(Cli::try_parse_from(args).is_err());
+        assert!(matches!(Cli::try_parse_from(args.into_iter().chain(["--writers-stopped"])).unwrap().command,
+            Some(Command::ExportBackup(_))));
+        assert!(matches!(Cli::try_parse_from(["comet", "import-backup", "--backup", "/export",
+            "--destination", "/native", "--validate-only"]).unwrap().command,
+            Some(Command::ImportBackup { validate_only: true, .. })));
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--writers-stopped", "--identity-session", "/existing-identity"])).is_err());
+        let offline = Cli::try_parse_from(args.into_iter().chain(["--writers-stopped", "--identity-session", "/existing-identity",
+            "--source-context", "/context.json", "--source-storage-directory", "/source-storage",
+            "--terminal-authority-root", "/terminal-authority", "--inventory-attachments-only"])).unwrap();
+        assert!(matches!(offline.command, Some(Command::ExportBackup(args)) if args.offline()));
     }
 }

@@ -24,8 +24,14 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     private weak var app: AppModel?
     private var token: String?
-    /// A tapped notification's chat, until the app can show it.
-    private var pendingChat: String?
+    private struct Target: Sendable {
+        let chatId: String
+        let userId: String
+        let projectScope: String
+        let deploymentId: String?
+    }
+    /// Retain identity with cold-start taps; never reinterpret a tap after account switch.
+    private var pendingTarget: Target?
     /// Opens a chat once the shell is up (set by the scene).
     var openChat: ((String) -> Bool)?
 
@@ -107,6 +113,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     /// Signing out: this phone stops getting the account's notifications.
     func signingOut(client: CoreClient?) {
         token = nil
+        pendingTarget = nil
         if let client { Task.detached { try? await client.unregisterPushTarget() } }
         UIApplication.shared.unregisterForRemoteNotifications()
     }
@@ -172,23 +179,40 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let chatId = response.notification.request.content.userInfo["chatId"] as? String
+        let info = response.notification.request.content.userInfo
+        let chatId = info["chatId"] as? String
+        let userId = info["userId"] as? String
+        let projectScope = info["projectScope"] as? String
+        let deploymentId = info["deploymentId"] as? String
+        let malformedDeployment = info["deploymentId"] != nil && deploymentId == nil
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
-                if let chatId { self.open(chatId) }
+                if let chatId, !chatId.isEmpty, let userId, let projectScope, !malformedDeployment {
+                    self.open(Target(chatId: chatId, userId: userId, projectScope: projectScope, deploymentId: deploymentId))
+                }
             }
             completionHandler()
         }
     }
 
-    private func open(_ chatId: String) {
-        if openChat?(chatId) != true { pendingChat = chatId }
+    nonisolated static func matchesScope(userId: String, projectScope: String, deploymentId: String?,
+                                         currentUser: String, currentProject: String, currentDeployment: String?) -> Bool {
+        !userId.isEmpty && !projectScope.isEmpty && userId == currentUser && projectScope == currentProject
+            && (deploymentId == nil || deploymentId == currentDeployment)
+    }
+
+    private func open(_ target: Target) {
+        guard let client = app?.client else { pendingTarget = target; return }
+        guard Self.matchesScope(userId: target.userId, projectScope: target.projectScope, deploymentId: target.deploymentId,
+                                currentUser: client.userId(), currentProject: client.orgId(), currentDeployment: Endpoints.deploymentId)
+        else { pendingTarget = nil; return }
+        if openChat?(target.chatId) != true { pendingTarget = target }
     }
 
     /// The shell is up: open a chat tapped before it was.
     func shellReady() {
-        guard let chat = pendingChat else { return }
-        pendingChat = nil
-        _ = openChat?(chat)
+        guard let target = pendingTarget else { return }
+        pendingTarget = nil
+        open(target)
     }
 }

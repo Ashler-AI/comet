@@ -1,5 +1,5 @@
 /**
- * Crew upstream canary: Scaffold-verified personal registry, opaque chat2
+ * Crew staging native: Scaffold-verified personal registry, opaque chat2
  * transport and capability-scoped DeviceRoom relay. No legacy workspace writes.
  *
  * Identity routes (all resource-bound to the configured Scaffold origin):
@@ -8,7 +8,7 @@
  *   POST|DELETE /auth/device-grants
  *   POST /auth/device-grants/exchange — one-time grant, public bearer exchange
  *   POST /auth/device-token/refresh   — rotates an unexpired device credential
- *   GET|HEAD /releases/*             — authenticated isolated R2 release artifacts
+ *   GET|HEAD /api/releases/:file     — authenticated private GCS release artifacts
  * Sync routes:
  *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
  *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
@@ -39,10 +39,12 @@ import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
 import { ChatRoom } from "./chat-room";
 import { peerRoute } from "./peer-route";
+import { fetchReleaseObject } from "./release-feed";
 
 export { AuthGrant, SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const RELEASE_FILE_RE = /^[A-Za-z0-9._-]{1,200}$/;
 
 /** `decodeURIComponent` that answers `undefined` for malformed %-escapes. */
 const safeDecode = (segment: string): string | undefined => {
@@ -107,8 +109,6 @@ export default {
       return json({ ok: true, auth: env.AUTH_MODE, environment: env.ENVIRONMENT });
     }
 
-    // This isolated generation has no public upstream installer or release feed.
-    if (url.pathname === "/install.sh") return json({ error: "not_found" }, 404);
     try {
       const publicAuth = await handlePublicAuthRoute(request, env, url);
       if (publicAuth) return publicAuth;
@@ -132,6 +132,12 @@ export default {
     if (peer) return peer;
     if (!authorizeRoute(request, auth)) return json({ error: "forbidden" }, 403);
     request = trustedRequest(request, auth);
+    if (url.pathname === "/install.sh") {
+      if (!auth.capabilities.includes("session.read") || !["GET", "HEAD"].includes(request.method)) {
+        return json({ error: "forbidden" }, 403);
+      }
+      return fetchReleaseObject(env, "install.sh", request.method as "GET" | "HEAD");
+    }
     // Compatibility is ownership-only: never revive the legacy session sync lane.
     if (parts[0] === "session" && parts[2] === "directory-authority" && parts.length === 3) {
       if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
@@ -156,28 +162,16 @@ export default {
     if (["session", "tail", "stats", "diff", "snapshot", "append", "workspace"].includes(parts[0])) {
       return json({ error: "use_registry_chat2" }, 410);
     }
-    if (
-      ((parts[0] === "releases" && parts.length >= 2) ||
-        (parts[0] === "api" && parts[1] === "releases" && parts.length === 3)) &&
-      (request.method === "GET" || request.method === "HEAD")
-    ) {
-      const key = safeDecode(parts[0] === "api" ? parts[2] : url.pathname.slice("/releases/".length));
-      if (!key || key.includes("..")) return json({ error: "bad request" }, 400);
-      const object = await env.RELEASES.get(key);
-      if (!object) return json({ error: "not_found" }, 404);
-      // latest.txt / manifest.json flip on release; artifacts are immutable by name.
-      const mutable = key.endsWith(".txt") || key.endsWith(".json");
-      const headers = new Headers({
-        "content-type": key.endsWith(".txt")
-          ? "text/plain; charset=utf-8"
-          : key.endsWith(".json")
-            ? "application/json"
-            : "application/octet-stream",
-        "content-length": String(object.size),
-        "cache-control": mutable ? "private, max-age=60" : "private, max-age=86400, immutable",
-        etag: object.httpEtag
-      });
-      return new Response(request.method === "HEAD" ? null : object.body, { headers });
+    if (parts[0] === "releases" || (parts[0] === "api" && parts[1] === "releases")) {
+      if (!auth.capabilities.includes("session.read") || !["GET", "HEAD"].includes(request.method)) {
+        return json({ error: "forbidden" }, 403);
+      }
+      const file = safeDecode(parts[0] === "api" ? parts[2] ?? "" : parts[1] ?? "");
+      if (parts.length !== (parts[0] === "api" ? 3 : 2) || !file ||
+          !RELEASE_FILE_RE.test(file) || file.includes("..")) {
+        return json({ error: "bad_request" }, 400);
+      }
+      return fetchReleaseObject(env, file, request.method as "GET" | "HEAD");
     }
 
 
@@ -317,10 +311,10 @@ export default {
       }
     }
 
-    // ── retired attachment mirror (clients ≤0.1.62): acknowledge and discard
-    //    so old outboxes drain once instead of retrying the PUT forever ──────
-    if (parts[0] === "attachments" && parts[1] && request.method === "PUT") {
-      return json({ ok: true });
+    // The retired mirror cannot persist data in this generation. Never report a
+    // successful upload after discarding its bytes.
+    if (parts[0] === "attachments") {
+      return json({ error: "legacy_attachments_retired" }, 410);
     }
 
     return json({ error: "not_found" }, 404);

@@ -1181,33 +1181,40 @@ async fn a_stopped_turns_delayed_duplicate_result_is_dropped() {
     );
 }
 
-/// A queued message the CLI cancels before starting releases the held turn
-/// end at once, from the lifecycle frame — not after a quiet timer.
+/// A queued cancellation releases the held end before the next CLI frame,
+/// not after a quiet timer (or a wall-clock budget that includes CLI startup).
 #[tokio::test]
 async fn a_cancelled_queued_message_releases_the_turn_end_immediately() {
     let (controls, steer, _token) = controls("A");
     steer.send(steer_msg("never started")).await.unwrap();
-    let started = std::time::Instant::now();
     let mut stream = harness()
         .run(request("scenario:lifecycle-queued-cancelled"), controls)
         .await
         .expect("run starts");
-    let status = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut cancelled = false;
+        let mut done = None;
         while let Some(event) = stream.next().await {
-            if let AgentEvent::Done { status, .. } = event.expect("event") {
-                return status;
+            match event.expect("event") {
+                AgentEvent::Steered { .. } => {
+                    assert!(done.is_none(), "Done preceded the queued cancellation");
+                    cancelled = true;
+                }
+                AgentEvent::Done { status, .. } => {
+                    assert!(cancelled, "Done preceded the queued cancellation");
+                    assert!(done.replace(status).is_none(), "duplicate Done");
+                }
+                AgentEvent::TextDelta { text } if text == "after cancellation" => {
+                    assert_eq!(done, Some(DoneStatus::Completed));
+                    return;
+                }
+                _ => {}
             }
         }
-        panic!("stream ended without Done");
+        panic!("stream ended without the post-cancellation frame");
     })
     .await
-    .expect("released");
-    assert_eq!(status, DoneStatus::Completed);
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        started.elapsed()
-    );
+    .expect("released before the next CLI frame");
 }
 
 /// A follow-up sent with another model/effort is adopted by the live process

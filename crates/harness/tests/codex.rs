@@ -757,27 +757,32 @@ async fn turn_failed_maps_to_errored_done() {
 }
 
 #[tokio::test]
-async fn resume_falls_back_to_fresh_thread() {
+async fn failed_resume_does_not_start_a_fresh_thread() {
+    let temp = tempfile::tempdir().unwrap();
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:resumed");
+    req.cwd = temp.path().display().to_string();
     req.resume = Some("resume-fail".into());
     let events = run_to_end(&harness(), req, controls).await;
 
     assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh"
-        )),
-        "fresh thread expected: {events:?}"
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. })),
+        "failed resume must not create a session: {events:?}"
     );
-    assert_eq!(
-        events.last(),
-        Some(&AgentEvent::Done {
-            status: DoneStatus::Completed,
+    assert!(
+        matches!(events.last(), Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
             result: None,
-            error: None,
-            session_id: Some("th-fresh".into()),
-        })
+            error: Some(error),
+            session_id: None,
+        }) if error.contains("rollout not found")),
+        "the original resume error must be preserved: {events:?}"
+    );
+    assert!(
+        !temp.path().join("rejected-resume-request.json").exists(),
+        "no request may follow a rejected resume"
     );
 }
 

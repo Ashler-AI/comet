@@ -5,6 +5,83 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeron_sync::chat_frames::{decode, encode, frame_type};
 
+#[tokio::test]
+async fn local_history_preserves_transcript_and_continuation_without_cloud_work() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Checkpoint).await;
+    for epoch in [0, crate::chat2_host::CHAT2_DOC_EPOCH] {
+        let id = "local-chat-0123456789abcdef";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let workspace = workspace(store.clone());
+        workspace.create_chat(id, None, Some("host"), Some(zeron_proto::ChatConfig {
+            harness: HarnessId::Omp, model: Some("original-model".into()), reasoning: None,
+            model_options: Default::default(), sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        }), Some("/original/repo".into())).unwrap();
+        workspace.set_chat_harness_session(id, "original-native", "/original/repo");
+        let source = SessionDoc::init(id).unwrap();
+        source.push_message(&zeron_doc::SessionMessageEntry {
+            id: "original-message".into(), role: zeron_doc::MessageRole::User,
+            parts: vec![zeron_doc::MessagePart::Text { id: "original-part".into(), text: "original history".into() }],
+            created_at: 1, device_id: "host".into(), status: None,
+            continuation_of: None, duration_ms: None,
+        }).unwrap();
+        store.save_snapshot_with_cursor(id, &source.export_snapshot().unwrap(), 0, epoch).unwrap();
+        let host = host(store.clone(), &relay);
+        host.set_workspace(workspace.clone());
+        let handle = host.open(id).unwrap();
+        assert_eq!(handle.watch_messages().borrow().entries.len(), 1);
+        assert_eq!(serde_json::to_value(handle.doc.read_entries().unwrap()).unwrap(),
+            serde_json::to_value(source.read_entries().unwrap()).unwrap());
+        let request = host.request_from_chat_row(id, "continue").unwrap();
+        assert_eq!(request.cwd, "/original/repo");
+        assert_eq!(request.model.as_deref(), Some("original-model"));
+        assert_eq!(workspace.chat_harness_session(id).unwrap().0, "original-native");
+        assert!(workspace.chat(id).unwrap().unwrap().crew.is_none());
+        handle.write_user_message("continued", "continue", 2).unwrap();
+        host.save_snapshot(&handle);
+        host.enqueue_wakeup(id).unwrap();
+        store.queue_directory(id).unwrap();
+        assert_eq!(host.prepare_sync_admission(&handle, None).unwrap(), None);
+        assert_eq!(host.prepare_stored_sync_admission(id, None).unwrap(), None);
+        assert!(!handle.sync_requested.load(Ordering::Acquire));
+        assert!(lock(&handle.chat2_local_sub).is_none());
+        assert!(!store.has_pending_chat_updates(id).unwrap());
+        assert!(store.sync_job_version(id, "wake").unwrap().is_none());
+        assert!(store.sync_job_version(id, "crew-directory").unwrap().is_none());
+        host.shutdown_workers().await;
+        let reopened = DocHost::new(store, DocHostConfig {
+            device_id: "host".into(), default_harness: HarnessId::Omp,
+            edge: Some(EdgeConfig::with_static_token(&relay.url, "test")),
+        });
+        reopened.set_workspace(workspace);
+        assert_eq!(reopened.open(id).unwrap().watch_messages().borrow().entries.len(), 2);
+        reopened.shutdown_workers().await;
+    }
+    assert_eq!(relay.joins.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn local_history_and_cloud_session_identity_gates_are_distinct() {
+    let session = "f38fe3c9-c235-4e3c-a50e-b2223653dd66";
+    assert!(chat_allows_sync(session));
+    assert!(zeron_proto::is_cloud_session_id(session));
+    // Current chat2 supports native child documents; legacy session APIs do not.
+    assert!(chat_allows_sync(&crate::sessions::subagent_doc_id(session, "child")));
+    assert!(!chat_allows_sync(&crate::sessions::subagent_doc_id("local-chat-native", "child_1")));
+    for id in ["local-chat-native", "local-chat-", "rcs_123", "ses_123", "short",
+        "F38FE3C9-C235-4E3C-A50E-B2223653DD66", "f38fe3c9c2354e3ca50eb2223653dd66"] {
+        assert!(!zeron_proto::is_cloud_session_id(id), "{id}");
+    }
+    for id in ["local-chat-native", "local-chat-", "local-chat-../other", "../other", ""] {
+        assert!(!chat_allows_sync(id), "{id}");
+    }
+    assert!(zeron_proto::is_local_history_chat("local-chat-0123456789abcdef"));
+    for id in ["local-chat-", "local-chat-../other", "rcs_123", "ses_123", "short"] {
+        assert!(!zeron_proto::is_local_history_chat(id), "{id}");
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Hold {
     Checkpoint,

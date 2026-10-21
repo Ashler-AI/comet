@@ -935,6 +935,8 @@ fn status_str(status: MessageStatus) -> &'static str {
         MessageStatus::Streaming => "streaming",
         MessageStatus::Complete => "complete",
         MessageStatus::Aborted => "aborted",
+        MessageStatus::Queued => "queued",
+        MessageStatus::Steered => "steered",
     }
 }
 
@@ -1680,6 +1682,30 @@ mod tests {
             continuation_of: None,
             duration_ms: None,
         }
+    }
+
+    #[test]
+    fn historical_delivery_statuses_round_trip_without_executable_work() {
+        let doc = SessionDoc::init("terminal-original-epoch").unwrap();
+        let mut expected = Vec::new();
+        for (wire, status) in [("queued", MessageStatus::Queued), ("steered", MessageStatus::Steered)] {
+            let mut raw = serde_json::to_value(user_entry(wire, "original historical followup")).unwrap();
+            raw["status"] = wire.into();
+            let entry = decode_entry_json(raw).unwrap();
+            assert_eq!(entry.status, Some(status));
+            doc.push_message(&entry).unwrap();
+            expected.push(entry);
+        }
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        let loaded = SessionDoc::from_doc(imported);
+        assert_eq!(loaded.read_entries().unwrap(), expected);
+        assert_eq!(loaded.read_opening_tail(10).unwrap(), expected);
+        // Delivery history is not executable queue/command admission.
+        assert!(loaded.read_commands().unwrap().is_empty());
+        assert!(loaded.read_queue().unwrap().is_empty());
+        assert_eq!(serde_json::to_value(&expected[0]).unwrap()["status"], "queued");
+        assert_eq!(serde_json::to_value(&expected[1]).unwrap()["status"], "steered");
     }
 
     #[test]

@@ -71,7 +71,7 @@ async fn enqueue_registry(store: &DocsStore, workspace: &WorkspaceHost) -> Resul
         if rows.is_empty() { return Ok(()); }
         for row in rows {
             after = row.id;
-            if uuid::Uuid::parse_str(&after).is_ok() { store.queue_directory(&after)?; }
+            if zeron_proto::is_cloud_session_id(&after) { store.queue_directory(&after)?; }
         }
         tokio::task::yield_now().await;
     }
@@ -102,6 +102,7 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
 
 async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
     id: &str, required_sources: &mut BTreeMap<String, Version>) -> Result<bool, EngineError> {
+    if !zeron_proto::is_cloud_session_id(id) { return Ok(true); }
     if workspace.directory_reconciliation_required() {
         return Err(failure("registry server reset observed; directory reconciliation required"));
     }
@@ -441,6 +442,30 @@ mod tests {
             device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
             org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
         }).unwrap();
+        let local_id = "local-chat-0123456789abcdef";
+        workspace.create_chat(local_id, None, Some("test-device"), Some(zeron_proto::ChatConfig {
+            harness: zeron_proto::HarnessId::Omp, model: Some("original-model".into()),
+            reasoning: None, model_options: Default::default(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        }), Some("/original/repo".into())).unwrap();
+        workspace.set_chat_harness_session(local_id, "original-native", "/original/repo");
+        let local = services.adopt_chat(&workspace, local_id).unwrap();
+        assert_eq!(local.id, local_id);
+        assert_eq!(local.harness_session_id.as_deref(), Some("original-native"));
+        assert!(local.crew.is_none());
+        assert!(services.session_metadata(local_id).is_err());
+        assert!(services.generate_title(local_id, "local prompt").await.is_err());
+        assert!(publish(&store, &services, &workspace, local_id, &mut BTreeMap::new()).await.unwrap());
+        assert!(requests.lock().unwrap().is_empty());
+        let mut fabricated = local;
+        fabricated.crew = Some(services.session_metadata(id).unwrap());
+        workspace.import_chat_row(&fabricated).unwrap();
+        assert!(services.adopt_chat(&workspace, local_id).is_err());
+        let client = services.runtime().client();
+        assert!(client.get_crew_session(local_id, Some("deployment-a")).await.is_err());
+        assert!(client.upsert_crew_session(&json!({"sessionId":local_id})).await.is_err());
+        assert!(client.generate_crew_title(local_id, Some("deployment-a"), "private").await.is_err());
+        assert!(requests.lock().unwrap().is_empty());
         let mut required = BTreeMap::new();
         enqueue_registry(&store, &workspace).await.unwrap();
         drain(&store, &services, &workspace, &mut required).await.unwrap();

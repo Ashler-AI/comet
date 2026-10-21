@@ -1,5 +1,5 @@
 {
-  "name": "@crew/upstream-canary-web",
+  "name": "@crew/native-web",
   "version": "0.2.0",
   "private": true,
   "type": "module",

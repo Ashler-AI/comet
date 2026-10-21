@@ -25,25 +25,12 @@ const INCOMING: &str = ".zeron-update-incoming.exe";
 /// Inno Setup's `_is1` suffix). Settings → Apps reads `DisplayVersion` here.
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{AD5DEC34-E254-467B-8F24-8127EBAF4DA6}_is1";
 
-#[derive(serde::Deserialize)]
-struct Config {
-    releases_url: String,
-}
 
 pub(super) fn is_managed(exe: &Path) -> bool {
     exe.file_name().is_some_and(|name| name == "zeron.exe")
         && exe.parent().is_some_and(|dir| dir.join(CONFIG).is_file())
 }
 
-pub(super) fn release_url() -> anyhow::Result<Option<String>> {
-    let exe = std::env::current_exe()?;
-    if !is_managed(&exe) {
-        return Ok(None);
-    }
-    let config: Config = serde_json::from_slice(&std::fs::read(exe.with_file_name(CONFIG))?)
-        .context("reading Windows update configuration")?;
-    super::validate_release_override(&config.releases_url).map(Some)
-}
 
 pub fn artifact(version: &str) -> String {
     format!("zeron-{version}-windows-{}.exe", std::env::consts::ARCH)
@@ -54,6 +41,7 @@ pub fn artifact(version: &str) -> String {
 /// leave a reusable, partially staged executable.
 pub async fn stage(
     edge_url: &str,
+    access_token: Option<&str>,
     manifest: &super::Manifest,
     directory: &Path,
 ) -> anyhow::Result<PathBuf> {
@@ -69,7 +57,7 @@ pub async fn stage(
     let expected = manifest
         .files
         .get(&file)
-        .and_then(|meta| meta.sha256.as_deref())
+        .map(|meta| meta.sha256.as_str())
         .context("Windows updates require a SHA-256 checksum")?;
     ensure!(
         expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -79,7 +67,7 @@ pub async fn stage(
         .prefix(".zeron-update-")
         .tempdir_in(directory)?;
     let staged = temporary.path().join("zeron.exe");
-    super::download_release_file(edge_url, manifest, &file, &staged).await?;
+    super::download_release_file(edge_url, access_token, manifest, &file, &staged).await?;
     std::fs::write(temporary.path().join("sha256"), expected)?;
     std::fs::write(temporary.path().join("version"), &manifest.version)?;
     verify(&staged)?;
@@ -459,45 +447,4 @@ mod tests {
         assert!(!backup.exists());
     }
 
-    #[tokio::test]
-    async fn manual_canary_rejects_download_before_staging() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = super::super::Manifest {
-            version: "1.2.3".into(),
-            ..Default::default()
-        };
-        assert!(
-            stage("http://127.0.0.1:1", &manifest, dir.path())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("private/manual")
-        );
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn manual_canary_preserves_install_without_contacting_feed() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let dir = tempfile::tempdir().unwrap();
-        let installed = dir.path().join("zeron.exe");
-        std::fs::write(&installed, b"existing installation").unwrap();
-        let manifest = super::super::Manifest {
-            version: "1.2.3".into(),
-            files: [(
-                artifact("1.2.3"),
-                super::super::FileMeta {
-                    sha256: Some(format!("{:x}", Sha256::digest(b"expected"))),
-                },
-            )]
-            .into(),
-        };
-        let error = stage(&base, &manifest, dir.path()).await.unwrap_err();
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept()).await.is_err());
-        assert!(error.to_string().contains("private/manual"));
-        assert!(apply(&installed, dir.path(), false).is_err());
-        assert_eq!(std::fs::read(&installed).unwrap(), b"existing installation");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
 }

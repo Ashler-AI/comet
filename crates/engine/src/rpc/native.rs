@@ -38,7 +38,9 @@ impl Drop for PeerWaitGuard {
 
 pub(super) fn handles(method: &str) -> bool {
     matches!(method, "ForkSession" | "HandoffSessionToScaffold" | "RecoverSessionHandoffToScaffold"
-        | "SendPeerMessage" | "ReplyPeerMessage" | "WaitPeerReply" | "DeliverPeerMessage" | "ImportCrewBackup")
+        | "HandoffSessionOnlyToScaffold" | "RecoverSessionOnlyHandoffToScaffold"
+        | "SendPeerMessage" | "ReplyPeerMessage" | "WaitPeerReply" | "DeliverPeerMessage" | "ImportCrewBackup" | "ExportCrewBackup"
+        | "VerifyImportedCrewSession" | "PublishImportedCrewSession")
 }
 fn failed(error: impl std::fmt::Display) -> RpcError { RpcError::Failed(error.to_string()) }
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, RpcError> {
@@ -52,6 +54,31 @@ fn branch_id(command: &str) -> String {
     uuid::Uuid::from_bytes(bytes).to_string()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VerifyImportedCrewSessionInput { logical_session_id: String }
+impl VerifyImportedCrewSessionInput {
+    fn parse(mut params: Value) -> Result<Self, RpcError> {
+        if let Some(params) = params.as_object_mut() {
+            params.remove("targetDeviceId");
+            params.remove("__crewAuthority");
+        }
+        let input: Self = zeron_rpc::parse_params(params)?;
+        if !uuid::Uuid::parse_str(&input.logical_session_id)
+            .is_ok_and(|id| id.to_string() == input.logical_session_id) {
+            return Err(RpcError::BadParams("logicalSessionId must be a canonical UUID".into()));
+        }
+        Ok(input)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyImportedCrewSessionResult {
+    report: zeron_sync::crew_import::CrewImportReport,
+    original_epoch_history_proof_json: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HandoffInput {
@@ -59,6 +86,7 @@ struct HandoffInput {
     command_id: String,
     prompt: String,
     database_environment: ScaffoldDatabaseEnvironment,
+    #[serde(default)] session_only: bool,
     #[serde(default)] recover_chat_id: Option<String>,
     #[serde(default)] recover_sandbox_id: Option<String>,
 }
@@ -125,6 +153,7 @@ impl EngineRpc {
 
     fn native_source(&self, id: &str) -> Result<BranchIntent, RpcError> {
         let source = self.crew_services()?.adopt_chat(&self.workspace, id).map_err(failed)?;
+        self.sessions.ensure_execution_allowed(id, source.harness_session_id.as_deref()).map_err(failed)?;
         if source.device_id != self.doc_host.device_id() { return Err(failed("Native source must be hosted on this engine")); }
         if !matches!(source.config.as_ref().map(|config| config.harness), Some(HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex)) {
             return Err(failed("This harness has no supported native fork; no transcript-only fallback is permitted"));
@@ -146,6 +175,7 @@ impl EngineRpc {
     }
 
     async fn prepare_native_branch(&self, key: &str, source_id: &str) -> Result<(BranchIntent, String, String), RpcError> {
+        self.sessions.ensure_execution_allowed(source_id, None).map_err(failed)?;
         let store = self.doc_host.crew_store();
         let intent_key = format!("{key}:snapshot");
         let intent: BranchIntent = match store.crew_command(&intent_key).map_err(failed)? {
@@ -156,6 +186,7 @@ impl EngineRpc {
                 intent
             }
         };
+        self.sessions.ensure_execution_allowed(source_id, Some(&intent.native_id)).map_err(failed)?;
         if intent.source.config.as_ref().map(|config| config.harness) != Some(HarnessId::Omp) {
             return Err(failed("Scaffold native transfer requires an OMP source"));
         }
@@ -170,12 +201,13 @@ impl EngineRpc {
         let expected_cwd = intent.cwd.clone();
         let expected_id = id.clone();
         let path_string = path.to_string_lossy().into_owned();
+        let scaffold_host = self.auth.as_ref().is_some_and(|auth| auth.device_mode());
         let captured = tokio::task::spawn_blocking(move || {
             if !path.exists() {
-                zeron_harness::omp::fork_native_session(&selector, &path, &expected_id).map_err(failed)?;
+                zeron_harness::omp::fork_native_session(&selector, &path, &expected_id, scaffold_host).map_err(failed)?;
             }
             if !prepared {
-                let blobs = zeron_harness::omp::native_session_blob_dir(&selector).map_err(failed)?;
+                let blobs = zeron_harness::omp::native_session_blob_dir(&selector, scaffold_host).map_err(failed)?;
                 crate::omp_session_artifact::prepare_native_branch_attachments(
                     &path, &expected_id, &expected_cwd, &blobs).map_err(failed)?;
             }
@@ -191,7 +223,43 @@ impl EngineRpc {
 
     pub(super) async fn native_rpc(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
         match method {
-            "ImportCrewBackup" => {
+            "VerifyImportedCrewSession" | "PublishImportedCrewSession" => {
+                let (subject, scope) = self.crew_services()?.controller()?;
+                if scope.session_id.is_some() {
+                    return Err(failed("Imported profile verification requires owner controller authority"));
+                }
+                let input = VerifyImportedCrewSessionInput::parse(params)?;
+                let principal = zeron_proto::CollaborationPrincipal {
+                    subject: subject.clone(), email: self.auth()?.verified_owner_email(),
+                    project_id: scope.project_id.clone(), deployment_id: scope.deployment_id.clone(),
+                    session_id: None, capabilities: vec![], unknown: Default::default(),
+                };
+                let store = self.doc_host.crew_store();
+                let device = self.doc_host.device_id().to_owned();
+                let expected_device = device.clone();
+                let report = tokio::task::spawn_blocking(move || {
+                    let profile = store.profile_root().map_err(failed)?;
+                    let report = zeron_sync::crew_import::verify_imported_profile(
+                        &profile, &principal, &device, &input.logical_session_id).map_err(failed)?;
+                    let proof_json = zeron_sync::crew_import::imported_original_epoch_proof_json(&profile, &report).map_err(failed)?;
+                    Ok::<_, RpcError>((report, proof_json))
+                }).await.map_err(failed)?;
+                let (current_subject, current_scope) = self.crew_services()?.controller()?;
+                if current_subject != subject || current_scope != scope
+                    || self.doc_host.device_id() != expected_device {
+                    return Err(failed("Crew controller scope changed during imported profile verification"));
+                }
+                let (report, original_epoch_history_proof_json) = report?;
+                if method == "PublishImportedCrewSession" {
+                    self.doc_host.publish_imported_terminal_history(&report).await.map_err(failed)?;
+                    let (current_subject, current_scope) = self.crew_services()?.controller()?;
+                    if current_subject != subject || current_scope != scope || self.doc_host.device_id() != expected_device {
+                        return Err(failed("Crew controller scope changed during imported history publication"));
+                    }
+                }
+                RpcReply::value(&VerifyImportedCrewSessionResult { report, original_epoch_history_proof_json })
+            }
+            "ImportCrewBackup" | "ExportCrewBackup" => {
                 self.native_controller()?;
                 let auth = self.auth()?;
                 let scope = auth.verified_scope().ok_or_else(|| failed("Verified scope required"))?;
@@ -201,18 +269,83 @@ impl EngineRpc {
                     deployment_id: scope.deployment_id, session_id: scope.session_id,
                     capabilities: vec![], unknown: Default::default(),
                 };
+                if method == "ExportCrewBackup" {
+                    if params.get("writersStopped").and_then(Value::as_bool) != Some(true) {
+                        return Err(RpcError::BadParams("explicit stopped-writer confirmation required".into()));
+                    }
+                    let original = std::path::PathBuf::from(string(&params, "sourceProfileRoot")?);
+                    let copied = std::path::PathBuf::from(string(&params, "sourceBackupRoot")?);
+                    let database = std::path::PathBuf::from(string(&params, "databaseRelative")?);
+                    let destination = std::path::PathBuf::from(string(&params, "destination")?);
+                    let native_roots: Vec<std::path::PathBuf> = serde_json::from_value(params.get("nativeHistoryRoots")
+                        .cloned().unwrap_or_else(|| json!([]))).map_err(|_| RpcError::BadParams("nativeHistoryRoots must be paths".into()))?;
+                    let context: Option<zeron_sync::crew_desktop_backup::DesktopSourceContext> = serde_json::from_value(
+                        params.get("desktopSourceContext").cloned().unwrap_or(Value::Null)).map_err(|_| RpcError::BadParams("invalid desktop source context".into()))?;
+                    let storage: Option<std::path::PathBuf> = serde_json::from_value(params.get("sourceStorageDirectory").cloned().unwrap_or(Value::Null))
+                        .map_err(|_| RpcError::BadParams("sourceStorageDirectory must be a path".into()))?;
+                    let attachments: Option<std::path::PathBuf> = serde_json::from_value(params.get("attachmentRoot").cloned().unwrap_or(Value::Null))
+                        .map_err(|_| RpcError::BadParams("attachmentRoot must be a path".into()))?;
+                    let terminal_authority: Option<std::path::PathBuf> = serde_json::from_value(params.get("terminalAuthorityRoot").cloned().unwrap_or(Value::Null))
+                        .map_err(|_| RpcError::BadParams("terminalAuthorityRoot must be a path".into()))?;
+                    let inventory_only: bool = serde_json::from_value(params.get("inventoryAttachmentsOnly").cloned().unwrap_or(Value::Bool(false)))
+                        .map_err(|_| RpcError::BadParams("inventoryAttachmentsOnly must be a Boolean".into()))?;
+                    if context.is_some() != storage.is_some()
+                        || (context.is_none() && (attachments.is_some() || terminal_authority.is_some() || inventory_only)) {
+                        return Err(RpcError::BadParams("desktop source context and storage are required together for witnessed export".into()));
+                    }
+                    if [&original, &copied, &destination].into_iter().chain(native_roots.iter())
+                        .chain(storage.iter()).chain(attachments.iter()).chain(terminal_authority.iter()).any(|path| !path.is_absolute()) {
+                        return Err(RpcError::BadParams("source and destination roots must be absolute paths".into()));
+                    }
+                    let manifest = tokio::task::spawn_blocking(move || -> Result<Value, zeron_sync::crew_import::CrewImportError> {
+                        let manifest = if let (Some(context), Some(storage)) = (context, storage) {
+                            if inventory_only {
+                                return Ok(serde_json::to_value(zeron_sync::crew_backup::inventory_desktop_crew_backup(
+                                    &original, &copied, &database, &destination, &native_roots, &principal, &context,
+                                    &storage, attachments.as_deref(), terminal_authority.as_deref())?)?);
+                            }
+                            zeron_sync::crew_backup::export_desktop_crew_backup(&original, &copied, &database, &destination,
+                                &native_roots, &principal, &context, &storage, attachments.as_deref(), terminal_authority.as_deref())?
+                        } else {
+                            zeron_sync::crew_backup::export_legacy_crew_backup(&original, &copied, &database, &destination, &native_roots, &principal)?
+                        };
+                        Ok(serde_json::to_value(manifest)?)
+                    })
+                        .await.map_err(failed)?.map_err(failed)?;
+                    return RpcReply::value(&manifest);
+                }
                 let source = std::path::PathBuf::from(string(&params, "backup")?);
                 let destination = std::path::PathBuf::from(string(&params, "destination")?);
                 if !source.is_absolute() || !destination.is_absolute() { return Err(failed("Backup and new destination must be absolute paths")); }
                 let device = self.doc_host.device_id().to_owned();
-                let report = tokio::task::spawn_blocking(move || zeron_sync::crew_import::import_legacy_crew_backup(
-                    &source, &destination, &principal, &device)).await.map_err(failed)?.map_err(failed)?;
+                let validate_only = match params.get("validateOnly") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => return Err(RpcError::BadParams("validateOnly must be a boolean".into())),
+                };
+                let verify_only = match params.get("verifyOnly") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => return Err(RpcError::BadParams("verifyOnly must be a boolean".into())),
+                };
+                if validate_only && verify_only { return Err(RpcError::BadParams("validation and destination readback are separate modes".into())); }
+                let report = tokio::task::spawn_blocking(move || {
+                    if validate_only {
+                        zeron_sync::crew_import::preflight_legacy_crew_backup(&source, &destination, &principal, &device)
+                    } else {
+                        let import = if verify_only { zeron_sync::crew_import::verify_legacy_crew_import }
+                            else { zeron_sync::crew_import::import_legacy_crew_backup };
+                        import(&source, &destination, &principal, &device)
+                            .and_then(|report| serde_json::to_value(report).map_err(Into::into))
+                    }
+                }).await.map_err(failed)?.map_err(failed)?;
                 RpcReply::value(&report)
             }
             "ForkSession" => {
                 self.native_controller()?;
                 let _gate = NATIVE_GATE.lock().await;
                 let source_id = string(&params, "sourceChatId")?;
+                self.sessions.ensure_execution_allowed(source_id, None).map_err(failed)?;
                 let command = string(&params, "commandId")?;
                 if command.len() > 256 { return Err(RpcError::BadParams("commandId exceeds 256 bytes".into())); }
                 let key = format!("native-fork:{command}");
@@ -230,6 +363,7 @@ impl EngineRpc {
                         seed
                     }
                 };
+                self.sessions.ensure_execution_allowed(source_id, Some(&seed.native_id)).map_err(failed)?;
                 let native_fork_pending = seed.source.config.as_ref().map(|config| config.harness) != Some(HarnessId::Omp);
                 let (intent, id) = if native_fork_pending {
                     let id = seed.native_id.clone();
@@ -256,11 +390,17 @@ impl EngineRpc {
                 store.finish_crew_command(&key, &serde_json::to_vec(&receipt).map_err(failed)?).map_err(failed)?;
                 RpcReply::value(&receipt)
             }
-            "HandoffSessionToScaffold" | "RecoverSessionHandoffToScaffold" => {
+            "HandoffSessionToScaffold" | "RecoverSessionHandoffToScaffold"
+            | "HandoffSessionOnlyToScaffold" | "RecoverSessionOnlyHandoffToScaffold" => {
                 self.native_controller()?;
                 let _gate = NATIVE_GATE.lock().await;
                 let mut input: HandoffInput = zeron_rpc::parse_params(params)?;
-                if method == "RecoverSessionHandoffToScaffold" {
+                let session_only = matches!(method, "HandoffSessionOnlyToScaffold" | "RecoverSessionOnlyHandoffToScaffold");
+                if input.session_only && !session_only {
+                    return Err(failed("Session-only transfer requires its dedicated RPC method"));
+                }
+                input.session_only = session_only;
+                if matches!(method, "RecoverSessionHandoffToScaffold" | "RecoverSessionOnlyHandoffToScaffold") {
                     input = self.recover_native_input(input)?;
                 } else if input.recover_chat_id.is_some() || input.recover_sandbox_id.is_some() {
                     return Err(failed("Preserved targets require the recovery method"));
@@ -282,10 +422,12 @@ impl EngineRpc {
                     command_id: input.command_id.clone(), source_session_id: input.source_chat_id.clone(),
                     native_session_id: selector, cwd: intent.cwd, prompt: input.prompt.clone(),
                     agent_route: route.clone(), database_environment: input.database_environment,
+                    session_only: input.session_only,
                     recover_chat_id: input.recover_chat_id, recover_sandbox_id: input.recover_sandbox_id,
                 }, &CancellationToken::new()).await?;
                 let mut chat = self.publish_crew_environment(receipt.attachment.clone(), Some(route)).await?;
                 chat.config = intent.source.config.clone(); chat.cwd = Some(receipt.cwd.clone());
+                chat.source_context = intent.source.source_context.clone();
                 chat.harness_session_id = Some(receipt.native_session_id.clone());
                 chat.harness_session_cwd = Some(receipt.cwd.clone());
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
@@ -333,8 +475,9 @@ impl EngineRpc {
             let original: HandoffInput = serde_json::from_slice(&bytes).map_err(failed)?;
             if original.source_chat_id != requested.source_chat_id || original.prompt != requested.prompt
                 || original.database_environment != requested.database_environment
+                || original.session_only != requested.session_only
                 || (!requested.command_id.is_empty() && original.command_id != requested.command_id) {
-                return Err(failed("Recovery cannot change the caller command, source, prompt or database mode"));
+                return Err(failed("Recovery cannot change the caller command, source, prompt, database or transfer mode"));
             }
             // prepare_handoff revalidates Stop/owner/scope before the same durable
             // prompt admission; never transfer another native branch to this target.
@@ -523,6 +666,53 @@ impl EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn imported_profile_verification_authenticates_before_profile_lookup() {
+        use zeron_rpc::RpcService;
+        let temp = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp, None,
+        ).unwrap();
+        for rpc in [core.build_rpc(), core.build_rpc().for_relay()] {
+            for params in [json!({"logicalSessionId": "53a67c53-cbc2-4a86-bffd-4c9f5c735590"}),
+                json!({"logicalSessionId": "invalid", "profileRoot": "/caller/path"})] {
+                for method in ["VerifyImportedCrewSession", "PublishImportedCrewSession"] {
+                    let error = match rpc.handle(method, params.clone()).await {
+                        Err(error) => error,
+                        Ok(_) => panic!("unauthenticated imported profile operation succeeded"),
+                    };
+                    assert!(error.to_string().contains("Crew sign-in required"));
+                }
+            }
+        }
+        assert!(core.rpc_service().handle("VerifyImportedCrewSession", json!({
+            "logicalSessionId": "53a67c53-cbc2-4a86-bffd-4c9f5c735590",
+            "__crewAuthority": {"subject": "owner"}
+        })).await.is_err());
+        core.sessions.shutdown().await;
+    }
+
+    #[test]
+    fn imported_profile_verification_has_a_fixed_session_only_route() {
+        let id = "53a67c53-cbc2-4a86-bffd-4c9f5c735590";
+        assert!(handles("VerifyImportedCrewSession"));
+        assert!(super::super::forwardable("VerifyImportedCrewSession"));
+        assert!(handles("PublishImportedCrewSession"));
+        assert!(super::super::forwardable("PublishImportedCrewSession"));
+        assert!(VerifyImportedCrewSessionInput::parse(json!({"logicalSessionId": id})).is_ok());
+        assert!(VerifyImportedCrewSessionInput::parse(json!({"logicalSessionId": id,
+            "targetDeviceId": "host", "__crewAuthority": {}})).is_ok());
+        for extra in ["backup", "source", "destination", "profileRoot", "principal", "report", "chatId"] {
+            let mut params = json!({"logicalSessionId": id});
+            params[extra] = json!("caller-controlled");
+            assert!(VerifyImportedCrewSessionInput::parse(params).is_err());
+        }
+        for invalid in ["", "not-a-uuid", "53A67C53-CBC2-4A86-BFFD-4C9F5C735590", "53a67c53cbc24a86bffd4c9f5c735590"] {
+            assert!(VerifyImportedCrewSessionInput::parse(json!({"logicalSessionId": invalid})).is_err());
+        }
+    }
     #[test]
     fn immutable_native_branch_and_peer_admission_identity() {
         assert_eq!(branch_id("caller-1"), branch_id("caller-1"));
