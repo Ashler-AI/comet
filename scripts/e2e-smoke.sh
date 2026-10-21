@@ -85,6 +85,7 @@ read -r EDGE_PORT A_PORT B_PORT < <(node --input-type=module -e '
 EDGE_URL="http://127.0.0.1:$EDGE_PORT"
 
 # ── 1. Fresh local-only Edge, with explicit development authority ─────────────
+# Match the native capability contract; local bindings intentionally have no defaults.
 echo "edge: starting isolated local worker on :$EDGE_PORT"
 set -m
 (
@@ -93,6 +94,7 @@ set -m
     --port "$EDGE_PORT" --persist-to "$LOG_DIR/edge" \
     --var AUTH_MODE:dev --var ENVIRONMENT:local \
     --var "SCAFFOLD_PROJECT_SCOPE:$ORG" --var "SCAFFOLD_DEPLOYMENT_ID:$ORG" \
+    --var "SCAFFOLD_REQUIRED_CAPABILITIES:session.read session.sync.write session.chat session.control session.annotate session.files session.environment" \
     --var "SCAFFOLD_CONTROL_PLANE_URL:$EDGE_URL"
 ) >"$LOG_DIR/edge.log" 2>&1 &
 EDGE_PID=$!
@@ -113,11 +115,14 @@ DRIVER="$ROOT/target/debug/examples/e2e_driver"
 mkdir -p "$A_DIR" "$B_DIR" "$LOG_DIR/home"
 
 start_engine() { # start_engine <data_dir> <ipc_port> <name> <log>
+  # Global mock mode deliberately strips Edge authority. The driver selects mock
+  # per chat; local inference permits that harness while the explicit dev bearer
+  # connects this isolated runtime to the local worker.
   env -i HOME="$LOG_DIR/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
     ASHLER_INCREMENTAL_TSC_CHECKS=false ZERON_NO_LOGIN_SHELL=1 \
     ZERON_DATA_DIR="$1" ZERON_IPC_PORT="$2" ZERON_DEVICE_NAME="$3" \
     ZERON_EDGE_URL="$EDGE_URL" ZERON_EDGE_TOKEN="$TOKEN" ZERON_ORG_ID="$ORG" \
-    ZERON_HARNESS=mock RUST_LOG=info "$ZERON" headless >"$4" 2>&1 &
+    COMET_INFERENCE_MODE=local RUST_LOG=info "$ZERON" headless >"$4" 2>&1 &
 }
 
 start_engine "$A_DIR" "$A_PORT" "e2e-device-a" "$LOG_DIR/engine-a.log"; A_PID=$!

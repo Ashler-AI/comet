@@ -62,6 +62,13 @@ TERM-resistant failure (669 ms and 2549 ms respectively). An earlier cold native
 entry hit the five-second smoke deadline; the instrumented attempt did not recur,
 so its cause remains unestablished and no deadline was extended.
 
+The real two-device smoke passed after updating its explicit local fixture:
+global mock mode intentionally disables Edge, so the fixture uses local inference
+with per-chat mock selection and supplies the native capability contract.
+Space/chat rows replicated through the isolated Worker, the remote command ran
+on its owning host, and the completed assistant reply and idle status returned
+to the other device. No installed profile, provider credential or deadline changed.
+
 Canary Agent Auth failures on October 21 came from staging Worker
 `690c85e0-c774-41a4-b4dd-42cd11cfe479` retiring the private broker at 22:26:15 UTC
 while the isolated Canary still depended on it. The in-flight provider error
