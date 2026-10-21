@@ -1,14 +1,13 @@
-//! Isolated Crew Canary service management. Never addresses an installed Crew
-//! or upstream Zeron service. Runtime coordinates are captured at installation;
-//! credentials remain in the profile auth store.
+//! Build-flavor-isolated Crew service management. Runtime coordinates are
+//! captured at installation; credentials remain in the profile auth store.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
 
-const LAUNCHD_LABEL: &str = "ai.ashler.crew.upstream-canary";
-const SYSTEMD_UNIT: &str = "crew-upstream-canary.service";
+const LAUNCHD_LABEL: &str = crate::environment::DEFAULTS.launchd_label;
+const SYSTEMD_UNIT: &str = crate::environment::DEFAULTS.systemd_unit;
 
 /// Capture executable discovery only. Runtime coordinates below come from the
 /// resolved CLI configuration, never stale inherited upstream service settings.
@@ -21,7 +20,7 @@ const CAPTURED_ENV: &[&str] = &[
 
 pub fn install(config: &zeron_engine::EngineConfig) -> anyhow::Result<()> {
     let data_dir = &config.data_dir;
-    let exe = std::env::current_exe().context("resolving the Crew Canary executable path")?;
+    let exe = std::env::current_exe().context("resolving the Crew executable path")?;
     let mut env = captured_env();
     env.extend([
         ("COMET_DATA_DIR".into(), data_dir.to_string_lossy().into_owned()),
@@ -240,8 +239,8 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.crew-upstream-canary/env\n\n[Install]\nWantedBy=default.target\n",
-        systemd_exec_path(exe)
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/{}/env\n\n[Install]\nWantedBy=default.target\n",
+        systemd_exec_path(exe), crate::environment::DEFAULTS.data_dir
     ));
     unit
 }
@@ -256,10 +255,10 @@ fn systemd_exec_path(exe: &Path) -> String {
 
 fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
     let installed = home
-        .map(|home| home.join(".crew-upstream-canary/app"))
+        .map(|home| home.join(crate::environment::DEFAULTS.data_dir).join("app"))
         .is_some_and(|app_root| exe.starts_with(app_root));
     if installed {
-        "%h/.crew-upstream-canary/app/current/comet".to_string()
+        format!("%h/{}/app/current/comet", crate::environment::DEFAULTS.data_dir)
     } else {
         format!("{}", exe.display())
     }
@@ -403,14 +402,12 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains("session.json"));
         assert!(!unit.contains("ConditionPathExists"));
-        assert!(unit.contains("EnvironmentFile=-%h/.crew-upstream-canary/env"));
+        assert!(unit.contains(&format!("EnvironmentFile=-%h/{}/env", crate::environment::DEFAULTS.data_dir)));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
     #[test]
-    fn canary_never_addresses_an_installed_service() {
-        assert_eq!(LAUNCHD_LABEL, "ai.ashler.crew.upstream-canary");
-        assert_eq!(SYSTEMD_UNIT, "crew-upstream-canary.service");
+    fn legacy_profile_executable_is_not_retargeted() {
         assert_eq!(exec_path_for(Path::new("/home/u/.zeron/app/0.3.0/zeron"), Some(Path::new("/home/u"))),
             "/home/u/.zeron/app/0.3.0/zeron");
     }
@@ -421,10 +418,10 @@ mod tests {
         // the versioned dir): the unit must point back at the symlink.
         assert_eq!(
             exec_path_for(
-                Path::new("/home/u/.crew-upstream-canary/app/0.3.0/comet"),
+                &Path::new("/home/u").join(crate::environment::DEFAULTS.data_dir).join("app/0.3.0/comet"),
                 Some(Path::new("/home/u")),
             ),
-            "%h/.crew-upstream-canary/app/current/comet"
+            format!("%h/{}/app/current/comet", crate::environment::DEFAULTS.data_dir)
         );
         // Source build: literal path.
         assert_eq!(
@@ -443,7 +440,7 @@ mod tests {
             &[("ZERON_EDGE_URL".into(), "https://e?a=1&b=2".into())],
             Path::new("/Users/x/.zeron/daemon.log"),
         );
-        assert!(plist.contains("<key>Label</key><string>ai.ashler.crew.upstream-canary</string>"));
+        assert!(plist.contains(&format!("<key>Label</key><string>{LAUNCHD_LABEL}</string>")));
         // XML-escaped exe path and env value.
         assert!(plist.contains("<string>/Users/x/zeron &amp; co/zeron</string>"));
         assert!(plist.contains("<string>https://e?a=1&amp;b=2</string>"));

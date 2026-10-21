@@ -6,6 +6,7 @@
 mod auth_cli;
 mod crew_cli;
 mod daemon;
+mod environment;
 mod paths;
 mod update_cli;
 mod session_cli;
@@ -153,7 +154,9 @@ fn main() -> anyhow::Result<()> {
     let persist_runtime = matches!(&cli.command,
         None | Some(Command::Headless(_) | Command::Login | Command::Logout)
         | Some(Command::Daemon { command: DaemonCommand::Install | DaemonCommand::Start | DaemonCommand::Restart }));
-    let mut config = cli.runtime.config(persist_runtime)?;
+    let own_runtime = persist_runtime || matches!(&cli.command,
+        Some(Command::Status | Command::Daemon { .. }));
+    let mut config = cli.runtime.config(persist_runtime, own_runtime)?;
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;

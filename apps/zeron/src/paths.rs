@@ -28,14 +28,14 @@ fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
                     .map(|home| PathBuf::from(home).join("AppData").join("Local"))
             })
             .expect("LOCALAPPDATA and USERPROFILE not set; set COMET_DATA_DIR");
-        local.join("Crew Canary")
+        local.join(crate::environment::DEFAULTS.windows_data_dir)
     }
     #[cfg(not(windows))]
     {
         let home = PathBuf::from(env("HOME").expect("HOME not set"));
-        // Canary startup never renames or opens the installed Crew profile.
+        // Never migrate or adopt an installed profile when selecting a flavor.
         // Importing an existing profile is a separate, explicit operation.
-        home.join(".crew-upstream-canary")
+        home.join(crate::environment::DEFAULTS.data_dir)
     }
 }
 
@@ -69,17 +69,31 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn starting_canary_does_not_adopt_an_installed_profile() {
+    fn starting_selected_flavor_does_not_adopt_an_installed_profile() {
         let home = tempfile::tempdir().unwrap();
-        let installed = home.path().join(".comet-native");
-        std::fs::create_dir(&installed).unwrap();
-        std::fs::write(installed.join("sentinel"), b"retained-session").unwrap();
+        let installed = [".comet-native", ".comet-native-staging", ".zeron"];
+        for name in installed {
+            let profile = home.path().join(name);
+            std::fs::create_dir(&profile).unwrap();
+            std::fs::write(profile.join("sentinel"), b"retained-session").unwrap();
+        }
         let selected = resolve(&[("HOME", home.path().to_str().unwrap())]);
-        assert_ne!(selected, installed);
+        assert_eq!(selected, home.path().join(crate::environment::DEFAULTS.data_dir));
         assert!(!selected.exists());
+        for name in installed {
+            assert_eq!(
+                std::fs::read(home.path().join(name).join("sentinel")).unwrap(),
+                b"retained-session"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selected_flavor_uses_native_local_app_data() {
         assert_eq!(
-            std::fs::read(installed.join("sentinel")).unwrap(),
-            b"retained-session"
+            resolve(&[("LOCALAPPDATA", "local"), ("HOME", "ignored")]),
+            PathBuf::from("local").join(crate::environment::DEFAULTS.windows_data_dir)
         );
     }
 

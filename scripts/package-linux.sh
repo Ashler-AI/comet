@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Linux packaging: build the release binary and produce
-#   target/package/crew-upstream-canary-<version>-linux-<arch>.tar.gz
-# containing comet, the matching crew-web bundle and contract, desktop assets,
-# and a manual install.sh. The browser bundle requires Node 22.4 or newer.
-# Installs only into ~/.crew-upstream-canary/app and a canary-named launcher.
+#   target/package/comet-<version>-linux-<arch>.tar.gz
+# containing the binary, the .desktop entry, and the icon, plus an install.sh
+# that drops them into ~/.local (XDG) paths.
 #
 # Usage: scripts/package-linux.sh
 # Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
@@ -12,133 +11,74 @@ set -euo pipefail
 export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "Linux packaging requires a Linux runner" >&2
+  exit 1
+fi
 PROFILE="${PROFILE:-release}"
 ARCH="$(uname -m)"
-VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
+case "$ARCH" in
+  amd64) ARCH=x86_64 ;;
+  arm64) ARCH=aarch64 ;;
+esac
+WORKSPACE_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml")"
+VERSION="${COMET_RELEASE_VERSION:-$WORKSPACE_VERSION}"
+if [[ -z "$WORKSPACE_VERSION" || "$VERSION" != "$WORKSPACE_VERSION" ]]; then
+  echo "release version '$VERSION' does not match workspace version '$WORKSPACE_VERSION'" >&2
+  exit 1
+fi
 OUT_DIR="$ROOT/target/package"
-STAGE="$OUT_DIR/crew-upstream-canary-$VERSION-linux-$ARCH"
+STAGE="$OUT_DIR/comet-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"
-TARGET_DIR="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+BIN="$(mktemp)"
+trap 'rm -f "$BIN"' EXIT
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build --locked --release -p zeron
-  BIN="$TARGET_DIR/release/zeron"
-elif [[ "$PROFILE" == "debug" ]]; then
-  cargo build --locked -p zeron
-  BIN="$TARGET_DIR/debug/zeron"
+  python3 scripts/local-cargo.py build --release --locked -p zeron --copy-binary release/zeron "$BIN"
 else
-  echo "PROFILE must be release or debug" >&2
-  exit 1
+  python3 scripts/local-cargo.py build --locked -p zeron --copy-binary debug/zeron "$BIN"
 fi
 
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/comet"
-install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/crew-upstream-canary.desktop"
-install -m 644 "$ROOT/dist/zeron.png" "$STAGE/crew-upstream-canary.png"
+rm -f "$BIN"
+install -m 644 "$ROOT/dist/comet.desktop" "$STAGE/comet.desktop"
+install -m 644 "$ROOT/dist/zeron.png" "$STAGE/comet.png"
+install -m 644 "$ROOT/dist/zeron.svg" "$STAGE/comet.svg"
+
 install -m 644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
-mkdir -p "$STAGE/crew-web/public"
-install -m 644 "$ROOT/apps/web/server.mjs" "$ROOT/apps/web/rpc.mjs" "$ROOT/apps/web/package.json" "$ROOT/apps/web/contract.json" "$STAGE/crew-web/"
-install -m 644 "$ROOT/apps/web/public/app.js" "$ROOT/apps/web/public/index.html" "$ROOT/apps/web/public/style.css" "$STAGE/crew-web/public/"
+
+# The sandbox serves this fixed-session viewport from the same immutable release
+# as its Crew engine. No package installation or frontend build runs at boot.
+mkdir -p "$STAGE/crew-web"
+tar -cf - --exclude='*.test.mjs' --exclude=node_modules --exclude=package-lock.json \
+  -C "$ROOT/apps/web" . | tar -xf - -C "$STAGE/crew-web"
+test -f "$STAGE/crew-web/server.mjs"
+test -f "$STAGE/crew-web/public/index.html"
 install -m 644 "$ROOT/apps/web/contract.json" "$STAGE/crew-web-contract.json"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
-# Install Crew Canary for this user; never overwrite Crew/Zeron installations.
-# This manual delivery layout does not opt into a shared release channel.
+# Install Crew into ~/.local (no root needed).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="__VERSION__"
-APP_ROOT="$HOME/.crew-upstream-canary/app"
-DIGEST="$(sha256sum "$HERE/comet" | cut -d' ' -f1)"
-DEST="$APP_ROOT/$VERSION-$DIGEST"
-mkdir -p "$APP_ROOT"
-if [ ! -x "$DEST/comet" ]; then
-  # Copy beside the final name, then rename: an interrupted install never
-  # leaves a half-copied version the updater would trust.
-  STAGE="$(mktemp -d "$APP_ROOT/.install-$VERSION-XXXXXX")"
-  cp -R "$HERE/." "$STAGE/"
-  rm -rf "$DEST"
-  mv "$STAGE" "$DEST"
-fi
-if ! "$DEST/comet" --version >/dev/null; then
-  echo "Crew Canary could not start; see the loader error above. Install the missing runtime libraries (including ALSA, libasound.so.2), then retry." >&2
-  exit 1
-fi
-ln -sfn "$DEST" "$APP_ROOT/current"
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$APP_ROOT/current/comet" "$HOME/.local/bin/crew-upstream-canary"
-
-# Absolute paths work even when ~/.local/bin is absent from the GUI PATH.
-install_desktop_entry() {
-  src="$1"
-  app="$2"
-  [ -f "$src/crew-upstream-canary.desktop" ] && [ -f "$src/crew-upstream-canary.png" ] || return 1
-  case "${XDG_DATA_HOME:-}" in
-    /*) data_home="$XDG_DATA_HOME" ;;
-    *) data_home="$HOME/.local/share" ;;
-  esac
-  apps_dir="$data_home/applications"
-  icon_dir="$data_home/icons/hicolor/1024x1024/apps"
-  bin="$app/current/comet"
-  icon="$app/current/crew-upstream-canary.png"
-  # Desktop Entry `Exec` quoting: double-quote an argument with reserved
-  # characters, backslash-escape ", `, $ and \ inside, then double every
-  # backslash again for the file's own string escaping. `%` must be `%%`.
-  case "$bin" in
-    *[!A-Za-z0-9_./-]*)
-      exec_bin="\"$(printf '%s' "$bin" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g' -e 's/%/%%/g')\""
-      ;;
-    *) exec_bin="$bin" ;;
-  esac
-  try_bin="$(printf '%s' "$bin" | sed 's/\\/\\\\/g')"
-  icon_val="$(printf '%s' "$icon" | sed 's/\\/\\\\/g')"
-
-  mkdir -p "$apps_dir" "$icon_dir" || return 1
-  # Write beside the final name, then rename, so a launcher watching the
-  # directory never reads a half-written entry (a leading dot is ignored).
-  entry_tmp="$apps_dir/.crew-upstream-canary.desktop.$$"
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      Exec=*) printf 'Exec=%s %%u\n' "$exec_bin" ;;
-      TryExec=*) printf 'TryExec=%s\n' "$try_bin" ;;
-      Icon=*) printf 'Icon=%s\n' "$icon_val" ;;
-      *) printf '%s\n' "$line" ;;
-    esac
-  done <"$src/crew-upstream-canary.desktop" >"$entry_tmp" || { rm -f "$entry_tmp"; return 1; }
-  mv -f "$entry_tmp" "$apps_dir/crew-upstream-canary.desktop" || { rm -f "$entry_tmp"; return 1; }
-  cp "$src/crew-upstream-canary.png" "$icon_dir/.crew-upstream-canary.png.$$" \
-    && mv -f "$icon_dir/.crew-upstream-canary.png.$$" "$icon_dir/crew-upstream-canary.png" || return 1
-
-  # Best-effort cache refresh; both tools are optional. The icon cache is only
-  # refreshed, never created: a user-level hicolor cache nobody else maintains
-  # would hide icons other apps later install there, and the entry above
-  # references the icon by path anyway.
-  command -v update-desktop-database >/dev/null 2>&1 \
-    && update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
-  [ -f "$data_home/icons/hicolor/icon-theme.cache" ] \
-    && command -v gtk-update-icon-cache >/dev/null 2>&1 \
-    && gtk-update-icon-cache -q -t -f "$data_home/icons/hicolor" >/dev/null 2>&1 || true
-  return 0
-}
-install_desktop_entry "$HERE" "$APP_ROOT" \
-  || echo "warn: could not install the desktop entry — Crew Canary won't appear in application launchers"
-
-echo "Installed Crew Canary $VERSION. Updates require another private/manual package."
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) echo "Add ~/.local/bin to your PATH to run \`crew-upstream-canary\` from a terminal." ;;
-esac
+install -Dm755 "$HERE/comet" "$HOME/.local/bin/comet"
+install -Dm644 "$HERE/comet.desktop" "$HOME/.local/share/applications/comet.desktop"
+install -Dm644 "$HERE/comet.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/comet.png"
+install -Dm644 "$HERE/comet.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/comet.svg"
+command -v update-desktop-database >/dev/null 2>&1 \
+  && update-desktop-database "$HOME/.local/share/applications" || true
+echo "Crew installed. Make sure ~/.local/bin is on your PATH."
 INSTALL
-sed -i "s/__VERSION__/$VERSION/" "$STAGE/install.sh"
 chmod 755 "$STAGE/install.sh"
 
-tar -czf "$TARBALL" -C "$OUT_DIR" "$(basename "$STAGE")"
+GZIP=-n tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 \
+  --numeric-owner -czf "$TARBALL" -C "$OUT_DIR" "$(basename "$STAGE")"
 rm -rf "$STAGE"
 echo "packaged: $TARBALL"
 tar -tzf "$TARBALL"
