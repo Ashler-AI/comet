@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Crew Canary
+GenericName=Coding Agent Controller
+Comment=Multi-device controller for coding agents
+Exec=crew-upstream-canary %u
+TryExec=crew-upstream-canary
+Icon=crew-upstream-canary
+Terminal=false
+StartupNotify=true
+Categories=Development;Utility;
+Keywords=agent;claude;codex;ai;coding;
+StartupWMClass=zeron
+MimeType=x-scheme-handler/crew-upstream-canary;

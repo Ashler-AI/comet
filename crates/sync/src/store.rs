@@ -2,12 +2,12 @@
 //! processed-command ledger (ARCHITECTURE §2 command plane: entries are marked
 //! processed BEFORE execution so a crash can never double-execute a command).
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use comet_doc::PendingRecord;
 
 /// Errors surfaced by [`DocsStore`].
 #[derive(Debug, thiserror::Error)]
@@ -16,10 +16,21 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("semantic journal: {0}")]
-    SemanticJournal(#[from] serde_json::Error),
-    #[error("document scope conflict: {0}")]
-    ScopeConflict(String),
+    #[error("command conflict: {0}")]
+    CommandConflict(String),
+}
+
+/// Synchronous command/doc callbacks still need commit-before-send semantics.
+/// Relinquish a multithread runtime's core BEFORE either SQLite or its mutex
+/// can block; moving only the snapshot writer leaves these contenders fatal.
+pub(crate) fn store_blocking<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
 }
 
 /// Ordered, append-only migrations. Each entry runs once inside a transaction;
@@ -35,58 +46,75 @@ const MIGRATIONS: &[&str] = &[
         command_id   TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
      ) STRICT;",
-    // v2 — durable local provenance for commands that do not carry a remote grant.
-    "CREATE TABLE trusted_local_commands (
-        command_id TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
-     ) STRICT;",
-    // v3 — one-shot data migrations scoped by this store's project/principal path.
-    "CREATE TABLE local_migrations (
-        name TEXT PRIMARY KEY,
-        applied_at INTEGER NOT NULL
-     ) STRICT;",
-    "CREATE TABLE crew_directory_jobs (
-        session_id TEXT PRIMARY KEY,
-        generation INTEGER NOT NULL DEFAULT 1,
-        state TEXT NOT NULL DEFAULT '{}',
-        deleted INTEGER NOT NULL DEFAULT 0,
-        due_at INTEGER NOT NULL DEFAULT 0,
-        retry_at INTEGER NOT NULL DEFAULT 0
+    // v2 — chat2 room cursor + doc epoch (docs/chat2-sync.md C2). The cursor
+    // is persisted in the SAME transaction as the snapshot bytes, so content
+    // and cursor cannot diverge (restored backups / copied devices simply
+    // redownload from their honest cursor). `epoch` marks rebuild lineage
+    // (M1/M3): 2 = thin chat2 rebuild; NULL/0 = pre-migration s2 doc.
+    "ALTER TABLE snapshots ADD COLUMN cursor INTEGER;
+     ALTER TABLE snapshots ADD COLUMN epoch INTEGER;",
+    // v3 — publication survives actor eviction and process restart.
+    "CREATE TABLE chat_outbox (
+        ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL UNIQUE,
+        bytes BLOB NOT NULL,
+        needs_checkpoint INTEGER NOT NULL DEFAULT 0
      ) STRICT;
-     CREATE INDEX crew_directory_jobs_due ON crew_directory_jobs(due_at, session_id);",
-    // v5 — completed turns outrank backfill once their retry deadline has passed.
-    "ALTER TABLE crew_directory_jobs ADD COLUMN completed_turn_pending INTEGER NOT NULL DEFAULT 0;",
-    // v6 — semantic local edits survive authoritative history replacement.
-    "CREATE TABLE semantic_intents (
+     CREATE INDEX chat_outbox_doc ON chat_outbox(doc_id,ordinal);
+     CREATE TABLE chat_outbox_initialized (doc_id TEXT PRIMARY KEY) STRICT;",
+    // Older cursors may have advanced over parked imports. Trust only writes
+    // made by the causal-aware persister, not every legacy epoch-2 snapshot.
+    "ALTER TABLE snapshots ADD COLUMN cursor_verified INTEGER NOT NULL DEFAULT 0;",
+    // Durable wake/recovery receipts, independent of live document handles.
+    "CREATE TABLE chat_sync_jobs (
+        doc_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY(doc_id, kind)
+    ) STRICT;
+    CREATE TABLE sync_job_clock (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL) STRICT;
+    INSERT INTO sync_job_clock VALUES (1,0);",
+    "ALTER TABLE chat_sync_jobs ADD COLUMN cursor TEXT NOT NULL DEFAULT '';",
+    "CREATE TABLE crew_commands (
+        command_id TEXT PRIMARY KEY,
+        request BLOB NOT NULL,
+        outcome BLOB
+    ) STRICT;",
+    "CREATE TABLE legacy_crew_records (
         doc_id TEXT NOT NULL,
         container TEXT NOT NULL,
         record_id TEXT NOT NULL,
         value BLOB NOT NULL,
-        acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
-        PRIMARY KEY (doc_id, container, record_id)
-     ) STRICT;",
-    "CREATE TABLE document_scopes (doc_id TEXT PRIMARY KEY, scope TEXT NOT NULL) STRICT;",
-    // v8 — accepted device wakes are independent of replaceable CRDT caches.
-    "CREATE TABLE pending_nudges (
-        chat_id TEXT PRIMARY KEY,
-        nudge_id TEXT NOT NULL,
-        accepted_at INTEGER NOT NULL
-     ) STRICT;",
-    // v9 — zeroblob stays compact only at the record tail, after saved_at.
-    // Keep rowids and every cache/backup byte; all callers name their columns.
-    "CREATE TABLE snapshots_blob_tail (
+        PRIMARY KEY(doc_id,container,record_id)
+    ) STRICT;",
+    // Observed directory evidence survives deleting a transcript. Work itself
+    // uses chat_sync_jobs, including its conditional-completion generation.
+    "CREATE TABLE crew_directory_state (
         doc_id TEXT PRIMARY KEY,
-        saved_at INTEGER NOT NULL,
-        bytes BLOB NOT NULL
-     ) STRICT;
-     INSERT INTO snapshots_blob_tail (rowid, doc_id, saved_at, bytes)
-        SELECT rowid, doc_id, saved_at, bytes FROM snapshots;
-     DROP TABLE snapshots;
-     ALTER TABLE snapshots_blob_tail RENAME TO snapshots;",
-    // v10 — immutable host setup is committed with its first command, not an index write.
-    "ALTER TABLE semantic_intents ADD COLUMN admission_context BLOB;
-     CREATE TABLE session_startups (chat_id TEXT PRIMARY KEY, worktree_path TEXT, cancelled INTEGER NOT NULL DEFAULT 0 CHECK(cancelled IN (0,1))) STRICT;",
+        state TEXT NOT NULL
+    ) STRICT;",
 ];
+
+const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// WAL size retained after a checkpoint resets the log. SQLite's default (-1)
+/// keeps the file at its all-time high-water mark (observed: 400 MB). Steady
+/// state never reaches this — auto-checkpoint folds the log every ~4 MB
+/// (1000 pages) — so the cap only bites after a large burst (a multi-MB
+/// snapshot, a VACUUM). 64 MiB bounds idle disk use while sparing ordinary
+/// bursts a truncate/re-extend cycle on every write.
+const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+/// VACUUM ([`DocsStore::reclaim_free_space`]) only when free pages are BOTH a large share of the file
+/// and a meaningful absolute size: a healthy database never pays the rewrite.
+const VACUUM_MIN_FREE_BYTES: i64 = 32 * 1024 * 1024;
+/// `freelist_count / page_count` above which reclaiming is worth a rewrite.
+const VACUUM_MIN_FREE_DENOMINATOR: i64 = 4;
+
+/// Maintenance is skipped (and logged) rather than waited on when another
+/// connection holds a lock.
+const MAINTENANCE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
 ///
@@ -95,7 +123,9 @@ const MIGRATIONS: &[&str] = &[
 /// that gives command execution mark-BEFORE-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
-    record_buffer: Mutex<Vec<u8>>,
+    failed_publications: Mutex<HashSet<String>>,
+    /// Snapshot jobs wait here asynchronously before entering the blocking pool.
+    pub snapshot_writer: std::sync::Arc<tokio::sync::Mutex<()>>,
     directory_changed: tokio::sync::watch::Sender<u64>,
 }
 
@@ -103,48 +133,246 @@ impl DocsStore {
     /// Open (creating directory, database, and schema as needed).
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let data_dir = data_dir.as_ref();
+        if data_dir.join("crew-import-incomplete").exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "incomplete Crew import: retain it for diagnosis and import into a fresh profile").into());
+        }
         std::fs::create_dir_all(data_dir)?;
-        let mut conn = Connection::open(data_dir.join("docs.sqlite3"))?;
+        let path = data_dir.join("docs.sqlite3");
+        let mut conn = Connection::open(&path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT_BYTES)?;
+        conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
         migrate(&mut conn)?;
+        // Best-effort hygiene must never stall boot behind another connection.
+        conn.busy_timeout(MAINTENANCE_BUSY_TIMEOUT)?;
+        // Only the cheap WAL truncate here: open sits on boot paths (engine
+        // assembly, the iOS client), and a VACUUM's cost is linear in the
+        // live size. Callers run `reclaim_free_space` off those paths.
+        checkpoint_truncate(&conn, &path, "open");
+        conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
         Ok(Self {
-            directory_changed: tokio::sync::watch::channel(0).0,
             conn: Mutex::new(conn),
-            record_buffer: Mutex::new(Vec::new()),
+            failed_publications: Mutex::new(HashSet::new()),
+            snapshot_writer: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            directory_changed: tokio::sync::watch::channel(0).0,
         })
     }
 
-    /// Commit before acknowledging a device-room nudge. Duplicate delivery never
-    /// renews its deadline; a newly accepted token replaces only this chat's wake.
-    pub fn accept_nudge(&self, chat_id: &str, nudge_id: &str) -> Result<(), StoreError> {
+    pub fn watch_directory(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.directory_changed.subscribe()
+    }
+
+    pub fn queue_directory(&self, id: &str) -> Result<(), StoreError> {
+        self.schedule_sync_job(id, "crew-directory")?;
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
+    }
+
+    pub fn directory_state(&self, id: &str) -> Result<Option<String>, StoreError> {
+        store_blocking(|| Ok(self.conn().query_row(
+            "SELECT state FROM crew_directory_state WHERE doc_id=?1", params![id], |r| r.get(0),
+        ).optional()?))
+    }
+
+    pub fn save_directory_state(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        store_blocking(|| {
+            self.conn().execute(
+                "INSERT INTO crew_directory_state(doc_id,state) VALUES (?1,?2)
+                 ON CONFLICT(doc_id) DO UPDATE SET state=excluded.state", params![id, state],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Reject oversized compressed snapshots before SQLite allocates their blob.
+    pub fn load_directory_snapshot(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let size: Option<i64> = conn.query_row(
+                "SELECT length(bytes) FROM snapshots WHERE doc_id=?1", params![id], |r| r.get(0),
+            ).optional()?;
+            if size.is_some_and(|size| size > 32 * 1024 * 1024) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                    "directory snapshot exceeds 32 MiB; reconciliation required").into());
+            }
+            Ok(conn.query_row("SELECT bytes FROM snapshots WHERE doc_id=?1",
+                params![id], |r| r.get(0)).optional()?)
+        })
+    }
+
+    fn queue_directory_in(&self, tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), StoreError> {
+        if uuid::Uuid::parse_str(id).is_ok() {
+            tx.execute("UPDATE sync_job_clock SET value=value+1 WHERE id=1", [])?;
+            tx.execute(
+                "INSERT INTO chat_sync_jobs(doc_id,kind,version)
+                 SELECT ?1,'crew-directory',value FROM sync_job_clock WHERE id=1
+                 ON CONFLICT(doc_id,kind) DO UPDATE SET version=excluded.version",
+                params![id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Insert before sending. Stable IDs make crash-after-ACK replay idempotent.
+    pub fn enqueue_chat_update(
+        &self,
+        doc_id: &str,
+        batch_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        store_blocking(|| self.enqueue_chat_update_blocking(doc_id, batch_id, bytes))
+    }
+
+    fn enqueue_chat_update_blocking(
+        &self,
+        doc_id: &str,
+        batch_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let result = self.conn().execute(
+            "INSERT OR IGNORE INTO chat_outbox(doc_id,batch_id,bytes) VALUES (?1,?2,?3)",
+            params![doc_id, batch_id, bytes],
+        );
+        if result.is_err() {
+            self.failed_publications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(doc_id.to_string());
+        }
+        result?;
+        Ok(())
+    }
+
+    pub fn pending_chat_updates(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        store_blocking(|| self.pending_chat_updates_blocking(doc_id))
+    }
+
+    /// Admission/lifetime checks must not copy the pending payloads.
+    pub fn has_pending_chat_updates(&self, doc_id: &str) -> Result<bool, StoreError> {
+        store_blocking(|| {
+            Ok(self.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_outbox WHERE doc_id=?1)",
+                params![doc_id],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    fn pending_chat_updates_blocking(
+        &self,
+        doc_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT batch_id,bytes FROM chat_outbox WHERE doc_id=?1 ORDER BY ordinal")?;
+        Ok(stmt
+            .query_map(params![doc_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn reject_chat_update(&self, doc_id: &str, batch_id: &str) -> Result<(), StoreError> {
+        store_blocking(|| self.reject_chat_update_blocking(doc_id, batch_id))
+    }
+
+    fn reject_chat_update_blocking(&self, doc_id: &str, batch_id: &str) -> Result<(), StoreError> {
         self.conn().execute(
-            "INSERT INTO pending_nudges(chat_id, nudge_id, accepted_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(chat_id) DO UPDATE SET nudge_id = excluded.nudge_id,
-             accepted_at = excluded.accepted_at WHERE pending_nudges.nudge_id != excluded.nudge_id",
-            params![chat_id, nudge_id, now_ms()],
+            "UPDATE chat_outbox SET needs_checkpoint=1 WHERE doc_id=?1 AND batch_id=?2",
+            params![doc_id, batch_id],
         )?;
         Ok(())
     }
 
-    pub fn pending_nudges(&self) -> Result<Vec<(String, String, i64)>, StoreError> {
-        let conn = self.conn();
-        let mut query = conn.prepare("SELECT chat_id, nudge_id, accepted_at FROM pending_nudges ORDER BY chat_id")?;
-        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    pub fn rejected_chat_updates(
+        &self,
+        doc_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        store_blocking(|| self.rejected_chat_updates_blocking(doc_id))
     }
 
-    /// An older processor must never remove a newer accepted wake.
-    pub fn complete_nudge(&self, chat_id: &str, nudge_id: &str) -> Result<bool, StoreError> {
-        Ok(self.conn().execute(
-            "DELETE FROM pending_nudges WHERE chat_id = ?1 AND nudge_id = ?2",
-            params![chat_id, nudge_id],
-        )? != 0)
+    fn rejected_chat_updates_blocking(
+        &self,
+        doc_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT batch_id,bytes FROM chat_outbox WHERE doc_id=?1 AND needs_checkpoint=1 ORDER BY ordinal")?;
+        Ok(stmt
+            .query_map(params![doc_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn acknowledge_chat_update(&self, doc_id: &str, batch_id: &str) -> Result<(), StoreError> {
+        store_blocking(|| self.acknowledge_chat_update_blocking(doc_id, batch_id))
+    }
+
+    fn acknowledge_chat_update_blocking(
+        &self,
+        doc_id: &str,
+        batch_id: &str,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "DELETE FROM chat_outbox WHERE doc_id=?1 AND batch_id=?2",
+            params![doc_id, batch_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn chat_outbox_initialized(&self, doc_id: &str) -> Result<bool, StoreError> {
+        store_blocking(|| self.chat_outbox_initialized_blocking(doc_id))
+    }
+
+    fn chat_outbox_initialized_blocking(&self, doc_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM chat_outbox_initialized WHERE doc_id=?1",
+                params![doc_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Upgrade legacy snapshots (including orphaned local history) once. The
+    /// marker and complete replay obligation commit together; never reset cursors.
+    pub fn initialize_chat_outbox(
+        &self,
+        doc_id: &str,
+        updates: &[Vec<u8>],
+    ) -> Result<(), StoreError> {
+        store_blocking(|| self.initialize_chat_outbox_blocking(doc_id, updates))
+    }
+
+    fn initialize_chat_outbox_blocking(
+        &self,
+        doc_id: &str,
+        updates: &[Vec<u8>],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if tx.execute(
+            "INSERT OR IGNORE INTO chat_outbox_initialized(doc_id) VALUES (?1)",
+            params![doc_id],
+        )? != 0
+        {
+            for bytes in updates {
+                tx.execute(
+                    "INSERT INTO chat_outbox(doc_id,batch_id,bytes) VALUES (?1,?2,?3)",
+                    params![doc_id, uuid::Uuid::new_v4().to_string(), bytes],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Latest saved snapshot for `doc_id`, if any.
     pub fn load_snapshot(&self, doc_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        store_blocking(|| self.load_snapshot_blocking(doc_id))
+    }
+
+    fn load_snapshot_blocking(&self, doc_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let bytes = self
             .conn()
             .query_row(
@@ -158,260 +386,250 @@ impl DocsStore {
 
     /// Save (upsert) the snapshot for `doc_id`.
     pub fn save_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        self.save_snapshot_with_priority(doc_id, bytes, false)
+        store_blocking(|| self.save_snapshot_blocking(doc_id, bytes))
     }
 
-    /// Persist a completed turn and prioritize its next directory claim atomically.
-    pub fn save_completed_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        self.save_snapshot_with_priority(doc_id, bytes, true)
+    fn save_snapshot_blocking(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO snapshots (doc_id, bytes, saved_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at",
+            params![doc_id, bytes, now_ms()],
+        )?;
+        self.invalidate_failed_publication(&tx, doc_id)?;
+        self.queue_directory_in(&tx, doc_id)?;
+        tx.commit()?;
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
     }
 
-    fn save_snapshot_with_priority(
+    /// Save the snapshot together with its chat2 room cursor and doc epoch —
+    /// ONE transaction, so bytes and cursor can never disagree (the C2 rule;
+    /// a divergent pair is exactly the restored-backup redownload bug).
+    pub fn save_snapshot_with_cursor(
         &self,
         doc_id: &str,
         bytes: &[u8],
-        completed: bool,
+        cursor: u64,
+        epoch: u32,
     ) -> Result<(), StoreError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        write_snapshot(&tx, doc_id, bytes)?;
-        queue_snapshot_directory(&tx, doc_id, completed)?;
-        tx.commit()?;
-        self.directory_changed
-            .send_modify(|value| *value = value.wrapping_add(1));
-        Ok(())
+        store_blocking(|| self.save_snapshot_with_cursor_blocking(doc_id, bytes, cursor, epoch))
     }
 
-    /// Only unacknowledged semantic edits are eligible for history reconciliation.
-    /// Acknowledged outcomes remain durable so a restart cannot resurrect them.
-    pub fn load_pending_records(&self, doc_id: &str) -> Result<Vec<PendingRecord>, StoreError> {
-        let conn = self.conn();
-        let mut query = conn.prepare(
-            "SELECT value FROM semantic_intents WHERE doc_id = ?1 AND acknowledged = 0
-             ORDER BY container, record_id",
-        )?;
-        let rows = query.query_map(params![doc_id], |row| row.get::<_, Vec<u8>>(0))?;
-        rows.map(|row| Ok(serde_json::from_slice(&row?)?)).collect()
-    }
-
-    pub fn load_command_outcome(&self, doc_id: &str, command_id: &str) -> Result<Option<comet_doc::SessionCommandEntry>, StoreError> {
-        let bytes: Option<Vec<u8>> = self.conn().query_row(
-            "SELECT value FROM semantic_intents WHERE doc_id = ?1 AND container = 'commands' AND record_id = ?2",
-            params![doc_id,command_id], |row| row.get(0),
-        ).optional()?;
-        let Some(bytes) = bytes else { return Ok(None) };
-        let record: PendingRecord = serde_json::from_slice(&bytes)?;
-        record.value.map(serde_json::from_value).transpose().map_err(StoreError::from)
-    }
-
-    /// Save the exact command, local provenance and optional execution setup together.
-    pub fn save_command_admission(
-        &self, doc_id: &str, snapshot_id: &str, record: &PendingRecord,
-        trust_key: Option<&str>, context: Option<&[u8]>,
-    ) -> Result<(), StoreError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let scope: Option<String> = tx.query_row("SELECT scope FROM document_scopes WHERE doc_id = ?1", params![snapshot_id], |row| row.get(0)).optional()?;
-        if scope.as_deref() != Some(doc_id) {
-            return Err(StoreError::ScopeConflict("command admission requires its exact claimed room".into()));
-        }
-        if tx.query_row("SELECT 1 FROM session_startups WHERE chat_id=?1 AND cancelled=1", params![snapshot_id], |_| Ok(())).optional()?.is_some() {
-            return Err(StoreError::ScopeConflict("command_startup_cancelled".into()));
-        }
-        if record.container != "commands" || record.value.is_none() || record.acknowledged {
-            return Err(StoreError::ScopeConflict("invalid command admission record".into()));
-        }
-        let existing: Option<Vec<u8>> = tx.query_row(
-            "SELECT value FROM semantic_intents WHERE doc_id=?1 AND container='commands' AND record_id=?2",
-            params![doc_id, record.key], |row| row.get(0),
-        ).optional()?;
-        if existing.is_some() {
-            return Err(StoreError::ScopeConflict("command was already admitted; read its original outcome".into()));
-        }
-        upsert_pending_records(&tx, doc_id, [record], &mut self.record_buffer.lock().unwrap_or_else(PoisonError::into_inner))?;
-        if let Some(context) = context {
-            tx.execute("UPDATE semantic_intents SET admission_context=?3 WHERE doc_id=?1 AND container='commands' AND record_id=?2", params![doc_id, record.key, context])?;
-        }
-        if let Some(key) = trust_key {
-            tx.execute("DELETE FROM trusted_local_commands WHERE created_at < ?1", params![now_ms().saturating_sub(comet_doc::COMMAND_DEFAULT_TTL_MS)])?;
-            tx.execute("INSERT OR IGNORE INTO trusted_local_commands(command_id,created_at) VALUES (?1,?2)", params![key, now_ms()])?;
-        }
-        tx.execute("INSERT INTO pending_nudges(chat_id,nudge_id,accepted_at) VALUES (?1,?2,?3) ON CONFLICT(chat_id) DO UPDATE SET nudge_id=excluded.nudge_id,accepted_at=excluded.accepted_at",
-            params![snapshot_id,record.key,now_ms()])?;
-        tx.execute("INSERT OR IGNORE INTO local_migrations(name,applied_at) VALUES (?1,?2)", params![format!("semantic/{doc_id}"), now_ms()])?;
-        tx.execute("DELETE FROM session_startups WHERE chat_id=?1", params![snapshot_id])?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn load_command_admission_context(&self, doc_id: &str, command_id: Option<&str>) -> Result<Option<Vec<u8>>, StoreError> {
-        let conn = self.conn();
-        if let Some(command_id) = command_id {
-            Ok(conn.query_row("SELECT admission_context FROM semantic_intents WHERE doc_id=?1 AND container='commands' AND record_id=?2",
-                params![doc_id,command_id], |row| row.get(0)).optional()?.flatten())
-        } else {
-            Ok(conn.query_row("SELECT admission_context FROM semantic_intents WHERE doc_id=?1 AND container='commands' AND admission_context IS NOT NULL ORDER BY json_extract(CAST(value AS TEXT),'$.value.issuedAt') DESC,record_id DESC LIMIT 1",
-                params![doc_id], |row| row.get(0)).optional()?.flatten())
-        }
-    }
-
-    /// Cancellation and checkout registration share the admission store's transaction gate.
-    pub fn cancel_session_startup(&self, chat_id: &str) -> Result<(bool, Option<String>), StoreError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let admitted = tx.query_row("SELECT 1 FROM semantic_intents WHERE doc_id=(SELECT scope FROM document_scopes WHERE doc_id=?1) AND container='commands' LIMIT 1", params![chat_id], |_| Ok(())).optional()?.is_some();
-        if admitted { return Ok((false,None)); }
-        tx.execute("INSERT INTO session_startups(chat_id,cancelled) VALUES (?1,1) ON CONFLICT(chat_id) DO UPDATE SET cancelled=1", params![chat_id])?;
-        let path = tx.query_row("SELECT worktree_path FROM session_startups WHERE chat_id=?1", params![chat_id], |row| row.get(0))?;
-        tx.commit()?;
-        Ok((true,path))
-    }
-
-    pub fn register_startup_worktree(&self, chat_id: &str, path: &str) -> Result<bool, StoreError> {
-        Ok(self.conn().execute("INSERT INTO session_startups(chat_id,worktree_path) VALUES (?1,?2) ON CONFLICT(chat_id) DO UPDATE SET worktree_path=excluded.worktree_path WHERE session_startups.cancelled=0", params![chat_id,path])? == 1)
-    }
-
-    pub fn is_session_startup_cancelled(&self, chat_id: &str) -> Result<bool, StoreError> {
-        Ok(self.conn().query_row("SELECT 1 FROM session_startups WHERE chat_id=?1 AND cancelled=1", params![chat_id], |_| Ok(())).optional()?.is_some())
-    }
-
-    /// Persist intent outcomes and an optional authoritative snapshot in one
-    /// transaction. An adopted source must also invalidate in-flight directory work.
-    pub fn save_pending_records(
+    fn save_snapshot_with_cursor_blocking(
         &self,
         doc_id: &str,
-        records: &[PendingRecord],
-        snapshot: Option<&[u8]>,
-    ) -> Result<(), StoreError> {
-        self.save_pending_records_for_snapshot(doc_id,doc_id,records,snapshot)
-    }
-
-    pub fn save_pending_records_for_snapshot<'a>(
-        &self, doc_id: &str, snapshot_id: &str, records: impl IntoIterator<Item = &'a PendingRecord>, snapshot: Option<&[u8]>,
+        bytes: &[u8],
+        cursor: u64,
+        epoch: u32,
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let scope: Option<String> = tx.query_row("SELECT scope FROM document_scopes WHERE doc_id = ?1",params![snapshot_id],|row| row.get(0)).optional()?;
-        if scope.as_deref().is_some_and(|scope| scope != doc_id) {
-            return Err(StoreError::ScopeConflict("retired document binding cannot write a different room scope".into()));
-        }
-        upsert_pending_records(&tx, doc_id, records, &mut self.record_buffer.lock().unwrap_or_else(PoisonError::into_inner))?;
         tx.execute(
-            "INSERT OR IGNORE INTO local_migrations (name, applied_at) VALUES (?1, ?2)",
-            params![format!("semantic/{doc_id}"), now_ms()],
+            "INSERT INTO snapshots (doc_id, bytes, saved_at, cursor, epoch) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at,
+                 cursor = excluded.cursor, epoch = excluded.epoch, cursor_verified = 0",
+            params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
         )?;
-        if let Some(snapshot) = snapshot {
-            write_snapshot(&tx, snapshot_id, snapshot)?;
-            queue_snapshot_directory(&tx, snapshot_id, false)?;
-        }
+        self.invalidate_failed_publication(&tx, doc_id)?;
+        self.queue_directory_in(&tx, doc_id)?;
         tx.commit()?;
-        if snapshot.is_some() {
-            self.directory_changed.send_modify(|value| *value = value.wrapping_add(1));
-        }
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
-    pub fn has_semantic_journal(&self, doc_id: &str) -> Result<bool, StoreError> {
-        self.is_local_migration_applied(&format!("semantic/{doc_id}"))
+    pub fn save_verified_snapshot_with_cursor(
+        &self,
+        doc_id: &str,
+        bytes: &[u8],
+        cursor: u64,
+        epoch: u32,
+    ) -> Result<(), StoreError> {
+        store_blocking(|| {
+            self.save_verified_snapshot_with_cursor_blocking(doc_id, bytes, cursor, epoch)
+        })
     }
 
-    pub fn has_semantic_records(&self, doc_id: &str) -> Result<bool, StoreError> {
-        Ok(self.conn().query_row("SELECT 1 FROM semantic_intents WHERE doc_id = ?1 LIMIT 1",params![doc_id],|_| Ok(())).optional()?.is_some())
-    }
-
-    /// Bootstrap legacy local intent once, without dropping snapshots, processed
-    /// commands, admission receipts, or already acknowledged semantic records.
-    pub fn migrate_pending_records(&self, doc_id: &str, records: &[PendingRecord]) -> Result<(), StoreError> {
+    fn save_verified_snapshot_with_cursor_blocking(
+        &self,
+        doc_id: &str,
+        bytes: &[u8],
+        cursor: u64,
+        epoch: u32,
+    ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let changed = tx.execute(
-            "INSERT OR IGNORE INTO local_migrations (name, applied_at) VALUES (?1, ?2)",
-            params![format!("semantic/{doc_id}"), now_ms()],
+        tx.execute(
+            "INSERT INTO snapshots (doc_id, bytes, saved_at, cursor, epoch, cursor_verified) VALUES (?1, ?2, ?3, ?4, ?5, 1)
+             ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at,
+                 cursor = excluded.cursor, epoch = excluded.epoch, cursor_verified = 1",
+            params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
         )?;
-        if changed != 0 {
-            upsert_pending_records(&tx, doc_id, records, &mut self.record_buffer.lock().unwrap_or_else(PoisonError::into_inner))?;
-        }
+        self.invalidate_failed_publication(&tx, doc_id)?;
+        self.queue_directory_in(&tx, doc_id)?;
         tx.commit()?;
+        self.directory_changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
-    /// Normalize existing workspace journals on every load, not just bootstrap.
-    /// Original serialized goals remain evidence; acknowledged outcomes never reenter
-    /// the outbox, including a canonical outcome reached before its legacy alias.
-    pub fn normalize_workspace_records(&self, doc_id: &str, cached: &loro::LoroDoc) -> Result<(), StoreError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let records: Vec<PendingRecord> = {
-            let mut query = tx.prepare("SELECT value FROM semantic_intents WHERE doc_id = ?1 ORDER BY container, record_id")?;
-            let rows = query.query_map(params![doc_id], |row| row.get::<_, Vec<u8>>(0))?;
-            rows.map(|row| Ok(serde_json::from_slice(&row?)?)).collect::<Result<_, StoreError>>()?
-        };
-        let mut normalized = std::collections::BTreeMap::new();
-        let evidence_id = format!("recovery-original/{doc_id}");
-        for original in records.iter().filter(|record| !record.acknowledged) {
-            let record = comet_doc::workspace::normalize_workspace_record(original)
-                .map_err(|error| StoreError::ScopeConflict(error.to_string()))?;
-            if record.key == original.key && record.before == original.before && record.value == original.value { continue }
-            // ponytail: startup-only lookup per renamed key; index canonical goals if legacy journals become large.
-            let target = records.iter().find(|target| target.container == record.container && target.key == record.key && target.key != original.key);
-            if let Some(target) = target.filter(|target| !target.acknowledged) {
-                let normalized_target = comet_doc::workspace::normalize_workspace_record(target)
-                    .map_err(|error| StoreError::ScopeConflict(error.to_string()))?;
-                if (normalized_target.before != record.before || normalized_target.value != record.value)
-                    && !comet_doc::workspace::canonical_creation_covers_alias(original, target, cached) {
-                    return Err(StoreError::ScopeConflict(format!("Crew recovery conflicts with canonical intent {}/{}", record.container, record.key)));
-                }
-            }
-            let identity = (record.container.clone(), record.key.clone());
-            if let Some(prior) = normalized.get(&identity) {
-                let prior: &PendingRecord = prior;
-                if prior.before != record.before || prior.value != record.value {
-                    return Err(StoreError::ScopeConflict("Crew recovery has competing self-alias intents".into()));
-                }
-            }
-            tx.execute("INSERT OR IGNORE INTO semantic_intents (doc_id, container, record_id, value, acknowledged) VALUES (?1, ?2, ?3, ?4, 1)",
-                params![evidence_id, original.container, original.key, serde_json::to_vec(original)?])?;
-            if record.key != original.key {
-                let mut retired = original.clone(); retired.acknowledged = true;
-                upsert_pending_records(&tx, doc_id, [&retired], &mut self.record_buffer.lock().unwrap_or_else(PoisonError::into_inner))?;
-            }
-            if target.is_none() { normalized.insert(identity, record); }
-        }
-        upsert_pending_records(&tx, doc_id, normalized.values(), &mut self.record_buffer.lock().unwrap_or_else(PoisonError::into_inner))?;
-        tx.commit()?;
-        Ok(())
+    pub fn snapshot_cursor(&self, doc_id: &str) -> Result<u64, StoreError> {
+        store_blocking(|| {
+            Ok(self
+                .conn()
+                .query_row(
+                    "SELECT COALESCE(cursor, 0) FROM snapshots WHERE doc_id = ?1",
+                    params![doc_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0) as u64)
+        })
     }
 
-    pub fn document_scope(&self, doc_id: &str) -> Result<Option<String>, StoreError> {
-        Ok(self.conn().query_row("SELECT scope FROM document_scopes WHERE doc_id = ?1",params![doc_id],|row| row.get(0)).optional()?)
+    pub fn snapshot_cursor_verified(&self, doc_id: &str) -> Result<bool, StoreError> {
+        store_blocking(|| self.snapshot_cursor_verified_blocking(doc_id))
     }
 
-    /// A UUID cache cannot cross authenticated room scopes. The sole allowed
-    /// retarget is an explicitly verified empty pre-attach document.
-    pub fn claim_document_scope(&self, doc_id: &str, scope: &str, empty_previous: Option<&str>) -> Result<(), StoreError> {
-        let mut conn = self.conn(); let tx = conn.transaction()?;
-        let previous: Option<String> = tx.query_row("SELECT scope FROM document_scopes WHERE doc_id = ?1",params![doc_id],|row| row.get(0)).optional()?;
-        match previous {
-            Some(previous) if previous == scope => {}
-            Some(previous) if empty_previous == Some(previous.as_str()) => {
-                tx.execute("UPDATE document_scopes SET scope = ?2 WHERE doc_id = ?1",params![doc_id,scope])?;
-            }
-            Some(_) => return Err(StoreError::ScopeConflict(format!("{doc_id}: original snapshot and intents retained"))),
-            None => { tx.execute("INSERT INTO document_scopes (doc_id,scope) VALUES (?1,?2)",params![doc_id,scope])?; }
-        }
-        tx.commit()?; Ok(())
+    fn snapshot_cursor_verified_blocking(&self, doc_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT cursor_verified FROM snapshots WHERE doc_id = ?1",
+                params![doc_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Snapshot + chat2 cursor + epoch. Pre-migration rows (or rows written
+    /// by [`Self::save_snapshot`]) read back as `(bytes, 0, 0)`.
+    pub fn load_snapshot_with_cursor(
+        &self,
+        doc_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64, u32)>, StoreError> {
+        store_blocking(|| self.load_snapshot_with_cursor_blocking(doc_id))
+    }
+
+    /// Read admission metadata without fetching or decoding the snapshot blob.
+    pub fn snapshot_epoch(&self, doc_id: &str) -> Result<u32, StoreError> {
+        store_blocking(|| {
+            Ok(self
+                .conn()
+                .query_row(
+                    "SELECT COALESCE(epoch, 0) FROM snapshots WHERE doc_id = ?1",
+                    params![doc_id],
+                    |row| row.get::<_, u32>(0),
+                )
+                .optional()?
+                .unwrap_or(0))
+        })
+    }
+
+    fn load_snapshot_with_cursor_blocking(
+        &self,
+        doc_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64, u32)>, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT bytes, cursor, epoch FROM snapshots WHERE doc_id = ?1",
+                params![doc_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                        row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u32,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Delete the snapshot row for `doc_id` (destructive schema breaks: the
     /// legacy `workspace` row is dropped on open). Missing rows are a no-op.
     pub fn delete_snapshot(&self, doc_id: &str) -> Result<(), StoreError> {
-        self.conn()
-            .execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
+        store_blocking(|| self.delete_snapshot_blocking(doc_id))
+    }
+
+    fn delete_snapshot_blocking(&self, doc_id: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
+        tx.execute("DELETE FROM chat_outbox WHERE doc_id = ?1", params![doc_id])?;
+        tx.execute(
+            "DELETE FROM chat_sync_jobs WHERE doc_id = ?1 AND kind != 'crew-directory'",
+            params![doc_id],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_outbox_initialized WHERE doc_id = ?1",
+            params![doc_id],
+        )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Whether a snapshot row exists for `doc_id` — presence only, no blob read.
+    pub fn has_snapshot(&self, doc_id: &str) -> Result<bool, StoreError> {
+        store_blocking(|| self.has_snapshot_blocking(doc_id))
+    }
+
+    fn has_snapshot_blocking(&self, doc_id: &str) -> Result<bool, StoreError> {
+        let hit = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM snapshots WHERE doc_id = ?1",
+                params![doc_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// The full command ledger — profile-import reads the source's claims so
+    /// imported pending commands can never re-execute under the new profile.
+    pub fn processed_commands(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        store_blocking(|| self.processed_commands_blocking())
+    }
+
+    fn processed_commands_blocking(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT command_id, processed_at FROM processed_commands")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Merge foreign ledger claims (profile import). Existing claims win;
+    /// returns how many rows were newly inserted.
+    pub fn import_processed_commands(&self, rows: &[(String, i64)]) -> Result<usize, StoreError> {
+        store_blocking(|| self.import_processed_commands_blocking(rows))
+    }
+
+    fn import_processed_commands_blocking(
+        &self,
+        rows: &[(String, i64)],
+    ) -> Result<usize, StoreError> {
+        let mut inserted = 0;
+        let conn = self.conn();
+        for (command_id, processed_at) in rows {
+            inserted += conn.execute(
+                "INSERT OR IGNORE INTO processed_commands (command_id, processed_at) VALUES (?1, ?2)",
+                params![command_id, processed_at],
+            )?;
+        }
+        Ok(inserted)
     }
 
     /// Whether `command_id` has already been claimed for execution.
     pub fn is_processed(&self, command_id: &str) -> Result<bool, StoreError> {
+        store_blocking(|| self.is_processed_blocking(command_id))
+    }
+
+    fn is_processed_blocking(&self, command_id: &str) -> Result<bool, StoreError> {
         let hit = self
             .conn()
             .query_row(
@@ -427,6 +645,10 @@ impl DocsStore {
     /// a crash mid-execution must never re-run the command). Returns `true`
     /// if this call claimed it, `false` if it was already processed.
     pub fn mark_processed(&self, command_id: &str) -> Result<bool, StoreError> {
+        store_blocking(|| self.mark_processed_blocking(command_id))
+    }
+
+    fn mark_processed_blocking(&self, command_id: &str) -> Result<bool, StoreError> {
         let changed = self.conn().execute(
             "INSERT OR IGNORE INTO processed_commands (command_id, processed_at) VALUES (?1, ?2)",
             params![command_id, now_ms()],
@@ -434,253 +656,134 @@ impl DocsStore {
         Ok(changed > 0)
     }
 
-    /// Persist that this command was authored through this device's local API.
-    /// Remote CRDT peers cannot create rows in this device-local database.
-    pub fn trust_local_command(&self, command_id: &str) -> Result<(), StoreError> {
-        self.conn().execute(
-            "INSERT OR IGNORE INTO trusted_local_commands (command_id, created_at) VALUES (?1, ?2)",
-            params![command_id, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    pub fn is_trusted_local_command(&self, command_id: &str) -> Result<bool, StoreError> {
-        let hit = self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM trusted_local_commands WHERE command_id = ?1",
-                params![command_id],
-                |_| Ok(()),
-            )
-            .optional()?;
-        Ok(hit.is_some())
-    }
-
-    /// Bound durable admission receipts without touching execution deduplication.
-    pub fn prune_local_commands(&self, created_before: i64) -> Result<(), StoreError> {
-        self.conn().execute(
-            "DELETE FROM trusted_local_commands WHERE created_at < ?1",
-            params![created_before],
-        )?;
-        Ok(())
-    }
-
-    pub fn forget_local_command(&self, command_id: &str) -> Result<(), StoreError> {
-        self.conn().execute(
-            "DELETE FROM trusted_local_commands WHERE command_id = ?1",
-            params![command_id],
-        )?;
-        Ok(())
-    }
-
-    /// Whether an identity-local data migration has completed.
-    pub fn is_local_migration_applied(&self, name: &str) -> Result<bool, StoreError> {
-        let hit = self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM local_migrations WHERE name = ?1",
-                params![name],
-                |_| Ok(()),
-            )
-            .optional()?;
-        Ok(hit.is_some())
-    }
-
-    /// Mark an identity-local data migration complete after its durable state is saved.
-    pub fn mark_local_migration_applied(&self, name: &str) -> Result<(), StoreError> {
-        self.conn().execute(
-            "INSERT OR IGNORE INTO local_migrations (name, applied_at) VALUES (?1, ?2)",
-            params![name, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    /// Keyset inventory: never reopen rooms or retain all snapshots for backfill.
-    pub fn snapshot_ids_after(&self, after: &str) -> Result<Vec<String>, StoreError> {
-        let conn = self.conn();
-        let mut query = conn
-            .prepare("SELECT doc_id FROM snapshots WHERE doc_id > ?1 ORDER BY doc_id LIMIT 32")?;
-        Ok(query
-            .query_map(params![after], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn load_bounded_snapshot(
-        &self,
-        id: &str,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        let conn = self.conn();
-        let size: Option<usize> = conn
-            .query_row(
-                "SELECT length(bytes) FROM snapshots WHERE doc_id = ?1",
-                params![id],
+    /// Claim immutable Crew control intent before network delivery. An existing
+    /// claim without an outcome is ambiguous and must be reconciled, never replayed.
+    pub fn claim_crew_command(&self, id: &str, request: &[u8]) -> Result<bool, StoreError> {
+        store_blocking(|| {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let existing: Option<Vec<u8>> = tx.query_row(
+                "SELECT request FROM crew_commands WHERE command_id=?1", [id],
                 |row| row.get(0),
-            )
-            .optional()?;
-        if size.is_some_and(|size| size > max_bytes) {
-            return Err(
-                std::io::Error::other("session snapshot exceeds directory scan budget").into(),
-            );
+            ).optional()?;
+            if let Some(existing) = existing {
+                if existing != request {
+                    return Err(StoreError::CommandConflict(id.into()));
+                }
+                return Ok(false);
+            }
+            let claimed = tx.execute(
+                "INSERT OR IGNORE INTO processed_commands(command_id,processed_at) VALUES (?1,?2)",
+                params![id, now_ms()],
+            )?;
+            if claimed == 0 {
+                return Err(StoreError::CommandConflict(format!("{id}: legacy claim has no intent")));
+            }
+            tx.execute("INSERT INTO crew_commands(command_id,request) VALUES (?1,?2)", params![id, request])?;
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn crew_command(&self, id: &str) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>, StoreError> {
+        store_blocking(|| Ok(self.conn().query_row(
+            "SELECT request,outcome FROM crew_commands WHERE command_id=?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?))
+    }
+
+    /// Terminal outcomes are immutable. Identical completion is idempotent.
+    pub fn finish_crew_command(&self, id: &str, outcome: &[u8]) -> Result<(), StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let changed = conn.execute(
+                "UPDATE crew_commands SET outcome=?2 WHERE command_id=?1 AND (outcome IS NULL OR outcome=?2)",
+                params![id, outcome],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::CommandConflict(format!("{id}: missing claim or conflicting outcome")));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn crew_commands(&self) -> Result<Vec<(String, Vec<u8>, Option<Vec<u8>>)>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT command_id,request,outcome FROM crew_commands ORDER BY command_id")?;
+            Ok(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub fn pending_crew_commands(&self, after: &str, limit: usize) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT command_id,request FROM crew_commands WHERE outcome IS NULL AND command_id>?1 ORDER BY command_id LIMIT ?2")?;
+            Ok(stmt.query_map(params![after, limit.clamp(1, 64) as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Lossless migration evidence/outcomes, never an execution queue.
+    pub fn legacy_crew_records(&self, doc_id: &str) -> Result<Vec<(String, String, Vec<u8>)>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT container,record_id,value FROM legacy_crew_records WHERE doc_id=?1 ORDER BY container,record_id")?;
+            Ok(stmt.query_map([doc_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    // Every snapshot path, including ACK/cursor persistence, must retain a
+    // replay obligation for operations whose outbox write failed. Invalidate
+    // the marker atomically with those operations becoming durable in a snapshot.
+    fn invalidate_failed_publication(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        doc_id: &str,
+    ) -> Result<(), StoreError> {
+        if self
+            .failed_publications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(doc_id)
+        {
+            tx.execute(
+                "DELETE FROM chat_outbox_initialized WHERE doc_id=?1",
+                params![doc_id],
+            )?;
         }
-        conn.query_row(
-            "SELECT bytes FROM snapshots WHERE doc_id = ?1",
-            params![id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    pub fn queue_directory(&self, id: &str, deleted: bool) -> Result<(), StoreError> {
-        self.conn().execute(
-            "INSERT INTO crew_directory_jobs(session_id, deleted) VALUES (?1, ?2)
-             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
-             deleted = MAX(deleted, excluded.deleted), due_at = retry_at",
-            params![id, deleted],
-        )?;
-        self.directory_changed
-            .send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
-    pub fn claim_directory(&self) -> Result<Option<(String, i64, String, bool)>, StoreError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let job = tx.query_row(
-            "SELECT session_id, generation, state, deleted FROM crew_directory_jobs WHERE due_at <= ?1 ORDER BY completed_turn_pending DESC, due_at, session_id LIMIT 1",
-            params![now_ms()], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).optional()?;
-        if let Some((id, _, _, _)) = &job {
-            // Consume only this claim's priority; a completion arriving in flight sets it again.
-            tx.execute("UPDATE crew_directory_jobs SET due_at = ?2, completed_turn_pending = 0 WHERE session_id = ?1", params![id, now_ms() + 120_000])?;
-        }
-        tx.commit()?;
-        Ok(job)
+    /// Reclaim free space: WAL truncate, then a VACUUM only past the
+    /// free-page thresholds, under a short busy timeout. Cheap when there is
+    /// nothing to reclaim. Blocking and holds the store for the VACUUM (it
+    /// rewrites the live database) — run it off any latency-sensitive path;
+    /// best-effort — problems are logged, never returned.
+    pub fn reclaim_free_space(&self) {
+        store_blocking(|| {
+            let conn = self.conn();
+            let Some(path) = conn.path().map(std::path::PathBuf::from) else {
+                return;
+            };
+            if let Err(err) = conn.busy_timeout(MAINTENANCE_BUSY_TIMEOUT) {
+                tracing::warn!(%err, "docs store: reclaim skipped");
+                return;
+            }
+            maintain(&conn, &path);
+            if let Err(err) = conn.busy_timeout(STORE_BUSY_TIMEOUT) {
+                tracing::warn!(%err, "docs store: busy timeout not restored after reclaim");
+            }
+        });
     }
 
-    pub fn save_directory_state(
-        &self,
-        id: &str,
-        state: &str,
-        deleted: bool,
-    ) -> Result<(), StoreError> {
-        self.conn().execute(
-            "UPDATE crew_directory_jobs SET state = ?2 WHERE session_id = ?1 AND deleted = ?3",
-            params![id, state, deleted],
-        )?;
-        Ok(())
-    }
-
-    pub fn queue_directory_deletion(&self, id: &str, state: &str) -> Result<(), StoreError> {
-        self.conn().execute(
-            "INSERT INTO crew_directory_jobs(session_id, deleted, state) VALUES (?1, 1, ?2)
-             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1, deleted = 1, due_at = 0, state = excluded.state",
-            params![id, state],
-        )?;
-        self.directory_changed
-            .send_modify(|value| *value = value.wrapping_add(1));
-        Ok(())
-    }
-
-    pub fn watch_directory(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.directory_changed.subscribe()
-    }
-
-    pub fn directory_retry_delay(&self) -> Result<Option<std::time::Duration>, StoreError> {
-        let due: Option<i64> = self.conn().query_row(
-            "SELECT MIN(due_at) FROM crew_directory_jobs WHERE due_at < 9223372036854775807",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(due
-            .map(|at| std::time::Duration::from_millis(at.saturating_sub(now_ms()).max(0) as u64)))
-    }
-
-    pub fn settle_directory(
-        &self,
-        id: &str,
-        generation: i64,
-        success: bool,
-    ) -> Result<(), StoreError> {
-        self.conn().execute(
-            "UPDATE crew_directory_jobs SET
-             due_at = CASE WHEN ?3 THEN CASE WHEN generation = ?2 THEN 9223372036854775807 ELSE due_at END ELSE ?4 END,
-             retry_at = CASE WHEN ?3 THEN 0 ELSE ?4 END WHERE session_id = ?1",
-            params![id, generation, success, now_ms() + 30_000],
-        )?;
-        Ok(())
-    }
-
-    pub fn defer_directory_title(
-        &self,
-        id: &str,
-        generation: i64,
-        deadline: i64,
-    ) -> Result<(), StoreError> {
-        self.conn().execute("UPDATE crew_directory_jobs SET due_at = ?3 WHERE session_id = ?1 AND generation = ?2 AND deleted = 0", params![id, generation, deadline])?;
-        Ok(())
-    }
-
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         // A poisoned lock only means another thread panicked mid-query; the
         // connection itself is still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-fn queue_snapshot_directory(tx: &rusqlite::Transaction<'_>, doc_id: &str, completed: bool) -> Result<(), StoreError> {
-    // Only global room-shaped ids enter discovery; the engine verifies UUID
-    // and authenticated ownership before reading or transmitting their data.
-    if doc_id.len() == 36 {
-        tx.execute(
-            "INSERT INTO crew_directory_jobs(session_id, due_at, completed_turn_pending) VALUES (?1, ?2, ?3)
-             ON CONFLICT(session_id) DO UPDATE SET generation = generation + 1,
-             due_at = MAX(retry_at, MIN(due_at, excluded.due_at)),
-             completed_turn_pending = MAX(completed_turn_pending, excluded.completed_turn_pending) WHERE deleted = 0",
-            params![doc_id, if completed { 0 } else { now_ms() + 30_000 }, completed],
-        )?;
-    }
-    Ok(())
-}
-
-fn write_snapshot(tx: &rusqlite::Transaction<'_>, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
-    use std::io::Write;
-    let length = i32::try_from(bytes.len())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let row_id: i64 = tx.query_row(
-        "INSERT INTO snapshots (doc_id, bytes, saved_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at
-         RETURNING rowid",
-        params![doc_id, rusqlite::blob::ZeroBlob(length), now_ms()],
-        |row| row.get(0),
-    )?;
-    if !bytes.is_empty() {
-        let mut blob = tx.blob_open(rusqlite::DatabaseName::Main, "snapshots", "bytes", row_id, false)?;
-        blob.write_all(bytes)?;
-        blob.close()?;
-    }
-    Ok(())
-}
-
-fn upsert_pending_records<'a>(
-    tx: &rusqlite::Transaction<'_>,
-    doc_id: &str,
-    records: impl IntoIterator<Item = &'a PendingRecord>,
-    buffer: &mut Vec<u8>,
-) -> Result<(), StoreError> {
-    let mut upsert = tx.prepare(
-        "INSERT INTO semantic_intents (doc_id, container, record_id, value, acknowledged)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(doc_id, container, record_id) DO UPDATE SET
-         value = excluded.value, acknowledged = excluded.acknowledged",
-    )?;
-    for record in records {
-        buffer.clear();
-        serde_json::to_writer(&mut *buffer, record)?;
-        upsert.execute(params![doc_id, record.container, record.key, buffer.as_slice(), record.acknowledged])?;
-    }
-    Ok(())
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
@@ -711,6 +814,81 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Fold and truncate a bloated WAL, then reclaim free pages if they dominate
+/// the file. Every step is best-effort — failures (including SQLITE_BUSY from
+/// another connection) are logged. Steady-state WAL growth is handled by
+/// SQLite's auto-checkpoint plus `journal_size_limit`, so there is no
+/// periodic pass.
+fn maintain(conn: &Connection, path: &Path) {
+    checkpoint_truncate(conn, path, "open");
+    match reclaim_free_pages(conn) {
+        // VACUUM in WAL mode writes the whole live database into the WAL.
+        Ok(true) => checkpoint_truncate(conn, path, "vacuum"),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(%err, "docs store: VACUUM skipped"),
+    }
+}
+
+/// `PRAGMA wal_checkpoint(TRUNCATE)`; logs instead of failing.
+fn checkpoint_truncate(conn: &Connection, path: &Path, reason: &str) {
+    let wal_path = path.with_extension("sqlite3-wal");
+    let wal_bytes = || std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+    let before = wal_bytes();
+    let result = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    });
+    match result {
+        Ok((0, frames)) => {
+            if before > 0 {
+                tracing::info!(
+                    reason,
+                    frames,
+                    wal_bytes_before = before,
+                    wal_bytes_after = wal_bytes(),
+                    "docs store: WAL checkpointed and truncated"
+                );
+            }
+        }
+        Ok((_, frames)) => tracing::warn!(
+            reason,
+            frames,
+            wal_bytes = before,
+            "docs store: WAL checkpoint busy (another connection is active); left for later"
+        ),
+        Err(err) => tracing::warn!(reason, %err, "docs store: WAL checkpoint failed"),
+    }
+}
+
+/// VACUUM when free pages are both a large fraction of the file and above an
+/// absolute floor. Returns whether a VACUUM ran. Rewrite cost is linear in the
+/// LIVE size (~0.6 s for 150 MB live / 70 MB free on an M-series SSD, warm
+/// cache); healthy databases skip it entirely.
+fn reclaim_free_pages(conn: &Connection) -> rusqlite::Result<bool> {
+    let pragma = |name: &str| conn.pragma_query_value(None, name, |row| row.get::<_, i64>(0));
+    let page_size = pragma("page_size")?;
+    let page_count = pragma("page_count")?;
+    let freelist = pragma("freelist_count")?;
+    if !worth_vacuuming(page_size, page_count, freelist) {
+        return Ok(false);
+    }
+    let started = Instant::now();
+    conn.execute_batch("VACUUM")?;
+    let after = pragma("page_count")? * page_size;
+    tracing::info!(
+        bytes_before = page_count * page_size,
+        bytes_after = after,
+        free_bytes = freelist * page_size,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "docs store: reclaimed free pages with VACUUM"
+    );
+    Ok(true)
+}
+
+fn worth_vacuuming(page_size: i64, page_count: i64, freelist: i64) -> bool {
+    freelist * page_size >= VACUUM_MIN_FREE_BYTES
+        && freelist * VACUUM_MIN_FREE_DENOMINATOR >= page_count
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -721,497 +899,75 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loro::ToJson;
 
-    fn pending(key: &str) -> PendingRecord {
-        PendingRecord {
-            container: "chats".into(),
-            key: key.into(),
-            before: Some(serde_json::json!({ "title": "before" })),
-            value: Some(serde_json::json!({ "title": "after" })),
-            version: vec![1, 2, 3],
-            acknowledged: false,
-        }
-    }
-
-    #[test]
-    fn workspace_alias_journal_normalizes_after_bootstrap_without_reviving_outcomes() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contended_connection_does_not_starve_a_two_worker_runtime() {
+        use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let public = "018eeb58-6508-78e8-a544-44682ab94c50";
-        let alias = format!("{public}::session::{public}::session::{public}");
-        let mut legacy = pending(&alias);
-        legacy.before = Some(serde_json::json!({"id": alias, "deviceId": "owner", "title": "before"}));
-        legacy.value = Some(serde_json::json!({"id": public, "deviceId": "owner", "title": "after"}));
-        store.migrate_pending_records("workspace", &[legacy.clone()]).unwrap();
-        store.normalize_workspace_records("workspace", &loro::LoroDoc::new()).unwrap();
-        let records = store.load_pending_records("workspace").unwrap();
-        assert_eq!(records.len(), 1); assert_eq!(records[0].key, public);
-        assert_eq!(records[0].before.as_ref().unwrap()["id"], public);
-        let evidence: Vec<u8> = store.conn().query_row("SELECT value FROM semantic_intents WHERE doc_id = 'recovery-original/workspace'", [], |row| row.get(0)).unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&evidence).unwrap(), serde_json::to_value(&legacy).unwrap());
-        let mut acknowledged = records[0].clone(); acknowledged.acknowledged = true;
-        store.save_pending_records("workspace", &[acknowledged], None).unwrap();
-        let mut completed = pending("completed-command"); completed.container = "commands".into(); completed.acknowledged = true;
-        store.save_pending_records("workspace", &[completed], None).unwrap();
-        // A late old cache cannot reactivate the already canonical acknowledged goal.
-        store.save_pending_records("workspace", &[legacy], None).unwrap();
-        drop(store);
-        let store = DocsStore::open(dir.path()).unwrap();
-        store.normalize_workspace_records("workspace", &loro::LoroDoc::new()).unwrap();
-        store.normalize_workspace_records("workspace", &loro::LoroDoc::new()).unwrap();
-        assert!(store.load_pending_records("workspace").unwrap().is_empty());
-        let mut foreign = pending(&alias);
-        foreign.before = Some(serde_json::json!({"id": alias, "deviceId": "owner"}));
-        foreign.value = Some(serde_json::json!({"id": public, "deviceId": "foreign"}));
-        store.save_pending_records("blocked-workspace", &[foreign.clone()], None).unwrap();
-        assert!(store.normalize_workspace_records("blocked-workspace", &loro::LoroDoc::new()).is_err());
-        assert_eq!(serde_json::to_value(store.load_pending_records("blocked-workspace").unwrap()).unwrap(), serde_json::to_value([foreign]).unwrap());
-    }
-
-    #[test]
-    fn covered_canonical_bootstrap_retires_stale_nested_alias_but_not_unknown_edits() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let public = "018eeb58-6508-78e8-a544-44682ab94c50";
-        let alias = format!("{public}::session::{public}::session::{public}");
-        let cached = loro::LoroDoc::new();
-        for (key, clock, harness) in [(public, 200_i64, "current"), (alias.as_str(), 100_i64, "stale")] {
-            let row = cached.get_map("chats").insert_container(key, loro::LoroMap::new()).unwrap();
-            row.insert("id", key).unwrap(); row.insert("deviceId", "owner").unwrap(); row.insert("title", "unchanged user title").unwrap();
-            row.insert("createdAt", clock).unwrap(); row.insert("lastSeenAt", clock).unwrap(); row.insert("lastMessageAt", clock).unwrap();
-            row.insert("harnessSessionId", harness).unwrap();
-        }
-        cached.commit();
-        let goal = |key: &str| PendingRecord { container: "chats".into(), key: key.into(), before: None,
-            value: cached.get_map("chats").get(key).map(|row| row.get_deep_value().to_json_value()),
-            version: cached.oplog_vv().encode(), acknowledged: false };
-        let canonical = goal(public); let legacy = goal(&alias);
-        store.migrate_pending_records("workspace", &[canonical.clone(), legacy.clone()]).unwrap();
-        store.normalize_workspace_records("workspace", &cached).unwrap();
-        assert_eq!(serde_json::to_value(store.load_pending_records("workspace").unwrap()).unwrap(), serde_json::to_value([canonical.clone()]).unwrap());
-        drop(store);
-        let store = DocsStore::open(dir.path()).unwrap();
-        store.normalize_workspace_records("workspace", &cached).unwrap();
-        assert_eq!(store.load_pending_records("workspace").unwrap()[0].value.as_ref().unwrap()["lastSeenAt"], 200);
-        let mut unknown = legacy.clone(); unknown.version.clear();
-        store.migrate_pending_records("unknown", &[canonical.clone(), unknown.clone()]).unwrap();
-        assert!(store.normalize_workspace_records("unknown", &cached).is_err());
-        let edited = cached.fork();
-        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = edited.get_map("chats").get(&alias) else { panic!("missing cached alias row") };
-        row.insert("title", "conflicting user edit").unwrap();
-        edited.commit();
-        let mut user_edit = legacy;
-        user_edit.value = edited.get_map("chats").get(&alias).map(|row| row.get_deep_value().to_json_value());
-        user_edit.version = edited.oplog_vv().encode();
-        let mut observed_canonical = canonical; observed_canonical.version = user_edit.version.clone();
-        store.migrate_pending_records("user-edit", &[observed_canonical, user_edit]).unwrap();
-        assert!(store.normalize_workspace_records("user-edit", &edited).is_err());
-        // A prior bootstrap can journal both a rich canonical row and a sparse
-        // alias. A shallow cache cannot prove that the alias's missing user fields
-        // were never explicitly cleared, so do not discard either retained goal.
-        let conflicted = cached.fork();
-        for key in [public, alias.as_str()] {
-            let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = conflicted.get_map("chats").get(key) else { panic!("missing bootstrap row") };
-            for field in ["title", "generatedTitle", "titleSource", "cwd", "branch", "checkoutId", "spaceId"] {
-                if key == public { row.insert(field, "canonical metadata").unwrap(); }
-                else { row.delete(field).unwrap(); }
-            }
-            if key == public {
-                row.insert("config", loro::LoroValue::from(serde_json::json!({"harness": "local", "model": "synthetic"}))).unwrap();
-            } else { row.delete("config").unwrap(); }
-        }
-        conflicted.commit();
-        let shallow = conflicted.export(loro::ExportMode::shallow_snapshot(&conflicted.state_frontiers())).unwrap();
-        let conflicted = loro::LoroDoc::new();
-        conflicted.import(&shallow).unwrap();
-        assert!(conflicted.is_shallow());
-        // With no retained semantic journal, cold legacy bootstrap migrates the
-        // cache first and emits only the existing canonical goal, without guessing
-        // which of two explicit pending user edits should win.
-        let cold = conflicted.fork();
-        let canonical_value = conflicted.get_map("chats").get(public).unwrap().get_deep_value().to_json_value();
-        comet_doc::WorkspaceDoc::from_doc(cold.clone()).migrate_execution_rows().unwrap();
-        assert!(cold.get_map("chats").get(&alias).is_none());
-        assert_eq!(cold.get_map("chats").get(public).unwrap().get_deep_value().to_json_value(), canonical_value);
-        let cold_goal = PendingRecord { container: "chats".into(), key: public.into(), before: None,
-            value: Some(canonical_value), version: cold.oplog_vv().encode(), acknowledged: false };
-        store.migrate_pending_records("cold-bootstrap", &[cold_goal.clone()]).unwrap();
-        store.normalize_workspace_records("cold-bootstrap", &cold).unwrap();
-        assert_eq!(serde_json::to_value(store.load_pending_records("cold-bootstrap").unwrap()).unwrap(), serde_json::to_value([cold_goal.clone()]).unwrap());
-        let bootstrap = |key: &str| PendingRecord { container: "chats".into(), key: key.into(), before: None,
-            value: conflicted.get_map("chats").get(key).map(|row| row.get_deep_value().to_json_value()),
-            version: conflicted.oplog_vv().encode(), acknowledged: false };
-        let earlier = "00000000-0000-0000-0000-000000000001";
-        let earlier_alias = format!("{earlier}::session::{earlier}");
-        let mut recoverable = pending(&earlier_alias);
-        recoverable.before = None;
-        recoverable.value = Some(serde_json::json!({"id": earlier_alias, "deviceId": "owner"}));
-        let originals = [recoverable, bootstrap(public), bootstrap(&alias)];
-        store.migrate_pending_records("metadata-conflict", &originals).unwrap();
-        store.save_snapshot("recovery-original/metadata-conflict", &shallow).unwrap();
-        let before = serde_json::to_value(store.load_pending_records("metadata-conflict").unwrap()).unwrap();
-        assert!(store.normalize_workspace_records("metadata-conflict", &conflicted).is_err());
-        assert_eq!(serde_json::to_value(store.load_pending_records("metadata-conflict").unwrap()).unwrap(), before);
-        let evidence_count: i64 = store.conn().query_row(
-            "SELECT count(*) FROM semantic_intents WHERE doc_id = 'recovery-original/metadata-conflict'", [], |row| row.get(0)
-        ).unwrap();
-        assert_eq!(evidence_count, 0); // Even the earlier recoverable alias rolls back.
-        drop(store);
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert!(store.normalize_workspace_records("metadata-conflict", &conflicted).is_err());
-        assert_eq!(serde_json::to_value(store.load_pending_records("metadata-conflict").unwrap()).unwrap(), before);
-        assert_eq!(store.load_snapshot("recovery-original/metadata-conflict").unwrap().unwrap(), shallow);
-        store.normalize_workspace_records("cold-bootstrap", &cold).unwrap();
-        assert_eq!(serde_json::to_value(store.load_pending_records("cold-bootstrap").unwrap()).unwrap(), serde_json::to_value([cold_goal]).unwrap());
-    }
-
-    #[test]
-    fn command_admission_atomically_retains_context_authority_and_wake() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        store.claim_document_scope("chat", "scope", None).unwrap();
-        let command: comet_doc::SessionCommandEntry = serde_json::from_value(serde_json::json!({
-            "id":"original", "payload":{"kind":"interrupt"}, "issuedBy":"owner", "issuedAt":1,
-            "expiresAt":1000, "status":"pending"
-        })).unwrap();
-        let record = PendingRecord { container:"commands".into(), key:command.id.clone(), before:None,
-            value:Some(serde_json::to_value(&command).unwrap()), version:Vec::new(), acknowledged:false };
-        store.conn().execute_batch("CREATE TRIGGER fail_admission BEFORE INSERT ON semantic_intents BEGIN SELECT RAISE(ABORT,'disk full'); END;").unwrap();
-        assert!(store.save_command_admission("scope","chat",&record,Some("authority"),Some(b"exact setup")).is_err());
-        assert!(store.load_command_outcome("scope","original").unwrap().is_none());
-        assert!(!store.is_trusted_local_command("authority").unwrap());
-        assert!(store.pending_nudges().unwrap().is_empty());
-        store.conn().execute_batch("DROP TRIGGER fail_admission").unwrap();
-        store.save_command_admission("scope","chat",&record,Some("authority"),Some(b"exact setup")).unwrap();
-        assert!(!store.cancel_session_startup("chat").unwrap().0);
-        assert!(store.save_command_admission("scope","chat",&record,Some("other authority"),Some(b"changed setup")).is_err());
-        drop(store);
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert_eq!(store.load_command_outcome("scope","original").unwrap(),Some(command));
-        assert_eq!(store.load_command_admission_context("scope",Some("original")).unwrap().as_deref(),Some(&b"exact setup"[..]));
-        assert!(store.is_trusted_local_command("authority").unwrap());
-        assert!(!store.is_trusted_local_command("other authority").unwrap());
-        assert_eq!(store.pending_nudges().unwrap()[0].0,"chat");
-        assert_eq!(store.pending_nudges().unwrap()[0].1,"original");
-        store.claim_document_scope("cancelled-chat","cancelled-scope",None).unwrap();
-        assert!(store.cancel_session_startup("cancelled-chat").unwrap().0);
-        assert!(store.is_session_startup_cancelled("cancelled-chat").unwrap());
-        assert!(store.save_command_admission("cancelled-scope","cancelled-chat",&record,Some("must not trust"),None).is_err());
-        assert!(store.load_command_outcome("cancelled-scope","original").unwrap().is_none());
-        assert!(!store.is_trusted_local_command("must not trust").unwrap());
-        assert!(!store.register_startup_worktree("cancelled-chat","/tmp/created-after-cancel").unwrap());
-        assert!(store.register_startup_worktree("handoff-chat","/tmp/registered-before-cancel").unwrap());
-        assert_eq!(store.cancel_session_startup("handoff-chat").unwrap(),(true,Some("/tmp/registered-before-cancel".into())));
-        assert!(!store.register_startup_worktree("handoff-chat","/tmp/must-not-replace").unwrap());
-    }
-
-    #[test]
-    fn durable_nudge_survives_cache_replacement_restart_and_old_completion() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        store.accept_nudge("chat-a", "old-token").unwrap();
-        let original = store.pending_nudges().unwrap();
-        store.conn().execute("UPDATE pending_nudges SET accepted_at = 7 WHERE chat_id = 'chat-a'", []).unwrap();
-        store.accept_nudge("chat-a", "old-token").unwrap();
-        assert_eq!(store.pending_nudges().unwrap(), vec![("chat-a".into(), "old-token".into(), 7)]);
-        store.accept_nudge("chat-a", "new-token").unwrap();
-        store.accept_nudge("chat-b", "other-token").unwrap();
-        store.save_snapshot("chat-a", b"replacement-cache").unwrap();
-        store.save_pending_records("chat-a", &[], None).unwrap();
-        assert!(!store.complete_nudge("chat-a", &original[0].1).unwrap());
-        let pending = store.pending_nudges().unwrap();
-        drop(store);
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert_eq!(store.pending_nudges().unwrap(), pending);
-        assert!(store.complete_nudge("chat-a", "new-token").unwrap());
-        assert_eq!(store.pending_nudges().unwrap(), vec![pending[1].clone()]);
-    }
-
-    #[test]
-    fn semantic_records_survive_restart_with_deletes_and_document_isolation() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let change = pending("change");
-        let mut deletion = pending("deleted");
-        deletion.value = None;
-        let records = [change.clone(), deletion];
-        store.migrate_pending_records("workspace", &records).unwrap();
-        store.save_pending_records("other-workspace", &[pending("change")], None).unwrap();
-        store.mark_processed("executed-command").unwrap();
-        store.trust_local_command("admitted-command").unwrap();
-        drop(store);
-
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert!(store.has_semantic_journal("workspace").unwrap());
-        assert_eq!(serde_json::to_value(store.load_pending_records("workspace").unwrap()).unwrap(), serde_json::to_value(&records).unwrap());
-        assert_eq!(serde_json::to_value(store.load_pending_records("other-workspace").unwrap()).unwrap(), serde_json::to_value([change]).unwrap());
-        assert!(store.is_processed("executed-command").unwrap());
-        assert!(store.is_trusted_local_command("admitted-command").unwrap());
-    }
-
-    #[test]
-    fn semantic_adoption_commits_snapshot_and_acknowledgements_together() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let record = pending("chat-a");
-        store.save_snapshot("workspace", b"old-history").unwrap();
-        store.migrate_pending_records("workspace", &[record.clone()]).unwrap();
-        let mut acknowledged = record.clone();
-        acknowledged.acknowledged = true;
-        store.conn().execute_batch(
-            "CREATE TRIGGER fail_adoption BEFORE UPDATE ON snapshots
-             BEGIN SELECT RAISE(ABORT, 'injected snapshot write failure'); END;",
-        ).unwrap();
-        assert!(store.save_pending_records("workspace", &[acknowledged.clone()], Some(b"authoritative-history")).is_err());
-        assert_eq!(store.load_snapshot("workspace").unwrap().as_deref(), Some(&b"old-history"[..]));
-        assert_eq!(serde_json::to_value(store.load_pending_records("workspace").unwrap()).unwrap(), serde_json::to_value([record.clone()]).unwrap());
-        store.conn().execute_batch("DROP TRIGGER fail_adoption").unwrap();
-        store.save_pending_records("workspace", &[acknowledged.clone()], Some(b"authoritative-history")).unwrap();
-        drop(store);
-
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert_eq!(store.load_snapshot("workspace").unwrap().as_deref(), Some(&b"authoritative-history"[..]));
-        assert!(store.load_pending_records("workspace").unwrap().is_empty());
-        // Re-running legacy bootstrap cannot revive an acknowledged instruction.
-        store.migrate_pending_records("workspace", &[record]).unwrap();
-        assert!(store.load_pending_records("workspace").unwrap().is_empty());
-        let retained: Vec<u8> = store.conn().query_row(
-            "SELECT value FROM semantic_intents WHERE doc_id = 'workspace' AND container = 'chats' AND record_id = 'chat-a' AND acknowledged = 1",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&retained).unwrap(), serde_json::to_value(acknowledged).unwrap());
-    }
-
-    #[test]
-    fn failed_semantic_migration_rolls_back_marker_and_all_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let records = [pending("first"), pending("reject")];
-        store.conn().execute_batch(
-            "CREATE TRIGGER fail_intent BEFORE INSERT ON semantic_intents
-             WHEN NEW.record_id = 'reject'
-             BEGIN SELECT RAISE(ABORT, 'injected intent write failure'); END;",
-        ).unwrap();
-        assert!(store.migrate_pending_records("workspace", &records).is_err());
-        assert!(!store.has_semantic_journal("workspace").unwrap());
-        assert!(store.load_pending_records("workspace").unwrap().is_empty());
-        store.conn().execute_batch("DROP TRIGGER fail_intent").unwrap();
-        store.migrate_pending_records("workspace", &records).unwrap();
-        assert!(store.has_semantic_journal("workspace").unwrap());
-        assert_eq!(serde_json::to_value(store.load_pending_records("workspace").unwrap()).unwrap(), serde_json::to_value(records).unwrap());
-    }
-
-    #[test]
-    fn directory_adoption_wakes_missing_sources_and_preserves_new_generations() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let id = "10000000-0000-4000-8000-000000000001";
-        let scope = "session/test-deployment/project/owner/10000000-0000-4000-8000-000000000001";
-        store.claim_document_scope(id, scope, None).unwrap();
-        store.queue_directory(id, false).unwrap();
-        let (_, missing_generation, _, _) = store.claim_directory().unwrap().unwrap();
-        assert!(store.load_snapshot(id).unwrap().is_none());
-        store.settle_directory(id, missing_generation, false).unwrap();
-        let mut changed = store.watch_directory();
-        changed.borrow_and_update();
-        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"authoritative")).unwrap();
-        assert!(changed.has_changed().unwrap());
-        assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"authoritative"[..]));
-        assert!(store.load_snapshot(scope).unwrap().is_none());
-        // Source arrival is durable, but does not bypass transport backoff.
-        assert!(store.claim_directory().unwrap().is_none());
-        store.conn().execute("UPDATE crew_directory_jobs SET due_at = 0, retry_at = 0 WHERE session_id = ?1", params![id]).unwrap();
-        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-        assert!(generation > missing_generation);
-        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"converged")).unwrap();
-        store.settle_directory(id, generation, true).unwrap();
-        // An acknowledgement of the old source cannot retire the adopted source.
-        assert!(store.directory_retry_delay().unwrap().is_some());
-        drop(store);
-        let store = DocsStore::open(dir.path()).unwrap();
-        store.queue_directory(id, false).unwrap();
-        let (_, newer, _, _) = store.claim_directory().unwrap().unwrap();
-        assert!(newer > generation);
-        store.settle_directory(id, newer, true).unwrap();
-        assert!(store.directory_retry_delay().unwrap().is_none());
-        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"next")).unwrap();
-        assert!(store.directory_retry_delay().unwrap().is_some());
-        // A stale scoped binding cannot overwrite the source or enqueue work.
-        assert!(store.save_pending_records_for_snapshot("wrong-scope", id, std::iter::empty(), Some(b"foreign")).is_err());
-        assert_eq!(store.load_snapshot(id).unwrap().as_deref(), Some(&b"next"[..]));
-        store.queue_directory_deletion(id, "{\"deleted\":true}").unwrap();
-        let (_, deleted_generation, _, _) = store.claim_directory().unwrap().unwrap();
-        store.settle_directory(id, deleted_generation, true).unwrap();
-        store.save_pending_records_for_snapshot(scope, id, std::iter::empty(), Some(b"late")).unwrap();
-        assert!(store.directory_retry_delay().unwrap().is_none());
-    }
-
-    #[test]
-    fn directory_snapshots_coalesce_without_postponing_deadline_or_bypassing_backoff() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let id = "10000000-0000-4000-8000-000000000001";
-        store.save_snapshot(id, b"first").unwrap();
-        assert!(store.claim_directory().unwrap().is_none());
-        let first_due: i64 = store
-            .conn()
-            .query_row(
-                "SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        store.save_snapshot(id, b"newest").unwrap();
-        let next_due: i64 = store
-            .conn()
-            .query_row(
-                "SELECT due_at FROM crew_directory_jobs WHERE session_id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(next_due, first_due);
-        store.queue_directory(id, false).unwrap();
-        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-        store.save_snapshot(id, b"raced").unwrap();
-        store.settle_directory(id, generation, false).unwrap();
-        store.save_snapshot(id, b"later").unwrap();
-        store.queue_directory(id, false).unwrap();
-        assert!(store.claim_directory().unwrap().is_none());
-    }
-
-    #[test]
-    fn completed_snapshot_prioritizes_failed_job_durably_without_resetting_backoff() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        let id = "90000000-0000-4000-8000-000000000001";
-        let backlog = "10000000-0000-4000-8000-000000000001";
-        store.queue_directory(id, false).unwrap();
-        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-        store.settle_directory(id, generation, false).unwrap();
-        let state = r#"{"nextTitleAt":9223372036854775807}"#;
-        store.save_directory_state(id, state, false).unwrap();
-        store.save_completed_snapshot(id, b"completed").unwrap();
-        assert!(store.claim_directory().unwrap().is_none());
-        // Advance past transport backoff without sleeping or resetting inference state.
-        store
-            .conn()
-            .execute(
-                "UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1",
-                params![id],
-            )
-            .unwrap();
-        store.queue_directory(backlog, false).unwrap();
-        drop(store);
-
-        let store = DocsStore::open(dir.path()).unwrap();
-        // Restart backfill and later debounced saves must not demote a completion.
-        store.queue_directory(id, false).unwrap();
-        store.save_snapshot(id, b"latest").unwrap();
-        let (claimed, _, saved, _) = store.claim_directory().unwrap().unwrap();
-        assert_eq!(claimed, id);
-        assert_eq!(saved, state);
-        assert_eq!(
-            store.load_snapshot(id).unwrap().as_deref(),
-            Some(&b"latest"[..])
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let holder = store.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holding = std::thread::spawn(move || {
+            let _connection = holder.conn();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let write = store.clone();
+        let a = tokio::spawn(async move {
+            write.save_snapshot("whale", &[0; 1024]).unwrap();
+        });
+        let read = store.clone();
+        let b = tokio::spawn(async move {
+            read.load_snapshot("registry1").unwrap();
+        });
+        // Both contenders have a chance to enter the shared connection wait.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "SQLite contenders monopolized both runtime workers"
         );
-    }
-
-    #[test]
-    fn completed_priority_is_consumed_before_retry_or_title_deferral() {
-        for deferred in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let store = DocsStore::open(dir.path()).unwrap();
-            let id = "90000000-0000-4000-8000-000000000001";
-            let backlog = "10000000-0000-4000-8000-000000000001";
-            store.save_completed_snapshot(id, b"completed").unwrap();
-            let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-            if deferred {
-                store
-                    .defer_directory_title(id, generation, i64::MAX - 1)
-                    .unwrap();
-            } else {
-                store.settle_directory(id, generation, false).unwrap();
-            }
-            assert!(store.claim_directory().unwrap().is_none());
-            // Once due again, the failed/deferred completion no longer jumps the backlog.
-            store
-                .conn()
-                .execute(
-                    "UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1",
-                    params![id],
-                )
-                .unwrap();
-            store.queue_directory(backlog, false).unwrap();
-            let (claimed, generation, _, _) = store.claim_directory().unwrap().unwrap();
-            assert_eq!(claimed, backlog);
-            store.settle_directory(backlog, generation, true).unwrap();
-            assert_eq!(store.claim_directory().unwrap().unwrap().0, id);
-        }
-    }
-
-    #[test]
-    fn completion_during_claim_survives_success_failure_and_title_deferral() {
-        for outcome in ["success", "failure", "deferred"] {
-            let dir = tempfile::tempdir().unwrap();
-            let store = DocsStore::open(dir.path()).unwrap();
-            let id = "90000000-0000-4000-8000-000000000001";
-            let backlog = "10000000-0000-4000-8000-000000000001";
-            store.save_completed_snapshot(id, b"first").unwrap();
-            let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-            store
-                .save_completed_snapshot(id, b"new completion")
-                .unwrap();
-            match outcome {
-                "deferred" => store
-                    .defer_directory_title(id, generation, i64::MAX - 1)
-                    .unwrap(),
-                _ => store
-                    .settle_directory(id, generation, outcome == "success")
-                    .unwrap(),
-            }
-            if outcome == "failure" {
-                assert!(store.claim_directory().unwrap().is_none());
-                store.conn().execute("UPDATE crew_directory_jobs SET due_at = 1, retry_at = 1 WHERE session_id = ?1", params![id]).unwrap();
-            }
-            store.queue_directory(backlog, false).unwrap();
-            let (claimed, newer, _, _) = store.claim_directory().unwrap().unwrap();
-            assert_eq!(claimed, id, "{outcome}");
-            assert!(newer > generation);
-            assert_eq!(
-                store.load_snapshot(id).unwrap().as_deref(),
-                Some(&b"new completion"[..])
-            );
-        }
-    }
-
-    #[test]
-    fn directory_acknowledgement_cannot_drop_newer_work_or_resurrect_deletion() {
-        let dir = tempfile::tempdir().unwrap();
-        let id = "10000000-0000-4000-8000-000000000001";
-        let store = DocsStore::open(dir.path()).unwrap();
-        store.queue_directory(id, false).unwrap();
-        let (_, generation, _, _) = store.claim_directory().unwrap().unwrap();
-        store.queue_directory(id, false).unwrap();
-        store.settle_directory(id, generation, true).unwrap();
-        let (_, newer, _, _) = store.claim_directory().unwrap().unwrap();
-        assert!(newer > generation);
-        store
-            .queue_directory_deletion(
-                id,
-                r#"{"sourceVersion":{"s:1":4},"deploymentId":"staging"}"#,
-            )
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
             .unwrap();
-        store.save_directory_state(id, "{}", false).unwrap();
+        let _accepted = listener.accept().await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "network progress waited for SQLite"
+        );
+        drop(socket);
+        a.await.unwrap();
+        b.await.unwrap();
+        holding.join().unwrap();
+    }
+
+    #[test]
+    fn verified_cursor_marker_tracks_atomic_snapshot_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        store
+            .save_snapshot_with_cursor("chat", b"old", 69000, 2)
+            .unwrap();
+        assert!(!store.snapshot_cursor_verified("chat").unwrap());
+        store
+            .save_verified_snapshot_with_cursor("chat", b"safe", 69001, 2)
+            .unwrap();
+        assert!(store.snapshot_cursor_verified("chat").unwrap());
         drop(store);
-        let restarted = DocsStore::open(dir.path()).unwrap();
-        restarted.queue_directory(id, false).unwrap();
-        let (_, _, state, deleted) = restarted.claim_directory().unwrap().unwrap();
-        assert!(deleted);
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert!(store.snapshot_cursor_verified("chat").unwrap());
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&state).unwrap()["deploymentId"],
-            "staging"
+            store.load_snapshot_with_cursor("chat").unwrap(),
+            Some((b"safe".to_vec(), 69001, 2))
+        );
+        store
+            .save_snapshot_with_cursor("chat", b"replacement", 0, 2)
+            .unwrap();
+        assert!(
+            !store.snapshot_cursor_verified("chat").unwrap(),
+            "unverified replacement invalidates trust"
         );
     }
 
@@ -1219,15 +975,54 @@ mod tests {
     fn snapshot_roundtrip_and_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let store = DocsStore::open(dir.path()).unwrap();
+
         assert_eq!(store.load_snapshot("chat-1").unwrap(), None);
-        store.save_snapshot("chat-1", b"initial").unwrap();
-        let pages: Vec<u8> = (0..11 * 4096 + 3).map(|index| index as u8).collect();
-        for bytes in [pages.as_slice(), &[0, 255], &[]] {
-            store.save_snapshot("chat-1", bytes).unwrap();
-            assert_eq!(store.load_snapshot("chat-1").unwrap().as_deref(), Some(bytes));
-        }
+        store.save_snapshot("chat-1", b"v1").unwrap();
+        assert_eq!(
+            store.load_snapshot("chat-1").unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        store.save_snapshot("chat-1", b"v2-longer-bytes").unwrap();
+        assert_eq!(
+            store.load_snapshot("chat-1").unwrap().as_deref(),
+            Some(&b"v2-longer-bytes"[..])
+        );
+        // Distinct docs do not collide.
         store.save_snapshot("chat-2", b"other").unwrap();
-        assert_eq!(store.load_snapshot("chat-1").unwrap().as_deref(), Some(&[][..]));
+        assert_eq!(
+            store.load_snapshot("chat-1").unwrap().as_deref(),
+            Some(&b"v2-longer-bytes"[..])
+        );
+    }
+
+    #[test]
+    fn cursor_rides_the_snapshot_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+
+        // Plain saves (pre-chat2 path) read back with cursor/epoch 0.
+        store.save_snapshot("chat-1", b"v1").unwrap();
+        assert_eq!(
+            store.load_snapshot_with_cursor("chat-1").unwrap(),
+            Some((b"v1".to_vec(), 0, 0))
+        );
+        // Cursor and bytes land together; a re-save moves both.
+        store
+            .save_snapshot_with_cursor("chat-1", b"v2", 41, 2)
+            .unwrap();
+        assert_eq!(
+            store.load_snapshot_with_cursor("chat-1").unwrap(),
+            Some((b"v2".to_vec(), 41, 2))
+        );
+        // Plain load still works for cursor-written rows.
+        assert_eq!(
+            store.load_snapshot("chat-1").unwrap().as_deref(),
+            Some(&b"v2"[..])
+        );
+        // A plain save (legacy caller) clears nothing — cursor persists…
+        store.save_snapshot("chat-1", b"v3").unwrap();
+        let (bytes, cursor, epoch) = store.load_snapshot_with_cursor("chat-1").unwrap().unwrap();
+        assert_eq!((bytes.as_slice(), cursor, epoch), (&b"v3"[..], 41, 2));
     }
 
     #[test]
@@ -1242,62 +1037,6 @@ mod tests {
             !store.mark_processed("cmd-1").unwrap(),
             "second mark must not re-claim"
         );
-    }
-
-    #[test]
-    fn local_command_trust_is_durable_and_revocable() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-
-        assert!(!store.is_trusted_local_command("cmd-local").unwrap());
-        store.trust_local_command("cmd-local").unwrap();
-        assert!(store.is_trusted_local_command("cmd-local").unwrap());
-        drop(store);
-
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert!(store.is_trusted_local_command("cmd-local").unwrap());
-        store.forget_local_command("cmd-local").unwrap();
-        assert!(!store.is_trusted_local_command("cmd-local").unwrap());
-    }
-
-    #[test]
-    fn local_command_retention_preserves_original_admission_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        store.trust_local_command("old").unwrap();
-        store
-            .conn()
-            .execute(
-                "UPDATE trusted_local_commands SET created_at = 10 WHERE command_id = 'old'",
-                [],
-            )
-            .unwrap();
-        store.mark_processed("old").unwrap();
-        store.trust_local_command("old").unwrap();
-        store.trust_local_command("current").unwrap();
-        store.prune_local_commands(11).unwrap();
-        assert!(
-            !store.is_trusted_local_command("old").unwrap(),
-            "retry must not refresh original admission time"
-        );
-        assert!(store.is_trusted_local_command("current").unwrap());
-        assert!(
-            store.is_processed("old").unwrap(),
-            "retention must not allow re-execution"
-        );
-    }
-
-    #[test]
-    fn local_migration_markers_are_durable_and_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert!(!store.is_local_migration_applied("membership-v1").unwrap());
-        store.mark_local_migration_applied("membership-v1").unwrap();
-        store.mark_local_migration_applied("membership-v1").unwrap();
-        drop(store);
-
-        let store = DocsStore::open(dir.path()).unwrap();
-        assert!(store.is_local_migration_applied("membership-v1").unwrap());
     }
 
     #[test]
@@ -1316,34 +1055,260 @@ mod tests {
         assert!(store.is_processed("cmd-1").unwrap());
         assert!(!store.mark_processed("cmd-1").unwrap());
     }
+}
 
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
     #[test]
-    fn legacy_snapshot_migration_preserves_bytes_clocks_rowids_and_command_ledger() {
+    fn outbox_survives_restart_initializes_once_and_preserves_cursor() {
         let dir = tempfile::tempdir().unwrap();
-        let payload: Vec<u8> = (0..11 * 4096 + 3).map(|index| index as u8).collect();
+        let original;
         {
-            let conn = Connection::open(dir.path().join("docs.sqlite3")).unwrap();
-            conn.execute_batch(MIGRATIONS[0]).unwrap();
-            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT;
-                INSERT INTO schema_migrations VALUES (1, 1);
-                INSERT INTO processed_commands VALUES ('accepted-command', 17);").unwrap();
-            conn.execute("INSERT INTO snapshots (rowid,doc_id,bytes,saved_at) VALUES (?1,?2,?3,?4)",
-                params![41,"public-room",payload.as_slice(),1234567890_i64]).unwrap();
-            conn.execute("INSERT INTO snapshots (rowid,doc_id,bytes,saved_at) VALUES (?1,?2,?3,?4)",
-                params![97,"recovery-original/room",&[] as &[u8],0]).unwrap();
-        }
-        for _ in 0..2 {
             let store = DocsStore::open(dir.path()).unwrap();
-            assert_eq!(store.load_snapshot("public-room").unwrap(),Some(payload.clone()));
-            assert_eq!(store.load_snapshot("recovery-original/room").unwrap(),Some(Vec::new()));
-            let metadata: Vec<(String,i64,i64)> = store.conn().prepare("SELECT doc_id,rowid,saved_at FROM snapshots ORDER BY rowid")
-                .unwrap().query_map([],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().map(Result::unwrap).collect();
-            assert_eq!(metadata,[("public-room".into(),41,1234567890),("recovery-original/room".into(),97,0)]);
-            assert!(store.is_processed("accepted-command").unwrap());
+            store
+                .save_snapshot_with_cursor("chat", b"snapshot", 40229, 2)
+                .unwrap();
+            store
+                .initialize_chat_outbox("chat", &[b"legacy-tail".to_vec()])
+                .unwrap();
+            original = store.pending_chat_updates("chat").unwrap();
+            store
+                .enqueue_chat_update("chat", "stable-id", b"new-turn")
+                .unwrap();
+            store
+                .enqueue_chat_update("chat", "stable-id", b"new-turn")
+                .unwrap();
         }
         let store = DocsStore::open(dir.path()).unwrap();
-        store.save_snapshot("public-room",b"new checkpoint").unwrap();
-        assert_eq!(store.load_snapshot("public-room").unwrap().as_deref(),Some(&b"new checkpoint"[..]));
-        assert_eq!(store.load_snapshot("recovery-original/room").unwrap(),Some(Vec::new()));
+        store
+            .initialize_chat_outbox("chat", &[b"must-not-reseed".to_vec()])
+            .unwrap();
+        let pending = store.pending_chat_updates("chat").unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0], original[0]);
+        assert_eq!(pending[1], ("stable-id".into(), b"new-turn".to_vec()));
+        assert_eq!(
+            store.load_snapshot_with_cursor("chat").unwrap().unwrap(),
+            (b"snapshot".to_vec(), 40229, 2)
+        );
+        store
+            .acknowledge_chat_update("other-chat", "stable-id")
+            .unwrap();
+        assert_eq!(store.pending_chat_updates("chat").unwrap().len(), 2);
+        store.acknowledge_chat_update("chat", "stable-id").unwrap();
+        assert_eq!(store.pending_chat_updates("chat").unwrap(), original);
+        store.delete_snapshot("chat").unwrap();
+        assert!(store.pending_chat_updates("chat").unwrap().is_empty());
+        assert!(!store.chat_outbox_initialized("chat").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod publication_failure_tests {
+    use super::*;
+    #[test]
+    fn cursor_save_after_failed_outbox_write_keeps_a_durable_replay_obligation() {
+        for cursor_save in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DocsStore::open(dir.path()).unwrap();
+            store
+                .save_snapshot_with_cursor("chat", b"before", 42, 2)
+                .unwrap();
+            store.initialize_chat_outbox("chat", &[]).unwrap();
+            store.conn().execute_batch("CREATE TRIGGER fail_publication BEFORE INSERT ON chat_outbox BEGIN SELECT RAISE(FAIL, 'injected disk failure'); END;").unwrap();
+            assert!(
+                store
+                    .enqueue_chat_update("chat", "batch", b"cleanup")
+                    .is_err()
+            );
+            if cursor_save {
+                store
+                    .save_snapshot_with_cursor("chat", b"after", 43, 2)
+                    .unwrap();
+            } else {
+                store.save_snapshot("chat", b"after").unwrap();
+            }
+            drop(store);
+            let reopened = DocsStore::open(dir.path()).unwrap();
+            assert!(!reopened.chat_outbox_initialized("chat").unwrap());
+            assert_eq!(
+                reopened.load_snapshot_with_cursor("chat").unwrap().unwrap(),
+                (b"after".to_vec(), if cursor_save { 43 } else { 42 }, 2)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    const MIB: usize = 1024 * 1024;
+
+    fn pragma(conn: &Connection, name: &str) -> i64 {
+        conn.pragma_query_value(None, name, |row| row.get(0))
+            .unwrap()
+    }
+
+    fn file_len(path: &Path) -> u64 {
+        std::fs::metadata(path).map_or(0, |m| m.len())
+    }
+
+    /// 48 MiB of snapshots, 40 MiB of them deleted: well past both thresholds.
+    fn fragmented_store(dir: &Path) {
+        let store = DocsStore::open(dir).unwrap();
+        for i in 0..48 {
+            store
+                .save_snapshot(&format!("d{i}"), &vec![7; MIB])
+                .unwrap();
+        }
+        for i in 0..40 {
+            store.delete_snapshot(&format!("d{i}")).unwrap();
+        }
+        let conn = store.conn();
+        assert!(worth_vacuuming(
+            pragma(&conn, "page_size"),
+            pragma(&conn, "page_count"),
+            pragma(&conn, "freelist_count")
+        ));
+    }
+
+    #[test]
+    fn open_folds_and_truncates_a_bloated_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(DocsStore::open(dir.path()).unwrap());
+        let wal = dir.path().join("docs.sqlite3-wal");
+        // A live connection keeps the WAL from being cleaned up on close.
+        let other = Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        other.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        for i in 0..8 {
+            other
+                .execute(
+                    "INSERT INTO snapshots(doc_id,bytes,saved_at) VALUES (?1,zeroblob(?2),0)",
+                    params![format!("d{i}"), MIB as i64],
+                )
+                .unwrap();
+        }
+        assert!(file_len(&wal) > 8 * MIB as u64);
+
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert_eq!(file_len(&wal), 0, "boot checkpoint truncates the WAL");
+        assert!(store.has_snapshot("d7").unwrap(), "frames folded, not lost");
+        assert_eq!(
+            pragma(&store.conn(), "journal_size_limit"),
+            JOURNAL_SIZE_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn reclaim_vacuums_a_fragmented_database_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("docs.sqlite3");
+        fragmented_store(dir.path());
+        let before = file_len(&db);
+
+        let store = DocsStore::open(dir.path()).unwrap();
+        // Open never pays for the rewrite; the reclaim pass does.
+        assert!(pragma(&store.conn(), "freelist_count") > 0);
+        store.reclaim_free_space();
+        assert_eq!(pragma(&store.conn(), "freelist_count"), 0);
+        assert!(file_len(&db) < before / 2, "file shrank");
+        assert_eq!(file_len(&dir.path().join("docs.sqlite3-wal")), 0);
+        assert_eq!(store.load_snapshot("d47").unwrap().unwrap().len(), MIB);
+        assert!(
+            !reclaim_free_pages(&store.conn()).unwrap(),
+            "a compacted database is not rewritten again"
+        );
+    }
+
+    #[test]
+    fn reclaim_after_a_post_open_shrink_vacuums_without_a_relaunch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("docs.sqlite3");
+        // Open-time maintenance finds nothing to do; the shrink happens after.
+        let store = DocsStore::open(dir.path()).unwrap();
+        store
+            .save_snapshot("registry1", &vec![7; 48 * MIB])
+            .unwrap();
+        store.save_snapshot("registry1", &vec![7; MIB]).unwrap();
+        assert!(pragma(&store.conn(), "freelist_count") > 0);
+        let before = file_len(&db);
+
+        store.reclaim_free_space();
+        assert_eq!(pragma(&store.conn(), "freelist_count"), 0);
+        assert!(file_len(&db) < before / 2, "file shrank");
+        assert_eq!(file_len(&dir.path().join("docs.sqlite3-wal")), 0);
+        assert_eq!(
+            store.load_snapshot("registry1").unwrap().unwrap().len(),
+            MIB
+        );
+        // The busy timeout is back at the store's normal wait.
+        let busy: i64 = pragma(&store.conn(), "busy_timeout");
+        assert_eq!(busy, STORE_BUSY_TIMEOUT.as_millis() as i64);
+        // Idempotent and cheap once compact.
+        store.reclaim_free_space();
+        assert_eq!(pragma(&store.conn(), "freelist_count"), 0);
+    }
+
+    #[test]
+    fn small_or_proportionally_minor_freelists_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        for i in 0..4 {
+            store
+                .save_snapshot(&format!("d{i}"), &vec![7; MIB])
+                .unwrap();
+        }
+        for i in 0..3 {
+            store.delete_snapshot(&format!("d{i}")).unwrap();
+        }
+        let freelist = pragma(&store.conn(), "freelist_count");
+        assert!(freelist > 0);
+        assert!(!reclaim_free_pages(&store.conn()).unwrap(), "below 32 MiB");
+        assert_eq!(pragma(&store.conn(), "freelist_count"), freelist);
+
+        let page = 4096;
+        let floor = VACUUM_MIN_FREE_BYTES / page;
+        assert!(worth_vacuuming(page, floor * 4, floor));
+        assert!(!worth_vacuuming(page, floor * 4 + 1, floor), "under 25%");
+        assert!(!worth_vacuuming(page, floor, floor - 1), "under the floor");
+    }
+
+    #[test]
+    fn maintenance_yields_to_a_connection_holding_the_database() {
+        // WAL lets VACUUM proceed beside a reader; a held write lock defers it.
+        for (lock, vacuumed) in [
+            ("BEGIN; SELECT count(*) FROM snapshots;", true),
+            ("BEGIN IMMEDIATE;", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fragmented_store(dir.path());
+            let other = Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+            other.execute_batch(lock).unwrap();
+
+            let started = Instant::now();
+            let store = DocsStore::open(dir.path()).expect("maintenance never fails open");
+            store.reclaim_free_space();
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "{lock}: maintenance waited on the store busy timeout"
+            );
+            assert_eq!(store.load_snapshot("d47").unwrap().unwrap().len(), MIB);
+            assert_eq!(
+                pragma(&store.conn(), "freelist_count") == 0,
+                vacuumed,
+                "{lock}"
+            );
+
+            other.execute_batch("COMMIT").unwrap();
+            store.save_snapshot("after", b"ok").unwrap();
+            assert!(store.has_snapshot("after").unwrap());
+            drop(store);
+            // A deferred VACUUM simply runs on the next uncontended pass.
+            let store = DocsStore::open(dir.path()).unwrap();
+            store.reclaim_free_space();
+            assert_eq!(pragma(&store.conn(), "freelist_count"), 0, "{lock}");
+        }
     }
 }

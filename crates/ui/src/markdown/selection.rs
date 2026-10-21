@@ -1,9 +1,10 @@
 //! Text selection for rendered markdown (round 18).
 //!
-//! gpui has no built-in selection for plain text elements. A single text model
-//! selects continuously, while Ashler Comet renders a tree of text elements in
-//! a virtualized list. This module rebuilds that continuity: each frame the
-//! renderer registers every painted text element in document order,
+//! gpui has no built-in selection for plain text elements. Zed's markdown
+//! selects continuously because its whole document is ONE element over one
+//! text model; zeron renders a TREE of text elements inside a virtualized
+//! list, so this module rebuilds that continuity: every frame the renderer
+//! registers each painted text element in paint order (= document order),
 //! and a drag anchored in one element resolves against that registry into
 //! per-element SPANS — partial in the anchor/head elements, whole for every
 //! element between. The wash paints per element from its span; copy joins
@@ -12,8 +13,8 @@
 //! This module is the pure state half (gpui-free, unit-tested); the
 //! registry, geometry and mouse listeners live in `render.rs`.
 
-use std::cell::RefCell;
 use std::ops::Range;
+use std::sync::{Mutex, OnceLock};
 
 /// One element's slice of the selection, in document order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,23 +30,42 @@ pub struct Span {
 
 #[derive(Clone, Default)]
 struct MdSelection {
+    /// Painted surface (transcript) the selection lives in. Keys are only
+    /// unique within one: a side chat's forked history repeats its parent's.
+    surface: u64,
     /// Element that owns the drag (where the mouse went down).
     anchor_key: String,
     /// Byte offset of the anchor within its element.
     anchor_ix: usize,
     dragging: bool,
-    /// Document direction from the anchor to the current head. This lets a
-    /// drag keep extending after virtualization scrolls the anchor off-screen.
-    forward: bool,
+    /// Document direction established while the anchor is still painted.
+    /// Once virtualization moves it out of the registry, this tells us which
+    /// side of the accumulated spans to preserve while extending the head.
+    forward: Option<bool>,
     /// Resolved spans, document order. Empty while a click hasn't moved.
     spans: Vec<Span>,
-    /// Window-space pointer position captured when the drag settles. The shell
-    /// places the comment action beside the highlighted text.
-    action_position: Option<(f32, f32)>,
 }
 
-thread_local! {
-    static STATE: RefCell<Option<MdSelection>> = const { RefCell::new(None) };
+fn state() -> &'static Mutex<Option<MdSelection>> {
+    static STATE: OnceLock<Mutex<Option<MdSelection>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Selection state is process-global; tests that exercise its lifecycle must
+/// not race each other.
+#[cfg(test)]
+pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Offsets retained across frames may now fall inside a character after the
+/// same element's text changes. Use the same left affinity as word selection,
+/// against the text being snapshotted, before publishing a span to consumers.
+fn normalize_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let start = text.floor_char_boundary(range.start);
+    start..text.floor_char_boundary(range.end).max(start)
 }
 
 /// Resolve the spans for a selection between `a` and `b`, each an
@@ -61,11 +81,14 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
     for (ei, (key, text)) in elements.iter().enumerate().take(end.0 + 1).skip(start.0) {
         let from = if ei == start.0 { start.1 } else { 0 };
         let to = if ei == end.0 { end.1 } else { text.len() };
-        let (from, to) = (from.min(text.len()), to.min(text.len()));
-        if from < to {
+        let range = normalize_range(text, from..to);
+        // Keep empty elements strictly between the endpoints. Rendered code
+        // fences register one element per source line, so a blank line must
+        // contribute its newline when a selection crosses it.
+        if !range.is_empty() || (ei > start.0 && ei < end.0) {
             spans.push(Span {
                 key: (*key).to_string(),
-                range: from..to,
+                range,
                 text: (*text).to_string(),
             });
         }
@@ -75,216 +98,252 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
 
 /// Begin a drag anchored at `(key, ix)`; claims the global selection.
 pub fn begin(key: &str, ix: usize) {
-    STATE.with(|state| {
-        *state.borrow_mut() = Some(MdSelection {
-            anchor_key: key.to_string(),
-            anchor_ix: ix,
-            dragging: true,
-            forward: true,
-            spans: Vec::new(),
-            action_position: None,
-        });
+    begin_in(0, key, ix);
+}
+
+/// `begin` on one of several surfaces painted in the same frame.
+pub(crate) fn begin_in(surface: u64, key: &str, ix: usize) {
+    *state().lock().unwrap() = Some(MdSelection {
+        surface,
+        anchor_key: key.to_string(),
+        anchor_ix: ix,
+        dragging: true,
+        forward: None,
+        spans: Vec::new(),
     });
 }
 
 /// Begin with an immediate span (double/triple click inside one element).
 pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
-    STATE.with(|state| {
-        let anchor_ix = range.start;
-        *state.borrow_mut() = Some(MdSelection {
-            anchor_key: key.to_string(),
-            anchor_ix,
-            dragging: true,
-            forward: true,
-            spans: vec![Span {
-                key: key.to_string(),
-                range,
-                text: text.to_string(),
-            }],
-            action_position: None,
-        });
+    begin_with_span_in(0, key, text, range);
+}
+
+/// `begin_with_span` on one of several surfaces painted in the same frame.
+pub(crate) fn begin_with_span_in(surface: u64, key: &str, text: &str, range: Range<usize>) {
+    let range = normalize_range(text, range);
+    *state().lock().unwrap() = Some(MdSelection {
+        surface,
+        anchor_key: key.to_string(),
+        anchor_ix: range.start,
+        dragging: true,
+        forward: None,
+        spans: vec![Span {
+            key: key.to_string(),
+            range,
+            text: text.to_string(),
+        }],
     });
 }
 
-/// The active drag's document anchor.
-pub fn drag_anchor() -> Option<(String, usize)> {
-    STATE.with(|state| {
-        let guard = state.borrow();
-        let selection = guard.as_ref()?;
-        selection
-            .dragging
-            .then(|| (selection.anchor_key.clone(), selection.anchor_ix))
-    })
+/// The live drag's anchor, if `key` owns it: `(anchor byte offset)`.
+pub fn drag_anchor(key: &str) -> Option<usize> {
+    let guard = state().lock().unwrap();
+    let sel = guard.as_ref()?;
+    (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_ix)
 }
 
-/// Resume a settled selection from its original anchor for Shift-click.
-pub fn resume_drag() -> bool {
-    STATE.with(|state| {
-        let mut guard = state.borrow_mut();
-        let Some(selection) = guard.as_mut() else {
-            return false;
-        };
-        if selection.spans.is_empty() {
-            return false;
-        }
-        selection.dragging = true;
-        selection.action_position = None;
-        true
-    })
+pub(crate) fn anchor_key() -> Option<String> {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.anchor_key.clone())
 }
 
-/// Extend the active selection to `head` in the currently painted document
-/// slice. When the original anchor has scrolled out, overlapping spans bridge
-/// the old and new virtualized slices without losing already-selected text.
-pub fn extend_to(elements: &[(&str, &str)], head: (usize, usize)) -> bool {
-    STATE.with(|state| {
-        let mut guard = state.borrow_mut();
-        let Some(selection) = guard.as_mut() else {
+/// The surface the selection lives in (0 when there is none).
+pub(crate) fn anchor_surface() -> u64 {
+    state().lock().unwrap().as_ref().map_or(0, |s| s.surface)
+}
+
+/// Whether a markdown selection drag is currently in flight.
+pub fn is_dragging() -> bool {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|selection| selection.dragging)
+}
+
+/// Resolve a drag head against this frame's visible elements.
+///
+/// While the anchor is visible this is a normal replacement, which lets the
+/// user contract or reverse the selection. Once a virtualized list scrolls the
+/// anchor away, merge through an overlapping selected element instead. The
+/// overlap preserves text that is no longer painted while allowing newly
+/// visible elements at the drag edge to join the selection.
+pub fn update_drag(elements: &[(&str, &str)], head: (usize, usize)) -> bool {
+    let mut guard = state().lock().unwrap();
+    let Some(selection) = guard.as_mut().filter(|selection| selection.dragging) else {
+        return false;
+    };
+    let spans = if let Some(anchor_ei) = elements
+        .iter()
+        .position(|(key, _)| *key == selection.anchor_key)
+    {
+        let anchor = (anchor_ei, selection.anchor_ix);
+        selection.forward = Some(anchor <= head);
+        resolve_spans(elements, anchor, head)
+    } else {
+        let Some(forward) = selection.forward else {
             return false;
         };
-        if !selection.dragging || elements.is_empty() || head.0 >= elements.len() {
+        let Some(spans) = extend_virtualized_drag(&selection.spans, elements, head, forward) else {
             return false;
-        }
+        };
+        spans
+    };
+    if selection.spans == spans {
+        return false;
+    }
+    selection.spans = spans;
+    true
+}
 
-        let next = if let Some(anchor_ei) = elements
-            .iter()
-            .position(|(key, _)| *key == selection.anchor_key)
-        {
-            selection.forward = (anchor_ei, selection.anchor_ix) <= head;
-            resolve_spans(elements, (anchor_ei, selection.anchor_ix), head)
-        } else {
-            let overlaps = elements
+fn extend_virtualized_drag(
+    existing: &[Span],
+    elements: &[(&str, &str)],
+    head: (usize, usize),
+    forward: bool,
+) -> Option<Vec<Span>> {
+    if forward {
+        let (element_ix, span_ix) =
+            elements
                 .iter()
                 .enumerate()
-                .filter_map(|(element_ix, (key, _))| {
-                    selection
-                        .spans
+                .find_map(|(element_ix, (key, _))| {
+                    existing
                         .iter()
                         .position(|span| span.key == *key)
                         .map(|span_ix| (element_ix, span_ix))
-                })
-                .collect::<Vec<_>>();
-            if selection.forward {
-                let Some(&(element_ix, span_ix)) = overlaps.first() else {
-                    return false;
-                };
-                let bridge_ix = selection.spans[span_ix].range.start;
-                let mut spans = selection.spans[..span_ix].to_vec();
-                spans.extend(resolve_spans(elements, (element_ix, bridge_ix), head));
-                spans
-            } else {
-                let Some(&(element_ix, span_ix)) = overlaps.last() else {
-                    return false;
-                };
-                let bridge_ix = selection.spans[span_ix].range.end;
-                let mut spans = resolve_spans(elements, head, (element_ix, bridge_ix));
-                spans.extend_from_slice(&selection.spans[span_ix + 1..]);
-                spans
-            }
+                })?;
+        let start = existing[span_ix].range.start;
+        let mut merged = existing[..span_ix].to_vec();
+        merged.extend(resolve_spans(elements, (element_ix, start), head));
+        Some(merged)
+    } else {
+        let (element_ix, span_ix) =
+            elements
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(element_ix, (key, _))| {
+                    existing
+                        .iter()
+                        .position(|span| span.key == *key)
+                        .map(|span_ix| (element_ix, span_ix))
+                })?;
+        // This overlap is inside the selection, not its anchor. If it was
+        // selected through the end, keep covering it through streaming edits.
+        let span = &existing[span_ix];
+        let end = if span.range.end == span.text.len() {
+            elements[element_ix].1.len()
+        } else {
+            span.range.end
         };
-
-        if selection.spans == next {
-            return false;
-        }
-        selection.spans = next;
-        true
-    })
+        let mut merged = resolve_spans(elements, head, (element_ix, end));
+        merged.extend_from_slice(&existing[span_ix + 1..]);
+        Some(merged)
+    }
 }
 
 /// Replace the resolved spans (drag update). Returns true if they changed.
-pub fn update_spans(spans: Vec<Span>) -> bool {
-    STATE.with(|state| {
-        let mut guard = state.borrow_mut();
-        let Some(selection) = guard.as_mut() else {
-            return false;
-        };
-        if selection.spans == spans {
-            return false;
-        }
-        selection.spans = spans;
-        true
-    })
+pub fn update_spans(mut spans: Vec<Span>) -> bool {
+    let mut guard = state().lock().unwrap();
+    let Some(sel) = guard.as_mut() else {
+        return false;
+    };
+    for span in &mut spans {
+        span.range = normalize_range(&span.text, span.range.clone());
+    }
+    if sel.spans == spans {
+        return false;
+    }
+    sel.spans = spans;
+    true
 }
 
 /// End the drag for `key`'s claim; returns the joined text if non-empty.
-pub fn end_drag(key: &str, action_position: Option<(f32, f32)>) -> Option<String> {
-    STATE.with(|state| {
-        let mut guard = state.borrow_mut();
-        let selection = guard.as_mut()?;
-        if selection.anchor_key != key || !selection.dragging {
-            return None;
-        }
-        selection.dragging = false;
-        selection.action_position = action_position;
-        if selection.spans.iter().all(|span| span.range.is_empty()) {
-            *guard = None;
-            return None;
-        }
-        Some(join_spans(&selection.spans))
-    })
+pub fn end_drag(key: &str) -> Option<String> {
+    let mut guard = state().lock().unwrap();
+    let sel = guard.as_mut()?;
+    if sel.anchor_key != key || !sel.dragging {
+        return None;
+    }
+    sel.dragging = false;
+    if sel.spans.iter().all(|s| s.range.is_empty()) {
+        *guard = None;
+        return None;
+    }
+    Some(join_spans(&sel.spans))
 }
 
-/// Clear any settled or active selection. True if one existed.
-pub fn clear() -> bool {
-    STATE.with(|state| state.borrow_mut().take().is_some())
+/// End whichever drag is active, even when virtualization has removed the
+/// anchor element (and therefore its frame-scoped mouse-up listener).
+pub fn end_active_drag() -> Option<String> {
+    let mut guard = state().lock().unwrap();
+    let sel = guard.as_mut()?;
+    if !sel.dragging {
+        return None;
+    }
+    sel.dragging = false;
+    if sel.spans.iter().all(|span| span.range.is_empty()) {
+        *guard = None;
+        return None;
+    }
+    Some(join_spans(&sel.spans))
 }
 
-/// The wash range for `key` this frame (empty ⇒ nothing to paint).
-pub fn wash_range(key: &str) -> Option<Range<usize>> {
-    STATE.with(|state| {
-        let guard = state.borrow();
-        let selection = guard.as_ref()?;
-        selection
-            .spans
-            .iter()
-            .find(|span| span.key == key && !span.range.is_empty())
-            .map(|span| span.range.clone())
-    })
+/// Clear if `key` owns a settled selection (a mouse-down landed outside the
+/// owner; the element the down landed IN claims right after). True if cleared.
+pub fn clear_if_owner(key: &str) -> bool {
+    let mut guard = state().lock().unwrap();
+    if guard
+        .as_ref()
+        .is_some_and(|s| s.anchor_key == key && !s.dragging)
+    {
+        *guard = None;
+        return true;
+    }
+    false
+}
+
+/// The wash range for `key` painted on `surface` this frame (empty ⇒ nothing
+/// to paint). Another surface showing the same key stays unwashed.
+pub fn wash_range(surface: u64, key: &str) -> Option<Range<usize>> {
+    let guard = state().lock().unwrap();
+    let sel = guard.as_ref().filter(|sel| sel.surface == surface)?;
+    sel.spans
+        .iter()
+        .find(|s| s.key == key && !s.range.is_empty())
+        .map(|s| s.range.clone())
 }
 
 /// The full selected text (Cmd+C), spans joined in document order.
 pub fn selected_text() -> Option<String> {
-    STATE.with(|state| {
-        let guard = state.borrow();
-        let selection = guard.as_ref()?;
-        if selection.spans.iter().all(|span| span.range.is_empty()) {
-            return None;
-        }
-        Some(join_spans(&selection.spans))
-    })
+    let guard = state().lock().unwrap();
+    let sel = guard.as_ref()?;
+    if sel.spans.iter().all(|s| s.range.is_empty()) {
+        return None;
+    }
+    Some(join_spans(&sel.spans))
 }
 
-/// Selected transcript message and text, when the settled selection stays
-/// within one message entry. Element keys are `{row_key}:{element}` and
-/// markdown row keys begin with `{message_id}#`.
-pub fn selected_message_context() -> Option<(String, String, (f32, f32))> {
-    STATE.with(|state| {
-        let guard = state.borrow();
-        let selection = guard.as_ref()?;
-        if selection.dragging || selection.spans.is_empty() {
-            return None;
-        }
-        let mut message_id: Option<&str> = None;
-        for span in &selection.spans {
-            let row_key = span.key.rsplit_once(':')?.0;
-            let current = row_key.split_once('#')?.0;
-            if message_id.is_some_and(|id| id != current) {
-                return None;
-            }
-            message_id = Some(current);
-        }
-        Some((
-            message_id?.to_string(),
-            join_spans(&selection.spans),
-            selection.action_position?,
-        ))
-    })
+/// Only a single transcript message can be a persistent semantic anchor.
+/// Rendered offsets are not source offsets, so the host reanchors by exact text.
+pub fn selected_message_anchor() -> Option<(String, String)> {
+    let guard = state().lock().unwrap();
+    let selection = guard.as_ref()?;
+    let (message, _) = selection.spans.first()?.key.split_once("#text.")?;
+    if selection.spans.iter().any(|span| span.key.split_once("#text.").map(|(id, _)| id) != Some(message)) {
+        return None;
+    }
+    let exact = join_spans(&selection.spans);
+    (!exact.trim().is_empty() && exact.len() <= 4096).then(|| (message.to_owned(), exact))
 }
 
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
-        .filter(|s| !s.range.is_empty())
         .map(|s| &s.text[s.range.clone()])
         .collect::<Vec<_>>()
         .join("\n")
@@ -293,12 +352,7 @@ fn join_spans(spans: &[Span]) -> String {
 /// Word range around `ix` for double-click selection: an alphanumeric/`_`
 /// run, or the single non-space char under the cursor, or empty at spaces.
 pub fn word_range(text: &str, ix: usize) -> Range<usize> {
-    let mut ix = ix.min(text.len());
-    // Snap into a char boundary (mouse indices should already be on one;
-    // defensive against mid-char byte offsets).
-    while ix > 0 && !text.is_char_boundary(ix) {
-        ix -= 1;
-    }
+    let ix = text.floor_char_boundary(ix);
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let before = text[..ix].chars().next_back();
     let at = text[ix..].chars().next();
@@ -359,88 +413,161 @@ mod tests {
     }
 
     #[test]
+    fn spans_across_empty_elements_preserve_blank_lines() {
+        let elements = [("line-1", "first"), ("line-2", ""), ("line-3", "third")];
+        let spans = resolve_spans(&elements, (0, 0), (2, 5));
+        assert_eq!(spans.len(), 3);
+        assert_eq!(join_spans(&spans), "first\n\nthird");
+    }
+
+    #[test]
     fn drag_lifecycle_and_copy_joins() {
+        let _state = test_state_lock();
         begin("p1", 6);
-        assert_eq!(drag_anchor(), Some(("p1".into(), 6)));
+        assert_eq!(drag_anchor("p1"), Some(6));
+        assert_eq!(drag_anchor("p2"), None);
         let spans = resolve_spans(&elems(), (0, 6), (1, 6));
         assert!(update_spans(spans.clone()));
         assert!(!update_spans(spans)); // unchanged ⇒ no repaint
-        assert_eq!(wash_range("p1"), Some(6..15));
-        assert_eq!(wash_range("p2"), Some(0..6));
-        assert_eq!(wash_range("p3"), None);
-        assert_eq!(
-            end_drag("p1", Some((10.0, 20.0))).as_deref(),
-            Some("paragraph\nsecond")
-        );
+        assert_eq!(wash_range(0, "p1"), Some(6..15));
+        assert_eq!(wash_range(0, "p2"), Some(0..6));
+        assert_eq!(wash_range(0, "p3"), None);
+        assert_eq!(end_drag("p1").as_deref(), Some("paragraph\nsecond"));
         assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond"));
-        assert!(clear());
-        assert!(!clear());
+        // Settled: a down elsewhere clears via the owner's listener.
+        assert!(!clear_if_owner("p2"));
+        assert!(clear_if_owner("p1"));
         assert_eq!(selected_text(), None);
     }
 
     #[test]
-    fn drag_extends_across_overlapping_virtualized_slices() {
+    fn drag_survives_forward_virtualization() {
+        let _state = test_state_lock();
         begin("p1", 6);
-        assert!(extend_to(&elems(), (1, 6)));
-        assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond"));
-
-        let scrolled = [("p2", "second"), ("p3", "third one")];
-        assert!(extend_to(&scrolled, (1, 5)));
-        assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond\nthird"));
-        assert_eq!(end_drag("p1", None).as_deref(), selected_text().as_deref());
+        assert!(update_drag(&elems(), (2, 5)));
+        let shifted = [("p2", "second"), ("p3", "third one"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (2, 4)));
+        assert_eq!(
+            selected_text().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(
+            end_active_drag().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(drag_anchor("p1"), None);
     }
 
     #[test]
-    fn shift_extension_resumes_from_original_anchor() {
-        begin("p1", 6);
-        assert!(extend_to(&elems(), (1, 3)));
-        assert!(end_drag("p1", None).is_some());
-        assert!(resume_drag());
-        assert!(extend_to(&elems(), (2, 5)));
-        assert_eq!(
-            end_drag("p1", None).as_deref(),
-            Some("paragraph\nsecond\nthird")
-        );
-    }
-
-    #[test]
-    fn settled_selection_exposes_one_message_context() {
-        begin("message-1#part.0:0", 0);
-        let spans = vec![
-            Span {
-                key: "message-1#part.0:0".into(),
-                range: 0..5,
-                text: "first".into(),
-            },
-            Span {
-                key: "message-1#part.1:0".into(),
-                range: 0..6,
-                text: "second".into(),
-            },
-        ];
-        assert!(update_spans(spans));
-        assert_eq!(
-            end_drag("message-1#part.0:0", Some((42.0, 84.0))).as_deref(),
-            Some("first\nsecond")
-        );
-        assert_eq!(
-            selected_message_context(),
-            Some(("message-1".into(), "first\nsecond".into(), (42.0, 84.0)))
-        );
+    fn drag_survives_backward_virtualization() {
+        let _state = test_state_lock();
+        begin("p5", 4);
+        let first = [("p3", "third"), ("p4", "fourth"), ("p5", "fifth")];
+        assert!(update_drag(&first, (0, 2)));
+        let shifted = [("p2", "second"), ("p3", "third"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (0, 3)));
+        assert_eq!(selected_text().as_deref(), Some("ond\nthird\nfourth\nfift"));
+        assert_eq!(end_drag("p5").as_deref(), Some("ond\nthird\nfourth\nfift"));
     }
 
     #[test]
     fn empty_click_clears_on_release() {
+        let _state = test_state_lock();
         begin("p1", 3);
-        assert_eq!(end_drag("p1", None), None);
+        assert_eq!(end_drag("p1"), None);
         assert_eq!(selected_text(), None);
     }
 
     #[test]
     fn double_click_span() {
+        let _state = test_state_lock();
         begin_with_span("p1", "hello world", 6..11);
-        assert_eq!(wash_range("p1"), Some(6..11));
-        assert_eq!(end_drag("p1", None).as_deref(), Some("world"));
+        assert_eq!(wash_range(0, "p1"), Some(6..11));
+        assert_eq!(end_drag("p1").as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn semantic_selection_keeps_message_identity_and_bounds() {
+        let _state = test_state_lock();
+        begin_with_span("message-1#text.0:0", "héllo world", 0..6);
+        assert_eq!(selected_message_anchor(), Some(("message-1".into(), "héllo".into())));
+        begin_with_span("file-preview:0", "file text", 0..4);
+        assert_eq!(selected_message_anchor(), None);
+        let oversized = "x".repeat(4097);
+        begin_with_span("message-1#text.0:0", &oversized, 0..oversized.len());
+        assert_eq!(selected_message_anchor(), None);
+        clear_if_owner("message-1#text.0:0");
+    }
+
+    #[test]
+    fn unicode_selection_consumers_share_normalized_snapshots() {
+        let _state = test_state_lock();
+        let key = "message-1#text.0:0";
+        for character in ["—", "中", "🙂"] {
+            let text = format!(" {character} {character}");
+            let end = 1 + character.len();
+            // Both endpoints can come from an older layout. Left affinity
+            // keeps the first complete character and excludes the second.
+            let range = 2..end + 2;
+            let expected = format!("{character} ");
+            for source in 0..3 {
+                match source {
+                    0 => {
+                        begin(key, range.start);
+                        update_drag(&[(key, &text)], (0, range.end));
+                    }
+                    1 => begin_with_span(key, &text, range.clone()),
+                    _ => {
+                        begin(key, range.start);
+                        update_spans(vec![Span {
+                            key: key.into(),
+                            range: range.clone(),
+                            text: text.clone(),
+                        }]);
+                    }
+                }
+                assert_eq!(wash_range(0, key), Some(1..end + 1));
+                assert_eq!(selected_text().as_deref(), Some(expected.as_str()));
+                assert_eq!(selected_message_anchor(), Some(("message-1".into(), expected.clone())));
+                assert_eq!(end_drag(key).as_deref(), Some(expected.as_str()));
+            }
+            begin_with_span(key, &text, word_range(&text, 2));
+            assert_eq!(end_active_drag().as_deref(), Some(character));
+        }
+        clear_if_owner(key);
+    }
+
+    #[test]
+    fn unicode_selection_rebinds_offsets_after_text_updates() {
+        let _state = test_state_lock();
+        let key = "message-1#text.0:0";
+        let prefix = "1234567890123456789012345678901";
+        let old = format!("{prefix}--tail");
+        begin(key, 33);
+        update_drag(&[(key, &old)], (0, 0));
+        assert_eq!(selected_text().as_deref(), Some(&old[..33]));
+        let updated = format!("{prefix}—中🙂");
+        // Byte 33 now lies inside the em dash at 31..34. The same key
+        // survives reparsing, but its old anchor is no longer a boundary.
+        update_drag(&[(key, &updated)], (0, 0));
+        assert_eq!(wash_range(0, key), Some(0..prefix.len()));
+        assert_eq!(selected_message_anchor(), Some(("message-1".into(), prefix.into())));
+        assert_eq!(end_active_drag().as_deref(), Some(prefix));
+
+        // A backwards drag must include the entire updated overlap after
+        // its anchor virtualizes away, not reuse the previous byte length.
+        let last = "message-1#text.2:2";
+        let middle = "message-1#text.1:1";
+        begin(last, "🙂".len());
+        update_drag(&[(middle, "--"), (last, "🙂")], (0, 0));
+        update_drag(&[(key, "—"), (middle, "—中🙂")], (0, 0));
+        let expected = "—\n—中🙂\n🙂";
+        assert_eq!(selected_text().as_deref(), Some(expected));
+        assert_eq!(selected_message_anchor(), Some(("message-1".into(), expected.into())));
+        assert_eq!(end_active_drag().as_deref(), Some(expected));
+        // Copy still uses its snapshots after the registry/text goes away.
+        assert_eq!(selected_text().as_deref(), Some(expected));
+        clear_if_owner(last);
     }
 
     #[test]

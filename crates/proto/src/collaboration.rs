@@ -19,6 +19,68 @@ pub const CAPABILITY_SESSION_ENVIRONMENT: &str = "session.environment";
 
 pub type UnknownFields = BTreeMap<String, serde_json::Value>;
 
+/// Index metadata, never proof of authority. Populate only from a verified
+/// controller response; the Edge still authorizes every room independently.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrewChatMetadata {
+    pub owner_subject: String,
+    pub scope: CollaborationScope,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<SessionEnvironment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_route: Option<AgentRoute>,
+}
+
+impl CrewChatMetadata {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.owner_subject.trim().is_empty() || self.owner_subject.len() > 512
+            || self.scope.project_id.trim().is_empty()
+            || self.session_id.trim().is_empty() || self.session_id.len() > 256
+            || self.scope.session_id.as_deref() != Some(self.session_id.as_str())
+        {
+            return Err("Crew identity requires an owner and exact session scope");
+        }
+        if let Some(environment) = &self.environment {
+            if environment.owner_principal != self.owner_subject || environment.scope != self.scope {
+                return Err("Crew environment identity differs from chat identity");
+            }
+        }
+        if let Some(route) = &self.agent_route {
+            route.validate()?;
+        }
+        Ok(())
+    }
+
+    /// A verified project user may access their own sessions. A session-bound
+    /// principal needs an explicit, live capability grant even when owner-named.
+    pub fn permits(&self, principal: &CollaborationPrincipal, grant: Option<&CapabilityGrant>,
+        capability: &str, now: i64) -> bool {
+        if self.validate().is_err()
+            || principal.project_id != self.scope.project_id
+            || principal.deployment_id != self.scope.deployment_id
+            || !principal.has_capability(capability)
+        {
+            return false;
+        }
+        if principal.session_id.is_none() && principal.subject == self.owner_subject {
+            return true;
+        }
+        grant.is_some_and(|grant| grant.scope == self.scope && grant.permits(principal, capability, now))
+    }
+}
+
+/// Caller command identity belongs to the durable RPC envelope, not the
+/// annotation. Author and timestamps are always supplied by the verified host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "camelCase")]
+pub enum AnnotationCommand {
+    Create { id: String, body: String, anchor: SemanticAnchor },
+    Edit { id: String, body: String },
+    Resolve { id: String, resolved: bool },
+}
+
 /// Verified internal identity and its explicit control-plane scope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -247,6 +309,7 @@ impl CapabilityGrant {
     pub fn permits(&self, principal: &CollaborationPrincipal, capability: &str, now: i64) -> bool {
         self.principal_subject == principal.subject
             && principal.authorizes_scope(&self.scope)
+            && now >= self.granted_at
             && self.expires_at.is_none_or(|expires| now < expires)
             && self.revoked_at.is_none_or(|revoked| now < revoked)
             && self.capabilities.iter().any(|value| value == capability)
@@ -300,6 +363,7 @@ impl DeviceJoinGrant {
         self.principal_subject == principal.subject
             && self.device_id == device_id
             && principal.authorizes_scope(&self.scope)
+            && now >= self.issued_at
             && now < self.expires_at
             && self.revoked_at.is_none_or(|revoked| now < revoked)
     }
@@ -682,10 +746,11 @@ pub enum ScaffoldEnvironmentControl {
         #[serde(rename = "agentRoute")]
         agent_route: AgentRoute,
     },
-    /// Transfer an authenticated native OMP session into a ready Scaffold host.
-    /// Unless session_only is set, also capture and apply its bounded Git-visible
-    /// worktree delta. The controller resolves the durable native id/cwd pair to
-    /// a discovered file; callers cannot provide paths.
+    /// Transfer an authenticated native OMP session and its Git-visible
+    /// worktree delta into a ready Scaffold host. The controller resolves the
+    /// durable native id/cwd pair to a discovered file; callers cannot provide
+    /// paths. Scaffold resolves its own immutable checkout commit before the
+    /// bounded delta is captured and applied.
     HandoffOmpSession {
         #[serde(rename = "sandboxId")]
         sandbox_id: String,
@@ -693,14 +758,12 @@ pub enum ScaffoldEnvironmentControl {
         #[serde(rename = "nativeSessionId")]
         native_session_id: String,
         cwd: String,
-        #[serde(default, rename = "sessionOnly")]
-        session_only: bool,
     },
 }
 
-/// Exact physical SessionRoom selected by a Scaffold attach. The local controller
-/// must carry this trusted result into its document watch; ordinary local watches
-/// omit it and remain on the legacy project/session namespace.
+/// Verified session identity returned by Scaffold attach. Its session ID is the
+/// stable upstream chat/registry ID on every client; this is routing metadata,
+/// not a second workspace transport or proof of room access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRoomProjection {
@@ -761,11 +824,6 @@ pub struct AgentSessionRecord {
     pub harness_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<crate::SessionStatus>,
-    /// Start of the most recent turn; unchanged by heartbeats and input resolution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_retry: Option<crate::ModelRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
     pub created_at: i64,
@@ -1060,6 +1118,26 @@ mod tests {
         parse_scaffold_device_id,
     };
 
+    #[test]
+    fn omp_handoff_control_uses_additive_camel_case_wire_shape() {
+        let control = ScaffoldEnvironmentControl::HandoffOmpSession {
+            sandbox_id: "sandbox-a".into(),
+            scope: CollaborationScope {
+                project_id: "project-a".into(),
+                deployment_id: Some("deployment-a".into()),
+                session_id: Some("session-a".into()),
+                unknown: Default::default(),
+            },
+            native_session_id: "omp-native-a".into(),
+            cwd: "/repo".into(),
+        };
+        let value = serde_json::to_value(control).unwrap();
+        assert_eq!(value["operation"], "handoffOmpSession");
+        assert_eq!(value["sandboxId"], "sandbox-a");
+        assert_eq!(value["nativeSessionId"], "omp-native-a");
+        assert_eq!(value["cwd"], "/repo");
+        assert_eq!(value["scope"]["sessionId"], "session-a");
+    }
     #[test]
     fn agent_route_update_control_uses_camel_case_wire_shape() {
         let control = ScaffoldEnvironmentControl::UpdateAgentRoute {

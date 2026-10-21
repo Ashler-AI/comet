@@ -8,6 +8,7 @@ mod tests {
     use hyper::{body::Frame, body::Incoming, service::service_fn};
     use serde_json::Value;
     use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     #[derive(Clone)]
@@ -28,13 +29,12 @@ mod tests {
         RelayStreamContext {
             session_id: "diagnostic-session".into(),
             request_id: request_id.into(),
-            upstream_request_id: None,
         }
     }
 
     fn instrumented_test_stream(
         items: Vec<Result<Bytes, BoxError>>,
-        cancellation: comet_harness::CancellationToken,
+        cancellation: zeron_harness::CancellationToken,
         request_id: &str,
     ) -> InstrumentedRelayStream {
         InstrumentedRelayStream::new(
@@ -61,7 +61,7 @@ mod tests {
 
         let mut complete = instrumented_test_stream(
             vec![Ok(Bytes::from_static(b"abc"))],
-            comet_harness::CancellationToken::new(),
+            zeron_harness::CancellationToken::new(),
             "request-complete",
         );
         assert_eq!(
@@ -70,7 +70,7 @@ mod tests {
         );
         assert!(complete.next().await.is_none());
 
-        let cancellation = comet_harness::CancellationToken::new();
+        let cancellation = zeron_harness::CancellationToken::new();
         let mut cancelled = InstrumentedRelayStream::new(
             Box::pin(stream::pending()),
             cancellation.clone(),
@@ -81,25 +81,18 @@ mod tests {
         assert!(cancelled.next().await.is_none());
 
         let mut failed = instrumented_test_stream(
-            vec![
-                Ok(Bytes::from_static(b"partial response")),
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "private authorization=Bearer secret-token prompt-private",
-                ))),
-            ],
-            comet_harness::CancellationToken::new(),
+            vec![Err(Box::new(std::io::Error::other("body closed")))],
+            zeron_harness::CancellationToken::new(),
             "request-failed",
         );
-        assert_eq!(failed.next().await.unwrap().unwrap(), Bytes::from_static(b"partial response"));
         assert_eq!(
             failed.next().await.unwrap().unwrap_err().to_string(),
-            "private authorization=Bearer secret-token prompt-private"
+            "body closed"
         );
 
         drop(InstrumentedRelayStream::new(
             Box::pin(stream::pending()),
-            comet_harness::CancellationToken::new(),
+            zeron_harness::CancellationToken::new(),
             relay_stream_context("request-dropped"),
             StatusCode::OK,
         ));
@@ -119,29 +112,18 @@ mod tests {
             assert!(line.contains("status=200"), "{line}");
             assert!(line.contains("bytes_received="), "{line}");
         }
-        assert!(logs.lines().any(|line| line.contains("request-failed")
-            && line.contains("cause=connection_reset_or_closed")));
-        assert!(!logs.contains("secret-token"));
-        assert!(!logs.contains("prompt-private"));
-    }
-
-    #[test]
-    fn diagnostic_ids_reject_log_injection_and_credential_shapes() {
-        for valid in ["request-1", "fba6da1d-ddfc-477e-b3eb-376fe16542c6", "req_abc"] {
-            assert!(diagnostic_request_id(valid));
-        }
-        for invalid in ["", "req\nforged-log", "private prompt", "req/secret", "é", "sk-secret", "sk_secret", "ia2credential", "cs1credential", "eyJcredential"] {
-            assert!(!diagnostic_request_id(invalid));
-        }
-        assert!(!diagnostic_request_id(&"a".repeat(129)));
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("request-failed") && line.contains("body closed"))
+        );
     }
 
     struct StaticToken;
 
     #[async_trait]
-    impl comet_rpc::TokenSource for StaticToken {
-        async fn token(&self) -> Option<String> {
-            Some("comet-access-token".into())
+    impl zeron_rpc::TokenSource for StaticToken {
+        async fn token(&self) -> Result<String, zeron_rpc::TokenError> {
+            Ok("comet-access-token".into())
         }
     }
 
@@ -372,6 +354,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renewal_cannot_rebind_an_existing_route_to_another_owner() {
+        let (captured_tx, _) = mpsc::unbounded_channel();
+        let origin = test_control_plane(captured_tx).await;
+        let relay = InferenceRelay::start(
+            ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()
+        ).unwrap();
+        let prepared = relay.prepare("session-owner", HarnessId::Codex, Some("gpt-5.6-sol"), None)
+            .await.unwrap().unwrap();
+        let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
+        let mut state = route.authority.lock().await;
+        state.expires_at = Utc::now() - TimeDelta::seconds(1);
+        drop(state);
+        let changed_owner = Route {
+            request: route.request.clone(),
+            local_session_id: None,
+            owner_subject: "identity:someone-else".into(),
+            cancellation: zeron_harness::CancellationToken::new(),
+            authority: AsyncMutex::new(AuthorityState {
+                authority: route.authority.lock().await.authority.clone(),
+                expires_at: Utc::now() - TimeDelta::seconds(1),
+            }),
+        };
+        assert!(relay.current_authority(&changed_owner).await.is_err());
+        assert!(changed_owner.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn issues_authority_streams_through_loopback_and_removes_locally() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
         let origin = test_control_plane(captured_tx).await;
@@ -418,11 +427,6 @@ mod tests {
             response.json::<Value>().await.unwrap(),
             json!({ "ok": true })
         );
-        assert_eq!(
-            relay.selected_account_id("session-1").as_deref(),
-            Some("account-actual")
-        );
-
         let captured = captured_rx.recv().await.unwrap();
         assert_eq!(
             captured.authorization,
@@ -433,7 +437,6 @@ mod tests {
         assert_eq!(captured.account_id, None);
         assert_eq!(captured.body["input"], "hello");
 
-        let mut expired_routes = relay.subscribe_expired_routes();
         relay.remove(&route.token);
         let removed = http
             .get(format!("{}/v1/models", route.base_url))
@@ -445,13 +448,6 @@ mod tests {
         assert_eq!(
             removed.json::<Value>().await.unwrap(),
             json!({ "error": "inference_route_expired", "restart_required": true })
-        );
-        assert_eq!(
-            expired_routes.recv().await.unwrap(),
-            ExpiredRoute {
-                logical_session_id: "session-1".into(),
-                lifecycle_epoch: 1,
-            }
         );
     }
     #[tokio::test]
@@ -504,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projects_local_import_id_and_restores_it_on_expiration() {
+    async fn projects_local_import_id_and_retires_its_local_token() {
         let local_id = "local-chat-b5b85d0f52a29e39da7656ab";
         let projected = agent_auth_logical_session_id(local_id).into_owned();
 
@@ -529,7 +525,6 @@ mod tests {
             assert_eq!(active.session_id(), local_id);
         }
 
-        let mut expired_routes = relay.subscribe_expired_routes();
         relay.remove(&route.token);
         let removed = reqwest::Client::new()
             .get(format!("{}/v1/models", route.base_url))
@@ -538,13 +533,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed.status(), reqwest::StatusCode::GONE);
-        assert_eq!(
-            expired_routes.recv().await.unwrap(),
-            ExpiredRoute {
-                logical_session_id: local_id.into(),
-                lifecycle_epoch: 1,
-            }
-        );
     }
 
     #[tokio::test]
@@ -635,7 +623,6 @@ mod tests {
             .unwrap();
         assert_ne!(openai.token, anthropic.token);
 
-        let mut expired_routes = relay.subscribe_expired_routes();
         let response = reqwest::Client::new()
             .get(format!("{}/v1/models", anthropic.base_url))
             .bearer_auth(&anthropic.token)
@@ -647,10 +634,6 @@ mod tests {
             response.json::<Value>().await.unwrap(),
             json!({ "error": "inference_route_expired", "restart_required": false })
         );
-        assert!(matches!(
-            expired_routes.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
     }
 
     #[tokio::test]
@@ -679,7 +662,6 @@ mod tests {
                     local_session_id: None,
                     owner_subject: "identity:owner-1".into(),
                     provider: "anthropic".into(),
-                    lifecycle_epoch: 1,
                     retired_at: Instant::now() - Duration::from_secs(1),
                 },
             );
@@ -697,7 +679,6 @@ mod tests {
             .unwrap();
         assert_eq!(parent.token, first.token);
 
-        let mut expired_routes = relay.subscribe_expired_routes();
         let rebound = reqwest::Client::new()
             .post(format!("{}/v1/messages", parent.base_url))
             .bearer_auth("persistent-worker-token")
@@ -713,10 +694,6 @@ mod tests {
             "Bearer remote-agent-auth-authority-2"
         );
         assert_eq!(captured.conversation_id, "persistent-session");
-        assert!(matches!(
-            expired_routes.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
 
         relay.remove(&parent.token);
         let retired = reqwest::Client::new()
@@ -855,16 +832,16 @@ mod tests {
             Some(("openai", "gpt-5.6-sol".into()))
         );
         assert_eq!(
-            inference_binding(HarnessId::PrimeAgent, Some("anthropic/claude-opus-5")),
+            inference_binding(HarnessId::Omp, Some("anthropic/claude-opus-5")),
             Some(("anthropic", "claude-opus-5".into()))
         );
         assert_eq!(
-            inference_binding(HarnessId::PrimeAgent, Some("openai/gpt-5.6-sol")),
+            inference_binding(HarnessId::Omp, Some("openai/gpt-5.6-sol")),
             Some(("openai", "gpt-5.6-sol".into()))
         );
         assert_eq!(
             inference_binding(
-                HarnessId::PrimeAgent,
+                HarnessId::Omp,
                 Some("prime-inference/x-ai/grok-4.20")
             ),
             None
@@ -887,7 +864,6 @@ mod tests {
                 HarnessId::Hermes,
                 Some("anthropic/claude-fable-5-1"),
                 None,
-                1,
             )
             .unwrap()
             .is_none()
@@ -897,21 +873,19 @@ mod tests {
     #[test]
     fn route_requests_preserve_automatic_and_pinned_account_selection() {
         let automatic =
-            inference_route_request("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None, 1)
+            inference_route_request("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None)
                 .unwrap()
                 .unwrap();
         assert_eq!(automatic.logical_session_id, "session-1");
         assert_eq!(automatic.provider, "openai");
         assert_eq!(automatic.model, "gpt-5.6-sol");
         assert_eq!(automatic.requested_account_id, None);
-        assert_eq!(automatic.lifecycle_epoch, 1);
 
         let pinned = inference_route_request(
             "session-1",
             HarnessId::ClaudeCode,
             Some("claude-opus-5"),
             Some("opaque-account-id"),
-            2,
         )
         .unwrap()
         .unwrap();
@@ -920,7 +894,6 @@ mod tests {
             pinned.requested_account_id.as_deref(),
             Some("opaque-account-id")
         );
-        assert_eq!(pinned.lifecycle_epoch, 2);
     }
 
     #[test]
@@ -935,7 +908,7 @@ mod tests {
         );
         assert_eq!(inference_binding(HarnessId::Omp, None), None);
         assert_eq!(
-            inference_binding(HarnessId::PrimeAgent, Some("default")),
+            inference_binding(HarnessId::Omp, Some("default")),
             None
         );
     }

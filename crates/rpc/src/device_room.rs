@@ -9,19 +9,18 @@
 //! - host → DO: must carry `to = connId`; the DO strips routing keys and delivers;
 //! - relay control frames use kind [`RELAY_KIND`] with payload `{"error": code}` —
 //!   codes `host_offline`, `host_closed`, `client_gone`, `client_closed`;
-//! - nudge frames use kind [`NUDGE_KIND`] with payload `{"chatId": …, "nudgeId": …}`;
-//!   [`NUDGE_ACK_KIND`] acknowledges the exact token only after durable acceptance.
+//! - nudge frames use kind [`NUDGE_KIND`] with payload `{"chatId": …}`.
 //!
 //! The RPC path multiplexes NOTHING new: each distinct client `connId` becomes a virtual
 //! string-frame connection feeding the existing [`serve_connection`] seam, so every RPC
-//! handler works through the relay untouched (the port of comet's `device-room-host.ts`).
+//! handler works through the relay untouched (the port of zeron's `device-room-host.ts`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -31,13 +30,8 @@ use crate::{RpcClient, RpcError, RpcService, serve_connection};
 /// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
 /// leading space — clients compare with equality; a mismatch makes host_offline invisible).
 pub const RELAY_KIND: &str = " relay";
-/// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId,nudgeId?}`.
+/// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId}`.
 pub const NUDGE_KIND: &str = "nudge";
-/// Host receipt for the exact durably accepted `{chatId,nudgeId}` wakeup.
-pub const NUDGE_ACK_KIND: &str = "nudge-ack";
-const NUDGE_ID_MAX_BYTES: usize = 128;
-/// Edge-verified authority grant emitted only on the authenticated host socket.
-pub const GRANT_KIND: &str = "grant";
 /// The RPC stream over the relay: both `s` (stream id) and `k` (kind) are `"rpc"`.
 pub const RPC_KIND: &str = "rpc";
 
@@ -54,19 +48,60 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Text `"ping"` keepalive — answered by the DO's hibernation-safe auto-response
 /// pair (`edge/src/device-room.ts`) without waking it.
 ///
-/// 15s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
+/// 10s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
 /// consumer NAT) can reap an idle flow well inside a minute, and a keepalive
 /// that races the reaper loses. The frame is 4 bytes and never wakes the DO, so
-/// the only cost of halving the interval is that the host stays reachable.
-const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// the only cost of shortening the interval is that the host stays reachable —
+/// and a tight interval is what lets the silence lease below stay short.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// Silence lease: every ping elicits an auto-pong, so a healthy socket sees
 /// inbound traffic at least once per `PING_INTERVAL`. No inbound frame for a
 /// couple of intervals plus grace = dead socket (half-open TCP after NAT
 /// timeout or sleep/wake) — drop it and reconnect instead of waiting on a TCP
-/// write error. Must stay well under the relay's own host-liveness window
-/// (`HOST_LIVENESS_MS`, edge/src/device-room.ts) so a host replaces its dead
-/// socket before the relay gives up on the device.
-const SILENCE_LEASE: Duration = Duration::from_secs(40);
+/// write error. 25s tolerates one lost pong (pings at +10/+20) before ruling
+/// the socket dead; the old 40s left sends wedged for most of a minute after
+/// an unnoticed drop. Must stay well under the relay's own host-liveness
+/// window (`HOST_LIVENESS_MS`, edge/src/device-room.ts) so a host replaces
+/// its dead socket before the relay gives up on the device.
+const SILENCE_LEASE: Duration = Duration::from_secs(25);
+/// App-level end-to-end liveness for the CLIENT link. The transport lease
+/// above proves only the client↔edge leg — the DO's auto-pong answers from
+/// the edge, so a link whose edge↔host leg is dead still looks healthy and
+/// retries frames into the void indefinitely (2026-08-19 incident: a peer
+/// link sat dead for 6 minutes until an unrelated token refresh cycled the
+/// host session). The client rides an `echo` frame on every keepalive; the
+/// HOST echoes it back. Silence past this deadline on a link that HAS echoed
+/// before = zombie relay path → drop and redial. Feature-detected: a link
+/// that never echoed (old host) keeps the transport-lease-only behavior, and
+/// inbound RPC frames count as echoes (end-to-end proof either way).
+const ECHO_KIND: &str = "echo";
+const ECHO_DEADLINE: Duration = Duration::from_secs(20);
+
+// Test seam: the consts above stay the production truth; integration tests
+// compress the client-link clocks so the zombie-path regression runs in
+// milliseconds instead of tens of seconds. Process-wide, test-only.
+static CLIENT_PING_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLIENT_ECHO_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn set_client_liveness_for_tests(ping: Duration, echo_deadline: Duration) {
+    CLIENT_PING_MS.store(ping.as_millis() as u64, Ordering::Relaxed);
+    CLIENT_ECHO_DEADLINE_MS.store(echo_deadline.as_millis() as u64, Ordering::Relaxed);
+}
+
+fn client_ping_interval() -> Duration {
+    match CLIENT_PING_MS.load(Ordering::Relaxed) {
+        0 => PING_INTERVAL,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+fn client_echo_deadline() -> Duration {
+    match CLIENT_ECHO_DEADLINE_MS.load(Ordering::Relaxed) {
+        0 => ECHO_DEADLINE,
+        ms => Duration::from_millis(ms),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Frame codec
@@ -180,52 +215,80 @@ pub fn device_room_ws_url(
     let ws_base = edge_url.replacen("http", "ws", 1);
     let ws_base = ws_base.trim_end_matches('/');
     let conn = conn_id.map(|c| format!("&connId={c}")).unwrap_or_default();
-    format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL)
+    format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}")
 }
 
-fn peer_session_ws_url(
-    edge_url: &str,
-    conn_id: &str,
-    token: &str,
-    session_id: &str,
-    deployment_id: Option<&str>,
-) -> String {
-    let ws_base = edge_url.replacen("http", "ws", 1);
-    let ws_base = ws_base.trim_end_matches('/');
-    let deployment = deployment_id
-        .map(|value| format!("&deploymentId={value}"))
-        .unwrap_or_default();
-    format!("{ws_base}/peer/{session_id}/ws?connId={conn_id}&token={token}{deployment}&syncProtocol={}", comet_proto::DURABLE_SYNC_PROTOCOL)
-}
-
-fn peer_device_ws_url(
-    edge_url: &str,
-    conn_id: &str,
-    token: &str,
-    session_id: &str,
-    deployment_id: Option<&str>,
-    device_id: &str,
-) -> String {
-    let ws_base = edge_url.replacen("http", "ws", 1);
-    let ws_base = ws_base.trim_end_matches('/');
-    let deployment = deployment_id
-        .map(|value| format!("&peerDeploymentId={value}"))
-        .unwrap_or_default();
-    format!(
-        "{ws_base}/device/{device_id}/ws?role=client&connId={conn_id}&token={token}&purpose=peer-reply&peerSessionId={session_id}{deployment}&syncProtocol={}",
-        comet_proto::DURABLE_SYNC_PROTOCOL
-    )
+fn directional_peer_url(edge_url: &str, device_id: Option<&str>, session_id: &str,
+    deployment_id: Option<&str>, token: &str, params: &serde_json::Value) -> Result<String, RpcError> {
+    let source = params["command"]["sourceChatId"].as_str()
+        .filter(|id| !id.is_empty()).ok_or_else(|| RpcError::BadParams("Missing peer source session".into()))?;
+    let source_device = params["command"]["sourceDeviceId"].as_str()
+        .filter(|id| !id.is_empty()).ok_or_else(|| RpcError::BadParams("Missing peer source device".into()))?;
+    let mut url = url::Url::parse(edge_url).map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+    let scheme = match url.scheme() { "https" => "wss", "http" => "ws", _ => return Err(RpcError::BadParams("Invalid Crew Edge scheme".into())) };
+    url.set_scheme(scheme).map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+    url.set_query(None); url.set_fragment(None);
+    {
+        let mut path = url.path_segments_mut().map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+        path.clear();
+        if let Some(device) = device_id { path.extend(["device", device, "ws"]); }
+        else { path.extend(["session", session_id, "peer", "ws"]); }
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("connId", &uuid::Uuid::new_v4().to_string())
+            .append_pair("token", token).append_pair("sourceSessionId", source)
+            .append_pair("sourceDeviceId", source_device);
+        if device_id.is_some() {
+            query.append_pair("role", "client").append_pair("purpose", "peer-reply").append_pair("peerSessionId", session_id);
+            if let Some(deployment) = deployment_id { query.append_pair("peerDeploymentId", deployment); }
+        } else if let Some(deployment) = deployment_id { query.append_pair("deploymentId", deployment); }
+    }
+    Ok(url.into())
 }
 
 // ---------------------------------------------------------------------------
 // Token source — the auth seam
 // ---------------------------------------------------------------------------
 
-/// Fresh-bearer provider: the relay re-reads it on every (re)dial so an expired access
-/// token is never reused after a refresh. `None` = signed out (host relay idles quietly).
+/// A temporarily unreachable token service does not revoke an existing session.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TokenError {
+    #[error("signed out")]
+    SignedOut,
+    #[error("access token temporarily unavailable: {0}")]
+    TemporarilyUnavailable(String),
+}
+
+impl From<TokenError> for zeron_sync::SyncError {
+    fn from(error: TokenError) -> Self {
+        match error {
+            TokenError::SignedOut => Self::Auth("signed out".into()),
+            TokenError::TemporarilyUnavailable(reason) => Self::TemporarilyUnavailable(reason),
+        }
+    }
+}
+
+/// Fresh-bearer provider, consulted on every dial. Only `SignedOut` may tear
+/// down authenticated sockets; temporary failures keep their supervisors alive.
 #[async_trait]
 pub trait TokenSource: Send + Sync + 'static {
-    async fn token(&self) -> Option<String>;
+    async fn token(&self) -> Result<String, TokenError>;
+
+    /// Changes whenever credentials become available or are replaced. Long-lived
+    /// supervisors use this to retry immediately instead of waiting for backoff.
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+}
+
+async fn token_changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    match changes {
+        Some(changes) => {
+            let _ = changes.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// A fixed token (dev mode / tests).
@@ -233,8 +296,8 @@ pub struct StaticToken(pub String);
 
 #[async_trait]
 impl TokenSource for StaticToken {
-    async fn token(&self) -> Option<String> {
-        Some(self.0.clone())
+    async fn token(&self) -> Result<String, TokenError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -242,22 +305,9 @@ impl TokenSource for StaticToken {
 // Host relay
 // ---------------------------------------------------------------------------
 
-/// A relay wakeup. Legacy frames omit the token and must never be acknowledged.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Nudge {
-    pub chat_id: String,
-    pub nudge_id: Option<String>,
-}
-
-/// Return success only after the wakeup is durably accepted, not merely scheduled.
-pub type NudgeHandler = Arc<dyn Fn(Nudge) -> Result<(), RpcError> + Send + Sync>;
-/// Called only for an edge-emitted [`GRANT_KIND`] frame. The stream id is the
-/// edge-verified session id and the bytes are the edge-derived grant envelope.
-pub type GrantHandler = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
-/// Called after every authenticated host reconnect, before any grant frame is
-/// accepted, so previously cached edge authority can be invalidated.
-pub type GrantResetHandler = Arc<dyn Fn() + Send + Sync>;
+/// Called with the chat id of every nudge frame ("this chat's doc has pending commands —
+/// open it and drain"); the engine warms/opens the chat doc.
+pub type NudgeHandler = Arc<dyn Fn(String) -> bool + Send + Sync>;
 
 pub struct HostRelayConfig {
     /// Edge base URL (`http(s)://…`; rewritten to `ws(s)` for the socket).
@@ -287,7 +337,7 @@ impl HostRelayConfig {
 /// `service` to every client conn through virtual string-frame connections. Immortal
 /// supervisor: quiet while signed out, reconnects with backoff when the socket drops
 /// (including the 4409 "superseded by new host connection" close — the newest host wins,
-/// so the superseded process backs off and retries, mirroring comet's DeviceRoomHost).
+/// so the superseded process backs off and retries, mirroring zeron's DeviceRoomHost).
 pub struct HostRelay {
     task: tokio::task::JoinHandle<()>,
 }
@@ -298,27 +348,10 @@ impl HostRelay {
         service: Arc<dyn RpcService>,
         on_nudge: NudgeHandler,
     ) -> Self {
-        Self::spawn_with_grants(config, service, on_nudge, Arc::new(|_, _| {}))
-    }
-
-    pub fn spawn_with_grants(
-        config: HostRelayConfig,
-        service: Arc<dyn RpcService>,
-        on_nudge: NudgeHandler,
-        on_grant: GrantHandler,
-    ) -> Self {
-        Self::spawn_with_authority(config, service, on_nudge, Arc::new(|| {}), on_grant)
-    }
-
-    pub fn spawn_with_authority(
-        config: HostRelayConfig,
-        service: Arc<dyn RpcService>,
-        on_nudge: NudgeHandler,
-        on_grant_reset: GrantResetHandler,
-        on_grant: GrantHandler,
-    ) -> Self {
         let task = tokio::spawn(async move {
-            let mut wake = comet_sync::wake::subscribe();
+            let mut wake = zeron_sync::wake::subscribe();
+            let mut online = zeron_sync::wake::subscribe_online();
+            let mut token_changes = config.token.subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
             // away, client dials bounce with "readiness check failed" (user
@@ -327,40 +360,71 @@ impl HostRelay {
             // failures walk the backoff.
             let mut delay = HOST_REJOIN_MIN;
             loop {
-                if let Some(token) = config.token.token().await {
-                    let url = device_room_ws_url(
-                        &config.edge_url,
-                        &config.device_id,
-                        "host",
-                        None,
-                        &token,
-                    );
-                    let started = tokio::time::Instant::now();
-                    let outcome =
-                        host_session(&url, &service, &on_nudge, &on_grant_reset, &on_grant).await;
-                    let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
-                    match outcome {
-                        Ok(()) => {
-                            tracing::info!("device-room: host session ended; reconnecting");
-                            delay = HOST_REJOIN_MIN;
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "device-room: host session failed");
-                            delay = if healthy {
-                                HOST_REJOIN_MIN
-                            } else {
-                                (delay * 2).min(config.retry)
-                            };
+                match config.token.token().await {
+                    Ok(token) => {
+                        let url = device_room_ws_url(
+                            &config.edge_url,
+                            &config.device_id,
+                            "host",
+                            None,
+                            &token,
+                        );
+                        let url = format!("{url}&nudgeAck=1");
+                        let started = tokio::time::Instant::now();
+                        let outcome = {
+                            let session = host_session(&url, &service, &on_nudge);
+                            tokio::pin!(session);
+                            loop {
+                                tokio::select! {
+                                    outcome = &mut session => break outcome,
+                                    _ = token_changed(&mut token_changes) => {
+                                        // Token rotations keep a healthy socket alive. Sign-out is
+                                        // different: dropping the session closes the authenticated
+                                        // socket and every virtual RPC connection immediately.
+                                        if matches!(config.token.token().await, Err(TokenError::SignedOut)) {
+                                            tracing::info!(
+                                                "device-room: credentials removed; closing host session"
+                                            );
+                                            break Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
+                        match outcome {
+                            Ok(()) => {
+                                tracing::info!("device-room: host session ended; reconnecting");
+                                delay = HOST_REJOIN_MIN;
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "device-room: host session failed");
+                                delay = if healthy {
+                                    HOST_REJOIN_MIN
+                                } else {
+                                    (delay * 2).min(config.retry)
+                                };
+                            }
                         }
                     }
-                } else {
-                    // Signed out: poll for credentials at the configured pace.
-                    delay = config.retry;
+                    Err(TokenError::SignedOut) => {
+                        delay = config.retry;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "device-room: token unavailable; retrying");
+                        delay = (delay * 2).min(config.retry);
+                    }
                 }
+                // Drain stale events (our own dial success notifies too) so
+                // only wakes/successes DURING this wait cut it short.
+                while online.try_recv().is_ok() {}
                 tokio::select! {
                     _ = tokio::time::sleep(delay + jitter()) => {}
                     // Wake = redial NOW (the old socket died with the suspend).
                     _ = wake.recv() => { delay = HOST_REJOIN_MIN; }
+                    // A sibling dial succeeded = the network is back.
+                    _ = online.recv() => { delay = HOST_REJOIN_MIN; }
+                    _ = token_changed(&mut token_changes) => { delay = HOST_REJOIN_MIN; }
                 }
             }
         });
@@ -435,78 +499,42 @@ async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
-    on_grant_reset: &GrantResetHandler,
-    on_grant: &GrantHandler,
 ) -> Result<(), RpcError> {
-    let (ws, _) = tokio_tungstenite::connect_async(url)
+    let ws = zeron_sync::dial::connect_ws(url)
         .await
         .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
-    on_grant_reset();
     tracing::info!("device-room: host connected");
-    let (mut sink, mut stream) = ws.split();
-    // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(1);
+    let transport = zeron_sync::socket::pump_with_timing(
+        ws,
+        out_rx,
+        in_tx,
+        WsMessage::Binary,
+        binary_frame,
+        PING_INTERVAL,
+        SILENCE_LEASE,
+    );
     let mut conns: HashMap<String, VirtualConn> = HashMap::new();
-    // Like ordinary virtual RPC requests, peer admissions must not block the
-    // socket reader/writer. Dropping the session cancels unfinished handlers.
-    let mut peer_commands = tokio::task::JoinSet::new();
-    let mut ping = tokio::time::interval(PING_INTERVAL);
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping.tick().await; // consume the immediate first tick
-    let mut last_rx = tokio::time::Instant::now();
-
-    loop {
-        tokio::select! {
-            _ = peer_commands.join_next(), if !peer_commands.is_empty() => {}
-            frame = out_rx.recv() => match frame {
-                Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
-                        break;
-                    }
-                }
-                None => break, // unreachable: we hold out_tx
-            },
-            message = stream.next() => match message {
-                Some(Ok(WsMessage::Binary(bytes))) => {
-                    last_rx = tokio::time::Instant::now();
-                    handle_host_frame(
-                        &bytes,
-                        &mut conns,
-                        service,
-                        &out_tx,
-                        on_nudge,
-                        on_grant,
-                        &mut peer_commands,
-                    ).await;
-                }
-                Some(Ok(WsMessage::Close(frame))) => {
-                    if let Some(frame) = frame {
-                        tracing::info!(code = %frame.code, reason = %frame.reason,
-                            "device-room: host socket closed by relay");
-                    }
-                    break;
-                }
-                Some(Err(_)) | None => break,
-                // Text "pong" / control frames: proof of life for the lease.
-                Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
-            },
-            _ = ping.tick() => {
-                if let Err(err) = sink.send(WsMessage::Text("ping".into())).await {
-                    // The usual way a silently-reaped uplink surfaces: reads
-                    // saw nothing, the keepalive write is what finds the body.
-                    tracing::warn!(error = %err, "device-room: host keepalive failed; reconnecting");
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                tracing::warn!("device-room: host socket silent past lease; reconnecting");
-                break;
-            }
+    let dispatch = async {
+        while let Some(bytes) = in_rx.recv().await {
+            handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge).await;
         }
+    };
+    // Poll the transport even when a virtual RPC connection is backpressured.
+    // Ending either side drops the socket and all per-client dispatch inputs.
+    tokio::select! {
+        _ = transport => {},
+        _ = dispatch => {},
     }
-    // Dropping the conns aborts every per-client dispatch loop (terminals etc. reaped).
-    conns.clear();
     Ok(())
+}
+
+fn binary_frame(frame: WsMessage) -> Option<Vec<u8>> {
+    match frame {
+        WsMessage::Binary(bytes) => Some(bytes),
+        _ => None,
+    }
 }
 
 async fn handle_host_frame(
@@ -515,8 +543,6 @@ async fn handle_host_frame(
     service: &Arc<dyn RpcService>,
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
-    on_grant: &GrantHandler,
-    peer_commands: &mut tokio::task::JoinSet<()>,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -535,85 +561,47 @@ async fn handle_host_frame(
         }
         return;
     }
-    if header.k == GRANT_KIND {
-        on_grant(header.s, payload);
+    if header.k == ECHO_KIND {
+        // App-level liveness: echo straight back to the sender — the
+        // client's proof the edge↔host leg is alive (auto-pongs only prove
+        // its client↔edge leg).
+        if let Some(from) = header.from {
+            let reply = DeviceFrameHeader::new(ECHO_KIND, ECHO_KIND).with_to(from);
+            match encode_device_frame(&reply, &payload) {
+                Ok(frame) => {
+                    let _ = out_tx.send(frame).await;
+                }
+                Err(err) => tracing::error!(error = %err, "device-room: echo encode failed"),
+            }
+        }
         return;
     }
-    if header.k == NUDGE_KIND {
-        let Ok(nudge) = serde_json::from_slice::<Nudge>(&payload) else {
-            tracing::warn!("device-room: malformed nudge — ignoring");
-            return;
-        };
-        if header.from.is_some()
-            || header.to.is_some()
-            || header.s != nudge.chat_id
-            || !uuid::Uuid::parse_str(&nudge.chat_id)
-                .is_ok_and(|id| id.to_string() == nudge.chat_id)
-            || nudge.nudge_id.as_ref().is_some_and(|id| {
-                id.is_empty() || id.len() > NUDGE_ID_MAX_BYTES
-            })
-        {
-            tracing::warn!("device-room: invalid nudge identity — ignoring");
-            return;
+    if header.k == NUDGE_KIND && header.from.is_none() {
+        #[derive(Deserialize, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Nudge {
+            chat_id: String,
+            #[serde(default)]
+            token: Option<String>,
         }
-        let nudge_id = nudge.nudge_id.clone();
-        if let Err(error) = on_nudge(nudge) {
-            tracing::warn!(%error, "device-room: durable nudge acceptance failed");
-            return;
-        }
-        if let Some(nudge_id) = nudge_id {
-            let receipt = serde_json::json!({ "chatId": header.s, "nudgeId": nudge_id });
-            if let Ok(frame) = encode_device_frame(
-                &DeviceFrameHeader::new(header.s, NUDGE_ACK_KIND),
-                receipt.to_string().as_bytes(),
-            ) {
-                // The session also drains this queue: waiting for capacity here
-                // would deadlock. Edge keeps the token and retries a lost receipt.
-                if let Err(error) = out_tx.try_send(frame) {
-                    tracing::warn!(%error, "device-room: nudge receipt not queued");
+        match serde_json::from_slice::<Nudge>(&payload) {
+            Ok(nudge) => {
+                // Acknowledge local durable admission, never mere receipt or
+                // successful socket send. Old edges omit token and need no ACK.
+                if on_nudge(nudge.chat_id.clone()) && nudge.token.is_some() {
+                    if let Ok(frame) = encode_device_frame(
+                        &DeviceFrameHeader::new(&nudge.chat_id, "nudgeAck"),
+                        &payload,
+                    ) {
+                        let _ = out_tx.send(frame).await;
+                    }
                 }
             }
+            Err(_) => tracing::warn!("device-room: malformed nudge — ignoring"),
         }
         return;
     }
     if header.k != RPC_KIND {
-        if header.k == "peer-command" {
-            #[derive(Deserialize)]
-            struct Admission {
-                authority: crate::PeerCommandAuthority,
-                request: crate::ClientFrame,
-            }
-            let Some(from) = header.from else { return };
-            let Ok(admission) = serde_json::from_slice::<Admission>(&payload) else {
-                return;
-            };
-            let Some(method) = admission.request.method.filter(|method| {
-                matches!(method.as_str(), "AdmitPeerCommand" | "ReadSessionCommand")
-            }) else { return };
-            let service = service.clone();
-            let out_tx = out_tx.clone();
-            peer_commands.spawn(async move {
-                let result = service
-                    .peer_command(&method, admission.authority, admission.request.params)
-                    .await;
-                let mut response = crate::ServerFrame {
-                    id: admission.request.id,
-                    ..Default::default()
-                };
-                match result {
-                    Ok(value) => response.ok = Some(value),
-                    Err(error) => response.err = Some(error.to_string()),
-                }
-                if let Ok(payload) = serde_json::to_vec(&response)
-                    && let Ok(frame) = encode_device_frame(
-                        &DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(from),
-                        &payload,
-                    )
-                {
-                    let _ = out_tx.send(frame).await;
-                }
-            });
-        }
         return; // future stream kinds (term, tunnel)
     }
     let Some(from) = header.from else {
@@ -644,88 +632,129 @@ pub struct DeviceLink {
 
 impl DeviceLink {
     pub async fn connect(url: &str) -> Result<Self, RpcError> {
-        let (ws, _) = tokio_tungstenite::connect_async(url)
+        let ws = zeron_sync::dial::connect_ws(url)
             .await
             .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
-        let (mut sink, mut stream) = ws.split();
+        Ok(Self::from_socket(ws))
+    }
+
+    fn from_socket<S>(ws: zeron_sync::socket::Connection<S>) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (wire_in, mut wire_out) = mpsc::channel::<Vec<u8>>(1);
         let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
         let (in_tx, in_rx) = mpsc::channel::<String>(256);
         let (closed_tx, closed_rx) = watch::channel::<Option<String>>(None);
 
         let pump = tokio::spawn(async move {
-            let mut ping = tokio::time::interval(PING_INTERVAL);
-            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ping.tick().await; // consume the immediate first tick
-            let mut last_rx = tokio::time::Instant::now();
-            let reason = loop {
-                tokio::select! {
-                    frame = out_rx.recv() => match frame {
-                        Some(text) => {
-                            let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND);
-                            let encoded = match encode_device_frame(&header, text.as_bytes()) {
-                                Ok(bytes) => bytes,
-                                Err(err) => {
-                                    tracing::error!(error = %err, "device-room: frame encode failed");
-                                    continue;
+            let transport = zeron_sync::socket::pump_with_timing(
+                ws,
+                wire_rx,
+                wire_in,
+                WsMessage::Binary,
+                binary_frame,
+                client_ping_interval(),
+                SILENCE_LEASE,
+            );
+            let protocol = async {
+                let mut ping = tokio::time::interval(client_ping_interval());
+                ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ping.tick().await; // consume the immediate first tick
+                // End-to-end liveness (see ECHO_DEADLINE): armed only once the
+                // host has echoed at least once, so old hosts keep working.
+                let mut last_echo = tokio::time::Instant::now();
+                let mut echo_seen = false;
+                let echo_frame =
+                    encode_device_frame(&DeviceFrameHeader::new(ECHO_KIND, ECHO_KIND), &[])
+                        .unwrap_or_default();
+                // First echo right away: fast feature detection + instant proof
+                // the host leg is alive (the dial's readiness probe proves it
+                // too; this seeds the ongoing cadence).
+                if !echo_frame.is_empty() {
+                    let _ = wire_tx.send(echo_frame.clone()).await;
+                }
+                loop {
+                    tokio::select! {
+                        frame = out_rx.recv() => match frame {
+                            Some(text) => {
+                                let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND);
+                                let encoded = match encode_device_frame(&header, text.as_bytes()) {
+                                    Ok(bytes) => bytes,
+                                    Err(err) => {
+                                        tracing::error!(error = %err, "device-room: frame encode failed");
+                                        continue;
+                                    }
+                                };
+                                if wire_tx.send(encoded).await.is_err() {
+                                    break "connection lost".to_string();
                                 }
-                            };
-                            if sink.send(WsMessage::Binary(encoded)).await.is_err() {
+                            }
+                            None => {
+                                break "closed".to_string();
+                            }
+                        },
+                        message = wire_out.recv() => match message {
+                            Some(bytes) => {
+                                match decode_device_frame(&bytes) {
+                                    Ok((header, payload)) if header.k == RELAY_KIND => {
+                                        // host_offline / host_closed: surface as link-down.
+                                        let code = relay_error_code(&payload)
+                                            .unwrap_or_else(|| "relay error".into());
+                                        tracing::info!(%code, "device-room: link down");
+                                        break code;
+                                    }
+                                    Ok((header, payload)) if header.k == RPC_KIND => {
+                                        // An RPC frame from the host proves the
+                                        // whole path just as well as an echo.
+                                        last_echo = tokio::time::Instant::now();
+                                        let text = String::from_utf8_lossy(&payload).into_owned();
+                                        if in_tx.send(text).await.is_err() {
+                                            break "client dropped".to_string();
+                                        }
+                                    }
+                                    Ok((header, _)) if header.k == ECHO_KIND => {
+                                        last_echo = tokio::time::Instant::now();
+                                        echo_seen = true;
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        tracing::warn!(error = %err, "device-room: malformed frame");
+                                    }
+                                }
+                            }
+                            None => {
+                                break "connection lost".to_string();
+                            }
+                        },
+                        _ = ping.tick() => {
+                            if !echo_frame.is_empty()
+                                && wire_tx.send(echo_frame.clone()).await.is_err()
+                            {
                                 break "connection lost".to_string();
                             }
                         }
-                        None => {
-                            let _ = sink.send(WsMessage::Close(None)).await;
-                            break "closed".to_string();
+                        _ = tokio::time::sleep_until(last_echo + client_echo_deadline()), if echo_seen => {
+                            tracing::warn!("device-room: host echo silent past deadline; link suspect");
+                            break "host echo silent".to_string();
                         }
-                    },
-                    message = stream.next() => match message {
-                        Some(Ok(WsMessage::Binary(bytes))) => {
-                            last_rx = tokio::time::Instant::now();
-                            match decode_device_frame(&bytes) {
-                                Ok((header, payload)) if header.k == RELAY_KIND => {
-                                    // host_offline / host_closed: surface as link-down.
-                                    let code = relay_error_code(&payload)
-                                        .unwrap_or_else(|| "relay error".into());
-                                    tracing::info!(%code, "device-room: link down");
-                                    break code;
-                                }
-                                Ok((header, payload)) if header.k == RPC_KIND => {
-                                    let text = String::from_utf8_lossy(&payload).into_owned();
-                                    if in_tx.send(text).await.is_err() {
-                                        break "client dropped".to_string();
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    tracing::warn!(error = %err, "device-room: malformed frame");
-                                }
-                            }
-                        }
-                        Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => {
-                            break "connection lost".to_string();
-                        }
-                        // Text "pong" / control frames: proof of life for the lease.
-                        Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
-                    },
-                    _ = ping.tick() => {
-                        if sink.send(WsMessage::Text("ping".into())).await.is_err() {
-                            break "connection lost".to_string();
-                        }
-                    }
-                    _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
-                        break "silent past lease".to_string();
                     }
                 }
+            };
+            let reason = tokio::select! {
+                _ = transport => "connection lost".to_string(),
+                reason = protocol => reason,
             };
             // Dropping in_tx ends the RpcClient reader → pending calls fail Closed.
             let _ = closed_tx.send(Some(reason));
         });
 
-        Ok(Self {
+        Self {
             client: Arc::new(RpcClient::new(out_tx, in_rx)),
             closed_rx,
             pump,
-        })
+        }
     }
 
     pub fn client(&self) -> Arc<RpcClient> {
@@ -752,22 +781,41 @@ impl Drop for DeviceLink {
 // Link cache
 // ---------------------------------------------------------------------------
 
+/// A dial-gate verdict on a peer device from the workspace layer (registry
+/// presence). Only a definitive `Dark` parks dials; every ambiguous state
+/// stays `Unknown` so a dead registry room (rows down, relay fine — the
+/// 2026-08-18 03:45 incident shape) never blocks the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerLiveness {
+    Live,
+    Dark,
+    Unknown,
+}
+
+pub type PeerLivenessProbe = Arc<dyn Fn(&str) -> PeerLiveness + Send + Sync>;
+
 pub struct LinkCacheConfig {
     pub edge_url: String,
     pub token: Arc<dyn TokenSource>,
     /// Exponential dial cooldown after failures (base, cap) — a dead peer must not be
-    /// redialed at full cadence; callers fail fast in between (comet peers.ts behavior).
+    /// redialed at full cadence; callers fail fast in between (zeron peers.ts behavior).
     pub cooldown_base: Duration,
     pub cooldown_max: Duration,
     /// Readiness probe budget: the relay accepts client joins even when the host is
-    /// offline, so an exact `LocalDevice` identity round-trip proves the path before caching.
+    /// offline, so a `LocalDevice` round-trip proves the path before caching.
     pub probe_timeout: Duration,
+    /// Optional dial gate: a `Dark` verdict fails the call fast with NO dial.
+    /// Without it, retrying callers hot-dialed devices that had been offline
+    /// for days in 3-dial bursts every ~60s for the life of the app. Un-park
+    /// is presence-driven: the workspace's peer-alive hook fires the moment
+    /// heartbeats return, and the next call passes the gate.
+    pub liveness: Option<PeerLivenessProbe>,
 }
 
 impl LinkCacheConfig {
     pub fn new(edge_url: impl Into<String>, token: Arc<dyn TokenSource>) -> Self {
         // Interactive remote control (remote folders, terminals, accounts) rides
-        // this cache: one blip must cost seconds, not minutes. The old comet
+        // this cache: one blip must cost seconds, not minutes. The old zeron
         // 15s→5min curve punished a single failed dial with a 5-minute refusal;
         // here the first failure backs off 5s and even a dead peer is re-probed
         // within a minute. A generous probe budget keeps a slow-waking laptop
@@ -778,6 +826,7 @@ impl LinkCacheConfig {
             cooldown_base: Duration::from_secs(5),
             cooldown_max: Duration::from_secs(60),
             probe_timeout: Duration::from_secs(10),
+            liveness: None,
         }
     }
 }
@@ -786,10 +835,6 @@ impl LinkCacheConfig {
 /// not escalate today's first retry up the backoff curve.
 const FAILURE_DECAY: Duration = Duration::from_secs(600);
 
-fn exact_device_response(response: &serde_json::Value, device_id: &str) -> bool {
-    response.get("deviceId").and_then(serde_json::Value::as_str) == Some(device_id)
-}
-
 #[derive(Default)]
 struct DialState {
     failures: u32,
@@ -797,13 +842,14 @@ struct DialState {
     cooldown_until: Option<Instant>,
 }
 
-/// Lazily-dialed, cached peer links keyed by device id — the Rust twin of comet's
+/// Lazily-dialed, cached peer links keyed by device id — the Rust twin of zeron's
 /// `Peers`. Cache hits never wait behind an in-flight dial; dials to the same device are
 /// serialized per device (a global lock would head-of-line-block healthy peers); links
 /// self-evict when the transport drops; a failed RPC should call [`LinkCache::invalidate`]
 /// so the next call re-dials.
 pub struct LinkCache {
     config: LinkCacheConfig,
+    revoked: AtomicBool,
     links: Mutex<HashMap<String, Arc<DeviceLink>>>,
     dial_state: Mutex<HashMap<String, DialState>>,
     dial_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -813,27 +859,99 @@ impl LinkCache {
     pub fn new(config: LinkCacheConfig) -> Arc<Self> {
         let cache = Arc::new(Self {
             config,
+            revoked: AtomicBool::new(false),
             links: Mutex::new(HashMap::new()),
             dial_state: Mutex::new(HashMap::new()),
             dial_locks: Mutex::new(HashMap::new()),
         });
         // Wake = every cached link is half-open and every cooldown is moot
         // (the failures belonged to the pre-suspend network). Drop them so the
-        // next call redials immediately with fresh credentials. Skipped
-        // outside a runtime (sync unit tests).
+        // next call redials immediately with fresh credentials. An online
+        // event (network path back / sibling dial success) likewise voids the
+        // cooldowns — those failures belonged to the dead network — but keeps
+        // live links, which a mere network *recovery* has not invalidated.
+        // Skipped outside a runtime (sync unit tests).
         if tokio::runtime::Handle::try_current().is_ok() {
             let weak = Arc::downgrade(&cache);
             tokio::spawn(async move {
-                let mut wake = comet_sync::wake::subscribe();
-                while wake.recv().await.is_ok() {
-                    let Some(cache) = weak.upgrade() else { return };
-                    lock(&cache.links).clear();
-                    lock(&cache.dial_state).clear();
-                    tracing::info!("peer: links + cooldowns cleared after wake");
+                let mut wake = zeron_sync::wake::subscribe();
+                let mut online = zeron_sync::wake::subscribe_online();
+                let mut token_changes = weak
+                    .upgrade()
+                    .and_then(|cache| cache.config.token.subscribe());
+                loop {
+                    tokio::select! {
+                        result = wake.recv() => {
+                            if result.is_err() { return; }
+                            let Some(cache) = weak.upgrade() else { return };
+                            lock(&cache.links).clear();
+                            lock(&cache.dial_state).clear();
+                            tracing::info!("peer: links + cooldowns cleared after wake");
+                        }
+                        result = online.recv() => {
+                            if result.is_err() { return; }
+                            let Some(cache) = weak.upgrade() else { return };
+                            lock(&cache.dial_state).clear();
+                        }
+                        _ = token_changed(&mut token_changes) => {
+                            let Some(cache) = weak.upgrade() else { return };
+                            let signed_out = match cache.config.token.token().await {
+                                Ok(_) => false,
+                                Err(TokenError::SignedOut) => true,
+                                Err(TokenError::TemporarilyUnavailable(_)) => continue,
+                            };
+                            if signed_out {
+                                // Cached clients were authenticated when their sockets
+                                // opened. Revocation must close them even though the
+                                // server has not independently reaped those sockets yet.
+                                cache.revoked.store(true, Ordering::Release);
+                                lock(&cache.links).clear();
+                            } else {
+                                cache.revoked.store(false, Ordering::Release);
+                            }
+                            lock(&cache.dial_state).clear();
+                            if signed_out {
+                                tracing::info!("peer: credentials removed; links closed");
+                            } else {
+                                tracing::info!("peer: dial cooldowns cleared after token refresh");
+                            }
+                        }
+                    }
                 }
             });
         }
         cache
+    }
+
+    /// A one-command directional link. Never cache it as a general device client
+    /// and never retry an ambiguous admission under a fresh command identity.
+    pub async fn peer_call(&self, session_id: &str, deployment_id: Option<&str>,
+        method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+        self.directional_peer_call(None, session_id, deployment_id, method, params).await
+    }
+
+    pub async fn peer_device_call(&self, device_id: &str, session_id: &str,
+        deployment_id: Option<&str>, method: &str, params: serde_json::Value)
+        -> Result<serde_json::Value, RpcError> {
+        self.directional_peer_call(Some(device_id), session_id, deployment_id, method, params).await
+    }
+
+    async fn directional_peer_call(&self, device_id: Option<&str>, session_id: &str,
+        deployment_id: Option<&str>, method: &str, params: serde_json::Value)
+        -> Result<serde_json::Value, RpcError> {
+        if self.revoked.load(Ordering::Acquire) { return Err(RpcError::Failed("not signed in".into())); }
+        if method != "DeliverPeerMessage" || params["chatId"].as_str() != Some(session_id) {
+            return Err(RpcError::BadParams("Directional peers admit only one message to their bound session".into()));
+        }
+        let token = self.config.token.token().await.map_err(|error| RpcError::Transport(error.to_string()))?;
+        let url = directional_peer_url(&self.config.edge_url, device_id, session_id, deployment_id, &token, &params)?;
+        let link = DeviceLink::connect(&url).await?;
+        let client = link.client();
+        tokio::time::timeout(self.config.probe_timeout, client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({})))
+            .await.map_err(|_| RpcError::Transport("Directional peer readiness timed out".into()))??;
+        if self.revoked.load(Ordering::Acquire) { return Err(RpcError::Failed("not signed in".into())); }
+        tokio::time::timeout(std::time::Duration::from_secs(120), client.call(method, params))
+            .await.map_err(|_| RpcError::Transport("Peer admission outcome unknown; retain and retry the same command ID".into()))?
     }
 
     /// A live `RpcClient` to `device_id`'s engine (dialed + cached on first use).
@@ -843,9 +961,23 @@ impl LinkCache {
     /// window should ride over it, not error (user report: refs/folders
     /// "unstable" vs the old app).
     pub async fn client(self: &Arc<Self>, device_id: &str) -> Result<Arc<RpcClient>, RpcError> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(RpcError::Transport("not signed in".into()));
+        }
         // Fast path outside any lock.
         if let Some(link) = self.cached(device_id) {
             return Ok(link.client());
+        }
+        // Registry-dark gate: a device with no recent presence is not worth a
+        // dial (let alone the 3-attempt sequence) — fail fast with zero
+        // network traffic. A live cached link above always wins over the
+        // verdict; ambiguity (registry down, unknown device) never parks.
+        if let Some(probe) = &self.config.liveness
+            && probe(device_id) == PeerLiveness::Dark
+        {
+            return Err(RpcError::Transport(format!(
+                "peer {device_id}: device is offline (no recent presence)"
+            )));
         }
         let dial_lock = {
             let mut locks = lock(&self.dial_locks);
@@ -872,7 +1004,12 @@ impl LinkCache {
             match self.dial(device_id).await {
                 Ok(link) => {
                     lock(&self.dial_state).remove(device_id);
-                    lock(&self.links).insert(device_id.to_string(), link.clone());
+                    let mut links = lock(&self.links);
+                    if self.revoked.load(Ordering::Acquire) {
+                        return Err(RpcError::Transport("not signed in".into()));
+                    }
+                    links.insert(device_id.to_string(), link.clone());
+                    drop(links);
                     self.spawn_evictor(device_id.to_string(), &link);
                     tracing::info!(device = %device_id, "peer: connected via device room");
                     return Ok(link.client());
@@ -889,132 +1026,17 @@ impl LinkCache {
         Err(last_err.unwrap_or(RpcError::Closed))
     }
 
-    /// Fresh authentication for each remote command or outcome read; no cached
-    /// socket may extend a revoked sign-in's authority.
-    pub async fn command_call(
-        &self,
-        device_id: &str,
-        chat_id: &str,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcError> {
-        let token = self
-            .config
-            .token
-            .token()
-            .await
-            .ok_or_else(|| RpcError::Transport("not signed in".into()))?;
-        let mut url = device_room_ws_url(
-            &self.config.edge_url,
-            device_id,
-            "client",
-            Some(&uuid::Uuid::new_v4().to_string()),
-            &token,
-        );
-        if params.get("roomProjection").is_none_or(serde_json::Value::is_null) {
-            url.push_str("&purpose=control&controlSessionId=");
-            url.push_str(chat_id);
-        }
-        let link = DeviceLink::connect(&url).await?;
-        tokio::time::timeout(
-            self.config.probe_timeout,
-            link.client().call(method, params),
-        )
-        .await
-        .map_err(|_| RpcError::Transport("peer command timed out".into()))?
-    }
-
     /// Drop a cached link after a failed RPC so the next call re-dials.
     pub fn invalidate(&self, device_id: &str) {
         lock(&self.links).remove(device_id);
     }
 
-    /// Deliver one command through the relay owned by `session_id`'s host.
-    pub async fn peer_call(
-        &self,
-        session_id: &str,
-        deployment_id: Option<&str>,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcError> {
-        let token = self
-            .config
-            .token
-            .token()
-            .await
-            .ok_or_else(|| RpcError::Transport("not signed in".into()))?;
-        let url = peer_session_ws_url(
-            &self.config.edge_url,
-            &uuid::Uuid::new_v4().to_string(),
-            &token,
-            session_id,
-            deployment_id,
-        );
-        let link = DeviceLink::connect(&url).await?;
-        let client = link.client();
-        tokio::time::timeout(
-            self.config.probe_timeout,
-            client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({})),
-        )
-        .await
-        .map_err(|_| {
-            RpcError::Transport(format!(
-                "peer session {session_id}: readiness check timed out"
-            ))
-        })?
-        .map_err(|error| {
-            RpcError::Transport(format!(
-                "peer session {session_id}: readiness check failed: {error}"
-            ))
-        })?;
-        tokio::time::timeout(self.config.probe_timeout, client.call(method, params))
-            .await
-            .map_err(|_| {
-                RpcError::Transport(format!("peer session {session_id}: delivery timed out"))
-            })?
-    }
-
-    /// Deliver a reply to the exact device recorded on the incoming peer command.
-    /// The target engine still verifies that it owns `session_id` before admission.
-    pub async fn peer_device_call(
-        &self,
-        device_id: &str,
-        session_id: &str,
-        deployment_id: Option<&str>,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcError> {
-        let token = self
-            .config
-            .token
-            .token()
-            .await
-            .ok_or_else(|| RpcError::Transport("not signed in".into()))?;
-        let url = peer_device_ws_url(
-            &self.config.edge_url,
-            &uuid::Uuid::new_v4().to_string(),
-            &token,
-            session_id,
-            deployment_id,
-            device_id,
-        );
-        let link = DeviceLink::connect(&url).await?;
-        let client = link.client();
-        tokio::time::timeout(
-            self.config.probe_timeout,
-            client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({})),
-        )
-        .await
-        .map_err(|_| {
-            RpcError::Transport(format!(
-                "peer device {device_id}: readiness check timed out"
-            ))
-        })??;
-        tokio::time::timeout(self.config.probe_timeout, client.call(method, params))
-            .await
-            .map_err(|_| {
-                RpcError::Transport(format!("peer device {device_id}: delivery timed out"))
-            })?
+    /// Close every authenticated peer socket. Future dials still consult the
+    /// live token provider and therefore remain disabled while signed out.
+    pub fn disconnect_all(&self) {
+        self.revoked.store(true, Ordering::Release);
+        lock(&self.links).clear();
+        lock(&self.dial_state).clear();
     }
 
     /// Data-driven cooldown reset: called when out-of-band evidence says the
@@ -1080,7 +1102,7 @@ impl LinkCache {
             .token
             .token()
             .await
-            .ok_or_else(|| RpcError::Transport("not signed in".into()))?;
+            .map_err(|e| RpcError::Transport(e.to_string()))?;
         let conn_id = uuid::Uuid::new_v4().to_string();
         let url = device_room_ws_url(
             &self.config.edge_url,
@@ -1090,13 +1112,19 @@ impl LinkCache {
             &token,
         );
         tracing::info!(device = %device_id, "peer: dialing via device room");
-        let link = Arc::new(DeviceLink::connect(&url).await?);
-        // Readiness probe: prove that the exact target host answers without
-        // invoking generic catalog discovery. Session-scoped Scaffold hosts
-        // expose only this non-mutating identity RPC before command routing.
+        // Bounded connect: `DeviceLink::connect` was the one unbounded await
+        // under `forward()` — a wedged edge socket hung callers indefinitely
+        // and only the UI's own per-call timers saved them (silently).
+        const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+        let link = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, DeviceLink::connect(&url))
+            .await
+            .map_err(|_| RpcError::Transport(format!("peer {device_id}: connect timed out")))?;
+        let link = Arc::new(link?);
+        // Readiness probe: prove the host answers before caching (an offline host bounces
+        // host_offline, which closes the link and fails this call fast).
         let client = link.client();
         let probe = client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({}));
-        let response = tokio::time::timeout(self.config.probe_timeout, probe)
+        tokio::time::timeout(self.config.probe_timeout, probe)
             .await
             .map_err(|_| {
                 RpcError::Transport(format!("peer {device_id}: readiness check timed out"))
@@ -1104,11 +1132,6 @@ impl LinkCache {
             .map_err(|e| {
                 RpcError::Transport(format!("peer {device_id}: readiness check failed: {e}"))
             })?;
-        if !exact_device_response(&response, device_id) {
-            return Err(RpcError::Transport(format!(
-                "peer {device_id}: readiness identity mismatch"
-            )));
-        }
         Ok(link)
     }
 
@@ -1145,214 +1168,66 @@ impl LinkCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn directional_url_keeps_source_target_and_token_separate() {
+        let params = serde_json::json!({"command":{"sourceChatId":"source","sourceDeviceId":"device-source"}});
+        let url = super::directional_peer_url("https://edge.example", Some("target-device"), "target",
+            Some("canary"), "opaque+&token", &params).unwrap();
+        let url = url::Url::parse(&url).unwrap();
+        assert_eq!(url.path(), "/device/target-device/ws");
+        let pairs: std::collections::HashMap<_,_> = url.query_pairs().collect();
+        assert_eq!(pairs["token"], "opaque+&token");
+        assert_eq!(pairs["sourceSessionId"], "source");
+        assert_eq!(pairs["peerSessionId"], "target");
+        assert_eq!(pairs["purpose"], "peer-reply");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn blocked_relay_upload_closes_link_and_fails_pending_rpc() {
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+        let (client, _peer) = tokio::io::duplex(64);
+        let (client, progress) = zeron_sync::socket::ProgressIo::new(client);
+        let socket = zeron_sync::socket::Connection {
+            socket: WebSocketStream::from_raw_socket(client, Role::Client, None).await,
+            progress,
+        };
+        let link = DeviceLink::from_socket(socket);
+        let client = link.client();
+        let request = client.call(
+            "test.upload",
+            serde_json::json!({"bytes": "x".repeat(4096)}),
+        );
+        let result = tokio::time::timeout(SILENCE_LEASE + Duration::from_secs(1), request)
+            .await
+            .expect("blocked upload stranded the RPC");
+        assert!(matches!(result, Err(RpcError::Closed)));
+        assert!(link.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_link_releases_a_blocked_transport() {
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+        let (client, mut peer) = tokio::io::duplex(8);
+        let (client, progress) = zeron_sync::socket::ProgressIo::new(client);
+        let socket = zeron_sync::socket::Connection {
+            socket: WebSocketStream::from_raw_socket(client, Role::Client, None).await,
+            progress,
+        };
+        let link = DeviceLink::from_socket(socket);
+        tokio::task::yield_now().await; // initial echo fills the uplink
+        drop(link);
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut received))
+            .await
+            .expect("dropping the link leaked the socket")
+            .unwrap();
+        assert!(!received.is_empty());
+    }
+
     use super::*;
 
     fn header(s: &str, k: &str) -> DeviceFrameHeader {
         DeviceFrameHeader::new(s, k)
-    }
-
-    const NUDGE_CHAT: &str = "00fd510b-d334-4e38-8eae-d62230f00d00";
-
-    struct NudgeTestService;
-
-    #[async_trait]
-    impl RpcService for NudgeTestService {
-        async fn handle(
-            &self,
-            method: &str,
-            _: serde_json::Value,
-        ) -> Result<crate::RpcReply, RpcError> {
-            Err(RpcError::UnknownMethod(method.into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn peer_admission_does_not_block_relay_grants_or_outbound_drain() {
-        struct WaitingPeer(tokio::sync::Notify);
-        #[async_trait]
-        impl RpcService for WaitingPeer {
-            async fn handle(&self, method: &str, _: serde_json::Value) -> Result<crate::RpcReply, RpcError> {
-                Err(RpcError::UnknownMethod(method.into()))
-            }
-            async fn peer_command(&self, _: &str, _: crate::PeerCommandAuthority, _: serde_json::Value) -> Result<serde_json::Value, RpcError> {
-                self.0.notified().await;
-                Ok(serde_json::json!({"accepted": true}))
-            }
-        }
-        let waiting = Arc::new(WaitingPeer(tokio::sync::Notify::new()));
-        let service: Arc<dyn RpcService> = waiting.clone();
-        let (out_tx, mut out_rx) = mpsc::channel(1);
-        out_tx.send(vec![0]).await.unwrap();
-        let mut conns = HashMap::new();
-        let mut tasks = tokio::task::JoinSet::new();
-        let on_nudge: NudgeHandler = Arc::new(|_| Ok(()));
-        let granted = Arc::new(Mutex::new(false));
-        let received_grant = granted.clone();
-        let on_grant: GrantHandler = Arc::new(move |_, _| *lock(&received_grant) = true);
-        let mut header = DeviceFrameHeader::new("rpc", "peer-command");
-        header.from = Some("exact-client".into());
-        let frame = encode_device_frame(&header, serde_json::json!({
-            "authority": {"subject": "owner", "projectId": "project", "deviceId": "host", "chatId": NUDGE_CHAT, "expiresAt": 123},
-            "request": {"id": 42, "method": "AdmitPeerCommand", "params": {}}
-        }).to_string().as_bytes()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), handle_host_frame(
-            &frame, &mut conns, &service, &out_tx, &on_nudge, &on_grant, &mut tasks,
-        )).await.expect("a pending admission must not hold the relay reader");
-        let grant = encode_device_frame(&DeviceFrameHeader::new(NUDGE_CHAT, GRANT_KIND), b"grant").unwrap();
-        handle_host_frame(&grant, &mut conns, &service, &out_tx, &on_nudge, &on_grant, &mut tasks).await;
-        assert!(*lock(&granted));
-        waiting.0.notify_one();
-        assert_eq!(out_rx.recv().await.unwrap(), vec![0]);
-        let reply = tokio::time::timeout(Duration::from_secs(1), out_rx.recv()).await.unwrap().unwrap();
-        let (header, payload) = decode_device_frame(&reply).unwrap();
-        assert_eq!(header.to.as_deref(), Some("exact-client"));
-        let response: crate::ServerFrame = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(response.id, 42);
-        assert_eq!(response.ok, Some(serde_json::json!({"accepted": true})));
-        tasks.join_next().await.unwrap().unwrap();
-    }
-
-    async fn dispatch_nudge_frame(
-        header: DeviceFrameHeader,
-        payload: &[u8],
-        out_tx: &mpsc::Sender<Vec<u8>>,
-        on_nudge: &NudgeHandler,
-    ) {
-        let frame = encode_device_frame(&header, payload).expect("encode nudge");
-        let service: Arc<dyn RpcService> = Arc::new(NudgeTestService);
-        let on_grant: GrantHandler = Arc::new(|_, _| {});
-        tokio::time::timeout(Duration::from_secs(1), handle_host_frame(
-            &frame,
-            &mut HashMap::new(),
-            &service,
-            out_tx,
-            on_nudge,
-            &on_grant,
-            &mut tokio::task::JoinSet::new(),
-        ))
-        .await.expect("frame processing must not wait on its own outbound queue");
-    }
-
-    #[tokio::test]
-    async fn durable_nudge_storage_failure_emits_no_ack() {
-        let (out_tx, mut out_rx) = mpsc::channel(2);
-        let admitted = Arc::new(Mutex::new(None));
-        let captured = admitted.clone();
-        let on_nudge: NudgeHandler = Arc::new(move |nudge| {
-            *lock(&captured) = Some(nudge);
-            Err(RpcError::Failed("wake journal unavailable".into()))
-        });
-        dispatch_nudge_frame(
-            header(NUDGE_CHAT, NUDGE_KIND),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "acceptance-1"})
-                .to_string().as_bytes(),
-            &out_tx,
-            &on_nudge,
-        ).await;
-        assert_eq!(*lock(&admitted), Some(Nudge {
-            chat_id: NUDGE_CHAT.into(), nudge_id: Some("acceptance-1".into()),
-        }));
-        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-    }
-
-    #[tokio::test]
-    async fn durable_nudge_ack_preserves_each_exact_token() {
-        let (out_tx, mut out_rx) = mpsc::channel(2);
-        let accepted = Arc::new(Mutex::new(None));
-        let captured = accepted.clone();
-        let on_nudge: NudgeHandler = Arc::new(move |nudge| {
-            *lock(&captured) = Some(nudge);
-            Ok(())
-        });
-        let old_id = "old-acceptance";
-        let new_id = "n".repeat(NUDGE_ID_MAX_BYTES);
-        for id in [old_id, new_id.as_str()] {
-            dispatch_nudge_frame(
-                header(NUDGE_CHAT, NUDGE_KIND),
-                serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": id})
-                    .to_string().as_bytes(),
-                &out_tx,
-                &on_nudge,
-            ).await;
-        }
-        assert_eq!(lock(&accepted).as_ref().unwrap().nudge_id.as_deref(), Some(new_id.as_str()));
-        // A newer acceptance is already stored before the old ACK is sent.
-        // The old receipt must not consume the new token's pending edge row.
-        for id in [old_id, new_id.as_str()] {
-            let frame = out_rx.try_recv().expect("durable acceptance ACK");
-            let (ack, payload) = decode_device_frame(&frame).expect("decode ACK");
-            assert_eq!(ack, header(NUDGE_CHAT, NUDGE_ACK_KIND));
-            assert_eq!(serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
-                serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": id}));
-        }
-        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-    }
-
-    #[tokio::test]
-    async fn durable_nudge_legacy_no_id_emits_no_ack() {
-        let (out_tx, mut out_rx) = mpsc::channel(2);
-        let accepted = Arc::new(Mutex::new(Vec::new()));
-        let captured = accepted.clone();
-        let on_nudge: NudgeHandler = Arc::new(move |nudge| {
-            lock(&captured).push(nudge);
-            Ok(())
-        });
-        for payload in [serde_json::json!({"chatId": NUDGE_CHAT}),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": null})] {
-            dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND),
-                payload.to_string().as_bytes(), &out_tx, &on_nudge).await;
-        }
-        assert_eq!(*lock(&accepted), vec![Nudge {
-            chat_id: NUDGE_CHAT.into(), nudge_id: None,
-        }; 2]);
-        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-    }
-
-    #[tokio::test]
-    async fn durable_nudge_invalid_identity_never_admitted_or_acked() {
-        let (out_tx, mut out_rx) = mpsc::channel(2);
-        let on_nudge: NudgeHandler = Arc::new(|_| panic!("invalid nudge reached durable storage"));
-        for payload in [
-            serde_json::json!({"chatId": "not-a-uuid", "nudgeId": "token"}),
-            serde_json::json!({"chatId": NUDGE_CHAT.to_uppercase(), "nudgeId": "token"}),
-            serde_json::json!({"chatId": NUDGE_CHAT.replace('-', ""), "nudgeId": "token"}),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": ""}),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "x".repeat(NUDGE_ID_MAX_BYTES + 1)}),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": 1}),
-            serde_json::json!({"nudgeId": "token"}),
-        ] {
-            let stream = payload.get("chatId").and_then(serde_json::Value::as_str).unwrap_or(NUDGE_CHAT);
-            dispatch_nudge_frame(header(stream, NUDGE_KIND),
-                payload.to_string().as_bytes(), &out_tx, &on_nudge).await;
-        }
-        let valid = serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "token"}).to_string();
-        let mut client_origin = header(NUDGE_CHAT, NUDGE_KIND);
-        client_origin.from = Some("client-1".into());
-        for header in [header("5cfe764f-62f5-4fe7-ad89-538d19931309", NUDGE_KIND),
-            client_origin, header(NUDGE_CHAT, NUDGE_KIND).with_to("client-1")] {
-            dispatch_nudge_frame(header, valid.as_bytes(), &out_tx, &on_nudge).await;
-        }
-        dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND), b"not-json", &out_tx, &on_nudge).await;
-        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-    }
-
-    #[tokio::test]
-    async fn durable_nudge_full_outbound_queue_does_not_deadlock_acceptance() {
-        let (out_tx, mut out_rx) = mpsc::channel(1);
-        out_tx.try_send(vec![42]).unwrap();
-        let on_nudge: NudgeHandler = Arc::new(|_| Ok(()));
-        dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "retry-token"})
-                .to_string().as_bytes(), &out_tx, &on_nudge).await;
-        assert_eq!(out_rx.try_recv().unwrap(), vec![42]);
-        assert!(matches!(out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
-        dispatch_nudge_frame(header(NUDGE_CHAT, NUDGE_KIND),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "retry-token"})
-                .to_string().as_bytes(), &out_tx, &on_nudge).await;
-        let (ack, payload) = decode_device_frame(&out_rx.try_recv().unwrap()).unwrap();
-        assert_eq!(ack, header(NUDGE_CHAT, NUDGE_ACK_KIND));
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
-            serde_json::json!({"chatId": NUDGE_CHAT, "nudgeId": "retry-token"}));
     }
 
     #[test]
@@ -1424,16 +1299,19 @@ mod tests {
     }
 
     #[test]
-    fn readiness_requires_the_exact_device_identity() {
-        assert!(exact_device_response(
-            &serde_json::json!({ "deviceId": "dev-1" }),
-            "dev-1"
-        ));
-        assert!(!exact_device_response(
-            &serde_json::json!({ "deviceId": "dev-2" }),
-            "dev-1"
-        ));
-        assert!(!exact_device_response(&serde_json::json!({}), "dev-1"));
+    fn ws_url_shapes() {
+        let url = device_room_ws_url(
+            "https://edge.example/",
+            "dev-1",
+            "client",
+            Some("c1"),
+            "tok",
+        );
+        assert_eq!(
+            url,
+            "wss://edge.example/device/dev-1/ws?role=client&connId=c1&token=tok"
+        );
+        let host = device_room_ws_url("http://localhost:26640", "d", "host", None, "t");
+        assert_eq!(host, "ws://localhost:26640/device/d/ws?role=host&token=t");
     }
-
 }

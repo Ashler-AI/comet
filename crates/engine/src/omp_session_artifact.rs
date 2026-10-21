@@ -10,7 +10,6 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use comet_proto::OmpSessionArtifact;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -22,6 +21,101 @@ use crate::EngineError;
 pub const MAX_OMP_SESSION_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 const MAX_OMP_SESSION_HEADER_BYTES: usize = 64 * 1024;
+
+/// Resolve a durable native identity within the configured OMP store only.
+/// Capture an inactive journal; native handoff supplies a completed-turn fork
+/// so the invoking runtime and its independent work can remain alive.
+pub(crate) fn capture_omp_file_for_session(
+    native_session_id: &str,
+    cwd: &str,
+    cancellation: &CancellationToken,
+) -> Result<CapturedOmpSessionFile, EngineError> {
+    let direct = Path::new(native_session_id);
+    if direct.is_absolute() {
+        if zeron_harness::omp::session_writer_state(direct) != zeron_harness::omp::SessionWriterState::Inactive {
+            return Err(invalid("private native branch has an active or unknown writer"));
+        }
+        let mut header = Vec::new();
+        open_regular_nofollow(direct)?.take(MAX_OMP_SESSION_HEADER_BYTES as u64).read_to_end(&mut header)?;
+        let (id, _) = parse_session_header(&header)?;
+        let relative = Path::new("crew-native").join(format!("{id}.jsonl"));
+        return capture_omp_session_file(direct, &relative, &id, cwd, cancellation);
+    }
+    let root = std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| {
+            std::path::PathBuf::from(home).join(".omp/agent")
+        }))
+        .ok_or_else(|| invalid("OMP session root is unavailable"))?;
+    capture_from_root(&root, native_session_id, cwd, cancellation)
+}
+
+/// Make the copied branch self-contained before its durable preparation receipt.
+pub(crate) fn prepare_native_branch_attachments(
+    path: &Path, native_id: &str, cwd: &str, blob_dir: &Path,
+) -> Result<(), EngineError> {
+    let cancellation = CancellationToken::new();
+    let captured = capture_omp_file_for_session(&path.to_string_lossy(), cwd, &cancellation)?;
+    if captured.native_session_id != native_id { return Err(invalid("Private native branch identity changed")); }
+    let captured = captured.prepare_historical_attachments(blob_dir, &cancellation)?;
+    let parent = path.parent().ok_or_else(|| invalid("Private native branch has no parent"))?;
+    let mut output = NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut captured.reopen()?, &mut output)?;
+    output.as_file().sync_all()?;
+    output.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn capture_from_root(
+    root: &Path,
+    native_session_id: &str,
+    cwd: &str,
+    cancellation: &CancellationToken,
+) -> Result<CapturedOmpSessionFile, EngineError> {
+    let sessions = root.join("sessions");
+    let mut directories = vec![sessions.clone()];
+    for entry in std::fs::read_dir(&sessions)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            directories.push(entry.path());
+        }
+    }
+    let mut matched = None;
+    for directory in directories {
+        for entry in std::fs::read_dir(directory)? {
+            check_cancelled(cancellation)?;
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let mut prefix = Vec::new();
+            open_regular_nofollow(&path)?.take(MAX_OMP_SESSION_HEADER_BYTES as u64)
+                .read_to_end(&mut prefix)?;
+            let Ok((id, session_cwd)) = parse_session_header(&prefix) else { continue };
+            if id != native_session_id || session_cwd != cwd { continue; }
+            if matched.is_some() {
+                return Err(invalid("multiple native OMP files have the same identity"));
+            }
+            matched = Some(path);
+        }
+    }
+    let path = matched.ok_or_else(|| invalid("local OMP session is no longer available"))?;
+    if !matches!(zeron_harness::omp::session_writer_state(&path),
+        zeron_harness::omp::SessionWriterState::Inactive)
+    {
+        return Err(invalid("native OMP writer must be stopped before handoff"));
+    }
+    let relative = path.strip_prefix(&sessions)
+        .map_err(|_| invalid("OMP session escaped the configured root"))?;
+    capture_omp_session_file(&path, relative, native_session_id, cwd, cancellation)?
+        .prepare_historical_attachments(&root.join("blobs"), cancellation)
+}
 
 #[derive(Debug)]
 pub(crate) struct CapturedOmpSessionFile {
@@ -440,75 +534,6 @@ fn check_cancelled(cancellation: &CancellationToken) -> Result<(), EngineError> 
     Ok(())
 }
 
-/// Capture one exact OMP JSONL session file.
-///
-/// `expected_native_session_id` and `expected_cwd` must match the OMP session
-/// header stored in the captured bytes. Callers must supply the concrete path
-/// found by local OMP discovery; the path is never included in the result.
-pub(crate) fn capture_omp_session_artifact(
-    path: &Path,
-    storage_relative_path: &Path,
-    expected_native_session_id: &str,
-    expected_cwd: &str,
-) -> Result<OmpSessionArtifact, EngineError> {
-    capture_with_limit(
-        path,
-        storage_relative_path,
-        expected_native_session_id,
-        expected_cwd,
-        MAX_OMP_SESSION_ARTIFACT_BYTES,
-    )
-}
-
-fn capture_with_limit(
-    path: &Path,
-    storage_relative_path: &Path,
-    expected_native_session_id: &str,
-    expected_cwd: &str,
-    limit: u64,
-) -> Result<OmpSessionArtifact, EngineError> {
-    if expected_native_session_id.trim().is_empty() || expected_cwd.trim().is_empty() {
-        return Err(invalid("OMP native session id and cwd are required"));
-    }
-    let storage_relative_path = validate_storage_relative_path(storage_relative_path)?;
-
-    let mut file = open_regular_nofollow(path)?;
-    let before = file.metadata()?;
-    validate_metadata(&before, limit)?;
-
-    let capacity = usize::try_from(before.len())
-        .map_err(|_| invalid("OMP session file size is not addressable"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    std::io::Read::by_ref(&mut file)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(invalid("OMP session file exceeds the capture limit"));
-    }
-
-    let after = file.metadata()?;
-    validate_metadata(&after, limit)?;
-    if !same_file_state(&before, &after) || after.len() != bytes.len() as u64 {
-        return Err(invalid("OMP session file changed during capture"));
-    }
-
-    let (native_session_id, cwd) = parse_session_header(&bytes)?;
-    if native_session_id != expected_native_session_id || cwd != expected_cwd {
-        return Err(invalid(
-            "OMP session header does not match the discovered native id and cwd",
-        ));
-    }
-
-    Ok(OmpSessionArtifact {
-        native_session_id,
-        cwd,
-        storage_relative_path,
-        sha256: hex_sha256(&bytes),
-        byte_count: bytes.len() as u64,
-        bytes,
-    })
-}
-
 fn validate_storage_relative_path(path: &Path) -> Result<String, EngineError> {
     use std::path::Component;
 
@@ -832,14 +857,17 @@ mod tests {
         assert_eq!(prepared.byte_count, output.len() as u64);
         // Ordinary capture/current input is never normalized. Only the explicit
         // prior-history preparation step above can replace an attachment.
-        let direct = capture_omp_session_artifact(
+        let direct = capture_omp_session_file(
             &path,
             Path::new("repo/session.jsonl"),
             "omp-1",
             "/workspace",
+            &token,
         )
         .unwrap();
-        assert_eq!(direct.bytes, bytes);
+        let mut original = Vec::new();
+        direct.reopen().unwrap().read_to_end(&mut original).unwrap();
+        assert_eq!(original, bytes);
     }
 
     #[test]
@@ -952,19 +980,22 @@ mod tests {
         let bytes = session_bytes("omp-1", "/workspace");
         std::fs::write(&path, &bytes).unwrap();
 
-        let artifact = capture_omp_session_artifact(
+        let artifact = capture_omp_session_file(
             &path,
             Path::new("repo/session.jsonl"),
             "omp-1",
             "/workspace",
+            &CancellationToken::new(),
         )
         .unwrap();
-        assert_eq!(artifact.bytes, bytes);
-        assert_eq!(artifact.byte_count, artifact.bytes.len() as u64);
+        let mut captured = Vec::new();
+        artifact.reopen().unwrap().read_to_end(&mut captured).unwrap();
+        assert_eq!(captured, bytes);
+        assert_eq!(artifact.byte_count, captured.len() as u64);
         assert_eq!(artifact.native_session_id, "omp-1");
         assert_eq!(artifact.cwd, "/workspace");
         assert_eq!(artifact.storage_relative_path, "repo/session.jsonl");
-        assert_eq!(artifact.sha256, hex_sha256(&artifact.bytes));
+        assert_eq!(artifact.sha256, hex_sha256(&captured));
     }
 
     #[test]
@@ -1086,11 +1117,12 @@ mod tests {
         std::fs::write(&target, session_bytes("omp-1", "/workspace")).unwrap();
         symlink(&target, &link).unwrap();
         assert!(
-            capture_omp_session_artifact(
+            capture_omp_session_file(
                 &link,
                 Path::new("repo/session.jsonl"),
                 "omp-1",
-                "/workspace"
+                "/workspace",
+                &CancellationToken::new(),
             )
             .is_err()
         );
@@ -1105,37 +1137,27 @@ mod tests {
         std::fs::write(&path, session_bytes("omp-1", "/workspace")).unwrap();
         std::fs::hard_link(&path, alias).unwrap();
         assert!(
-            capture_omp_session_artifact(
+            capture_omp_session_file(
                 &path,
                 Path::new("repo/session.jsonl"),
                 "omp-1",
-                "/workspace"
+                "/workspace",
+                &CancellationToken::new(),
             )
             .is_err()
         );
     }
 
     #[test]
-    fn rejects_directory_and_oversize_file() {
+    fn rejects_directory() {
         let temp = TempDir::new().unwrap();
         assert!(
-            capture_omp_session_artifact(
+            capture_omp_session_file(
                 temp.path(),
                 Path::new("repo/session.jsonl"),
                 "omp-1",
-                "/workspace"
-            )
-            .is_err()
-        );
-        let path = temp.path().join("session.jsonl");
-        std::fs::write(&path, session_bytes("omp-1", "/workspace")).unwrap();
-        assert!(
-            capture_with_limit(
-                &path,
-                Path::new("repo/session.jsonl"),
-                "omp-1",
                 "/workspace",
-                5
+                &CancellationToken::new(),
             )
             .is_err()
         );
@@ -1147,30 +1169,33 @@ mod tests {
         let path = temp.path().join("session.jsonl");
         std::fs::write(&path, session_bytes("omp-real", "/real")).unwrap();
         assert!(
-            capture_omp_session_artifact(
+            capture_omp_session_file(
                 &path,
                 Path::new("repo/session.jsonl"),
                 "omp-other",
-                "/real"
+                "/real",
+                &CancellationToken::new(),
             )
             .is_err()
         );
         assert!(
-            capture_omp_session_artifact(
+            capture_omp_session_file(
                 &path,
                 Path::new("repo/session.jsonl"),
                 "omp-real",
-                "/other"
+                "/other",
+                &CancellationToken::new(),
             )
             .is_err()
         );
         std::fs::write(&path, b"not-json\n").unwrap();
         assert!(
-            capture_omp_session_artifact(
+            capture_omp_session_file(
                 &path,
                 Path::new("repo/session.jsonl"),
                 "omp-real",
-                "/real"
+                "/real",
+                &CancellationToken::new(),
             )
             .is_err()
         );
@@ -1188,7 +1213,7 @@ mod tests {
             Path::new("repo/not-json.txt"),
         ] {
             assert!(
-                capture_omp_session_artifact(&path, relative, "omp-1", "/workspace").is_err(),
+                capture_omp_session_file(&path, relative, "omp-1", "/workspace", &CancellationToken::new()).is_err(),
                 "accepted unsafe path: {}",
                 relative.display()
             );

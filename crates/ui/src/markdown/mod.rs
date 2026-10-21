@@ -1,6 +1,6 @@
 //! Our own markdown stack — pulldown-cmark parse into a [`parser::BlockTree`],
 //! block-level incremental reparse for streaming, gpui rendering, and a
-//! lightweight paint-only syntax highlighter. No zed GPL crates.
+//! Tree-sitter paint-only syntax highlighting. No zed GPL crates.
 //!
 //! Design (docs/research/mugen-pretext.md §2):
 //! - the parse is block-granular and append-incremental: streaming reparses only
@@ -14,12 +14,17 @@
 //!   reflow already-painted text; the canonical parse settles honestly on
 //!   completion.
 
-pub mod highlight;
-pub mod mend;
-pub mod mermaid;
-pub mod parser;
+pub(crate) mod inline_code_links;
+mod link_destination;
+mod link_interaction;
+mod link_presentation;
+pub mod links;
+pub use zeron_markdown::{mend, parser};
 pub mod render;
 pub mod selection;
 pub mod veil;
 
 pub use parser::{Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full};
+
+pub mod mermaid;
+pub(crate) mod mermaid_cache;

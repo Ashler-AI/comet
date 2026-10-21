@@ -4,7 +4,7 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022", "ES2024.Promise"],
+    "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"],
     "strict": true,
     "noUnusedLocals": true,
@@ -19,5 +19,5 @@
     "rootDir": "./src",
     "noEmit": true
   },
-  "include": ["worker-configuration.d.ts", "src/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }

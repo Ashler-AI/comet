@@ -1,109 +1,52 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // Root is local-only. Deployed environments must be selected explicitly with
-  // `wrangler deploy --env staging|production`.
-  "name": "ashler-comet-edge-local-only",
+  // No upstream account, custom domain, production route, or shared storage is deployable here.
+  // Provision the isolated resources first; deploy ONLY with --env canary.
+  "name": "crew-upstream-canary-disabled",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-04",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_date": "2026-07-01",
   "workers_dev": false,
   "preview_urls": false,
-  "alias": {
-    "loro-crdt": "./src/loro-runtime.ts"
-  },
-  "durable_objects": {
-    "bindings": [
-      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
-      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
-      { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["SessionRoom", "DeviceRoom"]
-    },
-    {
-      "tag": "v2",
-      "new_sqlite_classes": ["AuthGrant"]
-    }
-  ],
-  "r2_buckets": [
-    { "binding": "BLOBS", "bucket_name": "ashler-comet-local-blobs" }
-  ],
-  "vars": {
-    "AUTH_MODE": "dev",
-    "ENVIRONMENT": "local",
-    "SCAFFOLD_CONTROL_PLANE_URL": "http://127.0.0.1:8788",
-    "SCAFFOLD_PROJECT_SCOPE": "ashler-local",
-    "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
-  },
-  "observability": {
-    "enabled": true,
-    "head_sampling_rate": 1
-  },
+  "routes": [],
+  "alias": { "loro-crdt": "loro-crdt/base64" },
+  "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" },
   "env": {
-    "staging": {
-      "name": "ashler-comet-edge-staging",
-      "workers_dev": false,
+    "canary": {
+      "name": "crew-upstream-canary",
+      "account_id": "dd15bb23eb5c14365fe2621acc049e01",
+      "workers_dev": true,
       "preview_urls": false,
-      "routes": [
-        { "pattern": "comet-staging.internal.ashler.com", "custom_domain": true }
-      ],
+      "routes": [],
       "durable_objects": {
         "bindings": [
           { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
           { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+          { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
+          { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
+          { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
           { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
         ]
       },
+      "migrations": [{
+        "tag": "crew-upstream-canary-v1",
+        "new_sqlite_classes": ["SessionRoom", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom", "AuthGrant"]
+      }],
       "r2_buckets": [
-        { "binding": "BLOBS", "bucket_name": "ashler-comet-staging-blobs" }
+        { "binding": "BLOBS", "bucket_name": "crew-upstream-canary-blobs" },
+        { "binding": "RELEASES", "bucket_name": "crew-upstream-canary-releases" }
       ],
       "vars": {
         "AUTH_MODE": "scaffold",
-        "ENVIRONMENT": "staging",
-        "APNS_TOPIC": "ai.ashler.crew.staging",
-        "APNS_TEAM_ID": "825LYXGJR6",
-        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
-        "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
-        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
-      },
-      "observability": {
-        "enabled": true,
-        "head_sampling_rate": 1
-      }
-    },
-    "production": {
-      "name": "ashler-comet-edge-production",
-      "workers_dev": false,
-      "preview_urls": false,
-      "routes": [
-        { "pattern": "comet.internal.ashler.com", "custom_domain": true }
-      ],
-      "durable_objects": {
-        "bindings": [
-          { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
-          { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
-          { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
-        ]
-      },
-      "r2_buckets": [
-        { "binding": "BLOBS", "bucket_name": "ashler-comet-production-blobs" }
-      ],
-      "vars": {
-        "AUTH_MODE": "scaffold",
-        "ENVIRONMENT": "production",
-        "APNS_TOPIC": "ai.ashler.crew",
-        "APNS_TEAM_ID": "825LYXGJR6",
-        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold.internal.ashler.com",
-        "SCAFFOLD_PROJECT_SCOPE": "ashler-production",
-        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
-      },
-      "observability": {
-        "enabled": true,
-        "head_sampling_rate": 0.1
+        "ENVIRONMENT": "crew-upstream-canary",
+        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-upstream-canary.internal.ashler.com",
+        // Matched by the separately deployed isolated Platform authority, never shared staging.
+        "SCAFFOLD_PROJECT_SCOPE": "crew-upstream-canary",
+        "SCAFFOLD_DEPLOYMENT_ID": "crew-upstream-canary",
+        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.environment",
+        "APNS_TOPIC": "ai.ashler.crew.upstream-canary"
       }
     }
-  }
+  },
+  // Tokens can appear in WebSocket query strings; do not enable request logging.
+  "observability": { "enabled": false }
 }

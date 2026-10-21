@@ -7,7 +7,7 @@ fail() { echo "Crew macOS verification: $*" >&2; exit 1; }
 APP="$1"
 BUNDLE_ID="$2"
 case "$BUNDLE_ID" in
-  ai.ashler.comet|ai.ashler.comet.staging) ;;
+  ai.ashler.comet|ai.ashler.comet.staging|ai.ashler.crew.upstream-canary) ;;
   *) fail "unsupported bundle identifier: $BUNDLE_ID" ;;
 esac
 [[ "${COMET_MACOS_SIGNING_TEAM_ID:-}" =~ ^[A-Z0-9]{10}$ ]] || fail "COMET_MACOS_SIGNING_TEAM_ID must be 10 uppercase alphanumeric characters"

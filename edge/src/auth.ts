@@ -5,6 +5,7 @@
  * through `/api/code-sandboxes/auth/session` so revocation is fail-closed.
  */
 import type { Env } from "./env";
+import { authenticateDeviceToken } from "./auth-routes";
 
 export type ScaffoldAuthEnv = Omit<
   Pick<
@@ -24,6 +25,14 @@ export interface Verified {
   readonly userId: string;
   readonly email: string;
   readonly projectScope: string;
+  readonly orgId?: string;
+  readonly deploymentId?: string;
+  readonly sessionId?: string;
+  readonly targetDeviceId?: string;
+  readonly grantId?: string;
+  readonly expiresAt?: number;
+  readonly lifecycleEpoch?: number;
+  readonly sandboxId?: string;
   readonly capabilities: readonly string[];
   readonly credential: "scaffold" | "device" | "dev";
 }
@@ -47,7 +56,7 @@ const REMOTE_CODE_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
   "remote_code:create": ["session.invite"],
   "remote_code:read": ["session.read"],
   "remote_code:write": ["session.chat", "session.annotate", "session.files"],
-  "remote_code:exec": ["session.control", "session.environment"],
+  "remote_code:exec": ["session.control", "session.environment", "session.sync.write"],
   "remote_code:lifecycle": ["session.control", "session.environment"]
 };
 
@@ -109,7 +118,6 @@ export const bearerFromRequest = (request: Request): string | undefined => {
 // ponytail: the exact callback stall is unknown; 2,918 ms is the retained
 // successful-launch p50, so two attempts leave 9,164 ms of the 15-second budget.
 const SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS = 2_918;
-
 const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): Promise<ScaffoldAuthenticationResult> => {
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
@@ -122,6 +130,7 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): P
     try {
       response = await fetch(`${resource}/api/code-sandboxes/auth/session`, {
         headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+        redirect: "manual",
         signal: AbortSignal.timeout(SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS)
       });
       if (response.status !== 408 && response.status !== 429 && response.status < 500) break;
@@ -162,6 +171,7 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): P
       userId: subject,
       email: subject,
       projectScope,
+      orgId: projectScope,
       capabilities,
       credential: "scaffold"
     }
@@ -189,6 +199,7 @@ export const authenticateScaffoldResult = async (env: ScaffoldAuthEnv, request: 
         userId,
         email: `${userId}@dev.local`,
         projectScope: env.SCAFFOLD_PROJECT_SCOPE,
+        orgId: env.SCAFFOLD_PROJECT_SCOPE,
         capabilities,
         credential: "dev"
       }
@@ -200,4 +211,25 @@ export const authenticateScaffoldResult = async (env: ScaffoldAuthEnv, request: 
 export const authenticateScaffold = async (env: ScaffoldAuthEnv, request: Request): Promise<Verified | undefined> => {
   const result = await authenticateScaffoldResult(env, request);
   return result.status === "authenticated" ? result.identity : undefined;
+};
+
+export const authenticateResult = async (env: Env, request: Request): Promise<ScaffoldAuthenticationResult> => {
+  if (!credentialTransportAllowed(request.url)) return { status: "invalid" };
+  if (!env.SCAFFOLD_DEPLOYMENT_ID || !env.SCAFFOLD_PROJECT_SCOPE || !env.SCAFFOLD_CONTROL_PLANE_URL) {
+    return { status: "unavailable" };
+  }
+  const token = bearerFromRequest(request);
+  if (token?.startsWith("cs1.")) {
+    try {
+      const identity = await authenticateDeviceToken(env, token);
+      return identity ? { status: "authenticated", identity } : { status: "invalid" };
+    } catch {
+      return { status: "unavailable" };
+    }
+  }
+  const result = await authenticateScaffoldResult(env, request);
+  if (result.status === "authenticated") {
+    return { status: "authenticated", identity: { ...result.identity, deploymentId: env.SCAFFOLD_DEPLOYMENT_ID } };
+  }
+  return result;
 };

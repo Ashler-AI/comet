@@ -10,7 +10,7 @@
 # environment before curl starts; it is never placed in argv or written to disk.
 # The release workflow publishes scaffold-SHA256SUMS; missing or mismatched files fail.
 #
-# Installs the self-contained native binary to ~/.comet-native/app, puts
+# Installs the self-contained native binary to the fresh ~/.crew/app, puts
 # `comet` on PATH, and — once signed in — runs it as a systemd user service.
 # After the comet install it bootstraps any missing agent CLIs (OMP, Claude
 # Code, Codex). Bootstrap failures never abort the comet install; set
@@ -164,7 +164,7 @@ esac
 ver="$(release_fetch -fsSL "$RELEASES/scaffold-latest.txt" | tr -d '[:space:]')"
 [ -n "$ver" ] || { echo "ashler comet install: could not resolve latest version" >&2; exit 1; }
 file="comet-$ver-$plat-$arch.tar.gz"
-data_root="$HOME/.comet-native"
+data_root="$HOME/.crew"
 app_root="$data_root/app"
 dest="$app_root/$ver"
 
@@ -198,7 +198,7 @@ signed_in=no
 service=manual
 if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   mkdir -p "$HOME/.config/systemd/user"
-  cat >"$HOME/.config/systemd/user/comet-native.service" <<'UNIT'
+  cat >"$HOME/.config/systemd/user/crew-production.service" <<'UNIT'
 [Unit]
 Description=Crew headless engine
 After=network-online.target
@@ -206,7 +206,7 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-ExecStart=%h/.comet-native/app/current/comet headless
+ExecStart=%h/.crew/app/current/comet headless
 Restart=on-failure
 RestartSec=5
 
@@ -215,9 +215,9 @@ RestartSec=5
 WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
-  systemctl --user enable comet-native >/dev/null 2>&1 || true
+  systemctl --user enable crew-production >/dev/null 2>&1 || true
   if [ "$signed_in" = yes ]; then
-    systemctl --user restart comet-native
+    systemctl --user restart crew-production
     service=running
   else
     service=ready
@@ -278,12 +278,12 @@ echo ""
 case "$service" in
   running)
     echo "the engine restarted with the new version."
-    echo "  systemctl --user status comet-native    check the service"
+    echo "  systemctl --user status crew-production    check the service"
     ;;
   ready)
     echo "next steps:"
     echo "  comet login                              sign in (paste-code) and exit"
-    echo "  systemctl --user start comet-native      then start the engine"
+    echo "  systemctl --user start crew-production    then start the engine"
     ;;
   manual)
     echo "next: \`comet login\` to sign in, then run the engine with \`comet headless\`."

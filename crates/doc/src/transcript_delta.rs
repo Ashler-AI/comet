@@ -6,13 +6,99 @@
 //! fallback when a diff would approach transcript size) or the changed
 //! entries only — during streaming that is one entry per tick.
 //!
-//! Both viewports share this module (the `comet_proto::view` rule: derivations
+//! Both viewports share this module (the `zeron_proto::view` rule: derivations
 //! that must not diverge per surface live in one place).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::parts::MessagePart;
 use crate::schema::SessionMessageEntry;
+
+/// Transcript changes and the current host-owned context snapshot travel together.
+/// Older readers ignore `contextUsage`; older hosts decode as unknown usage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptUpdate {
+    #[serde(flatten)]
+    pub frame: TranscriptFrame,
+    #[serde(default)]
+    pub context_usage: Option<zeron_proto::ContextUsage>,
+    /// Historical content included in this update, independent of reset/delta
+    /// encoding. Omitted on ordinary live updates and by older engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_baseline: Option<TranscriptBaseline>,
+}
+
+/// Compact presentation watermark: stable part ids and text byte lengths.
+/// Keeping the cutoff (rather than a one-frame boolean) lets a viewport
+/// coalesce historical and live updates without animating the history or
+/// swallowing the first live arrival. No transcript text is duplicated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptBaseline {
+    pub entries: HashMap<String, HashMap<String, usize>>,
+}
+
+impl TranscriptBaseline {
+    /// Fully historical entries can reuse the viewport's already parsed rows.
+    pub fn covers(&self, entry: &SessionMessageEntry) -> bool {
+        let Some(parts) = self.entries.get(&entry.id) else {
+            return false;
+        };
+        entry.parts.iter().all(|part| {
+            parts.get(part.id()).is_some_and(|&len| match part {
+                MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } => {
+                    len >= text.len()
+                }
+                _ => true,
+            })
+        })
+    }
+
+    pub fn capture(entries: &[SessionMessageEntry]) -> Self {
+        Self {
+            entries: entries
+                .iter()
+                .map(|entry| {
+                    let parts = entry
+                        .parts
+                        .iter()
+                        .map(|part| {
+                            let len = match part {
+                                MessagePart::Text { text, .. }
+                                | MessagePart::Reasoning { text, .. } => text.len(),
+                                _ => 0,
+                            };
+                            (part.id().to_owned(), len)
+                        })
+                        .collect();
+                    (entry.id.clone(), parts)
+                })
+                .collect(),
+        }
+    }
+
+    /// Reconstruct just the historical prefix from the current content.
+    /// Invalid/stale byte cutoffs never slice through a UTF-8 character.
+    pub fn historical_entry(&self, entry: &SessionMessageEntry) -> Option<SessionMessageEntry> {
+        let parts = self.entries.get(&entry.id)?;
+        let mut historical = entry.clone();
+        historical.parts.retain_mut(|part| {
+            let Some(&len) = parts.get(part.id()) else {
+                return false;
+            };
+            if let MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } = part {
+                let mut end = len.min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            true
+        });
+        Some(historical)
+    }
+}
 
 /// One `WatchDocMessages` stream item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,10 +106,6 @@ use crate::schema::SessionMessageEntry;
 pub enum TranscriptFrame {
     Reset {
         reset: Vec<SessionMessageEntry>,
-        /// Raw-list cursor for the next older page; `None` means the window
-        /// already reaches the beginning of the transcript.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before: Option<usize>,
     },
     Delta {
         #[serde(default)]
@@ -35,10 +117,6 @@ pub enum TranscriptFrame {
         /// Expected transcript length after applying this frame — the desync
         /// tripwire: a consumer that lands elsewhere resubscribes for a reset.
         count: usize,
-        /// Updated raw-list cursor for the next older page. A tail append can
-        /// retire the oldest visible row and advance this cursor.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before: Option<usize>,
     },
 }
 
@@ -60,41 +138,14 @@ pub struct TextAppend {
     pub entry: String,
     pub part: String,
     pub text: String,
-    /// Bytes removed from the visible text prefix before appending `text`.
-    #[serde(default)]
-    pub drop_prefix: usize,
-    /// Omitted source bytes represented by the resulting projected part.
-    #[serde(default)]
-    pub omitted_prefix_bytes: usize,
-    /// Total visible text length after applying this append.
+    /// Total text length of the part after the append (desync tripwire).
     pub len: usize,
 }
 
 impl TranscriptFrame {
-    pub fn reset(entries: &[SessionMessageEntry], before: Option<usize>) -> Self {
+    pub fn reset(entries: &[SessionMessageEntry]) -> Self {
         Self::Reset {
             reset: entries.to_vec(),
-            before,
-        }
-    }
-
-    pub fn before(&self) -> Option<usize> {
-        match self {
-            Self::Reset { before, .. } | Self::Delta { before, .. } => *before,
-        }
-    }
-
-    pub fn reset_entries(&self) -> Option<&[SessionMessageEntry]> {
-        match self {
-            Self::Reset { reset, .. } => Some(reset),
-            Self::Delta { .. } => None,
-        }
-    }
-
-    pub fn removed_entry_ids(&self) -> &[String] {
-        match self {
-            Self::Reset { .. } => &[],
-            Self::Delta { remove, .. } => remove,
         }
     }
 
@@ -107,9 +158,10 @@ impl TranscriptFrame {
     }
 }
 
-/// When `next` is `prev` plus text appended to exactly one text part (same
-/// position, all other fields and parts identical), the change is a
-/// [`TextAppend`]. Any other difference falls back to a full upsert.
+/// When `next` is `prev` plus text appended to exactly one text-bodied part
+/// (text or reasoning; same position, all other fields and parts identical),
+/// the change is a [`TextAppend`]. Any other difference falls back to a full
+/// upsert.
 fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Option<TextAppend> {
     if prev.id != next.id
         || prev.role != next.role
@@ -117,53 +169,34 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
         || prev.device_id != next.device_id
         || prev.status != next.status
         || prev.continuation_of != next.continuation_of
-        || prev.peer_message != next.peer_message
         || prev.parts.len() != next.parts.len()
     {
         return None;
     }
     let mut append = None;
-    for (previous, current) in prev.parts.iter().zip(&next.parts) {
-        if previous == current {
+    for (p, n) in prev.parts.iter().zip(&next.parts) {
+        if p == n {
             continue;
         }
-        let (pid, previous_text, previous_omitted) = text_projection(previous)?;
-        let (nid, current_text, current_omitted) = text_projection(current)?;
-        if pid != nid || current_omitted < previous_omitted || append.is_some() {
-            return None;
-        }
-        let drop_prefix = current_omitted - previous_omitted;
-        if drop_prefix > previous_text.len() {
-            return None;
-        }
-        let overlap = previous_text.len() - drop_prefix;
-        if overlap > current_text.len()
-            || previous_text.as_bytes()[drop_prefix..] != current_text.as_bytes()[..overlap]
-        {
+        let ((pid, pt), (nid, nt)) = match (p, n) {
+            (MessagePart::Text { id: pid, text: pt }, MessagePart::Text { id: nid, text: nt })
+            | (
+                MessagePart::Reasoning { id: pid, text: pt },
+                MessagePart::Reasoning { id: nid, text: nt },
+            ) => ((pid, pt), (nid, nt)),
+            _ => return None,
+        };
+        if pid != nid || !nt.starts_with(pt.as_str()) || append.is_some() {
             return None;
         }
         append = Some(TextAppend {
             entry: next.id.clone(),
-            part: nid.to_string(),
-            text: current_text[overlap..].to_string(),
-            drop_prefix,
-            omitted_prefix_bytes: current_omitted,
-            len: current_text.len(),
+            part: nid.clone(),
+            text: nt[pt.len()..].to_string(),
+            len: nt.len(),
         });
     }
     append
-}
-
-fn text_projection(part: &MessagePart) -> Option<(&str, &str, usize)> {
-    match part {
-        MessagePart::Text { id, text } => Some((id, text, 0)),
-        MessagePart::TextWindow {
-            id,
-            text,
-            omitted_prefix_bytes,
-        } => Some((id, text, *omitted_prefix_bytes)),
-        _ => None,
-    }
 }
 
 /// Diff two transcript states into a frame. An entry is upserted when it is
@@ -173,24 +206,13 @@ fn text_projection(part: &MessagePart) -> Option<(&str, &str, usize)> {
 pub fn diff_transcript(
     prev: &[SessionMessageEntry],
     next: &[SessionMessageEntry],
-    before: Option<usize>,
 ) -> TranscriptFrame {
-    let mut prev_by_id =
-        std::collections::HashMap::<&str, (usize, &SessionMessageEntry)>::with_capacity(prev.len());
-    for (index, entry) in prev.iter().enumerate() {
-        if prev_by_id
-            .insert(entry.id.as_str(), (index, entry))
-            .is_some()
-        {
-            return TranscriptFrame::reset(next, before);
-        }
-    }
-    let mut next_ids = std::collections::HashSet::<&str>::with_capacity(next.len());
-    for entry in next {
-        if !next_ids.insert(entry.id.as_str()) {
-            return TranscriptFrame::reset(next, before);
-        }
-    }
+    let prev_by_id: std::collections::HashMap<&str, (usize, &SessionMessageEntry)> = prev
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.as_str(), (i, e)))
+        .collect();
+    let next_ids: std::collections::HashSet<&str> = next.iter().map(|e| e.id.as_str()).collect();
 
     let remove: Vec<String> = prev
         .iter()
@@ -228,14 +250,13 @@ pub fn diff_transcript(
 
     // A delta touching most rows serializes like a reset but applies slower.
     if upsert.len() * 2 >= next.len().max(1) && next.len() > 4 {
-        return TranscriptFrame::reset(next, before);
+        return TranscriptFrame::reset(next);
     }
     TranscriptFrame::Delta {
         upsert,
         append,
         remove,
         count: next.len(),
-        before,
     }
 }
 
@@ -251,7 +272,7 @@ pub fn apply_transcript_frame(
     frame: TranscriptFrame,
 ) -> Result<(), TranscriptDesync> {
     match frame {
-        TranscriptFrame::Reset { reset, .. } => {
+        TranscriptFrame::Reset { reset } => {
             *current = reset;
             Ok(())
         }
@@ -260,56 +281,24 @@ pub fn apply_transcript_frame(
             append,
             remove,
             count,
-            before: _,
         } => {
-            let mut current_ids = std::collections::HashSet::<&str>::with_capacity(current.len());
-            if let Some(duplicate) = current
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .find(|id| !current_ids.insert(*id))
-            {
-                return Err(TranscriptDesync(format!(
-                    "duplicate current entry id {duplicate}"
-                )));
-            }
-            drop(current_ids);
-            let mut operation_ids =
-                std::collections::HashSet::<&str>::with_capacity(remove.len() + upsert.len());
-            for id in &remove {
-                if !operation_ids.insert(id.as_str()) {
-                    return Err(TranscriptDesync(format!(
-                        "duplicate delta operation for entry {id}"
-                    )));
-                }
-            }
-            for TranscriptUpsert { entry, .. } in &upsert {
-                if !operation_ids.insert(entry.id.as_str()) {
-                    return Err(TranscriptDesync(format!(
-                        "duplicate delta operation for entry {}",
-                        entry.id
-                    )));
-                }
-            }
-            drop(operation_ids);
             if !remove.is_empty() {
                 let gone: std::collections::HashSet<&str> =
                     remove.iter().map(String::as_str).collect();
-                current.retain(|entry| !gone.contains(entry.id.as_str()));
+                current.retain(|e| !gone.contains(e.id.as_str()));
             }
             for TranscriptUpsert { after, entry } in upsert {
-                if let Some(existing) = current
-                    .iter()
-                    .position(|candidate| candidate.id == entry.id)
-                {
+                if let Some(existing) = current.iter().position(|e| e.id == entry.id) {
                     current.remove(existing);
                 }
                 let at = match &after {
                     None => 0,
-                    Some(anchor) => current
-                        .iter()
-                        .position(|candidate| &candidate.id == anchor)
-                        .map(|index| index + 1)
-                        .ok_or_else(|| TranscriptDesync(format!("missing anchor {anchor}")))?,
+                    Some(anchor) => match current.iter().position(|e| &e.id == anchor) {
+                        Some(ix) => ix + 1,
+                        None => {
+                            return Err(TranscriptDesync(format!("missing anchor {anchor}")));
+                        }
+                    },
                 };
                 current.insert(at, entry);
             }
@@ -317,59 +306,29 @@ pub fn apply_transcript_frame(
                 entry,
                 part,
                 text,
-                drop_prefix,
-                omitted_prefix_bytes,
                 len,
             } in append
             {
-                let target = current
-                    .iter_mut()
-                    .find(|candidate| candidate.id == entry)
-                    .ok_or_else(|| TranscriptDesync(format!("missing append entry {entry}")))?;
-                let target_part = target
-                    .parts
-                    .iter_mut()
-                    .find(|candidate| {
-                        matches!(candidate, MessagePart::Text { id, .. } | MessagePart::TextWindow { id, .. } if *id == part)
-                    })
-                    .ok_or_else(|| TranscriptDesync(format!("missing append part {part}")))?;
-                let project_text =
-                    matches!(target_part, MessagePart::Text { .. }) && omitted_prefix_bytes > 0;
-                {
-                    let tail = match target_part {
-                        MessagePart::Text { text, .. } => text,
-                        MessagePart::TextWindow {
-                            text,
-                            omitted_prefix_bytes: omitted,
-                            ..
-                        } => {
-                            *omitted = omitted_prefix_bytes;
-                            text
-                        }
-                        _ => unreachable!(),
-                    };
-                    if drop_prefix > tail.len() || !tail.is_char_boundary(drop_prefix) {
-                        return Err(TranscriptDesync(format!(
-                            "invalid append prefix drop on {entry}#{part}: {drop_prefix}"
-                        )));
+                let Some(target) = current.iter_mut().find(|e| e.id == entry) else {
+                    return Err(TranscriptDesync(format!("missing append entry {entry}")));
+                };
+                let tail = target.parts.iter_mut().find_map(|p| match p {
+                    MessagePart::Text { id, text } | MessagePart::Reasoning { id, text }
+                        if *id == part =>
+                    {
+                        Some(text)
                     }
-                    tail.drain(..drop_prefix);
-                    tail.push_str(&text);
-                    if tail.len() != len {
-                        return Err(TranscriptDesync(format!(
-                            "append length mismatch on {entry}#{part}: have {}, expected {len}",
-                            tail.len()
-                        )));
-                    }
-                }
-                if project_text && let MessagePart::Text { id, text } = target_part {
-                    let id = std::mem::take(id);
-                    let text = std::mem::take(text);
-                    *target_part = MessagePart::TextWindow {
-                        id,
-                        text,
-                        omitted_prefix_bytes,
-                    };
+                    _ => None,
+                });
+                let Some(tail) = tail else {
+                    return Err(TranscriptDesync(format!("missing append part {part}")));
+                };
+                tail.push_str(&text);
+                if tail.len() != len {
+                    return Err(TranscriptDesync(format!(
+                        "append length mismatch on {entry}#{part}: have {}, expected {len}",
+                        tail.len()
+                    )));
                 }
             }
             if current.len() != count {
@@ -401,49 +360,12 @@ mod tests {
             device_id: "dev".into(),
             status: None,
             continuation_of: None,
-            peer_message: None,
+            duration_ms: None,
         }
-    }
-
-    #[test]
-    fn peer_metadata_transitions_survive_text_growth_and_wire_frames() {
-        let mut ordinary = entry("peer-command", "original");
-        ordinary.role = MessageRole::User;
-        let mut peer = ordinary.clone();
-        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
-            command_id: peer.id.clone(),
-            source_chat_id: "source-chat".into(),
-            thread_id: "thread".into(),
-            reply_to: None,
-        });
-        peer.parts = entry("unused", "original plus peer text").parts;
-        let mut changed_peer = peer.clone();
-        changed_peer.peer_message.as_mut().unwrap().reply_to = Some("reply-command".into());
-        changed_peer.parts = entry("unused", "original plus peer text and reply").parts;
-        let mut visible_again = changed_peer.clone();
-        visible_again.peer_message = None;
-        visible_again.parts =
-            entry("unused", "original plus peer text and reply and ordinary").parts;
-        let states = [ordinary, peer, changed_peer, visible_again];
-        for pair in states.windows(2) {
-            let frame = diff_transcript(&pair[..1], &pair[1..], None);
-            let frame: TranscriptFrame =
-                serde_json::from_value(serde_json::to_value(frame).unwrap()).unwrap();
-            let mut current = vec![pair[0].clone()];
-            apply_transcript_frame(&mut current, frame).unwrap();
-            assert_eq!(current, pair[1..]);
-            assert_eq!(current[0].is_peer_message(), pair[1].is_peer_message());
-        }
-        let frame = TranscriptFrame::reset(&states[1..2], None);
-        let frame: TranscriptFrame =
-            serde_json::from_value(serde_json::to_value(frame).unwrap()).unwrap();
-        let mut current = Vec::new();
-        apply_transcript_frame(&mut current, frame).unwrap();
-        assert_eq!(current, states[1..2]);
     }
 
     fn apply(prev: &[SessionMessageEntry], next: &[SessionMessageEntry]) {
-        let frame = diff_transcript(prev, next, None);
+        let frame = diff_transcript(prev, next);
         // Round-trip through JSON: the wire shape must survive serde.
         let json = serde_json::to_value(&frame).unwrap();
         let frame: TranscriptFrame = serde_json::from_value(json).unwrap();
@@ -457,8 +379,8 @@ mod tests {
         let a = entry("a", "hello");
         let b0 = entry("b", "wor");
         let b1 = entry("b", "world");
-        apply(&[], std::slice::from_ref(&a));
-        apply(std::slice::from_ref(&a), &[a.clone(), b0.clone()]);
+        apply(&[], &[a.clone()]);
+        apply(&[a.clone()], &[a.clone(), b0.clone()]);
         apply(&[a.clone(), b0], &[a, b1]);
     }
 
@@ -477,7 +399,7 @@ mod tests {
         let a = entry("a", "prompt");
         let b0 = entry("b", "streaming…");
         let b1 = entry("b", "streaming… more");
-        let frame = diff_transcript(&[a.clone(), b0.clone()], &[a.clone(), b1.clone()], None);
+        let frame = diff_transcript(&[a.clone(), b0.clone()], &[a.clone(), b1.clone()]);
         match &frame {
             TranscriptFrame::Delta {
                 upsert,
@@ -497,69 +419,27 @@ mod tests {
     }
 
     #[test]
-    fn sliding_text_window_stays_on_append_deltas() {
-        let full = entry("a", "abcdef");
-        let mut first_window = full.clone();
-        first_window.parts = vec![MessagePart::TextWindow {
-            id: "t0".into(),
-            text: "cdefg".into(),
-            omitted_prefix_bytes: 2,
+    fn streaming_reasoning_tick_is_a_text_append() {
+        let mut b0 = entry("b", "prompt");
+        b0.parts = vec![MessagePart::Reasoning {
+            id: "r0".into(),
+            text: "thinking".into(),
         }];
-        let mut second_window = full.clone();
-        second_window.parts = vec![MessagePart::TextWindow {
-            id: "t0".into(),
-            text: "defgh".into(),
-            omitted_prefix_bytes: 3,
+        let mut b1 = b0.clone();
+        b1.parts = vec![MessagePart::Reasoning {
+            id: "r0".into(),
+            text: "thinking more".into(),
         }];
-
-        let first_frame = diff_transcript(
-            std::slice::from_ref(&full),
-            std::slice::from_ref(&first_window),
-            None,
-        );
-        let TranscriptFrame::Delta { append, upsert, .. } = &first_frame else {
-            panic!("expected first sliding delta");
-        };
-        assert!(upsert.is_empty());
-        assert_eq!(append.len(), 1);
-        assert_eq!(append[0].drop_prefix, 2);
-        assert_eq!(append[0].text, "g");
-
-        let mut current = vec![full];
-        apply_transcript_frame(&mut current, first_frame).unwrap();
-        assert_eq!(current, vec![first_window.clone()]);
-
-        let second_frame = diff_transcript(
-            std::slice::from_ref(&first_window),
-            std::slice::from_ref(&second_window),
-            None,
-        );
-        let TranscriptFrame::Delta { append, upsert, .. } = &second_frame else {
-            panic!("expected second sliding delta");
-        };
-        assert!(upsert.is_empty());
-        assert_eq!(append.len(), 1);
-        assert_eq!(append[0].drop_prefix, 1);
-        assert_eq!(append[0].text, "h");
-
-        apply_transcript_frame(&mut current, second_frame).unwrap();
-        assert_eq!(current, vec![second_window]);
-    }
-
-    #[test]
-    fn bounded_tail_retires_oldest_entry_as_a_delta() {
-        let prev: Vec<_> = (0..64)
-            .map(|index| entry(&format!("m{index}"), "text"))
-            .collect();
-        let next: Vec<_> = (1..65)
-            .map(|index| entry(&format!("m{index}"), "text"))
-            .collect();
-        let frame = diff_transcript(&prev, &next, Some(1));
-        assert_eq!(frame.before(), Some(1));
-        assert!(matches!(frame, TranscriptFrame::Delta { .. }));
-        let mut current = prev;
-        apply_transcript_frame(&mut current, frame).unwrap();
-        assert_eq!(current, next);
+        let frame = diff_transcript(std::slice::from_ref(&b0), std::slice::from_ref(&b1));
+        match &frame {
+            TranscriptFrame::Delta { upsert, append, .. } => {
+                assert!(upsert.is_empty(), "reasoning growth must ride the hot path");
+                assert_eq!(append.len(), 1);
+                assert_eq!(append[0].text, " more");
+            }
+            other => panic!("expected delta, got {other:?}"),
+        }
+        apply(&[b0], &[b1]);
     }
 
     #[test]
@@ -567,7 +447,7 @@ mod tests {
         // Same id but a rewritten (non-prefix) text must re-send the entry.
         let b0 = entry("b", "draft text");
         let b1 = entry("b", "final");
-        let frame = diff_transcript(std::slice::from_ref(&b0), std::slice::from_ref(&b1), None);
+        let frame = diff_transcript(&[b0.clone()], &[b1.clone()]);
         match &frame {
             TranscriptFrame::Delta { upsert, append, .. } => {
                 assert_eq!(upsert.len(), 1);
@@ -586,13 +466,10 @@ mod tests {
                 entry: "a".into(),
                 part: "t0".into(),
                 text: "x".into(),
-                drop_prefix: 0,
-                omitted_prefix_bytes: 0,
                 len: 99,
             }],
             remove: vec![],
             count: 1,
-            before: None,
         };
         let mut current = vec![entry("a", "hello")];
         assert!(apply_transcript_frame(&mut current, frame).is_err());
@@ -603,38 +480,9 @@ mod tests {
         let prev: Vec<_> = (0..10).map(|i| entry(&format!("p{i}"), "x")).collect();
         let next: Vec<_> = (0..10).map(|i| entry(&format!("n{i}"), "y")).collect();
         assert!(matches!(
-            diff_transcript(&prev, &next, None),
+            diff_transcript(&prev, &next),
             TranscriptFrame::Reset { .. }
         ));
-    }
-
-    #[test]
-    fn duplicate_ids_force_reset_before_delta_can_reorder() {
-        let first = entry("duplicate", "first");
-        let middle = entry("middle", "middle");
-        let second = entry("duplicate", "second");
-        let inserted = entry("inserted", "inserted");
-        let prev = vec![first.clone(), middle.clone(), second.clone()];
-        let next = vec![first, middle, second, inserted];
-
-        assert!(matches!(
-            diff_transcript(&prev, &next, None),
-            TranscriptFrame::Reset { .. }
-        ));
-    }
-
-    #[test]
-    fn delta_rejects_a_legacy_transcript_with_duplicate_ids() {
-        let frame = TranscriptFrame::Delta {
-            upsert: vec![],
-            append: vec![],
-            remove: vec![],
-            count: 2,
-            before: None,
-        };
-        let mut current = vec![entry("duplicate", "first"), entry("duplicate", "second")];
-
-        assert!(apply_transcript_frame(&mut current, frame).is_err());
     }
 
     #[test]
@@ -647,9 +495,87 @@ mod tests {
             append: vec![],
             remove: vec![],
             count: 2,
-            before: None,
         };
         let mut current = Vec::new();
         assert!(apply_transcript_frame(&mut current, frame).is_err());
+    }
+}
+
+#[cfg(test)]
+mod context_update_tests {
+    use super::*;
+    #[test]
+    fn usage_envelope_is_compatible_with_old_hosts_and_readers() {
+        let old = serde_json::json!({"reset": []});
+        let update: TranscriptUpdate = serde_json::from_value(old).unwrap();
+        assert_eq!(update.context_usage, None);
+        assert!(update.replay_baseline.is_none());
+        let value = serde_json::to_value(TranscriptUpdate {
+            frame: TranscriptFrame::reset(&[]),
+            replay_baseline: Some(TranscriptBaseline::default()),
+            context_usage: Some(zeron_proto::ContextUsage {
+                tokens: Some(0),
+                window: Some(200000),
+            }),
+        })
+        .unwrap();
+        assert_eq!(value["contextUsage"]["tokens"], 0);
+        let roundtrip: TranscriptUpdate = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            roundtrip.replay_baseline,
+            Some(TranscriptBaseline::default())
+        );
+        assert!(matches!(
+            serde_json::from_value::<TranscriptFrame>(value).unwrap(),
+            TranscriptFrame::Reset { .. }
+        ));
+    }
+
+    #[test]
+    fn replay_cutoff_keeps_only_historical_parts_and_unicode_text_prefixes() {
+        let mut entry = SessionMessageEntry {
+            id: "message".into(),
+            role: crate::MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "text".into(),
+                text: "café".into(),
+            }],
+            created_at: 0,
+            device_id: "host".into(),
+            status: Some(crate::MessageStatus::Streaming),
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let baseline = TranscriptBaseline::capture(&[entry.clone()]);
+        assert!(baseline.covers(&entry));
+        entry.parts[0] = MessagePart::Text {
+            id: "text".into(),
+            text: "café recién hecho".into(),
+        };
+        entry.parts.push(MessagePart::Reasoning {
+            id: "new".into(),
+            text: "live".into(),
+        });
+        assert!(!baseline.covers(&entry));
+        let historical = baseline.historical_entry(&entry).unwrap();
+        assert_eq!(
+            historical.parts,
+            vec![MessagePart::Text {
+                id: "text".into(),
+                text: "café".into()
+            }]
+        );
+        // A replaced text can invalidate a former byte boundary.
+        entry.parts[0] = MessagePart::Text {
+            id: "text".into(),
+            text: "🙂🙂".into(),
+        };
+        assert_eq!(
+            baseline.historical_entry(&entry).unwrap().parts[0],
+            MessagePart::Text {
+                id: "text".into(),
+                text: "🙂".into()
+            }
+        );
     }
 }

@@ -1,8 +1,8 @@
-//! comet-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
+//! zeron-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
 //! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
 //!
 //! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
-//! byte transports), matching the shape of comet's Effect RPC without the Effect runtime:
+//! byte transports), matching the shape of zeron's Effect RPC without the Effect runtime:
 //!
 //! - client → server: `{id, method, params}` to invoke, `{id, cancel: true}` to stop a stream;
 //! - server → client: `{id, ok}` / `{id, err}` for unary calls,
@@ -24,9 +24,8 @@ mod server;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
-    DeviceFrameHeader, DeviceLink, GRANT_KIND, GrantHandler, GrantResetHandler, HostRelay,
-    HostRelayConfig, LinkCache, LinkCacheConfig, NUDGE_ACK_KIND, Nudge, NudgeHandler, StaticToken,
-    TokenSource,
+    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
+    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
     decode_device_frame, device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
@@ -34,74 +33,90 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const VOICE_CAPABILITIES_V2: &str = "VoiceCapabilitiesV2";
+    pub const PREPARE_VOICE_V2: &str = "PrepareVoiceV2";
+    pub const OWN_VOICE_V2: &str = "OwnVoiceV2";
+    pub const NEGOTIATE_VOICE_V2: &str = "NegotiateVoiceV2";
+    pub const CONFIRM_VOICE_MEDIA_V2: &str = "ConfirmVoiceMediaV2";
+    pub const REPORT_VOICE_MEDIA_V2: &str = "ReportVoiceMediaV2";
+    pub const STOP_VOICE_V2: &str = "StopVoiceV2";
+    pub const CANCEL_VOICE_ATTEMPT_V2: &str = "CancelVoiceAttemptV2";
+    pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
+    pub const CANCEL_INSTALL: &str = "CancelInstall";
+    pub const INSTALL_HARNESS: &str = "InstallHarness";
+    /// Flip a harness's enablement on the target device (Settings → Providers);
+    /// replies with the device's fresh `ListHarnesses` catalog.
+    pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
+    pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
+    pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
-    pub const LIST_HARNESS_COMMANDS: &str = "ListHarnessCommands";
+    pub const LIST_SKILLS: &str = "ListSkills";
+    pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
-    /// Relay-only admission for one peer command on its exact owning device.
-    pub const DELIVER_PEER_MESSAGE: &str = "DeliverPeerMessage";
-    /// Stop a verified external OMP writer and retry the blocked prompt under
-    /// the target Crew engine.
-    pub const TAKE_OVER_OMP_SESSION: &str = "TakeOverOmpSession";
-    /// Current OMP recovery phase followed by event-driven updates for one chat.
-    pub const WATCH_OMP_RECOVERY: &str = "WatchOmpRecovery";
-    /// Hold one exact live run while this authenticated subscription remains open.
-    pub const RETAIN_SESSION_SUPERVISION: &str = "RetainSessionSupervision";
+    pub const READ_COMMAND: &str = "ReadCommand";
+    pub const TAKE_PROJECT_ACTION_SETUP: &str = "TakeProjectActionSetup";
+    /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
+    /// command entry (client-minted id and all) straight over the device-room
+    /// link when its chat2 rows can't reach the edge but the host's peer link
+    /// is alive. The host claims the id in its processed ledger before
+    /// executing, so the doc row arriving later dedupes to a no-op —
+    /// exactly-once by construction. Params `{chatId, entry}`.
+    pub const RELAY_COMMAND: &str = "RelayCommand";
+    /// User-driven delivery retry for a chat with unadopted queued sends:
+    /// fresh chat2 socket, host nudge, drain pass, and a new delivery escort
+    /// per pending command. Params `{chatId}`; IPC-only.
+    pub const RETRY_DELIVERY: &str = "RetryDelivery";
+    pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
-    /// Read one older transcript page before an opaque raw-list cursor.
-    pub const READ_DOC_MESSAGES: &str = "ReadDocMessages";
-    /// Read one full message on explicit reveal, without expanding the transcript window.
-    pub const READ_DOC_MESSAGE: &str = "ReadDocMessage";
-    pub const SEND_PEER_MESSAGE: &str = "SendPeerMessage";
-    pub const REPLY_PEER_MESSAGE: &str = "ReplyPeerMessage";
-    pub const WAIT_PEER_REPLY: &str = "WaitPeerReply";
-    /// Search project-scoped Crew titles and source links using the signed-in account.
-    pub const SEARCH_SESSIONS: &str = "SearchSessions";
-    /// Create a distinct Crew chat from an existing session's native context.
-    pub const FORK_SESSION: &str = "ForkSession";
-    /// Transfer native context to Scaffold and queue its initial remote command.
-    pub const HANDOFF_SESSION_TO_SCAFFOLD: &str = "HandoffSessionToScaffold";
-    /// Recover only an explicitly accepted native handoff target; never create.
-    pub const RECOVER_SESSION_HANDOFF_TO_SCAFFOLD: &str = "RecoverSessionHandoffToScaffold";
-    /// Transfer native context without copying the checkout; older engines must reject.
-    pub const HANDOFF_SESSION_ONLY_TO_SCAFFOLD: &str = "HandoffSessionOnlyToScaffold";
-    /// Recover native context only in an accepted target; never create or copy a checkout.
-    pub const RECOVER_SESSION_ONLY_HANDOFF_TO_SCAFFOLD: &str = "RecoverSessionOnlyHandoffToScaffold";
-    /// Create and attach a Scaffold environment, transferring native session context.
-    pub const PREPARE_SCAFFOLD_SESSION: &str = "PrepareScaffoldSession";
-    /// Retain an interrupted preparation without changing newer attempts or admission.
-    pub const REPORT_SCAFFOLD_PREPARATION_FAILURE: &str = "ReportScaffoldPreparationFailure";
-    /// Metadata-only harness-native session candidates stored on this device.
-    pub const LIST_LOCAL_SESSIONS: &str = "ListLocalSessions";
-    /// Re-resolve and import one local candidate into a Comet chat.
-    pub const ATTACH_LOCAL_SESSION: &str = "AttachLocalSession";
-    /// Capture exact bytes for a discovered OMP native session. Local-controller
-    /// only; the opaque candidate id is re-resolved server-side.
-    pub const CAPTURE_OMP_SESSION_ARTIFACT: &str = "CaptureOmpSessionArtifact";
+    /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
+    /// connection; automatic subscriptions and retries must not call it.
+    pub const FOCUS_CHAT: &str = "FocusChat";
+    /// Messages typed while the agent was busy, held on the chat doc so every
+    /// device sees the same queue. `{ chatId }` → `{ items: QueuedMessage[] }`.
+    pub const WATCH_QUEUE: &str = "WatchQueue";
+    /// Append to the queue. `{ chatId, text, attachments?, holdForTurnEnd? }` → `{ id }`.
+    pub const QUEUE_MESSAGE: &str = "QueueMessage";
+    /// Retype a queued message; empty text deletes it.
+    /// `{ chatId, id, text }` → `{ changed }`.
+    pub const UPDATE_QUEUED_MESSAGE: &str = "UpdateQueuedMessage";
+    /// Acquire a host-authoritative edit lease for one queued row.
+    pub const BEGIN_QUEUED_MESSAGE_EDIT: &str = "BeginQueuedMessageEdit";
+    /// Renew an acquired queue edit lease.
+    pub const RENEW_QUEUED_MESSAGE_EDIT: &str = "RenewQueuedMessageEdit";
+    /// Commit, cancel, discard, or explicitly release an acquired edit.
+    pub const FINISH_QUEUED_MESSAGE_EDIT: &str = "FinishQueuedMessageEdit";
+    /// Reorder. `{ chatId, id, toIndex }` → `{ changed }`.
+    pub const MOVE_QUEUED_MESSAGE: &str = "MoveQueuedMessage";
+    pub const REMOVE_QUEUED_MESSAGE: &str = "RemoveQueuedMessage";
+    /// Interrupt whatever is running and send this one. `{ chatId, id }` → `{ sent }`.
+    pub const SEND_QUEUED_MESSAGE_NOW: &str = "SendQueuedMessageNow";
+    /// Steer this row into the live turn without interrupting it.
+    /// `{ chatId, id }` → `{ sent }`.
+    pub const STEER_QUEUED_MESSAGE_NOW: &str = "SteerQueuedMessageNow";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
     pub const PROBE_SYNC: &str = "ProbeSync";
-    /// Live sync introspection (`comet sync` / debug surfaces): per-room
+    /// Live sync introspection (`zeron sync` / debug surfaces): per-room
     /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
+    /// Pushed edge-connectivity posture (`zeron_proto::Connectivity`):
+    /// current value first, then every change — the connection pill /
+    /// composer-honesty / queued-badge feed. No params; IPC-only.
+    pub const WATCH_CONNECTIVITY: &str = "WatchConnectivity";
+    /// In-flight queued-attachment transfers (`zeron_proto::TransferProgress`
+    /// list): current set first, then a fresh snapshot per landed chunk —
+    /// the sending thumbnail's percent-ring feed. No params; IPC-only.
+    pub const WATCH_TRANSFERS: &str = "WatchTransfers";
     pub const WATCH_CHATS: &str = "WatchChats";
+    pub const WATCH_SIDEBAR_PREFERENCES: &str = "WatchSidebarPreferences";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
     /// Spaces registry (device+folder pairs) from the workspace doc.
     pub const WATCH_SPACES: &str = "WatchSpaces";
-    /// Workspace-local pointers to exact-id global session rooms.
-    pub const WATCH_SESSION_REFS: &str = "WatchSessionRefs";
-    pub const ADD_SESSION_REF: &str = "AddSessionRef";
-    pub const REMOVE_SESSION_REF: &str = "RemoveSessionRef";
-    /// Current native Scaffold environment snapshot and event-driven updates.
-    pub const WATCH_SCAFFOLD_ENVIRONMENTS: &str = "WatchScaffoldEnvironments";
-    /// Explicitly refresh Scaffold environments; no native polling loop is started.
-    pub const REFRESH_SCAFFOLD_ENVIRONMENTS: &str = "RefreshScaffoldEnvironments";
-    /// Inspect/create/pause/resume/stop/attach a typed Scaffold environment.
-    pub const CONTROL_SCAFFOLD_ENVIRONMENT: &str = "ControlScaffoldEnvironment";
     /// Entity mutations against the workspace doc (feature-inventory §2 DataRpc).
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
@@ -109,20 +124,28 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
-    /// Explicit local-controller wake of a registered Namespace device. Never forwarded.
-    pub const WAKE_DEVICE: &str = "WakeDevice";
-    /// Start the bounded Namespace auth callback tunnel without waking or relinking the device.
-    /// IPC-only; never relay-forwarded.
-    pub const ENSURE_DEVBOX_CALLBACK_FORWARD: &str = "EnsureDevboxCallbackForward";
-    /// Non-secret edge grant metadata for a deployment-bound Scaffold host.
-    /// IPC-only; local controllers use it to reuse an already-running host.
-    pub const SCAFFOLD_HOST_AUTHORITY: &str = "ScaffoldHostAuthority";
+    /// This engine runtime's fixed device and workspace identity.
+    pub const ENGINE_INFO: &str = "EngineInfo";
+    /// Readiness barrier for the engine runtime. The call completes once stores
+    /// and journals are assembled, or fails with the assembly error.
+    pub const ENGINE_READY: &str = "EngineReady";
+    /// Ask a headless IPC owner to drain its runtime and exit successfully.
+    /// Headed IPC owners do not implement this method: closing another app's
+    /// engine behind its windows would leave that process unusable.
+    pub const STOP_ENGINE: &str = "StopEngine";
     pub const AUTH_STATUS: &str = "AuthStatus";
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     pub const SIGN_IN: &str = "SignIn";
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
     pub const COMPLETE_SIGN_IN: &str = "CompleteSignIn";
     pub const SIGN_OUT: &str = "SignOut";
+    pub const LIST_ORGS: &str = "ListOrgs";
+    pub const CREATE_ORG: &str = "CreateOrg";
+    pub const SELECT_ORG: &str = "SelectOrg";
+    /// One-time local→synced profile import: what's importable (unary).
+    pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
+    /// One-time local→synced profile import: run it (stream of progress items).
+    pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
@@ -130,14 +153,46 @@ pub mod methods {
     pub const CREATE_REPO: &str = "CreateRepo";
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
+    pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
+    /// Fuzzy commit-subject / SHA search over the complete public history.
+    pub const SEARCH_GIT_HISTORY: &str = "SearchGitHistory";
+    /// Resolve hosted profile images for a page of Git commit authors.
+    pub const RESOLVE_GIT_AVATARS: &str = "ResolveGitAvatars";
+    /// Update remote-tracking refs without changing HEAD, the index, or files.
+    pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
+    pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
+    pub const SET_WORKTREE_SETTINGS: &str = "SetWorktreeSettings";
+    /// The device's browse roots: home plus mounted drives/volumes.
+    pub const LIST_DRIVES: &str = "ListDrives";
+    /// Folders under the host's home by name (new-project picker).
+    pub const SEARCH_HOME_FOLDERS: &str = "SearchHomeFolders";
+    /// The new-project picker closed: drop the host's home index if unpinned.
+    pub const RELEASE_HOME_FOLDER_SEARCH: &str = "ReleaseHomeFolderSearch";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
+    // Device-local workspace filesystem operations. All are relay-forwardable;
+    // WatchWorkspaceFiles is the only streaming method in this group.
+    pub const LIST_WORKSPACE_DIRECTORY: &str = "ListWorkspaceDirectory";
+    pub const SEARCH_WORKSPACE_FILES: &str = "SearchWorkspaceFiles";
+    /// Start or keep alive a workspace's search index (fire-and-forget warm).
+    pub const WARM_WORKSPACE_SEARCH: &str = "WarmWorkspaceSearch";
+    /// Plain-text search over a workspace's file contents.
+    pub const SEARCH_WORKSPACE_CONTENT: &str = "SearchWorkspaceContent";
+    pub const READ_WORKSPACE_IMAGE: &str = "ReadWorkspaceImage";
+    pub const READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
+    pub const MOVE_WORKSPACE_ENTRY: &str = "MoveWorkspaceEntry";
+    pub const DELETE_WORKSPACE_ENTRY: &str = "DeleteWorkspaceEntry";
+    pub const WRITE_WORKSPACE_FILE: &str = "WriteWorkspaceFile";
+    pub const WATCH_WORKSPACE_FILES: &str = "WatchWorkspaceFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
-    /// Roll back a first send that never reached command admission.
-    pub const CANCEL_CHAT_STARTUP: &str = "CancelChatStartup";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    // Project Actions are private state on the device that owns the project.
+    pub const LIST_PROJECT_ACTIONS: &str = "ListProjectActions";
+    pub const UPSERT_PROJECT_ACTION: &str = "UpsertProjectAction";
+    pub const DELETE_PROJECT_ACTION: &str = "DeleteProjectAction";
+    pub const RUN_PROJECT_ACTION: &str = "RunProjectAction";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
@@ -147,270 +202,65 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
-    /// Read the bounded full patch for one exact checkout checksum on demand.
-    pub const READ_CHECKOUT_DIFF: &str = "ReadCheckoutDiff";
-    // Shared Agent Auth account pool (ControlRpc, never device-targeted).
+    pub const WATCH_WORKSPACE_GIT_STATUS: &str = "WatchWorkspaceGitStatus";
+    /// Current pull request for one checkout, resolved on the checkout's host device.
+    pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
+    /// One page of a repository's open pull requests (`filter`, `after`
+    /// cursor), with the total count.
+    pub const LIST_CHANGE_REQUEST_PAGE: &str = "ListChangeRequestPage";
+    /// Resolve a selected checkout through local Git metadata only.
+    pub const GET_CHANGE_REQUEST_REPOSITORY: &str = "GetChangeRequestRepository";
+    pub const GET_CHANGE_REQUEST: &str = "GetChangeRequest";
+    pub const POST_CHANGE_REQUEST_COMMENT: &str = "PostChangeRequestComment";
+    pub const GET_CHANGE_REQUEST_DIFF: &str = "GetChangeRequestDiff";
+    pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
+    /// Permanently restore one chat-owned checkout to its current HEAD and
+    /// remove only its untracked, non-ignored paths.
+    pub const DISCARD_WORKING_TREE: &str = "DiscardWorkingTree";
+    pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
+    // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
-    pub const MIGRATE_AGENT_ACCOUNT: &str = "MigrateAgentAccount";
-    pub const REVOKE_AGENT_ACCOUNT: &str = "RevokeAgentAccount";
+    pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
+    pub const FORGET_AGENT_ACCOUNT: &str = "ForgetAgentAccount";
     pub const START_AGENT_LOGIN: &str = "StartAgentLogin";
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
-    /// Owner-scoped attribution for the account that handled a logical session.
-    pub const GET_AGENT_ROUTE_RECEIPT: &str = "GetAgentRouteReceipt";
-    /// Device-local account most recently observed serving a logical session.
-    pub const GET_AGENT_ROUTE_ACCOUNT: &str = "GetAgentRouteAccount";
-    /// Read and update OMP's device-local advisor settings.
-    pub const GET_OMP_ADVISOR_CONFIG: &str = "GetOmpAdvisorConfig";
-    pub const SET_OMP_ADVISOR_CONFIG: &str = "SetOmpAdvisorConfig";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
-    /// One tool invocation's full input/output from the target device's run
-    /// journal (the doc keeps only the sanitized chip line).
-    pub const TOOL_CALL_DETAIL: &str = "ToolCallDetail";
+    /// Store an agent's HTML page and show it inline in that chat's live
+    /// turn (`show_visual`). Local only: the calling agent runs on this device.
+    pub const PUBLISH_VISUAL: &str = "PublishVisual";
+    /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
+    /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
+    pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
-    /// Download and verify the newest macOS app bundle on the target device.
-    pub const STAGE_UPDATE: &str = "StageUpdate";
-    /// Run a local agent CLI's own self-updater (`omp update`, `claude
-    /// update`, `codex update`) on the target device; replies with the
-    /// refreshed `HarnessStatus` row.
-    pub const UPDATE_HARNESS: &str = "UpdateHarness";
-    /// Persist whether agent CLIs auto-refresh after a Comet update lands on
-    /// the target device.
-    pub const SET_HARNESS_AUTO_UPDATE: &str = "SetHarnessAutoUpdate";
+    /// Device-local agent CLI update lifecycle. The stream emits the complete
+    /// ordered status list initially and after every transition.
+    pub const WATCH_HARNESS_UPDATES: &str = "WatchHarnessUpdates";
+    pub const CHECK_HARNESS_UPDATES: &str = "CheckHarnessUpdates";
+    pub const APPLY_HARNESS_UPDATE: &str = "ApplyHarnessUpdate";
+    pub const CANCEL_HARNESS_UPDATE: &str = "CancelHarnessUpdate";
+    pub const DISMISS_HARNESS_UPDATE: &str = "DismissHarnessUpdate";
+    pub const SET_HARNESS_UPDATE_POLICY: &str = "SetHarnessUpdatePolicy";
 }
 
-/// Parameters for `ReadCheckoutDiff`. A checksum mismatch returns no patch,
-/// preventing a response for an older watch frame from masquerading as current.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadCheckoutDiffParams {
-    pub checkout_id: String,
-    pub checksum: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_device_id: Option<String>,
+/// Stable capability error codes transported without provider stderr.
+pub mod capability_errors {
+    pub const PULL_REQUESTS_CLI_UNAVAILABLE: &str = "pull_requests.cli_unavailable";
+    pub const PULL_REQUESTS_AUTHENTICATION: &str = "pull_requests.authentication";
+    pub const PULL_REQUESTS_RATE_LIMITED: &str = "pull_requests.rate_limited";
+    pub const PULL_REQUESTS_TIMEOUT: &str = "pull_requests.timeout";
+    pub const PULL_REQUESTS_DECODE: &str = "pull_requests.decode";
+    pub const PULL_REQUESTS_COMMAND_FAILED: &str = "pull_requests.command_failed";
 }
-/// Non-null unary envelope for `ReadCheckoutDiff`. The RPC frame itself uses an
-/// optional `ok` field, so a bare JSON `null` would be indistinguishable from a
-/// missing reply and leave the caller pending forever.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadCheckoutDiffResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diff: Option<comet_proto::CheckoutDiffPatch>,
-}
-
-/// Shared parameters for `AddSessionRef` and `RemoveSessionRef`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionRefParams {
-    pub chat_id: String,
-}
-
-/// Run capability is supplied only by the engine's child environment, never a prompt.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RetainSessionSupervisionParams {
-    pub chat_id: String,
-    pub token: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SearchSessionsParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchSessionsResult {
-    pub sessions: Vec<SessionSearchMatch>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionSearchMatch {
-    pub session_id: String,
-    pub title: String,
-    pub owner: SessionSearchOwner,
-    pub session_url: String,
-    pub matched_by: Vec<SessionSearchMatchKind>,
-    pub matched_sources: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSearchOwner {
-    pub id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionSearchMatchKind {
-    Title,
-    SlackThread,
-    SlackMessage,
-    NotionPage,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReportScaffoldPreparationFailureParams {
-    pub chat_id: String,
-    pub generation: String,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ForkSessionParams {
-    pub source_chat_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ForkSessionResult {
-    pub chat_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HandoffSessionToScaffoldParams {
-    pub source_chat_id: String,
-    pub prompt: String,
-    #[serde(default)]
-    pub database_environment: comet_proto::ScaffoldDatabaseEnvironment,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecoverSessionHandoffToScaffoldParams {
-    #[serde(flatten)]
-    pub handoff: HandoffSessionToScaffoldParams,
-    pub recover_chat_id: String,
-    pub recover_sandbox_id: String,
-}
-
-/// Receipt for a transferred native session with its initial remote command queued.
-/// This does not indicate that the remote task has completed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HandoffSessionToScaffoldResult {
-    pub chat_id: String,
-    pub sandbox_id: String,
-    pub command_id: String,
-    pub environment: comet_proto::SessionEnvironment,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoveSessionRefResult {
-    pub removed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GetAgentRouteReceiptParams {
-    pub logical_session_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct GetAgentRouteAccountParams {
-    pub logical_session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_device_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetAgentRouteAccountResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SendPeerMessageParams {
-    pub source_chat_id: String,
-    pub target_chat_id: String,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command_id: Option<String>,
-    #[serde(default)]
-    pub wait: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplyPeerMessageParams {
-    pub session_id: String,
-    pub command_id: String,
-    pub text: String,
-    #[serde(default)]
-    pub wait: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WaitPeerReplyParams {
-    pub source_chat_id: String,
-    pub thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerReplyResult {
-    pub command_id: String,
-    pub text: String,
-    pub source_chat_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerMessageResult {
-    pub command_id: String,
-    pub thread_id: String,
-    pub delivery: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply: Option<PeerReplyResult>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerWaitResult {
-    pub thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply: Option<PeerReplyResult>,
-}
-
-pub(crate) const STREAM_OVERFLOW_ERROR: &str =
-    "rpc_stream_overflow: resubscribe for a fresh snapshot or replay";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -418,17 +268,15 @@ pub enum RpcError {
     UnknownMethod(String),
     #[error("bad params: {0}")]
     BadParams(String),
+    /// Stable machine-readable capability failure preserved across transports.
+    #[error("capability error: {0}")]
+    Capability(String),
     #[error("{0}")]
     Failed(String),
-    /// Locally classified before Scaffold HTTP dispatch; never reconstructed from wire text.
-    #[error("scaffold_auth_unavailable")]
-    ScaffoldAuthUnavailable,
     #[error("transport: {0}")]
     Transport(String),
     #[error("connection closed")]
     Closed,
-    #[error("{}", STREAM_OVERFLOW_ERROR)]
-    StreamOverflow,
 }
 
 /// A client-originated frame.
@@ -447,7 +295,13 @@ pub struct ClientFrame {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerFrame {
     pub id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `"ok": null` is a reply whose value is `null` (for example an absent
+    /// `Option`), distinct from a frame without `ok`.
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ok: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
@@ -457,15 +311,19 @@ pub struct ServerFrame {
     pub done: bool,
 }
 
+fn present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 /// What a service returns for one invocation.
 pub enum RpcReply {
     /// Unary response — sent as `{id, ok}`.
     Value(serde_json::Value),
     /// Stream — each item sent as `{id, item}`, then `{id, done: true}` when it ends.
     Stream(BoxStream<'static, serde_json::Value>),
-    /// Fallible stream (e.g. a forwarded subscription). An error emits `{id, err}`,
-    /// never a successful `{done}`; queued items retain their original order.
-    FallibleStream(BoxStream<'static, Result<serde_json::Value, RpcError>>),
 }
 
 impl RpcReply {
@@ -477,32 +335,10 @@ impl RpcReply {
     }
 }
 
-/// One-shot authority emitted by the edge, never accepted from RPC parameters.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PeerCommandAuthority {
-    pub subject: String,
-    pub project_id: String,
-    pub device_id: String,
-    pub chat_id: String,
-    pub expires_at: i64,
-}
-
 /// Server-side dispatch: one implementation serves every transport.
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
-
-    /// Only the authenticated host relay invokes this seam. Ordinary JSON RPC
-    /// dispatch cannot manufacture a verified principal by claiming its fields.
-    async fn peer_command(
-        &self,
-        _method: &str,
-        _authority: PeerCommandAuthority,
-        _params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcError> {
-        Err(RpcError::Failed("peer_command_authority_required".into()))
-    }
 }
 
 /// Deserialize typed params out of the envelope's `params` value.
@@ -526,8 +362,55 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::Mutex;
 
     struct TestService;
+
+    struct CancelAwareService {
+        dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RpcService for CancelAwareService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            if !matches!(
+                method,
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST | methods::WATCH_HARNESS_UPDATES | "Silent"
+            ) {
+                return Err(RpcError::UnknownMethod(method.into()));
+            }
+            let guard = DropSignal(self.dropped.lock().unwrap().take());
+            let stream = futures::stream::unfold(guard, |guard| async move {
+                let item = std::future::pending::<Option<(serde_json::Value, DropSignal)>>().await;
+                drop(guard);
+                item
+            });
+            if method == methods::WATCH_HARNESS_UPDATES {
+                // Update watches send an initial status snapshot, then may stay
+                // quiet indefinitely. Legacy peers do not send a readiness frame.
+                return Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(stream)
+                        .boxed(),
+                ));
+            }
+            Ok(RpcReply::Stream(stream.boxed()))
+        }
+    }
 
     #[async_trait]
     impl RpcService for TestService {
@@ -545,11 +428,10 @@ mod tests {
                     ))
                 }
                 "Never" => Ok(RpcReply::Stream(futures::stream::pending().boxed())),
-                "Overflow" => Ok(RpcReply::FallibleStream(futures::stream::iter([
-                    Ok(serde_json::json!("queued prefix")),
-                    Err(RpcError::StreamOverflow),
-                ]).boxed())),
                 "Boom" => Err(RpcError::Failed("boom".into())),
+                "Capability" => Err(RpcError::Capability(
+                    capability_errors::PULL_REQUESTS_AUTHENTICATION.into(),
+                )),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
@@ -571,7 +453,7 @@ mod tests {
             .unwrap();
         let mut seen = Vec::new();
         while let Some(v) = items.recv().await {
-            seen.push(v.unwrap());
+            seen.push(v);
         }
         assert_eq!(
             seen,
@@ -587,6 +469,136 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
+
+        let err = client
+            .call("Capability", serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::Capability(code)
+                if code == capability_errors::PULL_REQUESTS_AUTHENTICATION
+        ));
+    }
+
+    #[tokio::test]
+    async fn checked_stream_acknowledges_support_and_preserves_unknown_method() {
+        let client = memory_client(Arc::new(TestService));
+
+        let mut items = client
+            .subscribe_checked("Count", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        assert_eq!(items.recv().await, Some(serde_json::json!(0)));
+        assert_eq!(items.recv().await, None);
+
+        let error = match client
+            .subscribe_checked("FutureStream", serde_json::Value::Null)
+            .await
+        {
+            Ok(_) => panic!("old service must reject unknown stream"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RpcError::UnknownMethod(method) if method == "FutureStream"));
+    }
+
+    #[tokio::test]
+    async fn dropping_checked_subscription_cancels_pending_server_stream() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let client = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        }));
+        let stream = client
+            .subscribe_checked(
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("server stream cancelled")
+            .expect("drop signal");
+    }
+
+    #[tokio::test]
+    async fn scoped_subscription_returns_before_first_item_and_cancels_silence() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let service = Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let client = memory_client(service.clone());
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.subscribe_scoped("Silent", serde_json::Value::Null),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        while service.dropped.lock().unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_one_device_update_watch_preserves_the_other() {
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        let first = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(first_tx)),
+        }));
+        let second = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(second_tx)),
+        }));
+        let first_watch = first
+            .subscribe_checked(methods::WATCH_HARNESS_UPDATES, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let second_watch = second
+            .subscribe_checked(methods::WATCH_HARNESS_UPDATES, serde_json::Value::Null)
+            .await
+            .unwrap();
+
+        drop(first_watch);
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_rx)
+            .await
+            .expect("first device's quiet stream cancelled")
+            .expect("first drop signal");
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        drop(second_watch);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_rx)
+            .await
+            .expect("second device's quiet stream cancelled")
+            .expect("second drop signal");
+    }
+
+    #[tokio::test]
+    async fn unary_null_reply_resolves_the_call() {
+        let client = memory_client(Arc::new(TestService));
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.call("Echo", serde_json::Value::Null),
+        )
+        .await
+        .expect("a null reply is a reply")
+        .unwrap();
+        assert_eq!(reply, serde_json::Value::Null);
+        let frame: ServerFrame = serde_json::from_str(r#"{"id":1,"ok":null}"#).unwrap();
+        assert_eq!(frame.ok, Some(serde_json::Value::Null));
+        let frame: ServerFrame = serde_json::from_str(r#"{"id":1,"done":true}"#).unwrap();
+        assert_eq!(frame.ok, None);
     }
 
     #[tokio::test]
@@ -606,29 +618,37 @@ mod tests {
             .subscribe("Count", serde_json::json!({"n": 2}))
             .await
             .unwrap();
-        assert_eq!(items.recv().await.unwrap().unwrap(), serde_json::json!(0));
-        assert_eq!(items.recv().await.unwrap().unwrap(), serde_json::json!(1));
-        assert!(items.recv().await.is_none());
+        assert_eq!(items.recv().await, Some(serde_json::json!(0)));
+        assert_eq!(items.recv().await, Some(serde_json::json!(1)));
+        assert_eq!(items.recv().await, None);
     }
 
     #[tokio::test]
-    async fn forwarded_stream_failure_is_not_successful_completion() {
-        struct Forward(Arc<RpcClient>);
-        #[async_trait]
-        impl RpcService for Forward {
-            async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
-                let rx = self.0.subscribe(method, params).await?;
-                Ok(RpcReply::FallibleStream(futures::stream::unfold(rx, |mut rx| async move {
-                    rx.recv().await.map(|item| (item, rx))
-                }).boxed()))
-            }
-        }
-        let source = Arc::new(memory_client(Arc::new(TestService)));
-        let forwarded = memory_client(Arc::new(Forward(source)));
-        let mut stream = forwarded.subscribe("Overflow", serde_json::Value::Null).await.unwrap();
-        assert_eq!(stream.recv().await.unwrap().unwrap(), serde_json::json!("queued prefix"));
-        assert!(matches!(stream.recv().await, Some(Err(RpcError::StreamOverflow))));
-        assert!(stream.recv().await.is_none());
+    async fn handshake_with_origin_header_is_rejected() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+
+        // A browser page opening ws://127.0.0.1:{port} always sends Origin;
+        // the server must refuse the handshake before serving any RPC.
+        let mut req = format!("ws://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("origin", "https://evil.example".parse().unwrap());
+        let result = tokio_tungstenite::connect_async(req).await;
+        assert!(
+            result.is_err(),
+            "handshake carrying an Origin header must be rejected"
+        );
+
+        // A native viewport (no Origin) still connects and can call RPC — the
+        // reject must not be a blanket denial.
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
+        assert_eq!(echoed, serde_json::json!("ok"));
     }
 
     #[tokio::test]

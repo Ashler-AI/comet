@@ -1,8 +1,6 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
@@ -41,6 +39,11 @@ on:
         required: false
         default: ""
         type: string
+      reviewed_sha:
+        description: "Exact reviewed SHA, required for an unmerged build-only candidate"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -72,19 +75,14 @@ jobs:
           REQUESTED_RELEASE_SURFACE: ${{ inputs.release_surface }}
           REQUESTED_PROMOTION_TARGET: ${{ inputs.promotion_target }}
           REQUESTED_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          REQUESTED_REVIEWED_SHA: ${{ inputs.reviewed_sha }}
         run: |
           set -euo pipefail
           workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
           test -n "$workspace_version"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            requested="${GITHUB_REF_NAME#v}"
-            release_surface="desktop-and-scaffold"
-            promotion_target="production"
-          else
-            requested="$REQUESTED_VERSION"
-            release_surface="$REQUESTED_RELEASE_SURFACE"
-            promotion_target="$REQUESTED_PROMOTION_TARGET"
-          fi
+          requested="$REQUESTED_VERSION"
+          release_surface="$REQUESTED_RELEASE_SURFACE"
+          promotion_target="$REQUESTED_PROMOTION_TARGET"
           case "$release_surface" in
             desktop|desktop-and-scaffold) ;;
             *)
@@ -99,10 +97,12 @@ jobs:
               exit 1
               ;;
           esac
-          if [[ "$promotion_target" == "production" ]]; then
-            git fetch origin main
-            if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
-              echo "::error::production release source must be merged into main before promotion"
+          # Publication requires merged main. A reviewed branch may only build
+          # private Actions artifacts: target=none never enters a publisher job.
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            if [[ "$promotion_target" != none || ! "${REQUESTED_REVIEWED_SHA:-}" =~ ^[0-9a-f]{40}$ || "$REQUESTED_REVIEWED_SHA" != "$GITHUB_SHA" ]]; then
+              echo "::error::publication requires merged main; unmerged build-only source requires its exact reviewed_sha"
               exit 1
             fi
           fi
@@ -121,7 +121,7 @@ jobs:
             echo "::error::release version $requested does not match workspace version $workspace_version"
             exit 1
           fi
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[] | select(.name == "comet") | .version] | unique | .[]')"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[] | select(.name == "zeron") | .version] | unique | .[]')"
           if [[ "$cargo_version" != "$workspace_version" ]]; then
             echo "::error::Cargo metadata reports $cargo_version, expected $workspace_version"
             exit 1
@@ -131,6 +131,16 @@ jobs:
           echo "promotion_target=$promotion_target" >> "$GITHUB_OUTPUT"
           echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+
+  browser-contracts:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test apps/web/server.test.mjs
 
   linux:
     if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
@@ -157,7 +167,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -298,6 +308,7 @@ jobs:
     if: >-
       always() &&
       needs.version.result == 'success' &&
+      needs['browser-contracts'].result == 'success' &&
       (
         (
           inputs.candidate_run_id != '' &&
@@ -310,7 +321,7 @@ jobs:
           (needs.linux.result == 'success' || needs.linux.result == 'skipped')
         )
       )
-    needs: [version, linux, macos]
+    needs: [version, linux, macos, browser-contracts]
     runs-on: ubuntu-24.04
     outputs:
       digest: ${{ steps.candidate.outputs.digest || steps.reuse.outputs.digest }}
@@ -538,7 +549,8 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
       - uses: google-github-actions/setup-gcloud@v2
-      - name: Preflight exact storage permissions and privacy
+      - id: privacy
+        name: Preflight exact storage permissions and privacy
         run: |
           set -euo pipefail
           required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get","storage.objects.list"]'
@@ -547,10 +559,15 @@ jobs:
             curl --config - --fail-with-body --silent --show-error \
               "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list" \
               > permitted.json
+          printf 'header = "Authorization: Bearer %s"\n' "$access_token" |
+            curl --config - --fail-with-body --silent --show-error \
+              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET?fields=iamConfiguration" \
+              > bucket-config.json
           unset access_token
           jq -e --argjson required "$required" \
             '($required - (.permissions // [])) as $missing | if ($missing | length) == 0 then true else error("missing publisher permissions: \($missing | join(", "))") end' \
             permitted.json
+          jq -e '.iamConfiguration.uniformBucketLevelAccess.enabled == true and .iamConfiguration.publicAccessPrevention == "enforced"' bucket-config.json >/dev/null
           gcloud storage buckets get-iam-policy "gs://$COMET_RELEASES_GCS_BUCKET" --format=json > bucket-iam.json
           if jq -e '[.bindings[]?.members[]?] | any(. == "allUsers" or . == "allAuthenticatedUsers")' bucket-iam.json >/dev/null; then
             echo "::error::release bucket must not grant public or all-authenticated-user access"
@@ -723,7 +740,8 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
       - uses: google-github-actions/setup-gcloud@v2
-      - name: Preflight exact storage permissions and privacy
+      - id: privacy
+        name: Preflight exact storage permissions and privacy
         run: |
           set -euo pipefail
           required='["storage.buckets.get","storage.buckets.getIamPolicy","storage.objects.create","storage.objects.delete","storage.objects.get","storage.objects.list"]'
@@ -732,10 +750,15 @@ jobs:
             curl --config - --fail-with-body --silent --show-error \
               "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.buckets.getIamPolicy&permissions=storage.objects.create&permissions=storage.objects.delete&permissions=storage.objects.get&permissions=storage.objects.list" \
               > permitted.json
+          printf 'header = "Authorization: Bearer %s"\n' "$access_token" |
+            curl --config - --fail-with-body --silent --show-error \
+              "https://storage.googleapis.com/storage/v1/b/$COMET_RELEASES_GCS_BUCKET?fields=iamConfiguration" \
+              > bucket-config.json
           unset access_token
           jq -e --argjson required "$required" \
             '($required - (.permissions // [])) as $missing | if ($missing | length) == 0 then true else error("missing publisher permissions: \($missing | join(", "))") end' \
             permitted.json
+          jq -e '.iamConfiguration.uniformBucketLevelAccess.enabled == true and .iamConfiguration.publicAccessPrevention == "enforced"' bucket-config.json >/dev/null
           gcloud storage buckets get-iam-policy "gs://$COMET_RELEASES_GCS_BUCKET" --format=json > bucket-iam.json
           if jq -e '[.bindings[]?.members[]?] | any(. == "allUsers" or . == "allAuthenticatedUsers")' bucket-iam.json >/dev/null; then
             echo "::error::release bucket must not grant public or all-authenticated-user access"

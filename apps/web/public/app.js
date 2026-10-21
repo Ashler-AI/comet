@@ -50,8 +50,7 @@ const terminalCommandStatuses = new Set(['rejected', 'expired', 'superseded', 'c
 function renderActivity() {
   const statuses = { working: 'Composing…', awaitingInput: 'Awaiting your answer', errored: 'Session encountered an error', idle: '' };
   const pending = pendingCommands.values().next().value;
-  const retry = connected && state?.connection === 'connected' && state.session.status === 'working' ? state.session.modelRetry : null;
-  ui.activity.textContent = retry ? `Reconnecting to model — attempt ${retry.attempt}/${retry.maxAttempts}` : pending || (statuses[state?.session.status] ?? state?.session.status ?? '');
+  ui.activity.textContent = pending || (statuses[state?.session.status] ?? state?.session.status ?? '');
 }
 
 function element(tag, className, text) {
@@ -80,7 +79,7 @@ async function api(path, options = {}) {
   return payload;
 }
 api('native-open').then(({ url }) => {
-  if (typeof url !== 'string' || !/^comet(?:-staging)?:\/\/scaffold\/(?:[A-Za-z0-9._-]{1,256}\/){3}[A-Za-z0-9._-]{1,256}$/.test(url)) throw new Error('Crew returned an invalid session link.');
+  if (typeof url !== 'string' || !/^crew-upstream-canary:\/\/scaffold\/(?:[A-Za-z0-9._-]{1,256}\/){3}[A-Za-z0-9._-]{1,256}$/.test(url)) throw new Error('Crew returned an invalid session link.');
   $('native-open').href = url;
   $('native-open').hidden = false;
 }).catch(showError);
@@ -141,7 +140,6 @@ function connection(value) {
   ui.connection.dataset.state = live ? 'connected' : 'disconnected';
   ui.connection.textContent = live ? 'Connected' : state ? 'Reconnecting…' : 'Connecting…';
   updateControls();
-  renderActivity();
 }
 
 // Markdown is constructed entirely from DOM text nodes. Raw HTML and remote images

@@ -3,32 +3,24 @@
 //! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
 //! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
 //! - `messages`: LoroList of LoroMap {
-//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf?, peerMessage? }
+//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?,
+//!   continuationOf?, durationMs? }
 //! - `commands`: LoroList of LoroMap {
 //!   id, kind, payload(json), issuedBy, issuedAt, basedOn?, expiresAt?, status, resolution? }
+//! - `queue`:    LoroMovableList of LoroMap {
+//!   id, text, attachments?, issuedBy, issuedAt, editedAt? }        (any device writes)
 //!
-//! Part maps: { id, kind: "text"|"tool"|"input"|"error", text?: LoroText, call?: LoroMap,
-//! isError?, questions?: json, resolved?, message? }. Tool-call objects/arrays use nested
-//! LoroMap/LoroList and strings use LoroText; legacy scalar call JSON remains readable.
-//! Deep JSON is unchanged. Growing text and tool arguments append RLE-merged suffixes.
+//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image", text?: LoroText,
+//! reasoning?: LoroText, call?: json, isError?, questions?: json, resolved?, message? }.
+//! Text bodies are **LoroText** so streaming appends RLE-merge (1.03x oplog overhead vs
+//! 125x for whole-value rewrites).
 
-use std::collections::HashSet;
-
-use comet_proto::{
-    COLLABORATION_SCHEMA_VERSION, CollaborationSnapshot, PeerMessageProvenance, PublicationRecord,
-    PublicationValue,
-};
-use loro::{
-    ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, TextDelta, ToJson,
-    cursor::PosType,
-};
+use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
-use crate::collaboration::validate_publication;
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
-use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT, TAIL_TEXT_BYTE_BUDGET};
-use crate::parts::{MessagePart, MessageStatus};
-use crate::SharedDocument;
+use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
+use crate::parts::{MessagePart, MessageStatus, SubagentStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -62,60 +54,11 @@ pub struct SessionMessageEntry {
     pub status: Option<MessageStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_of: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_peer_message"
-    )]
-    pub peer_message: Option<PeerMessageProvenance>,
-}
-
-impl SessionMessageEntry {
-    /// Only explicitly identified user peer messages are collapsed in Crew.
-    /// Orphan continuations and historical entries without metadata stay visible.
-    pub fn is_peer_message(&self) -> bool {
-        self.role == MessageRole::User
-            && self.continuation_of.is_none()
-            && self.peer_message.as_ref().is_some_and(|peer| {
-                !self.id.trim().is_empty()
-                    && peer.command_id == self.id
-                    && !peer.source_chat_id.trim().is_empty()
-                    && !peer.thread_id.trim().is_empty()
-                    && peer
-                        .reply_to
-                        .as_ref()
-                        .is_none_or(|id| !id.trim().is_empty())
-            })
-    }
-}
-
-// Invalid or unsupported optional provenance must not discard the containing row.
-fn deserialize_peer_message<'de, D>(
-    deserializer: D,
-) -> Result<Option<PeerMessageProvenance>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).ok())
-}
-
-/// A newest-first transcript page projected back into chronological order.
-/// `before` is an opaque raw-list cursor for the next older page.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionEntryWindow {
-    pub entries: Vec<SessionMessageEntry>,
-    pub before: Option<usize>,
-}
-
-/// Directory identity and completion metadata, without transcript payloads.
-pub struct DirectoryEntry {
-    pub id: String,
-    pub role: MessageRole,
-    pub status: Option<MessageStatus>,
-    pub peer_message: Option<PeerMessageProvenance>,
-    pub has_error: bool,
+    /// Wall-clock length of this assistant turn, stamped when the segment
+    /// finishes. Absent on user rows, live streams, and docs written before
+    /// the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 /// The doc-resident flat part map (`DocMessagePart` in TS). Distinct from the app-layer
@@ -126,7 +69,19 @@ struct DocPartJson {
     id: String,
     kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    /// Thinking body for `kind: "reasoning"` (additive). Deliberately NOT the
+    /// `text` field: old readers' unknown-kind fallback renders `text` as
+    /// prose, so reasoning riding `text` would leak raw thinking into old
+    /// transcripts; on this field they degrade to an invisible empty part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     call: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,35 +92,76 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Fork seam (`kind: "fork"`, additive): the chat the history above was
+    /// copied from, and its title at the time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    started: Option<bool>,
+    source_chat_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    completed: Option<bool>,
+    source_title: Option<String>,
+    /// Tool output summary (additive — absent on old rows and old writers;
+    /// pre-strip writers stored up to 4KB of capped output here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    /// Capped inline tool diff (additive; pre-strip writers only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff: Option<serde_json::Value>,
+    /// Sidecar key of the full output (additive, docs/chat2-sync.md A1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_ref: Option<String>,
+    /// Full-output byte length (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_bytes: Option<u64>,
+    /// Sidecar key of the full diff JSON (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_ref: Option<String>,
+    /// Per-file diff stats (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_stats: Option<serde_json::Value>,
+    /// Subagent doc/blob ref carried by a spawn chip (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_ref: Option<String>,
+    /// Subagent lifecycle ("running"/"done"/"failed", additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_status: Option<String>,
+    /// One-line live tail of the subagent's output (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_tail: Option<String>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
 fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
     Ok(match part {
+        MessagePart::Image {
+            id,
+            path,
+            name,
+            mime_type,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "image".into(),
+            path: Some(path.clone()),
+            name: Some(name.clone()),
+            mime_type: Some(mime_type.clone()),
+            ..Default::default()
+        },
+        // The script path and title ride `path` and `name`.
+        MessagePart::Visual { id, path, title } => DocPartJson {
+            id: id.clone(),
+            kind: "visual".into(),
+            path: Some(path.clone()),
+            name: Some(title.clone()),
+            ..Default::default()
+        },
         MessagePart::Text { id, text } => DocPartJson {
             id: id.clone(),
             kind: "text".into(),
             text: Some(text.clone()),
             ..Default::default()
         },
-        MessagePart::TextWindow { .. } => {
-            return Err(DocError::Schema(
-                "projected text windows cannot be persisted".into(),
-            ));
-        }
-        MessagePart::Thinking {
-            id,
-            started,
-            completed,
-        } => DocPartJson {
+        MessagePart::Reasoning { id, text } => DocPartJson {
             id: id.clone(),
-            kind: "thinking".into(),
-            started: Some(*started),
-            completed: Some(*completed),
+            kind: "reasoning".into(),
+            reasoning: Some(text.clone()),
             ..Default::default()
         },
         MessagePart::Tool {
@@ -173,6 +169,15 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             call,
             is_error,
             resolved,
+            output,
+            diff,
+            output_ref,
+            output_bytes,
+            diff_ref,
+            diff_stats,
+            subagent_ref,
+            subagent_status,
+            subagent_tail,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -180,6 +185,22 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             // TS shape parity: `isError` is written only once the tool result arrived;
             // its presence IS the resolution marker.
             is_error: if *resolved { Some(*is_error) } else { None },
+            output: output.clone(),
+            diff: diff.as_ref().map(serde_json::to_value).transpose()?,
+            output_ref: output_ref.clone(),
+            output_bytes: *output_bytes,
+            diff_ref: diff_ref.clone(),
+            diff_stats: diff_stats.as_ref().map(serde_json::to_value).transpose()?,
+            subagent_ref: subagent_ref.clone(),
+            subagent_status: subagent_status.map(|s| {
+                match s {
+                    SubagentStatus::Running => "running",
+                    SubagentStatus::Done => "done",
+                    SubagentStatus::Failed => "failed",
+                }
+                .to_owned()
+            }),
+            subagent_tail: subagent_tail.clone(),
             ..Default::default()
         },
         MessagePart::Input {
@@ -200,28 +221,60 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Fork {
+            id,
+            source_chat_id,
+            source_title,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "fork".into(),
+            source_chat_id: Some(source_chat_id.clone()),
+            source_title: Some(source_title.clone()),
+            ..Default::default()
+        },
     })
 }
 
 /// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
+        "image" => image_part(p.id, p.path, p.name, p.mime_type),
+        "visual" => match p.path.filter(|path| !path.is_empty()) {
+            Some(path) => MessagePart::Visual {
+                id: p.id,
+                path,
+                title: p.name.unwrap_or_default(),
+            },
+            None => MessagePart::Error {
+                id: p.id,
+                message: "Visual unavailable".into(),
+            },
+        },
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
             Some(call) => MessagePart::Tool {
                 id: p.id,
                 call,
                 is_error: p.is_error.unwrap_or(false),
                 resolved: p.is_error.is_some(),
+                output: p.output,
+                diff: p.diff.and_then(|d| serde_json::from_value(d).ok()),
+                output_ref: p.output_ref,
+                output_bytes: p.output_bytes,
+                diff_ref: p.diff_ref,
+                diff_stats: p.diff_stats.and_then(|s| serde_json::from_value(s).ok()),
+                subagent_ref: p.subagent_ref,
+                subagent_status: p.subagent_status.as_deref().and_then(|s| match s {
+                    "running" => Some(SubagentStatus::Running),
+                    "done" => Some(SubagentStatus::Done),
+                    "failed" => Some(SubagentStatus::Failed),
+                    _ => None,
+                }),
+                subagent_tail: p.subagent_tail,
             },
             None => MessagePart::Text {
                 id: p.id,
                 text: String::new(),
             },
-        },
-        "thinking" => MessagePart::Thinking {
-            id: p.id,
-            started: p.started.unwrap_or(true),
-            completed: p.completed.unwrap_or(false),
         },
         "input" => MessagePart::Input {
             id: p.id.clone(),
@@ -236,6 +289,15 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             id: p.id,
             message: p.message.unwrap_or_default(),
         },
+        "reasoning" => MessagePart::Reasoning {
+            id: p.id,
+            text: p.reasoning.unwrap_or_default(),
+        },
+        "fork" => MessagePart::Fork {
+            id: p.id,
+            source_chat_id: p.source_chat_id.unwrap_or_default(),
+            source_title: p.source_title.unwrap_or_default(),
+        },
         _ => MessagePart::Text {
             id: p.id,
             text: p.text.unwrap_or_default(),
@@ -243,28 +305,44 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
     }
 }
 
+fn image_part(
+    id: String,
+    path: Option<String>,
+    name: Option<String>,
+    mime_type: Option<String>,
+) -> MessagePart {
+    match (path, name, mime_type) {
+        (Some(path), Some(name), Some(mime_type))
+            if !path.is_empty()
+                && !name.is_empty()
+                && matches!(
+                    mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                ) =>
+        {
+            MessagePart::Image {
+                id,
+                path,
+                name,
+                mime_type,
+            }
+        }
+        _ => MessagePart::Error {
+            id,
+            message: "Generated image unavailable".into(),
+        },
+    }
+}
+
 /// A session doc handle: typed access over a LoroDoc with the schema above.
 pub struct SessionDoc {
-    doc: SharedDocument,
+    doc: LoroDoc,
 }
 
 impl SessionDoc {
-    /// Wrap an existing doc (e.g. imported from a snapshot) and perform the additive v2
-    /// cutover. Existing/unknown containers and fields are untouched.
+    /// Wrap an existing doc (e.g. imported from a snapshot).
     pub fn from_doc(doc: LoroDoc) -> Self {
-        let meta = doc.get_map("meta");
-        let current = match meta.get("schemaVersion") {
-            Some(loro::ValueOrContainer::Value(LoroValue::I64(value))) => value,
-            _ => 0,
-        };
-        if current < i64::from(SESSION_SCHEMA_VERSION) {
-            if let Err(error) = meta.insert("schemaVersion", i64::from(SESSION_SCHEMA_VERSION)) {
-                tracing::warn!(%error, "session schema version cutover failed");
-            } else {
-                doc.commit();
-            }
-        }
-        Self { doc: SharedDocument::new(doc) }
+        Self { doc }
     }
 
     /// Create + initialize a fresh doc for `chat_id` (host-only).
@@ -273,24 +351,160 @@ impl SessionDoc {
         let meta = doc.get_map("meta");
         meta.insert("chatId", chat_id)?;
         meta.insert("schemaVersion", SESSION_SCHEMA_VERSION as i64)?;
-        meta.insert("directoryCompletedTurn", "")?;
         doc.commit();
-        Ok(Self { doc: SharedDocument::new(doc) })
+        Ok(Self { doc })
     }
 
-    /// A raw snapshot handle; typed mutators use the replaceable binding.
-    pub fn doc(&self) -> LoroDoc {
-        self.doc.raw()
+    pub fn doc(&self) -> &LoroDoc {
+        &self.doc
     }
 
-    pub fn binding(&self) -> SharedDocument {
-        self.doc.clone()
+    /// Durable annotations are independent of transcript rendering and queue
+    /// messages. Restricted clients submit commands; they never write this map.
+    pub fn annotations(&self) -> Result<Vec<zeron_proto::SemanticAnnotation>, DocError> {
+        let value = self.doc.get_map("crewAnnotations").get_deep_value().to_json_value();
+        let rows: std::collections::BTreeMap<String, zeron_proto::SemanticAnnotation> =
+            serde_json::from_value(value)?;
+        Ok(rows.into_values().collect())
     }
 
-    pub fn set_completed_turn(&self, entry_id: &str) -> Result<(), DocError> {
-        let _operation = self.doc.operation();
-        self.doc.get_map("meta").insert("directoryCompletedTurn", entry_id)?;
-        self.doc.commit()
+    /// The annotation and its immutable command result share one Loro commit.
+    /// Callers serialize this with other transcript mutations and persist the
+    /// snapshot before acknowledging/finishing their external command claim.
+    pub fn apply_annotation_command(
+        &self,
+        command_id: &str,
+        command: &zeron_proto::AnnotationCommand,
+        principal: &zeron_proto::CollaborationPrincipal,
+        grant: Option<&zeron_proto::CapabilityGrant>,
+        metadata: &zeron_proto::CrewChatMetadata,
+        now: i64,
+    ) -> Result<zeron_proto::SemanticAnnotation, DocError> {
+        if command_id.is_empty() || command_id.len() > 256
+            || !metadata.permits(principal, grant, zeron_proto::CAPABILITY_SESSION_ANNOTATE, now) {
+            return Err(DocError::Schema("annotation command identity or access denied".into()));
+        }
+        let intent = serde_json::json!({
+            "principal":principal.subject, "scope":metadata.scope,
+            "sessionId":metadata.session_id, "chatId":self.chat_id(), "command":command,
+        });
+        let commands = self.doc.get_map("crewAnnotationCommands");
+        if let Some(existing) = commands.get(command_id) {
+            let existing = existing.get_deep_value().to_json_value();
+            if existing.get("intent") != Some(&intent) {
+                return Err(DocError::Schema("annotation command id was reused with different intent".into()));
+            }
+            return serde_json::from_value(existing.get("result").cloned()
+                .ok_or_else(|| DocError::Schema("annotation command result missing".into()))?).map_err(Into::into);
+        }
+        let annotation = self.prepare_annotation(command, principal, metadata, now)?;
+        let value = serde_json::to_value(&annotation)?;
+        let record = serde_json::json!({"intent":intent, "result":value});
+        self.doc.get_map("crewAnnotations").insert(&annotation.id, LoroValue::from(value))?;
+        commands.insert(command_id, LoroValue::from(record))?;
+        self.doc.commit();
+        Ok(annotation)
+    }
+
+    /// `None` is outcome-unknown, never permission to replay an external claim.
+    /// Authorization of this lookup is enforced by the host RPC boundary.
+    pub fn annotation_command_result(&self, command_id: &str) -> Result<Option<zeron_proto::SemanticAnnotation>, DocError> {
+        let Some(record) = self.doc.get_map("crewAnnotationCommands").get(command_id) else { return Ok(None); };
+        let value = record.get_deep_value().to_json_value();
+        Ok(Some(serde_json::from_value(value.get("result").cloned()
+            .ok_or_else(|| DocError::Schema("annotation command result missing".into()))?)?))
+    }
+
+    fn prepare_annotation(
+        &self,
+        command: &zeron_proto::AnnotationCommand,
+        principal: &zeron_proto::CollaborationPrincipal,
+        metadata: &zeron_proto::CrewChatMetadata,
+        now: i64,
+    ) -> Result<zeron_proto::SemanticAnnotation, DocError> {
+        use zeron_proto::{AnnotationCommand, AnnotationState, SemanticAnnotation};
+        let id = match command {
+            AnnotationCommand::Create { id, .. } | AnnotationCommand::Edit { id, .. }
+                | AnnotationCommand::Resolve { id, .. } => id,
+        };
+        let existing = self.annotations()?.into_iter().find(|value| &value.id == id);
+        let annotation = match (command, existing) {
+            (AnnotationCommand::Create { id, body, anchor }, None) => SemanticAnnotation {
+                id: id.clone(), author_subject: principal.subject.clone(), body: body.clone(),
+                anchor: anchor.clone(), state: AnnotationState::Anchored,
+                created_at: now, resolved_at: None, unknown: Default::default(),
+            },
+            (AnnotationCommand::Create { .. }, Some(_)) =>
+                return Err(DocError::Schema("annotation already exists".into())),
+            (_, None) => return Err(DocError::Schema("annotation not found".into())),
+            (command, Some(mut annotation)) => {
+                if annotation.author_subject != principal.subject && metadata.owner_subject != principal.subject {
+                    return Err(DocError::Schema("only the annotation author or session owner may edit it".into()));
+                }
+                match command {
+                    AnnotationCommand::Edit { body, .. } => annotation.body = body.clone(),
+                    AnnotationCommand::Resolve { resolved, .. } => annotation.resolved_at = resolved.then_some(now),
+                    AnnotationCommand::Create { .. } => unreachable!(),
+                }
+                annotation
+            }
+        };
+        crate::collaboration::validate_annotation(&annotation)?;
+        Ok(annotation)
+    }
+
+    /// A single atomic value prevents tokens and capacity from tearing on sync.
+    pub fn context_usage(&self) -> Option<zeron_proto::ContextUsage> {
+        let loro::ValueOrContainer::Value(LoroValue::String(value)) =
+            self.doc.get_map("meta").get("contextUsage")?
+        else {
+            return None;
+        };
+        serde_json::from_str(&value).ok()
+    }
+
+    pub fn update_context_usage(
+        &self,
+        tokens: Option<u64>,
+        window: Option<u64>,
+    ) -> Result<(), DocError> {
+        let previous = self.context_usage().unwrap_or_default();
+        let next = zeron_proto::ContextUsage {
+            tokens: tokens.or(previous.tokens),
+            window: window.filter(|n| *n > 0).or(previous.window),
+        };
+        if next != previous {
+            self.doc
+                .get_map("meta")
+                .insert("contextUsage", serde_json::to_string(&next)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    pub fn clear_context_usage(&self) -> Result<(), DocError> {
+        self.doc.get_map("meta").delete("contextUsage")?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// The provider session that received a fork's copied history — a side
+    /// chat's bootstrap is owed to any other session it continues in.
+    pub fn fork_history_session(&self) -> Option<String> {
+        match self.doc.get_map("meta").get("forkHistorySession") {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn set_fork_history_session(&self, session_id: &str) -> Result<(), DocError> {
+        if self.fork_history_session().as_deref() != Some(session_id) {
+            self.doc
+                .get_map("meta")
+                .insert("forkHistorySession", session_id)?;
+            self.doc.commit();
+        }
+        Ok(())
     }
 
     pub fn chat_id(&self) -> Option<String> {
@@ -300,182 +514,17 @@ impl SessionDoc {
         }
     }
 
-    /// Insert one complete message entry (user/system messages, command-side
-    /// inserts). Streaming assistant entries go through [`SegmentWriter`].
+    /// Insert a complete message entry (user/system messages, command-side inserts).
+    /// Streaming assistant entries go through [`SegmentWriter`].
     pub fn push_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
-        self.push_messages(std::slice::from_ref(entry))
-    }
-
-    /// Insert complete entries in one Loro commit. Native history imports use
-    /// this path so a thousand-message attach produces one publish/snapshot
-    /// wake instead of a thousand intermediate transcript states.
-    pub fn push_messages(&self, entries: &[SessionMessageEntry]) -> Result<(), DocError> {
-        let _operation = self.doc.operation();
-        let existing_ids = (entries.len() > 1).then(|| self.message_ids());
-        let mut fresh = std::collections::HashMap::new();
-        for entry in entries {
-            if let Some(previous) = fresh.get(entry.id.as_str()) {
-                if *previous != entry { return Err(DocError::Schema("message id names conflicting accepted content".into())); }
-                continue;
-            }
-            if existing_ids.as_ref().is_none_or(|ids| ids.contains(&entry.id))
-                && let Some(previous) = self.read_entry(&entry.id)?
-            {
-                if previous != *entry { return Err(DocError::Schema("message id names conflicting accepted content".into())); }
-                continue;
-            }
-            fresh.insert(entry.id.as_str(),entry);
-        }
-        let has_fresh = !fresh.is_empty();
         let messages = self.doc.get_list("messages");
-        for entry in entries {
-            if fresh.remove(entry.id.as_str()).is_none() { continue; }
-            let map = messages.push_container(LoroMap::new())?;
-            write_entry_scalar_fields(&map, entry)?;
-            let parts = map.insert_container("parts", LoroList::new())?;
-            for part in &entry.parts {
-                push_part(&parts, part)?;
-            }
-        }
-        if has_fresh {
-            self.doc.commit()?;
-        }
-        Ok(())
-    }
-
-    /// Replay an accepted message against a replacement snapshot by stable identity.
-    /// Streaming prefixes may advance; terminal content and immutable identity cannot diverge.
-    pub fn reconcile_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
-        let _operation = self.doc.operation();
-        let messages = self.doc.get_list("messages");
-        for index in 0..messages.len() {
-            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = messages.get(index) else { continue; };
-            if optional_string(&map, "id").as_deref() != Some(entry.id.as_str()) { continue; }
-            let current = entry_from_json(map.get_deep_value().to_json_value())?;
-            if current == *entry { return Ok(()); }
-            let conflict = || DocError::Schema(format!(
-                "message {} conflicts with replacement snapshot (roles={:?}/{:?}, status={:?}/{:?}, identity_equal=[{},{},{},{}], parts={}/{}, prefixes={}/{})",
-                entry.id, current.role, entry.role, current.status, entry.status,
-                current.device_id == entry.device_id, current.created_at == entry.created_at,
-                current.continuation_of == entry.continuation_of, current.peer_message == entry.peer_message,
-                current.parts.len(), entry.parts.len(), parts_are_prefix(&current.parts, &entry.parts), parts_are_prefix(&entry.parts, &current.parts),
-            ));
-            if current.device_id != entry.device_id || current.role != entry.role
-                || current.created_at != entry.created_at || current.continuation_of != entry.continuation_of
-                || current.peer_message != entry.peer_message {
-                return Err(conflict());
-            }
-            if current.role != MessageRole::Assistant && current.parts == entry.parts {
-                match (current.status,entry.status) {
-                    (Some(MessageStatus::Complete | MessageStatus::Aborted),Some(MessageStatus::Queued | MessageStatus::Steered) | None)
-                    | (Some(MessageStatus::Steered),Some(MessageStatus::Queued) | None) => return Ok(()),
-                    (Some(MessageStatus::Queued | MessageStatus::Steered) | None,Some(MessageStatus::Complete | MessageStatus::Aborted | MessageStatus::Steered)) => {
-                        map.insert("status",status_str(entry.status.expect("matched delivery status")))?;
-                        return self.doc.commit();
-                    }
-                    _ => return Err(conflict()),
-                }
-            }
-            if current.role != MessageRole::Assistant { return Err(conflict()); }
-            let interruption = entry.parts.split_last().filter(|(last, _)|
-                entry.status == Some(MessageStatus::Aborted) && matches!(last, MessagePart::Error { .. }));
-            if current.status != Some(MessageStatus::Streaming) {
-                if matches!(current.status, Some(MessageStatus::Complete | MessageStatus::Aborted))
-                    && ((entry.status == Some(MessageStatus::Streaming)
-                        && (parts_are_prefix(&entry.parts, &current.parts) || parts_are_prefix(&current.parts, &entry.parts)))
-                        || interruption.is_some_and(|(_, prefix)| parts_are_prefix(prefix, &current.parts))) {
-                    return Ok(()); // The remote owner already committed a terminal outcome.
-                }
-                return Err(conflict());
-            }
-            // A checkpoint may trail acknowledged streaming content. Its
-            // retained prefix is already satisfied, not a competing rewrite.
-            if entry.status == Some(MessageStatus::Streaming)
-                && parts_are_prefix(&entry.parts, &current.parts) {
-                return Ok(());
-            }
-            // Restart recovery closes a retained checkpoint, not the richer
-            // acknowledged stream. Keep that stream and append its interruption.
-            let interruption = interruption.filter(|(_, prefix)| parts_are_prefix(prefix, &current.parts));
-            if interruption.is_none() && (!matches!(entry.status, Some(MessageStatus::Streaming | MessageStatus::Complete | MessageStatus::Aborted))
-                || !parts_are_prefix(&current.parts, &entry.parts)) { return Err(conflict()); }
-            let parts = match map.get("parts") {
-                Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => parts,
-                _ => return Err(conflict()),
-            };
-            if let Some((error, _)) = interruption {
-                if let Some(existing) = current.parts.iter().find(|part| part.id() == error.id()) {
-                    if existing != error { return Err(conflict()); }
-                } else {
-                    push_part(&parts, error)?;
-                }
-            } else {
-                if parts.len() > 0 { parts.delete(0, parts.len())?; }
-                for part in &entry.parts { push_part(&parts, part)?; }
-            }
-            map.insert("status", status_str(entry.status.expect("checked message status")))?;
-            self.doc.commit()?;
-            return Ok(());
-        }
         let map = messages.push_container(LoroMap::new())?;
         write_entry_scalar_fields(&map, entry)?;
         let parts = map.insert_container("parts", LoroList::new())?;
-        for part in &entry.parts { push_part(&parts, part)?; }
-        self.doc.commit()
-    }
-
-    /// Read message ids without materializing parts or text bodies.
-    pub fn message_ids(&self) -> HashSet<String> {
-        let messages = self.doc.get_list("messages");
-        let mut ids = HashSet::with_capacity(messages.len());
-        for index in 0..messages.len() {
-            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
-                messages.get(index)
-                && let Some(loro::ValueOrContainer::Value(LoroValue::String(id))) = map.get("id")
-            {
-                ids.insert(id.to_string());
-            }
+        for part in &entry.parts {
+            push_part(&parts, part)?;
         }
-        ids
-    }
-
-    pub fn directory_entry_count(&self) -> usize {
-        self.doc.get_list("messages").len()
-    }
-
-    /// Read only metadata; directory_visit_text scans relevant content separately.
-    pub fn directory_entry(&self, index: usize) -> Result<Option<DirectoryEntry>, DocError> {
-        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = self.doc.get_list("messages").get(index) else {
-            return Err(DocError::Schema("malformed directory transcript row".into()));
-        };
-        if optional_string(&row, "role").as_deref() == Some("system") { return Ok(None); }
-        let entry = entry_metadata(&row)?;
-        let has_error = match row.get("parts") {
-            Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => (0..parts.len()).any(|index| {
-                matches!(parts.get(index), Some(loro::ValueOrContainer::Container(loro::Container::Map(part)))
-                    if optional_string(&part, "kind").as_deref() == Some("error"))
-            }),
-            _ => false,
-        };
-        Ok(Some(DirectoryEntry { id: entry.id, role: entry.role, status: entry.status,
-            peer_message: entry.peer_message, has_error }))
-    }
-
-    pub fn directory_visit_text(&self, index: usize, mut visit: impl FnMut(&str, bool) -> Result<(), DocError>) -> Result<(), DocError> {
-        let Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) = self.doc.get_list("messages").get(index) else {
-            return Err(DocError::Schema("malformed directory transcript row".into()));
-        };
-        if optional_string(&row, "role").as_deref() == Some("system") { return Ok(()); }
-        let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) = row.get("parts") else { return Ok(()) };
-        for index in 0..parts.len() {
-            let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) = parts.get(index) else { continue };
-            let field = match optional_string(&part, "kind").as_deref() {
-                Some("text") => "text",
-                Some("tool") => "call",
-                _ => continue,
-            };
-            if let Some(value) = part.get(field) { directory_visit_value(value, &mut visit)?; }
-        }
+        self.doc.commit();
         Ok(())
     }
 
@@ -500,289 +549,63 @@ impl SessionDoc {
             .filter_map(|v| match entry_from_json(v) {
                 Ok(entry) => Some(entry),
                 Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed transcript entry");
+                    tracing::warn!(
+                        chat = %self.chat_id().unwrap_or_default(),
+                        error = %err,
+                        "skipping unsalvageable transcript entry"
+                    );
                     None
                 }
             })
             .collect())
     }
 
-    /// Read the final valid raw entry's id without materializing earlier history.
-    /// Command ancestry refers to raw continuation rows, not their joined root.
-    pub fn last_message_id(&self) -> Option<String> {
-        let messages = self.doc.get_list("messages");
-        for index in (0..messages.len()).rev() {
-            let Some(row) = messages.get(index) else {
-                continue;
-            };
-            match entry_from_json(row.get_deep_value().to_json_value()) {
-                Ok(entry) => return Some(entry.id),
-                Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed transcript entry");
-                }
-            }
-        }
-        None
-    }
-
-    /// Read one raw entry without materializing unrelated messages or joining continuations.
-    /// Malformed matching rows are skipped, just as in `read_entries`.
-    pub fn read_entry(&self, message_id: &str) -> Result<Option<SessionMessageEntry>, DocError> {
-        let messages = self.doc.get_list("messages");
-        for index in 0..messages.len() {
-            let Some(row) = messages.get(index) else {
-                continue;
-            };
-            let matches_id = match &row {
-                loro::ValueOrContainer::Container(loro::Container::Map(map)) => matches!(
-                    map.get("id"),
-                    Some(loro::ValueOrContainer::Value(LoroValue::String(id)))
-                        if id.as_str() == message_id
-                ),
-                loro::ValueOrContainer::Value(LoroValue::Map(map)) => matches!(
-                    map.get("id"),
-                    Some(LoroValue::String(id)) if id.as_str() == message_id
-                ),
-                _ => false,
-            };
-            if matches_id {
-                match entry_from_json(row.get_deep_value().to_json_value()) {
-                    Ok(entry) => return Ok(Some(entry)),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "skipping malformed transcript entry");
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Check a message id without decoding unrelated message bodies. Matching
-    /// rows still use the full decoder: a torn row must not suppress an append.
-    pub fn contains_message(&self, message_id: &str) -> bool {
-        self.read_entry(message_id).ok().flatten().is_some()
-    }
-
-    /// Full original for an explicit reveal. Only this root and its compatible
-    /// continuations are decoded; normal transcript windows remain byte-bounded.
-    pub fn read_message(&self, message_id: &str) -> Result<Option<SessionMessageEntry>, DocError> {
-        let Some(root) = self.read_entry(message_id)? else {
-            return Ok(None);
-        };
-        if root.continuation_of.is_some() {
-            return Ok(Some(root));
-        }
-        let messages = self.doc.get_list("messages");
-        let mut entries = vec![root];
-        for index in 0..messages.len() {
-            let Some(row) = messages.get(index) else {
-                continue;
-            };
-            let is_continuation = match &row {
-                loro::ValueOrContainer::Container(loro::Container::Map(map)) => matches!(
-                    map.get("continuationOf"),
-                    Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == message_id
-                ),
-                loro::ValueOrContainer::Value(LoroValue::Map(map)) => matches!(
-                    map.get("continuationOf"),
-                    Some(LoroValue::String(id)) if id.as_str() == message_id
-                ),
-                _ => false,
-            };
-            if is_continuation {
-                match entry_from_json(row.get_deep_value().to_json_value()) {
-                    Ok(entry) => entries.push(entry),
-                    Err(err) => tracing::warn!(error = %err, "skipping malformed transcript entry"),
-                }
-            }
-        }
-        Ok(join_continuation_entries(entries).into_iter().next())
-    }
-
-    /// Read at most `max_messages` joined messages ending before the raw-list
-    /// cursor `before` (`None` = current tail). Entries are materialized one at
-    /// a time from the end of the Loro list, so opening a chat never converts
-    /// the entire transcript container into JSON.
-    ///
-    /// Continuation rows do not consume the message limit. Scanning stops only
-    /// after their root row is included, so a page never starts with a partial
-    /// joined message when it is resumed using the returned cursor.
-    pub fn read_entry_window(
+    /// Read a bounded suffix directly from the containers, without expanding
+    /// the full messages tree. For first paint only: the full watch must follow.
+    /// Limits count parts rather than joined messages (one turn can have tens
+    /// of thousands of parts). Never truncate a part's text or persisted data.
+    pub fn read_opening_tail(
         &self,
-        before: Option<usize>,
-        max_messages: usize,
-    ) -> Result<SessionEntryWindow, DocError> {
+        max_parts: usize,
+    ) -> Result<Vec<SessionMessageEntry>, DocError> {
+        use loro::{Container, ValueOrContainer};
         let messages = self.doc.get_list("messages");
-        let mut cursor = before.unwrap_or_else(|| messages.len()).min(messages.len());
-        let max_messages = max_messages.max(1);
-        let mut roots = 0usize;
-        let mut text_budget = TAIL_TEXT_BYTE_BUDGET;
-        let mut reversed = Vec::with_capacity(max_messages);
-
-        while cursor > 0 && roots < max_messages {
-            cursor -= 1;
-            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
-                messages.get(cursor)
-            else {
+        let mut remaining = max_parts;
+        let mut entries = Vec::new();
+        for index in (0..messages.len()).rev() {
+            if remaining == 0 {
+                break;
+            }
+            let Some(ValueOrContainer::Container(Container::Map(map))) = messages.get(index) else {
                 continue;
             };
-            match entry_from_map_window(&map, &mut text_budget) {
-                Ok(entry) => {
-                    if entry.continuation_of.is_none() {
-                        roots += 1;
-                    }
-                    reversed.push(entry);
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed transcript entry");
-                }
-            }
-        }
-
-        reversed.reverse();
-        Ok(SessionEntryWindow {
-            entries: join_continuation_entries(reversed),
-            before: (cursor > 0).then_some(cursor),
-        })
-    }
-
-    /// Append one immutable collaboration publication. Publication ids are durable
-    /// idempotency keys: replay/reconnect of the same record is a no-op and can never
-    /// remove a message or an earlier publication.
-    pub fn append_publication(&self, record: &PublicationRecord) -> Result<bool, DocError> {
-        let _operation = self.doc.operation();
-        validate_publication(record)?;
-        let publications = self.doc.get_list("publications");
-        for index in 0..publications.len() {
-            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
-                publications.get(index)
-                && matches!(
-                    map.get("id"),
-                    Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == record.id
-                )
-            {
-                return Ok(false);
-            }
-        }
-        let map = publications.push_container(LoroMap::new())?;
-        map.insert("id", record.id.as_str())?;
-        map.insert(
-            "record",
-            loro_value_from_json(&serde_json::to_value(record)?),
-        )?;
-        self.doc.commit()?;
-        Ok(true)
-    }
-
-    /// Replace liveness for one anchored owner without growing immutable history.
-    /// Actual owner/phase transitions remain append-only publications.
-    pub fn upsert_agent_session(&self, record: &PublicationRecord) -> Result<bool, DocError> {
-        let _operation = self.doc.operation();
-        validate_publication(record)?;
-        let PublicationValue::AgentSession(session) = &record.value else {
-            return Err(DocError::Schema("owner status must be an agent session".into()));
-        };
-        let publications = self.read_publications()?;
-        let anchors = session_anchors(&publications);
-        let anchor = anchors.get(session.session_id.as_str()).copied()
-            .ok_or_else(|| DocError::Schema("owner status has no immutable session anchor".into()))?;
-        if record.published_by != anchor.owner_subject || !same_session_owner(anchor, session) {
-            return Err(DocError::Schema("owner status does not match its immutable session anchor".into()));
-        }
-        let at = session.updated_at.unwrap_or(session.created_at);
-        let anchored_at = anchor.updated_at.unwrap_or(anchor.created_at);
-        if at < anchored_at || (at == anchored_at && session.status != anchor.status) { return Ok(false); }
-        let register = self.doc.get_map("agentSessions");
-        let value = serde_json::to_value(record)?;
-        if let Some(previous) = register.get(&session.session_id) {
-            let previous = previous.get_deep_value().to_json_value();
-            if previous == value { return Ok(false); }
-            if let Ok(previous) = serde_json::from_value::<PublicationRecord>(previous)
-                && let PublicationValue::AgentSession(previous) = previous.value
-                && same_session_owner(anchor, &previous)
-                && previous.updated_at.unwrap_or(previous.created_at) > at {
-                return Ok(false);
-            }
-        }
-        register.insert(&session.session_id, loro_value_from_json(&value))?;
-        self.doc.commit()?;
-        Ok(true)
-    }
-
-    /// Materialize collaboration publications in append order. Malformed or
-    /// over-bound future rows are skipped independently, like transcript rows.
-    pub fn read_publications(&self) -> Result<Vec<PublicationRecord>, DocError> {
-        #[derive(Deserialize)]
-        struct RawPublication {
-            record: PublicationRecord,
-        }
-
-        let value = self
-            .doc
-            .get_list("publications")
-            .get_deep_value()
-            .to_json_value();
-        let rows: Vec<serde_json::Value> = serde_json::from_value(value)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let raw: RawPublication = match serde_json::from_value(row) {
-                    Ok(raw) => raw,
-                    Err(error) => {
-                        tracing::warn!(%error, "skipping malformed collaboration publication");
-                        return None;
-                    }
-                };
-                match validate_publication(&raw.record) {
-                    Ok(()) => Some(raw.record),
-                    Err(error) => {
-                        tracing::warn!(%error, "skipping over-bound collaboration publication");
-                        None
+            let mut value = map.get_value().to_json_value();
+            let mut tail = Vec::new();
+            if let Some(ValueOrContainer::Container(Container::List(parts))) = map.get("parts") {
+                let count = remaining.min(parts.len());
+                for part_index in parts.len().saturating_sub(count)..parts.len() {
+                    if let Some(part) = parts.get(part_index) {
+                        tail.push(part.get_deep_value().to_json_value());
                     }
                 }
-            })
-            .collect())
-    }
-
-    pub fn collaboration_snapshot(&self) -> Result<CollaborationSnapshot, DocError> {
-        let publications = self.read_publications()?;
-        let mut sessions_by_id: std::collections::BTreeMap<_, _> = session_anchors(&publications)
-            .into_iter().map(|(id, session)| (id.to_string(), session.clone())).collect();
-        let mut message_provenance = Vec::new();
-        for publication in &publications {
-            match &publication.value {
-                PublicationValue::MessageProvenance(provenance) => {
-                    message_provenance.push(provenance.clone());
-                }
-                _ => {}
+                remaining -= count.max(1).min(remaining);
+            } else {
+                remaining -= 1;
+            }
+            value["parts"] = serde_json::Value::Array(tail);
+            if let Ok(entry) = entry_from_json(value) {
+                entries.push(entry);
             }
         }
-        if let serde_json::Value::Object(register) = self.doc.get_map("agentSessions").get_deep_value().to_json_value() {
-            for (id, value) in register {
-                let Ok(record) = serde_json::from_value::<PublicationRecord>(value) else { continue; };
-                if validate_publication(&record).is_err() { continue; }
-                let PublicationValue::AgentSession(session) = record.value else { continue; };
-                if session.session_id != id { continue; }
-                if let Some(anchor) = sessions_by_id.get(&id)
-                    && record.published_by == anchor.owner_subject
-                    && same_session_owner(anchor, &session)
-                    && (session.updated_at.unwrap_or(session.created_at) > anchor.updated_at.unwrap_or(anchor.created_at)
-                        || (session.updated_at.unwrap_or(session.created_at) == anchor.updated_at.unwrap_or(anchor.created_at)
-                            && session.status == anchor.status)) {
-                    sessions_by_id.insert(id, *session);
-                }
-            }
+        entries.reverse();
+        // Preserve the joined id even when the first included segment's root
+        // is outside the window, so its text rows survive the full reset.
+        if let Some(first) = entries.first_mut()
+            && let Some(root) = first.continuation_of.take()
+        {
+            first.id = root;
         }
-        let sessions = sessions_by_id.into_values().collect();
-        Ok(CollaborationSnapshot {
-            schema_version: COLLABORATION_SCHEMA_VERSION,
-            sessions,
-            message_provenance,
-            publications,
-            participants: Vec::new(),
-            principal: None,
-            grants: Vec::new(),
-        })
+        Ok(join_continuation_entries(entries))
     }
 
     /// Read the commands ledger.
@@ -811,55 +634,8 @@ impl SessionDoc {
             .collect())
     }
 
-    /// Read one typed command without materializing unrelated ledger payloads.
-    /// Malformed matching rows are skipped, just as in `read_commands`.
-    pub fn read_command(&self, command_id: &str) -> Result<Option<SessionCommandEntry>, DocError> {
-        let commands = self.doc.get_list("commands");
-        for index in 0..commands.len() {
-            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
-                commands.get(index)
-            else {
-                continue;
-            };
-            if !matches!(
-                map.get("id"),
-                Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == command_id
-            ) {
-                continue;
-            }
-            match serde_json::from_value(map.get_deep_value().to_json_value()) {
-                Ok(entry) => return Ok(Some(entry)),
-                Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed command entry");
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
-        let _operation = self.doc.operation();
-        if self
-            .read_commands()?
-            .iter()
-            .any(|existing| existing.id == entry.id)
-        {
-            return Ok(());
-        }
-        if let Some(error) = self.doc.recovery_error() {
-            return Err(DocError::Schema(error));
-        }
-        const MAX_COMMAND_METADATA_BYTES: usize = 256 * 1024;
-        if entry.id.is_empty() || entry.id.len() > 256 || entry.issued_by.len() > 512 {
-            return Err(DocError::Schema(
-                "command identity metadata exceeds bounds".into(),
-            ));
-        }
-        let payload_json = serde_json::to_value(&entry.payload)?;
-        if serde_json::to_vec(&payload_json)?.len() > MAX_COMMAND_METADATA_BYTES {
-            return Err(DocError::Schema("command payload exceeds 256 KiB".into()));
-        }
         let commands = self.doc.get_list("commands");
         let map = commands.push_container(LoroMap::new())?;
         map.insert("id", entry.id.as_str())?;
@@ -869,7 +645,10 @@ impl SessionDoc {
                 .as_str()
                 .ok_or_else(|| DocError::Schema("kind not a string".into()))?,
         )?;
-        map.insert("payload", loro_value_from_json(&payload_json))?;
+        map.insert(
+            "payload",
+            loro_value_from_json(&serde_json::to_value(&entry.payload)?),
+        )?;
         map.insert("issuedBy", entry.issued_by.as_str())?;
         map.insert("issuedAt", entry.issued_at)?;
         if let Some(based_on) = &entry.based_on {
@@ -887,7 +666,7 @@ impl SessionDoc {
                 .as_str()
                 .ok_or_else(|| DocError::Schema("status not a string".into()))?,
         )?;
-        self.doc.commit()?;
+        self.doc.commit();
         Ok(())
     }
 
@@ -898,12 +677,6 @@ impl SessionDoc {
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) -> Result<(), DocError> {
-        let _operation = self.doc.operation();
-        if command_id.len() > 256 || resolution.is_some_and(|value| value.len() > 2 * 1024) {
-            return Err(DocError::Schema(
-                "command outcome metadata exceeds bounds".into(),
-            ));
-        }
         let commands = self.doc.get_list("commands");
         for i in 0..commands.len() {
             if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
@@ -923,7 +696,7 @@ impl SessionDoc {
                     if let Some(r) = resolution {
                         map.insert("resolution", r)?;
                     }
-                    self.doc.commit()?;
+                    self.doc.commit();
                     return Ok(());
                 }
             }
@@ -939,7 +712,6 @@ impl SessionDoc {
         message_id: &str,
         status: MessageStatus,
     ) -> Result<bool, DocError> {
-        let _operation = self.doc.operation();
         let messages = self.doc.get_list("messages");
         for i in 0..messages.len() {
             if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
@@ -951,7 +723,7 @@ impl SessionDoc {
                 );
                 if id_matches {
                     map.insert("status", status_str(status))?;
-                    self.doc.commit()?;
+                    self.doc.commit();
                     return Ok(true);
                 }
             }
@@ -968,7 +740,6 @@ impl SessionDoc {
         part_id: &str,
         message: &str,
     ) -> Result<bool, DocError> {
-        let _operation = self.doc.operation();
         let messages = self.doc.get_list("messages");
         for i in 0..messages.len() {
             let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
@@ -1007,7 +778,7 @@ impl SessionDoc {
                     message: message.to_string(),
                 },
             )?;
-            self.doc.commit()?;
+            self.doc.commit();
             return Ok(true);
         }
         Ok(false)
@@ -1019,7 +790,6 @@ impl SessionDoc {
     /// question whose run already died — no fold owns the entry anymore.
     /// Returns `false` when no such part exists.
     pub fn resolve_input(&self, request_id: &str) -> Result<bool, DocError> {
-        let _operation = self.doc.operation();
         let messages = self.doc.get_list("messages");
         for i in 0..messages.len() {
             let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
@@ -1048,7 +818,79 @@ impl SessionDoc {
                 );
                 if is_input && id_matches {
                     part.insert("resolved", true)?;
-                    self.doc.commit()?;
+                    self.doc.commit();
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Update a subagent SPAWN CHIP (a tool part) in place, wherever it
+    /// lives: `resolved`-style stamping for the eager-done world, where the
+    /// chip's entry is usually already finished by the time the background
+    /// subagent produces its lifecycle. Searched from the NEWEST entry back
+    /// (the chip belongs to a recent turn). `None` fields are left as-is.
+    pub fn update_subagent_chip(
+        &self,
+        part_id: &str,
+        subagent_ref: Option<&str>,
+        status: Option<&str>,
+        tail: Option<&str>,
+    ) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in (0..messages.len()).rev() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_tool = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "tool"
+                );
+                let id_matches = matches!(
+                    part.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == part_id
+                );
+                if is_tool && id_matches {
+                    // Genus gate: subagent lifecycle only ever lands on a
+                    // SPAWN call. Mis-keyed tagged traffic (a driver bug —
+                    // claude's background shells settled through the
+                    // subagent subtype, 2026-08-20) must not decorate an
+                    // ordinary chip with a ref to a doc it never had.
+                    let is_spawn = part
+                        .get("call")
+                        .and_then(|v| match v {
+                            loro::ValueOrContainer::Value(v) => serde_json::to_value(v).ok(),
+                            _ => None,
+                        })
+                        .and_then(|j| serde_json::from_value::<zeron_proto::ToolCall>(j).ok())
+                        .is_some_and(|c| c.is_subagent_spawn());
+                    if !is_spawn {
+                        return Ok(false);
+                    }
+                    if let Some(r) = subagent_ref {
+                        part.insert("subagentRef", r)?;
+                    }
+                    if let Some(s) = status {
+                        part.insert("subagentStatus", s)?;
+                    }
+                    if let Some(t) = tail {
+                        part.insert("subagentTail", t)?;
+                    }
+                    self.doc.commit();
                     return Ok(true);
                 }
             }
@@ -1064,88 +906,6 @@ impl SessionDoc {
     }
 }
 
-fn parts_are_prefix(old: &[MessagePart], new: &[MessagePart]) -> bool {
-    old.len() <= new.len() && old.iter().zip(new).all(|(old, new)| {
-        if old == new { return true; }
-        match (old, new) {
-            (MessagePart::Text { id: a, text: old }, MessagePart::Text { id: b, text: new }) => a == b && new.starts_with(old),
-            (MessagePart::Tool { id: a, call: old_call, is_error: old_error, resolved: before },
-             MessagePart::Tool { id: b, call: new_call, is_error: new_error, resolved: after }) =>
-                a == b && (!*before || (*after && old_error == new_error
-                    && (old_call == new_call || match (old_call, new_call) {
-                        (comet_proto::ToolCall::Todo { items: old }, comet_proto::ToolCall::Todo { items: new }) =>
-                            old.len() <= new.len() && old.iter().zip(new).all(|(old, new)|
-                                old.text == new.text && (!old.done || new.done)),
-                        _ => false,
-                    }))),
-            (MessagePart::Input { id: a, request_id: old_id, questions: old, resolved: before },
-             MessagePart::Input { id: b, request_id: new_id, questions: new, resolved: after }) =>
-                a == b && old_id == new_id && old == new && (!*before || *after),
-            (MessagePart::Thinking { id: a, started: old_started, completed: before },
-             MessagePart::Thinking { id: b, started: new_started, completed: after }) =>
-                a == b && (!*old_started || *new_started) && (!*before || *after),
-            _ => false,
-        }
-    })
-}
-
-/// Replay order is not ownership order: an old offline phase may append last.
-fn session_anchors(publications: &[PublicationRecord]) -> std::collections::BTreeMap<&str, &comet_proto::AgentSessionRecord> {
-    let mut anchors = std::collections::BTreeMap::new();
-    for publication in publications {
-        let PublicationValue::AgentSession(session) = &publication.value else { continue; };
-        if publication.published_by != session.owner_subject { continue; }
-        let id = session.session_id.as_str();
-        match anchors.get(id).copied() {
-            None => { anchors.insert(id, session.as_ref()); }
-            Some(current) if newer_session_anchor(current, session) => { anchors.insert(id, session.as_ref()); }
-            _ => {}
-        }
-    }
-    anchors
-}
-
-fn newer_session_anchor(current: &comet_proto::AgentSessionRecord, next: &comet_proto::AgentSessionRecord) -> bool {
-    if same_session_owner(current, next) {
-        let current_at = current.updated_at.unwrap_or(current.created_at);
-        let next_at = next.updated_at.unwrap_or(next.created_at);
-        let terminal_rank = |status| match status {
-            Some(comet_proto::SessionStatus::Errored) => 2,
-            Some(comet_proto::SessionStatus::Idle) => 1,
-            Some(comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput) => 0,
-            None => -1,
-        };
-        return next_at > current_at || (next_at == current_at && terminal_rank(next.status) >= terminal_rank(current.status));
-    }
-    if current.session_id != next.session_id || current.chat_id != next.chat_id
-        || current.owner_subject != next.owner_subject
-        || current.source != comet_proto::AgentSessionSource::Scaffold
-        || next.source != comet_proto::AgentSessionSource::Scaffold {
-        return false;
-    }
-    let Some((sandbox, epoch)) = comet_proto::parse_scaffold_device_id(&current.owner_device_id) else { return false; };
-    let Some((next_sandbox, next_epoch)) = comet_proto::parse_scaffold_device_id(&next.owner_device_id) else { return false; };
-    if sandbox != next_sandbox || next_epoch <= epoch { return false; }
-    let valid_environment = |session: &comet_proto::AgentSessionRecord, expected_epoch| {
-        session.environment.as_ref().is_none_or(|environment| {
-            environment.owner_principal == session.owner_subject && matches!(&environment.source,
-                comet_proto::SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle_epoch, .. }
-                    if sandbox_id == sandbox && lifecycle_epoch.is_none_or(|epoch| epoch == expected_epoch))
-        })
-    };
-    if !valid_environment(current, epoch) || !valid_environment(next, next_epoch) { return false; }
-    match (&current.environment, &next.environment) {
-        (Some(a), Some(b)) => a.scope == b.scope && a.database_environment == b.database_environment,
-        (None, _) => true,
-        (Some(_), None) => false,
-    }
-}
-
-fn same_session_owner(a: &comet_proto::AgentSessionRecord, b: &comet_proto::AgentSessionRecord) -> bool {
-    a.session_id == b.session_id && a.chat_id == b.chat_id
-        && a.owner_subject == b.owner_subject && a.owner_device_id == b.owner_device_id
-        && a.source == b.source && a.environment == b.environment
-}
 fn write_entry_scalar_fields(map: &LoroMap, entry: &SessionMessageEntry) -> Result<(), DocError> {
     map.insert("id", entry.id.as_str())?;
     map.insert(
@@ -1164,11 +924,8 @@ fn write_entry_scalar_fields(map: &LoroMap, entry: &SessionMessageEntry) -> Resu
     if let Some(continuation_of) = &entry.continuation_of {
         map.insert("continuationOf", continuation_of.as_str())?;
     }
-    if let Some(peer_message) = &entry.peer_message {
-        map.insert(
-            "peerMessage",
-            loro_value_from_json(&serde_json::to_value(peer_message)?),
-        )?;
+    if let Some(duration_ms) = entry.duration_ms {
+        map.insert("durationMs", duration_ms)?;
     }
     Ok(())
 }
@@ -1178,81 +935,7 @@ fn status_str(status: MessageStatus) -> &'static str {
         MessageStatus::Streaming => "streaming",
         MessageStatus::Complete => "complete",
         MessageStatus::Aborted => "aborted",
-        MessageStatus::Queued => "queued",
-        MessageStatus::Steered => "steered",
     }
-}
-
-/// JSON positions share the same typed container update discipline in maps and arrays.
-enum JsonSlot<'a> {
-    Map(&'a LoroMap, &'a str),
-    List(&'a LoroList, usize),
-}
-
-impl JsonSlot<'_> {
-    fn get(&self) -> Option<loro::ValueOrContainer> {
-        match self { Self::Map(map, key) => map.get(key), Self::List(list, index) => list.get(*index) }
-    }
-
-    fn container<C: loro::ContainerTrait>(&self, child: C) -> Result<C, DocError> {
-        Ok(match self {
-            Self::Map(map, key) => map.insert_container(key, child)?,
-            Self::List(list, index) => {
-                if *index < list.len() { list.delete(*index, 1)?; }
-                list.insert_container(*index, child)?
-            }
-        })
-    }
-
-    fn scalar(&self, value: LoroValue) -> Result<(), DocError> {
-        if matches!(self.get(), Some(loro::ValueOrContainer::Value(current)) if current == value) { return Ok(()); }
-        match self {
-            Self::Map(map, key) => map.insert(key, value)?,
-            Self::List(list, index) => {
-                if *index < list.len() { list.delete(*index, 1)?; }
-                list.insert(*index, value)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Keep progressive tool arguments in appendable text instead of retaining a
-/// whole scalar JSON copy on every refresh. Deep JSON stays wire-compatible.
-fn sync_call_json(slot: JsonSlot<'_>, value: &serde_json::Value) -> Result<(), DocError> {
-    match value {
-        serde_json::Value::Object(fields) => {
-            let map = match slot.get() {
-                Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => map,
-                _ => slot.container(LoroMap::new())?,
-            };
-            let removed: Vec<_> = map.keys().filter(|key| !fields.contains_key(key.as_str())).collect();
-            for key in removed { map.delete(key.as_str())?; }
-            for (key, value) in fields { sync_call_json(JsonSlot::Map(&map, key), value)?; }
-        }
-        serde_json::Value::Array(values) => {
-            let list = match slot.get() {
-                Some(loro::ValueOrContainer::Container(loro::Container::List(list))) => list,
-                _ => slot.container(LoroList::new())?,
-            };
-            if list.len() > values.len() { list.delete(values.len(), list.len() - values.len())?; }
-            for (index, value) in values.iter().enumerate() { sync_call_json(JsonSlot::List(&list, index), value)?; }
-        }
-        serde_json::Value::String(value) => {
-            let text = match slot.get() {
-                Some(loro::ValueOrContainer::Container(loro::Container::Text(text))) => text,
-                _ => slot.container(LoroText::new())?,
-            };
-            let previous = text.to_string();
-            if let Some(suffix) = value.strip_prefix(previous.as_str()) {
-                if !suffix.is_empty() { text.insert(text.len_unicode(), suffix)?; }
-            } else {
-                text.update(value, Default::default()).map_err(|error| DocError::Schema(error.to_string()))?;
-            }
-        }
-        _ => slot.scalar(loro_value_from_json(value))?,
-    }
-    Ok(())
 }
 
 /// Append one part map to a parts list; text bodies become LoroText containers.
@@ -1265,8 +948,23 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         let t = map.insert_container("text", LoroText::new())?;
         t.insert(0, text)?;
     }
+    if let Some(reasoning) = &doc_part.reasoning {
+        // LoroText like `text`: reasoning streams token by token, and
+        // whole-value rewrites cost ~125x the oplog of a text append.
+        let t = map.insert_container("reasoning", LoroText::new())?;
+        t.insert(0, reasoning)?;
+    }
+    for (key, value) in [
+        ("path", &doc_part.path),
+        ("name", &doc_part.name),
+        ("mimeType", &doc_part.mime_type),
+    ] {
+        if let Some(value) = value {
+            map.insert(key, value.as_str())?;
+        }
+    }
     if let Some(call) = &doc_part.call {
-        sync_call_json(JsonSlot::Map(&map, "call"), call)?;
+        map.insert("call", loro_value_from_json(call))?;
     }
     if let Some(is_error) = doc_part.is_error {
         map.insert("isError", is_error)?;
@@ -1280,10 +978,53 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    for (key, value) in [
+        ("sourceChatId", &doc_part.source_chat_id),
+        ("sourceTitle", &doc_part.source_title),
+    ] {
+        if let Some(value) = value {
+            map.insert(key, value.as_str())?;
+        }
+    }
+    if let Some(output) = &doc_part.output {
+        map.insert("output", output.as_str())?;
+    }
+    if let Some(diff) = &doc_part.diff {
+        map.insert("diff", loro_value_from_json(diff))?;
+    }
+    if let Some(output_ref) = &doc_part.output_ref {
+        map.insert("outputRef", output_ref.as_str())?;
+    }
+    if let Some(output_bytes) = doc_part.output_bytes {
+        map.insert("outputBytes", output_bytes as i64)?;
+    }
+    if let Some(diff_ref) = &doc_part.diff_ref {
+        map.insert("diffRef", diff_ref.as_str())?;
+    }
+    if let Some(diff_stats) = &doc_part.diff_stats {
+        map.insert("diffStats", loro_value_from_json(diff_stats))?;
+    }
+    if let Some(subagent_ref) = &doc_part.subagent_ref {
+        map.insert("subagentRef", subagent_ref.as_str())?;
+    }
+    if let Some(subagent_status) = &doc_part.subagent_status {
+        map.insert("subagentStatus", subagent_status.as_str())?;
+    }
+    if let Some(subagent_tail) = &doc_part.subagent_tail {
+        map.insert("subagentTail", subagent_tail.as_str())?;
+    }
     Ok(())
 }
 
-pub(crate) fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
+/// Decode ONE `messages` entry map's deep JSON value (same strict-then-salvage
+/// policy as [`SessionDoc::read_entries`]). The per-entry seam for viewers
+/// that keep an incremental transcript mirror: they re-decode only the entry
+/// maps a commit touched instead of materializing the whole list.
+pub fn decode_entry_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
+    entry_from_json(v)
+}
+
+fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct RawEntry {
@@ -1297,217 +1038,154 @@ pub(crate) fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntr
         status: Option<MessageStatus>,
         #[serde(default)]
         continuation_of: Option<String>,
-        #[serde(default, deserialize_with = "deserialize_peer_message")]
-        peer_message: Option<PeerMessageProvenance>,
+        #[serde(default)]
+        duration_ms: Option<i64>,
     }
-    let raw: RawEntry = serde_json::from_value(v)?;
-    Ok(SessionMessageEntry {
-        id: raw.id,
-        role: raw.role,
-        parts: raw.parts.into_iter().map(from_doc_part).collect(),
-        created_at: raw.created_at,
-        device_id: raw.device_id,
-        status: raw.status,
-        continuation_of: raw.continuation_of,
-        peer_message: raw.peer_message,
-    })
-}
-
-fn scalar_string(map: &LoroMap, key: &str) -> Result<String, DocError> {
-    match map.get(key) {
-        Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Ok(value.to_string()),
-        _ => Err(DocError::Schema(format!("missing string field {key}"))),
-    }
-}
-
-fn optional_string(map: &LoroMap, key: &str) -> Option<String> {
-    match map.get(key) {
-        Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => Some(value.to_string()),
-        _ => None,
+    match serde_json::from_value::<RawEntry>(v.clone()) {
+        Ok(raw) => Ok(SessionMessageEntry {
+            id: raw.id,
+            role: raw.role,
+            parts: raw.parts.into_iter().map(from_doc_part).collect(),
+            created_at: raw.created_at,
+            device_id: raw.device_id,
+            status: raw.status,
+            continuation_of: raw.continuation_of,
+            duration_ms: raw.duration_ms,
+        }),
+        // 2026-08-10 incident rule: a missing field must cost AT MOST what
+        // the field carried — never the entry, never the transcript. Rooms
+        // merge writes from every device and app version; one bad writer
+        // (or one mangled export) blanking whole sessions for every reader
+        // is exactly what tonight looked like.
+        Err(strict_err) => salvage_entry(v, strict_err),
     }
 }
 
-fn scalar_i64(map: &LoroMap, key: &str) -> Result<i64, DocError> {
-    match map.get(key) {
-        Some(loro::ValueOrContainer::Value(LoroValue::I64(value))) => Ok(value),
-        _ => Err(DocError::Schema(format!("missing integer field {key}"))),
-    }
-}
-
-fn entry_from_map_window(
-    map: &LoroMap,
-    text_budget: &mut usize,
+/// Field-level salvage for entries the strict shape rejects. Missing
+/// identity/attribution fields get deterministic stand-ins (content-hashed
+/// id, so repeated reads and continuation joins stay stable); parts are
+/// salvaged individually — a part missing `kind` is inferred from its
+/// content shape, and only truly contentless parts are dropped.
+fn salvage_entry(
+    v: serde_json::Value,
+    strict_err: serde_json::Error,
 ) -> Result<SessionMessageEntry, DocError> {
-    let mut entry = entry_metadata(map)?;
-    entry.parts = match map.get("parts") {
-        Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => {
-            read_parts_window(&parts, text_budget)?
+    let Some(obj) = v.as_object() else {
+        return Err(DocError::Json(strict_err));
+    };
+    let stable_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        v.to_string().hash(&mut hasher);
+        hasher.finish()
+    };
+    let str_field = |key: &str| obj.get(key).and_then(|x| x.as_str()).map(str::to_owned);
+    let id = str_field("id").unwrap_or_else(|| format!("recovered-{stable_hash:016x}"));
+    let role = obj
+        .get("role")
+        .and_then(|r| serde_json::from_value::<MessageRole>(r.clone()).ok())
+        .unwrap_or(MessageRole::Assistant);
+    let mut parts = Vec::new();
+    let mut dropped_parts = 0usize;
+    if let Some(raw_parts) = obj.get("parts").and_then(|p| p.as_array()) {
+        for (ix, part) in raw_parts.iter().enumerate() {
+            match serde_json::from_value::<DocPartJson>(part.clone()) {
+                Ok(p) => parts.push(from_doc_part(p)),
+                Err(_) => match salvage_part(part, &id, ix) {
+                    Some(p) => parts.push(p),
+                    None => dropped_parts += 1,
+                },
+            }
         }
-        _ => Vec::new(),
-    };
-    Ok(entry)
-}
-
-fn entry_metadata(map: &LoroMap) -> Result<SessionMessageEntry, DocError> {
-    let role = match scalar_string(map, "role")?.as_str() {
-        "user" => MessageRole::User,
-        "assistant" => MessageRole::Assistant,
-        "system" => MessageRole::System,
-        other => return Err(DocError::Schema(format!("unknown message role {other}"))),
-    };
-    let status = match optional_string(map, "status").as_deref() {
-        Some("streaming") => Some(MessageStatus::Streaming),
-        Some("complete") => Some(MessageStatus::Complete),
-        Some("aborted") => Some(MessageStatus::Aborted),
-        Some("queued") => Some(MessageStatus::Queued),
-        Some("steered") => Some(MessageStatus::Steered),
-        Some(other) => return Err(DocError::Schema(format!("unknown message status {other}"))),
-        None => None,
-    };
+    }
+    tracing::warn!(
+        entry = %id,
+        error = %strict_err,
+        salvaged_parts = parts.len(),
+        dropped_parts,
+        "transcript entry failed strict parse; salvaged"
+    );
     Ok(SessionMessageEntry {
-        id: scalar_string(map, "id")?,
+        id,
         role,
-        parts: Vec::new(),
-        created_at: scalar_i64(map, "createdAt")?,
-        device_id: scalar_string(map, "deviceId")?,
-        status,
-        continuation_of: optional_string(map, "continuationOf"),
-        peer_message: map
-            .get("peerMessage")
-            .and_then(|value| serde_json::from_value(value.get_deep_value().to_json_value()).ok()),
+        parts,
+        created_at: obj.get("createdAt").and_then(|x| x.as_i64()).unwrap_or(0),
+        device_id: str_field("deviceId").unwrap_or_default(),
+        status: obj
+            .get("status")
+            .and_then(|s| serde_json::from_value(s.clone()).ok()),
+        continuation_of: str_field("continuationOf"),
+        duration_ms: obj.get("durationMs").and_then(|x| x.as_i64()),
     })
 }
 
-// Visit native containers and legacy scalar JSON without deep-value/JSON copies.
-// Only one 64KiB text chunk is materialized, even for multi-megabyte tool output.
-fn directory_visit_value(value: loro::ValueOrContainer, visit: &mut impl FnMut(&str, bool) -> Result<(), DocError>) -> Result<(), DocError> {
-    use loro::{Container, ValueOrContainer};
-    match value {
-        ValueOrContainer::Value(value) => directory_visit_scalar(&value, visit)?,
-        ValueOrContainer::Container(Container::Map(map)) => {
-            for key in map.keys() {
-                if directory_text_key(key.as_str()) {
-                    if let Some(value) = map.get(key.as_str()) { directory_visit_value(value, visit)?; }
-                }
-            }
-        }
-        ValueOrContainer::Container(Container::List(list)) => {
-            for index in 0..list.len() {
-                if let Some(value) = list.get(index) { directory_visit_value(value, visit)?; }
-            }
-        }
-        ValueOrContainer::Container(Container::Text(text)) => {
-            let total = text.len_utf8();
-            let mut start = 0;
-            while start < total {
-                let mut end = (start + 64 * 1024).min(total);
-                let delta = loop {
-                    match text.slice_delta(start, end, PosType::Bytes) {
-                        Ok(delta) => break delta,
-                        Err(_) if end > start + 1 => { end -= 1; }
-                        Err(_) => return Err(DocError::Schema("invalid directory text boundary".into())),
-                    }
-                };
-                for delta in delta {
-                    if let TextDelta::Insert { insert, .. } = delta { visit(&insert, false)?; }
-                }
-                start = end;
-            }
-            visit("", true)?;
-        }
-        _ => {}
+/// Salvage one part whose strict `DocPartJson` parse failed: infer the kind
+/// from the content shape (`text` → text part, parseable `call` → tool
+/// part). `None` only when nothing renderable survives.
+fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<MessagePart> {
+    let obj = part.as_object()?;
+    let id = obj
+        .get("id")
+        .and_then(|x| x.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{entry_id}#recovered-{ix}"));
+    if obj.get("kind").and_then(|v| v.as_str()) == Some("image") {
+        let field = |key| obj.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        return Some(image_part(
+            id,
+            field("path"),
+            field("name"),
+            field("mimeType"),
+        ));
     }
-    Ok(())
-}
-
-fn directory_text_key(key: &str) -> bool {
-    !matches!(key, "reasoning" | "thinking" | "system" | "systemPrompt")
-}
-
-fn directory_visit_scalar(value: &LoroValue, visit: &mut impl FnMut(&str, bool) -> Result<(), DocError>) -> Result<(), DocError> {
-    match value {
-        LoroValue::String(value) => {
-            let mut remaining: &str = value.as_ref();
-            while !remaining.is_empty() {
-                let mut end = remaining.len().min(64 * 1024);
-                while !remaining.is_char_boundary(end) { end -= 1; }
-                visit(&remaining[..end], false)?;
-                remaining = &remaining[end..];
-            }
-            visit("", true)?;
-        }
-        LoroValue::Map(fields) => {
-            for (key, value) in fields.iter() {
-                if directory_text_key(key.as_str()) { directory_visit_scalar(value, visit)?; }
-            }
-        }
-        LoroValue::List(values) => {
-            for value in values.iter() { directory_visit_scalar(value, visit)?; }
-        }
-        _ => {}
+    if let Some(reasoning) = obj.get("reasoning").and_then(|x| x.as_str()) {
+        return Some(MessagePart::Reasoning {
+            id,
+            text: reasoning.to_owned(),
+        });
     }
-    Ok(())
-}
-
-fn text_tail(text: &LoroText, budget: usize) -> Result<(String, usize), DocError> {
-    let total = text.len_utf8();
-    if total <= budget {
-        return Ok((text.to_string(), 0));
+    if let Some(text) = obj.get("text").and_then(|x| x.as_str()) {
+        return Some(MessagePart::Text {
+            id,
+            text: text.to_owned(),
+        });
     }
-    let target = total - budget;
-    for start in target..=(target + 3).min(total) {
-        let Ok(delta) = text.slice_delta(start, total, PosType::Bytes) else {
-            continue;
-        };
-        let body = delta
-            .into_iter()
-            .filter_map(|delta| match delta {
-                TextDelta::Insert { insert, .. } => Some(insert),
-                _ => None,
-            })
-            .collect();
-        return Ok((body, start));
+    if let Some(call) = obj
+        .get("call")
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+    {
+        return Some(MessagePart::Tool {
+            id,
+            call,
+            is_error: obj
+                .get("isError")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            resolved: obj
+                .get("resolved")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
+            output: obj
+                .get("output")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned),
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        });
     }
-    Err(DocError::Schema(
-        "could not find UTF-8 boundary for transcript tail".into(),
-    ))
-}
-
-fn read_parts_window(
-    parts: &LoroList,
-    text_budget: &mut usize,
-) -> Result<Vec<MessagePart>, DocError> {
-    let mut reversed = Vec::with_capacity(parts.len());
-    for index in (0..parts.len()).rev() {
-        let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) = parts.get(index)
-        else {
-            continue;
-        };
-        let id = scalar_string(&part, "id")?;
-        let kind = scalar_string(&part, "kind")?;
-        if kind == "text"
-            && let Some(loro::ValueOrContainer::Container(loro::Container::Text(text))) =
-                part.get("text")
-        {
-            let (body, omitted) = text_tail(&text, *text_budget)?;
-            *text_budget = text_budget.saturating_sub(body.len());
-            reversed.push(if omitted == 0 {
-                MessagePart::Text { id, text: body }
-            } else {
-                MessagePart::TextWindow {
-                    id,
-                    text: body,
-                    omitted_prefix_bytes: omitted,
-                }
-            });
-            continue;
-        }
-        reversed.push(from_doc_part(serde_json::from_value(
-            part.get_deep_value().to_json_value(),
-        )?));
+    if let Some(message) = obj.get("message").and_then(|x| x.as_str()) {
+        return Some(MessagePart::Error {
+            id,
+            message: message.to_owned(),
+        });
     }
-    reversed.reverse();
-    Ok(reversed)
+    None
 }
 
 /// Render-time continuation join at the entry level (`joinContinuations` in TS):
@@ -1521,13 +1199,13 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
     for entry in entries {
         match &entry.continuation_of {
             Some(root_id) => {
-                if let Some(&at) = root_index.get(root_id)
-                    && out[at].role == entry.role
-                    && (!out[at].is_peer_message() || out[at].peer_message == entry.peer_message)
-                {
+                if let Some(&at) = root_index.get(root_id) {
                     out[at].parts.extend(entry.parts);
+                    if entry.duration_ms.is_some() {
+                        out[at].duration_ms = entry.duration_ms;
+                    }
                 } else {
-                    // Orphan or incompatible continuation — preserve its visible content.
+                    // Orphan continuation — surface as its own entry rather than dropping.
                     out.push(entry);
                 }
             }
@@ -1542,7 +1220,7 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
 
 /// Incremental streaming writer for one assistant entry.
 ///
-/// Port of comet's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
+/// Port of zeron's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
 /// live segment (from `fold_event_into_parts`) at each commit tick, it diffs against what's in
 /// the doc and writes only the delta:
 /// - trailing text growth → `LoroText` append (RLE-merged),
@@ -1553,12 +1231,11 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
 /// text never mutates. Tool/input parts may update fields in place.
 pub struct SegmentWriter<'a> {
     doc: &'a SessionDoc,
-    /// Stable identity plus an index hint, validated on every write after adoption.
-    entry_id: String,
+    /// Index of this entry in the `messages` list.
     entry_index: usize,
-    generation: u64,
     /// Mirror of what we've written so far (part id → app part).
     written: Vec<MessagePart>,
+    created_at: i64,
 }
 
 impl<'a> SegmentWriter<'a> {
@@ -1569,7 +1246,6 @@ impl<'a> SegmentWriter<'a> {
         device_id: &str,
         created_at: i64,
     ) -> Result<Self, DocError> {
-        let _operation = doc.doc.operation();
         let messages = doc.doc.get_list("messages");
         let entry_index = messages.len();
         let map = messages.push_container(LoroMap::new())?;
@@ -1583,35 +1259,52 @@ impl<'a> SegmentWriter<'a> {
                 device_id: device_id.into(),
                 status: Some(MessageStatus::Streaming),
                 continuation_of: None,
-                peer_message: None,
+                duration_ms: None,
             },
         )?;
         map.insert_container("parts", LoroList::new())?;
-        doc.doc.commit()?;
+        doc.doc.commit();
         Ok(Self {
             doc,
-            entry_id: entry_id.to_string(),
             entry_index,
-            generation: doc.doc.generation(),
             written: Vec::new(),
+            created_at,
         })
+    }
+
+    /// Reattach to a streaming entry a prior [`Self::begin`] pushed on the
+    /// same doc, with the caller-held mirror of what was already written —
+    /// the seam that lets a sink hold `(entry_index, written)` between
+    /// coalesced flushes instead of a doc-borrowing writer.
+    pub fn resume(doc: &'a SessionDoc, entry_index: usize, written: Vec<MessagePart>) -> Self {
+        let created_at = match doc.doc.get_list("messages").get(entry_index) {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => {
+                match map.get("createdAt") {
+                    Some(loro::ValueOrContainer::Value(LoroValue::I64(ms))) => ms,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        };
+        Self {
+            doc,
+            entry_index,
+            written,
+            created_at,
+        }
+    }
+
+    /// The state a later [`Self::resume`] needs.
+    pub fn into_state(self) -> (usize, Vec<MessagePart>) {
+        (self.entry_index, self.written)
     }
 
     fn entry_map(&self) -> Result<LoroMap, DocError> {
         let messages = self.doc.doc.get_list("messages");
-        let matches_id = |map: &LoroMap| matches!(map.get("id"),
-            Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == self.entry_id);
-        if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = messages.get(self.entry_index)
-            && matches_id(&map) {
-            return Ok(map);
+        match messages.get(self.entry_index) {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Ok(map),
+            _ => Err(DocError::Schema("streaming entry map missing".into())),
         }
-        for index in (0..messages.len()).rev() {
-            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = messages.get(index)
-                && matches_id(&map) {
-                return Ok(map);
-            }
-        }
-        Err(DocError::Schema("streaming entry map missing".into()))
     }
 
     fn parts_list(&self) -> Result<LoroList, DocError> {
@@ -1625,17 +1318,6 @@ impl<'a> SegmentWriter<'a> {
 
     /// Diff `folded` (the full folded segment so far) into the doc.
     pub fn sync(&mut self, folded: &[MessagePart]) -> Result<(), DocError> {
-        let binding = self.doc.binding();
-        let _operation = binding.operation();
-        let generation = binding.generation();
-        if generation != self.generation {
-            let current = entry_from_json(self.entry_map()?.get_deep_value().to_json_value())?;
-            if current.status != Some(MessageStatus::Streaming) || !parts_are_prefix(&current.parts, folded) {
-                return Err(DocError::Schema("adopted streaming entry has a terminal or divergent outcome".into()));
-            }
-            self.written = current.parts;
-            self.generation = generation;
-        }
         let parts = self.parts_list()?;
         let mut dirty = false;
 
@@ -1648,16 +1330,25 @@ impl<'a> SegmentWriter<'a> {
                 }
                 Some(prev) if prev == part => {}
                 Some(prev) => {
-                    match (prev, part) {
+                    // Trailing growth of a text-bodied part appends into its
+                    // LoroText container instead of rewriting the map value.
+                    let grown = match (prev, part) {
                         (
                             MessagePart::Text { text: old, .. },
                             MessagePart::Text { text: new, .. },
-                        ) if new.starts_with(old.as_str()) => {
-                            // Trailing-text growth: append the suffix into the LoroText.
+                        ) if new.starts_with(old.as_str()) => Some(("text", old, new)),
+                        (
+                            MessagePart::Reasoning { text: old, .. },
+                            MessagePart::Reasoning { text: new, .. },
+                        ) if new.starts_with(old.as_str()) => Some(("reasoning", old, new)),
+                        _ => None,
+                    };
+                    match grown {
+                        Some((field, old, new)) => {
                             let delta = &new[old.len()..];
                             if !delta.is_empty() {
                                 let part_map = part_map_at(&parts, i)?;
-                                match part_map.get("text") {
+                                match part_map.get(field) {
                                     Some(loro::ValueOrContainer::Container(
                                         loro::Container::Text(t),
                                     )) => {
@@ -1665,15 +1356,15 @@ impl<'a> SegmentWriter<'a> {
                                         t.insert(len, delta)?;
                                     }
                                     _ => {
-                                        return Err(DocError::Schema(
-                                            "text part missing LoroText".into(),
-                                        ));
+                                        return Err(DocError::Schema(format!(
+                                            "{field} part missing LoroText"
+                                        )));
                                     }
                                 }
                                 dirty = true;
                             }
                         }
-                        _ => {
+                        None => {
                             // Field-level update (tool refresh/resolve, input resolve, or a
                             // non-append text rewrite, which the fold shouldn't produce —
                             // rewrite the part map fields defensively).
@@ -1688,21 +1379,25 @@ impl<'a> SegmentWriter<'a> {
         }
 
         if dirty {
-            self.doc.doc.commit()?;
+            self.doc.doc.commit();
         }
         Ok(())
     }
 
-    /// Finish the stream: sync final parts and stamp a terminal status.
+    /// Finish the stream: sync final parts, stamp a terminal status, and
+    /// record how long the turn ran (`now - createdAt`).
     pub fn finish(mut self, folded: &[MessagePart], status: MessageStatus) -> Result<(), DocError> {
         self.sync(folded)?;
-        let _operation = self.doc.doc.operation();
         let map = self.entry_map()?;
-        if optional_string(&map, "status").as_deref() != Some("streaming") {
-            return Err(DocError::Schema("streaming entry already has a terminal outcome".into()));
-        }
         map.insert("status", status_str(status))?;
-        self.doc.doc.commit()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(self.created_at);
+        if self.created_at > 0 {
+            map.insert("durationMs", (now - self.created_at).max(0))?;
+        }
+        self.doc.doc.commit();
         Ok(())
     }
 }
@@ -1717,8 +1412,17 @@ fn part_map_at(parts: &LoroList, index: usize) -> Result<LoroMap, DocError> {
 /// In-place field refresh for tool/input parts (and defensive text rewrite).
 fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError> {
     let doc_part = to_doc_part(part)?;
+    for (key, value) in [
+        ("path", &doc_part.path),
+        ("name", &doc_part.name),
+        ("mimeType", &doc_part.mime_type),
+    ] {
+        if let Some(value) = value {
+            map.insert(key, value.as_str())?;
+        }
+    }
     if let Some(call) = &doc_part.call {
-        sync_call_json(JsonSlot::Map(map, "call"), call)?;
+        map.insert("call", loro_value_from_json(call))?;
     }
     if let Some(is_error) = doc_part.is_error {
         map.insert("isError", is_error)?;
@@ -1732,6 +1436,33 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    if let Some(output) = &doc_part.output {
+        map.insert("output", output.as_str())?;
+    }
+    if let Some(diff) = &doc_part.diff {
+        map.insert("diff", loro_value_from_json(diff))?;
+    }
+    if let Some(output_ref) = &doc_part.output_ref {
+        map.insert("outputRef", output_ref.as_str())?;
+    }
+    if let Some(output_bytes) = doc_part.output_bytes {
+        map.insert("outputBytes", output_bytes as i64)?;
+    }
+    if let Some(diff_ref) = &doc_part.diff_ref {
+        map.insert("diffRef", diff_ref.as_str())?;
+    }
+    if let Some(diff_stats) = &doc_part.diff_stats {
+        map.insert("diffStats", loro_value_from_json(diff_stats))?;
+    }
+    if let Some(subagent_ref) = &doc_part.subagent_ref {
+        map.insert("subagentRef", subagent_ref.as_str())?;
+    }
+    if let Some(subagent_status) = &doc_part.subagent_status {
+        map.insert("subagentStatus", subagent_status.as_str())?;
+    }
+    if let Some(subagent_tail) = &doc_part.subagent_tail {
+        map.insert("subagentTail", subagent_tail.as_str())?;
+    }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
@@ -1739,10 +1470,19 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
                 .map_err(|e| DocError::Schema(e.to_string()))?;
         }
     }
+    if let Some(reasoning) = &doc_part.reasoning {
+        // Same defensive rewrite for the reasoning body.
+        if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) =
+            map.get("reasoning")
+        {
+            t.update(reasoning, Default::default())
+                .map_err(|e| DocError::Schema(e.to_string()))?;
+        }
+    }
     Ok(())
 }
 
-fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
+pub(crate) fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
     LoroValue::from(v.clone())
 }
 
@@ -1783,7 +1523,148 @@ pub fn materialize_tail(
 mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
-    use comet_proto::{AgentEvent, ToolCall};
+
+    #[test]
+    fn fork_seam_round_trips_through_the_doc() {
+        let doc = SessionDoc::init("fork").unwrap();
+        let seam = MessagePart::Fork {
+            id: "fork:side".into(),
+            source_chat_id: "main".into(),
+            source_title: "Main conversation".into(),
+        };
+        doc.push_message(&SessionMessageEntry {
+            duration_ms: None,
+            id: "fork:side".into(),
+            role: MessageRole::System,
+            parts: vec![seam.clone()],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, MessageRole::System);
+        assert_eq!(entries[0].parts, vec![seam]);
+    }
+    use zeron_proto::{AgentEvent, ToolCall};
+
+    #[test]
+    fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
+        let doc = SessionDoc::init("whale").unwrap();
+        for segment in 0..4 {
+            doc.push_message(&SessionMessageEntry {
+                id: format!("segment-{segment}"),
+                role: MessageRole::Assistant,
+                parts: (0..100)
+                    .map(|part| MessagePart::Text {
+                        id: format!("part-{}", segment * 100 + part),
+                        text: "body".into(),
+                    })
+                    .collect(),
+                created_at: segment,
+                device_id: "device".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: (segment > 0).then(|| "segment-0".into()),
+                duration_ms: None,
+            })
+            .unwrap();
+        }
+        let before = doc.export_snapshot().unwrap();
+        let tail = doc.read_opening_tail(128).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].id, "segment-0");
+        assert_eq!(tail[0].parts.len(), 128);
+        assert_eq!(tail[0].parts[0].id(), "part-272");
+        assert_eq!(tail[0].parts.last().unwrap().id(), "part-399");
+        assert_eq!(
+            doc.read_opening_tail(1000).unwrap(),
+            join_continuation_entries(doc.read_entries().unwrap())
+        );
+        assert!(doc.read_opening_tail(0).unwrap().is_empty());
+        assert_eq!(
+            before,
+            doc.export_snapshot().unwrap(),
+            "preview never mutates storage"
+        );
+    }
+
+    #[test]
+    fn generated_image_persists_updates_and_salvages() {
+        let doc = SessionDoc::init("images").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        let event = AgentEvent::GeneratedImage {
+            id: "i:image".into(),
+            path: "/uploads/a.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        };
+        fold_event_into_parts(&mut parts, &event);
+        writer.sync(&parts).unwrap();
+        if let MessagePart::Image { path, .. } = &mut parts[0] {
+            *path = "/uploads/b.png".into();
+        }
+        writer.sync(&parts).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, parts);
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        let loaded = SessionDoc::from_doc(imported);
+        assert_eq!(loaded.read_entries().unwrap()[0].parts, parts);
+        let valid = serde_json::json!({"kind":"image", "id":"i", "path":"/uploads/i.png", "name":"i.png", "mimeType":"image/png", "isError":42});
+        assert!(matches!(
+            salvage_part(&valid, "a", 0),
+            Some(MessagePart::Image { .. })
+        ));
+        for bad in [
+            serde_json::json!({"kind":"image", "id":"i"}),
+            serde_json::json!({"kind":"image", "id":"i", "path":"/x", "name":"x", "mimeType":"image/svg+xml"}),
+        ] {
+            assert!(matches!(
+                from_doc_part(serde_json::from_value(bad.clone()).unwrap()),
+                MessagePart::Error { .. }
+            ));
+            assert!(matches!(
+                salvage_part(&bad, "a", 0),
+                Some(MessagePart::Error { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn visual_round_trips_and_degrades_without_a_path() {
+        let doc = SessionDoc::init("visuals").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Visual {
+                id: "v:1".into(),
+                path: "/uploads/v-1-visual.luau".into(),
+                title: "Latency by region".into(),
+            },
+        );
+        writer.sync(&parts).unwrap();
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        let loaded = SessionDoc::from_doc(imported);
+        assert_eq!(loaded.read_entries().unwrap()[0].parts, parts);
+        assert!(matches!(
+            from_doc_part(
+                serde_json::from_value(serde_json::json!({"kind":"visual", "id":"v", "name":"t"}))
+                    .unwrap()
+            ),
+            MessagePart::Error { .. }
+        ));
+        assert!(matches!(
+            from_doc_part(
+                serde_json::from_value(serde_json::json!({"kind":"visual", "id":"v", "path":"/p"}))
+                    .unwrap()
+            ),
+            MessagePart::Visual { .. }
+        ));
+    }
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -1797,635 +1678,8 @@ mod tests {
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
-            peer_message: None,
+            duration_ms: None,
         }
-    }
-
-    #[test]
-    fn progressive_300k_tool_command_exports_only_linear_updates() {
-        const BYTES: usize = 300 * 1024;
-        let mut state = 0x1234_5678_u32;
-        let command: String = (0..BYTES).map(|_| {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            char::from(32 + ((state >> 24) % 95) as u8)
-        }).collect();
-        let doc = SessionDoc::init("chat").unwrap();
-        let mut writer = SegmentWriter::begin(&doc, "active", "device", 1).unwrap();
-        let mut exported = 0;
-        let part = |text: &str| MessagePart::Tool { id: "exec".into(),
-            call: ToolCall::Exec { command: text.into() }, is_error: false, resolved: false };
-        for end in (1024..=BYTES).step_by(1024) {
-            let before = doc.doc().oplog_vv();
-            writer.sync(&[part(&command[..end])]).unwrap();
-            exported += doc.doc().export(ExportMode::updates(&before)).unwrap().len();
-        }
-        let expected = part(&command);
-        writer.finish(std::slice::from_ref(&expected), MessageStatus::Complete).unwrap();
-        assert_eq!(doc.read_entry("active").unwrap().unwrap().parts, vec![expected]);
-        // Sum independent deltas: whole-value rewrites cannot hide their
-        // quadratic growth through compression against earlier prefixes.
-        assert!(exported < BYTES * 3, "progressive tool arguments exported {exported} bytes for {BYTES} input bytes");
-    }
-
-    #[test]
-    fn mixed_scalar_and_container_tool_peers_preserve_typed_json() {
-        let doc = SessionDoc::init("chat").unwrap();
-        let mut writer = SegmentWriter::begin(&doc, "active", "device", 1).unwrap();
-        let part = |input| MessagePart::Tool { id: "tool".into(),
-            call: ToolCall::Unknown { name: "Eval".into(), input: Some(input) }, is_error: false, resolved: false };
-        let initial = part(serde_json::json!({
-            "nested": { "code": "α" }, "args": [{ "text": "β" }, null, true, 42, -3.5], "removed": "gone",
-        }));
-        writer.sync(std::slice::from_ref(&initial)).unwrap();
-        assert_eq!(doc.read_entry_window(None, 1).unwrap().entries[0].parts, vec![initial]);
-
-        // An older peer replaces the call with the original scalar JSON shape.
-        let peer = LoroDoc::new();
-        peer.import(&doc.export_snapshot().unwrap()).unwrap();
-        let legacy = part(serde_json::json!({ "nested": false, "args": [null, 1], "old": "scalar" }));
-        let MessagePart::Tool { call, .. } = &legacy else { unreachable!() };
-        let raw_entry = match peer.get_list("messages").get(0) {
-            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => map,
-            _ => panic!("entry missing"),
-        };
-        let raw_parts = match raw_entry.get("parts") {
-            Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => parts,
-            _ => panic!("parts missing"),
-        };
-        part_map_at(&raw_parts, 0).unwrap().insert("call", loro_value_from_json(&serde_json::to_value(call).unwrap())).unwrap();
-        peer.commit();
-        doc.binding().import(&peer.export(ExportMode::updates(&doc.doc().oplog_vv())).unwrap()).unwrap();
-        assert_eq!(doc.read_entry("active").unwrap().unwrap().parts, vec![legacy]);
-
-        let final_part = part(serde_json::json!({
-            "nested": { "code": "αβ" }, "args": [{ "text": "βγ" }, false, null, -42, 0.125],
-            "emptyObject": {}, "emptyArray": [], "nothing": null,
-        }));
-        let before = peer.oplog_vv();
-        writer.finish(std::slice::from_ref(&final_part), MessageStatus::Complete).unwrap();
-        peer.import(&doc.doc().export(ExportMode::updates(&before)).unwrap()).unwrap();
-        assert_eq!(doc.read_entry_window(None, 1).unwrap().entries[0].parts, vec![final_part.clone()]);
-        assert_eq!(SessionDoc::from_doc(peer).read_entry("active").unwrap().unwrap().parts, vec![final_part]);
-    }
-
-    #[test]
-    fn live_writer_follows_adopted_snapshot_by_message_id() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let binding = doc.binding();
-        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
-        let text = |value: &str| vec![MessagePart::Text { id: "text".into(), text: value.into() }];
-        let mut writer = SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap();
-        writer.sync(&text("first")).unwrap();
-        let replacement = SessionDoc::init("chat-1").unwrap();
-        replacement.push_message(&user_entry("prefix", "server history")).unwrap();
-        let mut remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
-        remote.sync(&text("fir")).unwrap();
-        drop(remote);
-        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
-        writer.finish(&text("first continued"), MessageStatus::Complete).unwrap();
-        let active = doc.read_entry("active").unwrap().unwrap();
-        assert_eq!(active.parts, text("first continued"));
-        assert_eq!(active.status, Some(MessageStatus::Complete));
-        assert_eq!(doc.read_entry("prefix").unwrap(), Some(user_entry("prefix", "server history")));
-        assert_eq!(doc.read_entries().unwrap().iter().filter(|entry| entry.id == "active").count(), 1);
-    }
-
-    #[test]
-    fn authoritative_backfill_keeps_acknowledged_stream_content_ahead_of_checkpoint() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let binding = doc.binding();
-        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
-        let text = |value: &str| vec![MessagePart::Text { id: "text".into(), text: value.into() }];
-        let mut writer = SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap();
-        writer.sync(&text("first")).unwrap();
-        let replacement = SessionDoc::init("chat-1").unwrap();
-        let mut remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
-        remote.sync(&text("first acknowledged")).unwrap();
-        drop(remote);
-        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
-        assert_eq!(doc.read_entry("active").unwrap().unwrap().parts, text("first acknowledged"));
-        writer.finish(&text("first acknowledged continued"), MessageStatus::Complete).unwrap();
-        assert_eq!(doc.read_entry("active").unwrap().unwrap().parts, text("first acknowledged continued"));
-        assert_eq!(doc.read_entries().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn interrupted_checkpoint_keeps_acknowledged_stream_content() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let binding = doc.binding();
-        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
-        let text = |value: &str| MessagePart::Text { id: "text".into(), text: value.into() };
-        let plan = |done| MessagePart::Tool {
-            id: "omp-plan".into(),
-            call: ToolCall::Todo { items: vec![comet_proto::TodoItem { text: "Recover the session".into(), done }] },
-            is_error: false,
-            resolved: true,
-        };
-        let later = MessagePart::Text { id: "later".into(), text: "later output".into() };
-        let error = MessagePart::Error { id: "active-recovery".into(), message: "Run interrupted by Crew restart".into() };
-        let writer = SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap();
-        writer.finish(&[text("first"), plan(false), error.clone()], MessageStatus::Aborted).unwrap();
-        let replacement = SessionDoc::init("chat-1").unwrap();
-        let mut remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
-        remote.sync(&[text("first acknowledged"), plan(true), later.clone()]).unwrap();
-        let snapshot = replacement.export_snapshot().unwrap();
-        for _ in 0..2 {
-            binding.adopt_snapshot(&snapshot, Some("chat-1")).unwrap();
-            let adopted = doc.read_entry("active").unwrap().unwrap();
-            assert_eq!(adopted.status, Some(MessageStatus::Aborted));
-            assert_eq!(adopted.parts, vec![text("first acknowledged"), plan(true), later.clone(), error.clone()]);
-        }
-        remote.finish(&[text("first acknowledged"), plan(true), later.clone()], MessageStatus::Complete).unwrap();
-        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
-        let completed = doc.read_entry("active").unwrap().unwrap();
-        assert_eq!(completed.status, Some(MessageStatus::Complete));
-        assert_eq!(completed.parts, vec![text("first acknowledged"), plan(true), later]);
-        let retained = doc.read_entry("active").unwrap().unwrap();
-        let foreign = SessionDoc::init("chat-1").unwrap();
-        let mut writer = SegmentWriter::begin(&foreign, "active", "foreign-device", 2).unwrap();
-        writer.sync(&[text("first acknowledged")]).unwrap();
-        assert!(binding.adopt_snapshot(&foreign.export_snapshot().unwrap(), Some("chat-1")).is_err());
-        assert_eq!(doc.read_entry("active").unwrap(), Some(retained));
-    }
-
-    #[test]
-    fn interrupted_checkpoint_preserves_an_acknowledged_marker_without_duplication() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let binding = doc.binding();
-        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
-        let text = |id: &str, value: &str| MessagePart::Text { id: id.into(), text: value.into() };
-        let error = |message: &str| MessagePart::Error { id: "active-recovery".into(), message: message.into() };
-        let marker = error("Run interrupted by Crew restart");
-        SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap()
-            .finish(&[text("text", "first"), marker.clone()], MessageStatus::Aborted).unwrap();
-        let replacement = SessionDoc::init("chat-1").unwrap();
-        let mut remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
-        let acknowledged = vec![text("text", "first acknowledged"), text("later", "later output"), marker];
-        remote.sync(&acknowledged).unwrap();
-        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
-        let adopted = doc.read_entry("active").unwrap().unwrap();
-        assert_eq!(adopted.status, Some(MessageStatus::Aborted));
-        assert_eq!(adopted.parts, acknowledged);
-
-        let divergent = SessionDoc::init("chat-1").unwrap();
-        let mut writer = SegmentWriter::begin(&divergent, "active", "dev-a", 2).unwrap();
-        writer.sync(&[text("text", "first acknowledged"), text("later", "later output"), error("Conflicting acknowledged marker")]).unwrap();
-        assert!(binding.adopt_snapshot(&divergent.export_snapshot().unwrap(), Some("chat-1")).is_err());
-        assert_eq!(doc.read_entry("active").unwrap(), Some(adopted));
-    }
-
-    #[test]
-    fn live_writer_cannot_reopen_adopted_terminal_outcome() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let binding = doc.binding();
-        binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
-        let folded = vec![MessagePart::Text { id: "text".into(), text: "answer".into() }];
-        let mut writer = SegmentWriter::begin(&doc, "active", "dev-a", 2).unwrap();
-        writer.sync(&folded).unwrap();
-        let replacement = SessionDoc::init("chat-1").unwrap();
-        let remote = SegmentWriter::begin(&replacement, "active", "dev-a", 2).unwrap();
-        remote.finish(&folded, MessageStatus::Aborted).unwrap();
-        binding.adopt_snapshot(&replacement.export_snapshot().unwrap(), Some("chat-1")).unwrap();
-        assert!(writer.finish(&folded, MessageStatus::Complete).is_err());
-        assert_eq!(doc.read_entry("active").unwrap().unwrap().status, Some(MessageStatus::Aborted));
-        assert_eq!(doc.read_entry("active").unwrap().unwrap().parts, folded);
-    }
-
-    #[test]
-    fn replay_respects_terminal_content_and_rejects_divergence() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let mut entry = user_entry("active", "first");
-        entry.role = MessageRole::Assistant;
-        entry.status = Some(MessageStatus::Streaming);
-        doc.push_message(&entry).unwrap();
-        let mut complete = entry.clone();
-        complete.parts = vec![MessagePart::Text { id: "t0".into(), text: "first complete".into() }];
-        complete.status = Some(MessageStatus::Complete);
-        doc.reconcile_message(&complete).unwrap();
-        doc.reconcile_message(&entry).unwrap();
-        assert_eq!(doc.read_entry("active").unwrap(), Some(complete.clone()));
-        let mut divergent = complete.clone();
-        divergent.parts = vec![MessagePart::Text { id: "t0".into(), text: "different".into() }];
-        assert!(doc.reconcile_message(&divergent).is_err());
-        divergent = complete.clone();
-        divergent.device_id = "other-owner".into();
-        assert!(doc.reconcile_message(&divergent).is_err());
-        assert_eq!(doc.read_entry("active").unwrap(), Some(complete));
-    }
-
-    #[test]
-    fn streaming_replay_refreshes_tools_but_never_regresses_resolution() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let mut entry = user_entry("active", "");
-        entry.role = MessageRole::Assistant;
-        entry.status = Some(MessageStatus::Streaming);
-        entry.parts = vec![MessagePart::Tool { id: "tool".into(),
-            call: ToolCall::Exec { command: "echo".into() }, is_error: false, resolved: false }];
-        doc.push_message(&entry).unwrap();
-        let mut updated = entry.clone();
-        updated.parts = vec![MessagePart::Tool { id: "tool".into(),
-            call: ToolCall::Exec { command: "echo done".into() }, is_error: false, resolved: true }];
-        doc.reconcile_message(&updated).unwrap();
-        assert_eq!(doc.read_entry("active").unwrap(), Some(updated.clone()));
-        doc.reconcile_message(&entry).unwrap();
-        assert_eq!(doc.read_entry("active").unwrap(), Some(updated));
-    }
-
-    #[test]
-    fn owner_heartbeats_are_bounded_and_phase_history_stays_durable() {
-        use comet_proto::{AgentSessionRecord, AgentSessionSource, SessionStatus};
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let mut record = PublicationRecord {
-            id: "start".into(), schema_version: COLLABORATION_SCHEMA_VERSION,
-            published_at: 1, published_by: "owner".into(), unknown: Default::default(),
-            value: PublicationValue::AgentSession(Box::new(AgentSessionRecord {
-                session_id: "chat-1".into(), chat_id: "chat-1".into(),
-                owner_subject: "owner".into(), owner_device_id: "dev-a".into(),
-                source: AgentSessionSource::Local, environment: None,
-                harness: None, model: None, harness_session_id: None,
-                model_retry: None,
-                started_at: None,
-                status: Some(SessionStatus::Working), updated_at: Some(1), created_at: 1,
-                unknown: Default::default(),
-            })),
-        };
-        doc.append_publication(&record).unwrap();
-        let mut heartbeat_base = Vec::new();
-        for at in 2..=1_000 {
-            if at == 3 { doc.binding().install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(()))); }
-            record.id = format!("heartbeat-{at}");
-            record.published_at = at;
-            let PublicationValue::AgentSession(session) = &mut record.value else { unreachable!() };
-            session.updated_at = Some(at);
-            doc.upsert_agent_session(&record).unwrap();
-            if at == 2 { heartbeat_base = doc.export_snapshot().unwrap(); }
-        }
-        assert_eq!(doc.doc().get_map("agentSessions").len(), 1);
-        assert_eq!(doc.read_publications().unwrap().len(), 1);
-        assert_eq!(doc.collaboration_snapshot().unwrap().sessions[0].updated_at, Some(1_000));
-        let current = doc.export_snapshot().unwrap();
-        let raw = LoroDoc::new(); raw.import(&current).unwrap();
-        let restored = SessionDoc::from_doc(raw);
-        restored.binding().install_journal(doc.binding().pending_records(), std::sync::Arc::new(|_, _| Ok(())));
-        restored.binding().adopt_snapshot(&heartbeat_base, Some("chat-1")).unwrap();
-        restored.binding().adopt_snapshot(&current, Some("chat-1")).unwrap();
-        assert_eq!(restored.collaboration_snapshot().unwrap().sessions[0].updated_at, Some(1_000));
-        assert_eq!(restored.doc().get_map("agentSessions").len(), 1);
-        record.id = "idle".into();
-        record.published_at = 1_000;
-        let PublicationValue::AgentSession(session) = &mut record.value else { unreachable!() };
-        session.status = Some(SessionStatus::Idle);
-        session.updated_at = Some(1_000);
-        doc.append_publication(&record).unwrap();
-        assert_eq!(doc.collaboration_snapshot().unwrap().sessions[0].status, Some(SessionStatus::Idle),
-            "the immutable terminal transition wins a same-millisecond heartbeat tie");
-        doc.upsert_agent_session(&record).unwrap();
-        let PublicationValue::AgentSession(session) = &mut record.value else { unreachable!() };
-        session.owner_device_id = "attacker".into();
-        session.updated_at = Some(2_000);
-        assert!(doc.upsert_agent_session(&record).is_err());
-        assert_eq!(doc.read_publications().unwrap().iter().map(|record| record.id.as_str()).collect::<Vec<_>>(), ["start", "idle"]);
-        assert_eq!(doc.collaboration_snapshot().unwrap().sessions[0].status, Some(SessionStatus::Idle));
-        assert_eq!(doc.doc().get_map("agentSessions").len(), 1);
-    }
-
-    #[test]
-    fn replayed_offline_phase_cannot_displace_terminal_or_newer_scaffold_owner() {
-        use comet_proto::{AgentSessionRecord, AgentSessionSource, SessionStatus};
-        for (source, old_device, current_device, old_at) in [
-            (AgentSessionSource::Local, "dev-a", "dev-a", 10),
-            (AgentSessionSource::Scaffold, "comet-scaffold-sandbox-e1", "comet-scaffold-sandbox-e2", 10_000),
-        ] {
-            let publication = |id: &str, device: &str, at, status| PublicationRecord {
-                id: id.into(), schema_version: COLLABORATION_SCHEMA_VERSION, published_at: at,
-                published_by: "owner".into(), unknown: Default::default(),
-                value: PublicationValue::AgentSession(Box::new(AgentSessionRecord {
-                    session_id: "chat".into(), chat_id: "chat".into(), owner_subject: "owner".into(),
-                    owner_device_id: device.into(), source, environment: None,
-                    harness: None, model: None, harness_session_id: None,
-                    model_retry: None,
-                    started_at: None,
-                    status: Some(status), updated_at: Some(at), created_at: 1, unknown: Default::default(),
-                })),
-            };
-            let local = SessionDoc::init("chat").unwrap();
-            let binding = local.binding();
-            binding.install_journal(Vec::new(), std::sync::Arc::new(|_, _| Ok(())));
-            let old = publication("offline-old", old_device, old_at, SessionStatus::Working);
-            local.append_publication(&old).unwrap();
-            let server = SessionDoc::init("chat").unwrap();
-            let terminal = publication("current-terminal", current_device, 20, SessionStatus::Idle);
-            server.append_publication(&terminal).unwrap();
-            server.upsert_agent_session(&publication("heartbeat", current_device, 30, SessionStatus::Idle)).unwrap();
-            binding.adopt_snapshot(&server.export_snapshot().unwrap(), Some("chat")).unwrap();
-            let snapshot = local.collaboration_snapshot().unwrap();
-            assert_eq!(snapshot.sessions[0].owner_device_id, current_device);
-            assert_eq!(snapshot.sessions[0].status, Some(SessionStatus::Idle));
-            assert_eq!(snapshot.sessions[0].updated_at, Some(30));
-            assert_eq!(snapshot.publications.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(), ["current-terminal", "offline-old"]);
-            // Heartbeats and projection must use the same selected anchor,
-            // even though the obsolete offline phase was appended last.
-            local.upsert_agent_session(&publication("next-heartbeat", current_device, 40, SessionStatus::Idle)).unwrap();
-            local.append_publication(&publication("same-ms-active", current_device, 20, SessionStatus::Working)).unwrap();
-            let mut foreign = publication("foreign-owner", "foreign-device", 50_000, SessionStatus::Working);
-            foreign.published_by = "foreign".into();
-            let PublicationValue::AgentSession(session) = &mut foreign.value else { unreachable!() };
-            session.owner_subject = "foreign".into();
-            local.append_publication(&foreign).unwrap();
-            let snapshot = local.collaboration_snapshot().unwrap();
-            assert_eq!(snapshot.sessions[0].owner_device_id, current_device);
-            assert_eq!(snapshot.sessions[0].status, Some(SessionStatus::Idle));
-            assert_eq!(snapshot.sessions[0].updated_at, Some(40));
-            assert_eq!(snapshot.publications.len(), 4, "obsolete and foreign history remains durable but not authoritative");
-            if source == AgentSessionSource::Scaffold {
-                local.append_publication(&publication("next-epoch", "comet-scaffold-sandbox-e3", 5, SessionStatus::Idle)).unwrap();
-                local.append_publication(&publication("old-epoch-future-clock", current_device, 100_000, SessionStatus::Working)).unwrap();
-                local.append_publication(&publication("different-sandbox", "comet-scaffold-other-e99", 200_000, SessionStatus::Working)).unwrap();
-                let snapshot = local.collaboration_snapshot().unwrap();
-                assert_eq!(snapshot.sessions[0].owner_device_id, "comet-scaffold-sandbox-e3");
-                assert_eq!(snapshot.sessions[0].status, Some(SessionStatus::Idle));
-                assert_eq!(snapshot.sessions[0].updated_at, Some(5));
-                assert!(local.upsert_agent_session(&publication("wrong-old-heartbeat", current_device, 300_000, SessionStatus::Working)).is_err());
-                local.upsert_agent_session(&publication("current-heartbeat", "comet-scaffold-sandbox-e3", 50, SessionStatus::Idle)).unwrap();
-                assert_eq!(local.collaboration_snapshot().unwrap().sessions[0].updated_at, Some(50));
-                assert_eq!(local.read_publications().unwrap().len(), 7);
-            }
-        }
-    }
-
-    fn peer_entry(id: &str, text: &str) -> SessionMessageEntry {
-        let mut entry = user_entry(id, text);
-        entry.peer_message = Some(PeerMessageProvenance {
-            command_id: id.into(),
-            source_chat_id: "source-chat".into(),
-            thread_id: "thread".into(),
-            reply_to: Some("previous-command".into()),
-        });
-        entry
-    }
-
-    fn peer_command(id: &str) -> SessionCommandEntry {
-        SessionCommandEntry {
-            id: id.into(),
-            payload: crate::commands::SessionCommandPayload::PeerMessage {
-                text: "original peer text".into(),
-                source_chat_id: "source-chat".into(),
-                source_deployment_id: None,
-                source_device_id: Some("source-device".into()),
-                thread_id: "thread".into(),
-                reply_to: None,
-                hop_count: 0,
-            },
-            issued_by: "dev-a".into(),
-            issued_at: 1,
-            based_on: None,
-            expires_at: None,
-            status: SessionCommandStatus::Pending,
-            resolution: None,
-        }
-    }
-
-    #[test]
-    fn peer_provenance_survives_snapshot_window_and_tail() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let entry = peer_entry("peer-command", "unchanged original peer text");
-        doc.push_message(&entry).unwrap();
-        let other = LoroDoc::new();
-        other.import(&doc.export_snapshot().unwrap()).unwrap();
-        let restored = SessionDoc::from_doc(other);
-        assert_eq!(restored.read_entries().unwrap(), vec![entry.clone()]);
-        let window = restored.read_entry_window(None, 1).unwrap();
-        assert_eq!(window.entries, vec![entry.clone()]);
-        assert!(window.entries[0].is_peer_message());
-        let tail = materialize_tail(&restored, 2, 1).unwrap();
-        let wire = serde_json::to_value(&tail).unwrap();
-        assert_eq!(
-            wire["messages"][0]["peerMessage"],
-            serde_json::json!({
-                "commandId": "peer-command",
-                "sourceChatId": "source-chat",
-                "threadId": "thread",
-                "replyTo": "previous-command"
-            })
-        );
-        let decoded: SessionTail = serde_json::from_value(wire).unwrap();
-        assert_eq!(decoded.messages, vec![entry]);
-        assert!(decoded.messages[0].is_peer_message());
-    }
-
-    #[test]
-    fn peer_provenance_is_independent_of_bounded_text_projection() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let source = "x".repeat(TAIL_TEXT_BYTE_BUDGET + 10);
-        let entry = peer_entry("peer-command", &source);
-        doc.push_message(&entry).unwrap();
-        let window = doc.read_entry_window(None, 1).unwrap();
-        assert!(window.entries[0].is_peer_message());
-        assert_eq!(window.entries[0].peer_message, entry.peer_message);
-        assert_eq!(
-            window.entries[0].parts,
-            vec![MessagePart::TextWindow {
-                id: "t0".into(),
-                text: source[10..].into(),
-                omitted_prefix_bytes: 10,
-            }]
-        );
-        assert_eq!(
-            doc.read_message("peer-command").unwrap(),
-            Some(entry.clone())
-        );
-        assert!(doc.read_message("missing").unwrap().is_none());
-        assert_eq!(doc.read_entries().unwrap(), vec![entry]);
-    }
-
-    #[test]
-    fn old_peer_lookalike_remains_visible_even_with_matching_command() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let entry = user_entry(
-            "peer-command",
-            "[Message from agent source-chat]\noriginal peer text",
-        );
-        doc.push_message(&entry).unwrap();
-        doc.queue_command(&peer_command("peer-command")).unwrap();
-        let other = LoroDoc::new();
-        other.import(&doc.export_snapshot().unwrap()).unwrap();
-        let restored = SessionDoc::from_doc(other);
-        for entries in [
-            restored.read_entries().unwrap(),
-            restored.read_entry_window(None, 1).unwrap().entries,
-            materialize_tail(&restored, 2, 1).unwrap().messages,
-        ] {
-            assert_eq!(entries, vec![entry.clone()]);
-            assert!(!entries[0].is_peer_message());
-            assert!(
-                serde_json::to_value(&entries[0])
-                    .unwrap()
-                    .get("peerMessage")
-                    .is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_peer_metadata_never_discards_message_content() {
-        for metadata in [
-            serde_json::json!(null),
-            serde_json::json!("peer-command"),
-            serde_json::json!({"commandId": "peer-command"}),
-            serde_json::json!({"commandId": 7, "sourceChatId": "source", "threadId": "thread"}),
-            serde_json::json!({"commandId": "peer-command", "sourceChatId": "source", "threadId": "thread", "replyTo": 7}),
-        ] {
-            let doc = SessionDoc::init("chat-1").unwrap();
-            let entry = user_entry("peer-command", "never discard this text");
-            doc.push_message(&entry).unwrap();
-            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
-                doc.doc().get_list("messages").get(0)
-            else {
-                panic!("missing message map");
-            };
-            map.insert("peerMessage", loro_value_from_json(&metadata))
-                .unwrap();
-            assert_eq!(doc.read_entries().unwrap(), vec![entry.clone()]);
-            assert_eq!(
-                doc.read_entry_window(None, 1).unwrap().entries,
-                vec![entry.clone()]
-            );
-            let mut wire = serde_json::to_value(&entry).unwrap();
-            wire["peerMessage"] = metadata;
-            let decoded: SessionMessageEntry = serde_json::from_value(wire).unwrap();
-            assert_eq!(decoded, entry);
-            assert!(!decoded.is_peer_message());
-        }
-    }
-
-    #[test]
-    fn peer_visibility_requires_valid_identity_and_user_role() {
-        let entry = peer_entry("peer-command", "peer text");
-        assert!(entry.is_peer_message());
-        for role in [MessageRole::Assistant, MessageRole::System] {
-            let mut other = entry.clone();
-            other.role = role;
-            assert!(!other.is_peer_message());
-        }
-        for (field, value) in [
-            ("commandId", "other-command"),
-            ("commandId", " "),
-            ("sourceChatId", "\t"),
-            ("threadId", ""),
-            ("replyTo", "\n"),
-        ] {
-            let mut wire = serde_json::to_value(&entry).unwrap();
-            wire["peerMessage"][field] = value.into();
-            let decoded: SessionMessageEntry = serde_json::from_value(wire).unwrap();
-            assert!(!decoded.is_peer_message());
-            assert_eq!(decoded.parts, entry.parts);
-        }
-        assert!(!peer_entry(" ", "peer text").is_peer_message());
-        let mut wire = serde_json::to_value(&entry).unwrap();
-        wire["peerMessage"]["replyTo"] = serde_json::Value::Null;
-        wire["peerMessage"]["futureField"] = true.into();
-        let decoded: SessionMessageEntry = serde_json::from_value(wire).unwrap();
-        assert!(decoded.is_peer_message());
-        assert!(
-            serde_json::to_value(decoded).unwrap()["peerMessage"]
-                .get("replyTo")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn continuation_join_keeps_unprovenanced_and_assistant_content_visible() {
-        let root = peer_entry("peer-command", "root peer text");
-        let mut continuation = user_entry("peer-command#c1", "continued peer text");
-        continuation.continuation_of = Some(root.id.clone());
-        continuation.peer_message = root.peer_message.clone();
-        let mut ordinary = user_entry("ordinary", "ordinary content");
-        ordinary.continuation_of = Some(root.id.clone());
-        let mut assistant = peer_entry("assistant", "assistant answer");
-        assistant.role = MessageRole::Assistant;
-        assistant.continuation_of = Some(root.id.clone());
-        let doc = SessionDoc::init("chat-1").unwrap();
-        doc.push_messages(&[
-            root.clone(),
-            continuation.clone(),
-            ordinary.clone(),
-            assistant.clone(),
-        ])
-        .unwrap();
-        let mut joined_root = root;
-        joined_root.parts.extend(continuation.parts.clone());
-        for entries in [
-            join_continuation_entries(doc.read_entries().unwrap()),
-            doc.read_entry_window(None, 1).unwrap().entries,
-            materialize_tail(&doc, 2, 3).unwrap().messages,
-        ] {
-            assert_eq!(
-                entries,
-                vec![joined_root.clone(), ordinary.clone(), assistant.clone()]
-            );
-            assert!(entries[0].is_peer_message());
-            assert!(!entries[1].is_peer_message());
-            assert!(!entries[2].is_peer_message());
-        }
-        assert_eq!(
-            doc.read_message("peer-command").unwrap(),
-            Some(joined_root.clone())
-        );
-        assert_eq!(doc.read_message("ordinary").unwrap(), Some(ordinary));
-        // Even a self-matching orphan must not become hidden without its root.
-        continuation.peer_message.as_mut().unwrap().command_id = continuation.id.clone();
-        let orphan = join_continuation_entries(vec![continuation.clone()]);
-        assert_eq!(orphan, vec![continuation]);
-        assert!(!orphan[0].is_peer_message());
-        // Child metadata cannot retroactively classify an ordinary root.
-        let mut ordinary_root = joined_root;
-        ordinary_root.peer_message = None;
-        let joined = join_continuation_entries(vec![ordinary_root, orphan[0].clone()]);
-        assert!(!joined[0].is_peer_message());
-    }
-
-    #[test]
-    fn exact_command_lookup_skips_malformed_rows_without_guessing() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let malformed = doc
-            .doc()
-            .get_list("commands")
-            .push_container(LoroMap::new())
-            .unwrap();
-        malformed.insert("id", "peer-command").unwrap();
-        doc.queue_command(&peer_command("peer-command-other"))
-            .unwrap();
-        assert!(doc.read_command("peer-command").unwrap().is_none());
-        let command = peer_command("peer-command");
-        doc.queue_command(&command).unwrap();
-        assert_eq!(doc.read_command("peer-command").unwrap(), Some(command));
-        assert!(doc.read_command("peer").unwrap().is_none());
-    }
-
-    #[test]
-    fn exact_entry_lookup_preserves_original_provenance_without_backfill() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let malformed = doc
-            .doc()
-            .get_list("messages")
-            .push_container(LoroMap::new())
-            .unwrap();
-        malformed.insert("id", "peer-command").unwrap();
-        doc.push_message(&peer_entry("peer-command-other", "unrelated"))
-            .unwrap();
-        assert!(doc.read_entry("peer-command").unwrap().is_none());
-        let entry = peer_entry("peer-command", "original");
-        doc.push_message(&entry).unwrap();
-        assert_eq!(doc.read_entry("peer-command").unwrap(), Some(entry));
-        assert!(doc.read_entry("peer").unwrap().is_none());
-        let historical = user_entry("historical-command", "original peer text");
-        doc.push_message(&historical).unwrap();
-        doc.queue_command(&peer_command("historical-command"))
-            .unwrap();
-        assert_eq!(
-            doc.read_entry("historical-command").unwrap(),
-            Some(historical)
-        );
     }
 
     #[test]
@@ -2446,6 +1700,195 @@ mod tests {
     }
 
     #[test]
+    fn todo_status_survives_the_doc_and_refreshes_in_place() {
+        use zeron_proto::{TodoItem, TodoStatus};
+        let todo = |items: Vec<TodoItem>| MessagePart::Tool {
+            // The ACP/Codex plan reuses one id for every update.
+            id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+            call: ToolCall::Todo { items },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let doc = SessionDoc::init("c1").unwrap();
+        let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let first = todo(vec![
+            TodoItem::new("read", TodoStatus::InProgress),
+            TodoItem::new("fix", TodoStatus::Pending),
+        ]);
+        w.sync(std::slice::from_ref(&first)).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, vec![first]);
+        // The next plan update rewrites the same part, in-progress moved on.
+        let second = todo(vec![
+            TodoItem::new("read", TodoStatus::Completed),
+            TodoItem::new("fix", TodoStatus::InProgress),
+        ]);
+        w.sync(std::slice::from_ref(&second)).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].parts, vec![second]);
+    }
+
+    #[test]
+    fn legacy_todo_part_without_status_still_reads() {
+        // Written by a build that only knew `done`.
+        let part: DocPartJson = serde_json::from_value(serde_json::json!({
+            "id": "t", "kind": "tool", "isError": false,
+            "call": { "kind": "todo", "items": [
+                { "text": "a", "done": true }, { "text": "b", "done": false }
+            ]}
+        }))
+        .unwrap();
+        let MessagePart::Tool {
+            call: ToolCall::Todo { items },
+            ..
+        } = from_doc_part(part)
+        else {
+            panic!("a legacy todo part must still decode");
+        };
+        assert_eq!(items[0].status(), zeron_proto::TodoStatus::Completed);
+        assert_eq!(items[1].status(), zeron_proto::TodoStatus::Pending);
+    }
+
+    #[test]
+    fn segment_sync_persists_subagent_chip_fields_on_live_parts() {
+        // The eager-done world's OTHER path: the chip mutates while its
+        // segment still streams (codex fan-outs) — update_part_fields must
+        // carry the chip fields or SegmentWriter::sync drops them silently.
+        let doc = SessionDoc::init("c1").unwrap();
+        let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let mut part = MessagePart::Tool {
+            id: "call_alpha".into(),
+            call: zeron_proto::ToolCall::Unknown {
+                name: "Agent: alpha".into(),
+                input: None,
+            },
+            is_error: false,
+            resolved: false,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        w.sync(std::slice::from_ref(&part)).unwrap();
+        if let MessagePart::Tool {
+            subagent_ref,
+            subagent_status,
+            subagent_tail,
+            ..
+        } = &mut part
+        {
+            *subagent_ref = Some("c1--sub--call_alpha".into());
+            *subagent_status = Some(SubagentStatus::Running);
+            *subagent_tail = Some("scanning".into());
+        }
+        w.sync(std::slice::from_ref(&part)).unwrap();
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            MessagePart::Tool {
+                subagent_ref,
+                subagent_status,
+                subagent_tail,
+                ..
+            } => {
+                assert_eq!(subagent_ref.as_deref(), Some("c1--sub--call_alpha"));
+                assert_eq!(subagent_status, &Some(SubagentStatus::Running));
+                assert_eq!(subagent_tail.as_deref(), Some("scanning"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_subagent_chip_refuses_non_spawn_parts() {
+        // The genus gate at the doc boundary: whatever id a driver keys its
+        // tagged traffic to, subagent lifecycle only ever lands on a SPAWN
+        // call (claude's background shells settled through the subagent
+        // subtype and turned Run chips into dead spawn links, 2026-08-20).
+        let doc = SessionDoc::init("c1").unwrap();
+        let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let tool = |id: &str, call: zeron_proto::ToolCall| MessagePart::Tool {
+            id: id.into(),
+            call,
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let parts = vec![
+            tool(
+                "toolu_bash",
+                zeron_proto::ToolCall::Exec {
+                    command: "git clone …".into(),
+                },
+            ),
+            tool(
+                "toolu_spawn",
+                zeron_proto::ToolCall::Unknown {
+                    name: "Agent: scan".into(),
+                    input: None,
+                },
+            ),
+        ];
+        w.sync(&parts).unwrap();
+        assert!(
+            doc.update_subagent_chip(
+                "toolu_spawn",
+                Some("c1--sub--toolu_spawn"),
+                Some("running"),
+                None
+            )
+            .unwrap()
+        );
+        assert!(
+            !doc.update_subagent_chip(
+                "toolu_bash",
+                Some("c1--sub--toolu_bash"),
+                Some("done"),
+                None
+            )
+            .unwrap()
+        );
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            MessagePart::Tool {
+                subagent_ref,
+                subagent_status,
+                ..
+            } => {
+                assert!(subagent_ref.is_none());
+                assert!(subagent_status.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        match &entries[0].parts[1] {
+            MessagePart::Tool { subagent_ref, .. } => {
+                assert_eq!(subagent_ref.as_deref(), Some("c1--sub--toolu_spawn"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_input_stamps_the_part_in_place() {
         let doc = SessionDoc::init("chat-1").unwrap();
         doc.push_message(&SessionMessageEntry {
@@ -2462,7 +1905,7 @@ mod tests {
             // The orphan case: the run died and recovery stamped the entry.
             status: Some(MessageStatus::Aborted),
             continuation_of: None,
-            peer_message: None,
+            duration_ms: None,
         })
         .unwrap();
         assert!(!doc.resolve_input("nope").unwrap());
@@ -2544,6 +1987,7 @@ mod tests {
                 id: "tool-1".into(),
                 is_error: false,
                 output: None,
+                diff: None,
             },
         );
         writer.sync(&folded).unwrap();
@@ -2552,6 +1996,10 @@ mod tests {
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, Some(MessageStatus::Complete));
+        assert!(
+            entries[0].duration_ms.is_some(),
+            "finish stamps how long the turn ran"
+        );
         assert_eq!(entries[0].parts.len(), 2);
         match &entries[0].parts[0] {
             MessagePart::Text { text, .. } => assert_eq!(text, "Hello"),
@@ -2563,6 +2011,176 @@ mod tests {
             } => {
                 assert!(*resolved);
                 assert!(!*is_error);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Reasoning streams like text: LoroText appends into the `reasoning`
+    /// field (not `text` — old readers' unknown-kind fallback renders `text`
+    /// as prose), interleaving with text/tool parts, and round-trips through
+    /// the doc read path.
+    #[test]
+    fn segment_writer_streams_reasoning_incrementally() {
+        let doc = SessionDoc::init("chat-r").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ReasoningDelta {
+                text: "let me ".into(),
+            },
+        );
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ReasoningDelta {
+                text: "think".into(),
+            },
+        );
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::TextDelta {
+                text: "Done".into(),
+            },
+        );
+        writer.sync(&folded).unwrap();
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].parts.len(), 2);
+        match &entries[0].parts[0] {
+            MessagePart::Reasoning { id, text } => {
+                assert_eq!(id, "r0");
+                assert_eq!(text, "let me think");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &entries[0].parts[1] {
+            MessagePart::Text { text, .. } => assert_eq!(text, "Done"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Old-reader degradation contract: the raw doc part carries NO
+        // `text` field, so a pre-reasoning client's fallback renders an
+        // empty (invisible) text part, never the thinking body.
+        let value = doc.doc.get_deep_value().to_json_value();
+        let part = &value["messages"][0]["parts"][0];
+        assert_eq!(part["kind"], "reasoning");
+        assert_eq!(part["reasoning"], "let me think");
+        assert!(part.get("text").is_none(), "{part:?}");
+    }
+
+    /// The ToolResult resolution path goes through `update_part_fields` —
+    /// the stripped output summary, sidecar refs, and diff stats must survive
+    /// the doc round trip (regression: output/diff were silently dropped
+    /// there while `to_doc_part` carried them).
+    #[test]
+    fn segment_writer_round_trips_stripped_tool_fields() {
+        let doc = SessionDoc::init("chat-2").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: false,
+                output: Some("total 0\nmore lines".into()),
+                diff: Some(zeron_proto::ToolDiff {
+                    path: "/w/a.rs".into(),
+                    old_text: Some("old\n".into()),
+                    new_text: "new\n".into(),
+                }),
+            },
+        );
+        crate::parts::apply_sidecar_refs("chat-2", &mut folded);
+        writer.sync(&folded).unwrap();
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            MessagePart::Tool {
+                output,
+                output_ref,
+                output_bytes,
+                diff,
+                diff_ref,
+                diff_stats,
+                ..
+            } => {
+                // One-liner chips: the fold drops outputs entirely (journal
+                // only), so even a direct apply_sidecar_refs call has no
+                // output to key — diff stats still get their ref (this test
+                // calls apply_sidecar_refs directly; the live fold no longer
+                // does).
+                assert_eq!(output.as_deref(), None);
+                assert_eq!(output_ref.as_deref(), None);
+                assert_eq!(*output_bytes, None);
+                assert!(diff.is_none(), "no inline diff text in the doc");
+                assert_eq!(diff_ref.as_deref(), Some("chat-2/t1.diff"));
+                let stats = diff_stats.as_ref().expect("stats survive");
+                assert_eq!(stats[0].path, "/w/a.rs");
+                assert_eq!((stats[0].additions, stats[0].deletions), (1, 1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Old pre-strip docs carry inline `output`/`diff` — they must still read
+    /// back (schema changes are serde-additive ONLY; old readers, old docs).
+    #[test]
+    fn pre_strip_doc_parts_still_round_trip() {
+        let doc = SessionDoc::init("chat-3").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "t1".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+                is_error: false,
+                resolved: true,
+                output: Some("full inline output\nline 2".into()),
+                diff: Some(zeron_proto::ToolDiff {
+                    path: "/w/a.rs".into(),
+                    old_text: Some("old".into()),
+                    new_text: "new".into(),
+                }),
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            MessagePart::Tool { output, diff, .. } => {
+                assert_eq!(output.as_deref(), Some("full inline output\nline 2"));
+                assert_eq!(diff.as_ref().unwrap().new_text, "new");
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -2615,52 +2233,6 @@ mod tests {
     }
 
     #[test]
-    fn command_queue_is_idempotent_by_entry_id() {
-        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let first = SessionCommandEntry {
-            id: "stable-id".into(),
-            payload: SessionCommandPayload::Interrupt {},
-            issued_by: "dev-a".into(),
-            issued_at: 10,
-            based_on: None,
-            expires_at: None,
-            status: SessionCommandStatus::Pending,
-            resolution: None,
-        };
-        let retry = SessionCommandEntry {
-            payload: SessionCommandPayload::Steer {
-                prompt: "must not replace the original".into(),
-                message_id: None,
-            },
-            ..first.clone()
-        };
-        doc.queue_command(&first).unwrap();
-        doc.queue_command(&retry).unwrap();
-        let commands = doc.read_commands().unwrap();
-        assert_eq!(commands, vec![first]);
-    }
-
-    #[test]
-    fn unknown_publication_kinds_do_not_enter_collaboration_state() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let record = PublicationRecord {
-            id: "future-1".into(),
-            schema_version: COLLABORATION_SCHEMA_VERSION,
-            published_at: 1,
-            published_by: "iap:alice@example.com".into(),
-            value: PublicationValue::Unknown {
-                kind: "futureControl".into(),
-                value: serde_json::json!({ "action": "mutate" }),
-            },
-            unknown: Default::default(),
-        };
-
-        assert!(doc.append_publication(&record).is_err());
-        assert!(doc.read_publications().unwrap().is_empty());
-    }
-
-    #[test]
     fn tail_materializes_last_n_joined() {
         let doc = SessionDoc::init("chat-1").unwrap();
         for i in 0..5 {
@@ -2674,106 +2246,102 @@ mod tests {
         assert_eq!(tail.chat_id, "chat-1");
     }
 
+    /// 2026-08-10 incident: entries/parts missing strict fields must salvage
+    /// field-by-field — a fresh reader importing a room's merged doc must
+    /// never render a BLANK transcript because some writer (old app version,
+    /// other-platform client, mangled export) omitted metadata.
     #[test]
-    fn entry_window_pages_from_tail_without_overlap() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        for i in 0..5 {
-            doc.push_message(&user_entry(&format!("m{i}"), &format!("msg {i}")))
-                .unwrap();
+    fn malformed_entries_salvage_instead_of_vanishing() {
+        // Entry missing `id` + `deviceId`; one part missing `kind` but
+        // carrying text; one part contentless (dropped).
+        let v = serde_json::json!({
+            "role": "assistant",
+            "createdAt": 123,
+            "parts": [
+                { "id": "p1", "text": "still readable" },
+                { "opaque": true },
+                { "id": "p3", "kind": "text", "text": "well-formed" }
+            ]
+        });
+        let entry = entry_from_json(v.clone()).expect("salvaged");
+        assert!(
+            entry.id.starts_with("recovered-"),
+            "deterministic stand-in id"
+        );
+        let again = entry_from_json(v).expect("salvaged again");
+        assert_eq!(entry.id, again.id, "recovered id is stable across reads");
+        assert_eq!(entry.role, MessageRole::Assistant);
+        assert_eq!(entry.created_at, 123);
+        assert_eq!(
+            entry.parts.len(),
+            2,
+            "text parts survive, contentless part dropped"
+        );
+        match &entry.parts[0] {
+            MessagePart::Text { text, .. } => assert_eq!(text, "still readable"),
+            other => panic!("unexpected {other:?}"),
         }
 
-        let tail = doc.read_entry_window(None, 2).unwrap();
-        assert_eq!(
-            tail.entries
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            ["m3", "m4"]
-        );
-        assert_eq!(tail.before, Some(3));
+        // Tool part missing `kind` but with a parseable call salvages as Tool.
+        let v = serde_json::json!({
+            "role": "assistant",
+            "createdAt": 1,
+            "parts": [ { "id": "t1", "call": { "kind": "exec", "command": "ls" }, "output": "x" } ]
+        });
+        let entry = entry_from_json(v).expect("salvaged");
+        assert!(matches!(
+            &entry.parts[0],
+            MessagePart::Tool { resolved: true, .. }
+        ));
 
-        let older = doc.read_entry_window(tail.before, 2).unwrap();
-        assert_eq!(
-            older
-                .entries
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            ["m1", "m2"]
-        );
-        assert_eq!(older.before, Some(1));
+        // Only non-objects are truly unsalvageable.
+        assert!(entry_from_json(serde_json::json!("garbage")).is_err());
+        assert!(entry_from_json(serde_json::json!(42)).is_err());
 
-        let oldest = doc.read_entry_window(older.before, 2).unwrap();
-        assert_eq!(
-            oldest
-                .entries
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            ["m0"]
-        );
-        assert_eq!(oldest.before, None);
+        // Well-formed entries take the strict path unchanged.
+        let v = serde_json::json!({
+            "id": "m1", "role": "user", "createdAt": 5, "deviceId": "d",
+            "parts": [ { "id": "p", "kind": "text", "text": "hi" } ]
+        });
+        let entry = entry_from_json(v).expect("strict");
+        assert_eq!(entry.id, "m1");
     }
+}
 
+#[cfg(test)]
+mod context_usage_tests {
+    use super::*;
     #[test]
-    fn entry_window_truncates_oversized_utf8_text_at_a_boundary() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let source = format!("{}END", "é".repeat(TAIL_TEXT_BYTE_BUDGET / 2 + 8));
-        doc.push_message(&user_entry("large", &source)).unwrap();
-
-        let window = doc.read_entry_window(None, 1).unwrap();
-        let MessagePart::TextWindow {
-            text,
-            omitted_prefix_bytes,
-            ..
-        } = &window.entries[0].parts[0]
-        else {
-            panic!("oversized text should be projected as a bounded window");
-        };
-        assert!(*omitted_prefix_bytes > 0);
-        assert!(source.is_char_boundary(*omitted_prefix_bytes));
-        assert_eq!(text, &source[*omitted_prefix_bytes..]);
-        assert!(text.len() <= TAIL_TEXT_BYTE_BUDGET);
-        assert!(text.ends_with("END"));
-    }
-
-    #[test]
-    fn entry_window_includes_continuations_with_their_root() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        doc.push_message(&user_entry("older", "older")).unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "root".into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: "first".into(),
-            }],
-            created_at: 2,
-            device_id: "dev-a".into(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-            peer_message: None,
-        })
-        .unwrap();
-        doc.push_message(&SessionMessageEntry {
-            id: "root#c1".into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text {
-                id: "t1".into(),
-                text: "second".into(),
-            }],
-            created_at: 2,
-            device_id: "dev-a".into(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: Some("root".into()),
-            peer_message: None,
-        })
-        .unwrap();
-
-        let tail = doc.read_entry_window(None, 1).unwrap();
-        assert_eq!(tail.entries.len(), 1);
-        assert_eq!(tail.entries[0].id, "root");
-        assert_eq!(tail.entries[0].parts.len(), 2);
-        assert_eq!(tail.before, Some(1));
+    fn context_snapshot_survives_remote_import_restart_and_rebuild() {
+        let host = SessionDoc::init("context-chat").unwrap();
+        assert_eq!(host.context_usage(), None);
+        host.update_context_usage(Some(150_000), Some(200_000))
+            .unwrap();
+        let replica = SessionDoc::from_doc(LoroDoc::new());
+        replica
+            .doc()
+            .import(&host.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(replica.context_usage(), host.context_usage());
+        let version = host.doc().oplog_vv();
+        // Compaction is a replacement, not an accumulating counter. Zero capacity is invalid.
+        host.update_context_usage(Some(0), Some(0)).unwrap();
+        replica
+            .doc()
+            .import(&host.doc().export(ExportMode::updates(&version)).unwrap())
+            .unwrap();
+        assert_eq!(
+            replica.context_usage(),
+            Some(zeron_proto::ContextUsage {
+                tokens: Some(0),
+                window: Some(200_000)
+            })
+        );
+        host.update_context_usage(None, Some(1_000_000)).unwrap();
+        assert_eq!(host.context_usage().unwrap().tokens, Some(0));
+        let rebuilt = crate::rebuild_thin_doc(&host).unwrap().doc;
+        assert_eq!(rebuilt.context_usage(), host.context_usage());
+        rebuilt.clear_context_usage().unwrap();
+        assert_eq!(rebuilt.context_usage(), None);
     }
 }

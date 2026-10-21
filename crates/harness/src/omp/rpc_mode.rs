@@ -20,21 +20,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
-use parking_lot::Mutex;
+use std::sync::Mutex;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use crate::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use comet_proto::{
-    AgentActivity, AgentActivityStatus, AgentEvent, DoneStatus, HarnessCommand,
-    HarnessCommandSubcommand, HarnessId, ModelRetry, OMP_GOAL_STATE_CALL_ID, OMP_GOAL_STATE_CALL_NAME,
-    TodoItem, ToolCall, UserInputQuestion,
-};
-
+use zeron_proto::{AgentEvent, DoneStatus, SlashCommand, HarnessId, TodoItem, ToolCall, UserInputQuestion};
 use crate::{HarnessError, RunControls};
-
+const OMP_GOAL_STATE_CALL_ID: &str = "omp-goal-state";
+const OMP_GOAL_STATE_CALL_NAME: &str = "OMP goal";
 const STATE_DEADLINE: Duration = Duration::from_secs(15);
 const INACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(300);
 /// Command metadata can change while skills, extensions, and MCP prompts finish
@@ -105,26 +101,20 @@ impl RpcModeClient {
         fields.insert("id".into(), Value::String(id.clone()));
         fields.insert("type".into(), Value::String(kind.into()));
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().insert(id.clone(), tx);
-        struct RemovePending<'a>(&'a Pending, String);
-        impl Drop for RemovePending<'_> {
-            fn drop(&mut self) {
-                self.0.lock().remove(&self.1);
-            }
-        }
-        let _pending = RemovePending(&self.pending, id.clone());
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone(), tx);
         if self.writer.send(Value::Object(fields).to_string()).is_err() {
-            self.pending.lock().remove(&id);
+            self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
             return Err(HarnessError::Protocol(
                 "OMP RPC child stdin closed".to_string(),
             ));
         }
-        match rx.await {
-            Ok(Ok(data)) => Ok(data),
-            Ok(Err(message)) => Err(HarnessError::Protocol(format!("OMP RPC {kind}: {message}"))),
-            Err(_) => Err(HarnessError::Protocol(format!(
-                "OMP RPC {kind}: child exited before responding"
-            ))),
+        let result = tokio::time::timeout(STATE_DEADLINE, rx).await;
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+        match result {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(message))) => Err(HarnessError::Protocol(format!("OMP RPC {kind}: {message}"))),
+            Ok(Err(_)) => Err(HarnessError::Protocol(format!("OMP RPC {kind}: child exited before responding"))),
+            Err(_) => Err(HarnessError::Protocol(format!("OMP RPC {kind}: response timed out"))),
         }
     }
 }
@@ -134,7 +124,7 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
         let mut framed = line.into_bytes();
         framed.push(b'\n');
         if let Err(error) = stdin.write_all(&framed).await {
-            tracing::debug!(target: "comet_harness::omp", %error, "RPC-mode stdin write failed");
+            tracing::debug!(target: "zeron_harness::omp", %error, "RPC-mode stdin write failed");
         }
     }
 }
@@ -174,12 +164,12 @@ fn assemble_chunk(active: &mut Option<ChunkAssembly>, frame: &Value) -> Option<V
         || assembly.byte_length != byte_length
         || assembly.next_index != index
     {
-        tracing::warn!(target: "comet_harness::omp", chunk_id, "RPC chunk sequence violated; dropping");
+        tracing::warn!(target: "zeron_harness::omp", chunk_id, "RPC chunk sequence violated; dropping");
         *active = None;
         return None;
     }
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) else {
-        tracing::warn!(target: "comet_harness::omp", chunk_id, "RPC chunk was not valid base64; dropping");
+        tracing::warn!(target: "zeron_harness::omp", chunk_id, "RPC chunk was not valid base64; dropping");
         *active = None;
         return None;
     };
@@ -191,7 +181,7 @@ fn assemble_chunk(active: &mut Option<ChunkAssembly>, frame: &Value) -> Option<V
     let assembly = active.take()?;
     if assembly.bytes.len() as u64 != assembly.byte_length {
         tracing::warn!(
-            target: "comet_harness::omp",
+            target: "zeron_harness::omp",
             chunk_id = %assembly.chunk_id,
             expected = assembly.byte_length,
             actual = assembly.bytes.len(),
@@ -202,7 +192,7 @@ fn assemble_chunk(active: &mut Option<ChunkAssembly>, frame: &Value) -> Option<V
     match serde_json::from_slice::<Value>(&assembly.bytes) {
         Ok(value) => Some(value),
         Err(error) => {
-            tracing::warn!(target: "comet_harness::omp", %error, "RPC chunk reassembly was not JSON; dropping");
+            tracing::warn!(target: "zeron_harness::omp", %error, "RPC chunk reassembly was not JSON; dropping");
             None
         }
     }
@@ -214,7 +204,7 @@ fn resolve_pending(pending: &Pending, frame: &Value) -> bool {
     let Some(id) = frame.get("id").and_then(Value::as_str) else {
         return false;
     };
-    let Some(sender) = pending.lock().remove(id) else {
+    let Some(sender) = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id) else {
         return false;
     };
     let result = if frame.get("success").and_then(Value::as_bool) == Some(true) {
@@ -239,7 +229,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<RpcFr
             continue;
         }
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
-            tracing::debug!(target: "comet_harness::omp", "skipping non-JSON RPC-mode line");
+            tracing::debug!(target: "zeron_harness::omp", "skipping non-JSON RPC-mode line");
             continue;
         };
         let frame = match frame.get("type").and_then(Value::as_str) {
@@ -259,7 +249,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<RpcFr
         }
     }
     // EOF: fail every awaited request, then tell the session loop.
-    pending.lock().clear();
+    pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     let _ = tx.send(RpcFrame::Eof).await;
 }
 
@@ -364,7 +354,9 @@ async fn kill_rpc_process(
         let _ = child.wait().await;
         return;
     }
-    let _ = child.kill().await;
+    if child.start_kill().is_ok() {
+        let _ = child.wait().await;
+    }
 }
 
 fn rpc_assistant_message_id(session_id: &str, nonce: &uuid::Uuid, turn: u64) -> String {
@@ -439,7 +431,7 @@ fn tool_call_from_start(frame: &Value) -> Option<AgentEvent> {
         }),
         "glob" => arg_str("pattern").map(|pattern| ToolCall::Glob { pattern }),
         "web_search" => arg_str("query").map(|query| ToolCall::WebSearch { query }),
-        "task" => agent_tasks(&args).map(|agents| ToolCall::Agent { agents }),
+        "task" => Some(ToolCall::Unknown { name: "Agent".into(), input: Some(args.clone()) }),
         _ => None,
     }
     .unwrap_or_else(|| ToolCall::Unknown {
@@ -452,69 +444,6 @@ fn tool_call_from_start(frame: &Value) -> Option<AgentEvent> {
         input: (!args.is_null()).then(|| args.clone()),
     });
     Some(AgentEvent::ToolCall { id, call })
-}
-
-fn agent_tasks(args: &Value) -> Option<Vec<AgentActivity>> {
-    let tasks = args.get("tasks")?.as_array()?;
-    (!tasks.is_empty()).then(|| {
-        tasks
-            .iter()
-            .enumerate()
-            .map(|(index, task)| AgentActivity {
-                id: task
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("Agent {}", index + 1)),
-                role: task
-                    .get("agent")
-                    .and_then(Value::as_str)
-                    .unwrap_or("task")
-                    .to_string(),
-                status: AgentActivityStatus::Pending,
-                model: None,
-            })
-            .collect()
-    })
-}
-
-/// Subagent progress from a task tool result or in-flight partial result,
-/// mirroring the ACP `rawOutput.details.progress` shape.
-fn agent_progress(frame: &Value) -> Option<Vec<AgentActivity>> {
-    let progress = frame
-        .pointer("/result/details/progress")
-        .or_else(|| frame.pointer("/partialResult/details/progress"))?
-        .as_array()?;
-    (!progress.is_empty()).then(|| {
-        progress
-            .iter()
-            .enumerate()
-            .map(|(index, activity)| AgentActivity {
-                id: activity
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("Agent {}", index + 1)),
-                role: activity
-                    .get("agent")
-                    .and_then(Value::as_str)
-                    .unwrap_or("task")
-                    .to_string(),
-                status: super::agent_activity_status(
-                    activity
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("running"),
-                ),
-                model: activity
-                    .get("resolvedModel")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            })
-            .collect()
-    })
 }
 
 fn result_text(result: &Value) -> Option<String> {
@@ -541,11 +470,9 @@ fn assistant_message_event(frame: &Value) -> Option<AgentEvent> {
     let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
     match kind {
         "text_delta" if !delta.is_empty() => Some(AgentEvent::TextDelta { text: delta.into() }),
-        "thinking_start" => Some(AgentEvent::ReasoningStarted),
         "thinking_delta" if !delta.is_empty() => {
             Some(AgentEvent::ReasoningDelta { text: delta.into() })
         }
-        "thinking_end" => Some(AgentEvent::ReasoningCompleted),
         _ => None,
     }
 }
@@ -560,49 +487,27 @@ fn command_output_event(frame: &Value) -> Option<AgentEvent> {
         })
 }
 
-fn tool_progress_from_update(frame: &Value) -> Option<AgentEvent> {
-    let id = frame
-        .get("toolCallId")
-        .and_then(Value::as_str)
-        .unwrap_or("omp-tool")
-        .to_string();
-    if let Some(agents) = agent_progress(frame) {
-        return Some(AgentEvent::ToolCall {
-            id,
-            call: ToolCall::Agent { agents },
-        });
-    }
-    Some(AgentEvent::ToolProgress {
-        id,
-        output: frame
-            .get("partialResult")
-            .and_then(result_text)
-            .map(comet_proto::truncate_tool_output),
-    })
-}
-
 fn tool_result_from_end(frame: &Value) -> Option<AgentEvent> {
     let id = frame
         .get("toolCallId")
         .and_then(Value::as_str)
         .unwrap_or("omp-tool")
         .to_string();
-    if let Some(agents) = agent_progress(frame) {
-        return Some(AgentEvent::ToolCall {
-            id,
-            call: ToolCall::Agent { agents },
-        });
-    }
     Some(AgentEvent::ToolResult {
         id,
         is_error: frame.get("isError").and_then(Value::as_bool) == Some(true),
+        diff: None,
         output: frame
             .get("result")
             .and_then(result_text)
-            .map(comet_proto::truncate_tool_output),
+            .map(|mut output| {
+                let mut end = output.len().min(16_384);
+                while !output.is_char_boundary(end) { end -= 1; }
+                output.truncate(end);
+                output
+            }),
     })
 }
-
 /// The error carried by an assistant message that ended with
 /// `stopReason: "error"` (observed live: `errorMessage` is the provider's
 /// error body).
@@ -617,26 +522,6 @@ fn assistant_error(message: &Value) -> Option<String> {
             .unwrap_or("OMP reported a model error")
             .to_string(),
     )
-}
-
-fn model_retry_from_frame(frame: &Value) -> Option<AgentEvent> {
-    let retry = match frame.get("type")?.as_str()? {
-        "auto_retry_start" => {
-            let attempt = u32::try_from(frame.get("attempt")?.as_u64()?).ok()?;
-            let max_attempts = u32::try_from(frame.get("maxAttempts")?.as_u64()?).ok()?;
-            if attempt == 0 || attempt > max_attempts {
-                return None;
-            }
-            // OMP counts retries; the composer shows total model-call attempts.
-            Some(ModelRetry {
-                attempt: attempt.checked_add(1)?,
-                max_attempts: max_attempts.checked_add(1)?,
-            })
-        }
-        "auto_retry_end" => None,
-        _ => return None,
-    };
-    Some(AgentEvent::ModelRetry { retry })
 }
 
 fn usage_event(message: &Value) -> Option<AgentEvent> {
@@ -667,6 +552,7 @@ fn todo_items_from_state(state: &Value) -> Vec<TodoItem> {
             Some(TodoItem {
                 text: text.to_string(),
                 done: task.get("status").and_then(Value::as_str) == Some("completed"),
+                status: task.get("status").cloned().and_then(|value| serde_json::from_value(value).ok()),
             })
         })
         .collect()
@@ -700,63 +586,16 @@ fn goal_state_event_from_frame(frame: &Value) -> Option<AgentEvent> {
     })
 }
 
-fn commands_from_frame(frame: &Value) -> Option<Vec<HarnessCommand>> {
-    let mut commands = frame
-        .get("commands")?
-        .as_array()?
-        .iter()
-        .filter_map(|command| {
-            Some(HarnessCommand {
-                name: command.get("name")?.as_str()?.to_string(),
-                description: command
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                input_hint: command
-                    .pointer("/input/hint")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                aliases: command
-                    .get("aliases")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect(),
-                subcommands: command
-                    .get("subcommands")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|subcommand| {
-                        Some(HarnessCommandSubcommand {
-                            name: subcommand.get("name")?.as_str()?.to_string(),
-                            description: subcommand
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            usage: subcommand
-                                .get("usage")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        })
-                    })
-                    .collect(),
-                source: command
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            })
+fn commands_from_frame(frame: &Value) -> Option<Vec<SlashCommand>> {
+    let mut commands: Vec<_> = frame.get("commands")?.as_array()?.iter().filter_map(|command| {
+        Some(SlashCommand {
+            name: command.get("name")?.as_str()?.to_owned(),
+            description: command.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            input_hint: command.pointer("/input/hint").and_then(Value::as_str).map(str::to_owned),
         })
-        .collect::<Vec<_>>();
-    // OMP 17.2.9 executes `/goal` in RPC mode but omits TUI-backed mode
-    // commands from `available_commands_update`. Keep runtime metadata when
-    // OMP starts advertising it; otherwise expose the executable command.
+    }).collect();
     if !commands.iter().any(|command| command.name == "goal") {
-        commands.push(comet_proto::omp_goal_command());
+        commands.push(SlashCommand { name: "goal".into(), description: "Manage this session's goal".into(), input_hint: Some("goal | status | drop".into()) });
     }
     Some(commands)
 }
@@ -794,6 +633,8 @@ fn handle_ui_request(frame: &Value, client: &RpcModeClient, request_input: &supe
                 },
                 options: vec!["Continue".into(), "Cancel".into()],
                 multi_select: false,
+                prefill: None,
+                multiline: false,
             }]);
             let client = client.clone();
             tokio::spawn(async move {
@@ -831,6 +672,8 @@ fn handle_ui_request(frame: &Value, client: &RpcModeClient, request_input: &supe
                 question: message.to_string(),
                 options,
                 multi_select: false,
+                prefill: None,
+                multiline: false,
             }]);
             let client = client.clone();
             tokio::spawn(async move {
@@ -895,7 +738,7 @@ fn is_goal_command(prompt: &str) -> bool {
 /// the steering mailbox closes, the run is interrupted, or the child dies.
 pub(crate) async fn run_rpc(
     process: RpcModeProcess,
-    request: comet_proto::RunRequest,
+    request: zeron_proto::RunRequest,
     controls: RunControls,
     events: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     interrupt_grace: Duration,
@@ -915,7 +758,15 @@ pub(crate) async fn run_rpc(
         mut steering,
         interrupt,
         context: _,
+        execution_lease: _execution_lease,
+        realtime: _,
+        turn: turn_control,
     } = controls;
+    let cleanup_interrupt = interrupt.clone();
+    let cleanup_events = events.clone();
+    let mut cancelled_during_startup = false;
+    let result = tokio::select! {
+        result = async {
     let crash = |child: &mut Child, label: &str| {
         HarnessError::Protocol(crate::crash_message(
             label,
@@ -924,73 +775,53 @@ pub(crate) async fn run_rpc(
         ))
     };
 
-    // All startup waits honor interruption before any readiness is published.
-    let startup = async {
-        // Stage 1: the ready frame (always the first stdout object).
-        let ready = tokio::time::timeout(super::RPC_STARTUP_DEADLINE, async {
-            loop {
-                match frames.recv().await {
-                    Some(RpcFrame::Frame(frame))
-                        if frame.get("type").and_then(Value::as_str) == Some("ready") =>
-                    {
-                        return Ok(frame);
-                    }
-                    Some(RpcFrame::Frame(_)) => continue,
-                    Some(RpcFrame::Eof) | None => Err::<Value, ()>(()),
-                }?;
-            }
-        })
+    // Stage 1: the ready frame (always the first stdout object).
+    let ready = tokio::time::timeout(super::RPC_STARTUP_DEADLINE, async {
+        loop {
+            match frames.recv().await {
+                Some(RpcFrame::Frame(frame))
+                    if frame.get("type").and_then(Value::as_str) == Some("ready") =>
+                {
+                    return Ok(frame);
+                }
+                Some(RpcFrame::Frame(_)) => continue,
+                Some(RpcFrame::Eof) | None => Err::<Value, ()>(()),
+            }?;
+        }
+    })
+    .await
+    .map_err(|_| {
+        HarnessError::Protocol(format!(
+            "{} ready frame timed out after {}s",
+            options.process_label,
+            super::RPC_STARTUP_DEADLINE.as_secs()
+        ))
+    })?
+    .map_err(|()| crash(&mut child, options.process_label))?;
+
+    // Stage 2: negotiate lossless framing when the server advertises v2.
+    let supports_v2 = ready
+        .get("supportedProtocolVersions")
+        .and_then(Value::as_array)
+        .is_some_and(|versions| versions.iter().any(|v| v.as_u64() == Some(2)));
+    if supports_v2 {
+        let mut fields = Map::new();
+        fields.insert("protocolVersion".into(), json!(2));
+        if let Err(error) = client.request("negotiate_protocol", fields).await {
+            tracing::warn!(target: "zeron_harness::omp", %error, "protocol v2 negotiation failed; staying on v1");
+        }
+    }
+
+    // Stage 3: session identity (and resume validation) from get_state.
+    let state = tokio::time::timeout(STATE_DEADLINE, client.request("get_state", Map::new()))
         .await
         .map_err(|_| {
             HarnessError::Protocol(format!(
-                "{} ready frame timed out after {}s",
+                "{} get_state timed out after {}s",
                 options.process_label,
-                super::RPC_STARTUP_DEADLINE.as_secs()
+                STATE_DEADLINE.as_secs()
             ))
-        })?
-        .map_err(|()| crash(&mut child, options.process_label))?;
-
-        // Stage 2: fail closed if the advertised v2 negotiation is uncertain.
-        let supports_v2 = ready
-            .get("supportedProtocolVersions")
-            .and_then(Value::as_array)
-            .is_some_and(|versions| versions.iter().any(|v| v.as_u64() == Some(2)));
-        if supports_v2 {
-            let mut fields = Map::new();
-            fields.insert("protocolVersion".into(), json!(2));
-            tokio::time::timeout(STATE_DEADLINE, client.request("negotiate_protocol", fields))
-                .await
-                .map_err(|_| HarnessError::Protocol(format!(
-                    "{} protocol negotiation timed out after {}s; retry the session",
-                    options.process_label, STATE_DEADLINE.as_secs()
-                )))??;
-        }
-
-        // Stage 3: session identity (and resume validation) from get_state.
-        tokio::time::timeout(STATE_DEADLINE, client.request("get_state", Map::new()))
-            .await
-            .map_err(|_| {
-                HarnessError::Protocol(format!(
-                    "{} get_state timed out after {}s",
-                    options.process_label,
-                    STATE_DEADLINE.as_secs()
-                ))
-            })?
-    };
-    let state = tokio::select! {
-        biased;
-        _ = interrupt.cancelled() => {
-            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-            return Ok(());
-        }
-        result = startup => match result {
-            Ok(state) => state,
-            Err(error) => {
-                kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                return Err(error);
-            }
-        },
-    };
+        })??;
     let session_id = state
         .get("sessionId")
         .and_then(Value::as_str)
@@ -1060,15 +891,12 @@ pub(crate) async fn run_rpc(
         ),
         &request.prompt,
     )];
-    let mut todo_state_request: Option<String> = None;
-    let mut goal_state_request: Option<String> = None;
-    let state_deadline = tokio::time::sleep(STATE_DEADLINE);
-    tokio::pin!(state_deadline);
 
     let mut steering_open = true;
     let mut streaming = false;
     let mut turn_error: Option<String> = None;
     let mut done_emitted = false;
+    let mut stopped = false;
     let inactivity = tokio::time::sleep(INACTIVITY_LOG_INTERVAL);
     tokio::pin!(inactivity);
 
@@ -1132,14 +960,6 @@ pub(crate) async fn run_rpc(
                             return Ok(());
                         }
                     }
-                    "tool_execution_update" => {
-                        if let Some(event) = tool_progress_from_update(&frame)
-                            && events.send(Ok(event)).await.is_err()
-                        {
-                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                            return Ok(());
-                        }
-                    }
                     "tool_execution_end" => {
                         let todo_tool = frame.get("toolName").and_then(Value::as_str) == Some("todo")
                             && frame.get("isError").and_then(Value::as_bool) != Some(true);
@@ -1149,23 +969,27 @@ pub(crate) async fn run_rpc(
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
                             return Ok(());
                         }
-                        // Keep draining frames while the state response is queued behind
-                        // tool output; awaiting it here can deadlock the bounded reader.
-                        if todo_tool {
-                            todo_state_request = Some(client.send_command("get_state", Map::new()));
-                            state_deadline.as_mut().reset(Instant::now() + STATE_DEADLINE);
+                        // The todo tool mutates session-held state; the frame
+                        // carries only the op. Snapshot the resulting phases so
+                        // Comet renders the plan like the ACP lane's `plan`
+                        // updates did.
+                        if todo_tool && let Ok(state) = client.request("get_state", Map::new()).await {
+                            let items = todo_items_from_state(&state);
+                            if events
+                                .send(Ok(AgentEvent::ToolCall {
+                                    id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                                    call: ToolCall::Todo { items },
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                                return Ok(());
+                            }
                         }
                     }
                     "goal_updated" => {
                         if let Some(event) = goal_state_event_from_frame(&frame)
-                            && events.send(Ok(event)).await.is_err()
-                        {
-                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                            return Ok(());
-                        }
-                    }
-                    "auto_retry_start" | "auto_retry_end" => {
-                        if let Some(event) = model_retry_from_frame(&frame)
                             && events.send(Ok(event)).await.is_err()
                         {
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
@@ -1177,19 +1001,17 @@ pub(crate) async fn run_rpc(
                             continue;
                         }
                         streaming = false;
-                        let status = if turn_error.is_some() {
+                        let status = if std::mem::take(&mut stopped) {
+                            DoneStatus::Interrupted
+                        } else if turn_error.is_some() {
                             DoneStatus::Errored
                         } else {
                             DoneStatus::Completed
                         };
-                        if let Some(message) = turn_error.clone()
-                            && events.send(Ok(AgentEvent::Error { message })).await.is_err()
-                        {
-                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                            return Ok(());
-                        }
                         // A terminal error closes the persistent RPC run. Reap its
                         // session writer before Done makes queued recovery dispatchable.
+                        // Done carries the sole visible error; emitting Error as
+                        // well would fold the same failure into two transcript cards.
                         if status == DoneStatus::Errored {
                             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
                         }
@@ -1233,31 +1055,6 @@ pub(crate) async fn run_rpc(
                     }
                     "response" => {
                         let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
-                        let todo_refresh = todo_state_request.as_deref() == Some(id);
-                        let goal_refresh = goal_state_request.as_deref() == Some(id);
-                        if todo_refresh || goal_refresh {
-                            if todo_refresh { todo_state_request = None; }
-                            if goal_refresh { goal_state_request = None; }
-                            if frame.get("success").and_then(Value::as_bool) == Some(true) {
-                                let state = &frame["data"];
-                                let event = if todo_refresh {
-                                    AgentEvent::ToolCall {
-                                        id: "omp-plan".into(),
-                                        call: ToolCall::Todo { items: todo_items_from_state(state) },
-                                    }
-                                } else {
-                                    goal_state_event_from_session_state(state)
-                                        .unwrap_or_else(|| goal_state_event(Value::Null, None))
-                                };
-                                if events.send(Ok(event)).await.is_err() {
-                                    kill_rpc_process(&mut child, process_group, interrupt_grace).await;
-                                    return Ok(());
-                                }
-                            } else {
-                                tracing::warn!(target: "comet_harness::omp", error = ?frame.get("error"),
-                                    "RPC state refresh failed");
-                            }
-                        }
                         if let Some(index) = outstanding_prompts.iter().position(|prompt| prompt.id == id) {
                             let prompt = outstanding_prompts.swap_remove(index);
                             if frame.get("success").and_then(Value::as_bool) != Some(true) {
@@ -1277,8 +1074,21 @@ pub(crate) async fn run_rpc(
                             // Snapshot after the ack so the editor indicator appears
                             // immediately and `/goal drop` clears persisted state.
                             if prompt.refresh_goal_state {
-                                goal_state_request = Some(client.send_command("get_state", Map::new()));
-                                state_deadline.as_mut().reset(Instant::now() + STATE_DEADLINE);
+                                match client.request("get_state", Map::new()).await {
+                                    Ok(state) => {
+                                        let event = goal_state_event_from_session_state(&state)
+                                            .unwrap_or_else(|| goal_state_event(Value::Null, None));
+                                        if events.send(Ok(event)).await.is_err() {
+                                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                                            return Ok(());
+                                        }
+                                    }
+                                    Err(error) => tracing::warn!(
+                                        target: "zeron_harness::omp",
+                                        %error,
+                                        "goal command state refresh failed"
+                                    ),
+                                }
                             }
                             // Local-only prompt: completed without agent events.
                             if frame.pointer("/data/agentInvoked").and_then(Value::as_bool)
@@ -1351,12 +1161,18 @@ pub(crate) async fn run_rpc(
                     }
                     done_emitted = false;
                     outstanding_prompts.push(PendingPrompt::new(
-                        client.send_command("prompt", prompt_fields(&message.prompt, Vec::new())),
+                        client.send_command("prompt", prompt_fields(&message.prompt, image_content(&message.attachments))),
                         &message.prompt,
                     ));
                 }
                 None => steering_open = false,
             },
+            _ = turn_control.stop_requested(), if streaming || !done_emitted => {
+                stopped = true;
+                // Abort only the foreground turn; the persistent native session stays alive.
+                tokio::time::timeout(interrupt_grace, client.request("abort", Map::new()))
+                    .await.map_err(|_| HarnessError::Protocol("OMP turn abort timed out".into()))??;
+            }
             _ = interrupt.cancelled() => {
                 // The RPC peer may accept stdin while never answering `abort`,
                 // and a successful abort does not exit the persistent RPC host.
@@ -1380,15 +1196,10 @@ pub(crate) async fn run_rpc(
                     .ok();
                 return Ok(());
             }
-            _ = &mut state_deadline, if todo_state_request.is_some() || goal_state_request.is_some() => {
-                todo_state_request = None;
-                goal_state_request = None;
-                tracing::warn!(target: "comet_harness::omp", "RPC state refresh timed out");
-            }
             _ = &mut inactivity => {
                 if streaming {
                     tracing::warn!(
-                        target: "comet_harness::omp",
+                        target: "zeron_harness::omp",
                         process = options.process_label,
                         inactivity_ms = INACTIVITY_LOG_INTERVAL.as_millis() as u64,
                         "RPC turn remains active without frames"
@@ -1404,17 +1215,25 @@ pub(crate) async fn run_rpc(
         // The run ends only once the mailbox is closed AND the current turn
         // has fully settled: an early mailbox close (engine teardown racing
         // agent_start) must never kill a turn that is still owed its Done.
-        if !steering_open
-            && !streaming
-            && done_emitted
-            && outstanding_prompts.is_empty()
-            && todo_state_request.is_none()
-            && goal_state_request.is_none()
-        {
+        if !steering_open && !streaming && done_emitted && outstanding_prompts.is_empty() {
             kill_rpc_process(&mut child, process_group, interrupt_grace).await;
             return Ok(());
         }
     }
+        } => result,
+        _ = cleanup_interrupt.cancelled() => {
+            let _ = tokio::time::timeout(interrupt_grace, client.request("abort", Map::new())).await;
+            cancelled_during_startup = true;
+            Ok(())
+        },
+        _ = cleanup_events.closed() => Ok(()),
+    };
+    kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+    if cancelled_during_startup {
+        let _ = cleanup_events.send(Ok(AgentEvent::Done { status: DoneStatus::Interrupted,
+            result: None, error: None, session_id: request.resume.clone() })).await;
+    }
+    result
 }
 
 /// One-shot command catalog. OMP emits a startup snapshot and may emit richer
@@ -1424,7 +1243,7 @@ pub(crate) async fn run_rpc(
 pub(crate) async fn command_catalog(
     mut process: RpcModeProcess,
     deadline: Duration,
-) -> Result<Vec<HarnessCommand>, HarnessError> {
+) -> Result<Vec<SlashCommand>, HarnessError> {
     let result = tokio::time::timeout(deadline, async {
         let mut latest = None;
         let mut requested = false;
@@ -1484,543 +1303,18 @@ pub(crate) async fn command_catalog(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
-    async fn stalled_negotiation_times_out_or_cancels_without_readiness() {
-        for cancel in [false, true] {
-            let child = tokio::process::Command::new("/bin/sleep")
-                .arg("600").kill_on_drop(true).spawn().unwrap();
-            let pid = child.id().unwrap();
-            let (writer, mut requests) = mpsc::unbounded_channel();
-            let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-            let client = RpcModeClient {
-                writer, pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
-            };
-            let (frames_tx, frames) = mpsc::channel(1);
-            frames_tx.send(RpcFrame::Frame(json!({
-                "type": "ready", "supportedProtocolVersions": [1, 2]
-            }))).await.unwrap();
-            let interrupt = crate::CancellationToken::new();
-            let (_steer, steering) = mpsc::channel(1);
-            let (events, mut received) = mpsc::channel(8);
-            let task = tokio::spawn(run_rpc(
-                RpcModeProcess {
-                    child, client, frames, process_group: None,
-                    process_group_guard: ProcessGroupGuard::new(None, false),
-                    stderr_tail: crate::StderrTail::default(), run_config: None,
-                },
-                comet_proto::RunRequest {
-                    prompt: "hello".into(), model: None, agent_account_id: None,
-                    reasoning: None, model_options: Map::new(), cwd: String::new(),
-                    sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-                    auto_approve: false, resume: None, attachments: Vec::new(),
-                },
-                RunControls {
-                    request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
-                    steering, interrupt: interrupt.clone(), context: None,
-                },
-                events, Duration::ZERO,
-                RpcRunOptions { process_label: "test OMP", expected_resume: None },
-            ));
-            let request: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
-            assert_eq!(request["type"], "negotiate_protocol");
-            if cancel {
-                interrupt.cancel();
-            } else {
-                tokio::time::advance(STATE_DEADLINE).await;
-            }
-            let result = task.await.unwrap();
-            if cancel {
-                assert!(result.is_ok());
-            } else {
-                assert!(result.unwrap_err().to_string().contains("protocol negotiation timed out"));
-            }
-            assert!(pending.lock().is_empty(), "cancelled request retained in pending map");
-            assert!(received.recv().await.is_none(), "startup falsely published readiness");
-            assert!(requests.try_recv().is_err(), "uncertain negotiation fell back to v1");
-            assert!(super::super::process_birth(pid).is_none(), "startup child survived");
-        }
-    }
-
-    #[cfg(unix)]
     #[test]
-    fn process_group_guard_kills_child_when_run_future_drops() {
-        use std::os::unix::process::CommandExt as _;
-
-        let mut command = std::process::Command::new("/bin/sh");
-        command
-            .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0);
-        let mut child = command.spawn().unwrap();
-        let guard = ProcessGroupGuard::new(Some(child.id() as i32), false);
-        drop(guard);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if child.try_wait().unwrap().is_none() {
-            let _ = child.kill();
-            panic!("process group survived its run guard");
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rpc_teardown_sends_sigterm_before_forcing_the_group() {
-        use std::os::unix::process::CommandExt as _;
-
-        let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("ready");
-        let terminated = temp.path().join("terminated");
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                "trap 'echo term >\"$TERMINATED\"; exit 0' TERM; echo ready >\"$READY\"; while :; do sleep 1; done",
-            ])
-            .env("READY", &ready)
-            .env("TERMINATED", &terminated)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        command.as_std_mut().process_group(0);
-        let mut child = command.spawn().unwrap();
-        let group = child.id().unwrap() as i32;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !ready.exists() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            ready.exists(),
-            "test process did not install its TERM handler"
-        );
-
-        kill_rpc_process(&mut child, Some(group), Duration::from_millis(250)).await;
-
-        assert!(terminated.exists(), "RPC teardown skipped graceful SIGTERM");
-        assert!(child.try_wait().unwrap().is_some());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rpc_teardown_waits_only_the_configured_grace_before_sigkill() {
-        use std::os::unix::process::CommandExt as _;
-
-        let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("ready");
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                "trap '' TERM; echo ready >\"$READY\"; while :; do sleep 1; done",
-            ])
-            .env("READY", &ready)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        command.as_std_mut().process_group(0);
-        let mut child = command.spawn().unwrap();
-        let group = child.id().unwrap() as i32;
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
-        while !ready.exists() && Instant::now() < ready_deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(ready.exists(), "test process did not ignore SIGTERM");
-
-        let grace = Duration::from_millis(125);
-        let started = Instant::now();
-        kill_rpc_process(&mut child, Some(group), grace).await;
-
-        assert!(
-            started.elapsed() >= grace,
-            "SIGKILL escalation ignored the configured grace"
-        );
-        assert!(child.try_wait().unwrap().is_some());
-    }
-    #[test]
-    fn chunk_reassembly_round_trips() {
-        let payload = json!({ "type": "response", "id": "x", "success": true });
-        let bytes = payload.to_string().into_bytes();
+    fn native_chunks_round_trip_and_reject_out_of_order_frames() {
+        let payload = json!({"type":"response","id":"x","success":true});
+        let bytes = serde_json::to_vec(&payload).unwrap();
         let (a, b) = bytes.split_at(bytes.len() / 2);
-        let encode = |part: &[u8]| base64::engine::general_purpose::STANDARD.encode(part);
+        let frame = |index, part| json!({
+            "type":"rpc_chunk", "chunkId":"r1", "index":index, "count":2,
+            "byteLength":bytes.len(), "data":base64::engine::general_purpose::STANDARD.encode(part),
+        });
         let mut active = None;
-        let first = json!({
-            "type": "rpc_chunk", "chunkId": "r1", "index": 0, "count": 2,
-            "byteLength": bytes.len(), "data": encode(a),
-        });
-        assert!(assemble_chunk(&mut active, &first).is_none());
-        let second = json!({
-            "type": "rpc_chunk", "chunkId": "r1", "index": 1, "count": 2,
-            "byteLength": bytes.len(), "data": encode(b),
-        });
-        assert_eq!(assemble_chunk(&mut active, &second), Some(payload));
-    }
-
-    #[test]
-    fn chunk_reassembly_rejects_out_of_order_sequences() {
-        let mut active = None;
-        let stray = json!({
-            "type": "rpc_chunk", "chunkId": "r2", "index": 1, "count": 2,
-            "byteLength": 10, "data": "aGk=",
-        });
-        assert!(assemble_chunk(&mut active, &stray).is_none());
-        assert!(active.is_none());
-    }
-
-    #[test]
-    fn maps_common_tools_to_native_calls() {
-        let bash = json!({
-            "type": "tool_execution_start",
-            "toolCallId": "t1", "toolName": "bash",
-            "args": { "command": "echo hi" }, "intent": "Run echo hi",
-        });
-        let Some(AgentEvent::ToolCall { id, call }) = tool_call_from_start(&bash) else {
-            panic!("expected tool call");
-        };
-        assert_eq!(id, "t1");
-        assert_eq!(
-            call,
-            ToolCall::Exec {
-                command: "echo hi".into()
-            }
-        );
-
-        let unknown = json!({
-            "type": "tool_execution_start",
-            "toolCallId": "t2", "toolName": "mystery",
-            "args": { "x": 1 }, "intent": "Do something",
-        });
-        let Some(AgentEvent::ToolCall { call, .. }) = tool_call_from_start(&unknown) else {
-            panic!("expected tool call");
-        };
-        assert_eq!(
-            call,
-            ToolCall::Unknown {
-                name: "Do something".into(),
-                input: Some(json!({ "x": 1 })),
-            }
-        );
-    }
-
-    #[test]
-    fn maps_task_tool_to_agent_activities() {
-        let start = json!({
-            "type": "tool_execution_start",
-            "toolCallId": "t3", "toolName": "task",
-            "args": { "tasks": [{ "name": "ScoutOne", "agent": "scout" }] },
-        });
-        let Some(AgentEvent::ToolCall { call, .. }) = tool_call_from_start(&start) else {
-            panic!("expected tool call");
-        };
-        let ToolCall::Agent { agents } = call else {
-            panic!("expected agent call");
-        };
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].id, "ScoutOne");
-        assert_eq!(agents[0].role, "scout");
-        assert_eq!(agents[0].status, AgentActivityStatus::Pending);
-
-        let end = json!({
-            "type": "tool_execution_end",
-            "toolCallId": "t3", "toolName": "task", "isError": false,
-            "result": { "details": { "progress": [
-                { "id": "ScoutOne", "agent": "scout", "status": "completed", "resolvedModel": "m-1" }
-            ]}},
-        });
-        let Some(AgentEvent::ToolCall { call, .. }) = tool_result_from_end(&end) else {
-            panic!("expected agent update");
-        };
-        let ToolCall::Agent { agents } = call else {
-            panic!("expected agent call");
-        };
-        assert_eq!(agents[0].status, AgentActivityStatus::Completed);
-        assert_eq!(agents[0].model.as_deref(), Some("m-1"));
-    }
-
-    #[test]
-    fn maps_reasoning_lifecycle_without_exposing_private_text() {
-        for (kind, expected) in [
-            ("thinking_start", AgentEvent::ReasoningStarted),
-            ("thinking_end", AgentEvent::ReasoningCompleted),
-        ] {
-            let frame = json!({
-                "assistantMessageEvent": { "type": kind }
-            });
-            assert_eq!(assistant_message_event(&frame), Some(expected));
-        }
-
-        let delta = json!({
-            "assistantMessageEvent": { "type": "thinking_delta", "delta": "private" }
-        });
-        assert_eq!(
-            assistant_message_event(&delta),
-            Some(AgentEvent::ReasoningDelta {
-                text: "private".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn maps_slash_command_output_to_preformatted_text() {
-        assert_eq!(
-            command_output_event(&json!({
-                "type": "command_output",
-                "text": "MCP server management\n/mcp list    List configured servers"
-            })),
-            Some(AgentEvent::TextDelta {
-                text: "    MCP server management\n    /mcp list    List configured servers".into()
-            })
-        );
-        assert_eq!(command_output_event(&json!({ "text": "" })), None);
-    }
-
-    #[test]
-    fn maps_bounded_tool_progress_without_resolving_the_call() {
-        let update = json!({
-            "type": "tool_execution_update",
-            "toolCallId": "t1",
-            "partialResult": { "content": [{ "type": "text", "text": "working" }] },
-        });
-        assert_eq!(
-            tool_progress_from_update(&update),
-            Some(AgentEvent::ToolProgress {
-                id: "t1".into(),
-                output: Some("working".into()),
-            })
-        );
-    }
-
-    #[test]
-    fn tool_result_extracts_text_blocks() {
-        let end = json!({
-            "type": "tool_execution_end",
-            "toolCallId": "t1", "toolName": "bash", "isError": false,
-            "result": { "content": [{ "type": "text", "text": "hi" }], "details": {} },
-        });
-        let Some(AgentEvent::ToolResult {
-            id,
-            is_error,
-            output,
-        }) = tool_result_from_end(&end)
-        else {
-            panic!("expected tool result");
-        };
-        assert_eq!(id, "t1");
-        assert!(!is_error);
-        assert_eq!(output.as_deref(), Some("hi"));
-    }
-
-    #[test]
-    fn assistant_error_surfaces_stop_reason() {
-        let errored = json!({
-            "role": "assistant", "stopReason": "error",
-            "errorMessage": "model: not found",
-        });
-        assert_eq!(
-            assistant_error(&errored).as_deref(),
-            Some("model: not found")
-        );
-        let clean = json!({ "role": "assistant", "stopReason": "toolUse" });
-        assert_eq!(assistant_error(&clean), None);
-    }
-
-    #[test]
-    fn retry_progress_counts_total_attempts_and_rejects_invalid_bounds() {
-        for (attempt, total) in [(1, 2), (3, 4)] {
-            assert_eq!(
-                model_retry_from_frame(&json!({
-                    "type": "auto_retry_start", "attempt": attempt, "maxAttempts": 3,
-                    "errorMessage": "private provider response",
-                })),
-                Some(AgentEvent::ModelRetry {
-                    retry: Some(ModelRetry { attempt: total, max_attempts: 4 }),
-                }),
-            );
-        }
-        for (attempt, max_attempts) in [(0, 3), (4, 3), (1, u64::MAX), (1, u32::MAX as u64)] {
-            assert_eq!(
-                model_retry_from_frame(&json!({
-                    "type": "auto_retry_start", "attempt": attempt, "maxAttempts": max_attempts,
-                })),
-                None,
-            );
-        }
-        assert_eq!(
-            model_retry_from_frame(&json!({ "type": "auto_retry_end", "success": false })),
-            Some(AgentEvent::ModelRetry { retry: None }),
-        );
-    }
-
-    #[test]
-    fn usage_sums_context_tokens() {
-        let message = json!({
-            "usage": { "input": 6, "output": 4, "cacheRead": 100, "cacheWrite": 50 }
-        });
-        assert_eq!(
-            usage_event(&message),
-            Some(AgentEvent::Usage {
-                input_tokens: 156,
-                output_tokens: 4,
-            })
-        );
-        assert_eq!(usage_event(&json!({ "usage": null })), None);
-    }
-
-    #[test]
-    fn todo_state_flattens_to_items() {
-        let state = json!({
-            "todoPhases": [
-                { "id": "p1", "name": "Build", "tasks": [
-                    { "id": "t1", "content": "Map surface", "status": "completed" },
-                    { "id": "t2", "content": "Write loop", "status": "in_progress" },
-                ]},
-                { "id": "p2", "name": "Verify", "tasks": [
-                    { "id": "t3", "content": "Run tests", "status": "pending" },
-                ]},
-            ]
-        });
-        let items = todo_items_from_state(&state);
-        assert_eq!(items.len(), 3);
-        assert!(items[0].done);
-        assert!(!items[1].done);
-        assert_eq!(items[2].text, "Run tests");
-    }
-
-    #[test]
-    fn command_catalog_adds_missing_goal_without_overriding_runtime_metadata() {
-        let commands = commands_from_frame(&json!({
-            "commands": [{ "name": "ralplan", "description": "Plan with consensus" }]
-        }))
-        .expect("commands");
-        let goal = commands
-            .iter()
-            .find(|command| command.name == "goal")
-            .expect("goal fallback");
-        assert_eq!(goal.input_hint.as_deref(), Some("[objective]"));
-        assert_eq!(
-            goal.subcommands
-                .iter()
-                .map(|subcommand| subcommand.name.as_str())
-                .collect::<Vec<_>>(),
-            ["set", "show", "pause", "resume", "drop", "budget"]
-        );
-
-        let commands = commands_from_frame(&json!({
-            "commands": [{ "name": "goal", "description": "Runtime goal metadata" }]
-        }))
-        .expect("commands");
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|command| command.name == "goal")
-                .count(),
-            1
-        );
-        assert_eq!(commands[0].description, "Runtime goal metadata");
-    }
-
-    #[test]
-    fn goal_updates_normalize_to_hidden_state_parts() {
-        let event = goal_state_event_from_frame(&json!({
-            "type": "goal_updated",
-            "goal": {
-                "id": "g1",
-                "objective": "Ship the release",
-                "status": "active"
-            },
-            "state": {
-                "enabled": true,
-                "mode": "active"
-            }
-        }))
-        .expect("goal update");
-        assert_eq!(
-            event,
-            AgentEvent::ToolCall {
-                id: OMP_GOAL_STATE_CALL_ID.into(),
-                call: ToolCall::Unknown {
-                    name: OMP_GOAL_STATE_CALL_NAME.into(),
-                    input: Some(json!({
-                        "goal": {
-                            "id": "g1",
-                            "objective": "Ship the release",
-                            "status": "active"
-                        },
-                        "state": {
-                            "enabled": true,
-                            "mode": "active"
-                        }
-                    })),
-                },
-            }
-        );
-
-        assert!(
-            goal_state_event_from_frame(&json!({
-                "type": "goal_updated",
-                "goal": null
-            }))
-            .is_some()
-        );
-        assert!(goal_state_event_from_frame(&json!({ "type": "agent_end" })).is_none());
-    }
-
-    #[test]
-    fn command_catalog_maps_complete_metadata() {
-        let frame = json!({
-            "type": "available_commands_update",
-            "commands": [
-                {
-                    "name": "compact",
-                    "aliases": ["shrink"],
-                    "description": "Compact the session",
-                    "input": { "hint": "<instructions>" },
-                    "source": "builtin",
-                    "subcommands": [
-                        { "name": "soft", "description": "Summarize locally", "usage": "[focus]" }
-                    ]
-                },
-                { "name": "help" },
-            ],
-        });
-        let commands = commands_from_frame(&frame).unwrap();
-        assert_eq!(commands.len(), 3);
-        assert_eq!(commands[0].name, "compact");
-        assert_eq!(commands[0].aliases, ["shrink"]);
-        assert_eq!(commands[0].input_hint.as_deref(), Some("<instructions>"));
-        assert_eq!(commands[0].source.as_deref(), Some("builtin"));
-        assert_eq!(commands[0].subcommands[0].name, "soft");
-        assert_eq!(commands[0].subcommands[0].usage.as_deref(), Some("[focus]"));
-        assert_eq!(commands[1].description, "");
-    }
-
-    #[test]
-    fn message_updates_map_only_stream_deltas() {
-        // Toolcall deltas are partial JSON, not prose: they must not leak into
-        // the transcript as text.
-        let kinds = [
-            ("text_delta", true),
-            ("thinking_delta", true),
-            ("toolcall_delta", false),
-            ("text_start", false),
-            ("text_end", false),
-        ];
-        for (kind, expected) in kinds {
-            let frame = json!({
-                "type": "message_update",
-                "assistantMessageEvent": { "type": kind, "delta": "chunk" },
-            });
-            let event = frame.get("assistantMessageEvent");
-            let mapped = matches!(
-                event
-                    .and_then(|event| event.get("type"))
-                    .and_then(Value::as_str),
-                Some("text_delta") | Some("thinking_delta")
-            );
-            assert_eq!(mapped, expected, "{kind}");
-        }
+        assert!(assemble_chunk(&mut active, &frame(1, b)).is_none());
+        assert!(assemble_chunk(&mut active, &frame(0, a)).is_none());
+        assert_eq!(assemble_chunk(&mut active, &frame(1, b)), Some(payload));
     }
 }

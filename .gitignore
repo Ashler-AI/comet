@@ -1,5 +1,7 @@
-target/
+/target
 **/*.rs.bk
+# Local-only scratch space — holds signing/notary credentials, never commit.
+/ignore/
 *.pdb
 .DS_Store
 .env
@@ -8,4 +10,7 @@ node_modules
 .wrangler
 build/
 edge/dist/
-**/xcuserdata/
+.agents
+.claude
+CLAUDE.md
+/scripts/**/__pycache__/

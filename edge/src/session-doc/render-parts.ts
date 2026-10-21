@@ -14,7 +14,7 @@
  * discarded at the event layer (harness ToolResult carries only `isError`),
  * and ApplyPatch already stores path-only summaries.
  */
-import type { MessagePart, ToolCall } from "./control-types";
+import type { MessagePart, TodoItem, ToolCall, ToolPartDiff } from "./control-types";
 
 /** A tool call reduced to its render surface. Structurally a subset of
  * {@link ToolCall}; every variant here is assignable-from its wire twin after
@@ -37,13 +37,14 @@ export type RenderToolCall =
   | { readonly _tag: "WebSearch"; readonly query: string }
   | {
       readonly _tag: "Todo";
-      readonly items: ReadonlyArray<{ readonly text: string; readonly done: boolean }>;
+      readonly items: ReadonlyArray<TodoItem>;
     }
   | { readonly _tag: "Mcp"; readonly server?: string; readonly tool: string }
   | { readonly _tag: "Unknown"; readonly name: string };
 
 /** A message part as stored in the session doc: identical to the app-layer
- * {@link MessagePart} except tool calls are render-only. */
+ * {@link MessagePart} except tool calls are render-only. Image references pass
+ * through unchanged as atomic metadata; media bytes never enter the document. */
 export type SessionMessagePart =
   | Exclude<MessagePart, { kind: "tool" }>
   | {
@@ -51,6 +52,11 @@ export type SessionMessagePart =
       readonly id: string;
       readonly call: RenderToolCall;
       readonly isError?: boolean;
+      /** Capped tool output — kept by the policy (the caps are the size
+       * discipline; unlike raw inputs, output is the rendered record). */
+      readonly output?: string;
+      /** Capped inline diff — kept for the same reason. */
+      readonly diff?: ToolPartDiff;
     };
 
 /** Reduce a wire tool call to its render surface. Idempotent — feeding an
@@ -95,10 +101,13 @@ export const sanitizeToolCall = (call: ToolCall | RenderToolCall): RenderToolCal
     case "Todo":
       return {
         _tag: "Todo",
-        items: (call as Extract<RenderToolCall, { _tag: "Todo" }>).items.map((i) => ({
-          text: i.text,
-          done: i.done
-        }))
+        // `status` rides along when present so an in-progress item survives the
+        // rebuild; dropping it would flatten the checklist to done / not done.
+        items: (call as Extract<RenderToolCall, { _tag: "Todo" }>).items.map((i) =>
+          i.status === undefined
+            ? { text: i.text, done: i.done }
+            : { text: i.text, done: i.done, status: i.status }
+        )
       };
     case "Mcp": {
       const { server, tool } = call as { server?: string; tool: string };
@@ -126,7 +135,9 @@ export const toRenderParts = (
           kind: "tool",
           id: p.id,
           call: sanitizeToolCall(p.call),
-          ...(typeof p.isError === "boolean" ? { isError: p.isError } : {})
+          ...(typeof p.isError === "boolean" ? { isError: p.isError } : {}),
+          ...(typeof p.output === "string" ? { output: p.output } : {}),
+          ...(p.diff !== undefined ? { diff: p.diff } : {})
         }
       : p
   );

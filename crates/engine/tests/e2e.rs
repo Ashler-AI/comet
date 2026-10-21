@@ -9,36 +9,35 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use comet_doc::{
+use zeron_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
-    SessionCommandPayload, SessionCommandStatus, SessionControlAction, SessionDoc,
-    SessionMessageEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
 };
-use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
-use comet_harness::mock::MockHarness;
-use comet_harness::{Harness, HarnessError, RunControls};
-use comet_proto::{
-    AgentEvent, AgentSessionSource, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
-    RuntimeProfile, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
+use zeron_engine::{EngineCore, EngineRpc, HarnessRegistry, RunJournal};
+use zeron_harness::mock::MockHarness;
+use zeron_harness::{Harness, HarnessError, RunControls};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    SessionStatus, SteeringMode, ToolCall,
 };
-use comet_sync::DocsStore;
+use zeron_sync::DocsStore;
 
-const CHAT: &str = "11111111-1111-4111-8111-111111111111";
+const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
-const SESSION: &str = "22222222-2222-4222-8222-222222222222";
-const EXECUTION_KEY: &str = "11111111-1111-4111-8111-111111111111::session::22222222-2222-4222-8222-222222222222";
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
+        harness: None,
         model: None,
-        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     }
 }
@@ -74,7 +73,8 @@ fn mock_script() -> Vec<AgentEvent> {
         AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
-            output: Some("wrote 6 bytes".into()),
+            output: None,
+            diff: None,
         },
         done(DoneStatus::Completed),
     ]
@@ -86,7 +86,6 @@ struct ScriptedHarness {
     script: Vec<AgentEvent>,
     step_delay: Duration,
     hang_until_interrupt: bool,
-    steering_mode: SteeringMode,
 }
 
 #[async_trait]
@@ -101,7 +100,7 @@ impl Harness for ScriptedHarness {
         true
     }
     fn steering_mode(&self) -> SteeringMode {
-        self.steering_mode
+        SteeringMode::StepBoundary
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[ReasoningLevel::Medium]
@@ -120,10 +119,6 @@ impl Harness for ScriptedHarness {
         let hang = self.hang_until_interrupt;
         let token = controls.interrupt.clone();
         tokio::spawn(async move {
-            // Keep the whole control set alive for the run. In particular,
-            // dropping the steering receiver would make the engine treat the
-            // live harness as non-steerable before the boundary is reached.
-            let _controls = controls;
             for event in script {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -142,78 +137,69 @@ impl Harness for ScriptedHarness {
     }
 }
 
-struct QueuedFollowupHarness {
-    release_first_turn: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
-    received: tokio::sync::mpsc::UnboundedSender<String>,
-    steering_mode: SteeringMode,
+/// Two-run harness for interrupt isolation. Run B stays parked until the test
+/// releases it, then records whether its own token was cancelled before it
+/// completes. This makes a cross-chat cancellation observable even if B has
+/// not yet had a chance to publish `Done` when A's interrupt returns.
+struct InterruptIsolationHarness {
+    release_b: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
-impl Harness for QueuedFollowupHarness {
+impl Harness for InterruptIsolationHarness {
     fn id(&self) -> HarnessId {
         HarnessId::Mock
     }
-
     fn display_name(&self) -> &str {
-        "Queued followup"
+        "Interrupt isolation"
     }
-
     fn supports_steering(&self) -> bool {
         true
     }
-
     fn steering_mode(&self) -> SteeringMode {
-        self.steering_mode
+        SteeringMode::StepBoundary
     }
-
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[ReasoningLevel::Medium]
     }
-
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(Vec::new())
+        Ok(vec![])
     }
-
     async fn run(
         &self,
-        _request: RunRequest,
+        request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let release = self
-            .release_first_turn
-            .lock()
-            .unwrap()
-            .take()
-            .expect("one run");
-        let received = self.received.clone();
-        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(8);
+        let release_b = self.release_b.clone();
+        let token = controls.interrupt.clone();
         tokio::spawn(async move {
-            let mut steering = controls.steering;
-            let _ = events.send(Ok(AgentEvent::SessionStarted {
-                harness: HarnessId::Mock,
-                model: "mock-1".into(),
-                tools: Vec::new(),
-                cwd: "/tmp".into(),
-                session_id: "queued-followup-session".into(),
-                assistant_message_id: "a-1".into(),
-            }));
-            let _ = events.send(Ok(AgentEvent::TextDelta {
-                text: "first turn active".into(),
-            }));
-            let _ = release.await;
-            let _ = events.send(Ok(done(DoneStatus::Completed)));
-            let Some(followup) = steering.recv().await else {
+            if tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: format!("{} started", request.prompt),
+                }))
+                .await
+                .is_err()
+            {
                 return;
-            };
-            let _ = received.send(followup.prompt);
-            let _ = events.send(Ok(AgentEvent::Steered {
-                assistant_message_id: Some("a-1".into()),
-                next_assistant_message_id: Some("a-2".into()),
-            }));
-            let _ = events.send(Ok(AgentEvent::TextDelta {
-                text: "second turn complete".into(),
-            }));
-            let _ = events.send(Ok(done(DoneStatus::Completed)));
+            }
+
+            if request.prompt == "run-b" {
+                release_b.notified().await;
+                if token.is_cancelled() {
+                    let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+                } else {
+                    let _ = tx
+                        .send(Ok(AgentEvent::TextDelta {
+                            text: "; completed independently".into(),
+                        }))
+                        .await;
+                    let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                }
+            } else {
+                token.cancelled().await;
+                let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+            }
         });
         Ok(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|event| (event, rx))
@@ -222,66 +208,260 @@ impl Harness for QueuedFollowupHarness {
     }
 }
 
-struct FailingDispatchHarness;
-
-#[async_trait]
-impl Harness for FailingDispatchHarness {
-    fn id(&self) -> HarnessId {
-        HarnessId::Mock
-    }
-
-    fn display_name(&self) -> &str {
-        "Failing dispatch"
-    }
-
-    fn supports_steering(&self) -> bool {
-        false
-    }
-
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[]
-    }
-
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(vec![])
-    }
-
-    async fn run(
-        &self,
-        _request: RunRequest,
-        _controls: RunControls,
-    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        Err(HarnessError::Protocol(
-            "dispatch transport unavailable".into(),
-        ))
-    }
-}
-
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
-    let registry = HarnessRegistry::for_profile(RuntimeProfile::Mock);
+    let registry = HarnessRegistry::new();
     registry.register(harness);
     Arc::new(registry)
 }
 
-/// Identity is pinned (`assemble_with_identity`, not env-reading `assemble`):
-/// these tests seed and inspect `projects/ashler-local/dev-user` directly, so
-/// they must stay hermetic under a developer shell that exports a real
-/// `$COMET_PROJECT_SCOPE` / `$COMET_USER_ID`.
 fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
-    EngineCore::assemble_with_identity(
-        dir,
-        registry_with(harness),
-        HarnessId::Mock,
-        None,
-        "ashler-local",
-        "dev-user",
-        RuntimeProfile::Mock,
+    EngineCore::assemble(dir, registry_with(harness), HarnessId::Mock, None)
+        .expect("engine core assembles")
+}
+
+#[tokio::test]
+async fn update_deferred_steering_preserves_the_active_turn_and_queued_prompt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct HoldsTurn {
+        events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>>>,
+        starts: AtomicUsize,
+    }
+    #[async_trait]
+    impl Harness for HoldsTurn {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Step-boundary fixture"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let events = self.events.lock().unwrap().take();
+            if let Some(events) = events {
+                Ok(
+                    futures::stream::unfold((events, controls), |(mut rx, controls)| async move {
+                        rx.recv().await.map(|event| (Ok(event), (rx, controls)))
+                    })
+                    .boxed(),
+                )
+            } else {
+                MockHarness {
+                    script: mock_script(),
+                }
+                .run(request, controls)
+                .await
+            }
+        }
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let harness = Arc::new(HoldsTurn {
+        events: std::sync::Mutex::new(Some(rx)),
+        starts: AtomicUsize::new(0),
+    });
+    let registry = registry_with(harness.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            run_request("opening"),
+            Some("opening".into()),
+        )
+        .await
+        .unwrap();
+    tx.send(mock_script()[0].clone()).unwrap();
+    wait_for(
+        || harness.starts.load(Ordering::SeqCst) == 1,
+        "first turn starts",
     )
-    .expect("engine core assembles")
+    .await;
+    registry.begin_update(HarnessId::Mock);
+    queue_as_viewer(
+        handle.doc(),
+        "deferred-steer",
+        SessionCommandPayload::Steer {
+            prompt: "follow up".into(),
+            message_id: Some("follow-up".into()),
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "deferred-steer"),
+                Some((SessionCommandStatus::Applied, _))
+            )
+        },
+        "steer retained",
+    )
+    .await;
+    assert_eq!(harness.starts.load(Ordering::SeqCst), 1);
+    assert!(core.sessions.turn_in_flight(CHAT));
+    assert!(
+        handle
+            .doc()
+            .read_queue()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == "follow-up")
+    );
+    assert!(
+        !handle
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == "follow-up")
+    );
+    // Explicit queued-row steering must also preserve the row and active turn.
+    assert!(
+        core.doc_host
+            .steer_queued_now(CHAT, "follow-up")
+            .await
+            .is_err()
+    );
+    assert!(
+        handle
+            .doc()
+            .read_queue()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == "follow-up")
+    );
+    tx.send(done(DoneStatus::Completed)).unwrap();
+    let installing = tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.update_lease(HarnessId::Mock),
+    )
+    .await
+    .unwrap();
+    assert_eq!(harness.starts.load(Ordering::SeqCst), 1);
+    drop(installing);
+    registry.end_update(HarnessId::Mock);
+    wait_for(
+        || harness.starts.load(Ordering::SeqCst) == 2,
+        "queued prompt runs after update",
+    )
+    .await;
+    assert!(handle.doc().read_queue().unwrap().is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn pending_update_does_not_block_dispatch_or_other_harnesses() {
+    struct RecordingHarness(HarnessId, Arc<std::sync::Mutex<Vec<String>>>);
+    #[async_trait]
+    impl Harness for RecordingHarness {
+        fn id(&self) -> HarnessId {
+            self.0
+        }
+        fn display_name(&self) -> &str {
+            "Recording"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            assert!(controls.execution_lease.is_some());
+            self.1.lock().unwrap().push(request.prompt.clone());
+            MockHarness {
+                script: mock_script(),
+            }
+            .run(request, controls)
+            .await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = Arc::new(HarnessRegistry::new());
+    for id in [HarnessId::ClaudeCode, HarnessId::Codex] {
+        registry.register(Arc::new(RecordingHarness(id, started.clone())));
+    }
+    let core =
+        EngineCore::assemble(dir.path(), registry.clone(), HarnessId::ClaudeCode, None).unwrap();
+    let active_turn = registry.execution_lease(HarnessId::ClaudeCode).await;
+    registry.begin_update(HarnessId::ClaudeCode);
+    // These awaits model the shared queue watcher's serial dispatch calls.
+    // Neither a waiting writer nor an active installation may block dispatch.
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        core.sessions.dispatch(
+            "waiting",
+            HarnessId::ClaudeCode,
+            run_request("waiting"),
+            None,
+        ),
+    )
+    .await
+    .expect("dispatch must not wait for the update")
+    .unwrap();
+    drop(active_turn);
+    let installing = registry.update_lease(HarnessId::ClaudeCode).await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        core.sessions.dispatch(
+            "cancelled",
+            HarnessId::ClaudeCode,
+            run_request("cancelled"),
+            None,
+        ),
+    )
+    .await
+    .expect("dispatch must not wait for installation")
+    .unwrap();
+    core.sessions
+        .dispatch("other", HarnessId::Codex, run_request("other"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || started.lock().unwrap().contains(&"other".to_string()),
+        "unrelated harness starts",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), core.sessions.interrupt("cancelled"))
+        .await
+        .expect("a run waiting for an update remains interruptible")
+        .unwrap();
+    assert_eq!(*started.lock().unwrap(), ["other"]);
+    drop(installing);
+    registry.end_update(HarnessId::ClaudeCode);
+    wait_for(
+        || started.lock().unwrap().contains(&"waiting".to_string()),
+        "deferred run starts after update",
+    )
+    .await;
+    assert!(!started.lock().unwrap().contains(&"cancelled".to_string()));
+    core.shutdown().await;
 }
 
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
@@ -292,7 +472,7 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         doc.read_entries()
             .expect("read entries")
             .last()
-            .map(|m| comet_doc::CommandBasedOn {
+            .map(|m| zeron_doc::CommandBasedOn {
                 turn_id: Some(m.id.clone()),
                 frontier: None,
             });
@@ -307,116 +487,6 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         resolution: None,
     })
     .expect("queue command");
-}
-
-fn controller_payload(
-    core: &EngineCore,
-    alias: &str,
-    payload: SessionCommandPayload,
-) -> SessionCommandPayload {
-    let action = match payload {
-        SessionCommandPayload::Run {
-            request,
-            message_id,
-        } => SessionControlAction::Start {
-            request,
-            message_id,
-        },
-        SessionCommandPayload::Steer { prompt, message_id } => {
-            SessionControlAction::Steer { prompt, message_id }
-        }
-        SessionCommandPayload::Queue { prompt, message_id } => {
-            SessionControlAction::Queue { prompt, message_id }
-        }
-        SessionCommandPayload::Interrupt {} => SessionControlAction::Stop {
-            expected_turn_id: None,
-        },
-        SessionCommandPayload::RespondInput {
-            request_id,
-            answers,
-        } => SessionControlAction::RespondInput {
-            request_id,
-            answers,
-        },
-        SessionCommandPayload::PeerMessage { .. } => {
-            panic!("controller_payload does not accept peer messages")
-        }
-        SessionCommandPayload::Control { .. } => {
-            panic!("controller_payload accepts an unscoped test action")
-        }
-    };
-    let device_id = core.doc_host.device_id().to_string();
-    let auth = core.auth();
-    let state = auth.state();
-    let actor_subject = state.user().expect("development auth identity").id.clone();
-    SessionCommandPayload::Control {
-        session_id: SESSION.into(),
-        owner_device_id: device_id.clone(),
-        actor_device_id: device_id,
-        actor_subject,
-        grant_id: format!("grant-{alias}"),
-        source: AgentSessionSource::Local,
-        action: Box::new(action),
-    }
-}
-
-/// Supply exact first-run setup instead of treating an opened transcript as host authority.
-fn controller_params(
-    core: &EngineCore,
-    alias: &str,
-    payload: SessionCommandPayload,
-) -> serde_json::Value {
-    let command = controller_payload(core, alias, payload);
-    let mut params = serde_json::json!({
-        "chatId": CHAT, "targetDeviceId": core.device_id, "command": command,
-    });
-    if !core.doc_host.is_locally_hosted(CHAT)
-        && let SessionCommandPayload::Control { action, .. } = &command
-        && let SessionControlAction::Start { request, .. } = action.as_ref()
-    {
-        let created = chrono::Utc::now().to_rfc3339();
-        params["bootstrap"] = serde_json::json!({
-            "chat": {
-                "id": CHAT, "deviceId": core.device_id, "archived": false,
-                "cwd": request.cwd, "spaceId": "e2e-space", "createdAt": created,
-                "config": comet_proto::ChatConfig {
-                    harness: HarnessId::Mock,
-                    model: request.model.clone(),
-                    agent_account_id: request.agent_account_id.clone(),
-                    reasoning: request.reasoning,
-                    model_options: request.model_options.clone(),
-                    sandbox: request.sandbox,
-                },
-            },
-            "space": {
-                "id": "e2e-space", "deviceId": core.device_id,
-                "path": request.cwd, "gitDetected": false, "createdAt": created,
-            },
-        });
-    }
-    params
-}
-
-/// Queue through the authenticated local RPC path while targeting one concrete agent session.
-/// The returned id is server-minted and is the command ledger lookup key.
-async fn queue_as_controller(
-    core: &EngineCore,
-    alias: &str,
-    payload: SessionCommandPayload,
-) -> String {
-    let params = controller_params(core, alias, payload);
-    let client = comet_rpc::memory_client(core.rpc_service());
-    let queued = client
-        .call(
-            comet_rpc::methods::QUEUE_COMMAND,
-            params,
-        )
-        .await
-        .expect("queue authenticated session command");
-    queued["commandId"]
-        .as_str()
-        .expect("server-minted command id")
-        .to_string()
 }
 
 async fn wait_for<F>(mut predicate: F, what: &str)
@@ -434,8 +504,12 @@ where
 }
 
 fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    entries_for(core, CHAT)
+}
+
+fn entries_for(core: &EngineCore, chat_id: &str) -> Vec<SessionMessageEntry> {
     core.doc_host
-        .open(CHAT)
+        .open(chat_id)
         .expect("open chat")
         .doc()
         .read_entries()
@@ -466,42 +540,6 @@ fn command_status(core: &EngineCore, id: &str) -> Option<(SessionCommandStatus, 
 }
 
 #[tokio::test]
-async fn blocked_recovery_does_not_materialize_an_unauthorized_command() {
-    let dir = tempfile::tempdir().unwrap();
-    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
-    let handle = core.doc_host.open(CHAT).unwrap();
-    let mut params = controller_params(&core, "blocked-recovery", SessionCommandPayload::Run {
-        request: run_request("continue after recovery"),
-        message_id: "recovered-user".into(),
-    });
-    let issued = chrono::Utc::now().timestamp_millis() - 1;
-    params["commandId"] = serde_json::json!("blocked-recovery-command");
-    params["issuedAt"] = serde_json::json!(issued);
-    params["expiresAt"] = serde_json::json!(issued + 60_000);
-    let client = comet_rpc::memory_client(core.rpc_service());
-    handle.doc().binding().fail_recovery("retained transcript conflicts with recovery snapshot".into());
-    assert!(client.call(comet_rpc::methods::QUEUE_COMMAND, params.clone()).await.is_err());
-    assert!(handle.doc().read_command("blocked-recovery-command").unwrap().is_none());
-    assert!(entries(&core).is_empty());
-    assert!(core.doc_host.command_entry(CHAT, "blocked-recovery-command").unwrap().is_none());
-    assert!(core.workspace.doc().chat(CHAT).unwrap().is_none());
-
-    let repaired = SessionDoc::init(CHAT).unwrap().export_snapshot().unwrap();
-    handle.doc().binding().adopt_snapshot(&repaired, Some(CHAT)).unwrap();
-    client.call(comet_rpc::methods::QUEUE_COMMAND, params.clone()).await.unwrap();
-    wait_for(|| command_status(&core, "blocked-recovery-command")
-        .is_some_and(|(status, _)| status == SessionCommandStatus::Applied), "recovered command to apply").await;
-    wait_for(|| entries(&core).iter().any(|entry| entry.role == MessageRole::Assistant
-        && entry.status == Some(MessageStatus::Complete)), "recovered assistant to complete").await;
-    assert_eq!(entries(&core)[0].id, "recovered-user");
-    let admitted = core.doc_host.command_entry(CHAT, "blocked-recovery-command").unwrap().unwrap();
-    assert_eq!(serde_json::to_value(&admitted.payload).unwrap(), params["command"]);
-    assert_eq!(admitted.issued_at, issued);
-    assert_eq!(admitted.expires_at, Some(issued + 60_000));
-    core.sessions.shutdown().await;
-}
-
-#[tokio::test]
 async fn queued_run_command_executes_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
@@ -510,22 +548,21 @@ async fn queued_run_command_executes_end_to_end() {
             script: mock_script(),
         }),
     );
-    let _handle = core.doc_host.open(CHAT).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
 
     // Live event subscription (journal replay + broadcast) before anything runs.
-    let (replayed, mut live) = core.sessions.subscribe(EXECUTION_KEY, 0).unwrap();
+    let (replayed, mut live) = core.sessions.subscribe(CHAT, 0).unwrap();
     assert!(replayed.is_empty());
 
-    // An authenticated controller targets one concrete agent session.
-    let command_id = queue_as_controller(
-        &core,
+    // A viewer device queues the run command into the doc.
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-1",
         SessionCommandPayload::Run {
             request: run_request("do the thing"),
             message_id: "msg-user-1".into(),
         },
-    )
-    .await;
+    );
 
     // The host executor picks it up, runs the harness, and the doc settles.
     wait_for(
@@ -579,32 +616,14 @@ async fn queued_run_command_executes_end_to_end() {
         other => panic!("unexpected second part {other:?}"),
     }
 
-    // The expanded-chip detail comes from the journal: the full input the doc
-    // stripped, plus the harness-captured output.
-    let detail = core
-        .sessions
-        .tool_call_detail(EXECUTION_KEY, "tool-1")
-        .unwrap()
-        .expect("journal saw tool-1");
-    assert_eq!(detail.input.as_deref(), Some("/tmp/x\n\nSECRET"));
-    assert_eq!(detail.output.as_deref(), Some("wrote 6 bytes"));
-    assert!(detail.resolved);
-    assert!(!detail.is_error);
-    assert_eq!(
-        core.sessions
-            .tool_call_detail(EXECUTION_KEY, "nope")
-            .unwrap(),
-        None
-    );
-
     // Command outcome written by the host (sole outcome writer).
     assert_eq!(
-        command_status(&core, &command_id),
+        command_status(&core, "cmd-run-1"),
         Some((SessionCommandStatus::Applied, None))
     );
 
     // Journal replay: the full script in order, terminal Done last.
-    let replay = core.sessions.subscribe(EXECUTION_KEY, 0).unwrap().0;
+    let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
     assert_eq!(replay.len(), mock_script().len());
     assert!(matches!(
         replay.last().map(|j| &j.event),
@@ -626,121 +645,8 @@ async fn queued_run_command_executes_end_to_end() {
 
     // Final session status: Idle.
     assert_eq!(
-        core.sessions
-            .session_status(EXECUTION_KEY)
-            .map(|s| s.status),
+        core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::Idle)
-    );
-}
-
-#[tokio::test]
-async fn new_input_unsettles_an_archived_chat() {
-    let dir = tempfile::tempdir().unwrap();
-    let core = assemble(
-        dir.path(),
-        Arc::new(MockHarness {
-            script: mock_script(),
-        }),
-    );
-    core.workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
-    assert!(core.workspace.set_chat_archived(CHAT, true).unwrap());
-    assert!(
-        core.workspace
-            .doc()
-            .chat(CHAT)
-            .unwrap()
-            .is_some_and(|chat| chat.archived)
-    );
-
-    let command_id = queue_as_controller(
-        &core,
-        "cmd-unsettle",
-        SessionCommandPayload::Run {
-            request: run_request("continue this session"),
-            message_id: "msg-unsettle".into(),
-        },
-    )
-    .await;
-    wait_for(
-        || {
-            command_status(&core, &command_id)
-                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
-        },
-        "unsettled session command",
-    )
-    .await;
-
-    assert!(
-        core.workspace
-            .doc()
-            .chat(CHAT)
-            .unwrap()
-            .is_some_and(|chat| !chat.archived),
-        "new input must return a settled session to the active list"
-    );
-}
-
-#[tokio::test]
-async fn dispatch_failure_resolves_durable_command_and_audit() {
-    let dir = tempfile::tempdir().unwrap();
-    let core = assemble(dir.path(), Arc::new(FailingDispatchHarness));
-    let handle = core.doc_host.open(CHAT).unwrap();
-    let command_id = queue_as_controller(
-        &core,
-        "cmd-dispatch-failure",
-        SessionCommandPayload::Run {
-            request: run_request("cannot dispatch"),
-            message_id: "msg-dispatch-failure".into(),
-        },
-    )
-    .await;
-
-    wait_for(
-        || {
-            command_status(&core, &command_id)
-                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
-        },
-        "failed dispatch command outcome",
-    )
-    .await;
-
-    let (status, resolution) = command_status(&core, &command_id).unwrap();
-    assert_eq!(status, SessionCommandStatus::Rejected);
-    assert!(
-        resolution
-            .as_deref()
-            .is_some_and(|reason| reason.contains("dispatch transport unavailable"))
-    );
-    let transcript = entries(&core);
-    assert!(
-        transcript.iter().any(|entry| {
-            entry.role == MessageRole::Assistant
-                && entry.parts.iter().any(|part| {
-                    matches!(
-                        part,
-                        MessagePart::Error { message, .. }
-                            if message.contains("dispatch transport unavailable")
-                    )
-                })
-        }),
-        "pre-stream dispatch failure must be visible in the transcript"
-    );
-    let audit_id = format!("audit/{command_id}");
-    let snapshot = handle.doc().collaboration_snapshot().unwrap();
-    let audit = snapshot
-        .publications
-        .iter()
-        .find(|publication| publication.id == audit_id)
-        .expect("command-derived audit publication");
-    let comet_proto::PublicationValue::Audit(audit) = &audit.value else {
-        panic!("command audit publication has wrong kind");
-    };
-    assert_eq!(audit.result, comet_proto::AuditResult::Rejected);
-    assert!(
-        audit
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("dispatch transport unavailable"))
     );
 }
 
@@ -753,22 +659,20 @@ async fn session_status_transitions_idle_working_idle() {
             script: mock_script(),
             step_delay: Duration::from_millis(40),
             hang_until_interrupt: false,
-            steering_mode: SteeringMode::StepBoundary,
         }),
     );
     let mut watch = core.sessions.watch_sessions();
     assert!(watch.borrow().is_empty(), "no sessions before dispatch");
 
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-status",
         SessionCommandPayload::Run {
             request: run_request("go"),
             message_id: "m-1".into(),
         },
-    )
-    .await;
+    );
 
     let mut seen = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -801,22 +705,20 @@ async fn interrupt_stamps_streaming_entry_aborted() {
             }],
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
-            steering_mode: SteeringMode::StepBoundary,
         }),
     );
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-hang",
         SessionCommandPayload::Run {
             request: run_request("hang"),
             message_id: "m-1".into(),
         },
-    )
-    .await;
+    );
 
-    // Wait until the streaming entry is visibly in the doc, then interrupt the
-    // selected agent session through its scoped durable command.
+    // Wait until the streaming entry is visibly in the doc, then interrupt via a
+    // viewer-queued durable command (based_on = the streaming entry = current turn).
     wait_for(
         || {
             entries(&core)
@@ -826,8 +728,11 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         "streaming entry",
     )
     .await;
-    let interrupt_id =
-        queue_as_controller(&core, "cmd-int-1", SessionCommandPayload::Interrupt {}).await;
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-int-1",
+        SessionCommandPayload::Interrupt {},
+    );
 
     wait_for(
         || {
@@ -849,465 +754,106 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         MessagePart::Text { text, .. } => assert_eq!(text, "partial output"),
         other => panic!("unexpected part {other:?}"),
     }
-    wait_for(
-        || {
-            command_status(&core, &interrupt_id)
-                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
-        },
-        "interrupt command outcome",
-    )
-    .await;
     assert_eq!(
-        command_status(&core, &interrupt_id),
+        command_status(&core, "cmd-int-1"),
         Some((SessionCommandStatus::Applied, None))
     );
     // Journal closed with a Done — nothing left to recover.
-    let journal =
-        RunJournal::open(dir.path().join("projects/ashler-local/dev-user/journals")).unwrap();
+    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
     assert_eq!(
-        core.sessions
-            .session_status(EXECUTION_KEY)
-            .map(|s| s.status),
+        core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::Idle)
     );
 }
 
-#[tokio::test]
-async fn canonical_room_control_stops_existing_legacy_writer() {
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_is_scoped_to_the_target_chat() {
+    const CHAT_A: &str = "chat-interrupt-a";
+    const CHAT_B: &str = "chat-interrupt-b";
+
     let dir = tempfile::tempdir().unwrap();
+    let release_b = Arc::new(tokio::sync::Notify::new());
     let core = assemble(
         dir.path(),
-        Arc::new(ScriptedHarness {
-            script: vec![AgentEvent::TextDelta { text: "still working".into() }],
-            step_delay: Duration::from_millis(5),
-            hang_until_interrupt: true,
-            steering_mode: SteeringMode::StepBoundary,
+        Arc::new(InterruptIsolationHarness {
+            release_b: release_b.clone(),
         }),
     );
-    core.workspace.claim_chat(CHAT, Some("/tmp")).unwrap();
-    let handle = core.doc_host.open(CHAT).unwrap();
-    let client = comet_rpc::memory_client(core.rpc_service());
-    client.call(comet_rpc::methods::QUEUE_COMMAND, serde_json::json!({
-        "chatId": CHAT,
-        "command": SessionCommandPayload::Run {
-            request: run_request("legacy turn"), message_id: "legacy-user".into(),
-        },
-    })).await.unwrap();
-    wait_for(|| entries(&core).iter().any(|entry| {
-        entry.role == MessageRole::Assistant && entry.status == Some(MessageStatus::Streaming)
-    }), "legacy writer streaming").await;
-    assert!(handle.doc().collaboration_snapshot().unwrap().sessions.iter().any(|session| {
-        session.session_id == CHAT && session.status == Some(SessionStatus::Working)
-    }));
 
-    // The UI selects the published canonical record and sends a typed Stop.
-    // It must reach the original bare writer, not a new ::session:: execution.
-    let mut stop = controller_payload(&core, "canonical-stop", SessionCommandPayload::Interrupt {});
-    if let SessionCommandPayload::Control { session_id, .. } = &mut stop {
-        *session_id = CHAT.into();
+    for (chat_id, command_id, message_id, prompt) in [
+        (CHAT_A, "cmd-run-a", "message-a", "run-a"),
+        (CHAT_B, "cmd-run-b", "message-b", "run-b"),
+    ] {
+        let handle = core.doc_host.open(chat_id).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            command_id,
+            SessionCommandPayload::Run {
+                request: run_request(prompt),
+                message_id: message_id.into(),
+            },
+        );
     }
-    client.call(comet_rpc::methods::QUEUE_COMMAND, serde_json::json!({
-        "chatId": CHAT, "command": stop,
-    })).await.unwrap();
-    wait_for(|| entries(&core).iter().any(|entry| {
-        entry.role == MessageRole::Assistant && entry.status == Some(MessageStatus::Aborted)
-    }), "canonical Stop aborts legacy turn").await;
-    wait_for(|| core.sessions.session_status(CHAT).is_some_and(|session| {
-        session.status == SessionStatus::Idle
-    }), "legacy writer becomes idle").await;
-    core.shutdown().await;
-}
 
-#[tokio::test]
-async fn explicit_queue_waits_for_the_next_turn_across_step_boundary_harnesses() {
-    let dir = tempfile::tempdir().unwrap();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
-    let core = assemble(
-        dir.path(),
-        Arc::new(QueuedFollowupHarness {
-            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
-            received: received_tx,
-            steering_mode: SteeringMode::StepBoundary,
-        }),
-    );
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
-        "cmd-run-before-queue",
-        SessionCommandPayload::Run {
-            request: run_request("start"),
-            message_id: "m-1".into(),
-        },
-    )
-    .await;
     wait_for(
         || {
-            entries_now(&core).iter().any(|entry| {
-                entry
-                    .parts
-                    .iter()
-                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "first turn active"))
+            [CHAT_A, CHAT_B].into_iter().all(|chat_id| {
+                core.sessions.session_status(chat_id).map(|s| s.status)
+                    == Some(SessionStatus::Working)
+                    && entries_for(&core, chat_id)
+                        .iter()
+                        .any(|entry| entry.status == Some(MessageStatus::Streaming))
             })
         },
-        "first turn to become active",
+        "both chats to be streaming",
     )
     .await;
 
-    let queue_command_id = queue_as_controller(
-        &core,
-        "cmd-queue-followup",
-        SessionCommandPayload::Queue {
-            prompt: "wait until next turn".into(),
-            message_id: Some("m-queued".into()),
-        },
-    )
-    .await;
-    wait_for(
-        || {
-            command_status(&core, &queue_command_id)
-                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
-        },
-        "queue command outcome",
-    )
-    .await;
+    assert!(core.sessions.interrupt(CHAT_A).await.unwrap());
     assert_eq!(
-        command_status(&core, &queue_command_id),
-        Some((
-            SessionCommandStatus::Applied,
-            Some("queued for the next turn".into())
-        ))
+        core.sessions.session_status(CHAT_A).map(|s| s.status),
+        Some(SessionStatus::Idle)
     );
-    assert!(matches!(
-        received_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-    assert_eq!(
-        entries_now(&core)
+    assert!(
+        entries_for(&core, CHAT_A)
             .iter()
-            .find(|entry| entry.id == "m-queued")
-            .and_then(|entry| entry.status),
-        Some(MessageStatus::Queued)
+            .any(|entry| entry.status == Some(MessageStatus::Aborted))
+    );
+    assert!(
+        !core.sessions.interrupt(CHAT_A).await.unwrap(),
+        "a settled chat must report that there is no live run to interrupt"
     );
 
-    release_tx.send(()).unwrap();
+    // B has not observed any completion signal yet. Release it through its
+    // independent test control; it checks its own token before completing, so
+    // a cancellation leaked from A cannot hide behind an early status read.
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
-            .await
-            .unwrap(),
-        Some("wait until next turn".into())
+        core.sessions.session_status(CHAT_B).map(|s| s.status),
+        Some(SessionStatus::Working),
+        "interrupting chat A must leave chat B running"
     );
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .find(|entry| entry.id == "m-queued")
-                .is_some_and(|entry| entry.status == Some(MessageStatus::Complete))
-        },
-        "queued message to become delivered",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn turn_boundary_steer_is_displayed_as_queued_until_acknowledged() {
-    let dir = tempfile::tempdir().unwrap();
-    let core = assemble(
-        dir.path(),
-        Arc::new(ScriptedHarness {
-            script: vec![AgentEvent::TextDelta {
-                text: "still working".into(),
-            }],
-            step_delay: Duration::from_millis(5),
-            hang_until_interrupt: true,
-            steering_mode: SteeringMode::TurnBoundary,
-        }),
-    );
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
-        "cmd-run-turn-boundary",
-        SessionCommandPayload::Run {
-            request: run_request("start"),
-            message_id: "m-1".into(),
-        },
-    )
-    .await;
-    wait_for(
-        || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .is_some_and(|session| session.status == SessionStatus::Working)
-        },
-        "turn-boundary run to start",
-    )
-    .await;
-
-    let steer_command_id = queue_as_controller(
-        &core,
-        "cmd-steer-turn-boundary",
-        SessionCommandPayload::Steer {
-            prompt: "change direction".into(),
-            message_id: Some("m-2".into()),
-        },
-    )
-    .await;
-    wait_for(
-        || {
-            command_status(&core, &steer_command_id)
-                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
-        },
-        "turn-boundary steer acknowledgement",
-    )
-    .await;
-    assert_eq!(
-        command_status(&core, &steer_command_id),
-        Some((
-            SessionCommandStatus::Applied,
-            Some("queued for the next turn boundary".into())
-        ))
-    );
-    assert_eq!(
-        entries_now(&core)
+    assert!(
+        entries_for(&core, CHAT_B)
             .iter()
-            .find(|entry| entry.id == "m-2")
-            .and_then(|entry| entry.status),
-        Some(MessageStatus::Queued)
+            .any(|entry| entry.status == Some(MessageStatus::Streaming))
     );
+    release_b.notify_one();
 
-    core.sessions.interrupt(EXECUTION_KEY).await.unwrap();
-}
-
-#[tokio::test]
-async fn turn_boundary_steer_becomes_active_when_the_harness_acknowledges_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
-    let core = assemble(
-        dir.path(),
-        Arc::new(QueuedFollowupHarness {
-            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
-            received: received_tx,
-            steering_mode: SteeringMode::TurnBoundary,
-        }),
-    );
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
-        "cmd-run-before-turn-boundary-steer",
-        SessionCommandPayload::Run {
-            request: run_request("start"),
-            message_id: "m-1".into(),
-        },
-    )
-    .await;
     wait_for(
-        || {
-            entries_now(&core).iter().any(|entry| {
-                entry
-                    .parts
-                    .iter()
-                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "first turn active"))
-            })
-        },
-        "first turn to become active",
+        || core.sessions.session_status(CHAT_B).map(|s| s.status) == Some(SessionStatus::Idle),
+        "chat B to complete independently",
     )
     .await;
 
-    queue_as_controller(
-        &core,
-        "cmd-turn-boundary-steer",
-        SessionCommandPayload::Steer {
-            prompt: "change direction next".into(),
-            message_id: Some("m-turn-steer".into()),
-        },
-    )
-    .await;
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .find(|entry| entry.id == "m-turn-steer")
-                .is_some_and(|entry| entry.status == Some(MessageStatus::Queued))
-        },
-        "turn-boundary steer to remain queued",
-    )
-    .await;
-    assert!(matches!(
-        received_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-
-    release_tx.send(()).unwrap();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
-            .await
-            .unwrap(),
-        Some("change direction next".into())
-    );
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .find(|entry| entry.id == "m-turn-steer")
-                .is_some_and(|entry| entry.status == Some(MessageStatus::Steered))
-        },
-        "turn-boundary steer acknowledgement",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn run_routed_to_parked_session_is_plain_delivered_input() {
-    // Reported repro: the turn finished (parked persistent session), the user
-    // sends a normal message. It must land as plain delivered input — not
-    // "Steering the model" — even though it rides the steering mailbox.
-    let dir = tempfile::tempdir().unwrap();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
-    let core = assemble(
-        dir.path(),
-        Arc::new(QueuedFollowupHarness {
-            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
-            received: received_tx,
-            steering_mode: SteeringMode::StepBoundary,
-        }),
-    );
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
-        "cmd-run-before-park",
-        SessionCommandPayload::Run {
-            request: run_request("start"),
-            message_id: "m-1".into(),
-        },
-    )
-    .await;
-    release_tx.send(()).unwrap();
-    wait_for(
-        || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .is_some_and(|session| session.status == SessionStatus::Idle)
-        },
-        "first turn to park",
-    )
-    .await;
-
-    queue_as_controller(
-        &core,
-        "cmd-run-while-parked",
-        SessionCommandPayload::Run {
-            request: run_request("next thing"),
-            message_id: "m-2".into(),
-        },
-    )
-    .await;
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
-            .await
-            .unwrap(),
-        Some("next thing".into())
-    );
-    wait_for(
-        || {
-            entries_now(&core)
-                .iter()
-                .find(|entry| entry.id == "m-2")
-                .is_some_and(|entry| entry.status == Some(MessageStatus::Complete))
-        },
-        "parked run message to be plain delivered",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn steer_routed_to_parked_session_is_plain_delivered_input() {
-    // A turn-boundary (OMP-shaped) parked session acknowledges its next-prompt
-    // pickup with a Steered event. That ack must not flip a parked delivery to
-    // "steering": only steers that found an active turn are acknowledged.
-    let dir = tempfile::tempdir().unwrap();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
-    let core = assemble(
-        dir.path(),
-        Arc::new(QueuedFollowupHarness {
-            release_first_turn: Arc::new(std::sync::Mutex::new(Some(release_rx))),
-            received: received_tx,
-            steering_mode: SteeringMode::TurnBoundary,
-        }),
-    );
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
-        "cmd-run-before-parked-steer",
-        SessionCommandPayload::Run {
-            request: run_request("start"),
-            message_id: "m-1".into(),
-        },
-    )
-    .await;
-    release_tx.send(()).unwrap();
-    wait_for(
-        || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .is_some_and(|session| session.status == SessionStatus::Idle)
-        },
-        "first turn to park",
-    )
-    .await;
-
-    let steer_command_id = queue_as_controller(
-        &core,
-        "cmd-steer-while-parked",
-        SessionCommandPayload::Steer {
-            prompt: "after the turn".into(),
-            message_id: Some("m-2".into()),
-        },
-    )
-    .await;
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
-            .await
-            .unwrap(),
-        Some("after the turn".into())
-    );
-    // Parked delivery is a plain new turn, not a queued boundary steer.
-    wait_for(
-        || {
-            command_status(&core, &steer_command_id)
-                .is_some_and(|(status, _)| status != SessionCommandStatus::Pending)
-        },
-        "parked steer command outcome",
-    )
-    .await;
-    assert_eq!(
-        command_status(&core, &steer_command_id),
-        Some((SessionCommandStatus::Applied, None))
-    );
-    // Wait past the harness's Steered acknowledgement (second turn text) to
-    // prove the ack did not restamp the parked delivery.
-    wait_for(
-        || {
-            entries_now(&core).iter().any(|entry| {
-                entry
-                    .parts
-                    .iter()
-                    .any(|part| matches!(part, MessagePart::Text { text, .. } if text == "second turn complete"))
-            })
-        },
-        "second turn to complete",
-    )
-    .await;
-    assert_eq!(
-        entries_now(&core)
-            .iter()
-            .find(|entry| entry.id == "m-2")
-            .and_then(|entry| entry.status),
-        Some(MessageStatus::Complete)
-    );
+    let assistant_b = entries_for(&core, CHAT_B)
+        .into_iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .expect("chat B assistant entry");
+    assert_eq!(assistant_b.status, Some(MessageStatus::Complete));
+    assert!(assistant_b.parts.iter().any(|part| {
+        matches!(part, MessagePart::Text { text, .. } if text.contains("completed independently"))
+    }));
 }
 
 #[tokio::test]
@@ -1319,21 +865,20 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
             script: mock_script(),
         }),
     );
-    let _handle = core.doc_host.open(CHAT).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
 
-    let first_command_id = queue_as_controller(
-        &core,
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-1",
         SessionCommandPayload::Run {
             request: run_request("first"),
             message_id: "m-1".into(),
         },
-    )
-    .await;
+    );
     wait_for(
         || {
             matches!(
-                command_status(&core, &first_command_id),
+                command_status(&core, "cmd-run-1"),
                 Some((SessionCommandStatus::Applied, _))
             )
         },
@@ -1341,38 +886,32 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     )
     .await;
     wait_for(
-        || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .map(|s| s.status)
-                == Some(SessionStatus::Idle)
-        },
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
         "first run settled",
     )
     .await;
 
     // No live run anymore (mock finishes instantly): a steer command must fall back to
-    // dispatch-as-next-turn, per comet's executor.
-    let steer_command_id = queue_as_controller(
-        &core,
+    // dispatch-as-next-turn, per zeron's executor.
+    queue_as_viewer(
+        handle.doc(),
         "cmd-steer-1",
         SessionCommandPayload::Steer {
             prompt: "also do this".into(),
             message_id: Some("m-2".into()),
         },
-    )
-    .await;
+    );
     wait_for(
         || {
             matches!(
-                command_status(&core, &steer_command_id),
+                command_status(&core, "cmd-steer-1"),
                 Some((SessionCommandStatus::Applied, Some(_)))
             )
         },
         "steer fallback applied",
     )
     .await;
-    let (status, resolution) = command_status(&core, &steer_command_id).unwrap();
+    let (status, resolution) = command_status(&core, "cmd-steer-1").unwrap();
     assert_eq!(status, SessionCommandStatus::Applied);
     assert_eq!(resolution.as_deref(), Some("queued as new turn"));
 
@@ -1397,6 +936,118 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
     );
 }
 
+/// A live turn with no steering mailbox. Hangs until interrupted, recording
+/// whether that ever happened.
+struct UnsteerableHarness {
+    interrupted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Harness for UnsteerableHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Unsteerable"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(8);
+        let token = controls.interrupt.clone();
+        let interrupted = self.interrupted.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: "working".into(),
+                }))
+                .await;
+            token.cancelled().await;
+            interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+/// Steering must never kill the turn it steers (a mobile steer used to reach
+/// an interrupting dispatch — a Codex app-server takes its subagents down
+/// with it). A live turn with no mailbox holds the steer for the boundary.
+#[tokio::test]
+async fn steer_into_unsteerable_live_turn_holds_instead_of_interrupting() {
+    let dir = tempfile::tempdir().unwrap();
+    let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let core = assemble(
+        dir.path(),
+        Arc::new(UnsteerableHarness {
+            interrupted: interrupted.clone(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "turn running",
+    )
+    .await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-steer-1",
+        SessionCommandPayload::Steer {
+            prompt: "also do this".into(),
+            message_id: Some("m-2".into()),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-steer-1")
+                .is_some_and(|(s, _)| s != SessionCommandStatus::Pending)
+        },
+        "steer resolved",
+    )
+    .await;
+    let (status, resolution) = command_status(&core, "cmd-steer-1").unwrap();
+    assert_eq!(status, SessionCommandStatus::Applied);
+    assert_eq!(resolution.as_deref(), Some("held until the turn ends"));
+    assert!(!interrupted.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Working)
+    );
+    let queue = handle.doc().read_queue().unwrap();
+    assert!(queue.iter().any(|q| q.id == "m-2"), "held on the queue");
+    assert!(
+        !entries(&core).iter().any(|e| e.id == "m-2"),
+        "not in the transcript until delivered"
+    );
+}
+
 #[tokio::test]
 async fn processed_commands_are_skipped_on_redelivery() {
     let dir = tempfile::tempdir().unwrap();
@@ -1404,7 +1055,7 @@ async fn processed_commands_are_skipped_on_redelivery() {
     // Simulate a crash AFTER mark-processed but BEFORE execute/outcome: the ledger has
     // the id, the doc still says pending.
     {
-        let store = DocsStore::open(dir.path().join("projects/ashler-local/dev-user")).unwrap();
+        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
         assert!(store.mark_processed("cmd-crashed").unwrap());
     }
 
@@ -1424,28 +1075,37 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
 
-    // Give the drain a moment: the command must be SKIPPED — no user entry, no run.
+    // Give the drain a moment: the command must not EXECUTE — no user entry,
+    // no run. But it must not stay a forever-Pending ghost either (v0.2.12
+    // swallowed-send: "Sending…" forever, retry a no-op): the dead-command
+    // sweep terminalizes it as Rejected so the doc tells the truth and a
+    // retry can mint a fresh attempt.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         entries(&core).is_empty(),
         "skipped command must not execute"
     );
-    assert_eq!(
-        command_status(&core, "cmd-crashed"),
-        Some((SessionCommandStatus::Pending, None)),
-        "skip leaves the entry pending without an outcome"
-    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-crashed"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "crash-window command terminalized as Rejected",
+    )
+    .await;
     assert!(core.sessions.session_status(CHAT).is_none());
 
     // Direct ledger-evaluation check: re-evaluating a processed command = Skip.
-    let store = DocsStore::open(dir.path().join("projects/ashler-local/dev-user")).unwrap();
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
     let commands = handle.doc().read_commands().unwrap();
     let entry = commands.iter().find(|c| c.id == "cmd-crashed").unwrap();
     let is_processed = |id: &str| store.is_processed(id).unwrap_or(false);
     let never_past = |_: &str| false;
-    let verdict = comet_doc::evaluate_command(
+    let verdict = zeron_doc::evaluate_command(
         entry,
-        &comet_doc::EvaluationContext {
+        &zeron_doc::EvaluationContext {
             is_processed: &is_processed,
             now_ms: chrono::Utc::now().timestamp_millis(),
             entries: &commands,
@@ -1453,7 +1113,89 @@ async fn processed_commands_are_skipped_on_redelivery() {
             turn_is_past: &never_past,
         },
     );
-    assert_eq!(verdict, comet_doc::CommandDisposition::Skip);
+    assert_eq!(verdict, zeron_doc::CommandDisposition::Skip);
+}
+
+/// The v0.2.12 field report: a send whose command was consumed by the ledger
+/// but never executed (crash between mark and resolve) was invisible to
+/// every retry — the drain filters processed ids, so the session was dead
+/// forever while new sessions worked. Retry must mint a FRESH attempt.
+#[tokio::test]
+async fn retry_reissues_a_swallowed_send() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        assert!(store.mark_processed("cmd-dead").unwrap());
+    }
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-dead",
+        SessionCommandPayload::Run {
+            request: run_request("try again"),
+            message_id: "m-retry".into(),
+        },
+    );
+    // The sweep terminalizes the dead attempt without executing it…
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-dead"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "dead attempt rejected",
+    )
+    .await;
+    assert!(entries(&core).is_empty(), "dead attempt must not execute");
+
+    // …and the user's retry mints a fresh attempt that actually runs.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.id == "m-retry" && e.role == MessageRole::User)
+        },
+        "re-issued send writes the user entry",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "re-issued send runs to completion",
+    )
+    .await;
+    let run_attempts = |cmds: &[SessionCommandEntry]| {
+        cmds.iter()
+            .filter(|c| {
+                matches!(&c.payload,
+                    SessionCommandPayload::Run { message_id, .. } if message_id == "m-retry")
+            })
+            .count()
+    };
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "original + exactly one re-issue"
+    );
+    // A delivered message must never re-issue: retry while healthy is a no-op.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "retry after delivery must not duplicate the send"
+    );
 }
 
 #[tokio::test]
@@ -1466,8 +1208,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     // Craft the crash state: a journal without a terminal Done + a doc snapshot whose
     // assistant entry is still `streaming`.
     {
-        let journal =
-            RunJournal::open(dir.path().join("projects/ashler-local/dev-user/journals")).unwrap();
+        let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
         journal
             .append(
                 CHAT,
@@ -1489,7 +1230,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             device_id: device_id.into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
-            peer_message: None,
+            duration_ms: None,
         })
         .unwrap();
         let mut writer = SegmentWriter::begin(&doc, "m-assist", device_id, 2).unwrap();
@@ -1500,7 +1241,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             }])
             .unwrap();
         // No finish — the "process" dies here with the entry still streaming.
-        let store = DocsStore::open(dir.path().join("projects/ashler-local/dev-user")).unwrap();
+        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
         store
             .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
             .unwrap();
@@ -1524,8 +1265,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     }
 
     // Journal closed with a synthetic Done{interrupted}; no longer stale.
-    let journal =
-        RunJournal::open(dir.path().join("projects/ashler-local/dev-user/journals")).unwrap();
+    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
     let (_, last) = journal.last_event(CHAT).unwrap().unwrap();
     assert!(matches!(
@@ -1541,6 +1281,160 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
     );
 }
 
+fn spawn_chip(id: &str, status: SubagentStatus) -> MessagePart {
+    MessagePart::Tool {
+        id: id.into(),
+        call: ToolCall::Unknown {
+            name: "Agent: scout".into(),
+            input: None,
+        },
+        output: None,
+        diff: None,
+        is_error: false,
+        resolved: true,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        diff_stats: None,
+        subagent_ref: Some(format!("{CHAT}--sub--{id}")),
+        subagent_status: Some(status),
+        subagent_tail: None,
+    }
+}
+
+#[tokio::test]
+async fn recover_stale_journal_settles_chips_in_completed_local_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let device_id = "dev-host-fixed";
+    std::fs::write(dir.path().join("device-id"), device_id).unwrap();
+    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    journal
+        .append(
+            CHAT,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "spawn-running".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "working".into(),
+                }),
+            },
+        )
+        .unwrap();
+    let doc = SessionDoc::init(CHAT).unwrap();
+    for (id, device) in [("local", device_id), ("remote", "other-device")] {
+        doc.push_message(&SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts: vec![
+                spawn_chip(&format!("{id}-running"), SubagentStatus::Running),
+                spawn_chip(&format!("{id}-done"), SubagentStatus::Done),
+            ],
+            created_at: 1,
+            device_id: device.into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+    }
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    store
+        .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+        .unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let all = entries(&core);
+    let statuses: Vec<_> = all
+        .iter()
+        .flat_map(|e| &e.parts)
+        .filter_map(|p| match p {
+            MessagePart::Tool {
+                subagent_status, ..
+            } => *subagent_status,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            SubagentStatus::Failed,
+            SubagentStatus::Done,
+            SubagentStatus::Running,
+            SubagentStatus::Done
+        ]
+    );
+    assert!(
+        all.iter()
+            .all(|e| e.status == Some(MessageStatus::Complete))
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_done_without_a_live_sink_updates_a_persisted_chip() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: vec![
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "old-spawn".into(),
+                    event: Box::new(done(DoneStatus::Completed)),
+                },
+                done(DoneStatus::Completed),
+            ],
+        }),
+    );
+    core.doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .push_message(&SessionMessageEntry {
+            id: "old-assistant".into(),
+            role: MessageRole::Assistant,
+            parts: vec![spawn_chip("old-spawn", SubagentStatus::Running)],
+            created_at: 1,
+            device_id: core.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("resume"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "resumed turn completes",
+    )
+    .await;
+    let all = entries(&core);
+    let chip = all
+        .iter()
+        .flat_map(|e| &e.parts)
+        .find(|p| matches!(p, MessagePart::Tool { id, .. } if id == "old-spawn"))
+        .unwrap();
+    assert!(
+        matches!(
+            chip,
+            MessagePart::Tool {
+                subagent_status: Some(SubagentStatus::Done),
+                ..
+            }
+        ),
+        "{chip:?}"
+    );
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn rpc_surface_over_in_memory_transport() {
     let dir = tempfile::tempdir().unwrap();
@@ -1550,17 +1444,17 @@ async fn rpc_surface_over_in_memory_transport() {
             script: mock_script(),
         }),
     );
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = zeron_rpc::memory_client(core.rpc_service());
 
     // ListHarnesses + ListModels.
     let harnesses = client
-        .call(comet_rpc::methods::LIST_HARNESSES, serde_json::Value::Null)
+        .call(zeron_rpc::methods::LIST_HARNESSES, serde_json::Value::Null)
         .await
         .unwrap();
     assert_eq!(harnesses[0]["id"], "mock");
     let models = client
         .call(
-            comet_rpc::methods::LIST_MODELS,
+            zeron_rpc::methods::LIST_MODELS,
             serde_json::json!({"harness": "mock"}),
         )
         .await
@@ -1569,19 +1463,18 @@ async fn rpc_surface_over_in_memory_transport() {
 
     // WatchSessions + WatchDocMessages streams.
     let mut sessions_stream = client
-        .subscribe(comet_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
+        .subscribe(zeron_rpc::methods::WATCH_SESSIONS, serde_json::Value::Null)
         .await
         .unwrap();
     let first_sessions = tokio::time::timeout(Duration::from_secs(5), sessions_stream.recv())
         .await
-        .unwrap()
         .unwrap()
         .unwrap();
     assert_eq!(first_sessions, serde_json::json!([]));
 
     let mut messages_stream = client
         .subscribe(
-            comet_rpc::methods::WATCH_DOC_MESSAGES,
+            zeron_rpc::methods::WATCH_DOC_MESSAGES,
             serde_json::json!({"chatId": CHAT}),
         )
         .await
@@ -1589,24 +1482,23 @@ async fn rpc_surface_over_in_memory_transport() {
     let initial = tokio::time::timeout(Duration::from_secs(5), messages_stream.recv())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
     // Delta protocol: the stream opens with a full reset frame.
-    assert_eq!(initial, serde_json::json!({ "reset": [] }));
+    assert_eq!(
+        initial,
+        serde_json::json!({ "reset": [], "contextUsage": null, "replayBaseline": {"entries": {}} })
+    );
 
     // QueueCommand (as this device's composer would over IPC).
-    let params = controller_params(
-        &core,
-        "rpc-run",
-        SessionCommandPayload::Run {
-            request: run_request("via rpc"),
-            message_id: "m-rpc-1".into(),
-        },
-    );
+    let command = serde_json::to_value(SessionCommandPayload::Run {
+        request: run_request("via rpc"),
+        message_id: "m-rpc-1".into(),
+    })
+    .unwrap();
     let queued = client
         .call(
-            comet_rpc::methods::QUEUE_COMMAND,
-            params,
+            zeron_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({"chatId": CHAT, "command": command}),
         )
         .await
         .unwrap();
@@ -1621,10 +1513,9 @@ async fn rpc_surface_over_in_memory_transport() {
         let item = tokio::time::timeout_at(deadline, messages_stream.recv())
             .await
             .expect("doc messages before timeout")
-            .expect("stream alive")
-            .expect("stream item");
-        let frame: comet_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
-        comet_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
+            .expect("stream alive");
+        let frame: zeron_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
+        zeron_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
         if materialized.len() == 2 && materialized[1].status == Some(MessageStatus::Complete) {
             break materialized;
         }
@@ -1642,8 +1533,7 @@ async fn rpc_surface_over_in_memory_transport() {
         let item = tokio::time::timeout_at(deadline, sessions_stream.recv())
             .await
             .expect("session update before timeout")
-            .expect("stream alive")
-            .expect("stream item");
+            .expect("stream alive");
         let list: Vec<serde_json::Value> = serde_json::from_value(item).unwrap();
         if list.first().and_then(|s| s["status"].as_str()) == Some("idle") {
             break;
@@ -1682,11 +1572,13 @@ async fn respond_input_resolves_pending_question() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
                     multi_select: false,
                 }])
                 .await
@@ -1711,23 +1603,20 @@ async fn respond_input_resolves_pending_question() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(AskingHarness));
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-ask",
         SessionCommandPayload::Run {
             request: run_request("ask me"),
             message_id: "m-1".into(),
         },
-    )
-    .await;
+    );
 
     // The input request surfaces: status AwaitingInput + an unresolved input part.
     wait_for(
         || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .map(|s| s.status)
+            core.sessions.session_status(CHAT).map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -1761,18 +1650,17 @@ async fn respond_input_resolves_pending_question() {
             })
         })
         .unwrap();
-    let answer_command_id = queue_as_controller(
-        &core,
+    queue_as_viewer(
+        handle.doc(),
         "cmd-answer-1",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
             }],
         },
-    )
-    .await;
+    );
 
     wait_for(
         || {
@@ -1787,7 +1675,7 @@ async fn respond_input_resolves_pending_question() {
     )
     .await;
     assert_eq!(
-        command_status(&core, &answer_command_id),
+        command_status(&core, "cmd-answer-1"),
         Some((SessionCommandStatus::Applied, None))
     );
     // The input part is marked resolved in the doc.
@@ -1799,12 +1687,7 @@ async fn respond_input_resolves_pending_question() {
     // The run task writes the Complete entry BEFORE settling the status row —
     // wait for the transition instead of asserting the instant in between.
     wait_for(
-        || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .map(|s| s.status)
-                == Some(SessionStatus::Idle)
-        },
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
         "session to settle idle",
     )
     .await;
@@ -1844,11 +1727,13 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
                     multi_select: false,
                 }])
                 .await
@@ -1873,21 +1758,18 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(AskingHarness));
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-wrong",
         SessionCommandPayload::Run {
             request: run_request("ask me"),
             message_id: "m-1".into(),
         },
-    )
-    .await;
+    );
     wait_for(
         || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .map(|s| s.status)
+            core.sessions.session_status(CHAT).map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -1912,28 +1794,27 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
     .await;
 
     // A wrong-id answer: rejected with a resolution, question still live.
-    let bogus_command_id = queue_as_controller(
-        &core,
+    queue_as_viewer(
+        handle.doc(),
         "cmd-answer-bogus",
         SessionCommandPayload::RespondInput {
             request_id: "bogus-id".into(),
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
             }],
         },
-    )
-    .await;
+    );
     wait_for(
         || {
-            command_status(&core, &bogus_command_id)
+            command_status(&core, "cmd-answer-bogus")
                 .is_some_and(|(s, _)| s != SessionCommandStatus::Pending)
         },
         "bogus answer processed",
     )
     .await;
     assert_eq!(
-        command_status(&core, &bogus_command_id),
+        command_status(&core, "cmd-answer-bogus"),
         Some((
             SessionCommandStatus::Rejected,
             Some("no pending input request".into())
@@ -1942,9 +1823,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
     // The run is still waiting and the part is still unresolved — the
     // QuestionPanel keeps presenting the real request.
     assert_eq!(
-        core.sessions
-            .session_status(EXECUTION_KEY)
-            .map(|s| s.status),
+        core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::AwaitingInput)
     );
     let request_id = entries(&core)
@@ -1962,31 +1841,33 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         .expect("question still live after rejected answer");
 
     // The correct answer still resumes and completes the run.
-    queue_as_controller(
-        &core,
+    queue_as_viewer(
+        handle.doc(),
         "cmd-answer-right",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
             }],
         },
-    )
-    .await;
+    );
     wait_for(
         || {
-            core.sessions.session_status(EXECUTION_KEY).is_some_and(|session| session.status == SessionStatus::Idle)
-                && entries_now(&core).iter().any(|e| {
+            entries_now(&core).iter().any(|e| {
                 e.status == Some(MessageStatus::Complete)
                     && e.parts
                         .iter()
                         .any(|p| matches!(p, MessagePart::Text { text, .. } if text == "picked b"))
             })
         },
-        "answered turn to complete and become idle",
+        "answered turn to complete",
     )
     .await;
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
 }
 
 /// Resilience: interrupting a run that is BLOCKED on a question unparks the
@@ -2039,11 +1920,13 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
                     // Blocks on the question; an interrupt fails the resolver
                     // (empty answers) and cancels the token — like a real CLI
                     // being torn down, the stream then ends WITHOUT a Done.
-                    let _ = (controls.request_input)(vec![comet_proto::UserInputQuestion {
+                    let _ = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
                         id: "q1".into(),
                         header: "Pick".into(),
                         question: "Which one?".into(),
                         options: vec!["a".into(), "b".into()],
+                        prefill: None,
+                        multiline: false,
                         multi_select: false,
                     }])
                     .await;
@@ -2060,21 +1943,18 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(BlockingHarness));
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-block",
         SessionCommandPayload::Run {
             request: run_request("ask and block"),
             message_id: "m-1".into(),
         },
-    )
-    .await;
+    );
     wait_for(
         || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .map(|s| s.status)
+            core.sessions.session_status(CHAT).map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -2101,7 +1981,7 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
     // Interrupt while blocked: settles promptly (well under the 3s grace —
     // the unparked resolver lets the harness wind down on its own).
     let start = std::time::Instant::now();
-    core.sessions.interrupt(EXECUTION_KEY).await.unwrap();
+    core.sessions.interrupt(CHAT).await.unwrap();
     assert!(
         start.elapsed() < std::time::Duration::from_secs(3),
         "interrupt settled via the unparked resolver, not the grace timeout"
@@ -2129,15 +2009,14 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
     }));
 
     // And the session is usable: the next run completes.
-    queue_as_controller(
-        &core,
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-second",
         SessionCommandPayload::Run {
             request: run_request("second run"),
             message_id: "m-2".into(),
         },
-    )
-    .await;
+    );
     wait_for(
         || {
             entries_now(&core).iter().any(|e| {
@@ -2190,11 +2069,13 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let question = comet_proto::UserInputQuestion {
+                let question = zeron_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
                     multi_select: false,
                 };
                 // The pre-fix Claude/Codex shape: surface the question under
@@ -2228,22 +2109,19 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
 
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(DoubleEmitHarness));
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-run-twin",
         SessionCommandPayload::Run {
             request: run_request("ask me twice"),
             message_id: "m-1".into(),
         },
-    )
-    .await;
+    );
 
     wait_for(
         || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .map(|s| s.status)
+            core.sessions.session_status(CHAT).map(|s| s.status)
                 == Some(SessionStatus::AwaitingInput)
         },
         "awaiting input",
@@ -2295,18 +2173,17 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
             })
         })
         .unwrap();
-    let answer_command_id = queue_as_controller(
-        &core,
+    queue_as_viewer(
+        handle.doc(),
         "cmd-answer-twin",
         SessionCommandPayload::RespondInput {
             request_id,
-            answers: vec![comet_proto::UserInputAnswer {
+            answers: vec![zeron_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
             }],
         },
-    )
-    .await;
+    );
 
     // The run resumes and completes; the chip flips to resolved.
     wait_for(
@@ -2322,7 +2199,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
     )
     .await;
     assert_eq!(
-        command_status(&core, &answer_command_id),
+        command_status(&core, "cmd-answer-twin"),
         Some((SessionCommandStatus::Applied, None))
     );
     assert!(entries(&core).iter().any(|e| {
@@ -2333,12 +2210,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
     // The run task writes the Complete entry BEFORE settling the status row —
     // wait for the transition instead of asserting the instant in between.
     wait_for(
-        || {
-            core.sessions
-                .session_status(EXECUTION_KEY)
-                .map(|s| s.status)
-                == Some(SessionStatus::Idle)
-        },
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
         "session to settle idle",
     )
     .await;
@@ -2349,9 +2221,9 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
 // the prompt-embedded refs (the persisted transport) and the staged paths.
 // ---------------------------------------------------------------------------
 
-/// Delegates to a scripted mock and records every RunRequest the engine hands
-/// over, proving attachments survive doc-queue → executor → harness without an
-/// auxiliary title-generation run.
+/// Delegates to a scripted mock but records every RunRequest the engine hands
+/// over (the chat run AND the auto-title run share the harness) — proves
+/// `attachments` survives doc-queue → executor → harness.
 struct CapturingHarness {
     script: Vec<AgentEvent>,
     seen: Arc<std::sync::Mutex<Vec<RunRequest>>>,
@@ -2404,27 +2276,25 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
             seen: seen.clone(),
         }),
     );
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = zeron_rpc::memory_client(core.rpc_service());
 
-    // Chunked upload exactly as the composer sends it: independently encode
-    // 45KB raw slices into positional UploadChunk slots, then commit.
-    let payload: Vec<u8> = (0..=255u8).cycle().take(90_001).collect();
-    for (seq, bytes) in payload.chunks(45_000).enumerate() {
+    // Chunked upload exactly as the composer sends it: base64 split across
+    // positional UploadChunk slots, then UploadCommit → the durable path.
+    let payload: Vec<u8> = (0..=255u8).cycle().take(9_001).collect();
+    let encoded = b64.encode(&payload);
+    let (first, second) = encoded.split_at(encoded.len() / 2);
+    for (seq, data) in [(0, first), (1, second)] {
         client
             .call(
-                comet_rpc::methods::UPLOAD_CHUNK,
-                serde_json::json!({
-                    "uploadId": "e2e-att",
-                    "seq": seq,
-                    "data": b64.encode(bytes),
-                }),
+                zeron_rpc::methods::UPLOAD_CHUNK,
+                serde_json::json!({ "uploadId": "e2e-att", "seq": seq, "data": data }),
             )
             .await
             .expect("UploadChunk");
     }
     let committed = client
         .call(
-            comet_rpc::methods::UPLOAD_COMMIT,
+            zeron_rpc::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "e2e-att", "fileName": "red.png" }),
         )
         .await
@@ -2436,23 +2306,22 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         "committed file holds the exact reassembled bytes"
     );
 
-    // Run with the comet `withAttachments` transport: refs embedded in the
+    // Run with the zeron `withAttachments` transport: refs embedded in the
     // prompt text (this is what persists), paths on the additive field.
     let prompt = format!(
         "what color is this?\n\nAttached images (local files — open them to view):\n- {path}"
     );
     let mut request = run_request(&prompt);
     request.attachments = vec![path.clone()];
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-att-1",
         SessionCommandPayload::Run {
             request,
             message_id: "msg-att-1".into(),
         },
-    )
-    .await;
+    );
     wait_for(
         || {
             entries_now(&core).iter().any(|e| {
@@ -2476,18 +2345,21 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         other => panic!("unexpected user part {other:?}"),
     }
 
-    // Local deterministic titling never allocates a second harness request.
+    // The harness saw the staged paths on the request itself (the chat run —
+    // NOT the auto-title run, which fires at dispatch now, embeds the user
+    // prompt in its wrapper, and legitimately carries no attachments).
     let requests = seen.lock().unwrap().clone();
-    assert_eq!(requests.len(), 1);
-    let chat_run = &requests[0];
-    assert!(chat_run.prompt.contains("what color is this?"));
+    let chat_run = requests
+        .iter()
+        .find(|r| r.prompt.contains("what color is this?") && !r.prompt.contains("word title"))
+        .expect("chat run reached the harness");
     assert_eq!(chat_run.attachments, vec![path.clone()]);
     assert!(chat_run.prompt.contains(&path));
 
     // Read-back over the same RPC surface the transcript uses.
     let chunk = client
         .call(
-            comet_rpc::methods::READ_ATTACHMENT_CHUNK,
+            zeron_rpc::methods::READ_ATTACHMENT_CHUNK,
             serde_json::json!({ "path": path, "offset": 0 }),
         )
         .await
@@ -2502,7 +2374,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
 /// color — it can only know it by SEEING the inline image block (the sandbox
 /// prompt forbids opening the file). Ignored by default: needs an installed,
 /// authenticated `claude` CLI and spends real tokens.
-/// Run with: `cargo test -p comet-engine --test e2e -- --ignored`
+/// Run with: `cargo test -p zeron-engine --test e2e -- --ignored`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires installed+authenticated claude CLI; spends tokens"]
 async fn real_claude_sees_uploaded_image_inline() {
@@ -2515,16 +2387,14 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     let core = EngineCore::assemble(
         &dir,
-        Arc::new(comet_engine::default_registry(
-            comet_proto::RuntimeProfile::LocalController,
-        )),
+        Arc::new(zeron_engine::default_registry()),
         HarnessId::ClaudeCode,
         None,
     )
     .expect("engine core assembles");
-    // Pin the title so this test remains focused on the production harness path.
+    // Pre-title the chat so the auto-titler doesn't spend a second model call.
     core.workspace
-        .create_chat(CHAT, &core.device_id, None, Some("/tmp".into()))
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
         .expect("create chat row");
     core.workspace
         .rename_chat(CHAT, "Pre-titled")
@@ -2532,17 +2402,17 @@ async fn real_claude_sees_uploaded_image_inline() {
 
     // 8×8 solid-red PNG, uploaded exactly as the composer does.
     const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAB+GTG2wAAJP0GeGuMDBnAAAAAElFTkSuQmCC";
-    let client = comet_rpc::memory_client(core.rpc_service());
+    let client = zeron_rpc::memory_client(core.rpc_service());
     client
         .call(
-            comet_rpc::methods::UPLOAD_CHUNK,
+            zeron_rpc::methods::UPLOAD_CHUNK,
             serde_json::json!({ "uploadId": "real-img", "seq": 0, "data": RED_PNG_B64 }),
         )
         .await
         .expect("UploadChunk");
     let committed = client
         .call(
-            comet_rpc::methods::UPLOAD_COMMIT,
+            zeron_rpc::methods::UPLOAD_COMMIT,
             serde_json::json!({ "uploadId": "real-img", "fileName": "swatch.png" }),
         )
         .await
@@ -2559,9 +2429,10 @@ async fn real_claude_sees_uploaded_image_inline() {
          Attached images (local files — open them to view):\n- {path}"
     );
     let request = RunRequest {
+        mcp: None,
         prompt,
+        harness: None,
         model: Some("haiku".into()),
-        agent_account_id: None,
         reasoning: None,
         model_options: Default::default(),
         cwd: cwd.to_string_lossy().to_string(),
@@ -2569,6 +2440,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         auto_approve: false,
         attachments: vec![path],
         resume: None,
+        worktree: None,
     };
     core.doc_host
         .queue_command(
@@ -2658,27 +2530,26 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     });
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(MockHarness { script }));
-    let _handle = core.doc_host.open(CHAT).unwrap();
-    queue_as_controller(
-        &core,
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
         "cmd-hb-1",
         SessionCommandPayload::Run {
             request: run_request("hb"),
             message_id: "msg-hb-1".into(),
         },
-    )
-    .await;
+    );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| e.status == Some(MessageStatus::Complete))
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )
     .await;
     // Journal replay: the 40 empties were filtered; real content survived.
-    let replay = core.sessions.subscribe(EXECUTION_KEY, 0).unwrap().0;
+    let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
     let empties = replay
         .iter()
         .filter(|j| matches!(&j.event, AgentEvent::ReasoningDelta { text } if text.is_empty()))
@@ -2695,4 +2566,982 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
             .any(|j| matches!(&j.event, AgentEvent::TextDelta { text } if text == "done")),
         "text deltas unaffected"
     );
+}
+
+#[tokio::test]
+async fn parked_session_ignores_trailing_frames_and_stays_idle() {
+    // ACP children keep forwarding session/update frames after a turn's Done
+    // (late tool_call_updates, flushed text). A parked session must treat
+    // them as inert: no Working re-arm (the eternally-running-session bug),
+    // no phantom assistant entry.
+    let mut script = mock_script();
+    script.push(AgentEvent::ToolCall {
+        id: "tool-1".into(),
+        call: ToolCall::Exec {
+            command: "echo late-echo".into(),
+        },
+    });
+    script.push(AgentEvent::TextDelta {
+        text: "trailing flush".into(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-parked",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-parked".into(),
+        },
+    );
+
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session to complete",
+    )
+    .await;
+    // The trailing frames land right after the park; hold the assertion open
+    // past the 120ms flush window to catch a phantom segment or a Working
+    // re-arm (both are what the old code did).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            core.sessions.session_status(CHAT).map(|s| s.status),
+            Some(SessionStatus::Idle),
+            "trailing frames must not re-arm Working"
+        );
+        let all = entries_now(&core);
+        assert!(
+            all.len() <= 2,
+            "trailing frames must not open a phantom entry: {all:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let all = entries(&core);
+    assert_eq!(all.len(), 2, "user + one assistant entry");
+    assert_eq!(all[1].status, Some(MessageStatus::Complete));
+}
+
+#[tokio::test]
+async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
+    // Adapters re-emit shape-bearing tool_call_updates as full ToolCall
+    // events. Once a steer boundary reset the fold, such an echo for a
+    // PRIOR segment's tool must not mint a chip mid-text in the new segment
+    // (the mid-word transcript splits).
+    let script = vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-steer".into(),
+            assistant_message_id: "a-1".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "part one".into(),
+        },
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::Steered {
+            assistant_message_id: Some("a-1".into()),
+            next_assistant_message_id: Some("a-2".into()),
+        },
+        AgentEvent::TextDelta {
+            text: "part ".into(),
+        },
+        // The long-running exec from segment one completes mid-stream of the
+        // next segment: a shape-bearing echo plus its result.
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::ToolResult {
+            id: "tool-long".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        },
+        AgentEvent::TextDelta { text: "two".into() },
+        done(DoneStatus::Completed),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-echo",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-echo".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).len() == 3
+                && core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle)
+        },
+        "both segments to land",
+    )
+    .await;
+    let all = entries(&core);
+    // Segment one: text + the (unresolved-at-boundary) tool chip.
+    assert_eq!(all[1].parts.len(), 2, "{:#?}", all[1].parts);
+    // Segment two: ONE contiguous text part, no spliced chip.
+    assert_eq!(
+        all[2].parts,
+        vec![MessagePart::Text {
+            id: "t0".into(),
+            text: "part two".into()
+        }],
+        "stale echo must not split the streaming text"
+    );
+}
+
+/// The elapsed timer's base (`started_at`) is per user message: a settled
+/// session drops it (no reader can resurrect the previous turn's elapsed —
+/// the "timer opens at 30:00 on send" bug), and a steer into a PARKED
+/// persistent session restamps it fresh for the new turn.
+#[tokio::test]
+async fn parked_steer_restamps_started_at_and_idle_clears_it() {
+    // Steerable harness whose stream stays open after the turn's Done — the
+    // engine parks the session — and whose steering mailbox drives turn two.
+    struct ParkingHarness;
+    #[async_trait]
+    impl Harness for ParkingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Parking"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            mut controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "turn one".into(),
+                    }))
+                    .await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                // Parked. The next steer is turn two.
+                if let Some(_msg) = controls.steering.recv().await {
+                    let _ = tx
+                        .send(Ok(AgentEvent::Steered {
+                            assistant_message_id: None,
+                            next_assistant_message_id: None,
+                        }))
+                        .await;
+                    let _ = tx
+                        .send(Ok(AgentEvent::TextDelta {
+                            text: "turn two".into(),
+                        }))
+                        .await;
+                    // Hold the turn open so the test's poll observes Working
+                    // (the transition is otherwise sub-millisecond).
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                }
+            });
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ParkingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-park-timer",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "turn one to park",
+    )
+    .await;
+    let parked = core.sessions.session_status(CHAT).unwrap();
+    assert_eq!(
+        parked.started_at, None,
+        "a settled session must drop its timer base"
+    );
+
+    let before_steer = chrono::Utc::now();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-steer-park-timer",
+        SessionCommandPayload::Steer {
+            prompt: "next".into(),
+            message_id: Some("m-2".into()),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "turn two working",
+    )
+    .await;
+    let working = core.sessions.session_status(CHAT).unwrap();
+    let started = working.started_at.expect("Working carries a timer base");
+    assert!(
+        started >= before_steer,
+        "steer into a parked session must restamp started_at (got {started}, steered at {before_steer})"
+    );
+
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "turn two to settle",
+    )
+    .await;
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().started_at, None);
+}
+
+#[tokio::test]
+async fn context_usage_settles_after_done_without_reopening_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::TextDelta {
+                    text: "Finished".into(),
+                },
+                AgentEvent::ContextUsage {
+                    tokens: Some(64000),
+                    window: Some(200000),
+                },
+                done(DoneStatus::Completed),
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "child".into(),
+                    event: Box::new(AgentEvent::ContextUsage {
+                        tokens: Some(999999),
+                        window: Some(1000000),
+                    }),
+                },
+                AgentEvent::ContextUsage {
+                    tokens: Some(0),
+                    window: None,
+                },
+            ],
+            step_delay: Duration::from_millis(20),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "context-run",
+        SessionCommandPayload::Run {
+            request: run_request("measure context"),
+            message_id: "context-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            handle
+                .doc()
+                .context_usage()
+                .is_some_and(|u| u.tokens == Some(0))
+        },
+        "post-turn context update",
+    )
+    .await;
+    assert_eq!(
+        handle.doc().context_usage(),
+        Some(zeron_proto::ContextUsage {
+            tokens: Some(0),
+            window: Some(200000)
+        })
+    );
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    assert_eq!(
+        entries(&core).len(),
+        2,
+        "usage does not create transcript rows"
+    );
+}
+
+/// Reproduce a steer accepted just before the old turn's Done. The harness
+/// confirms the new boundary later; only its eventual completion may notify.
+#[tokio::test]
+async fn pending_steer_handoff_does_not_publish_a_completion() {
+    struct ControlledHarness(
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>>>,
+    );
+    #[async_trait]
+    impl Harness for ControlledHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Controlled"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let rx = self.0.lock().unwrap().take().unwrap();
+            // Keep the mailbox alive but let the test control confirmation.
+            Ok(
+                futures::stream::unfold((rx, controls), |(mut rx, controls)| async move {
+                    rx.recv().await.map(|event| (Ok(event), (rx, controls)))
+                })
+                .boxed(),
+            )
+        }
+    }
+    for routed_dispatch in [false, true] {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble(
+            dir.path(),
+            Arc::new(ControlledHarness(std::sync::Mutex::new(Some(rx)))),
+        );
+        let handle = core.doc_host.open(CHAT).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            "cmd-completion",
+            SessionCommandPayload::Run {
+                request: run_request("opening"),
+                message_id: "user-opening".into(),
+            },
+        );
+        tx.send(mock_script()[0].clone()).unwrap();
+        wait_for(
+            || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+            "opening run",
+        )
+        .await;
+        if routed_dispatch {
+            core.sessions
+                .dispatch(
+                    CHAT,
+                    HarnessId::Mock,
+                    run_request("redirect"),
+                    Some("user-steer".into()),
+                )
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                core.sessions
+                    .steer(CHAT, "redirect", Some("user-steer".into()))
+                    .await
+                    .unwrap(),
+                zeron_engine::sessions::SteerOutcome::Accepted
+            );
+        }
+        let before_done = core.sessions.session_status(CHAT).unwrap().updated_at;
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || {
+                core.sessions
+                    .session_status(CHAT)
+                    .is_some_and(|s| s.updated_at > before_done)
+            },
+            "internal handoff",
+        )
+        .await;
+        assert_eq!(
+            core.sessions.session_status(CHAT).unwrap().status,
+            SessionStatus::Working
+        );
+        assert_eq!(
+            core.sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_turn,
+            None
+        );
+        tx.send(AgentEvent::Steered {
+            assistant_message_id: Some("a-1".into()),
+            next_assistant_message_id: Some("a-steered".into()),
+        })
+        .unwrap();
+        tx.send(AgentEvent::TextDelta {
+            text: "redirected response".into(),
+        })
+        .unwrap();
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || {
+                core.sessions
+                    .session_status(CHAT)
+                    .and_then(|s| s.last_completed_turn)
+                    .as_deref()
+                    == Some("a-steered")
+            },
+            "real completion",
+        )
+        .await;
+        // A duplicate terminal frame from a parked runtime cannot ring twice.
+        let (_, mut events) = core.sessions.subscribe(CHAT, 0).unwrap();
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(duplicate.event, AgentEvent::Done { .. }));
+        // drive_run publishes and settles synchronously before polling again.
+        tokio::task::yield_now().await;
+        drop(tx);
+        assert_eq!(
+            core.sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_turn
+                .as_deref(),
+            Some("a-steered")
+        );
+        core.shutdown().await;
+    }
+}
+
+/// Real drive_run + journal + Loro, with an isolated Codex source root.
+#[tokio::test]
+async fn generated_image_is_materialized_before_publication_and_survives_reopen() {
+    use zeron_engine::{DocHost, DocHostConfig, SessionsEngine, Uploads};
+    let dir = tempfile::tempdir().unwrap();
+    let source_root = dir.path().join("codex/generated_images");
+    std::fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("source.png");
+    let bytes = b"\x89PNG\r\n\x1a\nBASE64_SENTINEL_ONLY_IN_FILE";
+    std::fs::write(&source, bytes).unwrap();
+    let image = AgentEvent::GeneratedImage {
+        id: "image-1:image".into(),
+        path: source.to_string_lossy().into_owned(),
+        name: "untrusted".into(),
+        mime_type: "untrusted".into(),
+    };
+    let script = vec![
+        AgentEvent::ToolCall {
+            id: "image-1".into(),
+            call: ToolCall::Unknown {
+                name: "Generate image".into(),
+                input: None,
+            },
+        },
+        AgentEvent::ToolResult {
+            id: "image-1".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        },
+        image.clone(),
+        image.clone(),
+        done(DoneStatus::Completed),
+    ];
+    let registry = registry_with(Arc::new(MockHarness { script }));
+    let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+    let sessions = SessionsEngine::new("host".into(), journal.clone(), registry);
+    let uploads = Uploads::from_root(&dir.path().join("profile/uploads"));
+    sessions.set_generated_images(uploads.clone(), source_root);
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = DocHost::new(
+        store,
+        DocHostConfig {
+            device_id: "host".into(),
+            default_harness: HarnessId::Mock,
+            edge: None,
+        },
+    );
+    sessions.set_doc_host(host.clone());
+    sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("image"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "image completion",
+    )
+    .await;
+    let handle = host.open(CHAT).unwrap();
+    let entries = handle.doc().read_entries().unwrap();
+    let images: Vec<_> = entries
+        .iter()
+        .flat_map(|e| &e.parts)
+        .filter_map(|p| {
+            if let MessagePart::Image { path, .. } = p {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(images.len(), 1);
+    // Materialization canonicalizes the uploads dir; macOS temp dirs sit
+    // behind the /var -> /private/var symlink.
+    assert!(std::path::Path::new(&images[0]).starts_with(uploads.dir().canonicalize().unwrap()));
+    let serialized = serde_json::to_string(&journal.replay(CHAT, 0).unwrap()).unwrap();
+    assert!(!serialized.contains(source.to_str().unwrap()));
+    assert!(!serialized.contains("BASE64_SENTINEL"));
+    let doc_json = serde_json::to_string(&entries).unwrap();
+    assert!(!doc_json.contains(source.to_str().unwrap()));
+    assert!(!doc_json.contains("BASE64_SENTINEL"));
+    std::fs::remove_file(&source).unwrap();
+    assert_eq!(std::fs::read(&images[0]).unwrap(), bytes);
+    let imported = loro::LoroDoc::new();
+    imported
+        .import(&handle.doc().export_snapshot().unwrap())
+        .unwrap();
+    assert_eq!(
+        SessionDoc::from_doc(imported).read_entries().unwrap(),
+        entries
+    );
+    // Resume echoes the successful completed item after Codex removed its source.
+    sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("resume"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "resume completion",
+    )
+    .await;
+    assert_eq!(
+        handle
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .flat_map(|e| &e.parts)
+            .filter(|p| matches!(p, MessagePart::Image { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !handle
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .flat_map(|e| &e.parts)
+            .any(|p| matches!(p, MessagePart::Error { .. }))
+    );
+    sessions.shutdown().await;
+}
+
+/// Real provider + engine smoke, opt-in because it consumes image quota.
+#[tokio::test]
+#[ignore = "requires authenticated Codex with image generation; consumes quota"]
+async fn real_image_generation_profile_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(
+        dir.path(),
+        registry_with(Arc::new(zeron_harness::CodexHarness::new())),
+        HarnessId::Codex,
+        None,
+    )
+    .unwrap();
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Codex,
+            run_request("Generate an image of a small green goblin using image generation."),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while !entries_now(&core)
+            .iter()
+            .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let all = entries(&core);
+    let image = all
+        .iter()
+        .flat_map(|e| &e.parts)
+        .find_map(|p| {
+            if let MessagePart::Image { path, .. } = p {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .expect("generated image reaches document");
+    assert!(std::path::Path::new(image).starts_with(core.uploads.dir()));
+    assert!(std::path::Path::new(image).is_file());
+    assert!(
+        !serde_json::to_string(&all)
+            .unwrap()
+            .contains("generated_images/")
+    );
+    core.sessions.shutdown().await;
+}
+
+/// Admission failures precede drive_run, but must still explain the saved
+/// prompt. An explicit new attempt reuses its message identity, never its text
+/// as a second user turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_failure_is_visible_and_recovers_with_same_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(HarnessRegistry::new());
+    let core = EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let payload = SessionCommandPayload::Run {
+        request: run_request("saved prompt"),
+        message_id: "original-message".into(),
+    };
+    // No harness is available yet: rejection happens before a runtime starts.
+    queue_as_viewer(handle.doc(), "admission-failed", payload.clone());
+    wait_for(
+        || matches!(command_status(&core, "admission-failed"), Some((SessionCommandStatus::Rejected, _))),
+        "admission rejected",
+    ).await;
+    let reason = command_status(&core, "admission-failed").unwrap().1.unwrap();
+    let failed = entries(&core);
+    assert_eq!(failed.iter().filter(|e| e.role == MessageRole::User).count(), 1);
+    assert!(failed.iter().any(|e| e.role == MessageRole::Assistant
+        && e.status == Some(MessageStatus::Complete)
+        && matches!(e.parts.as_slice(), [MessagePart::Error { message, .. }] if message == &reason)));
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().status, SessionStatus::Errored);
+    assert_eq!(handle.doc().read_commands().unwrap().len(), 1);
+
+    registry.register(Arc::new(MockHarness { script: mock_script() }));
+    queue_as_viewer(handle.doc(), "explicit-recovery", payload);
+    wait_for(
+        || matches!(command_status(&core, "explicit-recovery"), Some((SessionCommandStatus::Applied, _)))
+            && core.sessions.session_status(CHAT).is_some_and(|s| s.status == SessionStatus::Idle),
+        "explicit recovery completed",
+    ).await;
+    let recovered = entries(&core);
+    let users: Vec<_> = recovered.iter().filter(|e| e.role == MessageRole::User).collect();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, "original-message");
+    assert_eq!(recovered.iter().filter(|e| e.role == MessageRole::Assistant).count(), 2);
+    assert_eq!(command_status(&core, "admission-failed").unwrap().0, SessionCommandStatus::Rejected);
+    core.sessions.shutdown().await;
+}
+
+/// A harness that fails before streaming (an OpenCode server that never
+/// booted) must leave its reason in the transcript, not only a bare
+/// "Run failed" status.
+#[tokio::test(flavor = "multi_thread")]
+async fn start_failure_lands_in_the_transcript() {
+    struct FailsToStart;
+    #[async_trait]
+    impl Harness for FailsToStart {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "FailsToStart"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            Err(HarnessError::Protocol("server never booted".into()))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(FailsToStart));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-fails",
+        SessionCommandPayload::Run {
+            request: run_request("hello"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Errored),
+        "errored",
+    )
+    .await;
+    let entries = entries_now(&core);
+    let assistant = entries
+        .iter()
+        .find(|e| e.role == MessageRole::Assistant)
+        .expect("assistant entry for the failed start");
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    assert!(matches!(
+        assistant.parts.as_slice(),
+        [MessagePart::Error { message, .. }] if message.contains("server never booted")
+    ));
+    core.sessions.shutdown().await;
+}
+
+/// The session row carries how many subagents are streaming, so sidebars on
+/// every device can badge a chat they have not opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_row_counts_running_subagents_until_the_run_ends() {
+    fn spawn(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: "Agent: probe".into(),
+                input: None,
+            },
+        }
+    }
+    fn chatter(parent: &str) -> AgentEvent {
+        AgentEvent::Subagent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(AgentEvent::TextDelta {
+                text: "working".into(),
+            }),
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                spawn("sub-1"),
+                spawn("sub-2"),
+                chatter("sub-1"),
+                chatter("sub-2"),
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "sub-1".into(),
+                    event: Box::new(done(DoneStatus::Completed)),
+                },
+            ],
+            step_delay: Duration::from_millis(400),
+            hang_until_interrupt: true,
+        }),
+    );
+    let running = || {
+        core.sessions
+            .session_status(CHAT)
+            .map(|s| s.running_subagents)
+    };
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "subagents-run",
+        SessionCommandPayload::Run {
+            request: run_request("fan out"),
+            message_id: "subagents-user".into(),
+        },
+    );
+
+    wait_for(|| running() == Some(2), "both subagents counted").await;
+    wait_for(|| running() == Some(1), "one subagent settled").await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "subagents-interrupt",
+        SessionCommandPayload::Interrupt {},
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "run to end",
+    )
+    .await;
+    assert_eq!(
+        running(),
+        Some(0),
+        "an ended run leaves no subagents counted"
+    );
+}
+
+/// `show_visual` end to end below the MCP server: the RPC checks the script,
+/// stores it, and folds a visual part into the chat's live turn, after what
+/// the harness streamed; a broken script or no live turn is refused and
+/// stores nothing.
+#[tokio::test]
+async fn publish_visual_lands_in_the_live_turn() {
+    struct HoldsTurn {
+        events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>>>,
+    }
+    #[async_trait]
+    impl Harness for HoldsTurn {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Held turn"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let events = self.events.lock().unwrap().take();
+            match events {
+                Some(events) => Ok(futures::stream::unfold(events, |mut rx| async move {
+                    rx.recv().await.map(|event| (Ok(event), rx))
+                })
+                .boxed()),
+                None => {
+                    MockHarness {
+                        script: mock_script(),
+                    }
+                    .run(request, controls)
+                    .await
+                }
+            }
+        }
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(HoldsTurn {
+            events: std::sync::Mutex::new(Some(rx)),
+        }),
+    );
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    const SCRIPT: &str = r#"return ui.text { "chart", size = "lg" }"#;
+    let publish = |chat: &str, script: &str| {
+        client.call(
+            zeron_rpc::methods::PUBLISH_VISUAL,
+            serde_json::json!({
+                "chatId": chat,
+                "title": "  Latency  ",
+                "script": script,
+            }),
+        )
+    };
+    assert!(publish(CHAT, SCRIPT).await.is_err(), "no live turn yet");
+
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("chart please"), None)
+        .await
+        .unwrap();
+    tx.send(mock_script()[0].clone()).unwrap();
+    tx.send(AgentEvent::TextDelta {
+        text: "Building it.".into(),
+    })
+    .unwrap();
+    wait_for(|| core.sessions.turn_in_flight(CHAT), "turn starts").await;
+    let broken = publish(CHAT, "return ui.text { 'x', color = '#f00' }")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(broken.contains("theme tokens"), "{broken}");
+    let shown = publish(CHAT, SCRIPT).await.expect("PublishVisual");
+    assert_eq!(shown["title"], "Latency");
+    tx.send(AgentEvent::TextDelta {
+        text: "Uploads dominate.".into(),
+    })
+    .unwrap();
+    tx.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::Visual { .. }))
+            }) && !core.sessions.turn_in_flight(CHAT)
+        },
+        "visual folded",
+    )
+    .await;
+    let parts: Vec<MessagePart> = entries(&core)
+        .into_iter()
+        .filter(|e| e.role == MessageRole::Assistant)
+        .flat_map(|e| e.parts)
+        .collect();
+    let at = parts
+        .iter()
+        .position(|p| matches!(p, MessagePart::Visual { .. }))
+        .unwrap();
+    let MessagePart::Visual { path, title, .. } = &parts[at] else {
+        unreachable!()
+    };
+    assert_eq!(title, "Latency");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), SCRIPT);
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|p| matches!(p, MessagePart::Visual { .. }))
+            .count(),
+        1,
+        "the broken script left no part"
+    );
+    assert!(
+        matches!(&parts[at - 1], MessagePart::Text { text, .. } if text.ends_with("Building it.")),
+        "the page follows what streamed before it: {parts:?}"
+    );
+    assert!(
+        matches!(&parts[at + 1], MessagePart::Text { text, .. } if text == "Uploads dominate."),
+        "{parts:?}"
+    );
+    core.shutdown().await;
 }

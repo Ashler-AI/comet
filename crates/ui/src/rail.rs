@@ -10,7 +10,7 @@
 use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
 use std::time::{Duration, Instant};
 
-use comet_doc::{MessagePart, MessageRole, SessionMessageEntry};
+use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 
 use crate::motion;
 use crate::popover;
@@ -37,23 +37,12 @@ pub struct RailTick {
     pub reply: Option<String>,
 }
 
-/// Rail content and row lookup change with transcript revisions, not animation
-/// frames. Previews are capped here so a frame never copies a complete reply.
-#[derive(Default)]
-pub(crate) struct RailCache {
-    revision: Option<u64>,
-    pairs: Vec<(RailTick, usize)>,
-    tick_rows: Vec<usize>,
-}
-
 fn user_text(entry: &SessionMessageEntry) -> String {
     let raw = entry
         .parts
         .iter()
         .filter_map(|part| match part {
-            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => {
-                Some(text.as_str())
-            }
+            MessagePart::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -64,18 +53,21 @@ fn user_text(entry: &SessionMessageEntry) -> String {
     crate::attachments::user_message_rail_text(&raw)
 }
 
-fn first_reply_text(entry: &SessionMessageEntry) -> Option<String> {
-    entry.parts.iter().find_map(|part| match part {
-        MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. }
-            if !text.trim().is_empty() =>
-        {
-            Some(text.trim().to_string())
-        }
-        _ => None,
-    })
+fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| e.role == MessageRole::Assistant)
+        .and_then(|entry| {
+            entry.parts.iter().find_map(|part| match part {
+                MessagePart::Text { text, .. } if !text.trim().is_empty() => {
+                    Some(text.trim().to_string())
+                }
+                _ => None,
+            })
+        })
 }
 
-/// Extract rail ticks from the transcript: one per non-peer user entry (doc entries
+/// Extract rail ticks from the transcript: one per user entry (doc entries
 /// first, then unconfirmed echoes — matching transcript row order). Each tick
 /// carries the opening of the assistant reply that followed it, for the hover
 /// preview card.
@@ -84,31 +76,18 @@ pub fn rail_ticks(
     echoes: &[SessionMessageEntry],
 ) -> Vec<RailTick> {
     let mut ticks: Vec<RailTick> = Vec::new();
-    let mut next_assistant = None;
-    for entry in entries.iter().rev() {
-        if entry.role == MessageRole::Assistant {
-            next_assistant = Some(entry);
-        }
-        if entry.role != MessageRole::User || entry.is_peer_message() {
+    for (ix, entry) in entries.iter().enumerate() {
+        if entry.role != MessageRole::User {
             continue;
         }
         ticks.push(RailTick {
             message_id: entry.id.clone(),
             prompt: user_text(entry),
-            reply: next_assistant.and_then(first_reply_text),
+            reply: first_reply_text(&entries[ix + 1..]),
         });
     }
-    ticks.reverse();
-    let mut seen: std::collections::HashSet<&str> = entries
-        .iter()
-        .filter(|entry| entry.role == MessageRole::User)
-        .map(|entry| entry.id.as_str())
-        .collect();
     for echo in echoes {
-        if echo.role == MessageRole::User
-            && !echo.is_peer_message()
-            && seen.insert(echo.id.as_str())
-        {
+        if echo.role == MessageRole::User && !ticks.iter().any(|t| t.message_id == echo.id) {
             ticks.push(RailTick {
                 message_id: echo.id.clone(),
                 prompt: user_text(echo),
@@ -126,11 +105,10 @@ pub fn active_tick(tick_rows: &[usize], top_row: usize) -> Option<usize> {
     if tick_rows.is_empty() {
         return None;
     }
-    Some(
-        tick_rows
-            .partition_point(|&row| row <= top_row)
-            .saturating_sub(1),
-    )
+    match tick_rows.iter().rposition(|&row| row <= top_row) {
+        Some(ix) => Some(ix),
+        None => Some(0),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,12 +218,12 @@ impl GlideTimeline {
     }
 }
 
-/// `COMET_SCROLL_TRACE=1` logs per-frame glide positions at `warn` level —
-/// the smoothness measurement knob (same family as `COMET_FRAME_STATS`).
+/// `ZERON_SCROLL_TRACE=1` logs per-frame glide positions at `warn` level —
+/// the smoothness measurement knob (same family as `ZERON_FRAME_STATS`).
 fn scroll_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("COMET_SCROLL_TRACE").is_ok_and(|v| !v.is_empty() && v != "0")
+        std::env::var("ZERON_SCROLL_TRACE").is_ok_and(|v| !v.is_empty() && v != "0")
     })
 }
 
@@ -271,6 +249,7 @@ impl Transcript {
     ///   measurement correcting the estimate just re-enters the timeline;
     /// - once the target row is measured the glide is pixel-exact.
     pub fn scroll_to_row(&mut self, target: usize, cx: &mut Context<Self>) {
+        self.begin_scroll_navigation();
         if motion::reduced_motion(cx) {
             self.list_state().scroll_to(ListOffset {
                 item_ix: target,
@@ -433,40 +412,49 @@ impl Transcript {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let state = self.state_entity().clone();
-        let state = state.read(cx);
-        let revision = state.transcript_revision();
-        if self.rail_cache.revision != Some(revision) {
-            let mut row_indices = std::collections::HashMap::new();
-            for (ix, row) in self.rows().iter().enumerate() {
-                row_indices.entry(row.id.as_ref()).or_insert(ix);
-            }
-            let pairs: Vec<_> = rail_ticks(&state.transcript, state.pending_echoes())
-                .into_iter()
-                .filter_map(|mut tick| {
-                    let row = *row_indices.get(tick.message_id.as_str())?;
-                    tick.prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
-                    tick.reply = tick
-                        .reply
-                        .as_deref()
-                        .map(|reply| truncate_preview(reply, PREVIEW_REPLY_CHARS));
-                    Some((tick, row))
-                })
-                .collect();
-            self.rail_cache = RailCache {
-                revision: Some(revision),
-                tick_rows: pairs.iter().map(|(_, row)| *row).collect(),
-                pairs,
-            };
-        }
-        let pairs = &self.rail_cache.pairs;
+        let (entries, echoes) = {
+            let state = self.state_entity().read(cx);
+            (state.transcript.clone(), state.pending_echoes().to_vec())
+        };
+        let ticks = rail_ticks(&entries, &echoes);
+        // Map each tick to its transcript row (user rows share the entry id).
+        let pairs: Vec<(RailTick, usize)> = ticks
+            .into_iter()
+            .filter_map(|tick| {
+                let row = self
+                    .rows()
+                    .iter()
+                    .position(|r| r.id.as_ref() == tick.message_id.as_str())?;
+                Some((tick, row))
+            })
+            .collect();
         // A minimap of one exchange is noise, not navigation — the original
         // rail hides below two marks (message-rail.tsx `marks.length < 2`).
         if pairs.len() < 2 {
             return gpui::Empty.into_any_element();
         }
-        let top_row = self.list_state().logical_scroll_top().item_ix;
-        let active = active_tick(&self.rail_cache.tick_rows, top_row);
+        let tick_rows: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
+        // Active detection reads from the READING line, not the raw clip top:
+        // the titlebar overlays the list, so a row whose top sits within that
+        // chrome band is what you're reading — the sliver of the previous row
+        // above it is behind the blur. Concretely, the own-turn hold parks the
+        // newest prompt exactly at the chrome inset, and crediting the row at
+        // the raw clip top kept the PREVIOUS tick lit for the whole runway
+        // (user report). Walk forward over measured rows whose tops are at or
+        // above the reading line; unmeasured rows (None bounds) stop the walk,
+        // leaving the raw top row — the pre-fix behavior.
+        let mut top_row = self.list_state().logical_scroll_top().item_ix;
+        let read_top = f32::from(self.list_state().viewport_bounds().top())
+            + crate::transcript::OWN_SEND_TOP_INSET_PX
+            + 0.5;
+        while let Some(bounds) = self.list_state().bounds_for_item(top_row + 1) {
+            if f32::from(bounds.top()) <= read_top {
+                top_row += 1;
+            } else {
+                break;
+            }
+        }
+        let active = active_tick(&tick_rows, top_row);
         let hover = self.rail_hover();
         let theme = Theme::of(cx).clone();
 
@@ -509,9 +497,13 @@ impl Transcript {
                 } else {
                     crate::theme::ink(0.16)
                 };
-                let prompt = tick.prompt;
-                let reply = tick.reply;
+                let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
+                let reply = tick
+                    .reply
+                    .as_deref()
+                    .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
                 let card: Option<AnyElement> = is_hovered.then(|| {
+                    let theme = theme.for_popup();
                     let card = popover::popover_card(&theme)
                         .w(px(280.0))
                         .p(px(Theme::SPACE_SM))
@@ -520,14 +512,14 @@ impl Transcript {
                         .gap(px(6.0))
                         .child(
                             div()
-                                .text_size(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(theme.text)
                                 .child(SharedString::from(prompt.clone())),
                         )
                         .when_some(reply.clone(), |el, reply| {
                             el.child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(reply)),
                             )
@@ -537,14 +529,14 @@ impl Transcript {
                         .when(bucket_len > 1, |el| {
                             el.child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .text_size(crate::typography::ui_rems(10.0))
+                                    .text_color(theme.text_muted)
                                     .child(SharedString::from(format!("{bucket_len} prompts"))),
                             )
                         });
                     // Mounted straight through deferred/anchored (not a popover
                     // mount helper), so the frost wrap happens here.
-                    crate::frost::frosted(12.0, 16.0, card).into_any_element()
+                    crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element()
                 });
                 div()
                     .id(("rail-tick", ix))
@@ -584,7 +576,7 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_doc::MessageStatus;
+    use zeron_doc::MessageStatus;
 
     fn entry(id: &str, role: MessageRole, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -598,38 +590,8 @@ mod tests {
             device_id: "d".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
-            peer_message: None,
+            duration_ms: None,
         }
-    }
-
-    #[test]
-    fn peer_messages_never_create_prompt_previews_even_as_echoes() {
-        let mut peer = entry("peer", MessageRole::User, "private transport body");
-        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
-            command_id: peer.id.clone(),
-            source_chat_id: "source".into(),
-            thread_id: "thread".into(),
-            reply_to: None,
-        });
-        let ordinary = entry(
-            "ordinary",
-            MessageRole::User,
-            "[Peer message] ordinary prompt",
-        );
-        let reply = entry("reply", MessageRole::Assistant, "visible answer");
-        let ticks = rail_ticks(&[peer.clone(), ordinary.clone(), reply], &[peer.clone()]);
-        assert_eq!(
-            ticks,
-            vec![RailTick {
-                message_id: ordinary.id.clone(),
-                prompt: "[Peer message] ordinary prompt".into(),
-                reply: Some("visible answer".into()),
-            }]
-        );
-        assert!(rail_ticks(&[peer.clone()], &[peer.clone()]).is_empty());
-        peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
-        let ticks = rail_ticks(&[peer], &[]);
-        assert_eq!(ticks[0].prompt, "private transport body");
     }
 
     #[test]

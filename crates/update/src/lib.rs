@@ -1,99 +1,119 @@
-//! comet-update — release checking and self-update, shared by the engine (the
-//! background checker + `ApplyUpdate`), the CLI (`comet update`), and the UI.
-//! Release artifacts are stored privately in GCS and served through the
-//! authenticated Comet edge (see `.github/workflows/release.yml` and
-//! `install.sh`). Each request resolves the persisted Comet login; the edge
-//! obtains its own short-lived GCS authorization, so no storage credential is
-//! persisted on the device.
+//! zeron-update — release checking and self-update, shared by the engine (the
+//! background checker + `ApplyUpdate`), the CLI (`zeron update`), and the UI
+//! (its own report-only checker, the "Check for Updates…" menu item, the
+//! sidebar update strip, and the desktop install paths).
+//!
+//! Crew Canary uses private/manual artifacts only. The upstream implementation
+//! below is retained for upstream merges, but its public feed and mutation
+//! entrypoints are disabled by the build's delivery policy. Signed Crew delivery
+//! must port its authenticated, signed candidate contract before enabling
+//! updates; changing an environment URL must never enable the upstream feed.
 //!
 //! Install kinds and their update paths:
-//! - **Managed** (`~/.comet-native/app/<ver>` + `current` symlink — the curl|sh
-//!   installer): download the headless tarball into a new versioned dir, flip
-//!   the symlink, restart the service. Same flow the installer script performs,
-//!   natively.
-//! - **MacApp** (running out of `Crew.app` or `Crew Staging.app`): download the app tarball, swap the
+//! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
+//!   installer and the Linux tarball's `install.sh`): download the headless
+//!   tarball into a new versioned dir, flip the symlink, then restart the
+//!   service (daemon) or relaunch (desktop). Same flow the installer script
+//!   performs, natively.
+//! - **MacApp** (running out of an app bundle): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
-//! - **Unmanaged** (source builds, hand-copied binaries): report only.
+//! - **WindowsPortable** (the Windows installer or portable zip — both carry
+//!   `zeron-update.json`): swap the executable in place. Driven by the UI.
+//! - **Unmanaged** (source builds, hand-copied binaries): report only — the
+//!   UI's advisory strip links to [`RELEASES_PAGE`].
 //!
-//! Local agent CLIs (OMP, Claude Code, Codex) are tracked on the same check
-//! cadence and updated exclusively through their own self-updaters — Comet
-//! never swaps a vendor binary itself (see [`HarnessSpec`]).
+//! Desktop installs download as soon as a release is seen and install either
+//! on "Restart to update" or when the app next quits, so an app nobody
+//! restarts deliberately still lands on the new version at its next launch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, bail};
-use futures::{StreamExt as _, future::BoxFuture};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::watch;
 
-#[cfg(target_os = "macos")]
-mod macos_verification;
-
-fn staging_mac_app() -> bool {
-    cfg!(target_os = "macos") && option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
-}
-
-fn mac_app_name() -> &'static str {
-    if staging_mac_app() {
-        "Crew Staging.app"
-    } else {
-        "Crew.app"
-    }
-}
+#[cfg(windows)]
+pub mod windows;
 
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Background check cadence.
-const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-/// Retry sooner after a failed check (offline boot, transient edge error).
-const CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-/// First check waits out engine boot (room joins, doc re-sync).
-const CHECK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+/// Compile-time delivery boundary, not a runtime preference or URL override.
+/// This branch has no signed Crew channel. Do not enable the upstream public
+/// feed: a signed-channel cutover must replace its trust/verification contract.
+pub const AUTOMATIC_UPDATES_SUPPORTED: bool = false;
+pub const MANUAL_UPDATE_MESSAGE: &str =
+    "Crew Canary uses private/manual packages; automatic Crew updates are unavailable.";
+
+fn require_update_delivery() -> anyhow::Result<()> {
+    anyhow::ensure!(AUTOMATIC_UPDATES_SUPPORTED, MANUAL_UPDATE_MESSAGE);
+    Ok(())
+}
+
+/// Successful checks repeat this often. The feed is a sub-kilobyte,
+/// edge-cached document, so hourly polling is free and bounds how long a
+/// long-running app can sit on a stale release.
+const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Failed checks (offline boot, captive portal, transient edge error) back off
+/// through these delays, then stay at the last one.
+const CHECK_RETRY: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(30 * 60),
+];
+/// Check deadlines are wall-clock times: a monotonic sleep stops counting
+/// while the machine sleeps, so a laptop closed overnight used to push its
+/// next check out by the whole night. The loop re-reads the clock this often.
+const SCHEDULE_TICK: Duration = Duration::from_secs(60);
+/// The engine's first check waits out engine boot (room joins, doc re-sync).
+const ENGINE_INITIAL_DELAY: Duration = Duration::from_secs(20);
+/// The desktop checker only needs the window on screen first.
+const DESKTOP_INITIAL_DELAY: Duration = Duration::from_secs(2);
 /// While an auto-apply is deferred behind active sessions, re-probe idleness
 /// this often.
-const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// A `--version` probe must be instant; a hung binary must not stall the tick.
-const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Vendor release-channel metadata lookups (GitHub / npm registry).
-const CHANNEL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// A self-updater downloads a full CLI (OMP is ~150 MB) — allow slow links.
-const SELF_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
+/// A staged binary must answer `--version` within this window.
+const STAGED_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Release metadata is tiny. Bound both its buffered size and total transfer
+/// time so a compromised or misconfigured public feed cannot hold a checker
+/// forever or make every local install buffer an unbounded response.
+const RELEASE_METADATA_MAX_BYTES: usize = 1024 * 1024;
+const RELEASE_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Release metadata
 // ---------------------------------------------------------------------------
 
-/// Private platform-specific release manifest written by the release workflow.
-/// Desktop-only releases advance macOS without advertising an absent Linux host.
+/// `{edge}/releases/manifest.json` — written by the release workflow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
-    /// Artifact file name → required digest metadata.
+    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
+    /// via `latest.txt` — downloads then skip checksum verification (with a log).
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
-    pub sha256: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
-/// Artifact-name platform pair — `uname`-style strings matching the packaging
-/// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`.
+/// Artifact-name platform pair matching the packaging scripts. Unsupported
+/// updater targets retain their real OS name rather than impersonating Linux.
 pub fn platform_key() -> (&'static str, &'static str) {
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    };
+    let os = std::env::consts::OS;
     let arch = match (os, std::env::consts::ARCH) {
         ("macos", "aarch64") => "arm64",
         (_, arch) => arch,
@@ -101,127 +121,235 @@ pub fn platform_key() -> (&'static str, &'static str) {
     (os, arch)
 }
 
-/// `comet-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
-pub fn headless_artifact(version: &str) -> String {
-    let (os, arch) = platform_key();
-    format!("comet-{version}-{os}-{arch}.tar.gz")
+fn managed_updates_supported(os: &str) -> bool {
+    matches!(os, "linux" | "macos")
 }
 
-/// The packaged app tarball for this binary's compile-time package environment.
+fn require_managed_update_platform() -> anyhow::Result<()> {
+    if !managed_updates_supported(std::env::consts::OS) {
+        // Preserve the platform-specific diagnostic on unsupported targets.
+        bail!(
+            "managed updates are not supported on {}",
+            std::env::consts::OS
+        );
+    }
+    require_update_delivery()?;
+    Ok(())
+}
+
+fn require_mac_app_update_platform() -> anyhow::Result<()> {
+    if std::env::consts::OS != "macos" {
+        bail!(
+            "macOS app updates are not supported on {}",
+            std::env::consts::OS
+        );
+    }
+    require_update_delivery()?;
+    Ok(())
+}
+
+/// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
+pub fn headless_artifact(version: &str) -> String {
+    let (os, arch) = platform_key();
+    format!("zeron-{version}-{os}-{arch}.tar.gz")
+}
+
+/// `zeron-<ver>-macos-<arch>-app.tar.gz` — the macOS app update payload.
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
-    let prefix = if staging_mac_app() {
-        "comet-staging"
-    } else {
-        "comet"
-    };
-    format!("{prefix}-{version}-macos-{arch}-app.tar.gz")
+    format!("zeron-{version}-macos-{arch}-app.tar.gz")
+}
+
+fn parse_version(v: &str) -> Option<Vec<u64>> {
+    let nums: Vec<u64> = v
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    (!nums.is_empty()).then_some(nums)
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
 /// Unparseable versions never count as newer — a garbage `latest.txt` must not
 /// trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
-    fn parts(v: &str) -> Option<Vec<u64>> {
-        let nums: Vec<u64> = v
-            .trim()
-            .trim_start_matches('v')
-            .split('.')
-            .map(|p| p.parse().ok())
-            .collect::<Option<_>>()?;
-        (!nums.is_empty()).then_some(nums)
-    }
-    match (parts(latest), parts(current)) {
+    match (parse_version(latest), parse_version(current)) {
         (Some(l), Some(c)) => l > c,
         _ => false,
     }
 }
-fn release_manifest_name() -> &'static str {
-    if staging_mac_app() {
-        "desktop-staging-manifest.json"
-    } else if cfg!(target_os = "macos") {
-        "desktop-manifest.json"
-    } else {
-        "scaffold-manifest.json"
+
+/// Fetch the newest release metadata: `manifest.json`, falling back to
+/// `latest.txt` (version only, no checksums) for pre-manifest releases.
+pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
+    let base = release_base(edge_url)?;
+    let client = http_client()?;
+    let manifest_url = format!("{base}/manifest.json");
+    match fetch_release_metadata(&client, &manifest_url).await {
+        Ok(response) if response.status.is_success() => {
+            let manifest: Manifest =
+                serde_json::from_slice(&response.body).context("parsing manifest.json")?;
+            if manifest.version.trim().is_empty() {
+                bail!("manifest.json has an empty version");
+            }
+            return Ok(manifest);
+        }
+        Ok(response) => {
+            tracing::debug!(status = %response.status, "manifest.json unavailable; trying latest.txt")
+        }
+        Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
     }
+    let latest_url = format!("{base}/latest.txt");
+    let response = fetch_release_metadata(&client, &latest_url)
+        .await
+        .context("fetching latest.txt")?;
+    anyhow::ensure!(
+        response.status.is_success(),
+        "fetching latest.txt: HTTP {}",
+        response.status
+    );
+    let version = std::str::from_utf8(&response.body)
+        .context("reading latest.txt as UTF-8")?
+        .trim()
+        .to_string();
+    if version.is_empty() {
+        bail!("latest.txt is empty");
+    }
+    Ok(Manifest {
+        version,
+        files: BTreeMap::new(),
+    })
 }
 
-fn releases_base(edge_url: &str) -> anyhow::Result<String> {
-    let mut url = reqwest::Url::parse(edge_url).context("invalid Comet edge URL")?;
-    let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
-    if url.host_str().is_none()
-        || (url.scheme() != "https" && !(url.scheme() == "http" && local))
-        || url.username() != ""
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !matches!(url.path(), "" | "/")
-    {
-        bail!("Comet edge URL must be an exact HTTPS origin (HTTP is loopback-only)");
-    }
-    url.set_path("/api/releases");
-    Ok(url.to_string().trim_end_matches('/').to_string())
+#[derive(Debug)]
+struct ReleaseMetadataResponse {
+    status: reqwest::StatusCode,
+    body: Vec<u8>,
 }
 
-fn authorized_get(
+async fn fetch_release_metadata(
     client: &reqwest::Client,
     url: &str,
-    access_token: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let request = client.get(url);
-    match access_token.filter(|value| !value.trim().is_empty()) {
-        Some(token) => request.bearer_auth(token),
-        None => request,
-    }
+) -> anyhow::Result<ReleaseMetadataResponse> {
+    fetch_release_metadata_with_limits(
+        client,
+        url,
+        RELEASE_METADATA_TIMEOUT,
+        RELEASE_METADATA_MAX_BYTES,
+    )
+    .await
 }
 
-/// Fetch the latest compatible release manifest through the authenticated Comet edge.
-pub async fn fetch_latest(edge_url: &str, access_token: Option<&str>) -> anyhow::Result<Manifest> {
-    let base = releases_base(edge_url)?;
-    let manifest_url = format!("{base}/{}", release_manifest_name());
-    let client = http_client()?;
-    let manifest: Manifest = authorized_get(&client, &manifest_url, access_token)
-        .send()
+async fn fetch_release_metadata_with_limits(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    max_bytes: usize,
+) -> anyhow::Result<ReleaseMetadataResponse> {
+    let request = async {
+        let response = client
+            .get(url)
+            // Intermediaries must revalidate: the edge already bounds its own
+            // cache to a minute, and a proxy holding an old manifest for
+            // longer is exactly the "prompt appears late" failure.
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Ok(ReleaseMetadataResponse {
+                status,
+                body: Vec::new(),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            bail!("release metadata exceeds {max_bytes} bytes");
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading release metadata")?;
+            anyhow::ensure!(
+                body.len().saturating_add(chunk.len()) <= max_bytes,
+                "release metadata exceeds {max_bytes} bytes"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(ReleaseMetadataResponse { status, body })
+    };
+    tokio::time::timeout(timeout, request)
         .await
-        .with_context(|| format!("fetching {manifest_url}"))?
-        .error_for_status()
-        .with_context(|| format!("fetching {manifest_url}"))?
-        .json()
-        .await
-        .context("parsing private release manifest")?;
-    if manifest.version.trim().is_empty() {
-        bail!("manifest.json has an empty version");
-    }
-    if manifest.files.is_empty() {
-        bail!("manifest.json has no checksummed release files");
-    }
-    Ok(manifest)
+        .with_context(|| format!("fetching {url} exceeded the metadata deadline"))?
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("comet/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::custom(
-            |attempt| match validate_release_redirect(attempt.url(), attempt.previous()) {
-                Ok(()) => attempt.follow(),
-                Err(error) => attempt.error(error),
-            },
-        ))
-        .build()
-        .context("building release HTTP client")
+    http_client_with_timeouts(Duration::from_secs(15), Duration::from_secs(30))
 }
 
-fn validate_release_redirect(
-    next: &reqwest::Url,
-    previous: &[reqwest::Url],
-) -> Result<(), &'static str> {
-    if previous.len() >= 10 {
-        return Err("too many update redirects");
+fn http_client_with_timeouts(connect: Duration, read: Duration) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        // Inactivity timeout, not a total download cap: slow progressing
+        // updates remain viable on constrained links.
+        .read_timeout(read)
+        .user_agent(concat!("zeron/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many update redirects");
+            }
+            if attempt.previous().iter().any(|url| url.scheme() == "https")
+                && attempt.url().scheme() != "https"
+            {
+                return attempt.error("update redirect would downgrade HTTPS");
+            }
+            attempt.follow()
+        }))
+        .build()
+        .context("building http client")
+}
+
+fn validate_release_override(value: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(value.trim()).context("invalid update feed URL")?;
+    anyhow::ensure!(
+        url.scheme() == "https" && url.host_str().is_some(),
+        "update feed must use HTTPS"
+    );
+    anyhow::ensure!(
+        url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "update feed must be a base URL without credentials, query, or fragment"
+    );
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+/// The project's GitHub releases page — the advisory update strip opens this
+/// for unmanaged installs (source builds, hand-copied binaries), where no
+/// updater flow exists to drive.
+pub const RELEASES_PAGE: &str = "https://github.com/zeronsh/zeron/releases";
+
+/// The newest release's page — the download destination offered when this
+/// installation cannot replace itself.
+pub const LATEST_RELEASE_PAGE: &str = "https://github.com/zeronsh/zeron/releases/latest";
+
+fn release_base(edge_url: &str) -> anyhow::Result<String> {
+    require_update_delivery()?;
+    if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
+        && !url.trim().is_empty()
+    {
+        return validate_release_override(&url);
     }
-    if previous.iter().any(|url| url.scheme() == "https") && next.scheme() != "https" {
-        return Err("update redirect would downgrade HTTPS");
+    #[cfg(windows)]
+    if let Some(url) = windows::release_url()? {
+        return Ok(url.trim_end_matches('/').to_owned());
     }
-    Ok(())
+    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
 }
 
 // ---------------------------------------------------------------------------
@@ -231,13 +359,177 @@ fn validate_release_redirect(
 /// How this binary was installed — decides the update path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallKind {
-    /// `~/.comet-native/app/<ver>/comet` behind the `current` symlink
-    /// (curl|sh installer / a previous `comet update`).
+    /// `~/.zeron/app/<ver>/zeron` behind the `current` symlink
+    /// (curl|sh installer, the Linux tarball's `install.sh`, or a previous
+    /// `zeron update`).
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
     MacApp { bundle: PathBuf },
-    /// Source or hand-copied build — updates are report-only.
+    /// Windows installer or portable package with an explicit update-feed
+    /// configuration.
+    #[cfg(windows)]
+    WindowsPortable { directory: PathBuf },
+    /// Source build or hand-copied binary — updates are report-only.
     Unmanaged,
+}
+
+/// Why an installation that normally updates itself cannot right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateBlocker {
+    /// macOS App Translocation ran the app from a randomized read-only path
+    /// (launched from Downloads or a disk image without being moved first).
+    Translocated,
+    /// Running straight from the mounted disk image.
+    DiskImage,
+    /// The directory holding the installation is not writable by this user.
+    NotWritable(PathBuf),
+}
+
+impl std::fmt::Display for UpdateBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Translocated | Self::DiskImage => f.write_str(
+                "Zeron is running from a temporary, read-only location. Move Zeron to your \
+                 Applications folder and reopen it to turn on updates.",
+            ),
+            Self::NotWritable(dir) => write!(
+                f,
+                "Zeron doesn't have permission to replace itself in {}.",
+                dir.display()
+            ),
+        }
+    }
+}
+
+impl InstallKind {
+    /// Whether the desktop app downloads and installs updates itself.
+    pub fn supports_desktop_update(&self) -> bool {
+        if !AUTOMATIC_UPDATES_SUPPORTED {
+            return false;
+        }
+        match self {
+            Self::MacApp { .. } => true,
+            // The desktop path relaunches a GUI binary; on Linux that binary
+            // is the managed install itself.
+            Self::Managed { .. } => cfg!(target_os = "linux"),
+            #[cfg(windows)]
+            Self::WindowsPortable { .. } => true,
+            Self::Unmanaged => false,
+        }
+    }
+
+    /// Why this installation cannot replace itself, when it can't. Checked
+    /// before downloading so the UI can explain the fix instead of failing
+    /// after a wasted download with a raw rename error.
+    pub fn desktop_update_blocker(&self) -> Option<UpdateBlocker> {
+        match self {
+            Self::MacApp { bundle } => mac_bundle_blocker(bundle, dir_writable),
+            Self::Managed { app_root } => {
+                (!dir_writable(app_root)).then(|| UpdateBlocker::NotWritable(app_root.clone()))
+            }
+            #[cfg(windows)]
+            Self::WindowsPortable { directory } => {
+                (!dir_writable(directory)).then(|| UpdateBlocker::NotWritable(directory.clone()))
+            }
+            Self::Unmanaged => None,
+        }
+    }
+
+    pub async fn stage_desktop(
+        &self,
+        edge_url: &str,
+        manifest: &Manifest,
+        data_dir: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        require_update_delivery()?;
+        match self {
+            Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
+            Self::Managed { app_root } if self.supports_desktop_update() => {
+                stage_headless(edge_url, manifest, app_root).await
+            }
+            #[cfg(windows)]
+            Self::WindowsPortable { directory } => {
+                windows::stage(edge_url, manifest, directory).await
+            }
+            _ => bail!("this installation does not support desktop updates"),
+        }
+    }
+
+    /// Install a staged update. With `relaunch`, the new version starts once
+    /// this process exits ("Restart to update"); without it the update takes
+    /// effect at the next launch ("install on quit"). Either way the caller
+    /// must quit after this succeeds.
+    pub fn apply_desktop(&self, staged: &Path, relaunch: bool) -> anyhow::Result<()> {
+        require_update_delivery()?;
+        match self {
+            Self::MacApp { bundle } => {
+                apply_mac_app(staged, bundle)?;
+                // The swap copied the staged bundle; the cache is spent.
+                if let Some(version_dir) = staged.parent() {
+                    let _ = std::fs::remove_dir_all(version_dir);
+                }
+                if relaunch {
+                    relaunch_after_exit(Path::new("/usr/bin/open"), bundle);
+                }
+                Ok(())
+            }
+            Self::Managed { app_root } if self.supports_desktop_update() => {
+                let version = staged
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("staged install has no version directory")?;
+                apply_headless(app_root, version)?;
+                if relaunch {
+                    let binary = app_root.join("current").join("zeron");
+                    relaunch_after_exit(&binary, Path::new(""));
+                }
+                Ok(())
+            }
+            #[cfg(windows)]
+            Self::WindowsPortable { directory } => windows::apply(staged, directory, relaunch),
+            _ => bail!("this installation does not support desktop updates"),
+        }
+    }
+}
+
+fn mac_bundle_blocker(bundle: &Path, writable: impl Fn(&Path) -> bool) -> Option<UpdateBlocker> {
+    if bundle
+        .components()
+        .any(|part| part.as_os_str() == "AppTranslocation")
+    {
+        return Some(UpdateBlocker::Translocated);
+    }
+    let parent = bundle.parent()?;
+    if writable(parent) {
+        return None;
+    }
+    if bundle.starts_with("/Volumes") {
+        return Some(UpdateBlocker::DiskImage);
+    }
+    Some(UpdateBlocker::NotWritable(parent.to_path_buf()))
+}
+
+/// Probe by creating (and removing) a file: permission bits alone miss
+/// read-only mounts, ACLs, and sandboxed locations.
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".zeron-write-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        // A leftover probe from a crashed run still proves writability.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn detect_install() -> InstallKind {
@@ -249,9 +541,24 @@ pub fn detect_install() -> InstallKind {
 }
 
 fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
+    detect_install_from_for_os(exe, home, std::env::consts::OS)
+}
+
+fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> InstallKind {
+    #[cfg(windows)]
+    if os == "windows" && windows::is_managed(exe) {
+        return InstallKind::WindowsPortable {
+            directory: exe.parent().unwrap().to_owned(),
+        };
+    }
+    // Never interpret a coincidental Windows `%HOME%\.zeron\app` layout as
+    // the Unix symlink-managed installation.
+    if !managed_updates_supported(os) {
+        return InstallKind::Unmanaged;
+    }
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".comet-native").join("app");
+        let app_root = home.join(".zeron").join("app");
         if exe.starts_with(&app_root) {
             return InstallKind::Managed { app_root };
         }
@@ -268,30 +575,60 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
     InstallKind::Unmanaged
 }
 
+/// The version currently installed on disk for `kind`, read without executing
+/// anything. A long-running process compares it with its own version to notice
+/// that something else (the desktop app, `zeron update`, a re-run installer)
+/// has already replaced its binary.
+pub fn installed_version(kind: &InstallKind) -> Option<String> {
+    let version = match kind {
+        InstallKind::Managed { app_root } => std::fs::read_link(app_root.join("current"))
+            .ok()?
+            .file_name()?
+            .to_str()?
+            .to_owned(),
+        InstallKind::MacApp { bundle } => bundle_short_version(
+            &std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?,
+        )?,
+        _ => return None,
+    };
+    parse_version(&version).map(|_| version)
+}
+
+/// `CFBundleShortVersionString` from an XML property list (the packaging
+/// template; codesign leaves the format alone).
+fn bundle_short_version(plist: &str) -> Option<String> {
+    let after_key = plist
+        .split("<key>CFBundleShortVersionString</key>")
+        .nth(1)?;
+    let value = after_key.trim_start().strip_prefix("<string>")?;
+    let end = value.find("</string>")?;
+    Some(value[..end].trim().to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{private release feed}/<file>` to `dest`, verifying its manifest
-/// SHA-256. Writes through a `.partial` sidecar so an interrupted download never
+/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
+/// present. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
 pub async fn download_release_file(
     edge_url: &str,
-    access_token: Option<&str>,
     manifest: &Manifest,
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/{file}", releases_base(edge_url)?);
-    let expected = manifest
-        .files
-        .get(file)
-        .map(|metadata| metadata.sha256.as_str())
-        .filter(|digest| !digest.trim().is_empty())
-        .with_context(|| format!("release manifest has no SHA-256 for {file}"))?;
+    let url = format!("{}/{file}", release_base(edge_url)?);
+    let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
+    if expected.is_none() {
+        tracing::warn!(
+            file,
+            "no checksum in release metadata; skipping verification"
+        );
+    }
     let partial = dest.with_extension("partial");
-    let client = http_client()?;
-    let resp = authorized_get(&client, &url, access_token)
+    let resp = http_client()?
+        .get(&url)
         .send()
         .await
         .with_context(|| format!("downloading {url}"))?
@@ -307,12 +644,14 @@ pub async fn download_release_file(
         hasher.update(&chunk);
         out.write_all(&chunk).await.context("writing download")?;
     }
-    out.flush().await.ok();
+    out.flush().await.context("flushing download")?;
     drop(out);
-    let actual = format!("{:x}", hasher.finalize());
-    if !actual.eq_ignore_ascii_case(expected.trim()) {
-        tokio::fs::remove_file(&partial).await.ok();
-        bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
+    if let Some(expected) = expected {
+        let actual = format!("{:x}", hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            tokio::fs::remove_file(&partial).await.ok();
+            bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
+        }
     }
     tokio::fs::rename(&partial, dest)
         .await
@@ -336,21 +675,50 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run a freshly unpacked binary's `--version` before it can replace anything:
+/// proves the payload is complete, executable on this machine, and the release
+/// the manifest promised.
+async fn verify_staged_binary(binary: &Path, version: &str) -> anyhow::Result<()> {
+    let output = tokio::time::timeout(
+        STAGED_VERSION_TIMEOUT,
+        tokio::process::Command::new(binary)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("staged binary version check timed out")?
+    .with_context(|| format!("running {} --version", binary.display()))?;
+    let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    anyhow::ensure!(
+        output.status.success() && reported == format!("zeron {version}"),
+        "staged binary reported {reported:?} (exit {}), expected \"zeron {version}\"",
+        output.status
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Managed (symlink) installs — the daemon/VPS path
+// Managed (symlink) installs — the daemon/VPS path and Linux desktop
 // ---------------------------------------------------------------------------
 
 /// Download + unpack the headless tarball into `app_root/<ver>` (idempotent —
 /// an already-staged version is reused). Returns the versioned dir.
 pub async fn stage_headless(
     edge_url: &str,
-    access_token: Option<&str>,
     manifest: &Manifest,
     app_root: &Path,
 ) -> anyhow::Result<PathBuf> {
+    // Reject unsupported targets before creating a stage or making a request.
+    require_managed_update_platform()?;
     let version = &manifest.version;
+    anyhow::ensure!(
+        parse_version(version).is_some(),
+        "invalid release version {version:?}"
+    );
     let dest = app_root.join(version);
-    if dest.join("comet").exists() {
+    if dest.join("zeron").exists() {
         return Ok(dest);
     }
     let file = headless_artifact(version);
@@ -359,7 +727,7 @@ pub async fn stage_headless(
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let result = async {
         let tarball = stage.join(&file);
-        download_release_file(edge_url, access_token, manifest, &file, &tarball).await?;
+        download_release_file(edge_url, manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
         // Tarball root is the versioned stage dir (see scripts/package-linux.sh);
@@ -374,13 +742,14 @@ pub async fn stage_headless(
                 "--strip-components=1",
             ],
         )?;
-        if !unpacked.join("comet").is_file() {
-            bail!("tarball {file} did not contain a comet binary");
+        if !unpacked.join("zeron").is_file() {
+            bail!("tarball {file} did not contain a zeron binary");
         }
+        verify_staged_binary(&unpacked.join("zeron"), version).await?;
         match std::fs::rename(&unpacked, &dest) {
             Ok(()) => {}
             // Lost a race with another stager — the staged copy is equivalent.
-            Err(_) if dest.join("comet").exists() => {}
+            Err(_) if dest.join("zeron").exists() => {}
             Err(err) => {
                 return Err(err).with_context(|| format!("moving {} into place", dest.display()));
             }
@@ -395,10 +764,11 @@ pub async fn stage_headless(
 /// Atomically repoint `app_root/current` at `app_root/<ver>` (symlink to a temp
 /// name, then rename over — never a window with no `current`).
 pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
+    require_update_delivery()?;
     #[cfg(unix)]
     {
         let target = app_root.join(version);
-        if !target.join("comet").exists() {
+        if !target.join("zeron").exists() {
             bail!("{} is not a staged install", target.display());
         }
         let tmp = app_root.join(format!(".current-{}", std::process::id()));
@@ -410,23 +780,50 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
         let _ = (app_root, version);
-        bail!("managed installs are unix-only");
+        require_managed_update_platform()?;
+        unreachable!("supported managed-update platforms are Unix")
     }
 }
 
-/// Restart the installed engine service (the same units `comet daemon` and the
+/// Whether this process is the engine service [`restart_service`] manages:
+/// systemd places it in the `zeron.service` cgroup; launchd names the job in
+/// `XPC_SERVICE_NAME`.
+pub fn running_as_installed_service() -> bool {
+    if cfg!(target_os = "macos") {
+        std::env::var("XPC_SERVICE_NAME").is_ok_and(|label| label == "sh.zeron.app")
+    } else if cfg!(target_os = "linux") {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .is_ok_and(|cgroups| in_zeron_service_cgroup(&cgroups))
+    } else {
+        false
+    }
+}
+
+fn in_zeron_service_cgroup(cgroups: &str) -> bool {
+    cgroups
+        .lines()
+        .filter_map(|line| line.rsplit(':').next())
+        .any(|path| path.split('/').any(|part| part == "zeron.service"))
+}
+
+/// Restart the installed engine service (the same units `zeron daemon` and the
 /// curl|sh installer manage). Called after a symlink swap so the running daemon
-/// picks up the new binary.
+/// picks up the new binary. Only queues the restart: the caller may be the
+/// service itself, which must stay responsive to the stop signal that follows.
 pub fn restart_service() -> anyhow::Result<()> {
+    require_managed_update_platform()?;
     if cfg!(target_os = "macos") {
         let output = std::process::Command::new("id").arg("-u").output()?;
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
             "launchctl",
-            &["kickstart", "-k", &format!("gui/{uid}/ai.ashler.comet")],
+            &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.app")],
         )
     } else {
-        run("systemctl", &["--user", "restart", "comet-native.service"])
+        run(
+            "systemctl",
+            &["--user", "--no-block", "restart", "zeron.service"],
+        )
     }
 }
 
@@ -434,167 +831,132 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
-fn ensure_mac_app_updates_supported() -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    macos_verification::expected_team()?;
-    Ok(())
-}
-
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/<app-name>`
-/// for this binary's package environment (idempotent). Returns the staged bundle path.
+/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Zeron.app`
+/// (idempotent). The bundle is unpacked beside its final name and renamed in
+/// only after its binary answers with the expected version, so an interrupted
+/// unpack can never be mistaken for a staged update. Returns the staged bundle.
 pub async fn stage_mac_app(
     edge_url: &str,
-    access_token: Option<&str>,
     manifest: &Manifest,
     data_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
-    ensure_mac_app_updates_supported()?;
+    // Reject unsupported targets before creating a stage or making a request.
+    require_mac_app_update_platform()?;
     let version = &manifest.version;
-    let dir = data_dir.join("updates").join(version);
-    let app_name = mac_app_name();
-    let staged = dir.join(app_name);
-    if staged.exists() {
-        #[cfg(target_os = "macos")]
-        macos_verification::Policy::pinned()?
-            .verify_distribution(&staged)
-            .context("cached Crew update failed signature verification")?;
-        if !staged.join("Contents/MacOS/comet").exists() {
-            bail!("cached Crew update is not an app bundle");
-        }
+    anyhow::ensure!(
+        parse_version(version).is_some(),
+        "invalid release version {version:?}"
+    );
+    let updates = data_dir.join("updates");
+    let dir = updates.join(version);
+    let staged = dir.join("Zeron.app");
+    let staged_binary = staged.join("Contents/MacOS/zeron");
+    if staged_binary.exists() && verify_staged_binary(&staged_binary, version).await.is_ok() {
         return Ok(staged);
     }
+    prune_stale_stages(&updates, version);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let file = mac_app_artifact(version);
     let tarball = dir.join(&file);
-    download_release_file(edge_url, access_token, manifest, &file, &tarball).await?;
-    run(
+    download_release_file(edge_url, manifest, &file, &tarball).await?;
+    let unpack = dir.join(".unpack");
+    std::fs::create_dir_all(&unpack)?;
+    let unpacked = run(
         "tar",
         &[
             "-xzf",
             &tarball.to_string_lossy(),
             "-C",
-            &dir.to_string_lossy(),
+            &unpack.to_string_lossy(),
         ],
-    )?;
+    )
+    .map(|()| unpack.join("Zeron.app"));
     std::fs::remove_file(&tarball).ok();
-    if !staged.join("Contents/MacOS/comet").exists() {
-        bail!("app tarball {file} did not contain {app_name}");
+    let unpacked = unpacked?;
+    let unpacked_binary = unpacked.join("Contents/MacOS/zeron");
+    if !unpacked_binary.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+        bail!("app tarball {file} did not contain Zeron.app");
     }
-    #[cfg(target_os = "macos")]
-    macos_verification::Policy::pinned()?
-        .verify_distribution(&staged)
-        .context("downloaded Crew update failed signature verification")?;
+    if let Err(err) = verify_staged_binary(&unpacked_binary, version).await {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(err);
+    }
+    std::fs::rename(&unpacked, &staged)
+        .with_context(|| format!("moving {} into place", staged.display()))?;
+    let _ = std::fs::remove_dir_all(&unpack);
     Ok(staged)
 }
 
-/// Install the staged bundle next to the current app, preserving metadata and
-/// migrating renamed installs to `Crew.app` or `Crew Staging.app` as appropriate.
-/// Incoming, copied, and installed macOS bundles are authenticated before any
-/// installed bundle is moved. Legacy ad-hoc migration requires the updater itself
-/// to run from an already trusted distribution; it never re-signs an old app.
-/// Any existing target bundle is restored if the replacement fails.
-pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<PathBuf> {
-    ensure_mac_app_updates_supported()?;
-    #[cfg(target_os = "macos")]
-    let policy = macos_verification::Policy::pinned()?;
-    #[cfg(target_os = "macos")]
-    policy.verify_distribution(staged)?;
+/// Staged bundles of other versions are dead weight (each is a whole app):
+/// drop them whenever a new version stages.
+fn prune_stale_stages(updates: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(updates) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() != keep {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Swap the installed bundle for the staged one: `ditto` the staged copy next to
+/// the target (metadata-preserving, cross-volume safe), then two renames — the
+/// old bundle is restored if the second rename fails.
+pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
+    require_mac_app_update_platform()?;
     let parent = bundle
         .parent()
         .context("app bundle has no parent directory")?;
-    #[cfg(target_os = "macos")]
-    let target_name = std::ffi::OsStr::new(mac_app_name());
-    #[cfg(not(target_os = "macos"))]
-    let target_name = staged
-        .file_name()
-        .context("staged app bundle has no name")?;
-    let target = parent.join(target_name);
-    let current_name = bundle
+    let name = bundle
         .file_name()
         .context("app bundle has no name")?
         .to_string_lossy();
-    let target_name = target_name.to_string_lossy();
     let pid = std::process::id();
-    // Keep the .app suffix: stapler validates bundles by their file type.
-    let fresh = parent.join(format!(".{target_name}.new-{pid}.app"));
-    let old = parent.join(format!(".{current_name}.old-{pid}"));
-    let displaced_target = (target.as_path() != bundle && target.exists())
-        .then(|| parent.join(format!(".{target_name}.old-{pid}")));
-    // Do not discard an interrupted update's backups or follow a stale symlink.
-    for path in [&fresh, &old].into_iter().chain(displaced_target.iter()) {
-        if path.symlink_metadata().is_ok() {
-            bail!("update work path already exists: {}", path.display());
-        }
-    }
-    if let Err(error) = run(
-        if cfg!(target_os = "macos") {
-            "/usr/bin/ditto"
-        } else {
-            "ditto"
-        },
+    let fresh = parent.join(format!(".{name}.new-{pid}"));
+    let old = parent.join(format!(".{name}.old-{pid}"));
+    let _ = std::fs::remove_dir_all(&fresh);
+    if let Err(err) = run(
+        "ditto",
         &[&staged.to_string_lossy(), &fresh.to_string_lossy()],
     ) {
         let _ = std::fs::remove_dir_all(&fresh);
-        return Err(error).context("copying the verified Crew update");
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Verify the actual copy, then every installed bundle we would move.
-        // All trust checks precede the first rename or removal of installed data.
-        let verified = (|| -> anyhow::Result<()> {
-            policy.verify_distribution(&fresh)?;
-            policy.verify_installed(bundle)?;
-            if displaced_target.is_some() {
-                policy.verify_installed(&target)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = verified {
-            let _ = std::fs::remove_dir_all(&fresh);
-            return Err(error).context("Crew update refused before replacing the installed app");
-        }
-    }
-    if let Some(displaced) = displaced_target.as_ref() {
-        std::fs::rename(&target, displaced).context("moving the existing target app aside")?;
+        return Err(err);
     }
     if let Err(err) = std::fs::rename(bundle, &old) {
-        if let Some(displaced) = displaced_target.as_ref() {
-            let _ = std::fs::rename(displaced, &target);
-        }
         let _ = std::fs::remove_dir_all(&fresh);
         return Err(err).context("moving the current app aside");
     }
-    if let Err(err) = std::fs::rename(&fresh, &target) {
+    if let Err(err) = std::fs::rename(&fresh, bundle) {
         let _ = std::fs::rename(&old, bundle);
-        if let Some(displaced) = displaced_target.as_ref() {
-            let _ = std::fs::rename(displaced, &target);
-        }
         let _ = std::fs::remove_dir_all(&fresh);
         return Err(err).context("installing the new app bundle");
     }
     let _ = std::fs::remove_dir_all(&old);
-    if let Some(displaced) = displaced_target {
-        let _ = std::fs::remove_dir_all(displaced);
-    }
-    Ok(target)
+    Ok(())
 }
 
-/// Detached relauncher: waits for THIS process to exit, then `open`s the bundle.
-/// (Opening before exit would race the single-instance engine lock and the IPC
-/// port.) The caller quits the app after this returns.
-pub fn relaunch_app_after_exit(bundle: &Path) {
+/// Detached relauncher: waits for THIS process to exit, then runs `program`
+/// (with `argument` unless empty). Launching before exit would race the
+/// single-instance engine lock and the IPC port. Paths travel as positional
+/// parameters, never spliced into the script. The caller quits after this.
+pub fn relaunch_after_exit(program: &Path, argument: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        let pid = std::process::id();
-        let script = format!(
-            "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"{}\"",
-            bundle.display()
-        );
+        let pid = std::process::id().to_string();
+        let script = r#"while /bin/kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+if [ -n "$3" ]; then exec "$2" "$3"; else exec "$2"; fi"#;
         let mut command = std::process::Command::new("/bin/sh");
         command
-            .args(["-c", &script])
+            .arg("-c")
+            .arg(script)
+            .arg("zeron-relaunch")
+            .arg(&pid)
+            .arg(program)
+            .arg(argument)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -604,229 +966,16 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
         }
     }
     #[cfg(not(unix))]
-    let _ = bundle;
+    let _ = (program, argument);
 }
 
 // ---------------------------------------------------------------------------
-// Local agent CLIs (harnesses)
+// Background checker
 // ---------------------------------------------------------------------------
 
-/// One local agent CLI as reported over the `UpdateStatus` stream. Version
-/// facts only, mirroring [`UpdateStatus`] — apply progress is owned by whoever
-/// drives the update.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HarnessStatus {
-    pub id: String,
-    pub name: String,
-    /// Resolved executable; `None` = not installed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installed_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_version: Option<String>,
-    #[serde(default)]
-    pub update_available: bool,
-    /// Installed version is below this engine's compatibility floor.
-    #[serde(default)]
-    pub update_required: bool,
-}
-
-/// Where a harness's "latest" version comes from. Only used to *report*
-/// updates — applying one always goes through the CLI's own self-updater, so
-/// install-method quirks (npm prefixes, native installers) stay the vendor's
-/// problem.
-#[derive(Debug, Clone)]
-pub enum ReleaseChannel {
-    /// `api.github.com/repos/<repo>/releases/latest` → `tag_name`, leading `v`
-    /// stripped. `GITHUB_TOKEN`/`GH_TOKEN` ride along when set — VPS fleets
-    /// behind shared IPs hit the unauthenticated rate limit.
-    GitHub { repo: &'static str },
-    /// `registry.npmjs.org/<package>/latest` → `version`.
-    Npm { package: &'static str },
-}
-
-/// A local agent CLI the updater tracks. The engine supplies these —
-/// executable resolution lives in `comet-harness` (login-shell PATH snapshot,
-/// version-manager bins), which this crate must not depend on.
-#[derive(Clone)]
-pub struct HarnessSpec {
-    pub id: &'static str,
-    pub name: &'static str,
-    /// Resolve the installed executable (`None` = not installed).
-    pub resolve: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
-    pub channel: ReleaseChannel,
-    /// The CLI's own self-updater, spawned as `<exe> <args…>`.
-    pub self_update_args: &'static [&'static str],
-    /// Oldest version this engine can drive (`None` = no floor).
-    pub min_version: Option<&'static str>,
-}
-
-/// First `X.Y.Z…` dotted-numeric token in a `--version` output — tolerates
-/// every observed shape: `omp/17.2.9`, `2.1.224 (Claude Code)`,
-/// `codex-cli 0.146.0`, `v17.2.12`. Two segments ("2026.08") is a date or
-/// counter, never a CLI version.
-fn extract_version(output: &str) -> Option<String> {
-    output
-        .split(|c: char| !c.is_ascii_digit() && c != '.')
-        .map(|token| token.trim_matches('.'))
-        .find(|token| {
-            token.split('.').count() >= 3
-                && token
-                    .split('.')
-                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .map(str::to_string)
-}
-
-/// `<exe> --version` → parsed version, cached by (path → mtime) so the 6h tick
-/// and settings-driven refreshes never respawn an unchanged binary.
-async fn probe_cli_version(
-    cache: &Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>,
-    exe: &Path,
-) -> Option<String> {
-    let mtime = std::fs::metadata(exe).ok()?.modified().ok()?;
-    if let Some((seen, version)) = lock(cache).get(exe)
-        && *seen == mtime
-    {
-        return version.clone();
-    }
-    let output = tokio::time::timeout(
-        VERSION_PROBE_TIMEOUT,
-        tokio::process::Command::new(exe)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .output(),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok);
-    let version = output.as_ref().and_then(|out| {
-        extract_version(&String::from_utf8_lossy(&out.stdout))
-            .or_else(|| extract_version(&String::from_utf8_lossy(&out.stderr)))
-    });
-    lock(cache).insert(exe.to_path_buf(), (mtime, version.clone()));
-    version
-}
-
-async fn fetch_channel_latest(
-    client: &reqwest::Client,
-    channel: &ReleaseChannel,
-) -> anyhow::Result<String> {
-    match channel {
-        ReleaseChannel::GitHub { repo } => {
-            let mut request = client
-                .get(format!(
-                    "https://api.github.com/repos/{repo}/releases/latest"
-                ))
-                .header("accept", "application/vnd.github+json")
-                .timeout(CHANNEL_FETCH_TIMEOUT);
-            if let Some(token) = std::env::var("GITHUB_TOKEN")
-                .ok()
-                .or_else(|| std::env::var("GH_TOKEN").ok())
-                .filter(|token| !token.trim().is_empty())
-            {
-                request = request.bearer_auth(token.trim().to_string());
-            }
-            let body: serde_json::Value = request.send().await?.error_for_status()?.json().await?;
-            let tag = body
-                .get("tag_name")
-                .and_then(serde_json::Value::as_str)
-                .with_context(|| format!("no tag_name in {repo} latest release"))?;
-            Ok(tag.trim_start_matches('v').to_string())
-        }
-        ReleaseChannel::Npm { package } => {
-            let body: serde_json::Value = client
-                .get(format!("https://registry.npmjs.org/{package}/latest"))
-                .timeout(CHANNEL_FETCH_TIMEOUT)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let version = body
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                .with_context(|| format!("no version in {package} dist-tag"))?;
-            Ok(version.to_string())
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Update preferences + boot stamp
-// ---------------------------------------------------------------------------
-
-/// `{data_dir}/update-prefs.json`. One knob so far: whether agent CLIs
-/// self-refresh after a Comet update lands.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdatePrefs {
-    #[serde(default = "default_true")]
-    harness_auto_update: bool,
-}
-
-impl Default for UpdatePrefs {
-    fn default() -> Self {
-        Self {
-            harness_auto_update: true,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-const PREFS_FILE: &str = "update-prefs.json";
-
-fn load_prefs(data_dir: &Path) -> UpdatePrefs {
-    std::fs::read(data_dir.join(PREFS_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn store_prefs(data_dir: &Path, prefs: &UpdatePrefs) {
-    let path = data_dir.join(PREFS_FILE);
-    if let Ok(bytes) = serde_json::to_vec_pretty(prefs)
-        && let Err(err) = std::fs::write(&path, bytes)
-    {
-        tracing::warn!(error = %err, path = %path.display(), "update prefs not persisted");
-    }
-}
-
-/// `COMET_UPDATE_HARNESSES=0|false|no` — operator kill switch for the
-/// post-update agent refresh (daemon spelling, mirrors `COMET_AUTO_UPDATE`).
-fn harness_updates_disabled_by_env() -> bool {
-    std::env::var("COMET_UPDATE_HARNESSES")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-        .unwrap_or(false)
-}
-
-/// True exactly when a DIFFERENT Comet version last booted from `data_dir`
-/// (the current version is stamped either way). A first boot is not a
-/// transition — a fresh install just bootstrapped its agents.
-pub fn version_transition(data_dir: &Path) -> bool {
-    let stamp = data_dir.join("last-boot-version");
-    let previous = std::fs::read_to_string(&stamp)
-        .map(|s| s.trim().to_string())
-        .ok();
-    if previous.as_deref() != Some(current_version())
-        && let Err(err) = std::fs::write(&stamp, current_version())
-    {
-        tracing::warn!(error = %err, "boot-version stamp not persisted");
-    }
-    matches!(previous, Some(prev) if prev != current_version())
-}
-
-// ---------------------------------------------------------------------------
-// Engine-side checker
-// ---------------------------------------------------------------------------
-
-/// What the engine reports over the `UpdateStatus` stream. Version facts only —
-/// download/apply progress is owned by whoever drives the update (UI or CLI).
+/// What the checker reports (the engine's `UpdateStatus` stream, the desktop
+/// strip). Version facts only — download/apply progress is owned by whoever
+/// drives the update (UI or CLI).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateStatus {
@@ -840,113 +989,229 @@ pub struct UpdateStatus {
     pub checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Local agent CLIs on this device — populated on the same cadence as the
-    /// release check. Empty until the first tick (and over relays from
-    /// engines predating the field).
-    #[serde(default)]
-    pub harnesses: Vec<HarnessStatus>,
-    /// The persisted "refresh agents after a Comet update" toggle.
-    #[serde(default = "default_true")]
-    pub harness_auto_update: bool,
 }
 
 impl UpdateStatus {
-    fn initial(harness_auto_update: bool) -> Self {
+    fn initial() -> Self {
         Self {
             current_version: current_version().to_string(),
             latest_version: None,
             update_available: false,
             checked_at: None,
             error: None,
-            harnesses: Vec::new(),
-            harness_auto_update,
         }
     }
 }
 
-/// `COMET_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
+/// `ZERON_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
 fn auto_update_enabled() -> bool {
-    std::env::var("COMET_AUTO_UPDATE")
+    std::env::var("ZERON_AUTO_UPDATE")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+/// `ZERON_AUTO_UPDATE=0|false|no` — the desktop app then only reports: no
+/// background download and no install on quit. Unset means on.
+pub fn desktop_auto_update_enabled() -> bool {
+    if !AUTOMATIC_UPDATES_SUPPORTED {
+        return false;
+    }
+    std::env::var("ZERON_AUTO_UPDATE")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
 }
 
 /// "Nothing would be interrupted by a restart right now" — wired by the engine
 /// to its live-run and open-terminal registries. `None` = no gate.
 pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
-/// Resolves the current Comet login bearer for each release request, allowing
-/// the credential to rotate without rebuilding the updater.
-pub type AccessTokenSource = Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>;
-type HarnessVersionCache = Arc<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>>;
 
-/// Background release checker: polls `{edge}/releases` on a 6h cadence and
-/// publishes [`UpdateStatus`] over a watch channel (the `UpdateStatus` RPC
-/// stream). Managed installs with `COMET_AUTO_UPDATE` set stage + apply + service
-/// restart on their own — but only in a quiet window: while `quiescent` reports
-/// activity, the apply defers and re-probes every [`IDLE_RECHECK`].
+/// Who runs the checker — decides what it may do beyond reporting.
+enum Role {
+    /// The engine: managed installs with `ZERON_AUTO_UPDATE` apply themselves,
+    /// and a service daemon restarts into a binary someone else installed.
+    Engine { quiescent: Option<QuiescentCheck> },
+    /// The desktop app: report only — downloading and installing are UI
+    /// decisions (see `crates/ui/src/app_update.rs`).
+    Desktop,
+}
+
+/// Background release checker: polls `{edge}/releases` hourly on a wall-clock
+/// schedule (so sleep/wake cannot stretch it), backs off on failure, and
+/// publishes [`UpdateStatus`] over a watch channel. In the engine, managed
+/// installs with `ZERON_AUTO_UPDATE` set stage + apply + service restart on
+/// their own — but only in a quiet window: while `quiescent` reports activity,
+/// the apply defers and re-probes every [`IDLE_RECHECK`].
 #[derive(Clone)]
 pub struct Updater {
     edge_url: String,
-    data_dir: PathBuf,
+    role: Arc<Role>,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
-    quiescent: Option<QuiescentCheck>,
-    access_token: AccessTokenSource,
-    /// Agent CLIs tracked alongside the app's own releases.
-    harnesses: Arc<Vec<HarnessSpec>>,
-    /// `--version` probe results keyed by (path → mtime).
-    version_cache: HarnessVersionCache,
+    /// Wakes the loop; `forced` says whether the wake demands a check or only
+    /// a fresh look at the wall clock.
+    wake_tx: Arc<watch::Sender<u64>>,
+    forced: Arc<AtomicBool>,
+    /// Set by `zeron headless`: this process is the installed service and may
+    /// restart itself into a newer installed binary.
+    service: Arc<AtomicBool>,
+    /// Flips to true exactly once; the check loop selects against it so
+    /// cancellation lands at any await point (no tokio-util in this crate).
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    check_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Updater {
-    /// Spawn the check loop (must run on a tokio runtime).
-    pub fn spawn(
-        edge_url: String,
-        data_dir: PathBuf,
-        quiescent: Option<QuiescentCheck>,
-        access_token: AccessTokenSource,
-        harnesses: Vec<HarnessSpec>,
-    ) -> Self {
-        let (status_tx, _) = watch::channel(UpdateStatus::initial(
-            load_prefs(&data_dir).harness_auto_update,
-        ));
+    /// Spawn the engine's check loop (must run on a tokio runtime).
+    pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
+        Self::spawn_role(edge_url, Role::Engine { quiescent })
+    }
+
+    /// Spawn the desktop app's report-only check loop (must run on a tokio
+    /// runtime).
+    pub fn spawn_desktop(edge_url: String) -> Self {
+        Self::spawn_role(edge_url, Role::Desktop)
+    }
+
+    fn spawn_role(edge_url: String, role: Role) -> Self {
+        let initial_delay = match role {
+            Role::Engine { .. } => ENGINE_INITIAL_DELAY,
+            Role::Desktop => DESKTOP_INITIAL_DELAY,
+        };
+        let (status_tx, _) = watch::channel(UpdateStatus::initial());
+        let (wake_tx, _) = watch::channel(0);
+        let (shutdown_tx, _) = watch::channel(false);
         let updater = Self {
             edge_url,
-            data_dir,
+            role: Arc::new(role),
             status_tx: Arc::new(status_tx),
-            quiescent,
-            access_token,
-            harnesses: Arc::new(harnesses),
-            version_cache: Arc::new(Mutex::new(HashMap::new())),
+            wake_tx: Arc::new(wake_tx),
+            forced: Arc::new(AtomicBool::new(false)),
+            service: Arc::new(AtomicBool::new(false)),
+            shutdown_tx: Arc::new(shutdown_tx),
+            check_task: Arc::new(std::sync::Mutex::new(None)),
         };
+        if !AUTOMATIC_UPDATES_SUPPORTED {
+            updater.status_tx.send_modify(|status| {
+                status.error = Some(MANUAL_UPDATE_MESSAGE.into());
+            });
+            return updater;
+        }
+        // Subscribe before spawning so an immediate `check_now` cannot land
+        // before the background task first polls and be lost behind the
+        // initial delay.
+        let wakes = updater.wake_tx.subscribe();
         let for_loop = updater.clone();
-        tokio::spawn(async move { for_loop.check_loop().await });
+        let task = tokio::spawn(async move { for_loop.check_loop(wakes, initial_delay).await });
+        *updater.check_task.lock().unwrap() = Some(task);
         updater
+    }
+
+    /// Stop the check loop and wait for it to exit — a replaced runtime must
+    /// not keep polling `{edge}/releases` (or auto-applying) in the background.
+    /// Idempotent, and callable from any clone.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        let task = self
+            .check_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     pub fn watch(&self) -> watch::Receiver<UpdateStatus> {
         self.status_tx.subscribe()
     }
 
-    fn quiescent_now(&self) -> bool {
-        self.quiescent.as_ref().is_none_or(|check| check())
+    /// Check immediately, for example when authentication recovers after the
+    /// process started offline.
+    pub fn check_now(&self) {
+        self.forced.store(true, Ordering::SeqCst);
+        self.wake_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
-    async fn current_access_token(&self) -> Option<String> {
-        (self.access_token)().await
+    /// Re-read the wall clock now (window activation, system wake): checks
+    /// only if one is due, so frequent pokes cost nothing.
+    pub fn poke(&self) {
+        self.wake_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
-    async fn check_loop(&self) {
-        tokio::time::sleep(CHECK_INITIAL_DELAY).await;
-        loop {
-            let ok = self.check_once().await;
-            if ok
-                && self.status_tx.borrow().update_available
-                && auto_update_enabled()
-                && let InstallKind::Managed { .. } = detect_install()
-            {
-                self.auto_apply_when_idle().await;
+    /// Called by `zeron headless`: when this process is the installed engine
+    /// service and something else installs a newer binary, restart into it at
+    /// the next quiet moment. A hand-started `zeron headless` is left alone —
+    /// restarting the service unit would start a second engine beside it.
+    pub fn restart_when_superseded(&self) {
+        if !running_as_installed_service() {
+            return;
+        }
+        self.service.store(true, Ordering::SeqCst);
+        self.poke();
+    }
+
+    /// One user-requested check, awaited: publishes the result like a
+    /// scheduled check and returns it.
+    pub async fn check(&self) -> anyhow::Result<UpdateStatus> {
+        match fetch_latest(&self.edge_url).await {
+            Ok(manifest) => {
+                self.publish(manifest);
+                Ok(self.status_tx.borrow().clone())
             }
-            tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }).await;
+            Err(err) => {
+                self.status_tx
+                    .send_modify(|s| s.error = Some(format!("{err:#}")));
+                Err(err)
+            }
+        }
+    }
+
+    fn quiescent_now(&self) -> bool {
+        match &*self.role {
+            Role::Engine { quiescent } => quiescent.as_ref().is_none_or(|check| check()),
+            Role::Desktop => true,
+        }
+    }
+
+    async fn check_loop(&self, mut wakes: watch::Receiver<u64>, initial_delay: Duration) {
+        let mut shutdown = self.shutdown_tx.subscribe();
+        // Shutdown must cut the loop at ANY await point — including mid
+        // `check_once()` / `auto_apply_when_idle()` HTTP — so the whole body
+        // races the flag rather than checking it between iterations.
+        tokio::select! {
+            _ = shutdown.wait_for(|stop| *stop) => {}
+            _ = async {
+                tokio::select! {
+                    _ = tokio::time::sleep(initial_delay) => {}
+                    _ = wakes.changed() => {}
+                }
+                let mut schedule = Schedule::default();
+                let mut superseded = SupersededRestart::default();
+                loop {
+                    let forced = self.forced.swap(false, Ordering::SeqCst);
+                    if forced || schedule.due(SystemTime::now()) {
+                        let ok = self.check_once().await;
+                        schedule.record(SystemTime::now(), ok);
+                        if ok
+                            && self.status_tx.borrow().update_available
+                            && matches!(*self.role, Role::Engine { .. })
+                            && auto_update_enabled()
+                            && let InstallKind::Managed { .. } = detect_install()
+                        {
+                            self.auto_apply_when_idle().await;
+                        }
+                    }
+                    if self.service.load(Ordering::SeqCst) {
+                        superseded.poll(|| self.quiescent_now());
+                    }
+                    let wait = schedule.wait(SystemTime::now());
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = wakes.changed() => {}
+                    }
+                }
+            } => {}
         }
     }
 
@@ -957,18 +1222,9 @@ impl Updater {
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
-            let manifest_token = self.current_access_token().await;
-            match fetch_latest(&self.edge_url, manifest_token.as_deref()).await {
+            match fetch_latest(&self.edge_url).await {
                 Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    let artifact_token = self.current_access_token().await;
-                    if let Err(err) = stage_headless(
-                        &self.edge_url,
-                        artifact_token.as_deref(),
-                        &manifest,
-                        &app_root,
-                    )
-                    .await
-                    {
+                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
                         tracing::warn!(error = %err, "auto-update staging failed");
                         return;
                     }
@@ -981,47 +1237,61 @@ impl Updater {
             }
         }
         let mut deferred = false;
-        while !self.quiescent_now() {
-            if !deferred {
-                deferred = true;
-                tracing::info!("auto-update deferred: sessions or terminals active");
+        loop {
+            while !self.quiescent_now() {
+                if !deferred {
+                    deferred = true;
+                    tracing::info!("auto-update deferred: sessions or terminals active");
+                }
+                tokio::time::sleep(IDLE_RECHECK).await;
             }
-            tokio::time::sleep(IDLE_RECHECK).await;
-        }
-        match self.apply().await {
-            Ok(version) => {
-                tracing::info!(%version, "auto-update applied; service restarting")
+            // `apply_inner` fetches and stages again so a long defer lands on
+            // the newest release. Re-check quiescence immediately before the
+            // symlink swap: work can begin while that network/disk I/O runs.
+            match self.apply_inner(true).await {
+                Ok(Some(version)) => {
+                    tracing::info!(%version, "auto-update applied; service restarting");
+                    return;
+                }
+                Ok(None) => {
+                    if !deferred {
+                        deferred = true;
+                        tracing::info!(
+                            "auto-update deferred: activity began while staging the update"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "auto-update failed");
+                    return;
+                }
             }
-            Err(err) => tracing::warn!(error = %err, "auto-update failed"),
         }
     }
 
-    /// One check; returns false on fetch failure (retry sooner). Agent-CLI
-    /// rows ride the same tick: version probes are mtime-cached and channel
-    /// lookups short-timeout, so the added latency is a few seconds, 4×/day.
+    fn publish(&self, manifest: Manifest) {
+        let status = UpdateStatus {
+            current_version: current_version().to_string(),
+            update_available: version_newer(&manifest.version, current_version()),
+            latest_version: Some(manifest.version),
+            checked_at: Some(now_ms()),
+            error: None,
+        };
+        if status.update_available {
+            tracing::info!(
+                latest = status.latest_version.as_deref().unwrap_or(""),
+                current = %status.current_version,
+                "update available"
+            );
+        }
+        self.status_tx.send_replace(status);
+    }
+
+    /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
-        let access_token = self.current_access_token().await;
-        match fetch_latest(&self.edge_url, access_token.as_deref()).await {
+        match fetch_latest(&self.edge_url).await {
             Ok(manifest) => {
-                let harnesses = self.harness_statuses().await;
-                let harness_auto_update = self.status_tx.borrow().harness_auto_update;
-                let status = UpdateStatus {
-                    current_version: current_version().to_string(),
-                    update_available: version_newer(&manifest.version, current_version()),
-                    latest_version: Some(manifest.version),
-                    checked_at: Some(now_ms()),
-                    error: None,
-                    harnesses,
-                    harness_auto_update,
-                };
-                if status.update_available {
-                    tracing::info!(
-                        latest = status.latest_version.as_deref().unwrap_or(""),
-                        current = %status.current_version,
-                        "update available"
-                    );
-                }
-                self.status_tx.send_replace(status);
+                self.publish(manifest);
                 true
             }
             Err(err) => {
@@ -1037,186 +1307,131 @@ impl Updater {
     /// then restart the service after a short delay so the caller's RPC reply
     /// flushes before systemd/launchd kills this process.
     pub async fn apply(&self) -> anyhow::Result<String> {
+        self.apply_inner(false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("update became busy before apply"))
+    }
+
+    /// `require_quiescent` is used by automatic updates. It deliberately checks
+    /// after all network and staging I/O and directly before the destructive
+    /// swap/restart boundary; `None` tells the caller to wait and try again.
+    async fn apply_inner(&self, require_quiescent: bool) -> anyhow::Result<Option<String>> {
+        require_update_delivery()?;
         let InstallKind::Managed { app_root } = detect_install() else {
             bail!(
                 "this install is not update-managed — the desktop app updates from its UI; \
                  source builds update via git"
             );
         };
-        let manifest_token = self.current_access_token().await;
-        let manifest = fetch_latest(&self.edge_url, manifest_token.as_deref()).await?;
+        let manifest = fetch_latest(&self.edge_url).await?;
         if !version_newer(&manifest.version, current_version()) {
             bail!("already up to date ({})", current_version());
         }
-        let artifact_token = self.current_access_token().await;
-        stage_headless(
-            &self.edge_url,
-            artifact_token.as_deref(),
-            &manifest,
-            &app_root,
-        )
-        .await?;
+        stage_headless(&self.edge_url, &manifest, &app_root).await?;
+        if require_quiescent && !self.quiescent_now() {
+            return Ok(None);
+        }
         apply_headless(&app_root, &manifest.version)?;
         tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
             if let Err(err) = restart_service() {
                 tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
             }
         });
-        Ok(manifest.version)
+        Ok(Some(manifest.version))
     }
+}
 
-    /// Download and verify a macOS app update through the authenticated edge.
-    /// `None` means the installed version is already current.
-    pub async fn stage_mac_update(&self) -> anyhow::Result<Option<PathBuf>> {
-        let manifest_token = self.current_access_token().await;
-        let manifest = fetch_latest(&self.edge_url, manifest_token.as_deref()).await?;
-        if !version_newer(&manifest.version, current_version()) {
-            return Ok(None);
-        }
-        let artifact_token = self.current_access_token().await;
-        stage_mac_app(
-            &self.edge_url,
-            artifact_token.as_deref(),
-            &manifest,
-            &self.data_dir,
-        )
-        .await
-        .map(Some)
-    }
+/// Wall-clock check deadlines with failure backoff.
+#[derive(Debug, Default)]
+struct Schedule {
+    /// `None` until the first check: due immediately.
+    next_due: Option<SystemTime>,
+    failures: usize,
+}
 
-    /// Effective post-update agent refresh switch: the persisted toggle,
-    /// unless the operator env kill switch overrides it.
-    pub fn harness_auto_update(&self) -> bool {
-        self.status_tx.borrow().harness_auto_update && !harness_updates_disabled_by_env()
-    }
-
-    pub fn set_harness_auto_update(&self, enabled: bool) {
-        store_prefs(
-            &self.data_dir,
-            &UpdatePrefs {
-                harness_auto_update: enabled,
+impl Schedule {
+    fn due(&self, now: SystemTime) -> bool {
+        match self.next_due {
+            None => true,
+            Some(due) => match due.duration_since(now) {
+                Err(_) => true,
+                // A deadline further out than any interval means the clock
+                // jumped backwards; don't wait for it to catch up.
+                Ok(remaining) => remaining.is_zero() || remaining > CHECK_INTERVAL,
             },
-        );
-        self.status_tx
-            .send_modify(|status| status.harness_auto_update = enabled);
-    }
-
-    async fn harness_statuses(&self) -> Vec<HarnessStatus> {
-        let client = http_client().ok();
-        let mut statuses = Vec::with_capacity(self.harnesses.len());
-        for spec in self.harnesses.iter() {
-            statuses.push(self.harness_status(spec, client.as_ref()).await);
         }
-        statuses
     }
 
-    async fn harness_status(
-        &self,
-        spec: &HarnessSpec,
-        client: Option<&reqwest::Client>,
-    ) -> HarnessStatus {
-        let exe = (spec.resolve)();
-        let installed_version = match &exe {
-            Some(exe) => probe_cli_version(&self.version_cache, exe).await,
-            None => None,
+    fn record(&mut self, now: SystemTime, ok: bool) {
+        let delay = if ok {
+            self.failures = 0;
+            CHECK_INTERVAL
+        } else {
+            let delay = CHECK_RETRY[self.failures.min(CHECK_RETRY.len() - 1)];
+            self.failures = self.failures.saturating_add(1);
+            delay
         };
-        // "Latest" is only interesting for something that is installed.
-        let latest_version = match (&exe, client) {
-            (Some(_), Some(client)) => match fetch_channel_latest(client, &spec.channel).await {
-                Ok(version) => Some(version),
-                Err(err) => {
-                    tracing::debug!(harness = spec.id, error = %err, "latest-version lookup failed");
-                    None
-                }
-            },
-            _ => None,
+        self.next_due = Some(now + delay);
+    }
+
+    /// Monotonic sleep until the next look at the clock.
+    fn wait(&self, now: SystemTime) -> Duration {
+        self.next_due
+            .and_then(|due| due.duration_since(now).ok())
+            .unwrap_or(Duration::ZERO)
+            .clamp(Duration::from_secs(1), SCHEDULE_TICK)
+    }
+}
+
+/// Restarts a service daemon into a newer binary that is already installed
+/// (the desktop app swapped the bundle, `zeron update` flipped the symlink).
+/// Waits for quiescence, and tries at most once per installed version so a
+/// broken service manager cannot turn into a restart loop.
+#[derive(Debug, Default)]
+struct SupersededRestart {
+    attempted: Option<String>,
+    deferred_logged: bool,
+}
+
+impl SupersededRestart {
+    fn poll(&mut self, quiescent: impl Fn() -> bool) {
+        let Some(installed) = installed_version(&detect_install()) else {
+            return;
         };
-        let update_available = matches!(
-            (&latest_version, &installed_version),
-            (Some(latest), Some(installed)) if version_newer(latest, installed)
-        );
-        let update_required = matches!(
-            (spec.min_version, &installed_version),
-            (Some(min), Some(installed)) if version_newer(min, installed)
-        );
-        HarnessStatus {
-            id: spec.id.to_string(),
-            name: spec.name.to_string(),
-            path: exe.map(|p| p.display().to_string()),
-            installed_version,
-            latest_version,
-            update_available,
-            update_required,
-        }
+        self.poll_installed(&installed, current_version(), quiescent, restart_service);
     }
 
-    /// Run `id`'s own self-updater and fold its refreshed row into the current
-    /// status frame. The resolved executable's directory is prepended to PATH
-    /// because some updaters locate their installed binary by name.
-    pub async fn update_harness(&self, id: &str) -> anyhow::Result<HarnessStatus> {
-        let spec = self
-            .harnesses
-            .iter()
-            .find(|spec| spec.id == id)
-            .with_context(|| format!("unknown harness '{id}'"))?;
-        let exe = (spec.resolve)()
-            .with_context(|| format!("{} is not installed on this device", spec.name))?;
-        let mut command = harness_update_command(&exe, spec.self_update_args);
-        let output = tokio::time::timeout(SELF_UPDATE_TIMEOUT, command.output())
-            .await
-            .map_err(|_| anyhow::anyhow!("{} self-update timed out", spec.name))?
-            .with_context(|| format!("spawning {}", exe.display()))?;
-        if !output.status.success() {
-            bail!(
-                "{} self-update failed ({}): {}",
-                spec.name,
-                output.status,
-                output_tail(&output)
-            );
+    fn poll_installed(
+        &mut self,
+        installed: &str,
+        running: &str,
+        quiescent: impl Fn() -> bool,
+        restart: impl FnOnce() -> anyhow::Result<()>,
+    ) {
+        if !version_newer(installed, running) || self.attempted.as_deref() == Some(installed) {
+            return;
         }
-        // The swap happened under the CLI's own updater — drop the stale probe.
-        lock(&self.version_cache).remove(&exe);
-        let client = http_client().ok();
-        let status = self.harness_status(spec, client.as_ref()).await;
-        let updated = status.clone();
-        self.status_tx.send_modify(move |current| {
-            match current
-                .harnesses
-                .iter_mut()
-                .find(|row| row.id == updated.id)
-            {
-                Some(slot) => *slot = updated,
-                None => current.harnesses.push(updated),
+        if !quiescent() {
+            if !self.deferred_logged {
+                self.deferred_logged = true;
+                tracing::info!(
+                    installed,
+                    running,
+                    "newer version installed; restart deferred: sessions or terminals active"
+                );
             }
-        });
-        Ok(status)
-    }
-
-    /// The "on update" contract: refresh every installed agent once after a
-    /// Comet version transition. Sequential — vendor updaters contend on their
-    /// own locks — and failures are logged, never fatal.
-    pub fn spawn_post_update_refresh(&self) {
-        let updater = self.clone();
-        tokio::spawn(async move {
-            // Same boot deference as the release checker.
-            tokio::time::sleep(CHECK_INITIAL_DELAY).await;
-            for spec in updater.harnesses.iter() {
-                if (spec.resolve)().is_none() {
-                    continue;
-                }
-                match updater.update_harness(spec.id).await {
-                    Ok(status) => tracing::info!(
-                        harness = spec.id,
-                        version = status.installed_version.as_deref().unwrap_or("unknown"),
-                        "agent refreshed after comet update"
-                    ),
-                    Err(err) => {
-                        tracing::warn!(harness = spec.id, error = %err, "post-update agent refresh failed");
-                    }
-                }
-            }
-        });
+            return;
+        }
+        self.attempted = Some(installed.to_owned());
+        tracing::info!(
+            installed,
+            running,
+            "newer version installed; restarting service"
+        );
+        if let Err(err) = restart() {
+            tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
+        }
     }
 }
 
@@ -1226,55 +1441,221 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
-fn harness_update_command(exe: &Path, args: &[&str]) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(exe);
-    command.args(args).stdin(std::process::Stdio::null());
-    if let Some(dir) = exe.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        let mut paths = vec![dir.to_path_buf()];
-        if let Some(path) = std::env::var_os("PATH") {
-            paths.extend(std::env::split_paths(&path));
-        }
-        if let Ok(path) = std::env::join_paths(paths) {
-            command.env("PATH", path);
-        }
-    }
-    command
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Last few lines of a child's combined output — enough to say why an updater
-/// failed without shipping megabytes over RPC.
-fn output_tail(output: &std::process::Output) -> String {
-    let combined = [&output.stdout[..], &output.stderr[..]].concat();
-    let text = String::from_utf8_lossy(&combined);
-    let mut tail: Vec<&str> = text.lines().rev().take(8).collect();
-    tail.reverse();
-    tail.join("\n")
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+
     #[tokio::test]
-    async fn harness_updater_can_find_itself_by_name() {
-        use std::os::unix::fs::PermissionsExt;
-
+    async fn manual_canary_never_fetches_or_applies_a_release() {
         let temp = tempfile::tempdir().unwrap();
-        let exe = temp.path().join("crew-path-test-updater");
-        std::fs::write(
-            &exe,
-            "#!/bin/sh\ncommand -v crew-path-test-updater >/dev/null\n",
+        let root = temp.path().join("app");
+        assert!(!AUTOMATIC_UPDATES_SUPPORTED);
+        assert!(!desktop_auto_update_enabled());
+        assert!(fetch_latest("https://zeron.sh").await.unwrap_err().to_string().contains("private/manual"));
+        let manifest = Manifest { version: "999.0.0".into(), ..Manifest::default() };
+        assert!(stage_headless("https://zeron.sh", &manifest, &root).await.is_err());
+        assert!(!root.exists());
+        assert!(apply_headless(&root, &manifest.version).is_err());
+        let install = InstallKind::MacApp { bundle: root.clone() };
+        assert!(!install.supports_desktop_update());
+        assert!(install.apply_desktop(temp.path(), false).is_err());
+        let updater = Updater::spawn_desktop("https://zeron.sh".into());
+        assert!(updater.check_task.lock().is_ok_and(|task| task.is_none()));
+        assert_eq!(updater.watch().borrow().error.as_deref(), Some(MANUAL_UPDATE_MESSAGE));
+        updater.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for stall_body in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                if stall_body {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+                        .await
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+            let client =
+                http_client_with_timeouts(Duration::from_millis(200), Duration::from_millis(100))
+                    .unwrap();
+            let request = async {
+                client
+                    .get(format!("http://{address}"))
+                    .send()
+                    .await?
+                    .bytes()
+                    .await
+            };
+            let error = tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .expect("bounded read")
+                .unwrap_err();
+            assert!(error.is_timeout());
+            server.abort();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..10 {
+                socket.write_all(b"x").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+        let client =
+            http_client_with_timeouts(Duration::from_secs(1), Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            client
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .len(),
+            10
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_metadata_has_size_and_total_time_limits() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Reject an advertised oversized body before buffering it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n01234567890")
+                .await
+                .unwrap();
+        });
+        let client =
+            http_client_with_timeouts(Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        let error = fetch_release_metadata_with_limits(
+            &client,
+            &format!("http://{address}"),
+            Duration::from_secs(1),
+            10,
         )
-        .unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds 10 bytes"));
+        server.await.unwrap();
 
-        let output = harness_update_command(&exe, &[]).output().await.unwrap();
+        // Enforce the same cap when Content-Length is absent.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n01234567890")
+                .await
+                .unwrap();
+        });
+        let error = fetch_release_metadata_with_limits(
+            &client,
+            &format!("http://{address}"),
+            Duration::from_secs(1),
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds 10 bytes"));
+        server.await.unwrap();
 
-        assert!(output.status.success());
+        // Progressing bytes stay below the client's inactivity timeout but
+        // must still obey the metadata operation's total deadline.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..10 {
+                if socket.write_all(b"x").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+        let error = fetch_release_metadata_with_limits(
+            &client,
+            &format!("http://{address}"),
+            Duration::from_millis(80),
+            100,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("metadata deadline"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_update_tls_handshake_has_a_connect_deadline() {
+        use std::time::Duration;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let client =
+            http_client_with_timeouts(Duration::from_millis(100), Duration::from_secs(30)).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.get(format!("https://{address}")).send(),
+        )
+        .await
+        .expect("bounded TLS handshake")
+        .unwrap_err();
+        assert!(error.is_timeout());
+        server.abort();
+    }
+
+    #[test]
+    fn update_feed_override_requires_an_https_base_url() {
+        assert_eq!(
+            validate_release_override(" https://example.com/releases/ ").unwrap(),
+            "https://example.com/releases"
+        );
+        for url in [
+            "http://example.com/releases",
+            "file:///tmp/update",
+            "https://user:password@example.com",
+            "https://example.com?feed=x",
+            "https://example.com/#fragment",
+        ] {
+            assert!(validate_release_override(url).is_err(), "accepted {url}");
+        }
     }
 
     #[test]
@@ -1292,281 +1673,320 @@ mod tests {
     }
 
     #[test]
-    fn release_feed_is_derived_from_exact_edge_origin() {
-        assert_eq!(
-            releases_base("https://comet.internal.ashler.com").unwrap(),
-            "https://comet.internal.ashler.com/api/releases"
-        );
-        assert!(releases_base("http://comet.internal.ashler.com").is_err());
-        assert!(releases_base("https://comet.internal.ashler.com/other").is_err());
-        assert_eq!(
-            releases_base("http://127.0.0.1:8787").unwrap(),
-            "http://127.0.0.1:8787/api/releases"
-        );
-    }
-
-    #[test]
-    fn release_redirects_preserve_https_and_allow_loopback_development() {
-        let secure = reqwest::Url::parse("https://comet.internal.ashler.com/api/releases").unwrap();
-        let insecure =
-            reqwest::Url::parse("http://comet.internal.ashler.com/api/releases").unwrap();
-        let local = reqwest::Url::parse("http://127.0.0.1:8787/api/releases").unwrap();
-        assert!(validate_release_redirect(&insecure, std::slice::from_ref(&secure)).is_err());
-        assert!(validate_release_redirect(&local, std::slice::from_ref(&secure)).is_err());
-        assert!(validate_release_redirect(&secure, std::slice::from_ref(&secure)).is_ok());
-        assert!(validate_release_redirect(&local, std::slice::from_ref(&local)).is_ok());
-        assert!(validate_release_redirect(&secure, std::slice::from_ref(&local)).is_ok());
-        assert!(validate_release_redirect(&local, &[local.clone(), secure.clone()]).is_err());
-        assert!(validate_release_redirect(&secure, &vec![secure.clone(); 9]).is_ok());
-        assert!(validate_release_redirect(&secure, &vec![secure.clone(); 10]).is_err());
-    }
-
-    #[test]
-    fn release_manifest_matches_the_installed_platform() {
-        assert_eq!(
-            release_manifest_name(),
-            if cfg!(target_os = "macos")
-                && option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
-            {
-                "desktop-staging-manifest.json"
-            } else if cfg!(target_os = "macos") {
-                "desktop-manifest.json"
-            } else {
-                "scaffold-manifest.json"
-            }
-        );
-    }
-
-    #[test]
     fn install_kind_detection() {
         assert_eq!(
-            detect_install_from(
-                Path::new("/home/u/.comet-native/app/0.1.1/comet"),
+            detect_install_from_for_os(
+                Path::new("/home/u/.zeron/app/0.1.1/zeron"),
                 Some(Path::new("/home/u")),
+                "linux",
             ),
             InstallKind::Managed {
-                app_root: PathBuf::from("/home/u/.comet-native/app")
+                app_root: PathBuf::from("/home/u/.zeron/app")
             }
         );
         assert_eq!(
-            detect_install_from(
-                Path::new("/Applications/Comet.app/Contents/MacOS/comet"),
+            detect_install_from_for_os(
+                Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
                 Some(Path::new("/Users/u")),
+                "macos",
             ),
             InstallKind::MacApp {
-                bundle: PathBuf::from("/Applications/Comet.app")
-            }
-        );
-        assert_eq!(
-            detect_install_from(
-                Path::new("/Applications/Crew.app/Contents/MacOS/comet"),
-                Some(Path::new("/Users/u")),
-            ),
-            InstallKind::MacApp {
-                bundle: PathBuf::from("/Applications/Crew.app")
-            }
-        );
-        assert_eq!(
-            detect_install_from(
-                Path::new("/Applications/Crew Staging.app/Contents/MacOS/comet"),
-                Some(Path::new("/Users/u")),
-            ),
-            InstallKind::MacApp {
-                bundle: PathBuf::from("/Applications/Crew Staging.app")
+                bundle: PathBuf::from("/Applications/Zeron.app")
             }
         );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
-            detect_install_from(Path::new("/tmp/foo.app/comet"), None),
+            detect_install_from_for_os(Path::new("/tmp/foo.app/zeron"), None, "macos"),
             InstallKind::Unmanaged
         );
         assert_eq!(
-            detect_install_from(
-                Path::new("/src/target/release/comet"),
-                Some(Path::new("/home/u"))
+            detect_install_from_for_os(
+                Path::new("/src/target/release/zeron"),
+                Some(Path::new("/home/u")),
+                "linux",
             ),
             InstallKind::Unmanaged
         );
     }
 
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn app_update_refuses_unsigned_cached_bundle() {
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest = Manifest {
-            version: "1.2.3".to_owned(),
-            ..Manifest::default()
-        };
-        let binary = tmp
-            .path()
-            .join("updates/1.2.3")
-            .join(mac_app_name())
-            .join("Contents/MacOS/comet");
-        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        std::fs::write(&binary, b"untrusted cached binary").unwrap();
-
-        assert!(
-            stage_mac_app("http://127.0.0.1:1", None, &manifest, tmp.path())
-                .await
-                .is_err()
-        );
-        assert_eq!(std::fs::read(binary).unwrap(), b"untrusted cached binary");
-    }
-
-    #[cfg(target_os = "macos")]
     #[test]
-    fn app_update_refuses_unsigned_legacy_migration_without_changing_install() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy = tmp.path().join("Comet.app");
-        let staged = tmp.path().join("updates").join(mac_app_name());
-        let legacy_binary = legacy.join("Contents/MacOS/comet");
-        let staged_binary = staged.join("Contents/MacOS/comet");
-        std::fs::create_dir_all(legacy_binary.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(staged_binary.parent().unwrap()).unwrap();
-        std::fs::write(&legacy_binary, b"old").unwrap();
-        std::fs::write(&staged_binary, b"new").unwrap();
-
-        assert!(apply_mac_app(&staged, &legacy).is_err());
-        assert_eq!(std::fs::read(&legacy_binary).unwrap(), b"old");
-        assert_eq!(std::fs::read(&staged_binary).unwrap(), b"new");
-        assert!(!tmp.path().join(mac_app_name()).exists());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn app_update_refuses_unsigned_migration_without_displacing_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy = tmp.path().join("Comet.app");
-        let target = tmp.path().join(mac_app_name());
-        let staged = tmp.path().join("updates").join(mac_app_name());
-        for (bundle, contents) in [
-            (&legacy, b"legacy".as_slice()),
-            (&target, b"stale".as_slice()),
-            (&staged, b"current".as_slice()),
-        ] {
-            let binary = bundle.join("Contents/MacOS/comet");
-            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-            std::fs::write(binary, contents).unwrap();
-        }
-
-        assert!(apply_mac_app(&staged, &legacy).is_err());
-        for (bundle, contents) in [
-            (&legacy, b"legacy".as_slice()),
-            (&target, b"stale".as_slice()),
-            (&staged, b"current".as_slice()),
-        ] {
-            assert_eq!(
-                std::fs::read(bundle.join("Contents/MacOS/comet")).unwrap(),
-                contents
-            );
-        }
-    }
-
-    #[test]
-    fn artifact_names_match_packaging() {
+    fn retained_upstream_artifact_names_are_not_canary_delivery() {
         let (os, arch) = platform_key();
-        assert!(headless_artifact("0.2.0").starts_with("comet-0.2.0-"));
+        assert!(headless_artifact("0.2.0").starts_with("zeron-0.2.0-"));
         assert_eq!(
             headless_artifact("0.2.0"),
-            format!("comet-0.2.0-{os}-{arch}.tar.gz")
+            format!("zeron-0.2.0-{os}-{arch}.tar.gz")
         );
-        let prefix = if cfg!(target_os = "macos")
-            && option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging")
-        {
-            "comet-staging"
-        } else {
-            "comet"
-        };
+        assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_is_not_misclassified_as_linux() {
+        assert_eq!(platform_key().0, "windows");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_is_always_unmanaged() {
         assert_eq!(
-            mac_app_artifact("0.2.0"),
-            format!("{prefix}-0.2.0-macos-{arch}-app.tar.gz")
+            detect_install_from(
+                Path::new(r"C:\Users\u\.zeron\app\0.2.0\zeron.exe"),
+                Some(Path::new(r"C:\Users\u")),
+            ),
+            InstallKind::Unmanaged
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_rejects_platform_specific_updates_before_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            version: "9.9.9".into(),
+            files: BTreeMap::new(),
+        };
+        let app_root = tmp.path().join("app");
+        let data_dir = tmp.path().join("data");
+
+        let managed_err = stage_headless("http://127.0.0.1:1", &manifest, &app_root)
+            .await
+            .unwrap_err();
+        assert!(managed_err.to_string().contains("not supported on windows"));
+        assert!(!app_root.exists(), "managed staging must not touch disk");
+
+        let mac_err = stage_mac_app("http://127.0.0.1:1", &manifest, &data_dir)
+            .await
+            .unwrap_err();
+        assert!(mac_err.to_string().contains("not supported on windows"));
+        assert!(!data_dir.exists(), "macOS staging must not touch disk");
+
+        assert!(
+            apply_headless(&app_root, &manifest.version)
+                .unwrap_err()
+                .to_string()
+                .contains("private/manual")
+        );
+        assert!(
+            apply_mac_app(&data_dir.join("Zeron.app"), &data_dir.join("Installed.app"))
+                .unwrap_err()
+                .to_string()
+                .contains("not supported on windows")
+        );
+        assert!(
+            restart_service()
+                .unwrap_err()
+                .to_string()
+                .contains("not supported on windows")
         );
     }
 
     #[test]
-    fn manifest_requires_file_checksums() {
+    fn manifest_parses_with_and_without_files() {
         let full: Manifest = serde_json::from_str(
-            r#"{"version":"0.1.1","files":{"comet-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
+            r#"{"version":"0.1.1","files":{"zeron-0.1.1-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#,
         )
         .unwrap();
         assert_eq!(full.version, "0.1.1");
-        assert_eq!(full.files["comet-0.1.1-linux-x86_64.tar.gz"].sha256, "abc");
-        assert!(
-            serde_json::from_str::<Manifest>(r#"{"version":"0.1.1","files":{"comet.tar.gz":{}}}"#)
-                .is_err()
+        assert_eq!(
+            full.files["zeron-0.1.1-linux-x86_64.tar.gz"]
+                .sha256
+                .as_deref(),
+            Some("abc")
         );
+        let bare: Manifest = serde_json::from_str(r#"{"version":"0.1.1"}"#).unwrap();
+        assert!(bare.files.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn headless_symlink_swap() {
+    fn manual_canary_preserves_existing_install_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("app");
         for ver in ["0.1.0", "0.1.1"] {
             std::fs::create_dir_all(app_root.join(ver)).unwrap();
-            std::fs::write(app_root.join(ver).join("comet"), ver).unwrap();
+            std::fs::write(app_root.join(ver).join("zeron"), ver).unwrap();
         }
-        apply_headless(&app_root, "0.1.0").unwrap();
+        std::os::unix::fs::symlink(app_root.join("0.1.0"), app_root.join("current")).unwrap();
+        assert!(apply_headless(&app_root, "0.1.1").is_err());
         assert_eq!(
             std::fs::read_link(app_root.join("current")).unwrap(),
             app_root.join("0.1.0")
         );
-        // Swap over an existing symlink.
-        apply_headless(&app_root, "0.1.1").unwrap();
-        assert_eq!(
-            std::fs::read_link(app_root.join("current")).unwrap(),
-            app_root.join("0.1.1")
-        );
         // Unstaged version refuses.
         assert!(apply_headless(&app_root, "0.2.0").is_err());
     }
-
     #[test]
-    fn version_extraction() {
-        assert_eq!(extract_version("omp/17.2.9").as_deref(), Some("17.2.9"));
+    fn schedule_is_wall_clock_with_failure_backoff() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut schedule = Schedule::default();
+        assert!(schedule.due(start), "the first check is due immediately");
+
+        schedule.record(start, true);
+        assert!(!schedule.due(start + Duration::from_secs(59 * 60)));
+        // A machine that slept through the deadline is due the moment it
+        // looks at the clock again — no monotonic remainder to wait out.
+        assert!(schedule.due(start + Duration::from_secs(9 * 60 * 60)));
+        assert_eq!(schedule.wait(start), SCHEDULE_TICK);
+        // A clock that jumped backwards does not postpone checks.
+        assert!(schedule.due(start - Duration::from_secs(24 * 60 * 60)));
+
+        let mut backoff = Vec::new();
+        for _ in 0..6 {
+            schedule.record(start, false);
+            backoff.push(schedule.next_due.unwrap().duration_since(start).unwrap());
+        }
         assert_eq!(
-            extract_version("2.1.224 (Claude Code)").as_deref(),
-            Some("2.1.224")
+            backoff,
+            [
+                CHECK_RETRY[0],
+                CHECK_RETRY[1],
+                CHECK_RETRY[2],
+                CHECK_RETRY[3],
+                CHECK_RETRY[3],
+                CHECK_RETRY[3]
+            ]
+        );
+        schedule.record(start, true);
+        assert_eq!(schedule.failures, 0);
+    }
+
+    #[test]
+    fn superseded_service_restarts_once_when_quiet() {
+        let restarts = std::cell::Cell::new(0);
+        let restart = || {
+            restarts.set(restarts.get() + 1);
+            Ok(())
+        };
+        let mut superseded = SupersededRestart::default();
+        // Same or older installed versions never restart.
+        superseded.poll_installed("0.2.0", "0.2.0", || true, restart);
+        superseded.poll_installed("0.1.9", "0.2.0", || true, restart);
+        assert_eq!(restarts.get(), 0);
+        // Busy: deferred, not attempted.
+        superseded.poll_installed("0.2.1", "0.2.0", || false, restart);
+        assert_eq!(restarts.get(), 0);
+        // Quiet: exactly one attempt per installed version.
+        superseded.poll_installed("0.2.1", "0.2.0", || true, restart);
+        superseded.poll_installed("0.2.1", "0.2.0", || true, restart);
+        assert_eq!(restarts.get(), 1);
+        superseded.poll_installed("0.2.2", "0.2.0", || true, restart);
+        assert_eq!(restarts.get(), 2);
+    }
+
+    #[test]
+    fn systemd_service_cgroup_is_recognized() {
+        assert!(in_zeron_service_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/zeron.service\n"
+        ));
+        assert!(in_zeron_service_cgroup(
+            "12:pids:/user.slice/user@1000.service/zeron.service\n1:name=systemd:/x\n"
+        ));
+        assert!(!in_zeron_service_cgroup(
+            "0::/user.slice/user-1000.slice/session-3.scope\n"
+        ));
+        assert!(!in_zeron_service_cgroup(
+            "0::/user.slice/user@1000.service/app.slice/zeron.service.d\n"
+        ));
+    }
+
+    #[test]
+    fn bundle_version_reads_the_packaged_plist() {
+        let template = include_str!("../../../dist/macos/Info.plist");
+        let plist = template.replace("__VERSION__", "0.3.1");
+        assert_eq!(bundle_short_version(&plist).as_deref(), Some("0.3.1"));
+        assert_eq!(bundle_short_version("<plist></plist>"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_version_follows_the_current_symlink_and_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("app");
+        std::fs::create_dir_all(app_root.join("0.4.0")).unwrap();
+        std::fs::write(app_root.join("0.4.0").join("zeron"), "").unwrap();
+        let managed = InstallKind::Managed {
+            app_root: app_root.clone(),
+        };
+        assert_eq!(installed_version(&managed), None, "no current link yet");
+        std::os::unix::fs::symlink(app_root.join("0.4.0"), app_root.join("current")).unwrap();
+        assert_eq!(installed_version(&managed).as_deref(), Some("0.4.0"));
+
+        let bundle = tmp.path().join("Zeron.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            include_str!("../../../dist/macos/Info.plist").replace("__VERSION__", "0.4.1"),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_version(&InstallKind::MacApp { bundle }).as_deref(),
+            Some("0.4.1")
+        );
+        assert_eq!(installed_version(&InstallKind::Unmanaged), None);
+    }
+
+    #[test]
+    fn mac_bundles_that_cannot_replace_themselves_are_explained() {
+        let writable = |_: &Path| true;
+        let read_only = |_: &Path| false;
+        assert_eq!(
+            mac_bundle_blocker(Path::new("/Applications/Zeron.app"), writable),
+            None
         );
         assert_eq!(
-            extract_version("codex-cli 0.146.0").as_deref(),
-            Some("0.146.0")
+            mac_bundle_blocker(
+                Path::new("/private/var/folders/x/T/AppTranslocation/ABC/d/Zeron.app"),
+                writable
+            ),
+            Some(UpdateBlocker::Translocated)
         );
-        assert_eq!(extract_version("v17.2.12").as_deref(), Some("17.2.12"));
-        assert_eq!(extract_version("no version here"), None);
-        // Two segments is a date/counter, not a CLI version.
-        assert_eq!(extract_version("built 2026.08"), None);
-    }
-
-    #[test]
-    fn update_status_wire_compat() {
-        // Pre-harness frames (older engines over the relay) must still parse.
-        let old: UpdateStatus = serde_json::from_str(r#"{"currentVersion":"0.1.0"}"#).unwrap();
-        assert!(old.harnesses.is_empty());
-        assert!(old.harness_auto_update);
-    }
-
-    #[test]
-    fn boot_version_transition() {
-        let tmp = tempfile::tempdir().unwrap();
-        // First boot stamps but is not a transition.
-        assert!(!version_transition(tmp.path()));
-        assert!(!version_transition(tmp.path()));
-        std::fs::write(tmp.path().join("last-boot-version"), "0.0.1").unwrap();
-        assert!(version_transition(tmp.path()));
-        assert!(!version_transition(tmp.path()));
-    }
-
-    #[test]
-    fn harness_auto_update_pref_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(load_prefs(tmp.path()).harness_auto_update);
-        store_prefs(
-            tmp.path(),
-            &UpdatePrefs {
-                harness_auto_update: false,
-            },
+        assert_eq!(
+            mac_bundle_blocker(Path::new("/Volumes/Zeron/Zeron.app"), read_only),
+            Some(UpdateBlocker::DiskImage)
         );
-        assert!(!load_prefs(tmp.path()).harness_auto_update);
+        // An external drive the user can write to updates in place.
+        assert_eq!(
+            mac_bundle_blocker(Path::new("/Volumes/Work/Zeron.app"), writable),
+            None
+        );
+        assert_eq!(
+            mac_bundle_blocker(Path::new("/Applications/Zeron.app"), read_only),
+            Some(UpdateBlocker::NotWritable(PathBuf::from("/Applications")))
+        );
+    }
+
+    #[test]
+    fn writability_probe_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(dir_writable(tmp.path()));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert!(!dir_writable(&tmp.path().join("missing")));
+    }
+
+
+    #[tokio::test]
+    async fn desktop_checker_never_contacts_a_channel_on_demand() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let updater = Updater::spawn_desktop(format!("http://{}", listener.local_addr().unwrap()));
+        assert!(updater.check().await.unwrap_err().to_string().contains("private/manual"));
+        assert!(!updater.watch().borrow().update_available);
+        assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+        updater.shutdown().await;
+    }
+
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_binary_verification_rejects_the_wrong_release() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("zeron");
+        for version in ["1.0.0", "9.9.9"] {
+            std::fs::write(&binary, format!("#!/bin/sh\necho 'zeron {version}'\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = verify_staged_binary(&binary, "9.9.9").await;
+            assert_eq!(result.is_ok(), version == "9.9.9");
+        }
     }
 }

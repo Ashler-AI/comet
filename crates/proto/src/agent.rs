@@ -7,18 +7,143 @@ use serde::{Deserialize, Serialize};
 pub enum HarnessId {
     ClaudeCode,
     Codex,
-    Omp,
-    PrimeAgent,
-    /// Imported OpenCode history provenance; no executable harness is registered.
-    #[serde(rename = "opencode")]
-    OpenCode,
     Cursor,
+    /// Cognition's Devin agent, driven over ACP (`devin acp`).
     Devin,
+    /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
+    /// Nous Research's Hermes Agent, driven over ACP (`hermes acp`).
     Hermes,
+    /// The Pi coding agent (pi.dev), driven over its native JSONL RPC protocol.
     Pi,
+    /// Oh My Pi, driven over its own native OMP RPC protocol and session journal.
+    Omp,
+    /// SST's opencode agent, driven natively over its own HTTP/SSE server
+    /// protocol (`opencode serve` — the same wire the opencode desktop app
+    /// speaks).
+    Opencode,
+    /// google's antigravity agent over acp (`agy_acp_server`, installed from
+    /// its pinned release archive).
+    Antigravity,
     /// Test harness; never shown in production pickers.
     Mock,
+}
+
+/// Durable user preference for one agent's independently-installed CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessUpdatePolicy {
+    /// Check and surface an update, but never mutate the installation without
+    /// an explicit action.
+    #[default]
+    Notify,
+    /// Apply a discovered update after the harness execution gate becomes idle.
+    AutoWhenIdle,
+    /// Do not probe or update this harness.
+    Off,
+}
+
+/// Best-effort classification of the installation that owns an agent CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessInstallSource {
+    Npm,
+    Homebrew,
+    Cargo,
+    Vendor,
+    ManagedByZeron,
+    #[default]
+    Unknown,
+}
+
+/// The externally visible harness-update state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessUpdatePhase {
+    Dormant,
+    Checking,
+    Current,
+    Available,
+    WaitingForIdle,
+    Preparing,
+    Downloading,
+    Installing,
+    Verifying,
+    Updated,
+    ManualActionRequired,
+    Failed,
+}
+
+/// Real provider progress only. An absent value means the UI must render an
+/// indeterminate activity indicator rather than inventing a percentage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdateProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdateFailure {
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+/// One row in the device-local harness-update stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdateStatus {
+    pub harness: HarnessId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub source: HarnessInstallSource,
+    #[serde(default)]
+    pub policy: HarnessUpdatePolicy,
+    pub phase: HarnessUpdatePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<HarnessUpdateProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<HarnessUpdateFailure>,
+    /// Whether this device can safely apply the update without guessing which
+    /// package manager owns the installation. Older engines omit this field,
+    /// so clients must default to the conservative read-only behavior.
+    #[serde(default)]
+    pub can_apply: bool,
+    /// Provider command shown when mutation cannot be safely automated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
+}
+
+impl HarnessUpdateStatus {
+    /// Home notices describe discovered releases or an update in progress.
+    /// Manual checks remain available in Settings without implying that a
+    /// newer release exists.
+    pub fn show_update_notice(&self) -> bool {
+        matches!(
+            self.phase,
+            HarnessUpdatePhase::Available
+                | HarnessUpdatePhase::WaitingForIdle
+                | HarnessUpdatePhase::Preparing
+                | HarnessUpdatePhase::Downloading
+                | HarnessUpdatePhase::Installing
+                | HarnessUpdatePhase::Verifying
+                | HarnessUpdatePhase::Updated
+                | HarnessUpdatePhase::Failed
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -69,94 +194,6 @@ pub struct Model {
     pub options: Vec<ModelOption>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OmpAdvisorConfig {
-    pub enabled: bool,
-    pub model: String,
-    pub subagents: bool,
-    pub sync_backlog: OmpAdvisorSyncBacklog,
-    pub immune_turns: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OmpAdvisorSyncBacklog {
-    #[serde(rename = "off")]
-    Off,
-    #[serde(rename = "1")]
-    One,
-    #[serde(rename = "3")]
-    Three,
-    #[serde(rename = "5")]
-    Five,
-}
-
-impl OmpAdvisorSyncBacklog {
-    pub const ALL: [Self; 4] = [Self::Off, Self::One, Self::Three, Self::Five];
-
-    pub const fn value(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::One => "1",
-            Self::Three => "3",
-            Self::Five => "5",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HarnessCommandSubcommand {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HarnessCommand {
-    pub name: String,
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_hint: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subcommands: Vec<HarnessCommandSubcommand>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
-/// OMP executes `/goal` over RPC but current releases omit this TUI-backed
-/// command from `available_commands_update`. Both the harness adapter and the
-/// UI's cold-catalog fallback use one canonical command contract.
-pub fn omp_goal_command() -> HarnessCommand {
-    HarnessCommand {
-        name: "goal".into(),
-        description: "Toggle goal mode (persistent autonomous objective for this session)".into(),
-        input_hint: Some("[objective]".into()),
-        aliases: Vec::new(),
-        subcommands: [
-            ("set", "Set or replace the goal", Some("<objective>")),
-            ("show", "Show current goal details", None),
-            ("pause", "Pause the current goal", None),
-            ("resume", "Resume a paused goal", None),
-            ("drop", "Drop the current goal", None),
-            ("budget", "Adjust the token budget", Some("<N|off>")),
-        ]
-        .into_iter()
-        .map(|(name, description, usage)| HarnessCommandSubcommand {
-            name: name.into(),
-            description: description.into(),
-            usage: usage.map(str::to_string),
-        })
-        .collect(),
-        source: Some("builtin".into()),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
@@ -173,63 +210,91 @@ pub struct ModelOptionChoice {
     pub label: String,
 }
 
-const fn default_auto_approve() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     pub prompt: String,
-    pub model: Option<String>,
-    /// Opaque Agent Auth account selection. `None` requests automatic routing;
-    /// this is never a provider token or refresh credential.
+    /// The harness picked at send time. Rides the command plane so
+    /// claim-on-first-command (chat row still in flight on the registry
+    /// channel) dispatches — and records — the picked harness instead of the
+    /// engine default. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_account_id: Option<String>,
+    pub harness: Option<HarnessId>,
+    pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     /// Harness-specific option selections (option id -> choice id), JSON round-tripped.
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub cwd: String,
     pub sandbox: SandboxLevel,
-    #[serde(default = "default_auto_approve")]
+    #[serde(default)]
     pub auto_approve: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
     /// (composer uploads: UploadChunk/UploadCommit → durable path). The same
     /// paths also ride the prompt text as `Attached images (local files …)`
-    /// refs (comet's `withAttachments` transport — that's what persists in the
+    /// refs (zeron's `withAttachments` transport — that's what persists in the
     /// doc); this field additionally lets a harness inline the bytes as image
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AgentActivityStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentActivity {
-    pub id: String,
-    pub role: String,
-    pub status: AgentActivityStatus,
+    /// Host-side isolated-worktree creation (see [`WorktreeSpec`]): when set,
+    /// the HOST materializes the worktree at command-drain time and runs there
+    /// instead of `cwd`. Additive + serde-defaulted for wire compat — an old
+    /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub worktree: Option<WorktreeSpec>,
+    /// Zeron's own MCP server, injected by the HOST engine as it starts the
+    /// run: the `zeron mcp` subcommand of this same binary, pointed at the
+    /// engine's loopback IPC and stamped with the originating chat so the
+    /// agent can spawn, read, and message side chats. Additive +
+    /// serde-defaulted — an old host leaves it unset and the agent simply has
+    /// no Zeron tools; title runs never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpServer>,
 }
 
-/// Hidden transcript carrier for OMP's session-level goal state. The UI keeps
-/// it out of the conversation while using the persisted part for sidebar state.
-pub const OMP_GOAL_STATE_CALL_ID: &str = "omp-goal-state";
-pub const OMP_GOAL_STATE_CALL_NAME: &str = "omp_goal_state";
+/// A stdio MCP server the harness should add to the agent's session, on top
+/// of whatever the user configured. Each driver spells it in its own dialect
+/// (Claude `--mcp-config`, ACP `session/new` `mcpServers`, Codex
+/// `mcp_servers.*` config overrides).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
+/// by the HOST while draining the queued Run — not by the sender over a
+/// blocking CreateWorktree RPC — so the send path stays durable: a lost relay
+/// frame can't wedge the composer on "Sending…" while the session runs anyway
+/// (2026-08-18 user report).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSpec {
+    /// The repo whose worktree to create (the space's folder on the host).
+    pub repo_path: String,
+    /// Base ref the fresh `zeron/<name>` branch is created off.
+    pub base: String,
+    /// Owning project used to resolve host-local setup Actions. Optional for
+    /// wire compatibility with clients that only request worktree creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+}
+
+/// The session-scoped singleton id for the live plan/todo chip. ACP plan
+/// updates carry no wire id; adapters emit every update under this one id so
+/// the fold refreshes the same chip in place. Consumers that de-duplicate
+/// tool ids across segment boundaries (the engine's stale-echo filter) must
+/// EXEMPT this id — it legitimately reappears in every segment for the whole
+/// life of a run.
+pub const LIVE_PLAN_TOOL_ID: &str = "acp-plan";
 
 /// A decoded tool invocation, reduced to the fields each kind renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -278,12 +343,6 @@ pub enum ToolCall {
         #[serde(default)]
         items: Vec<TodoItem>,
     },
-    /// One or more OMP task subagents. Repeated tool-call updates refresh this
-    /// list in place so Comet can show pending/running/terminal activity rather
-    /// than collapsing delegation into an opaque generic tool.
-    Agent {
-        agents: Vec<AgentActivity>,
-    },
     Mcp {
         server: String,
         tool: String,
@@ -297,30 +356,189 @@ pub enum ToolCall {
     },
 }
 
-/// Cap on captured tool output (journal-line hygiene: a single `cargo test`
-/// dump must not balloon the append-only run journal). Adapters truncate at a
-/// char boundary via [`truncate_tool_output`].
-pub const TOOL_OUTPUT_CAP_BYTES: usize = 48 * 1024;
+impl ToolCall {
+    /// A subagent SPAWN call — the `Agent[: <description>]` naming convention
+    /// every driver decodes its spawn tool into (claude/codex `Task`, cursor
+    /// `task`, grok `spawn_subagent`, opencode `task`). This is the single
+    /// genus gate for subagent binding: tagged subagent traffic may only ever
+    /// stamp a ref/status onto a spawn call, so a driver keying bug can never
+    /// turn an ordinary Run/Read chip into a spawn chip (2026-08-20: claude's
+    /// background-shell `task_notification` did exactly that — the chip
+    /// linked to a never-created doc and opened an empty panel).
+    pub fn is_subagent_spawn(&self) -> bool {
+        let name = match self {
+            ToolCall::Unknown { name, .. } => name,
+            ToolCall::Mcp { tool, .. } => tool,
+            _ => return false,
+        };
+        name == "Agent" || name.starts_with("Agent: ")
+    }
 
-/// Enforce [`TOOL_OUTPUT_CAP_BYTES`] on a captured output, marking the cut.
-pub fn truncate_tool_output(mut text: String) -> String {
-    if text.len() <= TOOL_OUTPUT_CAP_BYTES {
-        return text;
+    /// The model a subagent SPAWN was given, when the spawn named one.
+    ///
+    /// Read off the spawn's own input rather than the session's picked model:
+    /// a spawn may override it per child (claude's `Agent` takes `model`, grok
+    /// `spawn_subagent` a `model_id`), and two chips spawned in one turn can
+    /// legitimately name different models. `None` means the spawn didn't say —
+    /// the child inherits the parent's model, which the chip already implies,
+    /// so nothing is rendered rather than guessing a name.
+    ///
+    /// Only ever answers for [`is_subagent_spawn`](Self::is_subagent_spawn)
+    /// calls: an ordinary tool with a stray `model` argument is not a spawn.
+    pub fn subagent_model(&self) -> Option<&str> {
+        if !self.is_subagent_spawn() {
+            return None;
+        }
+        let input = match self {
+            ToolCall::Unknown { input, .. } | ToolCall::Mcp { input, .. } => input.as_ref()?,
+            _ => return None,
+        };
+        SUBAGENT_MODEL_KEYS
+            .iter()
+            .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
     }
-    let mut end = TOOL_OUTPUT_CAP_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text.push_str("\n… [output truncated]");
-    text
 }
 
+/// Spawn-input keys that carry a child model, in precedence order. Drivers
+/// disagree on the spelling, so the lookup is by key set, not by harness —
+/// a new adapter naming it any of these needs no code change here.
+pub const SUBAGENT_MODEL_KEYS: [&str; 4] = ["model", "modelId", "model_id", "subagent_model"];
+
+/// The spawn-input keys [`sanitize_tool_call`](crate::) must preserve so the
+/// chip can name the child's model. Deliberately tiny: everything else on a
+/// spawn's input (the whole prompt, most of all) stays host-local.
+pub const SUBAGENT_INPUT_KEEP: [&str; 5] = [
+    "model",
+    "modelId",
+    "model_id",
+    "subagent_model",
+    "subagent_type",
+];
+
+/// Bounds on an agent's inline visual ([`AgentEvent::Visual`]): a Luau
+/// script Zeron runs in a sandbox and renders natively.
+pub const VISUAL_MAX_BYTES: usize = 256 * 1024;
+pub const VISUAL_MAX_TITLE_CHARS: usize = 200;
+/// Files a visual may ship with (models, textures, environment maps).
+pub const VISUAL_MAX_ASSETS: usize = 16;
+pub const VISUAL_MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
+pub const VISUAL_MAX_TOTAL_ASSET_BYTES: usize = 10 * 1024 * 1024;
+
+// The MCP server sends a visual to the engine in one WebSocket message, its
+// assets base64-encoded; that message must fit the engine's 16 MiB frame
+// (tungstenite's default), with room for the script escaped as JSON.
+const _: () = assert!(
+    VISUAL_MAX_TOTAL_ASSET_BYTES.div_ceil(3) * 4 + VISUAL_MAX_BYTES * 6 + 64 * 1024 < 16 * 1024 * 1024
+);
+
+/// Whether `name` can name a visual's asset: a plain file name.
+pub fn valid_visual_asset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Where one checklist item stands. Claude's TodoWrite, OpenCode and ACP plans
+/// distinguish the item being worked on from those still waiting; Codex and
+/// Cursor only report done / not done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TodoStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    /// Decode a harness status string. Anything unrecognised (including
+    /// `cancelled`) is `Pending`: not finished, not being worked on.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "completed" | "complete" | "done" => Self::Completed,
+            "in_progress" | "inProgress" | "in-progress" | "active" => Self::InProgress,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// One checklist entry.
+///
+/// `done` is the original wire field and stays authoritative for completion,
+/// so docs written before `status` existed (and readers that ignore it) keep
+/// working. `status` is additive and written only when it adds information —
+/// i.e. for an in-progress item; a missing or unreadable value derives from
+/// `done`. Build items with [`TodoItem::new`] to keep the two consistent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
     pub text: String,
     pub done: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_todo_status"
+    )]
+    pub status: Option<TodoStatus>,
+}
+
+impl TodoItem {
+    pub fn new(text: impl Into<String>, status: TodoStatus) -> Self {
+        Self {
+            text: text.into(),
+            done: status == TodoStatus::Completed,
+            status: (status == TodoStatus::InProgress).then_some(status),
+        }
+    }
+
+    /// Effective status: `done` wins, then the explicit status, else pending.
+    pub fn status(&self) -> TodoStatus {
+        if self.done {
+            TodoStatus::Completed
+        } else {
+            self.status.unwrap_or_default()
+        }
+    }
+}
+
+/// A status this build does not know (a future `blocked`, say) must not fail
+/// the whole tool call — the part would vanish from the transcript. Treat it
+/// as absent so the item falls back to `done`.
+fn lenient_todo_status<'de, D>(deserializer: D) -> Result<Option<TodoStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// A slash command advertised by the agent (ACP `availableCommands`): typed as
+/// `/name` at the start of the composer, sent to the agent as prompt text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Placeholder hint for the command's argument, when it takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+}
+
+/// A file modification carried inline on a tool result (ACP
+/// `ToolCallContent::Diff`). `old_text: None` means a new file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDiff {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    pub new_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -332,6 +550,10 @@ pub struct UserInputQuestion {
     pub options: Vec<String>,
     #[serde(default)]
     pub multi_select: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
+    #[serde(default)]
+    pub multiline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -349,16 +571,9 @@ pub enum DoneStatus {
     Errored,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelRetry {
-    pub attempt: u32,
-    pub max_attempts: u32,
-}
-
 /// The normalized streaming event every harness emits.
 ///
-/// Mirrors comet's `AgentEvent` tagged enum.
+/// Mirrors zeron's `AgentEvent` tagged enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
@@ -373,14 +588,26 @@ pub enum AgentEvent {
         session_id: String,
         assistant_message_id: String,
     },
-    SessionTitleChanged {
-        title: String,
-    },
     TextDelta {
         text: String,
     },
-    ReasoningStarted,
-    ReasoningCompleted,
+    /// A generated raster asset. The engine materializes this path before publication.
+    #[serde(rename_all = "camelCase")]
+    GeneratedImage {
+        id: String,
+        path: String,
+        name: String,
+        mime_type: String,
+    },
+    /// An agent-authored visual shown inline in the reply: a Luau script
+    /// that builds native UI (`zeron-visual`). The engine emits it when the
+    /// agent calls Zeron's `show_visual` MCP tool; `path` is the stored
+    /// script on the host device.
+    Visual {
+        id: String,
+        path: String,
+        title: String,
+    },
     ReasoningDelta {
         text: String,
     },
@@ -397,32 +624,34 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         is_error: bool,
-        /// Harness-reported tool output (plain text, capped at
-        /// [`TOOL_OUTPUT_CAP_BYTES`] by the capturing adapter). Journal-only:
-        /// never folded into doc parts — the transcript fetches it on demand
-        /// via `ToolCallDetail`. Serde-defaulted so old journal lines and old
-        /// peers stay readable.
+        /// Tool output text, capped by the emitting harness (ACP tool-call
+        /// content; claude/codex adapters never populate it). The doc-side
+        /// fold applies its own byte cap before anything persists.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// Inline file diff for edit-shaped tools (ACP `Diff` content).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<ToolDiff>,
     },
-    /// Bounded in-progress tool output. Unlike [`Self::ToolResult`], this does
-    /// not resolve the matching transcript tool chip.
+    /// Latest context occupancy, independent of cumulative billing usage.
+    /// Missing fields preserve the previous measurement; zero tokens is valid.
     #[serde(rename_all = "camelCase")]
-    ToolProgress {
-        id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        output: Option<String>,
-    },
-    /// Live model recovery status; never folded into transcript parts.
-    ModelRetry {
-        #[serde(default)]
-        retry: Option<ModelRetry>,
+    ContextUsage {
+        tokens: Option<u64>,
+        window: Option<u64>,
     },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    /// The agent advertised (or changed) its slash-command set — ACP
+    /// `available_commands_update`. The engine caches the latest list per
+    /// harness for the composer's `/` popup; never persisted to docs.
+    #[serde(rename_all = "camelCase")]
+    AvailableCommands {
+        commands: Vec<SlashCommand>,
     },
     Error {
         message: String,
@@ -436,6 +665,8 @@ pub enum AgentEvent {
     InputResolved {
         request_id: String,
     },
+    /// A confirmed new assignment. When tagged as Subagent, this reopens the
+    /// same child transcript even if the provider does not echo the user text.
     #[serde(rename_all = "camelCase")]
     Steered {
         assistant_message_id: Option<String>,
@@ -447,6 +678,29 @@ pub enum AgentEvent {
         result: Option<String>,
         error: Option<String>,
         session_id: Option<String>,
+    },
+    /// A USER-role message injected into a running session — today only seen
+    /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
+    /// subagent mid-run (claude: a tagged user frame's text blocks). The
+    /// engine writes it to the subagent doc as its own user entry, closing
+    /// the streaming assistant segment above it — the subagent transcript
+    /// then reads like any steered chat. Never emitted untagged (the parent
+    /// chat's user messages come from doc commands, not the wire).
+    #[serde(rename_all = "camelCase")]
+    UserMessage {
+        text: String,
+    },
+    /// An event belonging to a SUBAGENT's nested transcript, attributed to
+    /// the spawning tool call (`parent_tool_use_id` = the parent-feed
+    /// `ToolCall::id` that launched it). Never folded into the parent chat
+    /// doc — the engine routes these to the subagent's own doc; the parent
+    /// keeps only the spawn chip. Additive: old consumers that don't match
+    /// this variant drop the nested traffic, which is the pre-subagent-viz
+    /// behavior.
+    #[serde(rename_all = "camelCase")]
+    Subagent {
+        parent_tool_use_id: String,
+        event: Box<AgentEvent>,
     },
 }
 
@@ -464,15 +718,60 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
-        let retry = AgentEvent::ModelRetry {
-            retry: Some(ModelRetry { attempt: 2, max_attempts: 4 }),
+    }
+
+    /// Drivers spell the key differently; the chip must not care which one
+    /// spawned the child. Non-spawns never answer, whatever they carry.
+    #[test]
+    fn subagent_model_reads_every_spelling_and_only_off_a_spawn() {
+        let spawn = |input: serde_json::Value| ToolCall::Unknown {
+            name: "Agent: scan".into(),
+            input: Some(input),
         };
-        let json = serde_json::to_value(&retry).unwrap();
-        assert_eq!(json["retry"]["maxAttempts"], 4);
-        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), retry);
+        for key in SUBAGENT_MODEL_KEYS {
+            let call = spawn(serde_json::json!({ key: "haiku" }));
+            assert_eq!(call.subagent_model(), Some("haiku"), "key {key}");
+        }
+        // An MCP-shaped spawn (cursor routes its `task` through MCP) too.
         assert_eq!(
-            serde_json::from_str::<AgentEvent>(r#"{"type":"modelRetry","futureField":true}"#).unwrap(),
-            AgentEvent::ModelRetry { retry: None },
+            ToolCall::Mcp {
+                server: "s".into(),
+                tool: "Agent: scan".into(),
+                input: Some(serde_json::json!({ "model": "sonnet" })),
+            }
+            .subagent_model(),
+            Some("sonnet")
+        );
+        // Not a spawn: the name gate wins over the key.
+        assert_eq!(
+            ToolCall::Unknown {
+                name: "Bash".into(),
+                input: Some(serde_json::json!({ "model": "haiku" })),
+            }
+            .subagent_model(),
+            None
+        );
+        // A spawn that named nothing usable inherits — nothing to render.
+        assert_eq!(
+            spawn(serde_json::json!({ "model": " " })).subagent_model(),
+            None
+        );
+        assert_eq!(
+            spawn(serde_json::json!({ "prompt": "x" })).subagent_model(),
+            None
+        );
+        assert_eq!(
+            ToolCall::Unknown {
+                name: "Agent".into(),
+                input: None
+            }
+            .subagent_model(),
+            None
+        );
+        // Non-string values are not names.
+        assert_eq!(
+            spawn(serde_json::json!({ "model": 5 })).subagent_model(),
+            None
         );
     }
 
@@ -496,45 +795,28 @@ mod tests {
     }
 
     #[test]
-    fn run_request_serializes_only_an_opaque_pinned_account_selection() {
-        let old = r#"{"prompt":"p","model":"gpt-5.6-sol","reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
-        let automatic: RunRequest = serde_json::from_str(old).unwrap();
-        assert_eq!(automatic.agent_account_id, None);
-        assert!(
-            serde_json::to_value(&automatic)
-                .unwrap()
-                .get("agentAccountId")
-                .is_none()
-        );
-
-        let pinned = RunRequest {
-            agent_account_id: Some("opaque-account-id".into()),
-            ..automatic
+    fn run_request_worktree_default_and_round_trip() {
+        // Old-wire JSON without the field parses (additive compat)…
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.worktree.is_none());
+        // …and `None` serializes away (old readers never see it).
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("worktree").is_none());
+        // A populated spec round-trips camelCased.
+        let req = RunRequest {
+            worktree: Some(WorktreeSpec {
+                repo_path: "/repos/comet".into(),
+                base: "main".into(),
+                space_id: Some("space-1".into()),
+            }),
+            ..req
         };
-        let value = serde_json::to_value(&pinned).unwrap();
-        assert_eq!(value["agentAccountId"], "opaque-account-id");
-        assert_eq!(
-            serde_json::from_value::<RunRequest>(value)
-                .unwrap()
-                .agent_account_id
-                .as_deref(),
-            Some("opaque-account-id")
-        );
-    }
-
-    #[test]
-    fn run_request_defaults_to_auto_approve_but_preserves_explicit_opt_out() {
-        let defaulted: RunRequest = serde_json::from_str(
-            r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#,
-        )
-        .unwrap();
-        assert!(defaulted.auto_approve);
-
-        let explicit: RunRequest = serde_json::from_str(
-            r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","autoApprove":false,"resume":null}"#,
-        )
-        .unwrap();
-        assert!(!explicit.auto_approve);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
+        assert_eq!(json["worktree"]["spaceId"], "space-1");
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(round.worktree, req.worktree);
     }
 
     #[test]
@@ -543,5 +825,158 @@ mod tests {
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
         );
+    }
+
+    #[test]
+    fn harness_update_status_uses_stable_wire_names() {
+        let status = HarnessUpdateStatus {
+            harness: HarnessId::ClaudeCode,
+            installed_version: Some("1.0.0".into()),
+            latest_version: Some("1.1.0".into()),
+            channel: Some("stable".into()),
+            source: HarnessInstallSource::Npm,
+            policy: HarnessUpdatePolicy::AutoWhenIdle,
+            phase: HarnessUpdatePhase::WaitingForIdle,
+            progress: None,
+            checked_at: Some(42),
+            error: None,
+            can_apply: true,
+            manual_command: Some("claude update".into()),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["harness"], "claude-code");
+        assert_eq!(json["installedVersion"], "1.0.0");
+        assert_eq!(json["policy"], "auto-when-idle");
+        assert_eq!(json["phase"], "waiting-for-idle");
+        assert_eq!(json["canApply"], true);
+        assert_eq!(
+            serde_json::from_value::<HarnessUpdateStatus>(json.clone()).unwrap(),
+            status
+        );
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("canApply");
+        assert!(
+            !serde_json::from_value::<HarnessUpdateStatus>(legacy)
+                .unwrap()
+                .can_apply
+        );
+    }
+
+    #[test]
+    fn manual_checks_do_not_claim_an_available_update() {
+        let mut status: HarnessUpdateStatus = serde_json::from_value(serde_json::json!({
+            "harness": "cursor",
+            "phase": "manual-action-required",
+            "canApply": true,
+        }))
+        .unwrap();
+        assert!(!status.show_update_notice());
+        status.phase = HarnessUpdatePhase::Available;
+        status.latest_version = Some("2.0.0".into());
+        status.can_apply = false;
+        assert!(
+            status.show_update_notice(),
+            "known manual releases still need attention"
+        );
+        status.phase = HarnessUpdatePhase::Installing;
+        assert!(status.show_update_notice());
+    }
+}
+
+/// Host-owned context snapshot, replicated with the chat document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub tokens: Option<u64>,
+    pub window: Option<u64>,
+}
+
+impl ContextUsage {
+    pub fn fraction(self) -> Option<f64> {
+        Some(self.tokens? as f64 / self.window.filter(|n| *n > 0)? as f64)
+    }
+}
+
+#[cfg(test)]
+mod generated_image_tests {
+    use super::*;
+
+    #[test]
+    fn generated_image_event_round_trip() {
+        let event = AgentEvent::GeneratedImage {
+            id: "item:image".into(),
+            path: "/uploads/generated.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "generatedImage");
+        assert_eq!(value["mimeType"], "image/png");
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+    }
+}
+
+#[cfg(test)]
+mod todo_item_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_items_without_status_derive_from_done() {
+        let done: TodoItem = serde_json::from_value(json!({ "text": "a", "done": true })).unwrap();
+        let open: TodoItem = serde_json::from_value(json!({ "text": "b", "done": false })).unwrap();
+        assert_eq!(done.status(), TodoStatus::Completed);
+        assert_eq!(open.status(), TodoStatus::Pending);
+        assert_eq!(open.status, None);
+    }
+
+    #[test]
+    fn only_in_progress_adds_a_field_so_other_docs_are_unchanged() {
+        let pending = serde_json::to_value(TodoItem::new("a", TodoStatus::Pending)).unwrap();
+        let done = serde_json::to_value(TodoItem::new("b", TodoStatus::Completed)).unwrap();
+        let active = serde_json::to_value(TodoItem::new("c", TodoStatus::InProgress)).unwrap();
+        assert_eq!(pending, json!({ "text": "a", "done": false }));
+        assert_eq!(done, json!({ "text": "b", "done": true }));
+        assert_eq!(
+            active,
+            json!({ "text": "c", "done": false, "status": "inProgress" })
+        );
+    }
+
+    #[test]
+    fn unknown_status_falls_back_to_done_instead_of_failing_the_call() {
+        let call: ToolCall = serde_json::from_value(json!({
+            "kind": "todo",
+            "items": [
+                { "text": "a", "done": false, "status": "blocked" },
+                { "text": "b", "done": true, "status": 7 },
+            ]
+        }))
+        .unwrap();
+        let ToolCall::Todo { items } = call else {
+            panic!("expected a todo call");
+        };
+        assert_eq!(items[0].status(), TodoStatus::Pending);
+        assert_eq!(items[1].status(), TodoStatus::Completed);
+    }
+
+    #[test]
+    fn done_outranks_a_stale_status() {
+        let item = TodoItem {
+            text: "a".into(),
+            done: true,
+            status: Some(TodoStatus::InProgress),
+        };
+        assert_eq!(item.status(), TodoStatus::Completed);
+    }
+
+    #[test]
+    fn harness_status_strings_decode() {
+        assert_eq!(TodoStatus::parse("completed"), TodoStatus::Completed);
+        assert_eq!(TodoStatus::parse("in_progress"), TodoStatus::InProgress);
+        assert_eq!(TodoStatus::parse("inProgress"), TodoStatus::InProgress);
+        assert_eq!(TodoStatus::parse("pending"), TodoStatus::Pending);
+        assert_eq!(TodoStatus::parse("cancelled"), TodoStatus::Pending);
+        assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
     }
 }

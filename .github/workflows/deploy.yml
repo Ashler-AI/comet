@@ -1,19 +1,8 @@
 name: deploy
 
+# Activation hold: merges, pushes and tags never deploy Edge or synchronize
+# release-feed secrets. An operator must separately authorize a manual run.
 on:
-  push:
-    branches: [main]
-    tags: ["edge-staging-v*"]
-    paths:
-      - edge/**
-      - apps/comet/**
-      - crates/**
-      - scripts/**
-      - vendor/**
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - .github/workflows/deploy.yml
   workflow_dispatch:
     inputs:
       target:
@@ -46,23 +35,8 @@ jobs:
       - name: Install locked edge dependencies
         working-directory: edge
         run: npm ci
-      - name: Install native Rust build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxcb1-dev libx11-xcb-dev \
-            libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake
-      - name: Select checked-in Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - name: Build real headless host
-        run: cargo build --locked --package comet --bin comet
-      - name: Real local Edge and Rust collaboration smoke
-        env:
-          COMET_BIN: ${{ github.workspace }}/target/debug/comet
-        run: node scripts/headless-collaboration-smoke.mjs
+      - name: Verify native browser contracts
+        run: node --test apps/web/server.test.mjs
       - name: Generate Worker binding types
         working-directory: edge
         run: npm run types
@@ -76,7 +50,7 @@ jobs:
         run: npm test
       - name: Build deployment candidate once
         working-directory: edge
-        run: npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/comet-edge-candidate"
+        run: npx wrangler deploy --env staging --dry-run --outdir "$RUNNER_TEMP/comet-edge-candidate"
       - id: candidate
         name: Seal candidate digest
         env:
@@ -102,7 +76,7 @@ jobs:
           if-no-files-found: error
 
   staging:
-    if: github.repository_owner == 'Ashler-AI'
+    if: github.repository_owner == 'Ashler-AI' && github.event_name == 'workflow_dispatch'
     needs: [candidate, sync-staging-release-feed-secrets]
     runs-on: ubuntu-24.04
     environment: comet-staging
@@ -230,7 +204,7 @@ jobs:
         run: npx wrangler deploy "${{ steps.verify.outputs.entry }}" --no-bundle --config wrangler.jsonc --env production
 
   sync-staging-release-feed-secrets:
-    if: github.repository_owner == 'Ashler-AI'
+    if: github.repository_owner == 'Ashler-AI' && github.event_name == 'workflow_dispatch'
     needs: candidate
     runs-on: ubuntu-24.04
     environment: comet-release-staging

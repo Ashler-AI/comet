@@ -134,7 +134,7 @@ function releaseCheckout(t, merged) {
   const upstream = path.join(dir, "upstream");
   const checkout = path.join(dir, "checkout");
   fixtureCommand(dir, "git", "init", "-b", "main", upstream);
-  writeFileSync(path.join(upstream, "Cargo.toml"), `[workspace]\nmembers = ["."]\n[workspace.package]\nversion = "${VERSION}"\n[package]\nname = "comet"\nversion.workspace = true\nedition = "2024"\n[lib]\npath = "lib.rs"\n`);
+  writeFileSync(path.join(upstream, "Cargo.toml"), `[workspace]\nmembers = ["."]\n[workspace.package]\nversion = "${VERSION}"\n[package]\nname = "zeron"\nversion.workspace = true\nedition = "2024"\n[lib]\npath = "lib.rs"\n`);
   writeFileSync(path.join(upstream, "lib.rs"), "");
   fixtureCommand(upstream, "git", "add", ".");
   fixtureCommand(upstream, "git", "commit", "-m", "main baseline");
@@ -223,18 +223,33 @@ describe("executable release gates", () => {
     assert.notEqual(command(checkout.checkout, "git", ["rev-parse", "--verify", "refs/remotes/origin/main"]).status, 0);
   });
 
-  it("rejects unmerged production source but still permits private candidates", async (t) => {
+  it("rejects unmerged publication even when its exact source was reviewed", async (t) => {
     const checkout = releaseCheckout(t, false);
     const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
-    const production = runVersion(script, checkout);
-    assert.notEqual(production.status, 0);
-    assert.equal(production.output, "");
-    const privateCandidate = runVersion(script, checkout, {
-      REQUESTED_PROMOTION_TARGET: "none", REQUESTED_CANDIDATE_RUN_ID: "",
-    });
-    assert.equal(privateCandidate.status, 0, privateCandidate.stderr);
-    assert.ok(privateCandidate.output.includes("promotion_target=none\n"));
+    for (const target of ["staging-candidate", "staging", "production"]) {
+      const result = runVersion(script, checkout, {
+        REQUESTED_PROMOTION_TARGET: target, REQUESTED_CANDIDATE_RUN_ID: "",
+        REQUESTED_REVIEWED_SHA: checkout.sha,
+      });
+      assert.notEqual(result.status, 0);
+      assert.equal(result.output, "");
+    }
   });
+
+  it("builds unmerged private artifacts only for the exact reviewed SHA", async (t) => {
+    const checkout = releaseCheckout(t, false);
+    const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
+    for (const reviewed of ["", "c".repeat(40), checkout.sha]) {
+      const result = runVersion(script, checkout, {
+        REQUESTED_PROMOTION_TARGET: "none", REQUESTED_CANDIDATE_RUN_ID: "",
+        REQUESTED_REVIEWED_SHA: reviewed,
+      });
+      assert.equal(result.status === 0, reviewed === checkout.sha, result.stderr);
+      if (reviewed === checkout.sha) assert.match(result.output, /^promotion_target=none$/m);
+      else assert.equal(result.output, "");
+    }
+  });
+
 
   it("accepts desktop staging reuse of a full candidate without changing its archive digest", async (t) => {
     const workflow = await read(".github/workflows/release.yml");
@@ -431,20 +446,6 @@ describe("Crew edge deployment", () => {
       "-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----",
   };
 
-  it("routes release-feed synchronization through the matching GitHub environments before deploy", async () => {
-    const workflow = await read(".github/workflows/deploy.yml");
-    const staging = jobBlock(workflow, "sync-staging-release-feed-secrets");
-    const production = jobBlock(workflow, "sync-production-release-feed-secrets");
-    assert.match(jobBlock(workflow, "production"), /needs: \[candidate, staging, sync-production-release-feed-secrets\]/);
-    assert.match(production, /needs: \[candidate, staging\]/);
-    assert.match(jobBlock(workflow, "staging"), /needs: \[candidate, sync-staging-release-feed-secrets\]/);
-    assert.match(staging, /needs: candidate/);
-    assert.match(staging, /environment: comet-release-staging/);
-    assert.match(production, /environment: comet-release-production/);
-    assert.match(staging, /node scripts\/sync-edge-release-feed-secrets\.mjs staging/);
-    assert.match(production, /node scripts\/sync-edge-release-feed-secrets\.mjs production/);
-    assert.doesNotMatch(workflow, /wrangler secret put/);
-  });
 
   it("preserves Worker secrets when the environment-owned reader pair is absent", async () => {
     assert.equal(
@@ -567,4 +568,48 @@ describe("release candidate reuse validation", () => {
       /unified manifest\.files/,
     );
   });
+});
+
+describe("release bucket privacy", () => {
+  for (const job of ["publish-staging", "publish-production"]) {
+    it(`${job} requires uniform access, public-access prevention and private IAM`, async (t) => {
+      const script = shellStep(await read(".github/workflows/release.yml"), job, "privacy");
+      const privateConfig = { iamConfiguration: {
+        uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "enforced",
+      } };
+      for (const [config, publicIam, accepted] of [
+        [privateConfig, false, true],
+        [{ iamConfiguration: { uniformBucketLevelAccess: { enabled: false }, publicAccessPrevention: "enforced" } }, false, false],
+        [{ iamConfiguration: { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "inherited" } }, false, false],
+        [privateConfig, true, false],
+        [{}, false, false],
+      ]) {
+        const dir = scratch(t);
+        const bin = path.join(dir, "bin");
+        mkdirSync(bin);
+        writeFileSync(path.join(bin, "gcloud"), `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "auth" && args[1] === "print-access-token") console.log("test-only-no-authority");
+else if (args[0] === "storage" && args[1] === "buckets" && args[2] === "get-iam-policy") {
+  console.log(JSON.stringify({ bindings: process.env.FIXTURE_PUBLIC_IAM === "1"
+    ? [{ role: "roles/storage.objectViewer", members: ["allUsers"] }] : [] }));
+} else process.exit(90);
+`, { mode: 0o755 });
+        writeFileSync(path.join(bin, "curl"), `#!${process.execPath}
+require("node:fs").readFileSync(0);
+const url = process.argv.at(-1);
+if (url.includes("/iam/testPermissions?")) console.log(JSON.stringify({ permissions:
+  ["storage.buckets.get", "storage.buckets.getIamPolicy", "storage.objects.create", "storage.objects.delete", "storage.objects.get", "storage.objects.list"] }));
+else if (url.endsWith("?fields=iamConfiguration")) console.log(process.env.FIXTURE_BUCKET_CONFIG);
+else process.exit(91);
+`, { mode: 0o755 });
+        const result = command(dir, "bash", ["-c", script], {
+          PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          COMET_RELEASES_GCS_BUCKET: "test-private-release",
+          FIXTURE_BUCKET_CONFIG: JSON.stringify(config), FIXTURE_PUBLIC_IAM: publicIam ? "1" : "0",
+        });
+        assert.equal(result.status === 0, accepted, result.stderr);
+      }
+    });
+  }
 });

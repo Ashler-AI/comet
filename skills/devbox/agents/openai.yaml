@@ -1,7 +1,0 @@
-interface:
-  display_name: "Set up Devbox"
-  short_description: "Provision and verify a personal Ashler devbox"
-  default_prompt: "Use $devbox to create or recover my owner-named Namespace or Boat devbox, configure Crew and the Ashler local stack, then verify wake, sleep protection, Chromium, and private forwarded endpoints."
-
-policy:
-  allow_implicit_invocation: false

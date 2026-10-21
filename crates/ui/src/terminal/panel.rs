@@ -1,10 +1,11 @@
 //! The terminal panel: session-scoped tabs over engine PTYs.
 //!
-//! Feature-inventory §1.10: tabs are per selected chat and restored on return
-//! (emulators — and their server-side PTYs — survive navigation; detach is not
-//! close). Tab bar supports pointer drag-reorder with 150 ms sliding
-//! transforms, middle-click close, and a "+" new-tab button; Cmd/Ctrl+J
-//! toggles the panel (the shell owns the height animation + persistence).
+//! Feature-inventory §1.10: tabs are per selected chat (or the new-session
+//! canvas, keyed per space) and restored on return (emulators — and their
+//! server-side PTYs — survive navigation; detach is not close). Tab bar
+//! supports pointer drag-reorder with 150 ms sliding transforms, middle-click
+//! close, and a "+" new-tab button; Cmd/Ctrl+J toggles the panel (the shell
+//! owns the height animation + persistence).
 //!
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
@@ -13,37 +14,35 @@
 //! before `WriteTerminal`; viewport-driven resizes debounce 80 ms before
 //! `ResizeTerminal` (the emulator resizes immediately).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton, Render,
-    ScrollDelta, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, SharedString,
+    Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
-use comet_proto::{TerminalEvent, TerminalSession};
-use comet_rpc::methods;
+use zeron_proto::{TerminalEvent, TerminalSession};
+use zeron_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
+use crate::popover::{MenuScrollbarMetrics, MenuScrollbarState, ScrollRailHost};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
-use crate::state::{AppState, EngineHandle};
+use crate::state::{AppState, CANVAS_PANEL_PREFIX, EngineHandle};
 use crate::theme::Theme;
 
-use super::emulator::{CursorSnapshot, Emulator, VisibleRowSnapshot};
+use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::view::{
-    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, TerminalElement, TerminalRenderCache,
-    keystroke_bytes, paste_bytes, terminal_bg,
+    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
+    cell_at, keystroke_bytes, paste_bytes, terminal_panel_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
-/// Coalesce PTY stream bursts to at most one visible repaint per display frame.
-const REPAINT_COALESCE_MS: u64 = 16;
+const SELECTION_SCROLL_TICK_MS: u64 = 24;
 
 actions!(terminal, [ToggleTerminal]);
 
@@ -173,18 +172,98 @@ fn encode_base64(bytes: &[u8]) -> String {
 // Entity
 // ---------------------------------------------------------------------------
 
-/// Arc-backed grid snapshot handed to the paint element.
-pub(super) struct GridSnapshot {
-    pub rows: Arc<[VisibleRowSnapshot]>,
+/// A grid snapshot handed to the paint element.
+pub struct GridSnapshot {
+    pub lines: Vec<Vec<CellSnapshot>>,
     pub cursor: Option<CursorSnapshot>,
-    pub cache: Rc<RefCell<TerminalRenderCache>>,
+}
+
+/// Where the grid landed this frame, in window coordinates.
+///
+/// Reported by element prepaint because that is the only place the measured
+/// font metrics exist. Mouse events arrive on the wrapping div in window
+/// space, so mapping a pointer to a cell needs the glyph origin and the cell
+/// size the *current* frame used — a stale one puts the selection a row off
+/// after a resize.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridGeometry {
+    /// Full terminal body bounds, used by edge scrolling and the scrollbar.
+    pub bounds: gpui::Bounds<Pixels>,
+    /// Top-left of the first glyph (bounds origin plus padding).
+    pub origin: gpui::Point<Pixels>,
+    pub cell_w: f32,
+    pub line_h: f32,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// An in-flight left-button gesture.
+///
+/// A press alone does not select. It arms this, and only pointer travel past
+/// [`SELECTION_DRAG_THRESHOLD`] promotes it to a real selection — otherwise the
+/// click that focuses the panel would leave a one-cell selection behind
+/// whenever the hand moves a pixel.
+#[derive(Debug, Clone, Copy)]
+struct SelectionDrag {
+    /// Press position, in window space: both the threshold origin and the
+    /// selection's anchor, so the selection starts where the press landed
+    /// rather than where the threshold happened to trip.
+    origin: gpui::Point<Pixels>,
+    /// Latest pointer sample. Edge scrolling keeps using it while the pointer
+    /// is stationary, updating the selection after every scrollback step.
+    position: gpui::Point<Pixels>,
+    armed: bool,
+}
+
+/// The shared rail's geometry inputs from the grid's own extents, in px:
+/// `(viewport, content, offset)` — viewport = visible rows, content =
+/// history + visible rows, offset = position from the TOP of the scrollback.
+/// The terminal's display offset counts from the live bottom, so the two are
+/// mirrored.
+fn rail_parts(line_h: f32, rows: usize, history: usize, display_offset: usize) -> (f32, f32, f32) {
+    let from_top = history.saturating_sub(display_offset);
+    (
+        rows as f32 * line_h,
+        (history + rows) as f32 * line_h,
+        from_top as f32 * line_h,
+    )
+}
+
+/// Terminal scroll direction for a selection near the grid edge.
+///
+/// Alacritty uses positive deltas for history (up) and negative deltas for the
+/// live bottom. Speed is line-based because the terminal cannot expose partial
+/// rows without breaking its fixed grid.
+fn selection_scroll_lines(geometry: GridGeometry, position: gpui::Point<Pixels>) -> i32 {
+    let grid_height = geometry.line_h * geometry.rows as f32;
+    if grid_height <= 0.0 {
+        return 0;
+    }
+    let edge = geometry.line_h.min(grid_height / 3.0);
+    let y = f32::from(position.y);
+    let top = f32::from(geometry.origin.y);
+    let bottom = top + grid_height;
+    let speed = |penetration: f32| {
+        let t = (penetration / edge).clamp(0.0, 1.0);
+        (1.0 + 2.0 * t * t).round() as i32
+    };
+    if y < top + edge {
+        speed(top + edge - y)
+    } else if y > bottom - edge {
+        -speed(y - (bottom - edge))
+    } else {
+        0
+    }
 }
 
 struct TerminalTab {
     key: u64,
     title: SharedString,
     terminal_id: Option<String>,
+    target_device_id: Option<String>,
     emulator: Emulator,
+    /// Fractional wheel movement in rows, retained across trackpad events.
+    scroll_remainder: f32,
     exited: Option<i32>,
     last_seq: u64,
     coalescer: InputCoalescer,
@@ -192,7 +271,6 @@ struct TerminalTab {
     resize_task: Option<Task<()>>,
     /// Open + subscribe/reconnect lifecycle; dropping it cancels the stream.
     _run: Option<Task<()>>,
-    render_cache: Rc<RefCell<TerminalRenderCache>>,
 }
 
 #[derive(Default)]
@@ -243,14 +321,43 @@ impl Render for TabGhost {
 pub struct TerminalPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
+    focus_pending: bool,
     chats: HashMap<String, ChatTabs>,
     /// Shell-driven visibility gate: no RPC happens while closed (lazy).
     open: bool,
+    /// Right-pane surface host mode: the SHELL owns the tab strip (surface
+    /// tabs), so the internal bar hides, tabs are only ever created
+    /// explicitly (no ensure-on-open/chat-switch), and closing the last tab
+    /// must not dispatch the bottom drawer's [`ToggleTerminal`].
+    embedded: bool,
+    /// The right pane is in its width tween. Keep painting the retained grid
+    /// through the changing clip, but do not feed transient widths into the
+    /// emulator: alternate-screen rows truncate rather than reflow.
+    resize_suspended: bool,
+    /// Whether this docked panel's bottom-left/right corners sit at the
+    /// WINDOW's corners — the shell sets these per frame so the panel's fill
+    /// can carry the CSD window's rounded corners (gpui cannot clip children
+    /// rounded; each full-bleed layer rounds itself).
+    window_corner_bl: bool,
+    window_corner_br: bool,
     tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<String>,
-    /// One frame-rate repaint timer shared by every terminal stream.
-    repaint_task: Option<Task<()>>,
+    /// Last reported grid placement; `None` until the first prepaint.
+    geometry: Option<GridGeometry>,
+    /// Left-button gesture in flight, if any.
+    selection_drag: Option<SelectionDrag>,
+    /// One-shot timer rescheduled only while a live selection remains in an
+    /// edge zone.
+    selection_scroll_task: Option<Task<()>>,
+    /// The tab the rail is bound to this frame; see [`Self::sync_rail_tab`].
+    rail_tab_key: Option<u64>,
+    /// The floating scrollbar rail. The shared model owns all of its state —
+    /// hover, drag, and the linger/fade clock — so the panel keeps no
+    /// parallel hover or drag flags. It is an on-demand affordance rather
+    /// than a permanently painted rail beside the panel: the terminal owns
+    /// the cursor.
+    bar: MenuScrollbarState,
     _observe: Subscription,
 }
 
@@ -260,61 +367,241 @@ impl TerminalPanel {
         Self {
             state,
             focus_handle: cx.focus_handle(),
+            focus_pending: false,
             chats: HashMap::new(),
             open: false,
+            embedded: false,
+            resize_suspended: false,
+            window_corner_bl: false,
+            window_corner_br: false,
             tab_seq: 0,
             drag: None,
             last_selected: None,
-            repaint_task: None,
+            geometry: None,
+            selection_drag: None,
+            selection_scroll_task: None,
+            rail_tab_key: None,
+            bar: MenuScrollbarState::default(),
             _observe: observe,
         }
+    }
+
+    /// A panel in right-pane surface-host mode (see the `embedded` field).
+    pub fn new_embedded(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut panel = Self::new(state, cx);
+        panel.embedded = true;
+        panel
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
 
+    /// Claim focus once the terminal body mounts, after opening or selecting it.
+    pub fn request_focus(&mut self, cx: &mut Context<Self>) {
+        self.focus_pending = true;
+        cx.notify();
+    }
+
+    pub fn set_resize_suspended(&mut self, suspended: bool) {
+        self.resize_suspended = suspended;
+    }
+
+    /// Shell hook: whether the panel's bottom corners sit at the window's
+    /// corners (Linux CSD floating window). Notifies only on change so the
+    /// per-frame shell call stays cheap.
+    pub fn set_window_corners(&mut self, bl: bool, br: bool, cx: &mut Context<Self>) {
+        if self.window_corner_bl != bl || self.window_corner_br != br {
+            self.window_corner_bl = bl;
+            self.window_corner_br = br;
+            cx.notify();
+        }
+    }
+
     /// Shell toggle hook. Opening lazily creates the first tab for the
-    /// selected chat; closing keeps every session alive (detach ≠ close).
+    /// selected chat or new-session canvas (drawer mode; embedded tabs are
+    /// explicit); closing keeps every session alive (detach ≠ close).
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.open = open;
-        if open {
+        if !open {
+            self.focus_pending = false;
+        }
+        if open && !self.embedded {
             self.ensure_tab(cx);
         }
         cx.notify();
     }
 
+    /// Whether the drawer is currently shown (the shell's hide-before-navigate
+    /// checks this to avoid redundant updates).
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// A tab's display label: the live OSC 0/2 title when the running
+    /// program set one (shells title themselves with the cwd / running
+    /// command — the contextual name, user request), else the fixed
+    /// "Terminal N".
+    fn display_title(tab: &TerminalTab) -> SharedString {
+        match tab.emulator.title().map(str::trim) {
+            Some(title) if !title.is_empty() => title.to_string().into(),
+            _ => tab.title.clone(),
+        }
+    }
+
+    // ---- externally managed session API. Project Actions use these helpers
+    // ---- in the bottom drawer; the right-pane host also uses the keyed tab
+    // ---- operations because its surface strip lives in Shell.
+
+    /// `(key, title, exited)` for the selected chat's tabs, in tab order.
+    pub fn tab_summaries(&self, cx: &App) -> Vec<(u64, SharedString, bool)> {
+        let chat = self.selected_chat(cx);
+        self.chats
+            .get(&chat)
+            .map(|tabs| {
+                tabs.tabs
+                    .iter()
+                    .map(|t| (t.key, Self::display_title(t), t.exited.is_some()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Open a fresh tab for the selected chat and return its key.
+    pub fn open_tab_for_selected(&mut self, cx: &mut Context<Self>) -> Option<u64> {
+        let chat = self.selected_chat(cx);
+        self.open_tab(chat, cx);
+        self.request_focus(cx);
+        Some(self.tab_seq)
+    }
+
+    /// Create a named placeholder tab without opening a PTY. Project Actions
+    /// use this before their host-side run RPC completes.
+    pub fn reserve_tab_for_chat(
+        &mut self,
+        chat: String,
+        title: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.tab_seq += 1;
+        let key = self.tab_seq;
+        let entry = self.chats.entry(chat).or_default();
+        entry.tabs.push(TerminalTab {
+            key,
+            title: title.into(),
+            terminal_id: None,
+            target_device_id: None,
+            emulator: Emulator::new(80, 24),
+            scroll_remainder: 0.0,
+            exited: None,
+            last_seq: 0,
+            coalescer: InputCoalescer::default(),
+            flush_task: None,
+            resize_task: None,
+            _run: None,
+        });
+        entry.active = entry.tabs.len() - 1;
+        cx.notify();
+        key
+    }
+
+    /// Attach and stream a PTY that was already opened by the owning engine.
+    pub fn attach_reserved_session(
+        &mut self,
+        chat: &str,
+        key: u64,
+        session: TerminalSession,
+        target_device_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.tab_mut(chat, key).is_none() {
+            return false;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return false;
+        };
+        let run = Self::spawn_session(
+            chat.to_string(),
+            key,
+            engine,
+            target_device_id,
+            Some(session),
+            None,
+            cx,
+        );
+        if let Some(tab) = self.tab_mut(chat, key) {
+            tab._run = Some(run);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Turn a placeholder into a visible failed tab without opening a PTY.
+    pub fn fail_reserved_tab(
+        &mut self,
+        chat: &str,
+        key: u64,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tab_mut(chat, key) {
+            tab.emulator
+                .feed(format!("\x1b[31mfailed to run action: {message}\x1b[0m\r\n").as_bytes());
+            tab.exited = Some(-1);
+            cx.notify();
+        }
+    }
+
+    /// Make `key` the rendered tab of the selected chat.
+    pub fn select_tab_by_key(&mut self, key: u64, cx: &mut Context<Self>) {
+        let chat = self.selected_chat(cx);
+        let Some(ix) = self
+            .chats
+            .get(&chat)
+            .and_then(|tabs| tabs.tabs.iter().position(|t| t.key == key))
+        else {
+            return;
+        };
+        self.select_tab(&chat, ix, cx);
+    }
+
+    /// Close the selected chat's tab `key` (surface-tab ✕).
+    pub fn close_tab_by_key(&mut self, key: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let chat = self.selected_chat(cx);
+        self.close_tab(&chat, key, window, cx);
+    }
+
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        let selected = self.state.read(cx).selected_chat.clone();
-        let switched = selected != self.last_selected;
+        let selected_key = self.selected_chat(cx);
+        let prev = self.last_selected.clone();
+        let switched = Some(selected_key.clone()) != prev;
         if switched {
-            self.last_selected = selected;
+            self.last_selected = Some(selected_key.clone());
             self.drag = None;
         }
-        if self.open {
+        if self.open && !self.embedded {
             // Returning to a chat with tabs restores them; a fresh chat (or an
             // engine that only just finished booting) gets its first tab —
             // ensure_tab is idempotent, so calling on every state change is safe.
-            self.ensure_tab(cx);
+            // Embedded: surface tabs are explicit — a chat switch just shows
+            // that chat's own tabs (or the shell's surface picker).
+            // Entering the canvas from a chat never auto-creates: the shell
+            // hides the drawer on canvas entry, so creating here would open a
+            // PTY just to hide it (observer order vs. the shell is not
+            // guaranteed).
+            let entering_canvas = switched
+                && selected_key.starts_with(CANVAS_PANEL_PREFIX)
+                && prev
+                    .as_ref()
+                    .is_some_and(|prev| !prev.starts_with(CANVAS_PANEL_PREFIX));
+            if !entering_canvas {
+                self.ensure_tab(cx);
+            }
         }
         if switched {
             cx.notify();
         }
-    }
-    fn schedule_repaint(&mut self, cx: &mut Context<Self>) {
-        if self.repaint_task.is_some() {
-            return;
-        }
-        self.repaint_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(REPAINT_COALESCE_MS))
-                .await;
-            this.update(cx, |panel, cx| {
-                panel.repaint_task = None;
-                cx.notify();
-            })
-            .ok();
-        }));
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -328,22 +615,32 @@ impl TerminalPanel {
     /// engine checks the chat's cwd against its OWN filesystem and fails with
     /// "Session working directory is unavailable" (user report).
     fn chat_target(&self, chat: &str, cx: &App) -> Option<String> {
-        let state = self.state.read(cx);
-        let device = state.chat_host_device_id(chat)?.to_string();
-        (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
+        self.state.read(cx).terminal_target_device(chat)
     }
 
-    fn selected_chat(&self, cx: &App) -> Option<String> {
-        self.state.read(cx).selected_chat.clone()
+    fn selected_chat(&self, cx: &App) -> String {
+        self.state.read(cx).panel_session_key()
     }
 
     fn ensure_tab(&mut self, cx: &mut Context<Self>) {
-        let Some(chat) = self.selected_chat(cx) else {
+        let chat = self.selected_chat(cx);
+        if self.should_wait_for_canvas_project(&chat, cx) {
             return;
-        };
+        }
         if self.chats.get(&chat).is_none_or(|c| c.tabs.is_empty()) {
             self.open_tab(chat, cx);
         }
+    }
+
+    /// A restored project id with no WatchSpaces row yet: opening now would
+    /// send `~` and (before the engine resolved `space-canvas:` itself)
+    /// stick a home-dir PTY on this canvas key.
+    fn should_wait_for_canvas_project(&self, session_key: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        session_key.starts_with(CANVAS_PANEL_PREFIX)
+            && session_key != CANVAS_PANEL_PREFIX
+            && !state.spaces_synced
+            && state.terminal_open_cwd_for(session_key).is_none()
     }
 
     fn tab_mut(&mut self, chat: &str, key: u64) -> Option<&mut TerminalTab> {
@@ -355,7 +652,7 @@ impl TerminalPanel {
     }
 
     fn active_tab(&self, cx: &App) -> Option<&TerminalTab> {
-        let chat = self.state.read(cx).selected_chat.clone()?;
+        let chat = self.selected_chat(cx);
         let tabs = self.chats.get(&chat)?;
         tabs.tabs.get(tabs.active)
     }
@@ -366,27 +663,14 @@ impl TerminalPanel {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.tab_seq += 1;
-        let key = self.tab_seq;
-        let entry = self.chats.entry(chat.clone()).or_default();
-        let tab_no = entry.tabs.len() + 1;
-        entry.tabs.push(TerminalTab {
-            key,
-            title: format!("Terminal {tab_no}").into(),
-            terminal_id: None,
-            emulator: Emulator::new(80, 24),
-            exited: None,
-            last_seq: 0,
-            coalescer: InputCoalescer::default(),
-            flush_task: None,
-            resize_task: None,
-            _run: None,
-            render_cache: TerminalRenderCache::shared(),
-        });
-        entry.active = entry.tabs.len() - 1;
-
+        let tab_no = self
+            .chats
+            .get(&chat)
+            .map_or(1, |entry| entry.tabs.len() + 1);
+        let key = self.reserve_tab_for_chat(chat.clone(), format!("Terminal {tab_no}"), cx);
         let target = self.chat_target(&chat, cx);
-        let run = Self::spawn_session(chat.clone(), key, engine, target, cx);
+        let cwd = self.state.read(cx).terminal_open_cwd_for(&chat);
+        let run = Self::spawn_session(chat.clone(), key, engine, target, None, cwd, cx);
         if let Some(tab) = self.tab_mut(&chat, key) {
             tab._run = Some(run);
         }
@@ -399,6 +683,8 @@ impl TerminalPanel {
         key: u64,
         engine: EngineHandle,
         target: Option<String>,
+        existing_session: Option<TerminalSession>,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -411,19 +697,24 @@ impl TerminalPanel {
                 })
                 .unwrap_or((80, 24));
 
-            let opened = engine
-                .client()
-                .call_as::<TerminalSession>(
-                    methods::OPEN_TERMINAL,
-                    with_target(
-                        serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows }),
-                        &target,
-                    ),
-                )
-                .await;
-            let session = match opened {
-                Ok(session) => session,
-                Err(err) => {
+            let session = match existing_session {
+                Some(session) => session,
+                None => {
+                    let mut params =
+                        serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows });
+                    if let (Some(cwd), Some(object)) = (cwd, params.as_object_mut()) {
+                        object.insert("cwd".into(), serde_json::Value::String(cwd));
+                    }
+                    match engine
+                        .client()
+                        .call_as::<TerminalSession>(
+                            methods::OPEN_TERMINAL,
+                            with_target(params, &target),
+                        )
+                        .await
+                    {
+                        Ok(session) => session,
+                        Err(err) => {
                     tracing::warn!(error = %err, "OpenTerminal failed");
                     let _ = this.update(cx, |panel, cx| {
                         if let Some(tab) = panel.tab_mut(&chat, key) {
@@ -436,6 +727,8 @@ impl TerminalPanel {
                         }
                     });
                     return;
+                        }
+                    }
                 }
             };
             let terminal_id = session.id.clone();
@@ -443,6 +736,7 @@ impl TerminalPanel {
                 .update(cx, |panel, cx| {
                     if let Some(tab) = panel.tab_mut(&chat, key) {
                         tab.terminal_id = Some(terminal_id.clone());
+                        tab.target_device_id = target.clone();
                         cx.notify();
                         true
                     } else {
@@ -497,13 +791,6 @@ impl TerminalPanel {
                 };
 
                 while let Some(value) = rx.recv().await {
-                    let value = match value {
-                        Ok(value) => value,
-                        Err(error) => {
-                            tracing::debug!(%error, "terminal stream interrupted; replaying from last sequence");
-                            break;
-                        }
-                    };
                     let event: TerminalEvent = match serde_json::from_value(value) {
                         Ok(event) => event,
                         Err(err) => {
@@ -547,18 +834,10 @@ impl TerminalPanel {
         event: TerminalEvent,
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
-        let selected_chat_visible =
-            self.open && self.state.read(cx).selected_chat.as_deref() == Some(chat);
-        let active_tab_visible = selected_chat_visible
-            && self
-                .chats
-                .get(chat)
-                .and_then(|tabs| tabs.tabs.get(tabs.active))
-                .is_some_and(|tab| tab.key == key);
-        let target = self.chat_target(chat, cx);
         let Some(tab) = self.tab_mut(chat, key) else {
             return StreamDisposition::Stop;
         };
+        let target = tab.target_device_id.clone();
         match event {
             TerminalEvent::Data { seq, data } => {
                 tab.last_seq = seq;
@@ -583,18 +862,14 @@ impl TerminalPanel {
                     })
                     .detach();
                 }
-                if active_tab_visible {
-                    self.schedule_repaint(cx);
-                }
+                cx.notify();
                 StreamDisposition::Continue
             }
             TerminalEvent::Exit { seq, exit_code, .. } => {
                 tab.last_seq = seq;
                 tab.exited = Some(exit_code);
                 tab.emulator.feed(&exit_message(exit_code));
-                if selected_chat_visible {
-                    self.schedule_repaint(cx);
-                }
+                cx.notify();
                 StreamDisposition::Stop
             }
         }
@@ -604,9 +879,7 @@ impl TerminalPanel {
 
     /// Queue keyboard bytes on the active tab (12 ms coalescing window).
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.selected_chat(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
             return;
         };
@@ -640,10 +913,10 @@ impl TerminalPanel {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let target = self.chat_target(&chat, cx);
         let Some(tab) = self.tab_mut(&chat, key) else {
             return;
         };
+        let target = tab.target_device_id.clone();
         if tab.coalescer.is_empty() {
             return;
         }
@@ -691,6 +964,16 @@ impl TerminalPanel {
             cx.stop_propagation();
             return;
         }
+        // Copy: Cmd+C (macOS) / Ctrl+Shift+C. Only swallowed when it actually
+        // copied — so Ctrl+Shift+C with nothing selected still falls through
+        // to the interrupt, and plain Ctrl+C (no shift) never reaches here.
+        if ks.key == "c"
+            && (mods.platform || (mods.control && mods.shift))
+            && self.copy_selection(cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         let app_cursor = self
             .active_tab(cx)
             .map(|tab| tab.emulator.app_cursor_mode())
@@ -703,12 +986,19 @@ impl TerminalPanel {
 
     // ---- grid metrics / element hooks ----
 
-    /// Called from element prepaint with the measured cols×rows. Resizes the
-    /// emulator immediately; the `ResizeTerminal` RPC debounces 80 ms.
-    pub fn on_grid_metrics(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
-        let Some(chat) = self.selected_chat(cx) else {
+    /// Called from element prepaint with the frame's grid placement. Resizes
+    /// the emulator immediately; the `ResizeTerminal` RPC debounces 80 ms.
+    pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
+        // Stash unconditionally, before the early returns below: pointer
+        // mapping needs the placement even on frames where nothing resized,
+        // which is almost all of them.
+        self.geometry = Some(geometry);
+        if self.resize_suspended {
             return;
-        };
+        }
+        let (cols, rows) = (geometry.cols, geometry.rows);
+        let chat = self.selected_chat(cx);
+        let engine = self.engine(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
             return;
         };
@@ -721,8 +1011,7 @@ impl TerminalPanel {
         }
         tab.emulator.resize(cols, rows);
         let key = tab.key;
-        let engine = self.engine(cx);
-        let target = self.chat_target(&chat, cx);
+        let target = tab.target_device_id.clone();
         if let (Some(engine), Some(tab)) = (engine, self.tab_mut(&chat, key)) {
             let id = tab.terminal_id.clone();
             tab.resize_task = Some(cx.spawn(async move |this, cx| {
@@ -758,24 +1047,182 @@ impl TerminalPanel {
         // current frame, which already paints the resized grid.
     }
 
-    /// Snapshot for the paint element. Row cells and cache ownership are
-    /// Arc/Rc-backed, so a repaint does not clone the visible cell grid.
-    pub(super) fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
+    /// Snapshot for the paint element.
+    pub fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
         let tab = self.active_tab(cx)?;
         Some(GridSnapshot {
-            rows: tab.emulator.visible_rows(),
+            lines: tab.emulator.lines(),
             cursor: tab.emulator.cursor(),
-            cache: tab.render_cache.clone(),
         })
+    }
+
+    // ---- selection ----
+
+    /// Run `f` against the active tab's emulator.
+    fn with_active_emulator<R>(
+        &mut self,
+        cx: &App,
+        f: impl FnOnce(&mut Emulator) -> R,
+    ) -> Option<R> {
+        let chat = self.selected_chat(cx);
+        let tabs = self.chats.get_mut(&chat)?;
+        let active = tabs.active;
+        tabs.tabs.get_mut(active).map(|tab| f(&mut tab.emulator))
+    }
+
+    /// Window position → grid point, using this frame's placement. `None`
+    /// before the first prepaint, or when no tab is active.
+    fn grid_point_at(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &App,
+    ) -> Option<(GridPoint, Side)> {
+        let geometry = self.geometry?;
+        let hit = cell_at(
+            f32::from(position.x - geometry.origin.x),
+            f32::from(position.y - geometry.origin.y),
+            geometry.cell_w,
+            geometry.line_h,
+            geometry.cols as usize,
+            geometry.rows as usize,
+        );
+        let point = self.with_active_emulator(cx, |emu| emu.grid_point(hit.row, hit.col))?;
+        Some((point, hit.side))
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let Some((point, side)) = self.grid_point_at(event.position, cx) else {
+            return;
+        };
+        // Click count picks the granularity, the same mapping every terminal
+        // uses: drag, word, line.
+        let ty = match event.click_count {
+            0 => return,
+            1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+        let shift = event.modifiers.shift;
+        if ty == SelectionType::Simple {
+            // Shift+click extends an existing selection instead of replacing
+            // it — the one gesture that reaches text off the bottom of a long
+            // drag without redoing the whole thing.
+            let extended = shift
+                && self
+                    .with_active_emulator(cx, |emu| {
+                        let extend = emu.has_selection();
+                        if extend {
+                            emu.update_selection(point, side);
+                        }
+                        extend
+                    })
+                    .unwrap_or(false);
+            if extended {
+                self.selection_drag = Some(SelectionDrag {
+                    origin: event.position,
+                    position: event.position,
+                    armed: true,
+                });
+                cx.notify();
+                return;
+            }
+            // A plain press clears and arms; the selection itself only begins
+            // once the pointer travels far enough to mean it.
+            self.with_active_emulator(cx, |emu| emu.clear_selection());
+            self.selection_drag = Some(SelectionDrag {
+                origin: event.position,
+                position: event.position,
+                armed: false,
+            });
+        } else {
+            // Word and line selections are complete on the press, so they need
+            // no threshold — but keep the drag live so the pointer can extend
+            // them at that granularity.
+            self.with_active_emulator(cx, |emu| emu.start_selection(ty, point, side));
+            self.selection_drag = Some(SelectionDrag {
+                origin: event.position,
+                position: event.position,
+                armed: true,
+            });
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(mut drag) = self.selection_drag else {
+            return;
+        };
+        drag.position = event.position;
+        self.selection_drag = Some(drag);
+        if !drag.armed {
+            let dx = f32::from(event.position.x - drag.origin.x);
+            let dy = f32::from(event.position.y - drag.origin.y);
+            if dx.hypot(dy) < SELECTION_DRAG_THRESHOLD {
+                return;
+            }
+            // Threshold tripped: anchor at the *press*, not here, so the
+            // selection covers the whole gesture.
+            let Some((anchor, side)) = self.grid_point_at(drag.origin, cx) else {
+                return;
+            };
+            self.with_active_emulator(cx, |emu| {
+                emu.start_selection(SelectionType::Simple, anchor, side)
+            });
+            self.selection_drag = Some(SelectionDrag {
+                armed: true,
+                ..drag
+            });
+        }
+        let Some((point, side)) = self.grid_point_at(event.position, cx) else {
+            return;
+        };
+        self.with_active_emulator(cx, |emu| emu.update_selection(point, side));
+        cx.notify();
+        self.schedule_selection_scroll(cx);
+    }
+
+    fn on_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.selection_drag = None;
+        self.selection_scroll_task = None;
+    }
+
+    /// Copy the selection. Returns whether anything was copied, so the caller
+    /// can decide whether to swallow the keystroke.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self
+            .with_active_emulator(cx, |emu| emu.selection_text())
+            .flatten()
+        else {
+            return false;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        true
     }
 
     fn scroll_active(&mut self, delta_lines: i32, cx: &mut Context<Self>) {
         if delta_lines == 0 {
             return;
         }
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.selected_chat(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
             return;
         };
@@ -786,11 +1233,134 @@ impl TerminalPanel {
         }
     }
 
+    fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_scroll_task.is_some() {
+            return;
+        }
+        let (Some(drag), Some(geometry)) = (self.selection_drag, self.geometry) else {
+            return;
+        };
+        if !drag.armed || selection_scroll_lines(geometry, drag.position) == 0 {
+            return;
+        }
+        self.selection_scroll_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SELECTION_SCROLL_TICK_MS))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.selection_scroll_task = None;
+                panel.step_selection_scroll(cx);
+            });
+        }));
+    }
+
+    fn step_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        let (Some(drag), Some(geometry)) = (self.selection_drag, self.geometry) else {
+            return;
+        };
+        if !drag.armed {
+            return;
+        }
+        let lines = selection_scroll_lines(geometry, drag.position);
+        if lines == 0 {
+            return;
+        }
+        self.scroll_active(lines, cx);
+        if let Some((point, side)) = self.grid_point_at(drag.position, cx) {
+            self.with_active_emulator(cx, |emu| emu.update_selection(point, side));
+        }
+        self.schedule_selection_scroll(cx);
+    }
+
+    /// Pin the rail to the rendered tab. The shared rail host methods run
+    /// without an `&App`, so they cannot read the selected chat — render
+    /// records the tab here and they resolve it by key. A switch also drops
+    /// the rail's activity baseline, so the incoming tab's offset lands as a
+    /// first observation rather than as scroll motion.
+    fn sync_rail_tab(&mut self, cx: &App) {
+        let key = self.active_tab(cx).map(|tab| tab.key);
+        if self.rail_tab_key != key {
+            self.rail_tab_key = key;
+            self.bar.clear_scroll_baseline();
+        }
+    }
+
+    fn rail_tab(&self) -> Option<&TerminalTab> {
+        let key = self.rail_tab_key?;
+        self.chats
+            .values()
+            .find_map(|tabs| tabs.tabs.iter().find(|tab| tab.key == key))
+    }
+
+    fn rail_tab_mut(&mut self) -> Option<&mut TerminalTab> {
+        let key = self.rail_tab_key?;
+        self.chats
+            .values_mut()
+            .find_map(|tabs| tabs.tabs.iter_mut().find(|tab| tab.key == key))
+    }
+
+    /// The rendered grid's rail geometry in the shared metrics domain, plus
+    /// the track's window y (the grid bounds — the rail strip spans the
+    /// terminal body) and the scroll position in px from the top of the
+    /// scrollback.
+    fn rail_frame(&self) -> Option<(MenuScrollbarMetrics, Pixels, f32)> {
+        let geometry = self.geometry?;
+        let tab = self.rail_tab()?;
+        let (viewport, content, offset) = rail_parts(
+            geometry.line_h,
+            tab.emulator.rows(),
+            tab.emulator.history_lines(),
+            tab.emulator.display_offset(),
+        );
+        Some((
+            MenuScrollbarMetrics::from_parts(viewport, content, offset)?,
+            geometry.bounds.top(),
+            offset,
+        ))
+    }
+
+    /// Apply an engaged drag's target to the emulator. The shared target is a
+    /// fraction of the scrollback from the TOP; the emulator's scroll-to API
+    /// takes lines from the live bottom.
+    fn apply_rail_drag(&mut self, pointer_y: Pixels) -> bool {
+        let Some(line_h) = self.geometry.map(|geometry| geometry.line_h) else {
+            return false;
+        };
+        let Some((metrics, track_top, _)) = self.rail_frame() else {
+            return false;
+        };
+        let Some(fraction) = self.bar.drag_target_in(&metrics, track_top, pointer_y) else {
+            return false;
+        };
+        let lines = (((1.0 - fraction) * metrics.max_scroll) / line_h).round() as usize;
+        let Some(tab) = self.rail_tab_mut() else {
+            return false;
+        };
+        tab.emulator.scroll_to_offset(lines);
+        true
+    }
+
+    fn on_terminal_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.bar.set_list_hovered(*hovered) {
+            cx.notify();
+        }
+    }
+
+    fn render_scrollbar(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        self.sync_rail_tab(cx);
+        crate::popover::rail(self, "terminal-scrollbar", theme, cx)
+    }
+
     // ---- tab management ----
 
     fn select_tab(&mut self, chat: &str, ix: usize, cx: &mut Context<Self>) {
         if let Some(tabs) = self.chats.get_mut(chat)
             && ix < tabs.tabs.len()
+            && tabs.active != ix
         {
             tabs.active = ix;
             cx.notify();
@@ -799,7 +1369,6 @@ impl TerminalPanel {
 
     fn close_tab(&mut self, chat: &str, key: u64, window: &mut Window, cx: &mut Context<Self>) {
         let engine = self.engine(cx);
-        let target = self.chat_target(chat, cx);
         let Some(tabs) = self.chats.get_mut(chat) else {
             return;
         };
@@ -807,12 +1376,15 @@ impl TerminalPanel {
             return;
         };
         let tab = tabs.tabs.remove(ix);
+        let target = tab.target_device_id.clone();
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
         self.drag = None;
         // Closing the LAST terminal closes the drawer too — an empty dock is
         // dead space (user request). Same path as the collapse chevron.
-        if now_empty && self.open {
+        // Embedded, the SHELL owns emptiness (it falls back to the surface
+        // picker) — dispatching here would toggle the bottom drawer instead.
+        if now_empty && self.open && !self.embedded {
             window.dispatch_action(Box::new(ToggleTerminal), cx);
         }
         if let (Some(engine), Some(id)) = (engine, tab.terminal_id.clone()) {
@@ -881,9 +1453,10 @@ impl TerminalPanel {
                     .map(|(ix, tab)| {
                         let selected = ix == active;
                         let key = tab.key;
-                        // Fixed sequential label (comet: "Terminal N") — the
-                        // OSC title never replaces it.
-                        let title = tab.title.clone();
+                        // Contextual label (user request): the OSC title —
+                        // the shell's own cwd/command name — wins over the
+                        // fixed "Terminal N" fallback.
+                        let title = Self::display_title(tab);
                         let exited = tab.exited.is_some();
                         (ix, key, title, selected, exited)
                     })
@@ -893,7 +1466,7 @@ impl TerminalPanel {
 
         let bar_chat = chat_owned.clone();
         let drop_chat = chat_owned.clone();
-        // Comet terminal-panel.tsx: `flex h-10 items-center border-b
+        // Zeron terminal-panel.tsx: `flex h-10 items-center border-b
         // border-white/[0.07] pl-2 pr-1.5` on the #090909 panel — no separate
         // bar fill.
         div()
@@ -939,7 +1512,7 @@ impl TerminalPanel {
                         let chat_close2 = chat_owned.clone();
                         let chat_drag = chat_owned.clone();
                         let ghost_title = title.clone();
-                        // Comet tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
+                        // Zeron tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
                         // terminal glyph + label + close; active = white/8 wash.
                         let (text_color, bg, glyph_alpha) = if selected {
                             (theme.text, crate::theme::ink(0.08), 0.8)
@@ -965,6 +1538,7 @@ impl TerminalPanel {
                                 cx.stop_propagation();
                                 this.close_tab(&chat_close2, key, window, cx);
                             }))
+                            .tooltip(crate::settings::widgets::text_tooltip("Close terminal"))
                             .child(
                                 crate::icons::icon(crate::icons::CLOSE)
                                     .size(px(12.0))
@@ -982,7 +1556,7 @@ impl TerminalPanel {
                             .pl(px(8.0))
                             .pr(px(4.0))
                             .rounded(px(8.0))
-                            // comet terminal-panel.tsx tab: `transition-colors`.
+                            // zeron terminal-panel.tsx tab: `transition-colors`.
                             .bg(motion::hover_blend(
                                 &format!("term-tab-{key}"),
                                 bg,
@@ -994,6 +1568,7 @@ impl TerminalPanel {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_tab(&chat_select, ix, cx);
+                                this.request_focus(cx);
                             }))
                             // Middle-click closes (§1.10).
                             .on_mouse_down(
@@ -1060,7 +1635,7 @@ impl TerminalPanel {
                     .justify_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
-                    // comet terminal-panel.tsx icon buttons: `transition-colors`.
+                    // zeron terminal-panel.tsx icon buttons: `transition-colors`.
                     .bg(motion::hover_blend(
                         "term-new-tab",
                         gpui::transparent_black(),
@@ -1068,17 +1643,18 @@ impl TerminalPanel {
                     ))
                     .on_hover(motion::hover_listener("term-new-tab"))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(chat) = this.selected_chat(cx) {
-                            this.open_tab(chat, cx);
-                        }
+                        let chat = this.selected_chat(cx);
+                        this.open_tab(chat, cx);
+                        this.request_focus(cx);
                     }))
+                    .tooltip(crate::settings::widgets::text_tooltip("New terminal"))
                     .child(
                         crate::icons::icon(crate::icons::PLUS)
                             .size(px(16.0))
                             .text_color(theme.text_muted.opacity(0.6)),
                     ),
             )
-            // Collapse chevron pinned right (comet "Hide terminal" ⌘J).
+            // Collapse chevron pinned right (zeron "Hide terminal" ⌘J).
             .child(div().flex_1())
             .child(
                 div()
@@ -1099,12 +1675,48 @@ impl TerminalPanel {
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(ToggleTerminal), cx);
                     })
+                    .tooltip(crate::settings::widgets::text_tooltip("Hide terminal"))
                     .child(
                         crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                             .size(px(13.0))
                             .text_color(theme.text_muted.opacity(0.55)),
                     ),
             )
+    }
+}
+
+impl ScrollRailHost for TerminalPanel {
+    fn rail_bar(&mut self) -> &mut MenuScrollbarState {
+        &mut self.bar
+    }
+
+    /// Handle-less owner: the grid's own extents stand in for a scroll
+    /// handle's bounds.
+    fn rail_metrics(&mut self) -> Option<MenuScrollbarMetrics> {
+        let (metrics, _, offset) = self.rail_frame()?;
+        // The activity signal is the view's place in the scrollback, not the
+        // thumb's: appended output grows history and display offset together
+        // (the viewport stays anchored) and a resize trades history rows for
+        // viewport rows, so neither moves this value — only real scrolling
+        // lights the rail. Tab switches re-baseline in [`Self::sync_rail_tab`].
+        self.bar.note_scroll_offset(offset);
+        Some(metrics)
+    }
+
+    fn rail_press(&mut self, pointer_y: Pixels) -> bool {
+        let Some((metrics, track_top, _)) = self.rail_frame() else {
+            return false;
+        };
+        self.bar.begin_press_in(&metrics, track_top, pointer_y);
+        // Pressing the rail claims terminal focus, as it did before the
+        // shared rail; the next render's focus_pending pass applies it.
+        self.focus_pending = true;
+        self.apply_rail_drag(pointer_y);
+        true
+    }
+
+    fn rail_drag_to(&mut self, pointer_y: Pixels) -> bool {
+        self.apply_rail_drag(pointer_y)
     }
 }
 
@@ -1120,51 +1732,88 @@ impl Render for TerminalPanel {
         if self.drag.is_some() && !cx.has_active_drag() {
             self.drag = None;
         }
-        let Some(chat) = self.selected_chat(cx) else {
-            return div()
-                .size_full()
-                .bg(terminal_bg())
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("Select a chat to open a terminal"))
-                .into_any_element();
-        };
+        // Embedded, the RIGHT PANE's own surface shows through — a second
+        // fill here stacked another shade on the pane (user report); the
+        // drawer keeps its own tone.
+        let panel_bg: Option<gpui::Hsla> = (!self.embedded).then(|| terminal_panel_bg(&theme));
+        // Docked at the window's bottom edge, the panel's own fill carries
+        // the CSD window's bottom corners when it sits at them (the shell
+        // decides per frame; embedded panels never do).
+        let corner_bl = self.window_corner_bl;
+        let corner_br = self.window_corner_br;
+        let corner = px(crate::shell::LINUX_WINDOW_CORNER_RADIUS);
+        let chat = self.selected_chat(cx);
+        if std::mem::take(&mut self.focus_pending) && self.open {
+            window.focus(&self.focus_handle, cx);
+        }
         let focused = self.focus_handle.is_focused(window);
+        let scrollbar = self.render_scrollbar(&theme, cx);
 
+        // Embedded (right-pane surface host): the shell's surface tabs
+        // replace the internal bar.
+        let tab_bar: Option<gpui::AnyElement> =
+            (!self.embedded).then(|| self.render_tab_bar(&chat, cx).into_any_element());
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(terminal_bg())
-            .child(self.render_tab_bar(&chat, cx))
+            // Terminal chrome is fixed Geist; TerminalElement measures and
+            // paints its viewport independently with the technical mono role.
+            .font_family(theme.font_sans_fixed.clone())
+            .when_some(panel_bg, |el, bg| el.bg(bg))
+            .when(corner_bl, |el| el.rounded_bl(corner))
+            .when(corner_br, |el| el.rounded_br(corner))
+            .children(tab_bar)
             .child(
                 div()
                     .id("terminal-body")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .key_context("Terminal")
                     .track_focus(&self.focus_handle)
+                    .on_hover(cx.listener(Self::on_terminal_hover))
                     .on_key_down(cx.listener(Self::on_key_down))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window: &mut Window, cx| {
-                            window.focus(&this.focus_handle, cx);
-                        }),
-                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    // Bound on the window, not the element: a drag that ends
+                    // outside the panel still has to end the gesture, or the
+                    // next unrelated pointer move keeps extending a selection
+                    // the user let go of.
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                         let lines = match event.delta {
                             ScrollDelta::Lines(delta) => delta.y,
+                            // Against the measured row height, not the default:
+                            // a user-chosen font size changes how many lines a
+                            // pixel delta covers.
                             ScrollDelta::Pixels(delta) => {
-                                f32::from(delta.y) / super::view::TERM_LINE_HEIGHT
+                                let line_h = this
+                                    .geometry
+                                    .map(|g| g.line_h)
+                                    .unwrap_or(super::view::TERM_LINE_HEIGHT);
+                                f32::from(delta.y) / line_h
                             }
                         };
-                        let step = lines.round() as i32;
+                        let chat = this.selected_chat(cx);
+                        let Some(tabs) = this.chats.get_mut(&chat) else {
+                            return;
+                        };
+                        let Some(tab) = tabs.tabs.get_mut(tabs.active) else {
+                            return;
+                        };
+                        if event.touch_phase == gpui::TouchPhase::Started {
+                            tab.scroll_remainder = 0.0;
+                        }
+                        tab.scroll_remainder += lines;
+                        let step = tab.scroll_remainder.trunc() as i32;
+                        tab.scroll_remainder -= step as f32;
                         this.scroll_active(step, cx);
+                        cx.stop_propagation();
                     }))
-                    .child(TerminalElement::new(cx.entity(), focused)),
+                    .child(TerminalElement::new(cx.entity(), focused))
+                    .children(scrollbar),
             )
             .into_any_element()
     }
@@ -1173,6 +1822,95 @@ impl Render for TerminalPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn slow_trackpad_scroll_accumulates_per_terminal(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, Modifiers, ScrollWheelEvent, TouchPhase, point};
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state
+            });
+            let mut panel = TerminalPanel::new(state, cx);
+            for title in ["First", "Second"] {
+                let key = panel.reserve_tab_for_chat("chat".into(), title, cx);
+                let tab = panel.tab_mut("chat", key).unwrap();
+                for _ in 0..200 {
+                    tab.emulator.feed(b"scrollback\r\n");
+                }
+            }
+            panel
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let geometry = panel.read_with(cx, |panel, _| panel.geometry.unwrap());
+        let mut scroll = |delta, phase| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: geometry.bounds.center(),
+                delta,
+                modifiers: Modifiers::default(),
+                touch_phase: phase,
+            })
+        };
+        // Every event is smaller than half a row: rounding each one loses all movement.
+        for _ in 0..40 {
+            scroll(
+                ScrollDelta::Pixels(point(px(0.0), px(geometry.line_h / 4.0))),
+                TouchPhase::Moved,
+            );
+        }
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 10);
+        });
+        // Signed fractions work in reverse too; mouse-wheel rows stay exact.
+        let mut scroll = |delta, phase| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: geometry.bounds.center(),
+                delta,
+                modifiers: Modifiers::default(),
+                touch_phase: phase,
+            })
+        };
+        for _ in 0..8 {
+            scroll(
+                ScrollDelta::Pixels(point(px(0.0), px(-geometry.line_h / 4.0))),
+                TouchPhase::Moved,
+            );
+        }
+        scroll(ScrollDelta::Lines(point(0.0, 3.0)), TouchPhase::Moved);
+        scroll(ScrollDelta::Lines(point(0.0, 0.75)), TouchPhase::Moved);
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 11);
+        });
+        // A fresh gesture does not inherit the previous gesture's partial row.
+        cx.simulate_event(ScrollWheelEvent {
+            position: geometry.bounds.center(),
+            delta: ScrollDelta::Lines(point(0.0, 0.25)),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Started,
+        });
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 11);
+            assert_eq!(panel.active_tab(cx).unwrap().scroll_remainder, 0.25);
+            panel.select_tab_by_key(1, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_event(ScrollWheelEvent {
+            position: geometry.bounds.center(),
+            delta: ScrollDelta::Lines(point(0.0, 0.75)),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 0);
+            assert_eq!(panel.active_tab(cx).unwrap().scroll_remainder, 0.75);
+        });
+    }
 
     #[test]
     fn height_clamps_between_160_and_55vh() {
@@ -1193,6 +1931,63 @@ mod tests {
         assert_eq!(backoff_ms(4), 8000);
         assert_eq!(backoff_ms(10), 8000);
         assert_eq!(backoff_ms(u32::MAX), 8000);
+    }
+
+    fn test_geometry() -> GridGeometry {
+        GridGeometry {
+            bounds: gpui::Bounds::new(
+                gpui::point(px(10.0), px(20.0)),
+                gpui::size(px(300.0), px(200.0)),
+            ),
+            origin: gpui::point(px(18.0), px(28.0)),
+            cell_w: 8.0,
+            line_h: 20.0,
+            cols: 35,
+            rows: 9,
+        }
+    }
+
+    #[test]
+    fn selection_edge_scroll_uses_terminal_direction() {
+        let geometry = test_geometry();
+        assert!(selection_scroll_lines(geometry, gpui::point(px(20.0), px(28.0))) > 0);
+        assert_eq!(
+            selection_scroll_lines(geometry, gpui::point(px(20.0), px(100.0))),
+            0
+        );
+        assert!(selection_scroll_lines(geometry, gpui::point(px(20.0), px(208.0))) < 0);
+    }
+
+    #[test]
+    fn rail_parts_map_history_top_and_bottom() {
+        // No scrollback → the shared metrics report nothing to scroll.
+        assert_eq!(rail_parts(18.0, 20, 0, 0), (360.0, 360.0, 0.0));
+        assert!(MenuScrollbarMetrics::from_parts(360.0, 360.0, 0.0).is_none());
+
+        // Live bottom: the display offset counts from the bottom, so the
+        // scrollback position from the top is the whole history.
+        let (viewport, content, bottom) = rail_parts(18.0, 20, 80, 0);
+        assert_eq!((viewport, content, bottom), (360.0, 1800.0, 1440.0));
+        let metrics = MenuScrollbarMetrics::from_parts(viewport, content, bottom).unwrap();
+        assert!((metrics.thumb_height - 70.4).abs() < 0.01);
+        assert!((metrics.thumb_top - metrics.travel()).abs() < 0.01);
+
+        // Top of the history: the thumb rides the top of the track.
+        let top = rail_parts(18.0, 20, 80, 80).2;
+        assert_eq!(
+            MenuScrollbarMetrics::from_parts(viewport, content, top)
+                .unwrap()
+                .thumb_top,
+            0.0
+        );
+
+        // Output appended while scrolled up grows history and display offset
+        // together, so the position from the top — the rail's activity signal
+        // — does not move: no false flash.
+        assert_eq!(
+            rail_parts(18.0, 20, 80, 40).2,
+            rail_parts(18.0, 20, 120, 80).2
+        );
     }
 
     #[test]

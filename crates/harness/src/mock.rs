@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use comet_proto::{
+use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
     UserInputQuestion,
 };
@@ -15,7 +15,7 @@ pub struct MockHarness {
     pub script: Vec<AgentEvent>,
 }
 
-/// The scripted question set for the `COMET_MOCK_QUESTION` variant (exercises
+/// The scripted question set for the `ZERON_MOCK_QUESTION` variant (exercises
 /// the QuestionPanel end-to-end: single-select page, multi-select page).
 fn question_script() -> Vec<UserInputQuestion> {
     vec![
@@ -28,6 +28,8 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "Event-driven fold with coalesced commits".into(),
                 "Hybrid: event-driven with a polling fallback".into(),
             ],
+            prefill: None,
+            multiline: false,
             multi_select: false,
         },
         UserInputQuestion {
@@ -39,6 +41,8 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "End-to-end (two-device)".into(),
                 "Golden screenshots".into(),
             ],
+            prefill: None,
+            multiline: false,
             multi_select: true,
         },
     ]
@@ -86,27 +90,36 @@ impl Harness for MockHarness {
             },
         ])
     }
+    async fn run_title(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run(request, controls).await
+    }
+
     async fn run(
         &self,
         _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        // Optional pacing knob for demos/manual testing: `COMET_MOCK_DELAY_MS`
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
+        // Optional pacing knob for demos/manual testing: `ZERON_MOCK_DELAY_MS`
         // spaces the scripted events out so live-run UI states (working
         // indicator, streaming fade, trailing tool-group auto-open) are
         // observable. Unset (the default, and in tests) streams instantly.
-        let delay_ms = std::env::var("COMET_MOCK_DELAY_MS")
+        let delay_ms = std::env::var("ZERON_MOCK_DELAY_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let delay = std::time::Duration::from_millis(delay_ms);
 
-        // Dev/testing knob: `COMET_MOCK_QUESTION=1` swaps in a run that asks
+        // Dev/testing knob: `ZERON_MOCK_QUESTION=1` swaps in a run that asks
         // the user questions mid-stream via `controls.request_input` (the
         // engine mints the request id, emits `InputRequested`, and resolves it
         // from the `RespondInput` doc command) — the only data-side way to put
         // the QuestionPanel on screen.
-        let question_mode = std::env::var("COMET_MOCK_QUESTION")
+        let question_mode = std::env::var("ZERON_MOCK_QUESTION")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         if question_mode {
@@ -154,26 +167,26 @@ impl Harness for MockHarness {
             return Ok(stream.boxed());
         }
 
-        // Dev/testing knob: `COMET_MOCK_REPEAT=N` loops the script body N times
+        // Dev/testing knob: `ZERON_MOCK_REPEAT=N` loops the script body N times
         // before the final Done — long single-reply streams for frame-cost /
         // smoothness measurement (the terminal `Done` is emitted exactly once,
         // at the very end).
-        let repeat = std::env::var("COMET_MOCK_REPEAT")
+        let repeat = std::env::var("ZERON_MOCK_REPEAT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
-        // Dev/testing knob: `COMET_MOCK_ERROR=1` appends a scripted error
+        // Dev/testing knob: `ZERON_MOCK_ERROR=1` appends a scripted error
         // before the terminal Done — the only data-side way to put the
         // transcript ErrorChip on screen with the mock harness.
-        let mock_error = std::env::var("COMET_MOCK_ERROR")
+        let mock_error = std::env::var("ZERON_MOCK_ERROR")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
-        // Dev/testing knob: `COMET_MOCK_TABLE=1` appends scripted GFM tables
+        // Dev/testing knob: `ZERON_MOCK_TABLE=1` appends scripted GFM tables
         // before the terminal Done — a plain 3-column grid plus a wide/uneven
         // one (long prose cell beside short cells, mixed alignment) for
         // table-styling checks against the reference app.
-        let mock_table = std::env::var("COMET_MOCK_TABLE")
+        let mock_table = std::env::var("ZERON_MOCK_TABLE")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         let done_ix = self
@@ -185,10 +198,10 @@ impl Harness for MockHarness {
         let error_event = mock_error.then(|| AgentEvent::Error {
             message: "Claude usage limit reached — try again after the limit resets.".into(),
         });
-        // Dev/testing knob: `COMET_MOCK_CODE=1` appends rust + ts code blocks
+        // Dev/testing knob: `ZERON_MOCK_CODE=1` appends rust + ts code blocks
         // (keywords, strings, numbers, comments) plus inline code — for
         // syntax-palette and inline-code styling checks against the reference.
-        let mock_code = std::env::var("COMET_MOCK_CODE")
+        let mock_code = std::env::var("ZERON_MOCK_CODE")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         let code_event = mock_code.then(|| AgentEvent::TextDelta {
@@ -228,11 +241,11 @@ impl Harness for MockHarness {
                 | Sync | Session-room fan-out | 18ms |\n\n"
                 .into(),
         });
-        // Dev/testing knob: `COMET_MOCK_MEND=1` appends a link/list-heavy
+        // Dev/testing knob: `ZERON_MOCK_MEND=1` appends a link/list-heavy
         // passage — bold-led list items, inline links, emphasis, strikethrough
         // — the shapes whose half-streamed markers the display mend
         // (crates/ui markdown/mend.rs) must hold steady while streaming.
-        let mock_mend = std::env::var("COMET_MOCK_MEND")
+        let mock_mend = std::env::var("ZERON_MOCK_MEND")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         let mend_event = mock_mend.then(|| AgentEvent::TextDelta {
@@ -247,69 +260,230 @@ impl Harness for MockHarness {
             )
             .into(),
         });
-        // Dev/testing knob: `COMET_MOCK_MERMAID=1` appends a mermaid
-        // flowchart (subgraphs, shapes, labeled/dotted/thick edges), a
-        // sequence diagram (frames, notes, self-message, autonumber), and an
-        // unsupported diagram type that must stay a plain code block — for
-        // checking the native diagram renderer (crates/ui markdown/mermaid).
-        let mock_mermaid = std::env::var("COMET_MOCK_MERMAID")
+        // Dev/testing knob: `ZERON_MOCK_THINKING=1` appends a markdown-heavy
+        // reasoning stream plus a command — the thought-process chip inside a
+        // tool-group accordion, for checking that thinking renders styled
+        // (bold/lists/inline code) instead of literal `**` markers.
+        let mock_thinking = std::env::var("ZERON_MOCK_THINKING")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
-        let mermaid_event = mock_mermaid.then(|| AgentEvent::TextDelta {
-            text: concat!(
-                "\n### Mermaid check\n\n",
-                "```mermaid\n",
-                "flowchart LR\n",
-                "    H[harness adapters<br/>omp / claude / codex] -->|\"ToolResult { output }\"| J[run journal<br/>jsonl]\n",
-                "    J -->|\"ToolCallDetail RPC<br/>(relay-forwardable)\"| T[transcript chip pane]\n",
-                "    J -.->|\"render_parts still strips\"| D[synced doc<br/>unchanged]\n",
-                "    T ==> S{ship it?}\n",
-                "    S -->|yes| Y((done))\n",
-                "    S -->|no| H\n",
-                "    subgraph edge [Edge relay]\n",
-                "        R[(session room)]\n",
-                "    end\n",
-                "    D --> R\n",
-                "```\n\n",
-                "```mermaid\n",
-                "sequenceDiagram\n",
-                "    autonumber\n",
-                "    participant U as UI thread\n",
-                "    participant E as Engine\n",
-                "    U->>E: QueueCommand run\n",
-                "    E-->>U: RunState streaming\n",
-                "    E->>E: fold parts\n",
-                "    loop every 120ms\n",
-                "        E->>U: TextDelta\n",
-                "    end\n",
-                "    Note over U,E: veil fades per chunk\n",
-                "    alt journal ok\n",
-                "        E->>U: Done\n",
-                "    else error\n",
-                "        E--xU: Error chip\n",
-                "    end\n",
-                "```\n\n",
-                "```mermaid\n",
-                "gantt\n",
-                "    title Unsupported — must stay a code block\n",
-                "    section A\n",
-                "    task :a1, 2026-01-01, 3d\n",
-                "```\n\n",
-            )
-            .into(),
-        });
-        // Dev/testing knob: `COMET_MOCK_IMAGE=/abs/path.png` appends an inline
-        // markdown image (plus a remote URL that must stay a link) — for
-        // checking the transcript's inline-image rendering.
-        let image_event = std::env::var("COMET_MOCK_IMAGE")
+        let thinking_events = mock_thinking
+            .then(|| {
+                [
+                    AgentEvent::ReasoningDelta {
+                        text: concat!(
+                            "**Planning message rollback helper extraction**\n\n",
+                            "The `discard_message` helper needs to roll back optimistic sends on error. ",
+                            "Three constraints stand out:\n\n",
+                            "1. **Rollback** — remove the user message only when the server never persisted it\n",
+                            "2. **Credit state** — clear the exhaustion flag per workspace on auth changes\n",
+                            "3. **Paywall copy** — resolve icon conflicts, *then* update the tests\n\n",
+                            "Checking call sites before patching:\n\n",
+                            "```rust\n",
+                            "let rolled_back = ledger.discard(message_id)?;\n",
+                            "```\n\n",
+                            "The [ledger docs](https://example.com) say discard is idempotent, so ",
+                            "re-running the rollback on a retry is safe.",
+                        )
+                        .into(),
+                    },
+                    AgentEvent::ToolCall {
+                        id: "mock-think-tool".into(),
+                        call: zeron_proto::ToolCall::Exec {
+                            command: "rg -n walletInsufficient apps/word/src | wc -l".into(),
+                        },
+                    },
+                    AgentEvent::ToolResult {
+                        id: "mock-think-tool".into(),
+                        is_error: false,
+                        output: None,
+                        diff: None,
+                    },
+                ]
+            })
+            .into_iter()
+            .flatten();
+        // Dev/testing knob: `ZERON_MOCK_SUBAGENT=1` appends two spawn chips
+        // whose nested traffic arrives as tagged `AgentEvent::Subagent`
+        // events — the only data-side way to put spawn chips (running → done)
+        // AND their openable subagent docs on screen with the mock harness.
+        // The second subagent finishes after a beat of nested activity, so a
+        // paced run (`ZERON_MOCK_DELAY_MS`) holds a Running chip long enough
+        // to observe.
+        let mock_subagent = std::env::var("ZERON_MOCK_SUBAGENT")
             .ok()
-            .filter(|v| !v.is_empty() && v != "0")
-            .map(|path| AgentEvent::TextDelta {
-                text: format!(
-                    "\n### Screenshot\n\n![Steered and queued followup states]({path})\n\n\
-                     Remote sources stay links: ![remote](https://example.com/i.png)\n\n"
-                ),
-            });
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let subagent_events = mock_subagent
+            .then(|| {
+                let tag = |parent: &str, event: AgentEvent| AgentEvent::Subagent {
+                    parent_tool_use_id: parent.into(),
+                    event: Box::new(event),
+                };
+                let spawn = |id: &str, description: &str, prompt: &str| AgentEvent::ToolCall {
+                    id: id.into(),
+                    // The claude-driver spawn shape: `Agent: {description}`
+                    // with the task in the input (names the chip AND the tab).
+                    call: zeron_proto::ToolCall::Unknown {
+                        name: format!("Agent: {description}"),
+                        input: Some(serde_json::json!({
+                            "description": description,
+                            "prompt": prompt,
+                        })),
+                    },
+                };
+                let resolve = |id: &str| AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                };
+                let done = AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                };
+                vec![
+                    AgentEvent::TextDelta {
+                        text: "\n### Subagent check\n\nFanning out two scouts before the fold rewrite.\n\n".into(),
+                    },
+                    spawn(
+                        "mock-sub-1",
+                        "Audit the fold path",
+                        "Read crates/doc and list every call site of fold_event_into_parts, checking each holds the byte cap.",
+                    ),
+                    spawn(
+                        "mock-sub-2",
+                        "Verify the commit cadence",
+                        "Measure the 120ms coalesced commit cadence under a scripted delta burst.",
+                    ),
+                    // The spawn prompts seed each subagent's opening user
+                    // entry (like the claude driver's Task-prompt seeding).
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::UserMessage {
+                            text: "Read crates/doc and list every call site of fold_event_into_parts, checking each holds the byte cap.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::UserMessage {
+                            text: "Measure the 120ms coalesced commit cadence under a scripted delta burst.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::TextDelta {
+                            text: "Scanning `crates/doc` for fold call sites.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::ToolCall {
+                            id: "sub1-grep".into(),
+                            call: zeron_proto::ToolCall::Exec {
+                                command: "grep -rn fold_event_into_parts crates".into(),
+                            },
+                        },
+                    ),
+                    tag("mock-sub-1", resolve("sub1-grep")),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::TextDelta {
+                            text: "Three call sites: the live fold, the rebuild, and the subagent sink — every one applies the byte cap before persisting.".into(),
+                        },
+                    ),
+                    resolve("mock-sub-1"),
+                    tag("mock-sub-1", done.clone()),
+                    // A steer AFTER the subagent settled (claude's queued
+                    // SendMessage shape): resurrects the chip and reopens
+                    // the frozen transcript for the resumed segment.
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::UserMessage {
+                            text: "One more: confirm the rebuild path holds the byte cap too."
+                                .into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::TextDelta {
+                            text: "Rebuild path checked — same cap, applied before persisting."
+                                .into(),
+                        },
+                    ),
+                    tag("mock-sub-1", done.clone()),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Driving a 2k-delta burst through the writer.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::ToolCall {
+                            id: "sub2-burst".into(),
+                            call: zeron_proto::ToolCall::Exec {
+                                command: "cargo test -p zeron-doc cadence_burst -- --nocapture".into(),
+                            },
+                        },
+                    ),
+                    resolve("mock-sub-2"),
+                    tag("mock-sub-2", resolve("sub2-burst")),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Commits land on the 120ms cadence; no commit carried more than one burst.".into(),
+                        },
+                    ),
+                    // A parent→subagent steer: splits the transcript into a
+                    // user entry + fresh assistant segment (like the claude
+                    // driver's tagged user text blocks).
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::UserMessage {
+                            text: "Also verify the cadence holds while a steer lands mid-burst.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Re-running with a mid-burst steer injected.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::ToolCall {
+                            id: "sub2-steer-burst".into(),
+                            call: zeron_proto::ToolCall::Exec {
+                                command: "cargo test -p zeron-doc cadence_steer -- --nocapture"
+                                    .into(),
+                            },
+                        },
+                    ),
+                    tag("mock-sub-2", resolve("sub2-steer-burst")),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Watching the commit log while the burst drains: ".into(),
+                        },
+                    ),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 1 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 2 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 3 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 4 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 5 clean — ".into() }),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "every window under 120ms.\n\nSteer landed between commits; the cadence held.".into(),
+                        },
+                    ),
+                    tag("mock-sub-2", done),
+                ]
+            })
+            .into_iter()
+            .flatten();
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -318,16 +492,77 @@ impl Harness for MockHarness {
                 [
                     AgentEvent::ToolCall {
                         id: "mock-code-tool".into(),
-                        call: comet_proto::ToolCall::Exec {
+                        call: zeron_proto::ToolCall::Exec {
                             command: "set -e\nfixture_in_original=0\ngrep -rn \"veil\" crates/ui/src | wc -l".into(),
                         },
                     },
                     AgentEvent::ToolResult {
                         id: "mock-code-tool".into(),
                         is_error: false,
-                        output: Some("42".into()),
+                        output: None,
+                        diff: None,
                     },
                 ]
+            })
+            .into_iter()
+            .flatten();
+        // Dev/testing knob: `ZERON_MOCK_TODO=1` appends a checklist the agent
+        // works through — one `Todo` call rewritten in place per step, the way
+        // TodoWrite does — so the todo panel's open / fold / finished states
+        // can be watched live (pace it with `ZERON_MOCK_DELAY_MS`).
+        let mock_todo = std::env::var("ZERON_MOCK_TODO")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let todo_events = mock_todo
+            .then(|| {
+                const STEPS: [&str; 8] = [
+                    "Read the fold path in crates/doc",
+                    "Add the status field to TodoItem",
+                    "Map in-progress in every normalizer",
+                    "Write the fold-window view model",
+                    "Render the todo tray above the composer",
+                    "Persist open state per chat",
+                    "Run the unit tests",
+                    "Write the design note",
+                ];
+                let list = |active: usize| zeron_proto::ToolCall::Todo {
+                    items: STEPS
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, text)| {
+                            zeron_proto::TodoItem::new(
+                                *text,
+                                match ix.cmp(&active) {
+                                    std::cmp::Ordering::Less => zeron_proto::TodoStatus::Completed,
+                                    std::cmp::Ordering::Equal => {
+                                        zeron_proto::TodoStatus::InProgress
+                                    }
+                                    std::cmp::Ordering::Greater => zeron_proto::TodoStatus::Pending,
+                                },
+                            )
+                        })
+                        .collect(),
+                };
+                let mut events = vec![AgentEvent::TextDelta {
+                    text: "\n### Todo check\n\nWorking through the checklist.\n\n".into(),
+                }];
+                // Steps 0..=8: the last write has every item completed.
+                for active in 0..=STEPS.len() {
+                    events.push(AgentEvent::ToolCall {
+                        id: "mock-todo".into(),
+                        call: list(active),
+                    });
+                    events.push(AgentEvent::ToolResult {
+                        id: "mock-todo".into(),
+                        is_error: false,
+                        output: None,
+                        diff: None,
+                    });
+                    events.push(AgentEvent::TextDelta {
+                        text: format!("Update {} written.\n\n", active + 1),
+                    });
+                }
+                events
             })
             .into_iter()
             .flatten();
@@ -336,22 +571,23 @@ impl Harness for MockHarness {
             .cycle()
             .take(body.len() * repeat)
             .cloned()
+            .chain(thinking_events)
             .chain(code_tool_events)
+            .chain(subagent_events)
+            .chain(todo_events)
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)
-            .chain(mermaid_event)
-            .chain(image_event)
             .chain(error_event)
             .chain(tail.iter().cloned())
             .map(Ok)
             .collect();
-        // Dev/testing knob: `COMET_MOCK_CHARS=N` re-chunks every TextDelta
-        // into N-char deltas, so `COMET_MOCK_DELAY_MS` paces *characters*
+        // Dev/testing knob: `ZERON_MOCK_CHARS=N` re-chunks every TextDelta
+        // into N-char deltas, so `ZERON_MOCK_DELAY_MS` paces *characters*
         // instead of whole scripted blocks — delta boundaries then land inside
         // inline markers and links, which is the streaming shape real
         // harnesses produce and the display mend exists for.
-        let chunk_chars = std::env::var("COMET_MOCK_CHARS")
+        let chunk_chars = std::env::var("ZERON_MOCK_CHARS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0);
@@ -371,16 +607,45 @@ impl Harness for MockHarness {
                             })
                             .collect::<Vec<_>>()
                     }
+                    // Reasoning streams the same char-paced way — thought
+                    // chips have their own streaming display (mend + live
+                    // tail), which whole-block deltas would never exercise.
+                    Ok(AgentEvent::ReasoningDelta { text }) => {
+                        let chars: Vec<char> = text.chars().collect();
+                        chars
+                            .chunks(n)
+                            .map(|c| {
+                                Ok(AgentEvent::ReasoningDelta {
+                                    text: c.iter().collect(),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    }
                     other => vec![other],
                 })
                 .collect(),
         };
-        if delay_ms == 0 {
+        // Dev/testing knob: `ZERON_MOCK_SUBAGENT_DELAY_MS` paces TAGGED
+        // (subagent) events on their own clock — the parent turn settles at
+        // `ZERON_MOCK_DELAY_MS` speed while the background subagents stream
+        // on slowly, which is exactly the eager-done shape live tabs are
+        // observed under (and the only way a rig click can reliably land
+        // inside a subagent's streaming window).
+        let sub_delay_ms = std::env::var("ZERON_MOCK_SUBAGENT_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        if delay_ms == 0 && sub_delay_ms.is_none() {
             return Ok(futures::stream::iter(events).boxed());
         }
         Ok(futures::stream::iter(events)
             .then(move |event| async move {
-                tokio::time::sleep(delay).await;
+                let pause = match (&event, sub_delay_ms) {
+                    (Ok(AgentEvent::Subagent { .. }), Some(ms)) => {
+                        std::time::Duration::from_millis(ms)
+                    }
+                    _ => delay,
+                };
+                tokio::time::sleep(pause).await;
                 event
             })
             .boxed())

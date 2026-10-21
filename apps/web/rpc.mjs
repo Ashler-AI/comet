@@ -80,11 +80,23 @@ export class CrewRpc extends EventEmitter {
       this.pending.set(id, { resolve, reject, timer, item });
       this.socket.send(JSON.stringify({ id, method, params }));
     });
+    promise.cancel = () => {
+      const pending = this.pending.get(id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pending.delete(id);
+      if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ id, cancel: true }));
+      pending.resolve();
+    };
     return promise;
   }
 
   call(method, params = {}) { return this.request(method, params); }
-  watch(method, params, item) { this.request(method, params, item).catch(() => this.close()); }
+  watch(method, params, item) {
+    const request = this.request(method, params, item);
+    request.catch(() => this.close());
+    return () => request.cancel?.();
+  }
   close() { this.socket?.close(); }
 }
 
@@ -102,15 +114,10 @@ export function applyTranscriptFrame(entries, frame) {
   for (const append of frame.append ?? []) {
     const entry = result.find(row => row.id === append.entry);
     const part = entry?.parts.find(row => row.id === append.part);
-    if (!part || !['text', 'textWindow'].includes(part.kind)) throw new Error('Transcript part missing');
-    const bytes = Buffer.from(part.text);
-    if ((append.drop_prefix ?? 0) > bytes.length) throw new Error('Transcript prefix mismatch');
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(append.drop_prefix ?? 0)) + append.text;
+    if (!part || !['text', 'reasoning'].includes(part.kind)) throw new Error('Transcript part missing');
+    const text = part.text + append.text;
     if (Buffer.byteLength(text) !== append.len) throw new Error('Transcript text length mismatch');
     part.text = text;
-    part.kind = append.omitted_prefix_bytes ? 'textWindow' : 'text';
-    if (append.omitted_prefix_bytes) part.omitted_prefix_bytes = append.omitted_prefix_bytes;
-    else delete part.omitted_prefix_bytes;
   }
   if (result.length !== frame.count) throw new Error('Transcript count mismatch');
   return result;

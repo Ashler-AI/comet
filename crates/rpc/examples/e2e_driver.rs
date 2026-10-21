@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use comet_rpc::{RpcClient, connect_ws, methods};
+use zeron_rpc::{RpcClient, connect_ws, methods};
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 const MOCK_TEXT: &str = "Mock harness reporting in.";
@@ -44,40 +44,65 @@ async fn device_id(client: &RpcClient, label: &str) -> String {
 }
 
 /// Subscribe to a watch-stream and poll items until `predicate` returns `Some`.
+///
+/// Stream end is NOT a failure: the engine ends watch streams deliberately at
+/// lifecycle boundaries (the chat2 cutover drops the s2 handle so watchers
+/// converge onto the new room), and the client contract — the UI does exactly
+/// this — is to resubscribe. The step deadline still bounds the whole wait.
 async fn wait_stream<T>(
     client: &RpcClient,
     method: &str,
     params: serde_json::Value,
     what: &str,
-    predicate: impl Fn(&serde_json::Value) -> Option<T>,
+    mut predicate: impl FnMut(&serde_json::Value) -> Option<T>,
 ) -> T {
-    let mut rx = match client.subscribe(method, params).await {
-        Ok(rx) => rx,
-        Err(err) => fail(&format!("{what}: subscribe {method} failed: {err}")),
-    };
     let deadline = Instant::now() + STEP_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+    'resubscribe: loop {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
             fail(&format!(
                 "{what}: timed out after {}s",
                 STEP_TIMEOUT.as_secs()
             ));
         }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(Ok(item))) => {
-                if let Some(found) = predicate(&item) {
-                    return found;
-                }
+        let mut rx = match client.subscribe(method, params.clone()).await {
+            Ok(rx) => rx,
+            Err(err) => fail(&format!("{what}: subscribe {method} failed: {err}")),
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                fail(&format!(
+                    "{what}: timed out after {}s",
+                    STEP_TIMEOUT.as_secs()
+                ));
             }
-            Ok(Some(Err(error))) => fail(&format!("{what}: stream failed: {error}")),
-            Ok(None) => fail(&format!("{what}: stream ended early")),
-            Err(_) => fail(&format!(
-                "{what}: timed out after {}s",
-                STEP_TIMEOUT.as_secs()
-            )),
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(item)) => {
+                    if let Some(found) = predicate(&item) {
+                        return found;
+                    }
+                }
+                Ok(None) => {
+                    // Lifecycle boundary (e.g. chat2 cutover): resubscribe.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue 'resubscribe;
+                }
+                Err(_) => fail(&format!(
+                    "{what}: timed out after {}s",
+                    STEP_TIMEOUT.as_secs()
+                )),
+            }
         }
     }
+}
+
+fn apply_transcript_item(
+    current: &mut Vec<zeron_doc::SessionMessageEntry>,
+    item: &serde_json::Value,
+) -> Result<(), String> {
+    let frame: zeron_doc::TranscriptFrame =
+        serde_json::from_value(item.clone()).map_err(|err| err.to_string())?;
+    zeron_doc::apply_transcript_frame(current, frame).map_err(|err| err.to_string())
 }
 
 #[tokio::main]
@@ -210,19 +235,26 @@ async fn main() {
     .unwrap_or_else(|err| fail(&format!("QueueCommand on B: {err}")));
     pass("run command queued on B via the doc command queue");
 
-    // 5a. Assistant entry executed by A arrives back on B, complete, with the mock text.
+    // 5a. Assistant entry executed by A arrives back on B, complete, with the
+    // mock text. WatchDocMessages speaks the framed protocol: a full `reset`
+    // list on attach, then `upsert`/`append` deltas. Materialize every frame
+    // through the shared parser so candidates persist across incremental frames.
+    let mut transcript = Vec::new();
     let (by_device, text) = wait_stream(
         &b,
         methods::WATCH_DOC_MESSAGES,
         serde_json::json!({ "chatId": chat_id }),
         "assistant transcript on B",
         |item| {
-            let entry = item.as_array()?.iter().find(|entry| {
-                entry.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                    && entry.get("status").and_then(|v| v.as_str()) == Some("complete")
+            apply_transcript_item(&mut transcript, item)
+                .unwrap_or_else(|err| fail(&format!("assistant transcript on B: {err}")));
+            let entry = transcript.iter().find(|entry| {
+                entry.role == zeron_doc::MessageRole::Assistant
+                    && entry.status == Some(zeron_doc::MessageStatus::Complete)
             })?;
-            let device = entry.get("deviceId")?.as_str()?.to_string();
-            let text = entry.to_string();
+            let device = entry.device_id.clone();
+            let text = serde_json::to_string(entry)
+                .unwrap_or_else(|err| fail(&format!("serialize assistant transcript: {err}")));
             Some((device, text))
         },
     )
@@ -258,4 +290,35 @@ async fn main() {
     pass("session status (A working -> idle) round-tripped to B");
 
     println!("PASS: two-device e2e smoke complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_reset_frame_is_materialized() {
+        let mut transcript = Vec::new();
+        apply_transcript_item(
+            &mut transcript,
+            &serde_json::json!({
+                "reset": [{
+                    "id": "assistant-1",
+                    "role": "assistant",
+                    "parts": [{ "kind": "text", "id": "t0", "text": MOCK_TEXT }],
+                    "createdAt": 1,
+                    "deviceId": "device-a",
+                    "status": "complete"
+                }]
+            }),
+        )
+        .expect("reset frame");
+
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].device_id, "device-a");
+        assert_eq!(
+            transcript[0].status,
+            Some(zeron_doc::MessageStatus::Complete)
+        );
+    }
 }

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-13 -13 72 72" width="1024" height="1024" role="img" aria-label="Crew">
+  <rect x="-13" y="-13" width="72" height="72" fill="#000000"/>
+  <rect x="0" y="0" width="34" height="10" rx="1.2" fill="#fafafa"/>
+  <rect x="36" y="0" width="10" height="34" rx="1.2" fill="#fafafa"/>
+  <rect x="12" y="36" width="34" height="10" rx="1.2" fill="#fafafa"/>
+  <rect x="0" y="12" width="10" height="34" rx="1.2" fill="#fafafa"/>
+  <rect x="18" y="18" width="10" height="10" rx="1.2" fill="#09de5e"/>
+</svg>

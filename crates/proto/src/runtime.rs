@@ -21,17 +21,7 @@ pub enum RuntimeProfile {
 impl RuntimeProfile {
     pub fn allows_harness(self, harness: HarnessId) -> bool {
         match self {
-            Self::LocalController => matches!(
-                harness,
-                HarnessId::ClaudeCode
-                    | HarnessId::Codex
-                    | HarnessId::Omp
-                    | HarnessId::PrimeAgent
-                    | HarnessId::Devin
-                    | HarnessId::Grok
-                    | HarnessId::Hermes
-                    | HarnessId::Pi
-            ),
+            Self::LocalController => harness != HarnessId::Mock,
             Self::ScaffoldHost => harness == HarnessId::Omp,
             Self::Mock => harness == HarnessId::Mock,
         }
@@ -71,18 +61,19 @@ mod tests {
             HarnessId::ClaudeCode,
             HarnessId::Codex,
             HarnessId::Omp,
-            HarnessId::PrimeAgent,
             HarnessId::Devin,
             HarnessId::Grok,
             HarnessId::Hermes,
             HarnessId::Pi,
+            HarnessId::Cursor,
+            HarnessId::Opencode,
+            HarnessId::Antigravity,
         ] {
             assert!(RuntimeProfile::LocalController.allows_harness(harness));
             assert!(
                 !RuntimeProfile::ScaffoldHost.allows_harness(harness) || harness == HarnessId::Omp
             );
         }
-        assert!(!RuntimeProfile::LocalController.allows_harness(HarnessId::OpenCode));
         assert!(!RuntimeProfile::LocalController.allows_harness(HarnessId::Mock));
         assert!(RuntimeProfile::LocalController.allows_scaffold_control());
         assert!(RuntimeProfile::LocalController.allows_session_import());

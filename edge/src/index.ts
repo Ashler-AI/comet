@@ -1,210 +1,101 @@
-/** Ashler Comet edge: Scaffold identity, scoped rooms, private GCS releases, and R2 attachments. */
-import {
-  authenticateScaffold,
-  bearerFromRequest,
-  credentialTransportAllowed,
-  type Verified
-} from "./auth";
-import {
-  authenticateDeviceToken,
-  handleAuthenticatedAuthRoute,
-  handlePublicAuthRoute
-} from "./auth-routes";
-import {
-  AUTH_CAPABILITIES_HEADER,
-  AUTH_GRANT_HEADER,
-  AUTH_PROJECT_HEADER,
-  AUTH_USER_HEADER,
-  DEVICE_HOST_AUTH_HEADER,
-  NOTIFICATION_BEARER_HEADER,
-  ROOM_KIND_HEADER,
-  SESSION_OWNER_AUTH_HEADER,
-  DURABLE_SYNC_PROTOCOL,
-  SYNC_PROTOCOL_HEADER,
-  SYNC_PROTOCOL_QUERY,
-  stripTrustedAuthHeaders,
-  type Env
-} from "./env";
-import { AuthGrant } from "./grant-authority";
-import { scopedSessionRoomKey } from "./room-key";
-import { fetchReleaseObject, type ReleaseFeedEnv } from "./release-feed";
-import { canonicalSessionId, SessionRoom } from "./session-room";
-import {
-  authorizedDeviceSocketRole,
-  deviceGrantTargetsRoom,
-  DeviceRoom,
-  type DeviceHostAuthorization
-} from "./device-room";
+/**
+ * Crew upstream canary: Scaffold-verified personal registry, opaque chat2
+ * transport and capability-scoped DeviceRoom relay. No legacy workspace writes.
+ *
+ * Identity routes (all resource-bound to the configured Scaffold origin):
+ *   GET  /health
+ *   GET  /auth/session
+ *   POST|DELETE /auth/device-grants
+ *   POST /auth/device-grants/exchange — one-time grant, public bearer exchange
+ *   POST /auth/device-token/refresh   — rotates an unexpired device credential
+ *   GET|HEAD /releases/*             — authenticated isolated R2 release artifacts
+ * Sync routes:
+ *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
+ *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
+ *   GET  /registry/:orgId/rows        — registry full-table repair read
+ *   POST /registry/:orgId/reset       — registry operator wipe (self-healing)
+ *   GET  /device/:deviceId/ws?role=   — device-room byte pipe (§8)
+ *   GET  /device/:deviceId/sidecar/:name
+ *   POST /device/:deviceId/sidecar/:name
+ *   GET  /device/:deviceId/status
+ *   PUT  /blob/:chatId/:partId        — tool-output sidecar (chat2-sync A2)
+ *   GET  /blob/:chatId/:partId
+ *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
+ *   GET|POST /chat2/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
+ *   GET|PUT  /chat2/:chatId/tail      — host-published sidecars, served verbatim
+ *   GET|PUT  /chat2/:chatId/diff
+ *   GET  /chat2/:chatId/stats
+ *   POST /chat2/:chatId/reset
+ */
+import { authenticateResult } from "./auth";
+import { authorizeRoute, trustedRequest } from "./authority";
+import { chatRoute } from "./chat-route";
+import { AuthGrant, handlePublicAuthRoute, handleAuthenticatedAuthRoute } from "./auth-routes";
+import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import { SessionRoom } from "./session-room";
+import { previewRoute } from "./preview-route";
+import { PreviewRoom } from "./preview-room";
+import { DeviceRoom } from "./device-room";
+import { RegistryRoom } from "./registry-room";
+import { ChatRoom } from "./chat-room";
+import { peerRoute } from "./peer-route";
 
-export { SessionRoom, DeviceRoom, AuthGrant };
+export { AuthGrant, SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const SHA256_RE = /^[a-f0-9]{64}$/;
-const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
-const SANDBOX_DEVICE_PREFIX = "comet-scaffold-";
-const RELEASE_FILE_RE = /^[A-Za-z0-9._-]{1,200}$/;
+
+/** `decodeURIComponent` that answers `undefined` for malformed %-escapes. */
+const safeDecode = (segment: string): string | undefined => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
+};
+/** Tool part ids are harness-minted (`tool-1`, `call_x`, `m1#c1`-style) —
+ * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
+const PART_RE = /^[A-Za-z0-9._:#~-]{1,200}$/;
+const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" }
+    headers: { "content-type": "application/json", "cache-control": "no-store" }
   });
 
-const requestInit = (request: Request): RequestInit & { duplex: "half" } => ({
-  method: request.method,
-  body: request.body,
-  duplex: "half"
-});
-
+/** Forward into a DO with the verified user stamped on the request. */
 const forward = (
   ns: DurableObjectNamespace,
   name: string,
   request: Request,
-  identity: Verified,
+  userId: string,
   path: string,
-  search = "",
-  roomKind?: "workspace",
-  deviceHostAuthorization?: DeviceHostAuthorization
+  search?: string
 ): Promise<Response> => {
   const stub = ns.get(ns.idFromName(name));
   const url = new URL(request.url);
-  const declarations = url.searchParams.getAll(SYNC_PROTOCOL_QUERY);
-  const durableSync = declarations.length === 1 && declarations[0] === DURABLE_SYNC_PROTOCOL;
   url.pathname = path;
-  url.search = search;
+  if (search !== undefined) url.search = search;
+  url.searchParams.delete("token");
   const headers = new Headers(request.headers);
-  stripTrustedAuthHeaders(headers);
-  headers.delete("authorization");
-  if (durableSync) headers.set(SYNC_PROTOCOL_HEADER, DURABLE_SYNC_PROTOCOL);
-  headers.set(AUTH_USER_HEADER, identity.userId);
-  headers.set(AUTH_PROJECT_HEADER, identity.projectScope);
-  headers.set(AUTH_CAPABILITIES_HEADER, identity.capabilities.join(" "));
-  if (identity.credential === "device") {
-    const grant = identity as Verified & {
-      grantId: string;
-      projectId: string;
-      deploymentId: string;
-      sandboxId: string;
-      targetDeviceId: string;
-      sessionId: string;
-      lifecycleEpoch: number;
-      grantedAt: number;
-      expiresAt: number;
-      revokedAt: null;
-    };
-    headers.set(
-      AUTH_GRANT_HEADER,
-      JSON.stringify({
-        grantId: grant.grantId,
-        subject: grant.userId,
-        scope: {
-          projectId: grant.projectId,
-          deploymentId: grant.deploymentId,
-          sessionId: grant.sessionId,
-          lifecycleEpoch: grant.lifecycleEpoch
-        },
-        sandboxId: grant.sandboxId,
-        targetDeviceId: grant.targetDeviceId,
-        lifecycleEpoch: grant.lifecycleEpoch,
-        capabilities: grant.capabilities,
-        grantedAt: grant.grantedAt,
-        expiresAt: grant.expiresAt,
-        revokedAt: grant.revokedAt
-      })
-    );
-  }
-  if (path === "/notifications/device" && identity.credential !== "device") {
-    headers.set(NOTIFICATION_BEARER_HEADER, bearerFromRequest(request) ?? "");
-  }
-  if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
-  if (deviceHostAuthorization) {
-    headers.set(DEVICE_HOST_AUTH_HEADER, deviceHostAuthorization);
-  }
+  // Never forward caller-selected room authority.
+  headers.delete(ROOM_KIND_HEADER);
+  headers.set(AUTH_USER_HEADER, userId);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
 };
 
+const requestInit = (request: Request): RequestInit => ({
+  method: request.method,
+  body: request.body
+});
+
+/** Carry the dialing engine's `&device=` through to the DO (socket
+ * attribution in logs — the 2026-08-04 deaf socket was only identifiable by
+ * reverse-engineering rotating IPv6 privacy addresses). Validated so a
+ * hand-crafted value can't inject into log lines or the DO's query. */
 const deviceParam = (url: URL): string => {
   const device = url.searchParams.get("device") ?? "";
   return ID_RE.test(device) ? `&device=${device}` : "";
-};
-
-const hasCapability = (identity: Verified, capability: string): boolean =>
-  identity.capabilities.includes(capability);
-
-const authenticate = async (request: Request, env: Env): Promise<Verified | undefined> => {
-  const token = bearerFromRequest(request);
-  if (!token) return undefined;
-  return token.startsWith("cs1.")
-    ? authenticateDeviceToken(env, token)
-    : authenticateScaffold(env, request);
-};
-
-const deviceCredentialAllows = (
-  identity: Verified,
-  kind: "session" | "device",
-  id: string
-): boolean => {
-  if (identity.credential !== "device") return true;
-  const scoped = identity as Verified & { targetDeviceId?: string; sessionId?: string };
-  return kind === "session" ? scoped.sessionId === id : deviceGrantTargetsRoom(scoped.targetDeviceId, id);
-};
-
-export const sessionRoomKey = (
-  identity: Verified,
-  sessionId: string,
-  requestedDeploymentId?: string | null
-): string => {
-  if (identity.credential !== "device") {
-    return requestedDeploymentId
-      ? scopedSessionRoomKey(identity.projectScope, requestedDeploymentId, sessionId)
-      : `s3/${identity.projectScope}/${sessionId}`;
-  }
-  const scoped = identity as Verified & { projectId?: string; deploymentId?: string; sessionId?: string };
-  if (
-    scoped.projectId !== identity.projectScope ||
-    scoped.sessionId !== sessionId ||
-    typeof scoped.deploymentId !== "string" ||
-    !ID_RE.test(scoped.deploymentId) ||
-    (requestedDeploymentId !== null &&
-      requestedDeploymentId !== undefined &&
-      requestedDeploymentId !== scoped.deploymentId)
-  ) {
-    throw new Error("device_session_scope_invalid");
-  }
-  return scopedSessionRoomKey(scoped.projectId, scoped.deploymentId, sessionId);
-};
-
-const peerSessionOwnerDevice = async (
-  env: Env,
-  identity: Verified,
-  sessionId: string,
-  deploymentId?: string
-): Promise<string | undefined> => {
-  const room = deploymentId
-    ? scopedSessionRoomKey(identity.projectScope, deploymentId, sessionId)
-    : `s3/${identity.projectScope}/${sessionId}`;
-  try {
-    const stub = env.SESSION_ROOMS.get(env.SESSION_ROOMS.idFromName(room));
-    const response = await stub.fetch(
-      new Request("https://session.internal/authorize-owner", {
-        headers: {
-          [AUTH_USER_HEADER]: identity.userId,
-          [AUTH_PROJECT_HEADER]: identity.projectScope,
-          [SESSION_OWNER_AUTH_HEADER]: "verify"
-        }
-      })
-    );
-    if (!response.ok) return undefined;
-    const value = (await response.json().catch(() => null)) as {
-      ownsSession?: unknown;
-      deviceId?: unknown;
-    } | null;
-    return value?.ownsSession === true && typeof value.deviceId === "string" && ID_RE.test(value.deviceId)
-      ? value.deviceId
-      : undefined;
-  } catch {
-    return undefined;
-  }
 };
 
 export default {
@@ -215,286 +106,221 @@ export default {
     if (url.pathname === "/health") {
       return json({ ok: true, auth: env.AUTH_MODE, environment: env.ENVIRONMENT });
     }
-    if (!credentialTransportAllowed(url)) {
-      return json({ error: "secure_transport_required" }, 403);
+
+    // This isolated generation has no public upstream installer or release feed.
+    if (url.pathname === "/install.sh") return json({ error: "not_found" }, 404);
+    try {
+      const publicAuth = await handlePublicAuthRoute(request, env, url);
+      if (publicAuth) return publicAuth;
+    } catch {
+      return json({ error: "authority_unavailable" }, 503);
     }
-    const publicAuth = await handlePublicAuthRoute(request, env, url);
-    if (publicAuth) return publicAuth;
-
-    const identity = await authenticate(request, env);
-    if (!identity) return json({ error: "unauthenticated" }, 401);
-    if (identity.projectScope !== env.SCAFFOLD_PROJECT_SCOPE) {
-      return json({ error: "forbidden" }, 403);
+    const result = await authenticateResult(env, request);
+    if (result.status !== "authenticated") {
+      return json({ error: result.status === "invalid" ? "unauthenticated" : "authority_unavailable" },
+        result.status === "invalid" ? 401 : 503);
     }
-
-    const authenticatedAuth = await handleAuthenticatedAuthRoute(request, env, url, identity);
-    if (authenticatedAuth) return authenticatedAuth;
-    if (
-      parts[0] === "api" &&
-      parts[1] === "releases" &&
-      parts.length === 3 &&
-      RELEASE_FILE_RE.test(parts[2] ?? "")
-    ) {
-      if (
-        !hasCapability(identity, "session.read") ||
-        !["GET", "HEAD"].includes(request.method)
-      ) {
-        return json({ error: "forbidden" }, 403);
-      }
-      return fetchReleaseObject(
-        env as Env & ReleaseFeedEnv,
-        parts[2],
-        request.method as "GET" | "HEAD"
-      );
+    const auth = result.identity;
+    if (url.pathname === "/auth/session" && request.method === "GET") return json(auth);
+    try {
+      const authRoute = await handleAuthenticatedAuthRoute(request, env, url, auth);
+      if (authRoute) return authRoute;
+    } catch {
+      return json({ error: "authority_unavailable" }, 503);
     }
-
-
-    // Sandbox credentials share their project workspace but remain scoped to
-    // one session and device; other routes must opt in below.
-    const deviceCredential = identity.credential === "device";
-
-    if (url.pathname === "/notifications/device") {
-      if (deviceCredential || !hasCapability(identity, "session.read")) return json({ error: "forbidden" }, 403);
-      if (request.method !== "PUT" && request.method !== "DELETE") return json({ error: "method_not_allowed" }, 405);
-      return forward(env.SESSION_ROOMS, `ws4/${identity.projectScope}`, request, identity, "/notifications/device", "", "workspace");
-    }
-
-    const sessionId = canonicalSessionId(parts[1]);
+    const peer = await peerRoute(request, env, auth);
+    if (peer) return peer;
+    if (!authorizeRoute(request, auth)) return json({ error: "forbidden" }, 403);
+    request = trustedRequest(request, auth);
+    // Compatibility is ownership-only: never revive the legacy session sync lane.
     if (parts[0] === "session" && parts[2] === "directory-authority" && parts.length === 3) {
       if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
-      if (!hasCapability(identity, "session.control") || !sessionId || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      if (!sessionId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sessionId)) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parts[1])) {
         return json({ error: "invalid_session" }, 400);
       }
-      const deploymentId = url.searchParams.get("deploymentId");
-      if (deploymentId !== null && !ID_RE.test(deploymentId)) return json({ error: "invalid_deployment" }, 400);
-      if (deviceCredential) {
-        const grant = identity as Verified & { deploymentId?: string };
-        if (!deploymentId || deploymentId !== grant.deploymentId) return json({ error: "forbidden" }, 403);
+      if (!auth.capabilities.includes("session.control") ||
+          !auth.deploymentId || url.searchParams.get("deploymentId") !== auth.deploymentId) {
+        return json({ error: "forbidden" }, 403);
       }
       try {
-        const room = env.SESSION_ROOMS.get(env.SESSION_ROOMS.idFromName(sessionRoomKey(identity, sessionId, deploymentId)));
-        const response = await room.fetch(new Request("https://session.internal/authorize-owner", {
-          headers: {
-            [AUTH_USER_HEADER]: identity.userId,
-            [AUTH_PROJECT_HEADER]: identity.projectScope,
-            [SESSION_OWNER_AUTH_HEADER]: "verify"
-          }
-        }));
+        const response = await forward(env.CHAT_ROOMS, `chat2/${parts[1]}`, request, auth.userId, "/directory-authority", "");
         if (!response.ok) return json({ error: "directory_authority_unavailable" }, 503);
         const result = await response.json() as { ownsSession?: unknown };
         if (typeof result.ownsSession !== "boolean") return json({ error: "directory_authority_unavailable" }, 503);
-        return json({ ownsSession: result.ownsSession, projectId: identity.projectScope, actorId: identity.email, subject: identity.userId });
+        return json({ ownsSession: result.ownsSession, projectId: auth.projectScope, actorId: auth.email, subject: auth.userId });
       } catch {
         return json({ error: "directory_authority_unavailable" }, 503);
       }
     }
-    if (parts[0] === "session" && sessionId && ID_RE.test(sessionId) && parts[2] === "ws") {
-      if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) {
-        return json({ error: "forbidden" }, 403);
-      }
-      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-        return json({ error: "expected_websocket" }, 426);
-      }
-      return forward(
-        env.SESSION_ROOMS,
-        sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")),
-        request,
-        identity,
-        "/ws",
-        `?chatId=${sessionId}${deviceParam(url)}`
-      );
+    // Legacy document lanes cannot share this generation's ownership or grants.
+    if (["session", "tail", "stats", "diff", "snapshot", "append", "workspace"].includes(parts[0])) {
+      return json({ error: "use_registry_chat2" }, 410);
     }
-    if (parts[0] === "tail" && sessionId && ID_RE.test(sessionId) && request.method === "GET") {
-      if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/tail");
-    }
-    if (parts[0] === "stats" && sessionId && ID_RE.test(sessionId) && request.method === "GET") {
-      if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/stats");
-    }
-    if (parts[0] === "diff" && sessionId && ID_RE.test(sessionId)) {
-      const capability = request.method === "GET" ? "session.read" : "session.files";
-      if (!hasCapability(identity, capability) || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/diff");
-    }
-    if (parts[0] === "snapshot" && sessionId && ID_RE.test(sessionId) && request.method === "GET") {
-      if (!hasCapability(identity, "session.read") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/snapshot");
-    }
-    if (parts[0] === "append" && sessionId && ID_RE.test(sessionId) && request.method === "POST") {
-      if (!hasCapability(identity, "session.chat") || !deviceCredentialAllows(identity, "session", sessionId)) return json({ error: "forbidden" }, 403);
-      return forward(env.SESSION_ROOMS, sessionRoomKey(identity, sessionId, url.searchParams.get("deploymentId")), request, identity, "/append");
+    if (
+      ((parts[0] === "releases" && parts.length >= 2) ||
+        (parts[0] === "api" && parts[1] === "releases" && parts.length === 3)) &&
+      (request.method === "GET" || request.method === "HEAD")
+    ) {
+      const key = safeDecode(parts[0] === "api" ? parts[2] : url.pathname.slice("/releases/".length));
+      if (!key || key.includes("..")) return json({ error: "bad request" }, 400);
+      const object = await env.RELEASES.get(key);
+      if (!object) return json({ error: "not_found" }, 404);
+      // latest.txt / manifest.json flip on release; artifacts are immutable by name.
+      const mutable = key.endsWith(".txt") || key.endsWith(".json");
+      const headers = new Headers({
+        "content-type": key.endsWith(".txt")
+          ? "text/plain; charset=utf-8"
+          : key.endsWith(".json")
+            ? "application/json"
+            : "application/octet-stream",
+        "content-length": String(object.size),
+        "cache-control": mutable ? "private, max-age=60" : "private, max-age=86400, immutable",
+        etag: object.httpEtag
+      });
+      return new Response(request.method === "HEAD" ? null : object.body, { headers });
     }
 
-    if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
-      if (
-        parts[1] !== identity.projectScope ||
-        !hasCapability(identity, "session.read")
-      ) {
-        return json({ error: "forbidden" }, 403);
-      }
-      const room = `ws4/${identity.projectScope}`;
+
+    const preview = previewRoute(request, env, auth);
+    if (preview) return preview;
+
+    // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
+    //    Claim-on-first-join ownership enforced in the DO (chat ids are
+    //    client-minted). The DO handles /ws, /checkpoint (GET Range-resumable
+    //    + POST floor-guarded), host-published /tail + /diff sidecars,
+    //    /stats, /reset. ──────────────────────────────────────────────────────
+    const chatResponse = chatRoute(request, env, auth.userId);
+    if (chatResponse) return chatResponse;
+
+
+    // ── registry rooms (docs/registry-sync.md): the row-table replacement for
+    //    the Loro workspace doc. Same trust shape as /workspace: org claim
+    //    must match the URL, room derived from the caller's OWN user id, DO
+    //    trusts the stamped header. `reg1` = first registry generation. ─────
+    if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
+      const orgId = parts[1];
+      if ((auth.credential === "device" ? auth.projectScope : auth.orgId) !== orgId) return json({ error: "forbidden" }, 403);
+      const room = `reg1/${orgId}/${auth.userId}`;
       if (parts[2] === "ws") {
-        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "expected_websocket" }, 426);
-        return forward(env.SESSION_ROOMS, room, request, identity, "/ws", `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`, "workspace");
-      }
-      if (parts[2] === "tail" && request.method === "GET") return forward(env.SESSION_ROOMS, room, request, identity, "/tail", "", "workspace");
-      if (parts[2] === "stats" && request.method === "GET") return forward(env.SESSION_ROOMS, room, request, identity, "/stats", "", "workspace");
-      if (parts[2] === "reset-log" && request.method === "POST") {
-        if (deviceCredential || !hasCapability(identity, "session.control")) return json({ error: "forbidden" }, 403);
-        return forward(env.SESSION_ROOMS, room, request, identity, "/reset-log", "", "workspace");
-      }
-    }
-
-    if (parts[0] === "peer" && sessionId && parts[2] === "ws") {
-      const deploymentId = url.searchParams.get("deploymentId") ?? undefined;
-      if (
-        !deviceCredential ||
-        request.method !== "GET" ||
-        request.headers.get("upgrade")?.toLowerCase() !== "websocket" ||
-        !hasCapability(identity, "session.chat") ||
-        (deploymentId !== undefined && !ID_RE.test(deploymentId))
-      ) {
-        return json({ error: "forbidden" }, 403);
-      }
-      const deviceId = await peerSessionOwnerDevice(env, identity, sessionId, deploymentId);
-      if (!deviceId) return json({ error: "target_session_not_found" }, 404);
-      const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
-      return forward(
-        env.DEVICE_ROOMS,
-        `d3/${identity.projectScope}/${deviceId}`,
-        request,
-        identity,
-        "/ws",
-        `?role=client&connId=${encodeURIComponent(connId)}&purpose=peer&peerSessionId=${encodeURIComponent(sessionId)}&targetDeviceId=${encodeURIComponent(deviceId)}`
-      );
-    }
-
-    if (parts[0] === "device" && parts[1] && ID_RE.test(parts[1])) {
-      const deviceId = parts[1];
-      const requestedRole = url.searchParams.get("role");
-      const peerSessionId = canonicalSessionId(url.searchParams.get("peerSessionId") ?? undefined);
-      const peerDeploymentId = url.searchParams.get("peerDeploymentId") ?? undefined;
-      const peerPurpose = url.searchParams.get("purpose");
-      const controlSessionId = peerPurpose === "control"
-        ? canonicalSessionId(url.searchParams.get("controlSessionId") ?? undefined)
-        : undefined;
-      // Ordinary hosts have no authenticated deployment-aware admission contract.
-      // Never erase explicit scope and downgrade it to the legacy UUID route.
-      if (peerPurpose === "control" &&
-          (url.searchParams.has("controlDeploymentId") || url.searchParams.has("deploymentId"))) {
-        return json({ error: "scoped_control_not_supported" }, 403);
-      }
-      if (peerPurpose === "control" && (
-        deviceCredential || !controlSessionId || requestedRole !== "client" ||
-        deviceId.startsWith(SANDBOX_DEVICE_PREFIX) ||
-          (!hasCapability(identity, "session.control") && !hasCapability(identity, "session.read"))
-      )) return json({ error: "forbidden" }, 403);
-      const directPeerReply = peerPurpose === "peer-reply";
-      const peerClient =
-        parts[2] === "ws" &&
-        requestedRole === "client" &&
-        ((deviceCredential && peerPurpose === "peer") || directPeerReply) &&
-        peerSessionId !== undefined &&
-        (peerDeploymentId === undefined || ID_RE.test(peerDeploymentId));
-      if (!deviceCredentialAllows(identity, "device", deviceId) && !(deviceCredential && peerClient)) {
-        return json({ error: "forbidden" }, 403);
-      }
-      const room = `d3/${identity.projectScope}/${deviceId}`;
-      if (parts[2] === "ws") {
-        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "expected_websocket" }, 426);
-        let hostAuthorization: DeviceHostAuthorization | undefined;
-        if (requestedRole === "host") {
-          if (deviceCredential) {
-            hostAuthorization = "sandbox";
-          } else if (!deviceId.startsWith(SANDBOX_DEVICE_PREFIX)) {
-            hostAuthorization = "local";
-          }
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
         }
-        const role = authorizedDeviceSocketRole(
-          requestedRole,
-          deviceCredential,
-          hostAuthorization,
-          peerClient && !directPeerReply,
-          directPeerReply
-        );
-        if (!role) return json({ error: "forbidden" }, 403);
-        if (
-          role === "host"
-            ? !hasCapability(identity, "session.environment")
-            : peerClient
-              ? !hasCapability(identity, "session.chat")
-              : controlSessionId
-                ? !hasCapability(identity, "session.read") && !hasCapability(identity, "session.control")
-              : !hasCapability(identity, "session.control") &&
-                !hasCapability(identity, "session.environment")
-        ) {
-          return json({ error: "forbidden" }, 403);
-        }
-        if (peerClient && !directPeerReply) {
-          const ownerDeviceId = await peerSessionOwnerDevice(
-            env,
-            identity,
-            peerSessionId!,
-            peerDeploymentId
-          );
-          if (ownerDeviceId !== deviceId) return json({ error: "forbidden" }, 403);
-        }
-        const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
-        const peer = peerClient
-          ? `&purpose=${encodeURIComponent(peerPurpose!)}&peerSessionId=${encodeURIComponent(peerSessionId!)}&targetDeviceId=${encodeURIComponent(deviceId)}`
-          : `&targetDeviceId=${encodeURIComponent(deviceId)}${controlSessionId ? `&controlSessionId=${encodeURIComponent(controlSessionId)}` : ""}`;
         return forward(
-          env.DEVICE_ROOMS,
+          env.REGISTRY_ROOMS,
           room,
           request,
-          identity,
+          auth.userId,
           "/ws",
-          `?role=${role}&connId=${encodeURIComponent(connId)}${peer}`,
-          undefined,
-          hostAuthorization
+          `?${deviceParam(url).replace(/^&/, "")}`
         );
       }
-      if (deviceCredential) return json({ error: "forbidden" }, 403);
-      if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {
-        if (!hasCapability(identity, "session.environment")) return json({ error: "forbidden" }, 403);
-        return forward(env.DEVICE_ROOMS, room, request, identity, `/sidecar/${parts[3]}`);
+      if (parts[2] === "stats" && request.method === "GET") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/stats", "");
       }
-      if (parts[2] === "status" && request.method === "GET") {
-        if (!hasCapability(identity, "session.read")) return json({ error: "forbidden" }, 403);
-        return forward(env.DEVICE_ROOMS, room, request, identity, "/status");
+      // Pull over plain HTTPS: `?since=` returns the same delta the WS
+      // hello would (full table without it — the original repair read).
+      // One round trip on any network that passes HTTPS at all, where the
+      // WS upgrade needs 4 and a cooperative middlebox.
+      if (parts[2] === "rows" && request.method === "GET") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/rows", url.search);
       }
-      if (parts[2] === "nudge" && request.method === "POST") {
-        if (!hasCapability(identity, "session.control")) return json({ error: "forbidden" }, 403);
-        return forward(env.DEVICE_ROOMS, room, request, identity, "/nudge");
+      // Push over plain HTTPS — the WS push's fallback twin (LWW clocks
+      // make replays no-ops, so at-least-once delivery is safe).
+      if (parts[2] === "push" && request.method === "POST") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/push", url.search);
+      }
+      // A phone's APNs token + notification choices (POST), or removal on
+      // sign-out / turning notifications off (DELETE). `?device=` required.
+      if (parts[2] === "push-target" && (request.method === "POST" || request.method === "DELETE")) {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/push-target", url.search);
+      }
+      // Operator wipe. Unlike the CRDT rooms this needs no recipe: clients
+      // detect the seq regression on their next hello and re-seed the table
+      // from local rows with original clocks, automatically.
+      if (parts[2] === "reset" && request.method === "POST") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/reset", "");
       }
     }
 
-    if (parts[0] === "attachments" && parts[1] && SHA256_RE.test(parts[1])) {
-      if (deviceCredential || !hasCapability(identity, "session.files")) {
-        return json({ error: "forbidden" }, 403);
+    // ── device rooms ────────────────────────────────────────────────────────
+    if (parts[0] === "device" && parts[1] && ID_RE.test(parts[1])) {
+      const deviceId = parts[1];
+      if (parts[2] === "ws") {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        const role = url.searchParams.get("role") === "host" ? "host" : "client";
+        const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
+        // `d2/` — same staging→prod identity break as `s2/` above.
+        return forward(
+          env.DEVICE_ROOMS,
+          `d2/${deviceId}`,
+          request,
+          auth.userId,
+          "/ws",
+          `?role=${role}&connId=${encodeURIComponent(connId)}`
+        );
       }
-      const key = `att/${identity.projectScope}/${parts[1]}`;
+      if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, `/sidecar/${parts[3]}`, "");
+      }
+      if (parts[2] === "status") {
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/status", "");
+      }
+      // Durable command nudge (§7): "chat X has pending commands — open its
+      // doc". Delivered live if the host is connected, else queued in the DO
+      // and replayed on the host's next join.
+      if (parts[2] === "nudge" && request.method === "POST") {
+        return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/nudge", "");
+      }
+    }
+
+    // ── R2 tool-output sidecar (docs/chat2-sync.md A2): full tool outputs
+    //    and diffs live here, keyed `{chatId}/{partId}[.diff]`; the doc keeps
+    //    only a one-line summary + this key. Straight R2, no DO involvement —
+    //    the doc stays thin whether or not these uploads land. Per-user
+    //    prefix = owner auth. ─────────────────────────────────────────────
+    if (parts[0] === "blob" && parts.length === 3 && ID_RE.test(parts[1])) {
+      // Percent-decode the part segment before validating: PART_RE allows
+      // `#` (`m1#c1`-style harness ids), which HTTP clients cannot send raw
+      // (fragment delimiter) — the host percent-encodes it. Decode-then-
+      // validate keeps traversal shut: `%2F` decodes to `/`, fails PART_RE.
+      const partId = safeDecode(parts[2]);
+      if (partId === undefined || !PART_RE.test(partId)) {
+        return json({ error: "bad part id" }, 400);
+      }
+      const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();
-        if (body.byteLength > MAX_ATTACHMENT_BYTES) return json({ error: "too_large" }, 413);
-        const digest = await crypto.subtle.digest("SHA-256", body);
-        const hex = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-        if (hex !== parts[1]) return json({ error: "hash_mismatch" }, 400);
-        await env.BLOBS.put(key, body, { httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" } });
-        return json({ ok: true, hash: hex, bytes: body.byteLength });
+        // Outputs are 4KiB-capped at the harness boundary; diffs can run
+        // larger but a sidecar entry is one tool result, never a dump.
+        if (body.byteLength > MAX_TOOL_BLOB_BYTES) return json({ error: "too_large" }, 413);
+        await env.BLOBS.put(key, body, {
+          httpMetadata: {
+            contentType: request.headers.get("content-type") ?? "text/plain; charset=utf-8"
+          }
+        });
+        return json({ ok: true, bytes: body.byteLength });
       }
       if (request.method === "GET" || request.method === "HEAD") {
-        const object = request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
+        const object =
+          request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
         if (!object) return json({ error: "not_found" }, 404);
         const headers = new Headers();
         object.writeHttpMetadata(headers);
         headers.set("etag", object.httpEtag);
-        headers.set("cache-control", "private, max-age=31536000, immutable");
-        const body = request.method === "GET" && "body" in object ? (object as R2ObjectBody).body : null;
+        // Re-resolved tool parts overwrite their key, so short-lived caching only.
+        headers.set("cache-control", "private, max-age=300");
+        const body =
+          request.method === "GET" && "body" in object ? (object as R2ObjectBody).body : null;
         return new Response(body, { headers });
       }
+    }
+
+    // ── retired attachment mirror (clients ≤0.1.62): acknowledge and discard
+    //    so old outboxes drain once instead of retrying the PUT forever ──────
+    if (parts[0] === "attachments" && parts[1] && request.method === "PUT") {
+      return json({ ok: true });
     }
 
     return json({ error: "not_found" }, 404);

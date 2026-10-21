@@ -1,11 +1,5 @@
 import { bearerFromRequest, credentialTransportAllowed, type Verified } from "./auth";
-import {
-  AUTH_PROJECT_HEADER,
-  AUTH_USER_HEADER,
-  SESSION_OWNER_AUTH_HEADER,
-  type Env
-} from "./env";
-import { scopedSessionRoomKey } from "./room-key";
+import { AUTH_USER_HEADER, type Env } from "./env";
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const GRANT_TTL_MS = 15 * 60 * 1000;
@@ -75,6 +69,10 @@ export class AuthGrant implements DurableObject {
   constructor(private readonly ctx: DurableObjectState, _env: Env) {}
 
   async fetch(request: Request): Promise<Response> {
+    return this.ctx.blockConcurrencyWhile(() => this.handle(request));
+  }
+
+  private async handle(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/issue" && request.method === "POST") {
       const record = await bodyJson<GrantRecord>(request);
@@ -209,7 +207,8 @@ export const authenticateDeviceToken = async (
     method: "POST",
     body: JSON.stringify({ secret: parsed.secret })
   });
-  if (!response.ok) return undefined;
+  if (response.status === 401 || response.status === 403) return undefined;
+  if (!response.ok) throw new Error("grant authority unavailable");
   const body = await bodyJson<{
     userId?: unknown;
     email?: unknown;
@@ -231,6 +230,7 @@ export const authenticateDeviceToken = async (
     typeof body.projectId !== "string" ||
     body.projectId !== env.SCAFFOLD_PROJECT_SCOPE ||
     typeof body.deploymentId !== "string" ||
+    body.deploymentId !== env.SCAFFOLD_DEPLOYMENT_ID ||
     typeof body.sandboxId !== "string" ||
     typeof body.grantId !== "string" ||
     typeof body.targetDeviceId !== "string" ||
@@ -331,13 +331,15 @@ const verifiedSandboxTarget = async (
           "content-type": "application/json"
         },
         body: JSON.stringify(requested),
+        signal: AbortSignal.timeout(5000),
         redirect: "manual"
       }
     );
   } catch {
-    return undefined;
+    throw new Error("sandbox authority unavailable");
   }
-  if (!response.ok) return undefined;
+  if (response.status === 401 || response.status === 403 || response.status === 404) return undefined;
+  if (!response.ok) throw new Error("sandbox authority unavailable");
   const payload = await bodyJson<{
     ok?: unknown;
     profile?: {
@@ -394,25 +396,14 @@ const requesterOwnsSession = async (
   target: Pick<SandboxTarget, "projectId" | "deploymentId" | "sessionId">,
   userId: string
 ): Promise<boolean> => {
-  try {
-    const roomName = scopedSessionRoomKey(target.projectId, target.deploymentId, target.sessionId);
-    const room = env.SESSION_ROOMS.get(env.SESSION_ROOMS.idFromName(roomName));
-    const response = await room.fetch(
-      new Request("https://session.internal/authorize-owner", {
-        method: "GET",
-        headers: {
-          [AUTH_USER_HEADER]: userId,
-          [AUTH_PROJECT_HEADER]: target.projectId,
-          [SESSION_OWNER_AUTH_HEADER]: "verify"
-        }
-      })
-    );
-    if (!response.ok) return false;
-    const body = await bodyJson<{ ownsSession?: unknown }>(response);
-    return body?.ownsSession === true;
-  } catch {
-    return false;
-  }
+  const room = env.CHAT_ROOMS.get(env.CHAT_ROOMS.idFromName(`chat2/${target.sessionId}`));
+  const response = await room.fetch(new Request("https://chat.internal/bind-owner", {
+    method: "POST",
+    headers: { [AUTH_USER_HEADER]: userId }
+  }));
+  if (response.status === 403) return false;
+  if (!response.ok) throw new Error("chat authority unavailable");
+  return true;
 };
 
 export const handleAuthenticatedAuthRoute = async (
@@ -453,6 +444,7 @@ export const handleAuthenticatedAuthRoute = async (
       !body ||
       typeof body.deploymentId !== "string" ||
       !ID_RE.test(body.deploymentId) ||
+      body.deploymentId !== env.SCAFFOLD_DEPLOYMENT_ID ||
       typeof body.sandboxId !== "string" ||
       !ID_RE.test(body.sandboxId) ||
       typeof body.targetDeviceId !== "string" ||

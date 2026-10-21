@@ -35,9 +35,9 @@ cd "$ROOT"
 BIN="$(mktemp)"
 trap 'rm -f "$BIN"' EXIT
 if [[ "$PROFILE" == "release" ]]; then
-  python3 scripts/local-cargo.py build --release -p comet --copy-binary release/comet "$BIN"
+  python3 scripts/local-cargo.py build --release --locked -p zeron --copy-binary release/zeron "$BIN"
 else
-  python3 scripts/local-cargo.py build -p comet --copy-binary debug/comet "$BIN"
+  python3 scripts/local-cargo.py build --locked -p zeron --copy-binary debug/zeron "$BIN"
 fi
 
 rm -rf "$STAGE" "$TARBALL"
@@ -45,8 +45,13 @@ mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/comet"
 rm -f "$BIN"
 install -m 644 "$ROOT/dist/comet.desktop" "$STAGE/comet.desktop"
-install -m 644 "$ROOT/assets/brand/png/crew-icon-1024.png" "$STAGE/comet.png"
-install -m 644 "$ROOT/assets/brand/crew-icon.svg" "$STAGE/comet.svg"
+install -m 644 "$ROOT/dist/zeron.png" "$STAGE/comet.png"
+install -m 644 "$ROOT/dist/zeron.svg" "$STAGE/comet.svg"
+
+install -m 644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"
+mkdir -p "$STAGE/licenses/fonts"
+cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
+cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
 
 # The sandbox serves this fixed-session viewport from the same immutable release
 # as its Crew engine. No package installation or frontend build runs at boot.
@@ -55,6 +60,7 @@ tar -cf - --exclude='*.test.mjs' --exclude=node_modules --exclude=package-lock.j
   -C "$ROOT/apps/web" . | tar -xf - -C "$STAGE/crew-web"
 test -f "$STAGE/crew-web/server.mjs"
 test -f "$STAGE/crew-web/public/index.html"
+install -m 644 "$ROOT/apps/web/contract.json" "$STAGE/crew-web-contract.json"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash

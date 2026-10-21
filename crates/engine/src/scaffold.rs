@@ -13,16 +13,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use comet_harness::CancellationToken;
-use comet_proto::{
-    AgentAccountStatus, AgentRoute, AgentRouteReceipt, CAPABILITY_SESSION_ANNOTATE,
+use zeron_harness::CancellationToken;
+use zeron_proto::{
+    AgentRoute, AgentRouteReceipt, CAPABILITY_SESSION_ANNOTATE,
     CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL, CAPABILITY_SESSION_ENVIRONMENT,
     CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ, CollaborationScope, ScaffoldControlGrant,
     ScaffoldDatabaseEnvironment, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
     ScaffoldEnvironmentLinks, ScaffoldEnvironmentSnapshot, SessionEnvironment,
     SessionEnvironmentSource, SessionRoomProjection,
 };
-use comet_rpc::{RpcError, TokenSource};
+use zeron_rpc::{RpcError, TokenSource};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,7 +46,7 @@ const DEVICE_ACCESS_TTL_MS: i64 = 12 * 60 * 60 * 1000;
 const SCAFFOLD_HANDOFF_CWD: &str = "/workspace/crew-handoff";
 
 pub(crate) const SCAFFOLD_COMET_RUNTIME_VERSION: &str =
-    include_str!("../../../scaffold-runtime-version.txt");
+    include_str!("../../../scaffold-runtime-version.txt").trim_ascii();
 const JOIN_GRANT_PATH: [&str; 2] = ["auth", "device-grants"];
 pub fn is_retryable_scaffold_control_error(error: &RpcError) -> bool {
     matches!(
@@ -137,27 +137,22 @@ impl fmt::Display for ScaffoldTransportCause {
     }
 }
 
-pub(crate) fn classify_transport_error(error: &(dyn std::error::Error + 'static)) -> ScaffoldTransportCause {
-    let mut source = error;
-    let mut connect_failure = false;
+fn classify_transport_error(error: &reqwest::Error) -> ScaffoldTransportCause {
+    if error.is_timeout() {
+        return ScaffoldTransportCause::RequestTimeout;
+    }
+    let mut source: &(dyn std::error::Error + 'static) = error;
     loop {
-        if let Some(request_error) = source.downcast_ref::<reqwest::Error>() {
-            if request_error.is_timeout() {
-                return ScaffoldTransportCause::RequestTimeout;
-            }
-            connect_failure |= request_error.is_connect();
-        }
-        if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
-            match io_error.kind() {
-                std::io::ErrorKind::TimedOut => return ScaffoldTransportCause::RequestTimeout,
+        if let Some(io_error) = source.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_error.kind(),
                 std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::UnexpectedEof => {
-                    return ScaffoldTransportCause::ConnectionResetOrClosed;
-                }
-                _ => {}
-            }
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return ScaffoldTransportCause::ConnectionResetOrClosed;
         }
         if let Some(hyper_error) = source.downcast_ref::<hyper::Error>()
             && (hyper_error.is_closed() || hyper_error.is_incomplete_message())
@@ -169,7 +164,7 @@ pub(crate) fn classify_transport_error(error: &(dyn std::error::Error + 'static)
         };
         source = next;
     }
-    if connect_failure {
+    if error.is_connect() {
         ScaffoldTransportCause::ConnectFailure
     } else {
         ScaffoldTransportCause::SendFailure
@@ -180,6 +175,8 @@ pub(crate) fn classify_transport_error(error: &(dyn std::error::Error + 'static)
 pub enum ScaffoldError {
     #[error("scaffold_auth_unavailable")]
     AuthUnavailable,
+    #[error("scaffold_auth_temporarily_unavailable: {0}")]
+    AuthTemporarilyUnavailable(String),
     #[error("scaffold_request_cancelled")]
     Cancelled,
     #[error("scaffold_request_failed: {cause}")]
@@ -191,6 +188,8 @@ pub enum ScaffoldError {
     },
     #[error("scaffold_response_invalid: {0}")]
     InvalidResponse(String),
+    #[error("scaffold_attach_rejected: sandbox lifecycle {0:?}")]
+    AttachRejected(zeron_proto::ScaffoldLifecycle),
     #[error("scaffold_scope_invalid: {0}")]
     InvalidScope(String),
     #[error("{0}")]
@@ -272,6 +271,14 @@ impl ScaffoldError {
     }
 }
 
+async fn control_bearer(source: &dyn TokenSource) -> Result<String, ScaffoldError> {
+    match source.token().await {
+        Ok(token) if !token.trim().is_empty() => Ok(token),
+        Ok(_) | Err(zeron_rpc::TokenError::SignedOut) => Err(ScaffoldError::AuthUnavailable),
+        Err(zeron_rpc::TokenError::TemporarilyUnavailable(reason)) => Err(ScaffoldError::AuthTemporarilyUnavailable(reason)),
+    }
+}
+
 #[derive(Clone)]
 pub struct ScaffoldClient {
     http: reqwest::Client,
@@ -281,7 +288,7 @@ pub struct ScaffoldClient {
     bearer: Arc<dyn TokenSource>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentAccountCredentialImport {
     pub provider: String,
@@ -298,7 +305,7 @@ pub(crate) struct AgentAccountCredentialImport {
     pub credential: AgentAccountOAuthCredential,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentAccountOAuthCredential {
     pub access_token: String,
@@ -307,15 +314,27 @@ pub(crate) struct AgentAccountOAuthCredential {
     pub scopes: Vec<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteAgentUsageWindow {
     pub label: String,
     pub used_fraction: f32,
+    #[serde(rename(serialize = "resetsAt", deserialize = "resetAt"))]
     pub reset_at: Option<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AgentAccountStatus {
+    Connected,
+    Disabled,
+    AttentionRequired,
+    Revoked,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteAgentAccount {
     pub id: String,
@@ -324,6 +343,7 @@ pub(crate) struct RemoteAgentAccount {
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub organization: Option<String>,
+    #[serde(rename(serialize = "planLabel", deserialize = "plan"))]
     pub plan: Option<String>,
     pub status: AgentAccountStatus,
     #[serde(default)]
@@ -401,6 +421,10 @@ impl ScaffoldClient {
         &self.project_scope
     }
 
+    pub(crate) async fn require_auth(&self) -> Result<(), ScaffoldError> {
+        control_bearer(self.bearer.as_ref()).await.map(|_| ())
+    }
+
     pub async fn search_crew_sessions(&self, input: &Value) -> Result<Value, ScaffoldError> {
         self.crew_directory_request("search", input).await
     }
@@ -418,7 +442,7 @@ impl ScaffoldClient {
         if body.len() > 60 * 1024 {
             return Err(ScaffoldError::InvalidResponse("directory request exceeds 60 KiB".into()));
         }
-        let bearer = self.bearer.token().await.filter(|value| !value.trim().is_empty()).ok_or(ScaffoldError::AuthUnavailable)?;
+        let bearer = control_bearer(self.bearer.as_ref()).await?;
         let response = self.http.post(self.origin.join(&format!("/api/crew-directory/{operation}")).expect("directory API path"))
             .bearer_auth(bearer).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send().await?;
         Self::bounded_json(response).await
@@ -625,7 +649,9 @@ impl ScaffoldClient {
         scope: &CollaborationScope,
         cancellation: &CancellationToken,
     ) -> Result<Vec<SessionEnvironment>, ScaffoldError> {
-        self.validate_scope(scope)?;
+        let mut validation_scope = scope.clone();
+        validation_scope.session_id.get_or_insert_with(|| "list".into());
+        self.validate_scope(&validation_scope)?;
         let response: SandboxListEnvelope = self
             .request(
                 Method::GET,
@@ -643,7 +669,16 @@ impl ScaffoldClient {
         response
             .sandboxes
             .into_iter()
-            .map(|sandbox| sandbox.into_environment(scope.clone()))
+            .filter(|sandbox| sandbox.comet_runtime_profile.as_ref().is_some_and(|profile| {
+                profile.project_id == scope.project_id
+                    && Some(profile.deployment_id.as_str()) == scope.deployment_id.as_deref()
+                    && scope.session_id.as_deref().is_none_or(|id| id == profile.session_id)
+            }))
+            .map(|sandbox| {
+                let mut scope = scope.clone();
+                scope.session_id = sandbox.comet_runtime_profile.as_ref().map(|profile| profile.session_id.clone());
+                sandbox.into_environment(scope)
+            })
             .collect()
     }
 
@@ -664,37 +699,6 @@ impl ScaffoldClient {
             )
             .await?;
         response.sandbox.into_environment(scope.clone())
-    }
-
-    pub(crate) async fn inspect_agent_route(
-        &self,
-        sandbox_id: &str,
-        scope: &CollaborationScope,
-        cancellation: &CancellationToken,
-    ) -> Result<(SessionEnvironment, AgentRoute), ScaffoldError> {
-        self.validate_scope(scope)?;
-        let bearer = self.bearer.token().await.filter(|token| !token.trim().is_empty())
-            .ok_or(ScaffoldError::AuthUnavailable)?;
-        let request = self.http.get(self.sandbox_url(sandbox_id, None)?)
-            .bearer_auth(&bearer).header(reqwest::header::ACCEPT, "application/json");
-        let read = async {
-            let response = request.send().await.map_err(ScaffoldError::from)?;
-            drop(bearer);
-            let mut response: SandboxEnvelope = serde_json::from_value(Self::bounded_json(response).await?)
-                .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))?;
-            if response.sandbox.id != sandbox_id {
-                return Err(ScaffoldError::InvalidResponse("preserved route returned a different sandbox".into()));
-            }
-            let route = response.sandbox.agent_route.take()
-                .ok_or_else(|| ScaffoldError::InvalidResponse("preserved sandbox has no pinned agent route".into()))?;
-            route.validate().map_err(|error| ScaffoldError::InvalidResponse(error.into()))?;
-            Ok((response.sandbox.into_environment(scope.clone())?, route))
-        };
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(ScaffoldError::Cancelled),
-            result = read => result,
-        }
     }
 
     pub(crate) async fn create(
@@ -1046,12 +1050,7 @@ impl ScaffoldClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize + ?Sized,
     {
-        let bearer = self
-            .bearer
-            .token()
-            .await
-            .filter(|token| !token.trim().is_empty())
-            .ok_or(ScaffoldError::AuthUnavailable)?;
+        let bearer = control_bearer(self.bearer.as_ref()).await?;
         let mut request = self
             .http
             .request(method, url)
@@ -1294,7 +1293,7 @@ fn prepare_omp_handoff_archive(
 
     if artifact.native_session_id.trim().is_empty()
         || artifact.cwd.trim().is_empty()
-        || artifact.byte_count > crate::MAX_OMP_SESSION_ARTIFACT_BYTES
+        || artifact.byte_count > crate::omp_session_artifact::MAX_OMP_SESSION_ARTIFACT_BYTES
         || artifact.sha256.len() != 64
         || !artifact
             .sha256
@@ -1553,7 +1552,7 @@ struct ScaffoldSandbox {
     id: String,
     name: Option<String>,
     lifecycle_epoch: Option<u64>,
-    status: comet_proto::ScaffoldLifecycle,
+    status: zeron_proto::ScaffoldLifecycle,
     kind: Option<String>,
     runtime_profile: Option<String>,
     region: Option<String>,
@@ -1618,7 +1617,7 @@ impl ScaffoldSandbox {
         // Validate required timestamps even though only last activity enters the projection.
         let _ = parse_rfc3339_ms(&self.created_at, "createdAt")?;
         let _ = parse_rfc3339_ms(&self.updated_at, "updatedAt")?;
-        let scope = if self.runtime_profile.as_deref() == Some("comet_remote") {
+        let scope = {
             let profile = self.comet_runtime_profile.as_ref().ok_or_else(|| {
                 ScaffoldError::InvalidResponse(format!(
                     "sandbox {} has no authoritative Crew runtime profile",
@@ -1642,10 +1641,14 @@ impl ScaffoldSandbox {
                 session_id: Some(profile.session_id.clone()),
                 unknown: Default::default(),
             }
-        } else {
-            scope
         };
         let lifecycle_epoch = self.lifecycle_epoch;
+        let mut unknown: zeron_proto::UnknownFields = Default::default();
+        if let Some(route) = self.agent_route {
+            route.validate().map_err(|message| ScaffoldError::InvalidResponse(message.into()))?;
+            unknown.insert("agentRoute".into(), serde_json::to_value(route)
+                .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))?);
+        }
         Ok(SessionEnvironment {
             source: SessionEnvironmentSource::Scaffold {
                 sandbox_id: self.id,
@@ -1660,7 +1663,7 @@ impl ScaffoldSandbox {
             source_ref: self.source_ref,
             last_activity_at,
             database_environment: Some(self.database_environment),
-            unknown: Default::default(),
+            unknown,
         })
     }
 }
@@ -1737,6 +1740,19 @@ struct ScaffoldHostAuthorityResponse {
     capabilities: Vec<String>,
 }
 
+fn confirmed_host_authority(response: &ExecResponse, environment: &SessionEnvironment)
+    -> Option<ScaffoldHostAuthorityResponse> {
+    if !response.ok || response.exit_code != Some(0) { return None; }
+    let SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle_epoch: Some(epoch), .. } = &environment.source else { return None };
+    let existing: ScaffoldHostAuthorityResponse = serde_json::from_str(response.stdout.as_deref()?).ok()?;
+    (!existing.grant_id.is_empty() && existing.expires_at > now_ms()
+        && existing.principal_subject == environment.owner_principal
+        && existing.scope == environment.scope && &existing.sandbox_id == sandbox_id
+        && existing.device_id == device_id_for(sandbox_id, *epoch)
+        && existing.lifecycle_epoch == *epoch
+        && existing.capabilities == scaffold_host_capabilities()).then_some(existing)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecResponse {
@@ -1811,7 +1827,7 @@ MAX_TOTAL = 256 * 1024 * 1024
 MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024
 MAX_HISTORY_BYTES = 4 * 1024 * 1024 * 1024
 MAX_OBJECTS = 250000
-MAX_FILES = 50000
+MAX_FILES = 25000
 # Bound directory traversal independently of the regular-file/symlink budget.
 MAX_DIRECTORIES = 25000
 MAX_MEMORY = 512 * 1024 * 1024
@@ -2132,15 +2148,14 @@ finally:
 
 const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, shutil, stat, sys, tempfile, uuid
 probe_only = sys.argv[1] == "--probe"
-platform_root = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
 if not probe_only:
     staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
-    workspace = platform_root
+    workspace = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
     if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
         raise SystemExit(20)
 handoff_root = pathlib.Path("/workspace/crew-handoff")
 workspace = pathlib.Path(sys.argv[7])
-if workspace != workspace.resolve(strict=not probe_only) or (not probe_only and not workspace.is_dir()) or (workspace != platform_root and workspace != handoff_root and handoff_root not in workspace.parents):
+if workspace != workspace.resolve(strict=not probe_only) or (not probe_only and not workspace.is_dir()) or (workspace != handoff_root and handoff_root not in workspace.parents):
     raise SystemExit(29)
 rel = pathlib.PurePosixPath(sys.argv[2])
 if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
@@ -2515,12 +2530,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             ttl_seconds: request.expires_in_seconds,
         };
 
-        let bearer = self
-            .bearer
-            .token()
-            .await
-            .filter(|token| !token.trim().is_empty())
-            .ok_or(ScaffoldError::DeviceJoinGrantUnavailable)?;
+        let bearer = control_bearer(self.bearer.as_ref()).await?;
         let mut url = self.origin.clone();
         url.path_segments_mut()
             .expect("validated HTTP origin")
@@ -2625,10 +2635,91 @@ impl DeviceJoinGrantProvider for UnavailableDeviceJoinGrantProvider {
     }
 }
 
+struct RuntimeArtifact {
+    archive: NamedTempFile,
+    archive_bytes: u64,
+    sha256: String,
+}
+
+impl RuntimeArtifact {
+    fn capture(path: &std::path::Path, expected_sha256: &str) -> Result<Self, ScaffoldError> {
+        use sha2::{Digest, Sha256};
+        if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ScaffoldError::InvalidScope("Runtime artifact SHA256 is required".into()));
+        }
+        let capture = || -> Result<Self, crate::EngineError> {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            let mut source = options.open(path)?;
+            let metadata = source.metadata()?;
+            if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_HANDOFF_ARCHIVE_BYTES - 2048 {
+                return Err(crate::EngineError::Other("Invalid runtime artifact size or type".into()));
+            }
+            let mut archive = NamedTempFile::new()?;
+            crate::worktree_handoff::append_tar_header(archive.as_file_mut(), "comet", metadata.len(), 0o600)?;
+            let mut hash = Sha256::new();
+            let mut remaining = metadata.len();
+            let mut buffer = [0u8; 64 * 1024];
+            while remaining > 0 {
+                let limit = remaining.min(buffer.len() as u64) as usize;
+                let count = source.read(&mut buffer[..limit])?;
+                if count == 0 { return Err(crate::EngineError::Other("Runtime artifact changed during capture".into())); }
+                hash.update(&buffer[..count]);
+                archive.write_all(&buffer[..count])?;
+                remaining -= count as u64;
+            }
+            let sha256 = format!("{:x}", hash.finalize());
+            if source.read(&mut buffer[..1])? != 0 || sha256 != expected_sha256.to_ascii_lowercase() {
+                return Err(crate::EngineError::Other("Runtime artifact SHA256 mismatch".into()));
+            }
+            let padding = (512 - metadata.len() % 512) % 512;
+            archive.write_all(&[0; 1536][..padding as usize + 1024])?;
+            archive.as_file().sync_all()?;
+            let archive_bytes = archive.as_file().metadata()?.len();
+            Ok(Self { archive, archive_bytes, sha256 })
+        };
+        capture().map_err(|_| ScaffoldError::InvalidResponse("Runtime artifact capture or SHA256 verification failed".into()))
+    }
+}
+
+// Executed only in the explicitly selected sandbox. Never follows a directory
+// symlink or overwrites a pre-existing different runtime.
+const PREPARE_RUNTIME_DIRECTORY: &str = r#"import os,pathlib,stat,sys
+p=pathlib.PurePosixPath(sys.argv[1])
+parts=p.parts
+if len(parts)!=4 or parts[0]!='.scaffold' or not parts[1].startswith('crew-') or parts[2:]!=('bin','comet'):
+    raise SystemExit(40)
+current=os.getcwd()
+if not stat.S_ISDIR(os.lstat(current).st_mode): raise SystemExit(41)
+for part in parts[:-1]:
+    current=os.path.join(current,part)
+    try: os.mkdir(current,0o700)
+    except FileExistsError: pass
+    if not stat.S_ISDIR(os.lstat(current).st_mode): raise SystemExit(41)
+data=os.path.join(os.path.dirname(current),'data')
+try: os.mkdir(data,0o700)
+except FileExistsError: pass
+if not stat.S_ISDIR(os.lstat(data).st_mode): raise SystemExit(41)
+try:
+    st=os.lstat(str(p))
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1: raise SystemExit(42)
+    print('present')
+except FileNotFoundError: print('absent')
+"#;
+
 #[derive(Clone)]
 pub struct ScaffoldRuntime {
     inner: Arc<ScaffoldRuntimeInner>,
     deployment_id: Arc<str>,
+    remote_executable: Arc<str>,
+    remote_data_dir: Option<Arc<str>>,
+    remote_ipc_port: Option<u16>,
+    runtime_artifact: Option<Arc<RuntimeArtifact>>,
 }
 
 struct ScaffoldRuntimeInner {
@@ -2636,8 +2727,6 @@ struct ScaffoldRuntimeInner {
     edge_origin: String,
     grants: Arc<dyn DeviceJoinGrantProvider>,
     handoff_permits: Arc<Semaphore>,
-    preparation_gates:
-        Mutex<BTreeMap<(String, String, String), std::sync::Weak<tokio::sync::Mutex<()>>>>,
     environments: Mutex<BTreeMap<String, SessionEnvironment>>,
     watch_tx: watch::Sender<ScaffoldEnvironmentSnapshot>,
 }
@@ -2655,12 +2744,15 @@ impl ScaffoldRuntime {
         let (watch_tx, _) = watch::channel(snapshot);
         Self {
             deployment_id: client.project_scope.as_str().into(),
+            remote_executable: "comet".into(),
+            remote_data_dir: None,
+            remote_ipc_port: None,
+            runtime_artifact: None,
             inner: Arc::new(ScaffoldRuntimeInner {
                 client,
                 edge_origin: edge_origin.into(),
                 grants,
                 handoff_permits: Arc::new(Semaphore::new(1)),
-                preparation_gates: Mutex::new(BTreeMap::new()),
                 environments: Mutex::new(BTreeMap::new()),
                 watch_tx,
             }),
@@ -2672,31 +2764,105 @@ impl ScaffoldRuntime {
         self
     }
 
+    pub fn with_remote_executable(mut self, executable: String) -> Self {
+        self.remote_executable = executable.into();
+        self
+    }
+
+    pub fn with_remote_data_dir(mut self, data_dir: String) -> Self {
+        self.remote_data_dir = Some(data_dir.into());
+        self
+    }
+
+    pub fn with_remote_ipc_port(mut self, port: u16) -> Self {
+        self.remote_ipc_port = Some(port);
+        self
+    }
+
+    /// Captures immutable bytes now; the source path is never re-opened at upload.
+    pub fn with_runtime_artifact(mut self, path: std::path::PathBuf, sha256: String) -> Result<Self, ScaffoldError> {
+        self.runtime_artifact = Some(Arc::new(RuntimeArtifact::capture(&path, &sha256)?));
+        Ok(self)
+    }
+
+    async fn ensure_remote_runtime(&self, sandbox_id: &str, environment: &SessionEnvironment, cancellation: &CancellationToken) -> Result<(), ScaffoldError> {
+        let artifact = self.runtime_artifact.as_ref().ok_or_else(|| {
+            ScaffoldError::InvalidScope("A verified runtime artifact is required for native attachment".into())
+        })?;
+        let expected_data_dir = self.remote_executable.strip_suffix("/bin/comet")
+            .map(|root| format!("{root}/data"));
+        if expected_data_dir.as_deref() != self.remote_data_dir.as_deref()
+            || self.remote_data_dir.is_none()
+            || self.remote_ipc_port.is_none_or(|port| matches!(port, 0 | 27654 | 27655)) {
+            return Err(ScaffoldError::InvalidScope("Isolated runtime data directory and IPC port are required".into()));
+        }
+        let argv = vec!["python3".into(), "-c".into(), PREPARE_RUNTIME_DIRECTORY.into(), self.remote_executable.to_string()];
+        let prepared = self.probe_attach_authority(sandbox_id, &environment.scope, environment, &argv, cancellation).await?;
+        if !prepared.ok || prepared.exit_code != Some(0) {
+            return Err(ScaffoldError::InvalidScope("Runtime destination is not an isolated regular path".into()));
+        }
+        let present = match prepared.stdout.as_deref().map(str::trim) {
+            Some("present") => true,
+            Some("absent") => false,
+            _ => return Err(ScaffoldError::InvalidResponse("Runtime destination probe failed".into())),
+        };
+        if !present {
+            let relative = self.remote_executable.strip_suffix("/comet")
+                .ok_or_else(|| ScaffoldError::InvalidScope("Unsafe runtime artifact destination".into()))?;
+            let grant: UploadGrantEnvelope = self.inner.client.request(Method::POST,
+                self.inner.client.sandbox_url(sandbox_id, Some("uploads"))?,
+                Some(&UploadGrantRequest { destination_path: relative }), cancellation, None).await?;
+            if !grant.ok || grant.upload.destination_path != relative {
+                return Err(ScaffoldError::InvalidResponse("Runtime upload destination mismatch".into()));
+            }
+            validate_upload_grant(&grant.upload)?;
+            self.inner.client.upload_granted_file(&grant.upload,
+                artifact.archive.reopen().map_err(|_| ScaffoldError::InvalidResponse("Runtime artifact unavailable".into()))?,
+                artifact.archive_bytes, cancellation).await?;
+        }
+        let argv = vec!["sha256sum".into(), "--".into(), self.remote_executable.to_string()];
+        let verified = self.inner.client.exec(sandbox_id, &ExecBody {
+            argv: &argv, mode: "inline", timeout_ms: 60_000,
+        }, cancellation).await?;
+        if !verified.ok || verified.exit_code != Some(0)
+            || verified.stdout.as_deref().and_then(|value| value.split_whitespace().next()) != Some(artifact.sha256.as_str()) {
+            return Err(ScaffoldError::InvalidResponse("Remote runtime SHA256 mismatch; existing binary was not replaced".into()));
+        }
+        let argv = vec!["chmod".into(), "0700".into(), "--".into(), self.remote_executable.to_string()];
+        let secured = self.inner.client.exec(sandbox_id, &ExecBody {
+            argv: &argv, mode: "inline", timeout_ms: 10_000,
+        }, cancellation).await?;
+        if !secured.ok || secured.exit_code != Some(0) {
+            return Err(ScaffoldError::InvalidResponse("Could not secure verified runtime artifact".into()));
+        }
+        let argv = self.remote_argv("scaffold-install-web");
+        let installed = self.inner.client.exec(sandbox_id, &ExecBody {
+            argv: &argv, mode: "inline", timeout_ms: 30_000,
+        }, cancellation).await?;
+        if !installed.ok || installed.exit_code != Some(0) {
+            return Err(ScaffoldError::InvalidResponse("Verified runtime browser installation failed".into()));
+        }
+        Ok(())
+    }
+
+    fn remote_argv(&self, command: &str) -> Vec<String> {
+        let mut argv = vec![self.remote_executable.to_string()];
+        if let Some(path) = &self.remote_data_dir {
+            argv.extend(["--data-dir".into(), path.to_string()]);
+        }
+        if let Some(port) = self.remote_ipc_port {
+            argv.extend(["--ipc-port".into(), port.to_string()]);
+        }
+        argv.push(command.into());
+        argv
+    }
+
     pub(crate) fn deployment_id(&self) -> &str {
         &self.deployment_id
     }
 
     pub(crate) fn client(&self) -> ScaffoldClient {
         self.inner.client.clone()
-    }
-
-    pub(crate) fn preparation_gate(
-        &self,
-        scope: &CollaborationScope,
-    ) -> Arc<tokio::sync::Mutex<()>> {
-        let key = (
-            scope.project_id.clone(),
-            scope.deployment_id.clone().unwrap_or_default(),
-            scope.session_id.clone().unwrap_or_default(),
-        );
-        let mut gates = lock(&self.inner.preparation_gates);
-        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
-            return gate;
-        }
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(key, Arc::downgrade(&gate));
-        gate
     }
 
     pub fn watch(&self) -> watch::Receiver<ScaffoldEnvironmentSnapshot> {
@@ -2728,6 +2894,7 @@ impl ScaffoldRuntime {
         control: ScaffoldEnvironmentControl,
         cancellation: &CancellationToken,
     ) -> Result<ScaffoldEnvironmentControlResult, ScaffoldError> {
+        let resume_requested = matches!(control, ScaffoldEnvironmentControl::Resume { .. });
         let mut control_grant = None;
         let (environment, attached_device_id, run_id, handoff) = match control {
             ScaffoldEnvironmentControl::Inspect { sandbox_id, scope } => (
@@ -2774,15 +2941,6 @@ impl ScaffoldRuntime {
                 None,
                 None,
             ),
-            ScaffoldEnvironmentControl::Resume { sandbox_id, scope } => (
-                self.inner
-                    .client
-                    .resume(&sandbox_id, &scope, cancellation)
-                    .await?,
-                None,
-                None,
-                None,
-            ),
             ScaffoldEnvironmentControl::Stop { sandbox_id, scope } => (
                 self.inner
                     .client
@@ -2805,13 +2963,18 @@ impl ScaffoldRuntime {
                 None,
                 None,
             ),
-            ScaffoldEnvironmentControl::Attach { sandbox_id, scope } => {
+            ScaffoldEnvironmentControl::Attach { sandbox_id, scope }
+            | ScaffoldEnvironmentControl::Resume { sandbox_id, scope } => {
                 let mut environment = self
                     .inner
                     .client
                     .inspect(&sandbox_id, &scope, cancellation)
                     .await?;
-                if scaffold_source(&environment)?.0 == comet_proto::ScaffoldLifecycle::Paused {
+                let lifecycle = scaffold_source(&environment)?.0;
+                if matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Failed | zeron_proto::ScaffoldLifecycle::Stopped) {
+                    return Err(ScaffoldError::AttachRejected(lifecycle));
+                }
+                if resume_requested || lifecycle == zeron_proto::ScaffoldLifecycle::Paused {
                     let resumed = self
                         .inner
                         .client
@@ -2820,6 +2983,7 @@ impl ScaffoldRuntime {
                     if environment_sandbox_id(&resumed)? != sandbox_id
                         || resumed.scope != environment.scope
                         || resumed.owner_principal != environment.owner_principal
+                        || scaffold_source(&resumed)?.1 < scaffold_source(&environment)?.1
                     {
                         return Err(ScaffoldError::InvalidResponse(
                             "sandbox identity changed while resuming".into(),
@@ -2838,7 +3002,6 @@ impl ScaffoldRuntime {
                 scope,
                 native_session_id,
                 cwd,
-                session_only,
             } => {
                 let environment = self
                     .inner
@@ -2848,8 +3011,8 @@ impl ScaffoldRuntime {
                 let (lifecycle, _, _) = scaffold_source(&environment)?;
                 if !matches!(
                     lifecycle,
-                    comet_proto::ScaffoldLifecycle::Ready
-                        | comet_proto::ScaffoldLifecycle::AgentRunning
+                    zeron_proto::ScaffoldLifecycle::Ready
+                        | zeron_proto::ScaffoldLifecycle::AgentRunning
                 ) {
                     return Err(ScaffoldError::OmpSessionHandoffFailed);
                 }
@@ -2860,47 +3023,44 @@ impl ScaffoldRuntime {
                         permit.map_err(|_| ScaffoldError::OmpSessionHandoffFailed)?
                     }
                 };
-                let remote_base = if session_only {
-                    None
-                } else {
-                    // Capture against the actual immutable checkout, not a source-ref label.
-                    let base_argv = vec![
-                        "git".to_string(),
-                        "-C".to_string(),
-                        "/workspace/ashler-platform".to_string(),
-                        "rev-parse".to_string(),
-                        "--verify".to_string(),
-                        "HEAD^{commit}".to_string(),
-                    ];
-                    let remote_base = self
-                        .inner
-                        .client
-                        .exec(
-                            &sandbox_id,
-                            &ExecBody {
-                                argv: &base_argv,
-                                mode: "inline",
-                                timeout_ms: 10_000,
-                            },
-                            cancellation,
-                        )
-                        .await?;
-                    if !remote_base.ok || remote_base.exit_code != Some(0) {
-                        return Err(ScaffoldError::HandoffStage("source_repository_base"));
-                    }
-                    let remote_base = remote_base.stdout.as_deref().unwrap_or_default().trim();
-                    if !(remote_base.len() == 40 || remote_base.len() == 64)
-                        || !remote_base.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    {
-                        return Err(ScaffoldError::HandoffStage("source_repository_base"));
-                    }
-                    Some(remote_base.to_ascii_lowercase())
-                };
+                // Read the sandbox's actual checkout, not a mutable source-ref label.
+                // Capture uses this only when it can prove a local shared ancestor.
+                let base_argv = vec![
+                    "git".to_string(),
+                    "-C".to_string(),
+                    "/workspace/ashler-platform".to_string(),
+                    "rev-parse".to_string(),
+                    "--verify".to_string(),
+                    "HEAD^{commit}".to_string(),
+                ];
+                let remote_base = self
+                    .inner
+                    .client
+                    .exec(
+                        &sandbox_id,
+                        &ExecBody {
+                            argv: &base_argv,
+                            mode: "inline",
+                            timeout_ms: 10_000,
+                        },
+                        cancellation,
+                    )
+                    .await?;
+                if !remote_base.ok || remote_base.exit_code != Some(0) {
+                    return Err(ScaffoldError::HandoffStage("source_repository_base"));
+                }
+                let remote_base = remote_base.stdout.as_deref().unwrap_or_default().trim();
+                if !(remote_base.len() == 40 || remote_base.len() == 64)
+                    || !remote_base.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(ScaffoldError::HandoffStage("source_repository_base"));
+                }
+                let remote_base = remote_base.to_ascii_lowercase();
                 let capture_native_session_id = native_session_id.clone();
                 let capture_cwd = cwd.clone();
                 let capture_cancellation = cancellation.clone();
                 let (handoff_permit, artifact, worktree) = tokio::task::spawn_blocking(move || {
-                    let captured = crate::local_sessions::capture_omp_file_for_session(
+                    let captured = crate::omp_session_artifact::capture_omp_file_for_session(
                         &capture_native_session_id,
                         &capture_cwd,
                         &capture_cancellation,
@@ -2914,23 +3074,19 @@ impl ScaffoldRuntime {
                         }
                     })?;
                     let artifact = prepare_omp_handoff_archive(captured, &capture_cancellation)?;
-                    let worktree = remote_base
-                        .map(|remote_base| {
-                            crate::worktree_handoff::capture_worktree_handoff_cancellable(
-                                std::path::Path::new(&capture_cwd),
-                                Some(&remote_base),
-                                &capture_cancellation,
-                            )
-                            .map_err(|error| {
-                                tracing::warn!(error = %error, "Scaffold worktree handoff capture failed");
-                                if capture_cancellation.is_cancelled() {
-                                    ScaffoldError::Cancelled
-                                } else {
-                                    ScaffoldError::HandoffStage("source_repository_capture")
-                                }
-                            })
-                        })
-                        .transpose()?;
+                    let worktree = crate::worktree_handoff::capture_worktree_handoff_cancellable(
+                        std::path::Path::new(&capture_cwd),
+                        Some(&remote_base),
+                        &capture_cancellation,
+                    )
+                    .map_err(|error| {
+                        tracing::warn!(error = %error, "Scaffold worktree handoff capture failed");
+                        if capture_cancellation.is_cancelled() {
+                            ScaffoldError::Cancelled
+                        } else {
+                            ScaffoldError::HandoffStage("source_repository_capture")
+                        }
+                    })?;
                     Ok::<_, ScaffoldError>((handoff_permit, artifact, worktree))
                 })
                 .await
@@ -2939,10 +3095,10 @@ impl ScaffoldRuntime {
                     ScaffoldError::OmpSessionHandoffFailed
                 })??;
                 let _handoff_permit = handoff_permit;
-                let prospective_cwd = match worktree.as_ref() {
-                    Some(worktree) if worktree.cwd_relative_path.is_empty() => SCAFFOLD_HANDOFF_CWD.to_string(),
-                    Some(worktree) => format!("{SCAFFOLD_HANDOFF_CWD}/{}", worktree.cwd_relative_path),
-                    None => "/workspace/ashler-platform".to_string(),
+                let prospective_cwd = if worktree.cwd_relative_path.is_empty() {
+                    SCAFFOLD_HANDOFF_CWD.to_string()
+                } else {
+                    format!("{SCAFFOLD_HANDOFF_CWD}/{}", worktree.cwd_relative_path)
                 };
                 self.inner
                     .client
@@ -2953,17 +3109,14 @@ impl ScaffoldRuntime {
                         cancellation,
                     )
                     .await?;
-                let remote_cwd = if let Some(worktree) = worktree {
-                    self.inner
-                        .client
-                        .handoff_worktree(&sandbox_id, &worktree, prospective_cwd, cancellation)
-                        .await
-                        .inspect_err(|error| {
-                            tracing::warn!(error = %error, "Scaffold worktree handoff upload failed");
-                        })?
-                } else {
-                    prospective_cwd
-                };
+                let remote_cwd = self
+                    .inner
+                    .client
+                    .handoff_worktree(&sandbox_id, &worktree, prospective_cwd, cancellation)
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(error = %error, "Scaffold worktree handoff upload failed");
+                    })?;
                 let remote_cwd = self
                     .inner
                     .client
@@ -3003,8 +3156,34 @@ impl ScaffoldRuntime {
         })
     }
 
-    // Only retry the read-only authority probe, before minting credentials or
-    // launching a process. Application readiness depends on that bootstrap.
+    /// Observe an already-running host without installing, minting, starting or resuming.
+    pub(crate) async fn observe_attachment(&self, environment: SessionEnvironment,
+        cancellation: &CancellationToken) -> Result<Option<ScaffoldEnvironmentControlResult>, ScaffoldError> {
+        let (lifecycle, _, sandbox_id) = scaffold_source(&environment)?;
+        if !matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Creating
+            | zeron_proto::ScaffoldLifecycle::RestoringSnapshot | zeron_proto::ScaffoldLifecycle::Starting
+            | zeron_proto::ScaffoldLifecycle::Resuming | zeron_proto::ScaffoldLifecycle::Ready
+            | zeron_proto::ScaffoldLifecycle::AgentRunning) {
+            return Ok(None);
+        }
+        let argv = self.remote_argv("scaffold-authority");
+        let response = self.probe_attach_authority(sandbox_id, &environment.scope, &environment, &argv, cancellation).await?;
+        let Some(authority) = confirmed_host_authority(&response, &environment) else { return Ok(None) };
+        let room_projection = Some(SessionRoomProjection {
+            project_id: authority.scope.project_id,
+            deployment_id: authority.scope.deployment_id.ok_or_else(|| ScaffoldError::InvalidScope("Missing deployment binding".into()))?,
+            session_id: authority.scope.session_id.ok_or_else(|| ScaffoldError::InvalidScope("Missing session binding".into()))?,
+        });
+        Ok(Some(ScaffoldEnvironmentControlResult {
+            environment, preparation_generation: None, attached_device_id: Some(authority.device_id),
+            run_id: None, room_projection,
+            control_grant: Some(ScaffoldControlGrant { id: authority.grant_id, expires_at: authority.expires_at, capabilities: authority.capabilities }),
+            handoff_native_session_id: None, handoff_cwd: None,
+        }))
+    }
+
+    // Only retry authority reads or idempotent directory preparation, never
+    // credential minting or process launch. Bootstrap itself makes the app ready.
     async fn probe_attach_authority(
         &self,
         sandbox_id: &str,
@@ -3052,12 +3231,12 @@ impl ScaffoldRuntime {
                     || epoch != scaffold_source(environment)?.1
                     || !matches!(
                         lifecycle,
-                        comet_proto::ScaffoldLifecycle::Creating
-                            | comet_proto::ScaffoldLifecycle::RestoringSnapshot
-                            | comet_proto::ScaffoldLifecycle::Starting
-                            | comet_proto::ScaffoldLifecycle::Resuming
-                            | comet_proto::ScaffoldLifecycle::Ready
-                            | comet_proto::ScaffoldLifecycle::AgentRunning
+                        zeron_proto::ScaffoldLifecycle::Creating
+                            | zeron_proto::ScaffoldLifecycle::RestoringSnapshot
+                            | zeron_proto::ScaffoldLifecycle::Starting
+                            | zeron_proto::ScaffoldLifecycle::Resuming
+                            | zeron_proto::ScaffoldLifecycle::Ready
+                            | zeron_proto::ScaffoldLifecycle::AgentRunning
                     )
                 {
                     return Err(ScaffoldError::InvalidResponse(
@@ -3085,16 +3264,14 @@ impl ScaffoldRuntime {
         let (lifecycle, lifecycle_epoch, _) = scaffold_source(environment)?;
         if !matches!(
             lifecycle,
-            comet_proto::ScaffoldLifecycle::Creating
-                | comet_proto::ScaffoldLifecycle::RestoringSnapshot
-                | comet_proto::ScaffoldLifecycle::Resuming
-                | comet_proto::ScaffoldLifecycle::Starting
-                | comet_proto::ScaffoldLifecycle::Ready
-                | comet_proto::ScaffoldLifecycle::AgentRunning
+            zeron_proto::ScaffoldLifecycle::Creating
+                | zeron_proto::ScaffoldLifecycle::RestoringSnapshot
+                | zeron_proto::ScaffoldLifecycle::Resuming
+                | zeron_proto::ScaffoldLifecycle::Starting
+                | zeron_proto::ScaffoldLifecycle::Ready
+                | zeron_proto::ScaffoldLifecycle::AgentRunning
         ) {
-            return Err(ScaffoldError::InvalidResponse(format!(
-                "sandbox {sandbox_id} cannot attach in lifecycle {lifecycle:?}"
-            )));
+            return Err(ScaffoldError::AttachRejected(lifecycle));
         }
         let deployment_id = scope
             .deployment_id
@@ -3111,27 +3288,13 @@ impl ScaffoldRuntime {
         let lifecycle_epoch = lifecycle_epoch.ok_or_else(|| {
             ScaffoldError::InvalidResponse("sandbox lifecycle epoch is required to attach".into())
         })?;
+        self.ensure_remote_runtime(sandbox_id, environment, cancellation).await?;
 
-        let confirmed_authority = |response: &ExecResponse| {
-            if !response.ok || response.exit_code != Some(0) {
-                return None;
-            }
-            let existing: ScaffoldHostAuthorityResponse =
-                serde_json::from_str(response.stdout.as_deref()?).ok()?;
-            (existing.expires_at > now_ms()
-                && existing.principal_subject == environment.owner_principal
-                && existing.scope == *scope
-                && existing.sandbox_id == sandbox_id
-                && existing.device_id == device_id_for(sandbox_id, lifecycle_epoch)
-                && existing.lifecycle_epoch == lifecycle_epoch
-                && existing.capabilities == scaffold_host_capabilities())
-            .then_some(existing)
-        };
 
         // Reuse a live deployment-bound host before minting another grant. This
         // keeps repeated attach idempotent while preserving a fail-closed fallback
         // when the prior process is missing, stale, or bound to another room.
-        let authority_argv = vec!["comet".to_string(), "scaffold-authority".to_string()];
+        let authority_argv = self.remote_argv("scaffold-authority");
         let authority = self
             .probe_attach_authority(
                 sandbox_id,
@@ -3141,7 +3304,7 @@ impl ScaffoldRuntime {
                 cancellation,
             )
             .await?;
-        if let Some(existing) = confirmed_authority(&authority) {
+        if let Some(existing) = confirmed_host_authority(&authority, environment) {
             return Ok((
                 existing.device_id,
                 None,
@@ -3155,11 +3318,7 @@ impl ScaffoldRuntime {
 
         // Probe after reuse so an older binary without the authority command
         // still fails deterministically without minting a credential.
-        let probe_argv = vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            "command -v comet >/dev/null 2>&1".to_string(),
-        ];
+        let probe_argv = vec![self.remote_executable.to_string(), "--version".into()];
         let probe = self
             .inner
             .client
@@ -3244,14 +3403,19 @@ impl ScaffoldRuntime {
             }
         };
         let _ = chmod;
-        let argv = vec![
-            "comet".to_string(),
-            "headless".to_string(),
+        let mut argv = self.remote_argv("headless");
+        argv.extend([
             "--device-bootstrap-file".to_string(),
             bootstrap_path.clone(),
             "--edge-url".to_string(),
             self.inner.edge_origin.clone(),
-        ];
+            "--scaffold-url".to_string(),
+            self.inner.client.origin.as_str().to_owned(),
+            "--project-scope".to_string(),
+            scope.project_id.clone(),
+            "--deployment-id".to_string(),
+            deployment_id.to_owned(),
+        ]);
         let started = match self
             .inner
             .client
@@ -3305,7 +3469,7 @@ impl ScaffoldRuntime {
                         cancellation,
                     )
                     .await?;
-                if let Some(confirmed) = confirmed_authority(&authority) {
+                if let Some(confirmed) = confirmed_host_authority(&authority, environment) {
                     return Ok(confirmed);
                 }
                 // A completed authority response is authoritative: never wait
@@ -3349,13 +3513,14 @@ impl ScaffoldRuntime {
         snapshot
     }
 }
-fn device_id_for(sandbox_id: &str, lifecycle_epoch: u64) -> String {
+pub(crate) fn device_id_for(sandbox_id: &str, lifecycle_epoch: u64) -> String {
     format!("comet-scaffold-{sandbox_id}-e{lifecycle_epoch}")
 }
 
 fn scaffold_host_capabilities() -> Vec<String> {
     vec![
         CAPABILITY_SESSION_READ.into(),
+        "session.sync.write".into(),
         CAPABILITY_SESSION_CHAT.into(),
         CAPABILITY_SESSION_CONTROL.into(),
         CAPABILITY_SESSION_ANNOTATE.into(),
@@ -3366,7 +3531,7 @@ fn scaffold_host_capabilities() -> Vec<String> {
 
 fn scaffold_source(
     environment: &SessionEnvironment,
-) -> Result<(comet_proto::ScaffoldLifecycle, Option<u64>, &str), ScaffoldError> {
+) -> Result<(zeron_proto::ScaffoldLifecycle, Option<u64>, &str), ScaffoldError> {
     match &environment.source {
         SessionEnvironmentSource::Scaffold {
             sandbox_id,
@@ -3387,7 +3552,7 @@ fn environment_sandbox_id(environment: &SessionEnvironment) -> Result<&str, Scaf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_rpc::StaticToken;
+    use zeron_rpc::StaticToken;
     use sha2::Digest as _;
     #[test]
     fn remote_agent_account_tolerates_unknown_status() {
@@ -3399,6 +3564,19 @@ mod tests {
         }))
         .expect("unknown Agent Auth status");
         assert_eq!(account.status, AgentAccountStatus::Unknown);
+    }
+
+    #[test]
+    fn shared_pool_usage_preserves_reset_deadline_for_ui() {
+        let remote: RemoteAgentUsageWindow = serde_json::from_value(serde_json::json!({
+            "label": "Five-hour",
+            "usedFraction": 0.25,
+            "resetAt": "2026-10-16T20:00:00Z"
+        })).unwrap();
+        let view: zeron_proto::AgentUsageWindow = serde_json::from_value(
+            serde_json::to_value(remote).unwrap(),
+        ).unwrap();
+        assert_eq!(view.resets_at.map(|time| time.timestamp()), Some(1_792_180_800));
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3523,7 +3701,7 @@ mod tests {
 
     fn sandbox(status: &str) -> String {
         format!(
-            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
+            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","cometRuntimeProfile":{{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}},"region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
         )
     }
 
@@ -3548,7 +3726,7 @@ mod tests {
     fn comet_sandbox(status: &str) -> String {
         sandbox(status).replace(
             r#""runtimeProfile":"remote_code""#,
-            r#""runtimeProfile":"comet_remote","cometRuntimeProfile":{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}"#,
+            r#""runtimeProfile":"comet_remote""#,
         )
     }
 
@@ -3602,6 +3780,115 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn runtime_artifact_is_hash_bound_and_captured_immutably() {
+        let mut source = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut source, b"verified-runtime").unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(b"verified-runtime"));
+        let artifact = RuntimeArtifact::capture(source.path(), &digest).unwrap();
+        std::fs::write(source.path(), b"replacement").unwrap();
+        let mut archive = artifact.archive.reopen().unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut archive, &mut bytes).unwrap();
+        assert_eq!(&bytes[512..528], b"verified-runtime");
+        assert_eq!(artifact.sha256, digest);
+        assert!(RuntimeArtifact::capture(source.path(), &digest).is_err());
+    }
+
+    #[test]
+    fn runtime_archive_and_exec_share_the_api_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = ".scaffold/crew-test/bin/comet";
+        let prepare = |path: &str| std::process::Command::new("python3")
+            .args(["-c", PREPARE_RUNTIME_DIRECTORY, path])
+            .current_dir(workspace.path()).output().unwrap();
+        let first = prepare(executable);
+        assert!(first.status.success(), "{:?}", first);
+        assert!(!workspace.path().join(executable).exists());
+        assert!(workspace.path().join(executable).parent().unwrap().is_dir());
+        let mut source = NamedTempFile::new().unwrap();
+        source.write_all(TEST_RUNTIME_BYTES).unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES));
+        let artifact = RuntimeArtifact::capture(source.path(), &digest).unwrap();
+        let destination = workspace.path().join(executable).parent().unwrap().to_owned();
+        assert!(std::process::Command::new("tar").arg("-xf").arg(artifact.archive.path())
+            .arg("-C").arg(destination).status().unwrap().success());
+        let present = prepare(executable);
+        assert!(present.status.success(), "{:?}", present);
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(std::fs::read(workspace.path().join(executable)).unwrap())), digest);
+        for path in ["/workspace/.scaffold/crew-test/bin/comet", "../crew-test/bin/comet", ".scaffold/other/bin/comet"] {
+            assert!(!prepare(path).status.success(), "accepted {path}");
+        }
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), workspace.path().join(".scaffold/crew-link")).unwrap();
+            assert!(!prepare(".scaffold/crew-link/bin/comet").status.success());
+            assert!(!outside.path().join("bin").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_attachment_requires_an_explicit_runtime_artifact() {
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new("http://127.0.0.1:1", "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
+            "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
+        );
+        let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("starting")).unwrap();
+        let environment = envelope.sandbox.into_environment(scope()).unwrap();
+        assert!(runtime.ensure_remote_runtime("box", &environment, &CancellationToken::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn attachment_observes_current_native_authority_while_application_starts() {
+        for (authority_epoch, expected_grant) in [(1, Some("native-grant")), (2, None)] {
+            let authority = host_authority("native-grant", now_ms() + 60_000)
+                .replace("sandbox-a-e1", &format!("sandbox-a-e{authority_epoch}"))
+                .replace("\\\"lifecycleEpoch\\\":1", &format!("\\\"lifecycleEpoch\\\":{authority_epoch}"));
+            let (origin, server) = mock_server(vec![authority]).await;
+            let runtime = test_runtime(
+                ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
+                "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
+            );
+            let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("starting")).unwrap();
+            let observed = runtime.observe_attachment(envelope.sandbox.into_environment(scope()).unwrap(), &CancellationToken::new()).await.unwrap();
+            assert_eq!(observed.and_then(|result| result.control_grant).map(|grant| grant.id).as_deref(), expected_grant);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_attach_is_a_known_rejection_before_runtime_mutation() {
+        for (status, lifecycle) in [
+            ("failed", zeron_proto::ScaffoldLifecycle::Failed),
+            ("stopped", zeron_proto::ScaffoldLifecycle::Stopped),
+        ] {
+            let (origin, captured) = mock_server_with_status(vec![(200, comet_sandbox(status))]).await;
+            let runtime = ScaffoldRuntime::new(
+                ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
+                "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
+            );
+            let error = runtime.control(ScaffoldEnvironmentControl::Attach {
+                sandbox_id: "sandbox-a".into(), scope: scope(),
+            }, &CancellationToken::new()).await.unwrap_err();
+            assert!(matches!(error, ScaffoldError::AttachRejected(state) if state == lifecycle));
+            captured.await.unwrap();
+        }
+    }
+
+    const TEST_RUNTIME_BYTES: &[u8] = b"immutable crew runtime fixture";
+
+    fn test_runtime(client: ScaffoldClient, edge: &str, grants: Arc<dyn DeviceJoinGrantProvider>) -> ScaffoldRuntime {
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, TEST_RUNTIME_BYTES).unwrap();
+        ScaffoldRuntime::new(client, edge, grants)
+            .with_remote_executable(".scaffold/crew-test/bin/comet".into())
+            .with_remote_data_dir(".scaffold/crew-test/data".into())
+            .with_remote_ipc_port(27954)
+            .with_runtime_artifact(file.path().to_owned(), format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES)))
+            .unwrap()
+    }
+
     async fn mock_server_steps(
         responses: Vec<MockResponse>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -3609,7 +3896,8 @@ mod tests {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for response in responses {
+            let mut responses = std::collections::VecDeque::from(responses);
+            while !responses.is_empty() {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -3635,7 +3923,31 @@ mod tests {
                         }
                     }
                 }
-                requests.push(String::from_utf8(bytes).unwrap());
+                let request = String::from_utf8(bytes).unwrap();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let argv = value.get("argv").and_then(Value::as_array);
+                // Lifecycle tests model an already installed immutable fixture.
+                // Installer behavior has separate hash/path/capture regression cases.
+                let installation = argv.and_then(|argv| {
+                    if argv.get(2).and_then(Value::as_str) == Some(PREPARE_RUNTIME_DIRECTORY) {
+                        Some("present".to_string())
+                    } else if argv.first().and_then(Value::as_str) == Some("sha256sum") {
+                        Some(format!("{:x}  .scaffold/crew-test/bin/comet", sha2::Sha256::digest(TEST_RUNTIME_BYTES)))
+                    } else if (argv.first().and_then(Value::as_str) == Some("chmod")
+                        && argv.get(1).and_then(Value::as_str) == Some("0700"))
+                        || argv.last().and_then(Value::as_str) == Some("scaffold-install-web") {
+                        Some(String::new())
+                    } else { None }
+                });
+                if let Some(stdout) = installation {
+                    let body = serde_json::json!({"ok":true,"exitCode":0,"stdout":stdout}).to_string();
+                    let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body);
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    continue;
+                }
+                requests.push(request);
+                let response = responses.pop_front().unwrap();
                 match response {
                     MockResponse::Close => continue,
                     MockResponse::HeadersThenClose => {
@@ -3717,7 +4029,7 @@ mod tests {
                 assert!(matches!(
                     environment.source,
                     SessionEnvironmentSource::Scaffold {
-                        lifecycle: comet_proto::ScaffoldLifecycle::Resuming,
+                        lifecycle: zeron_proto::ScaffoldLifecycle::Resuming,
                         ..
                     }
                 ));
@@ -4100,7 +4412,7 @@ mod tests {
                     region: Some("us-central1"),
                     database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
                 },
-                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
+                &AgentRoute::automatic(zeron_proto::AgentProvider::OpenAi, "gpt-5.6-sol"),
                 &cancellation,
             )
             .await
@@ -4121,7 +4433,7 @@ mod tests {
             .update_agent_route(
                 "sandbox-a",
                 &scope(),
-                &AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.5"),
+                &AgentRoute::automatic(zeron_proto::AgentProvider::OpenAi, "gpt-5.5"),
                 &cancellation,
             )
             .await
@@ -4133,7 +4445,7 @@ mod tests {
         assert!(matches!(
             stopped.source,
             SessionEnvironmentSource::Scaffold {
-                lifecycle: comet_proto::ScaffoldLifecycle::Stopped,
+                lifecycle: zeron_proto::ScaffoldLifecycle::Stopped,
                 ..
             }
         ));
@@ -4176,7 +4488,7 @@ mod tests {
     #[test]
     fn create_sandbox_body_serializes_a_pinned_opaque_account() {
         let route = AgentRoute::pinned(
-            comet_proto::AgentProvider::Anthropic,
+            zeron_proto::AgentProvider::Anthropic,
             "claude-opus-5",
             "opaque-account-id",
         );
@@ -4205,6 +4517,135 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn resume_requires_current_native_authority_and_recovers_without_replay() {
+        use crate::{auth::{Auth, AuthConfig}, crew::CrewServices};
+        use zeron_sync::{DocsStore, scaffold_auth::{save_session, ScaffoldConfig,
+            ScaffoldIdentity, ScaffoldSession, DEFAULT_OAUTH_SCOPES}};
+
+        let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth_origin = format!("http://{}", auth_listener.local_addr().unwrap());
+        let resource = auth_origin.clone();
+        let auth_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = auth_listener.accept().await.unwrap();
+                let mut bytes = [0_u8; 8192];
+                let size = stream.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..size]);
+                let body = if request.starts_with("GET /auth/session ") {
+                    serde_json::json!({"userId":"alice", "email":"alice@example.com",
+                        "projectScope":"project-a", "deploymentId":"deployment-a",
+                        "credential":"scaffold", "capabilities":["session.read"]})
+                } else {
+                    assert!(request.starts_with("GET /api/code-sandboxes/auth/session "));
+                    serde_json::json!({"ok":true, "resource":resource,
+                        "actor":{"sub":"alice", "auth":"iap"},
+                        "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})
+                }.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        save_session(&directory.path().join("scaffold-session.json"), &ScaffoldSession {
+            access_token: "sc_rc_test".into(), resource: auth_origin.clone(), edge_origin: auth_origin.clone(), device: None,
+            identity: ScaffoldIdentity { user_id: "alice".into(), email: "alice@example.com".into(), name: None,
+                project_scope: "project-a".into(), deployment_id: Some("deployment-a".into()), capabilities: vec!["session.read".into()] },
+        }).unwrap();
+        let mut config = AuthConfig::new(&auth_origin, directory.path());
+        config.scaffold = Some(ScaffoldConfig::new(&auth_origin, &auth_origin, "project-a"));
+        let auth = Auth::detect(config).await;
+        assert!(auth.state().is_signed_in());
+        auth_server.await.unwrap();
+
+        let grant_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let expires_at = now_ms() + 60_000;
+        let authority = host_authority(grant_id, expires_at)
+            .replace("sandbox-a-e1", "sandbox-a-e3")
+            .replace(r#"\"lifecycleEpoch\":1"#, r#"\"lifecycleEpoch\":3"#);
+        let current = |status| comet_sandbox(status).replace("\"lifecycleEpoch\":1", "\"lifecycleEpoch\":3");
+        let unavailable = r#"{"ok":false,"exitCode":1}"#.to_string();
+        let (origin, captured) = mock_server(vec![
+            comet_sandbox("paused"), // Controller validates the old binding.
+            comet_sandbox("paused"), // Native attachment validates the resume transition.
+            current("resuming"),
+            unavailable.clone(),
+            r#"{"ok":true,"exitCode":0}"#.into(),
+            format!(r#"{{"grant":"cg1.{grant_id}.secret","expiresAt":{expires_at}}}"#),
+            r#"{"ok":true}"#.into(),
+            r#"{"ok":true,"exitCode":0}"#.into(),
+            r#"{"ok":true,"runId":"resumed-host"}"#.into(),
+            authority.clone(),
+            current("ready"),
+            unavailable.clone(), // Provider readiness alone must not confirm Resume.
+            current("ready"),
+            host_authority(grant_id, expires_at), // Old epoch is not live authority.
+            current("ready"),
+            authority.replace(grant_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .replace(&expires_at.to_string(), "0"), // Current epoch with an expired grant is not authority.
+            current("ready"),
+            authority.clone(),
+            current("failed"),
+            current("stopped"),
+            current("failed"),
+            current("failed"),
+            current("stopped"),
+            current("stopped"),
+            current("paused"),
+            current("paused"),
+            r#"{"ok":true}"#.into(), // Resume delivery is unknown after a malformed reply.
+            current("ready"),
+            unavailable,
+            current("ready"),
+            authority,
+        ]).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("control-token".into()));
+        let runtime = test_runtime(
+            ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+            &origin, Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+        ).with_deployment_id("deployment-a".into());
+        let store = Arc::new(DocsStore::open(&directory.path().join("store")).unwrap());
+        let services = CrewServices::new(auth, runtime, store.clone()).unwrap();
+        let cancellation = CancellationToken::new();
+        let control = ScaffoldEnvironmentControl::Resume { sandbox_id: "sandbox-a".into(), scope: scope() };
+        let first = services.control("resume-once", control.clone(), &cancellation).await.unwrap();
+        assert_eq!(first.status, "unknown");
+        assert!(first.result.is_none());
+        assert_eq!(services.control("resume-once", control, &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.reconcile("resume-once", &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.reconcile("resume-once", &cancellation).await.unwrap().status, "unknown");
+        let confirmed = services.reconcile("resume-once", &cancellation).await.unwrap();
+        assert_eq!(confirmed.status, "confirmed");
+        let result = confirmed.result.unwrap();
+        assert_eq!(result.attached_device_id.as_deref(), Some("comet-scaffold-sandbox-a-e3"));
+        assert_eq!(result.control_grant.unwrap().id, grant_id);
+        assert_eq!(scaffold_source(&result.environment).unwrap().1, Some(3));
+        assert_eq!(result.room_projection.unwrap().session_id, scope().session_id.unwrap());
+
+        // Pending resumes also retire on terminal provider observations, without launching.
+        let (request, _) = store.crew_command("resume-once").unwrap().unwrap();
+        for id in ["resume-failed", "resume-stopped"] {
+            assert!(store.claim_crew_command(id, &request).unwrap());
+            assert_eq!(services.reconcile(id, &cancellation).await.unwrap().status, "rejected");
+            assert_eq!(services.outcome(id).unwrap().status, "rejected");
+        }
+        for id in ["direct-resume-failed", "direct-resume-stopped"] {
+            let control = ScaffoldEnvironmentControl::Resume { sandbox_id: "sandbox-a".into(), scope: scope() };
+            assert_eq!(services.control(id, control, &cancellation).await.unwrap().status, "rejected");
+        }
+        let control = ScaffoldEnvironmentControl::Resume { sandbox_id: "sandbox-a".into(), scope: scope() };
+        assert_eq!(services.control("resume-ambiguous", control.clone(), &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.control("resume-ambiguous", control, &cancellation).await.unwrap().status, "unknown");
+        assert_eq!(services.reconcile("resume-ambiguous", &cancellation).await.unwrap().status, "unknown");
+        let recovered = services.reconcile("resume-ambiguous", &cancellation).await.unwrap();
+        assert_eq!(recovered.status, "confirmed");
+        assert_eq!(recovered.result.unwrap().attached_device_id.as_deref(), Some("comet-scaffold-sandbox-a-e3"));
+        let requests = captured.await.unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/resume ")).count(), 2);
+        assert_eq!(requests.iter().filter(|request| request.contains(r#""mode":"background""#)).count(), 1);
+        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /auth/device-grants ")).count(), 1);
+        assert!(!requests.iter().any(|request| request.starts_with("POST /api/code-sandboxes HTTP")));
+    }
+
+    #[tokio::test]
     async fn attach_resumes_existing_sandbox_and_uses_new_epoch_authority() {
         let grant_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let authority = host_authority(grant_id, now_ms() + 60_000)
@@ -4222,7 +4663,7 @@ mod tests {
             (200, authority),
         ])
         .await;
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
                 .unwrap(),
             "https://comet-edge.example",
@@ -4285,7 +4726,7 @@ mod tests {
             },
         ])
         .await;
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
                 .unwrap(),
             "https://comet-edge.example",
@@ -4338,7 +4779,7 @@ mod tests {
             (403, r#"{"error":"sandbox_profile_mismatch"}"#.into()),
         ])
         .await;
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
                 .unwrap(),
             "https://comet-edge.example",
@@ -4368,7 +4809,7 @@ mod tests {
             MockResponse::HeadersThenClose,
         ])
         .await;
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
                 .unwrap(),
             "https://comet-edge.example",
@@ -4396,12 +4837,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_keeps_credentials_out_of_process_arguments() {
+    async fn attach_starts_host_before_application_ready_and_keeps_credentials_private() {
         let join_expires_at = now_ms() + 60_000;
         let access_expires_at =
             join_expires_at - i64::from(JOIN_GRANT_TTL_SECONDS) * 1000 + DEVICE_ACCESS_TTL_MS;
         let responses = vec![
-            sandbox("ready"),
+            sandbox("starting"),
             r#"{"ok":false,"exitCode":1}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
             format!(
@@ -4414,7 +4855,7 @@ mod tests {
         ];
         let (origin, captured) = mock_server(responses).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("sc_rc_broad_secret".into()));
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
             "https://comet-edge.example",
             Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
@@ -4429,6 +4870,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(result.environment.source, SessionEnvironmentSource::Scaffold {
+            lifecycle: zeron_proto::ScaffoldLifecycle::Starting, lifecycle_epoch: Some(1), ..
+        }));
+        assert_eq!(result.environment.scope, scope());
+        assert_eq!(result.control_grant.as_ref().unwrap().id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(
             result.attached_device_id.as_deref(),
             Some("comet-scaffold-sandbox-a-e1")
@@ -4441,21 +4887,6 @@ mod tests {
                 project_id: "project-a".into(),
                 deployment_id: "deployment-a".into(),
                 session_id: "011664b5-3660-4fe6-83a2-3647fa6a2f65".into(),
-            })
-        );
-        assert_eq!(
-            result.control_grant,
-            Some(ScaffoldControlGrant {
-                id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                expires_at: access_expires_at,
-                capabilities: vec![
-                    CAPABILITY_SESSION_READ.into(),
-                    CAPABILITY_SESSION_CHAT.into(),
-                    CAPABILITY_SESSION_CONTROL.into(),
-                    CAPABILITY_SESSION_ANNOTATE.into(),
-                    CAPABILITY_SESSION_FILES.into(),
-                    CAPABILITY_SESSION_ENVIRONMENT.into(),
-                ],
             })
         );
         let serialized_result = serde_json::to_string(&result).unwrap();
@@ -4473,7 +4904,7 @@ mod tests {
                 .iter()
                 .all(|body| !body.contains("sc_rc_broad_secret") && !body.contains("cg1."))
         );
-        assert!(exec_bodies[0].contains(r#""comet","scaffold-authority""#));
+        assert!(exec_bodies[0].contains(r#""scaffold-authority""#));
         assert!(exec_bodies[2].contains(r#""chmod","600""#));
         assert!(exec_bodies[3].contains(r#""--device-bootstrap-file""#));
         assert!(!exec_bodies[3].contains("--device-join-grant"));
@@ -4520,7 +4951,7 @@ mod tests {
                 confirmation,
             ]).await;
             let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
-            let runtime = ScaffoldRuntime::new(
+            let runtime = test_runtime(
                 ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
                 "https://comet-edge.example",
                 Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
@@ -4559,7 +4990,7 @@ mod tests {
             r#"{"ok":false,"exitCode":1}"#.into(),
         ]).await;
         let token: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", token.clone()).unwrap(),
             "https://comet-edge.example",
             Arc::new(EdgeDeviceJoinGrantClient::new(&origin, token).unwrap()),
@@ -4604,7 +5035,7 @@ mod tests {
             (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at)),
         ]).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
             "https://comet-edge.example",
             Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
@@ -4660,7 +5091,7 @@ mod tests {
         responses.push((200, r#"{"ok":true,"exitCode":0}"#.into()));
         let (origin, captured) = mock_server_with_status(responses).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer).unwrap(),
             "https://comet-edge.example",
             Arc::new(UnavailableDeviceJoinGrantProvider),
@@ -4724,7 +5155,7 @@ mod tests {
             let expected_requests = responses.len();
             let (origin, captured) = mock_server_with_status(responses).await;
             let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
-            let runtime = ScaffoldRuntime::new(
+            let runtime = test_runtime(
                 ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
                 "https://comet-edge.example",
                 Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
@@ -4764,7 +5195,7 @@ mod tests {
                 (200, changed.to_string()),
             ])
             .await;
-            let runtime = ScaffoldRuntime::new(
+            let runtime = test_runtime(
                 ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into())))
                     .unwrap(),
                 "https://comet-edge.example",
@@ -4799,7 +5230,7 @@ mod tests {
             (200, comet_sandbox("starting")),
         ]).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
             "https://comet-edge.example",
             Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
@@ -4847,7 +5278,7 @@ mod tests {
         ];
         let (origin, captured) = mock_server(responses).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("sc_rc_broad_secret".into()));
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
             "https://comet-edge.example",
             Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
@@ -4875,7 +5306,7 @@ mod tests {
         );
         let requests = captured.await.unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].contains(r#""comet","scaffold-authority""#));
+        assert!(requests[1].contains(r#""scaffold-authority""#));
         assert!(
             !requests
                 .iter()
@@ -4890,7 +5321,7 @@ mod tests {
 
     #[tokio::test]
     async fn scaffold_handoffs_share_one_process_memory_permit() {
-        let runtime = ScaffoldRuntime::new(
+        let runtime = test_runtime(
             ScaffoldClient::new(
                 "http://127.0.0.1:1",
                 "project-a",
@@ -4912,6 +5343,7 @@ mod tests {
         assert!(runtime.inner.handoff_permits.try_acquire().is_ok());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_handoff_streams_a_manifest_bound_archive() {
         let repo = tempfile::tempdir().unwrap();
@@ -5526,107 +5958,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn worktree_materializer_imports_base_checkout_with_more_than_25000_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let source = root.join("source");
-        let platform = root.join("platform");
-        let remote = root.join("remote");
-        std::fs::create_dir_all(source.join("files")).unwrap();
-        std::fs::create_dir(&platform).unwrap();
-        std::fs::write(platform.join("sentinel"), "platform\n").unwrap();
-        let git = |cwd: &std::path::Path, args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(cwd)
-                .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            output.stdout
-        };
-        git(&source, &["init", "-q"]);
-        git(&source, &["config", "user.email", "crew@example.com"]);
-        git(&source, &["config", "user.name", "Crew"]);
-        for index in 0..25_001 {
-            std::fs::write(source.join(format!("files/file-{index}")), "base\n").unwrap();
-        }
-        git(&source, &["add", "."]);
-        git(&source, &["commit", "-qm", "large base checkout"]);
-        let snapshot = crate::worktree_handoff::capture_worktree_handoff(&source).unwrap();
-        assert_eq!(snapshot.entry_count, 0, "the files belong to the Git base");
-        let staging = platform.join(".scaffold/crew-handoff-staging");
-        std::fs::create_dir_all(&staging).unwrap();
-        let archive = tempfile::NamedTempFile::new().unwrap();
-        std::io::copy(
-            &mut snapshot.reopen().unwrap(),
-            &mut archive.reopen().unwrap(),
-        )
-        .unwrap();
-        assert!(
-            std::process::Command::new("tar")
-                .args([
-                    "-xf",
-                    archive.path().to_str().unwrap(),
-                    "-C",
-                    staging.to_str().unwrap(),
-                ])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let script = VERIFY_WORKTREE_HANDOFF_PYTHON
-            .replace("/workspace/ashler-platform", platform.to_str().unwrap())
-            .replace("/workspace/crew-handoff", remote.to_str().unwrap());
-        let result = std::process::Command::new("python3")
-            .args([
-                "-c",
-                &script,
-                staging.to_str().unwrap(),
-                &snapshot.manifest_sha256,
-                &snapshot.base_sha,
-                &snapshot.entry_count.to_string(),
-                &serde_json::to_string(&snapshot.cwd_relative_path).unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "status={} stderr={}",
-            result.status,
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&result.stdout).trim(),
-            format!("verified:{}:{}", snapshot.manifest_sha256, remote.display())
-        );
-        assert_eq!(
-            git(&remote, &["rev-parse", "HEAD"]),
-            git(&source, &["rev-parse", "HEAD"])
-        );
-        assert_eq!(
-            std::fs::read_dir(remote.join("files")).unwrap().count(),
-            25_001
-        );
-        for index in [0, 25_000] {
-            assert_eq!(
-                std::fs::read(remote.join(format!("files/file-{index}"))).unwrap(),
-                b"base\n"
-            );
-        }
-        assert_eq!(
-            std::fs::read(platform.join("sentinel")).unwrap(),
-            b"platform\n"
-        );
-        assert!(!staging.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn worktree_materializer_enforces_containment_and_separate_expansion_budgets() {
         use std::os::unix::fs::symlink;
         for scenario in [
@@ -5774,7 +6105,7 @@ mod tests {
                     "MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024",
                     "MAX_CHECKOUT_BYTES = 1024 * 1024",
                 )
-                .replace("MAX_FILES = 50000", "MAX_FILES = 12")
+                .replace("MAX_FILES = 25000", "MAX_FILES = 12")
                 .replace("MAX_DIRECTORIES = 25000", "MAX_DIRECTORIES = 3");
             let script = if scenario == "import_expansion" {
                 script.replace(
@@ -5915,13 +6246,9 @@ mod tests {
             .unwrap();
         assert!(prepare_omp_handoff_archive(artifact, &CancellationToken::new()).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn materializer_process_is_exact_idempotent_and_rejects_mismatch() {
-        materializer_process_for_cwd("crew-handoff/nested");
-        materializer_process_for_cwd("ashler-platform");
-    }
-
-    fn materializer_process_for_cwd(relative_cwd: &str) {
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Command;
         let temp = tempfile::tempdir().unwrap();
@@ -5929,9 +6256,8 @@ mod tests {
         let workspace = root.join("ashler-platform");
         let staging = workspace.join(".scaffold/omp-handoff-staging/by-cwd");
         std::fs::create_dir_all(&staging).unwrap();
-        let remote_cwd = root.join(relative_cwd);
+        let remote_cwd = root.join("crew-handoff/nested");
         std::fs::create_dir_all(&remote_cwd).unwrap();
-        std::fs::write(workspace.join("checked-out-source"), b"branch source\n").unwrap();
         let staged = staging.join("native-1.jsonl");
         let bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"native-1\",\"timestamp\":\"2026-08-16T00:00:00.000Z\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"id\":\"message-1\"}\n";
         let sha = format!("{:x}", sha2::Sha256::digest(bytes));
@@ -6019,10 +6345,9 @@ mod tests {
                 & 0o777,
             0o755
         );
-        let prospective = root.join("crew-handoff/not-created");
+        let prospective = remote_cwd.join("not-created");
         assert_eq!(probe(&prospective).stdout, b"absent\n");
         assert!(!prospective.exists());
-        assert_eq!(probe(&root.join("outside")).status.code(), Some(29));
         std::fs::write(&staged, bytes).unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
         let first = run(&script);
@@ -6032,7 +6357,6 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert!(!staged.exists(), "staged file must be consumed");
-        assert_eq!(std::fs::read(workspace.join("checked-out-source")).unwrap(), b"branch source\n");
         let sessions = profile_agent_dir.join("sessions");
         let target = std::fs::read_dir(&sessions)
             .unwrap()

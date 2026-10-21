@@ -1,14 +1,14 @@
-# comet-native — Architecture
+# zeron — Architecture
 
-A ground-up native rewrite of [comet](../comet) — a multi-device controller for coding agents
+A ground-up native rewrite of [zeron](../zeron) — a multi-device controller for coding agents
 (Claude Code / Codex) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
 
 **Pillars (from the goal):**
-- Sync is Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects.
+- Optional sync uses Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects; the same docs persist locally when sync is disabled.
 - Durable Objects stay **TypeScript** (decision + evidence: `docs/research/durable-objects-language.md`).
-  The native engine and desktop app are Rust.
-- Feature parity with comet **except token-usage display** (poor fit for CRDTs; excluded).
-- Desktop frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
+  Everything device-side is Rust.
+- Feature parity with zeron **except token-usage display** (poor fit for CRDTs; excluded).
+- Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
   **mugen + pretext** (`docs/research/mugen-pretext.md`).
 - One binary, **headed or headless**. Smooth transitions/animations matching the original
   (catalog in `docs/research/feature-inventory.md` §1.12).
@@ -17,55 +17,83 @@ A ground-up native rewrite of [comet](../comet) — a multi-device controller fo
 
 ```
 gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══ engine B ─ RPC ─ gpui UI
-                    │            (edge Worker: auth, rooms, R2)          │
-                    └── Loro sync ── SessionRoom DO (per chat) ──────────┘
-                                └── Workspace doc room (per org) ────────┘
+                    │       optional edge Worker: auth, rooms, R2        │
+                    └── optional chat2 sync ──  ChatRoom DO (per chat) ──┘
+                                          └─ Workspace registry room ────┘
 ```
 
-- **Engine = backend** (was `@comet/backend`): runs agents, owns auth, terminals, repos/worktrees,
+- **Engine = backend** (was `@zeron/backend`): runs agents, owns auth, terminals, repos/worktrees,
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
-- **Desktop UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC
-  whether the engine is in-process or a separate daemon. Organized around **spaces** — synced
-  (device, folder) pairs: the sidebar lists spaces plus a global attention-sorted Active list;
-  the main area shows the selected space's sessions as horizontal tabs (closing a tab archives);
-  new sessions are minted onto the space's device via relay-forwardable RPCs.
-- **Edge (TypeScript)**: Worker + SessionRoom DO (per shared thread) + DeviceRoom DO (per device) + R2 attachments. It verifies Google Cloud IAP principals through Scaffold's existing access path and binds capabilities to explicit Scaffold project/deployment/session scope. No Ashler application database or application-auth flow participates.
-
-For the separate browser surface, see the [Scaffold session web view](README.md#scaffold-session-web-view).
-
-Discovery, transcript replication, and device RPC are independent transports, not
-one user-wide streaming room. Same-user discovery requires the same authenticated
-principal and project/environment; staging and production remain isolated. A live
-session room does not prove workspace convergence or owner-engine reachability.
-The browser surface is a bound single-session viewport, not the session directory.
-Replacing a device's host socket invalidates prior client RPC streams: the new
-host has a new virtual-connection map. Clients reconnect and resubscribe; ambiguous
-unary calls are not automatically replayed. Durable commands reconcile their
-original identities through the command ledger.
+- **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **spaces** — (device, folder) pairs, local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable spaces dropdown ("All spaces" included) that also hosts space management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-space): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a space picker (defaulting to the sidebar filter, else the last selected space); new sessions are minted onto the picked space's device via relay-forwardable RPCs.
+- **Edge (TypeScript, ported from zeron `apps/edge`)**: Worker + ChatRoom DO (per chat, the
+  chat2 row protocol; the legacy SessionRoom DO remains deployed only for pre-cutover clients —
+  no current client dials it) + DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth.
+  Absorbs the old `apps/server` responsibilities (WorkOS code exchange/refresh, orgs) so
+  **Postgres, the Hono server, and the WebRTC/signaling stack are all gone**.
 
 ### Headed / headless
-Single binary `comet`:
-- `comet` — headed. If a local engine daemon is already listening on the IPC port, connect to it;
+Single binary `zeron`:
+- `zeron` — headed. If a local engine daemon is already listening on the IPC port, connect to it;
   otherwise run the engine **in-process** (RPC over an in-memory duplex — same protocol, zero
   serialization shortcuts, so the boundary stays honest) **and serve that same engine on the IPC
   port**. The embedded engine is not private: any other viewport can attach to the running app
   without it first being restarted as a daemon. Binding is best-effort — if the port is taken the
   window still opens, having lost only the ability to host peers.
-- `comet headless` — engine only; prints sign-in URL on TTY (paste-code flow), serves IPC on
-  localhost + hosts its DeviceRoom for remote control. A VPS runs this; a laptop's UI drives it.
+- `zeron headless` — engine only. A clean installation immediately serves its local profile over localhost IPC; when a saved account selects the synced profile at startup and a bearer is available, it also hosts its DeviceRoom for remote control. A VPS can run this while a laptop's UI drives it.
 
-Planned shutdown checkpoints interrupted requests before cancellation, refreshing
-their recovery age and resetting the crash-attempt budget. Cancellation-induced
-harness errors are interruptions, not successful retirement; explicit user stops
-and completed turns remain terminal. Online boot restores pending work but leaves
-settled history cold until selection or a durable nudge opens its room. Targeted
-room recovery filters journal candidates before reading unrelated histories.
+### Local-first workspace profiles
+
+Authentication and workspace selection are deliberately separate state machines:
+
+- `AuthState` is live credential state: `SignedOut`, `NeedsOrganization`, or `SignedIn`. It may change after login, refresh, revocation, or logout.
+- `WorkspaceScope` is the immutable storage and transport boundary captured once at engine startup: `Local`, `Synced`, or explicit `Development`.
+
+The engine never re-resolves an open store because `AuthState` changed. This prevents a sign-in, token refresh, or revocation from silently swapping databases or attaching online transports to a runtime that started local-only.
+
+| Startup condition | `WorkspaceScope` | Online transports |
+| --- | --- | --- |
+| WorkOS enabled, no parseable saved `session.json` | `Local` | Disabled |
+| Parseable saved WorkOS session | `Synced` | Enabled when a bearer is available; organization onboarding completes before opening the store when needed |
+| WorkOS disabled without a dev bearer | `Development` | Disabled |
+| Explicit non-empty dev bearer | `Development` | Enabled |
+
+`zeron login` and `zeron logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `WorkspaceScope` still changes only after restart.
+
+The resolved profile selects the session snapshots, registry snapshot, run journals, and attachment cache that may contain workspace data:
+
+| Scope | Store and journals | Uploads |
+| --- | --- | --- |
+| `Local` | `{data_dir}/profiles/local/` | `{data_dir}/profiles/local/uploads/` |
+| `Synced` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
+| `Development` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
+
+The synced and development store roots preserve the historical cloud layout while their attachment caches are account-scoped. Local identity lives in `{data_dir}/local-profile.json`; its UUID is stable across restarts and is not an account or development identity.
+
+Older releases wrote every synced and development attachment to `{data_dir}/uploads/`, and persisted those absolute paths in transcripts. On upgrade, the first synced or development account that opens this legacy cache claims it in `{data_dir}/legacy-uploads-owner.json`. That account may read the cache as a compatibility fallback, but all new staging and commits use its account-scoped uploads root; other accounts cannot read or write the legacy cache.
+
+Device identity and machine resources remain device-scoped under the common data directory: `device-id`, repository registration, managed worktrees, agent credentials/accounts, and UI settings. They are available across profiles, but they do not contain or expose another profile's transcripts or attachments.
+
+#### Privacy boundary and follow-ups
+
+This first local-first change does not upload, import, link, or delete local sessions when a user signs in. Local attachments remain jailed under the local upload root and are not readable through the synced attachment cache. Returning to local-only mode reopens the same local identity and data.
+
+##### Remote workspace file trust boundary
+
+Devices authenticated to the same synced account are trusted peers for remote workspace control. A peer may send relay-forwarded workspace file requests to the device that owns a checkout; the owning engine resolves the target and enforces workspace-relative path, containment, symlink, and write-conflict checks before touching its filesystem.
+
+Ignored-file visibility is not an authorization boundary. A remote peer may request ignored entries and then read or write them, including potentially sensitive files such as `.env`, when `includeIgnored` is enabled. `.git` remains unavailable regardless of that option. Zeron intentionally does not maintain a filename denylist because it would be incomplete and could imply a security guarantee it cannot provide.
+
+If authenticated devices must no longer trust one another with the full workspace, that policy must be enforced by the owning engine for remote requests. Hiding entries only in the UI is not a security control.
+
+The following product work is intentionally deferred:
+
+1. Explicit session selection and copy between local and synced profiles, including attachment copying, provenance, and conflict behavior.
+2. Browsing both scopes simultaneously or switching the visible scope without restarting the engine.
+3. A supported self-hosted backend contract covering authentication modes, room APIs, authorization, persistence, and blob storage. Current endpoint and bearer overrides remain development/deployment seams, not a promised compatibility surface.
 
 ## 2. Data model — all Loro
 
-Two doc kinds, one room protocol (loro-protocol over WebSocket, the same protocol the TS edge
-already speaks; Rust side uses the official `loro-protocol`/`loro-websocket-client` crates or a
-thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit criterion):
+Two persistent doc kinds. When sync is enabled, session docs ride the chat2 row protocol (loro updates as append-only rows + Range-resumable checkpoints, ChatRoom DO) and the registry rides its own row-frame protocol; local-only profiles persist the same docs without joining rooms:
 
 1. **Session doc** (per chat) — the transcript + durable command queue. Schema is a Rust port of
    `packages/session-doc` (same container names/shapes so the edge's tail materializer keeps
@@ -75,169 +103,16 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    Continuation splitting at 256KB, render-only tool parts (full inputs stay in the host's local
    run journal), tail/diff sidecars. Constants carried over (`STREAM_COMMIT_MS=120`,
    `DO_FLUSH_MS=5s`, compaction at 8MB, retain 30d, tail 64).
-   `chatId` is a client-minted UUID and the stable cross-client session reference; every boundary
-   canonicalizes it to lowercase. The edge additionally scopes the Durable Object key to the
-   verified project (and to the deployment for sandbox-device credentials), so knowing a UUID is
-   not authorization.
 
-   **Inter-session message visibility:** Crew collapses native peer inputs behind an
-   explicit Show/Hide disclosure on desktop and iOS. The host derives optional
-   `peerMessage: { commandId, sourceChatId, threadId, replyTo? }` from the exact typed
-   `PeerMessage` command whose id becomes the user message id. Metadata and original
-   parts are committed together; waiter delivery, active steering, queued turns,
-   command correlation, and agent input remain unchanged. Snapshots, full/window
-   reads, continuation joins, RPC reset/upsert deltas, and edge tails retain it.
-   Hidden inputs do not provide rail/shared-session body previews or generated titles;
-   workspace activity still advances with a content-free preview. Assistant replies
-   remain ordinary visible conversation.
+2. **Workspace registry doc** (per profile) — the `registry1` snapshot stores spaces (id, deviceId, path, name?, gitDetected, checkoutId, repositoryId), the chats index (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt, lastMessagePreview/At, config), devices, session-status rows, and checkout-diff summary pointers. A space is a device+folder pair in the active profile; the owning device's `SpacesSync` stamps git presence so branch pickers and the diff sidebar can gate without another RPC, plus a repository identity (the trunk's root commit, so renames, transfers and remote spellings don't split a repository; a shallow or empty history falls back to the normalized origin remote, then a device-scoped common-git-dir hash) that groups clones and worktrees of one repository in the sidebar's project mode. Local scope keeps the registry entirely in its profile store. Synced and development scopes join `/registry/{orgId}/ws`, backed by the private per-user room `reg1/{orgId}/{userId}`; rows are never visible to every member of an organization.
 
-   Missing/malformed metadata, mismatched identity, non-user roles, and orphan
-   continuations remain visible. User text imitating a peer prefix is never classified.
-   Old records stay visible even when an old command ledger supplies a matching id:
-   no backfill or destructive migration. Native history imported without this metadata
-   stays visible. Unknown additive metadata fields are tolerated; older clients that
-   do not implement the disclosure will continue showing the original message.
+   Writer discipline: each device writes its own device and session-status rows, rows for chats it hosts, and git stamps for spaces it owns. Creates, renames, archives, and seen marks are LWW sets accepted from any device. `deleteSpace` tombstones the space and every chat/session row in it in one commit. Presence uses ephemeral room frames rather than durable heartbeat writes.
 
-   Desktop transcript windows keep their text budget. Explicit reveal of a truncated
-   peer row calls `ReadDocMessage { chatId, messageId, roomProjection? }` to load only
-   the original message and compatible continuations, using the same scoped document
-   access as `ReadDocMessages`. Failed reads expose a retryable error, not an invented
-   body. Reveal state is view-local; original content is never deleted or replaced.
+   *Why one registry and not N tiny docs:* the sidebar needs one subscription for the whole list (grouping, resort animations, unseen markers). Its rows contain indexes rather than transcripts, so one local snapshot and, when enabled, one room connection remain bounded and cheap.
 
-   Focused verification (Rust/Xcode commands run only in an authorized remote build
-   environment; do not run local typechecks or Cargo builds/tests):
-   `cargo test -p comet-doc schema::tests`,
-   `cargo test -p comet-doc transcript_delta::tests`,
-   `cargo test -p comet-engine --test peer_messages`,
-   `cargo test -p comet-ui peer_`,
-   `cargo test -p comet-ui imported_session_preview_skips_peer_turns_and_evicts_stale_body`,
-   `cargo test -p comet-ui rail::tests`, and
-   `cd edge && npm test -- src/session-doc/messages.test.ts`.
-   Authorized macOS CI uses `CREW_MOBILE_ENVIRONMENT=staging node scripts/mobile-ci.mjs`
-   and the same command with `production`. Its existing `verifySimulator` launches
-   `-visibility-e2e` and now requires six regression markers, including
-   `OK Crew peer message visibility` from the actual Loro/row/disclosure scenario.
-   This runs before archive creation; an unsigned archive alone is not UI proof.
-   With newly built desktop/iOS apps, verify idle/send/reply, live waiter, active
-   step/turn-boundary steering, timeout/late reply, disconnect/restart, legacy and
-   lookalike text, collapse/reveal/copy, and long-message readback after newer output
-   consumes the transcript budget. Collapsed text must not appear in pixels,
-   accessibility descendants, selection/copy, or previews; ordinary conversation and
-   agent delivery must remain intact. Old installed binaries are not verification.
-
-2. **Workspace doc** (per verified project) — **spaces**
-   registry (id, deviceId, path, name?, gitDetected, checkoutId — a space is a synced
-   device+folder pair, the app's unit of organization; the owning device's SpacesSync stamps git
-   presence so branch pickers / the diff sidebar gate on a synced bool, no RPC), chats index
-   (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt,
-   lastMessagePreview/At, config), devices registry (id, name, platform, devboxProvider?, devboxId?, lastSeenAt), session
-   status rows (Working indicator; staleness-checked client-side so a crashed backend never shows
-   eternal "Working"), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
-   behind the "completed (unseen)" indicator. Lives in its own DO room (same SessionRoom DO
-   class, doc id `ws4/{projectScope}`), with presence
-   via Loro `EphemeralStore` (replaces the 15s heartbeat writes). Writer discipline: each device
-   writes only its own device/session/chat rows and the git stamps of spaces it owns;
-   creates/renames/archives/seen-marks are LWW map sets from any device. `deleteSpace` cascades:
-   the space row and every chat/session row in it tombstone in one commit.
-   Optional `devboxProvider: "namespace" | "boat"` and immutable `devboxId` identify
-   a devbox independently of OS and execution authority. Namespace uses its Linux
-   task directory; Boat must match the configured ID to current native `BOAT_ID`.
-   Legacy Namespace fields migrate once; neutral fields keep older readers compatible.
-   Missing provider data remains Local. Only the local authenticated controller may
-   dispatch a provider wake, and the exact Crew peer must confirm readiness.
-   If workspace heartbeats stop, the engine verifies stale devices against their device-relay
-   status in parallel. Each positive result immediately refreshes the device watch; historical
-   devices with slow or failed status requests cannot delay an active host's online badge.
-   Failed requests never establish liveness; without fresh evidence, the badge goes offline after 70 seconds.
-   Per-principal `sessionRefs` rows determine session discovery across that user's Crew clients.
-   Owned-session creation and explicit imports publish memberships; imports never assign host
-   placement. Legacy membership recovery runs for newly arriving rows, including after initial
-   backfill, using identity-local run journals or owner publications—not shared rows or an
-   arbitrary cached transcript. Removed memberships retain their tombstones and are not restored
-   by migration. Another principal's refs remain excluded from the local watch.
-
-   Scaffold hosts join the same project workspace room as controllers. Sandbox credentials
-   are trusted to read project-wide workspace metadata and publish workspace updates, subject
-   to their existing read/publish capabilities and grant expiry/revocation. Other session and
-   device routes remain scoped to the assigned session/device; cross-project access and
-   workspace reset-log stay denied. Native handoffs publish status under the canonical chat
-   identity while retaining private execution IDs for turn guards. Terminal transitions advance
-   `lastMessageAt`, including tool-only turns; heartbeats and repeated idle teardown do not
-   manufacture unread activity. Ordinary hosts also publish their canonical room status,
-   without rekeying existing bare-chat writers. Controllers observe pinned remote rooms
-   through existing DocHost handles and merge a principal-local activity watch with
-   workspace status using the newest original same-owner publication. Older observations
-   cannot backdate status; locally hosted runs keep direct live-status precedence.
-   The selected desktop thread also compares its direct room projection against
-   the workspace watch: a newer same-device owner heartbeat/outcome wins. Engine
-   and viewport share the principal/environment/lifecycle-aware child selector;
-   metadata, unrelated writers and expired heartbeats cannot refresh liveness.
-   Snapshot recovery also compares the retained baseline, pending observation and
-   cached owner status before accepting an incoming checkpoint. Status, run identity
-   and retry state form one clocked publication; original semantic intents remain durable.
-   Observers cover recent remote rooms plus fresh active sessions. Ordinary imported
-   memberships without a chat row may consume canonical same-owner Local status,
-   but do not invent a workspace placement; an arriving chat row fences device
-   ownership. Desktop device probes start immediately and publish each reachable
-   peer independently. Local presence does not depend on
-   the workspace socket. Background observation never resumes a paused sandbox;
-   explicit Attach obtains verified grant authority before opening legacy caches.
-
-   *Why a workspace doc and not N tiny metadata docs:* the sidebar consumes one engine
-   subscription for the whole list (grouping, resort animations, unseen markers).
-   Shared metadata remains one workspace room and mirror; remote-room activity observers
-   keep liveness independent of workspace materialization.
-   Workspace history uses **lossless snapshot folding**, not age- or size-based shallow trimming:
-   disconnected writers may still depend on any retained operation. This trades increasing
-   retained history for correct offline merges; transcript-room retention is separate. Fresh
-   readers receive the persisted baseline followed by ordered accepted deltas, avoiding a
-   whole-history export for every sign-in.
-   Client snapshot admission also preserves the room's retained causal history:
-   a newer version vector does not authorize advancing its shallow-history boundary.
-   Cold replay imports the baseline snapshot separately, then batches retained deltas
-   so each persisted update does not rematerialize the workspace's intermediate state.
-
-   Authorized workspace recovery may atomically replace a wedged room with one bounded complete
-   snapshot. The edge validates the snapshot envelope and enforces an 8 MiB observed-byte limit
-   before clearing old state, so independently compacted clients cannot race to seed incompatible
-   causal boundaries. An empty reset body retains the legacy clear-and-reupload operation.
-
-   A join response is not proof of convergence. Native clients retain advertised remote version
-   requirements across reconnects, wait for materialized backfill and catch-up upload ACKs, and
-   stay disconnected on rejection or unresolved dependencies. Pending initial joins are owned
-   by the workspace or session handle and are cancelled when it is dropped; adopting a trusted
-   session projection also cancels the old pending join. The edge acknowledges only complete
-   accepted imports; compatible concurrent snapshots retain both branches. A legacy room with
-   pending history reports `JoinError(AppError, "incomplete_history")` without advertising a
-   partial version. An authorized writer may supply a complete snapshot on that recovery-only
-   socket, then rejoin after its ACK. Fresh empty readers cannot manufacture missing history.
-   A matched successful complete-snapshot repair ACK releases cold journal recovery
-   only after scope-checked acknowledgement and advertised-history coverage. The
-   following equal-version JoinOk may have no backfill; it must still reach ready
-   once pending uploads are acknowledged. Unknown ACKs and rejected scopes cannot
-   release the recovery gate.
-   Workspace replay failures preserve stored bytes and keep cold replay retryable after
-   transient resource failures; the transcript crash budget must not permanently lock
-   workspace discovery. Irreversibly trimmed gaps still require a replica or backup
-   covering their dependencies, never automatic resets or silent loss.
-   Full backfill may be a snapshot plus journal or a journal alone. Journal-backed
-   clients assemble either shape in an isolated recovery document and adopt only
-   after the advertised frontier materializes, then wait for retained local edits'
-   upload acknowledgements. Socket read/write progress is independent and bounded;
-   unacknowledged writes redial rather than waiting for the idle-room probe.
-   Edge membership changes reread WebSocket attachments after asynchronous work.
-   Persisted updates fan out to independently authorized readers even if the
-   publisher disconnects; publisher acknowledgements remain authority-gated.
-   Mobile transcript projection publishes each coherent completed read and schedules
-   a trailing pass, so an ongoing stream cannot indefinitely invalidate rendering.
-
-   Rollout: deploy the edge changes before publishing desktop and mobile builds. Older clients
-   cannot perform the new incomplete-history handshake, so both native updates are needed for
-   recovery and membership reconciliation. No account-specific cache migration is required.
-
-3. **Mirror layer** (`comet-doc` crate) — Rust equivalent of loro-mirror: typed structs for the
+3. **Mirror layer** (`zeron-doc` crate) — Rust equivalent of loro-mirror: typed structs for the
    schema, **incremental** application of `doc.subscribe` diffs into cached state (no full
-   re-hydration per change — this is also what fixes comet's known O(transcript) re-projection
+   re-hydration per change — this is also what fixes zeron's known O(transcript) re-projection
    inefficiency, remaining-work item 1a), and a diff-reconcile write path (evaluate `lorosurgeon`
    0.2.x as a dep; our schema is small enough to hand-roll if it doesn't fit). The UI renders
    mirror state directly with per-entry change notifications — the "endgame" the TS
@@ -247,42 +122,42 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
 Send/steer/interrupt/respondInput = durable command entries in the session doc (`QueueCommand`),
 executed by the chat's **host** device (executor gated on chat ownership; mark-processed BEFORE
 execute; steer with no live run dispatches as the next turn). Offline sends queue in the doc.
-This is comet's proven design, kept verbatim.
-`TakeOverOmpSession` is a device-routed recovery exception: the owning engine verifies exact
-write-capable journal holders, stops only a configured OMP process tree or a same-user orphaned
-OMP tool, waits for writer release, then retries the blocked user message idempotently.
+This is zeron's proven design, kept verbatim.
 
 ## 3. Cargo workspace
 
 ```
-comet-native/
+zeron/
   Cargo.toml                 # workspace
   crates/
-    proto/        comet-proto    # wire types: AgentEvent, ToolCall, RunRequest, Model,
+    proto/        zeron-proto    # wire types: AgentEvent, ToolCall, RunRequest, Model,
                                  # entities, RPC envelopes (serde; ndjson framing);
                                  # `view` = the pure derivations both frontends share
                                  # (sort orders, staleness gating, grouping, boot gate)
-    doc/          comet-doc      # session-doc + workspace-doc schemas, mirror layer,
+    doc/          zeron-doc      # session-doc + workspace-registry schemas, mirror layer,
                                  # parts fold, continuations, command ledger, sidecars
-    sync/         comet-sync     # loro room client (join/VV backfill/fragments/backoff),
+    sync/         zeron-sync     # loro room client (join/VV backfill/fragments/backoff),
                                  # ephemeral presence, DocsStore (SQLite snapshots +
                                  # processed-command ledger)
-    harness/      comet-harness  # Harness trait + claude-code (stream-json subprocess),
+    harness/      zeron-harness  # Harness trait + claude-code (stream-json subprocess),
                                  # codex (app-server JSON-RPC), mock; steering mailbox,
                                  # requestInput, models/reasoning/options catalogs
-    engine/       comet-engine   # sessions engine (pub/sub, run journal, recovery, stall
+    engine/       zeron-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty), uploads,
-                                 # agent accounts (cred swap), Scaffold IAP identity,
+                                 # agent accounts (cred swap), auth (WorkOS via edge),
                                  # device-room host/peers, identity
-    rpc/          comet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
+    rpc/          zeron-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
                                  # sockets ({s,k,to,from} frames)
-    ui/           comet-ui       # gpui app: shell, sidebar, conversation, composer,
+    theme/        zeron-theme    # source-neutral theme schema + built-in/custom registry,
+                                 # validation, provenance, and local VS Code compiler
+    voice/        zeron-voice    # desktop-local optional Parakeet model, capture and inference; no RPC/sync
+    ui/           zeron-ui       # gpui app: shell, sidebar, conversation, composer,
                                  # terminal view, diff pane, settings, animation kit
   apps/
-    comet/                       # the binary (headed default, `headless` subcommand)
-  edge/                          # TypeScript Worker + DOs (ported from comet/apps/edge,
+    zeron/                       # the binary (headed default, `headless` subcommand)
+  edge/                          # TypeScript Worker + DOs (ported from zeron/apps/edge,
                                  # + auth-exchange routes absorbed from apps/server)
   docs/                          # this file + research reports
 ```
@@ -309,7 +184,7 @@ feature spec `docs/research/feature-inventory.md` §1.
   - row height memoization keyed by (row id, content length, width) so a streamed token
     re-measures one row;
   - scroll-anchor absorption for above-viewport height changes.
-- **Markdown** (`comet-ui::markdown`): `pulldown-cmark` parsing on `background_spawn` with
+- **Markdown** (`zeron-ui::markdown`): `pulldown-cmark` parsing on `background_spawn` with
   coalescing (Zed's proven pattern), block-level incremental re-parse of the streaming tail
   (incremark's O(delta) idea: only re-parse from the last stable block boundary), monochrome
   theme where **numbers drive layout, colors are paint**. Code blocks: monospace, no wrap ⇒
@@ -328,19 +203,24 @@ feature spec `docs/research/feature-inventory.md` §1.
   drag 160px–55vh, 12ms input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
 - **Diff pane**: unified-patch parser → virtualized file/hunk/line rows, per-file collapse
   (180ms height tween), time-sliced highlight, 200ms width transition on the pane itself.
-- **Animation kit** (`comet-ui::motion`): small helpers over gpui `Animation` reproducing the
-  comet catalog — `fade-in` (0.5s, cubic-bezier(0.16,1,0.3,1), translateY 4→0), `splash-out`,
-  `comet-pulse` staggered cell wave (boot splash + loaders), `gradient-spin-pulse` matrix
+- **Animation kit** (`zeron-ui::motion`): small helpers over gpui `Animation` reproducing the
+  zeron catalog — `fade-in` (0.5s, cubic-bezier(0.16,1,0.3,1), translateY 4→0), `splash-out`,
+  `zeron-pulse` staggered cell wave (boot splash + loaders), `gradient-spin-pulse` matrix
   spinner (WorkingIndicator + rotating flavour word), `menu-in`/`dialog-in` scale-fades, 200ms
   ease-out width/height transitions for sidebar/panes, sidebar-resort **slide animation**
   (we own the list, so animate row positions directly — the View Transitions equivalent, 260ms
   cubic-bezier(0.22,1,0.36,1)), reduced-motion switch.
-- **Theme**: always-dark monochrome, oklch-derived neutral scale precomputed to Hsla, hairline
-  borders, Geist/Geist Mono bundled fonts.
+- **Theme**: independent light/dark resolved variants, theme-owned semantic/syntax/terminal
+  palettes, optional interaction-accent overlays, and a device-local surface preference that
+  resolves each variant's recommended frost/opaque treatment without changing theme selection.
+  Forced frost derives contrast-checked tints from mapped theme surfaces. Local VS Code
+  file/package compilation and imported/linked custom families retain last-known-good
+  persistence. Colors remain paint-only; hairline borders and bundled Geist/Geist Mono remain
+  shared presentation foundations.
 
 ## 5. Engine plan
 
-Direct ports of comet behaviors (spec: feature-inventory §3):
+Direct ports of zeron behaviors (spec: feature-inventory §3):
 - **Sessions engine**: per-session broadcast hub; on-disk run journal (resumable `seq` replay,
   crash auto-resume); persistent steerable sessions (steering mailbox at step/turn boundary; idle
   reaper; 10min stall watchdog); recovery stamps `aborted`.
@@ -348,93 +228,37 @@ Direct ports of comet behaviors (spec: feature-inventory §3):
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
   snapshot store.
-  Watchers retain `Arc<SessionEntryWindow>` snapshots so each subscriber avoids
-  copying the bounded transcript tail; older snapshots and paging cursors remain
-  immutable across subsequent publications.
-- **Harness**: one `Harness` trait over Claude Code stream-json, Codex app-server JSON-RPC, and
-  persistent OMP native RPC. Persistent OMP runs launch under a separate Comet supervisor and
-  process group on macOS and Linux. Explicit interrupts send `SIGTERM`, poll the child through the
-  configured harness grace, and send `SIGKILL` only while it remains alive. After settlement the
-  engine best-effort probes the exact journal for daemonized residual holders; an inconclusive
-  cleanup probe is logged without reversing a successful Stop. Resume probes count only
-  write/append journal descriptors; verified takeover accepts configured OMP ancestry or a
-  same-user holder orphaned directly under PID 1, while unrelated live holders
-  fail closed.
-  OMP todo and goal-command snapshots use nonblocking `get_state` requests so the
-  bounded stdout queue keeps draining while replies arrive behind tool output.
-  Refreshes retain only the latest request per state kind, expire after 15 seconds
-  without another refresh, and never prevent steering or Stop. Mailbox-close
-  teardown waits for pending snapshots to settle or expire.
-  Managed OMP runs pass configuration overlays through repeatable `--config <path>`
-  arguments. Inherited `PI_CONFIG_FILES` entries are split using the host's path-list
-  syntax and forwarded unchanged in their original order, leaving path resolution and
-  missing-file errors to OMP; Crew's private run overlay comes last. Crew removes
-  `PI_CONFIG_FILES` from the child environment so descendants cannot inherit the
-  temporary overlay path. The parent environment is unchanged. The overlay remains
-  run-owned across turns and is removed best-effort when its owner drops; see
-  `OmpRunConfig` in `crates/harness/src/omp/mod.rs` for creation and cleanup.
-  Prime Agent and local Devin/Grok/Hermes/Pi reuse the shared ACP transport and
-  persistent turn loop. Startup drains replay without duplicating history; model
-  selection prefers live config options, with legacy `session/set_model` support.
-  Grok completion notifications must match the current session and prompt ID;
-  cancelled/timed-out requests release pending RPC state. New ACP agents never
-  inherit a Crew inference route or gain Scaffold-host capabilities.
-- **Repos/diffs**: git2 or `git` subprocess (subprocess — matches comet, avoids libgit2 edge
-  cases); worktrees under `~/.comet-native/worktrees`; fs watchers (`notify`) + 2min repair; diff
-  capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace doc summary + DO diff
+- **Harness** (research pending — `docs/research/harness.md`): trait mirroring zeron's
+  `HarnessShape`; Claude Code via `claude` CLI stream-json in/out (control protocol for
+  permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
+  `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
+- **Repos/diffs**: git2 or `git` subprocess (subprocess — matches zeron, avoids libgit2 edge
+  cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
+  capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff
   sidecar.
-  Managed checkout names combine 32 adjectives and 48 nouns (1,536 pairs), including
-  architecture/construction terms. Allocation starts at a time-derived offset and checks
-  every pair once before reporting exhaustion; existing directories and branches reserve names.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
   elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
-- **Auth**: verified Google Cloud IAP principals and Scaffold-scoped grants; local development uses an explicit mock principal and never production credentials.
+- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
+  callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
 
-## 6. Edge and deployment
+## 6. Edge plan (TypeScript, `edge/`)
 
-The TypeScript edge hosts SessionRoom and DeviceRoom Durable Objects plus the R2 attachment seam. Release artifacts are promoted separately to private, environment-isolated GCS buckets. Room authority comes from Scaffold's existing Google Cloud IAP access path. Deterministic room keys bind the authorized Scaffold project, deployment, and thread/session scope; caller-supplied organization identifiers never grant access.
-
-`edge/wrangler.jsonc` is the source of truth for two isolated environments:
-
-- `staging`: staging Worker, Durable Objects, blobs, releases, Scaffold control-plane URL, and project scope.
-- `production`: production Worker, Durable Objects, blobs, releases, Scaffold control-plane URL, and project scope.
-
-No Cloudflare account ID is checked in. `.github/workflows/deploy.yml` builds one candidate, records its SHA-256 and source provenance, and deploys it through the `comet-staging` GitHub environment. The manual production path reuses those platform-scoped deployment credentials only after the downloaded candidate, build output, and staged digest are equal and the GCP project/provider assertions pass. Release-feed credentials have separate protected environment boundaries described below.
-
-The deployment boundary requires `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, and `GCP_SERVICE_ACCOUNT`; required variables are `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE`. Release promotion uses `comet-release-staging` and `comet-release-production`, each with `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`, and `COMET_RELEASES_GCS_BUCKET`, plus the `GCP_PROJECT_ID` variable. Release buckets are private; publishers use environment-specific Workload Identity, while edge release readers are synchronized from protected GitHub environment secrets.
-
-Release-feed Worker secrets have a separate synchronization boundary inside the
-Deploy workflow. The staging and production sync jobs enter
-`comet-release-staging` and `comet-release-production`, respectively, and read
-the Cloudflare deployment credential plus the bucket and read-only GCS service
-account credentials from that environment. Both reader values absent means
-"preserve the current Worker secrets"; exactly one present, a malformed private
-key, or a missing Cloudflare/bucket value fails before mutation. A valid complete
-set is uploaded with one Wrangler bulk-secret operation. Local secret mutation
-is not a supported deployment path.
-
-`sync-production-release-feed-secrets` is also the sole manual approval gate for
-each production edge deployment. `production` depends on it even when the
-reader pair is absent and synchronization preserves the existing secrets. The
-approval therefore authorizes the production deployment boundary, not just a
-secret mutation.
-
-Run staging or the staging-to-production path with:
-
-```bash
-gh workflow run deploy.yml -f target=staging
-gh workflow run deploy.yml -f target=production
-```
-
-The local two-device contract smoke is `node scripts/headless-collaboration-smoke.mjs`; it needs no Cloudflare, GCP, Scaffold, or agent credentials.
+Port `zeron/apps/edge` nearly verbatim (it is already Loro-native and smoke-tested: session room
+w/ hibernation + two-level compaction + daily alarm backups, device room byte relay + nudges +
+sidecar slots, R2 attachments, JWKS auth). Additions:
+1. Private per-user registry rooms (`/registry/{orgId}/ws` → `reg1/{orgId}/{userId}`) with authenticated row sync and ephemeral device presence.
+2. `/auth/*` routes absorbed from `apps/server` (WorkOS API key in Worker secret).
+3. Drop `/seed` migration path and legacy sync anything (fresh app).
+Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
+per `docs/research/durable-objects-language.md`.
 
 ## 7. Parity exclusions & deliberate changes
 
 - **Excluded**: token-usage display (profile heatmap, lifetime stats, per-message token columns,
   `WatchUsage`). Rate-limit meters on agent accounts are *kept* (separate concern; probed from
   CLIs, not CRDT-synced).
-- **Changed**: Postgres entity sync/server → workspace doc + edge; Electron/React/mugen → gpui with
-  ported techniques; Node harness SDKs → subprocess protocols; WebRTC → device-room relay (comet
+- **Changed**: Postgres entity sync/server → workspace registry + edge; Electron/React/mugen → gpui with
+  ported techniques; Node harness SDKs → subprocess protocols; WebRTC → device-room relay (zeron
   had already made this move); mobile app → out of scope for this repo.
 - **Kept verbatim**: session-doc schema shape + constants, command ledger rules, edge DO design,
   render-parts privacy policy, UX behaviors and animation timings.
@@ -445,28 +269,32 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 
 - ✅ **M0 Scaffold** — workspace builds; `proto`/`doc` crates with ledger + parts + continuation
   unit tests; gpui hello-window runs.
-- ✅ **M1 Doc + sync core** — `comet-doc` mirror over loro 1.13; room client syncs with the edge
+- ✅ **M1 Doc + sync core** — `zeron-doc` mirror over loro 1.13; room client syncs with the edge
   running under `wrangler dev`; Rust⇄edge⇄Rust convergence test (M1 exit: two Rust peers converge
   through a real SessionRoom DO, tail endpoint serves).
-- ✅ **M2 Engine core** — Claude harness end-to-end headless: `comet headless` + dev auth runs a
+- ✅ **M2 Engine core** — Claude harness end-to-end headless: `zeron headless` + dev auth runs a
   turn, journal + doc writes, recovery test.
 - ✅ **M3 UI core** — shell (sidebar/panes/header), transcript (virtualized, markdown, streaming,
   stick-to-bottom), composer (send/steer/stop, question panel); local chat fully usable headed.
-- ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, scoped workspace sync, participant capabilities, and presence. `scripts/headless-collaboration-smoke.mjs` deterministically covers two headless devices, concurrent agent sessions, owner-only commands, merged publications, and reconnect.
+- ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, workspace
+  registry sync, WorkOS auth + org gate, presence. Proven live by `scripts/e2e-smoke.sh`:
+  two headless engines against a real edge — B queues a run into the chat doc, the durable
+  nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
   agent accounts UI, settings (devices/shortcuts/archived), Codex harness. Gaps: composer
   attachment UI (engine upload RPCs exist), Cursor harness.
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
   (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
-  not executed — needs a Mac). Gaps: prefers-reduced-motion and engine hardening (instance lock, watchdogs).
+  not executed — needs a Mac). Gaps: prefers-reduced-motion, engine hardening
+  (instance lock, watchdogs), edge production deploy.
 
 ## 9. Open questions (tracked, non-blocking)
 
 1. loro-protocol Rust client ⇄ TS edge interop — verify at M1; fallback is a ~300-line hand-rolled
    client (the frame protocol is small and we control both ends).
 2. `lorosurgeon` fit for the mirror write path vs hand-rolled reconcile.
-3. Cursor harness (comet has it; CLI surface for Rust TBD) — parity item, scheduled after Codex.
+3. Cursor harness (zeron has it; CLI surface for Rust TBD) — parity item, scheduled after Codex.
 4. Text shaping performance for analytic row heights: gpui measures shaped text natively (Rust ⇒
    cheap), so we start with gpui `list()` measurement + memoization rather than porting pretext's
    full analytic kernel; revisit only if cold-open of huge transcripts measures slow.

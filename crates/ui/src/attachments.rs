@@ -1,9 +1,9 @@
-//! Attachments (feature-inventory §1.7/§1.8): composer-staged images and
-//! pasted text, chunked upload to the chat's host device, the plain-text
-//! attachment-ref transport that rides the prompt, the transcript read-back
-//! cache for images, and the full-size image preview lightbox.
+//! Attachments (feature-inventory §1.7/§1.8): the composer's staged images,
+//! the chunked upload to the chat's host device, the plain-text attachment-ref
+//! transport that rides the prompt, the transcript read-back cache, and the
+//! full-size preview lightbox.
 //!
-//! Ports of comet's `composer/use-attachments.ts` (staging/upload),
+//! Ports of zeron's `composer/use-attachments.ts` (staging/upload),
 //! `control/message-attachments.ts` (the `withAttachments` /
 //! `parseUserMessageImages` text transport — attachment refs are embedded in
 //! the user message's plain text, which is exactly what persists in the doc),
@@ -12,35 +12,31 @@
 //! round-trip).
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
-use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::TryStreamExt as _;
 use gpui::{
-    AnyElement, BackgroundExecutor, Image, ImageFormat, ObjectFit, SharedString, Size,
-    StyledImage as _, div, img, prelude::*, px,
+    AnyElement, BackgroundExecutor, Image, ImageFormat, SharedString, Size, div, prelude::*, px,
 };
 
 use crate::state::EngineHandle;
 use crate::theme::ink;
-use comet_rpc::methods;
+use zeron_rpc::methods;
 
-/// Disk images up to this size retain an in-memory thumbnail. Larger images
-/// still upload from their path without a preview or a size ceiling.
-const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 24 * 1024 * 1024;
-/// Folder selections remain file-count bounded, but individual and aggregate
-/// byte sizes are not capped.
-pub const MAX_FOLDER_ATTACHMENT_FILES: usize = 200;
-const FOLDER_NAME_PREFIX: &str = "cf1-";
-const MAX_FOLDER_UPLOAD_NAME_BYTES: usize = 240;
-/// Base64 chars per `UploadChunk` (comet state.ts `UPLOAD_CHUNK` — sized for
-/// the relay when the target device is remote).
-pub const UPLOAD_CHUNK_B64_CHARS: usize = 60_000;
-const UPLOAD_CHUNK_BYTES: usize = UPLOAD_CHUNK_B64_CHARS / 4 * 3;
+/// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
+pub const MAX_ATTACHMENT_BYTES: u64 = 24 * 1024 * 1024;
+/// Base64 chars per `UploadChunk`, sized against the relay's hard ceiling:
+/// Cloudflare caps a WebSocket message at 1 MiB, and a chunk rides one relay
+/// frame (JSON envelope + uleb header add ~150 bytes) — 680 000 chars ≈
+/// 510 KB binary leaves ~35% headroom. Multiple of 4 so a slice of the
+/// whole-file base64 stays independently decodable. The old 60 000 (45 KB)
+/// made a 3 MB screenshot ~70 sequential round trips — each one a stall
+/// opportunity on a flaky link.
+pub const UPLOAD_CHUNK_B64_CHARS: usize = 680_000;
 /// state.ts `MAX_ATTACHMENT_READ_CHUNKS` — bounds the read-back loop.
 const MAX_READ_CHUNKS: usize = 1_000;
 
@@ -50,63 +46,89 @@ const MAX_READ_CHUNKS: usize = 1_000;
 
 /// The body used for image-only sends (`use-attachments.ts`).
 pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
-/// The body used when one or more non-image files are the only prompt content.
+/// The body used when any attachment is not an image.
 pub const FILE_ATTACHMENT_ONLY_TEXT: &str = "See the attached file(s).";
-/// Historical placeholder persisted by large-paste-only messages.
-const LEGACY_TEXT_ATTACHMENT_ONLY_TEXT: &str = "See the attached text.";
 
-/// How attachments ride the prompt: plain local paths appended to the text.
-/// Files are staged on the device that runs the agent, so the agent can open
-/// them with its own tools; the same text persists as the user doc entry.
-pub fn with_attachment_files(text: &str, image_paths: &[String], file_paths: &[String]) -> String {
-    if image_paths.is_empty() && file_paths.is_empty() {
-        return text.to_string();
-    }
-    let body = if !text.is_empty() {
-        text
-    } else if file_paths.is_empty() {
+/// Whether `text` is the placeholder body of an attachments-only send.
+pub fn is_attachment_only_text(text: &str) -> bool {
+    text == ATTACHMENT_ONLY_TEXT || text == FILE_ATTACHMENT_ONLY_TEXT
+}
+
+/// The placeholder body for an attachments-only send of `paths`.
+pub fn attachment_only_text(paths: &[String]) -> &'static str {
+    if paths.iter().all(|path| is_image_path(path)) {
         ATTACHMENT_ONLY_TEXT
     } else {
         FILE_ATTACHMENT_ONLY_TEXT
-    };
-    let mut content = String::with_capacity(
-        body.len()
-            + image_paths.iter().map(String::len).sum::<usize>()
-            + file_paths.iter().map(String::len).sum::<usize>()
-            + 128,
-    );
-    content.push_str(body);
-    if !image_paths.is_empty() {
-        content.push_str("\n\nAttached images (local files — open them to view):");
-        for path in image_paths {
-            let _ = write!(content, "\n- {path}");
-        }
     }
-    if !file_paths.is_empty() {
-        content.push_str("\n\nAttached files (local files — open them to inspect):");
-        for path in file_paths {
-            let _ = write!(content, "\n- {path}");
-        }
-    }
-    content
 }
 
-/// Compatibility entry point for the existing image-only transport.
+/// Whether an attachment ref names an image, as opposed to any other file.
+pub fn is_image_path(path: &str) -> bool {
+    format_by_extension(Path::new(path)).is_some()
+}
+
+pub use zeron_proto::attachment_mentions::attachment_display_name;
+
+/// Whether `mention` is the chip for the attachment at `path`.
+pub fn chip_names_attachment(
+    mention: &zeron_proto::attachment_mentions::AttachmentMention,
+    path: &str,
+) -> bool {
+    mention.names_attachment(path)
+}
+
+/// Number restored attachments after the chips in `text` that name them, so
+/// those chips stay live; an attachment no chip names is left unnumbered.
+pub fn pair_with_chips(text: &str, attachments: &mut [StagedAttachment]) {
+    let chips = zeron_proto::attachment_mentions::attachment_mentions(text);
+    for att in attachments {
+        att.mention = chips
+            .iter()
+            .find(|chip| chip_names_attachment(chip, &att.name))
+            .map(|chip| chip.index);
+    }
+}
+
+/// The attachments no chip in `text` stands for, in order. A chip is the
+/// attachment's handle wherever it shows, so only these still need a tile;
+/// anything a chip can't be matched to keeps its tile.
+pub fn unchipped_attachments<'a>(text: &str, paths: &'a [String]) -> Vec<&'a String> {
+    let mentions = zeron_proto::attachment_mentions::attachment_mentions(text);
+    paths
+        .iter()
+        .filter(|path| {
+            !mentions
+                .iter()
+                .any(|mention| chip_names_attachment(mention, path))
+        })
+        .collect()
+}
+
+/// How attachments ride the prompt (use-attachments.ts `withAttachments`):
+/// plain local paths appended to the text — the files are staged on the device
+/// that runs the agent, so the agent can open them with its own tools; the
+/// same text is what persists as the user doc entry.
 pub fn with_attachments(text: &str, paths: &[String]) -> String {
-    with_attachment_files(text, paths, &[])
+    if paths.is_empty() {
+        return text.to_string();
+    }
+    let refs: Vec<String> = paths.iter().map(|p| format!("- {p}")).collect();
+    let body = if text.is_empty() {
+        attachment_only_text(paths)
+    } else {
+        text
+    };
+    format!(
+        "{body}\n\nAttached images (local files — open them to view):\n{}",
+        refs.join("\n")
+    )
 }
 
 /// An attachment ref parsed back out of a user message's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserImageAttachment {
-    pub id: String,
-    pub path: String,
-    pub name: String,
-}
-
-/// A non-image file ref parsed back out of a user message's text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserFileAttachment {
+    pub appshot: Option<crate::appshots::AppshotPresentation>,
     pub id: String,
     pub path: String,
     pub name: String,
@@ -114,53 +136,9 @@ pub struct UserFileAttachment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedUserMessage {
-    /// The visible prompt (attachment-ref trailer already stripped).
+    /// The visible prompt (the refs trailer stripped; empty for image-only sends).
     pub text: String,
     pub attachments: Vec<UserImageAttachment>,
-    pub file_attachments: Vec<UserFileAttachment>,
-}
-
-fn folder_upload_name(display_name: &str) -> Option<String> {
-    let mut encoded = String::with_capacity(display_name.len() + FOLDER_NAME_PREFIX.len());
-    encoded.push_str(FOLDER_NAME_PREFIX);
-    for byte in display_name.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-') {
-            encoded.push(char::from(byte));
-        } else {
-            let _ = write!(encoded, "_{byte:02X}");
-        }
-        if encoded.len() > MAX_FOLDER_UPLOAD_NAME_BYTES {
-            return None;
-        }
-    }
-    Some(encoded)
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn decode_folder_upload_name(name: &str) -> Option<String> {
-    let encoded = name.strip_prefix(FOLDER_NAME_PREFIX)?.as_bytes();
-    let mut decoded = Vec::with_capacity(encoded.len());
-    let mut index = 0;
-    while index < encoded.len() {
-        if encoded[index] == b'_' {
-            let high = hex_value(*encoded.get(index + 1)?)?;
-            let low = hex_value(*encoded.get(index + 2)?)?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(encoded[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).ok()
 }
 
 fn name_from_path(path: &str) -> String {
@@ -169,145 +147,99 @@ fn name_from_path(path: &str) -> String {
         .next()
         .map(str::trim)
         .unwrap_or_default();
-    let name = name
-        .split_once('-')
-        .filter(|(prefix, _)| {
-            prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-        .map_or(name, |(_, original)| original);
     if name.is_empty() {
-        "attachment".to_string()
+        "image".to_string()
     } else {
-        decode_folder_upload_name(name).unwrap_or_else(|| name.to_string())
+        name.to_string()
     }
 }
 
-/// Find a refs trailer headed by `needle` (case-insensitive). Returns the byte
-/// offsets for the preceding body gap and the first refs line.
-fn find_refs_marker(content: &str, needle: &str) -> Option<(usize, usize)> {
+/// Find the refs trailer: a blank line, then a line starting (case-insensitive)
+/// with `Attached images (local files` and ending `):`. Returns
+/// `(body_end, refs_start)` byte offsets — the tolerant equivalent of zeron's
+/// `ATTACHED_IMAGES_RE`.
+fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
-    let needle = format!("\n\n{needle}");
-    let gap = lower.find(&needle)?;
-    let line_start = gap + 2;
-    let line_end = content[line_start..]
-        .find('\n')
-        .map(|p| line_start + p)
-        .unwrap_or(content.len());
-    let line = content[line_start..line_end].trim_end_matches('\r');
-    line.ends_with("):")
-        .then_some((gap, (line_end + 1).min(content.len())))
+    let needle = "\n\nattached images (local files";
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(needle) {
+        let gap = from + rel;
+        let line_start = gap + 2;
+        let line_end = content[line_start..]
+            .find('\n')
+            .map(|p| line_start + p)
+            .unwrap_or(content.len());
+        let line = content[line_start..line_end].trim_end_matches('\r');
+        if line.ends_with("):") {
+            let refs_start = (line_end + 1).min(content.len());
+            return Some((gap, refs_start));
+        }
+        from = line_start;
+    }
+    None
 }
 
-fn ref_paths(content: &str, start: usize, end: usize) -> Vec<String> {
-    content[start..end]
+/// message-attachments.ts `parseUserMessageImages`: split the visible prompt
+/// from its attachment-ref trailer.
+pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
+    let Some((body_end, refs_start)) = find_refs_marker(content) else {
+        return ParsedUserMessage {
+            text: content.to_string(),
+            attachments: Vec::new(),
+        };
+    };
+    let body = crate::appshots::strip_context_for_display(content[..body_end].trim_end());
+    let presentations = crate::appshots::presentations(content);
+    let attachments: Vec<UserImageAttachment> = content[refs_start..]
         .lines()
         .filter_map(|line| {
             let path = line.trim_start().strip_prefix("- ")?.trim();
             (!path.is_empty()).then(|| path.to_string())
         })
-        .collect()
-}
-
-fn ref_paths_for_marker(
-    content: &str,
-    marker: Option<(usize, usize)>,
-    markers: &[Option<(usize, usize)>],
-) -> Vec<String> {
-    let Some((gap, start)) = marker else {
-        return Vec::new();
-    };
-    let end = markers
-        .iter()
-        .flatten()
-        .map(|(next_gap, _)| *next_gap)
-        .filter(|next_gap| *next_gap > gap)
-        .min()
-        .unwrap_or(content.len());
-    ref_paths(content, start, end)
-}
-
-/// Split the visible prompt from image and file attachment trailers.
-pub fn parse_user_message_attachments(content: &str) -> ParsedUserMessage {
-    let image_marker = find_refs_marker(content, "attached images (local files");
-    let file_marker = find_refs_marker(content, "attached files (local files");
-    // Existing transcripts used a separate marker for large pasted text.
-    let legacy_text_marker = find_refs_marker(content, "attached text (local files");
-    let markers = [image_marker, file_marker, legacy_text_marker];
-    let image_paths = ref_paths_for_marker(content, image_marker, &markers);
-    let mut file_paths = ref_paths_for_marker(content, file_marker, &markers);
-    let legacy_text_paths = ref_paths_for_marker(content, legacy_text_marker, &markers);
-    if file_marker.map(|(gap, _)| gap) <= legacy_text_marker.map(|(gap, _)| gap) {
-        file_paths.extend(legacy_text_paths);
-    } else {
-        let mut ordered = legacy_text_paths;
-        ordered.extend(file_paths);
-        file_paths = ordered;
-    }
-    if image_paths.is_empty() && file_paths.is_empty() {
-        return ParsedUserMessage {
-            text: content.to_string(),
-            attachments: Vec::new(),
-            file_attachments: Vec::new(),
-        };
-    }
-    let mut body_end = content.len();
-    if !image_paths.is_empty() {
-        body_end = body_end.min(image_marker.expect("non-empty image refs require marker").0);
-    }
-    if !file_paths.is_empty() {
-        if let Some((gap, _)) = file_marker {
-            body_end = body_end.min(gap);
-        }
-        if let Some((gap, _)) = legacy_text_marker {
-            body_end = body_end.min(gap);
-        }
-    }
-    let body = content[..body_end].trim_end();
-    let attachments = image_paths
-        .into_iter()
         .enumerate()
         .map(|(index, path)| UserImageAttachment {
+            appshot: presentations.get(&path).cloned(),
             id: format!("{index}:{path}"),
             name: name_from_path(&path),
             path,
         })
         .collect();
-    let file_attachments = file_paths
-        .into_iter()
-        .enumerate()
-        .map(|(index, path)| UserFileAttachment {
-            id: format!("{index}:{path}"),
-            name: name_from_path(&path),
-            path,
-        })
-        .collect();
+    if attachments.is_empty() {
+        return ParsedUserMessage {
+            text: content.to_string(),
+            attachments,
+        };
+    }
     ParsedUserMessage {
-        text: if matches!(
-            body.trim(),
-            ATTACHMENT_ONLY_TEXT | FILE_ATTACHMENT_ONLY_TEXT | LEGACY_TEXT_ATTACHMENT_ONLY_TEXT
-        ) {
+        text: if is_attachment_only_text(body.trim()) {
             String::new()
         } else {
             body.to_string()
         },
         attachments,
-        file_attachments,
     }
 }
 
-/// What the rail/sidebar shows for a user message with no visible prompt.
+/// message-attachments.ts `userMessageRailText`: what the rail/sidebar shows
+/// for a user message ("Attached image" / "N attached images" when image-only).
 pub fn user_message_rail_text(content: &str) -> String {
-    let parsed = parse_user_message_attachments(content);
+    let parsed = parse_user_message_images(content);
     if !parsed.text.trim().is_empty() {
         return parsed.text;
     }
-    match (parsed.attachments.len(), parsed.file_attachments.len()) {
-        (0, 0) => content.to_string(),
-        (1, 0) => "Attached image".to_string(),
-        (images, 0) => format!("{images} attached images"),
-        (0, 1) => "Attached file".to_string(),
-        (0, files) => format!("{files} attached files"),
-        (images, files) => format!("{} attached files", images + files),
+    let kind = if parsed
+        .attachments
+        .iter()
+        .all(|att| is_image_path(&att.path))
+    {
+        "image"
+    } else {
+        "file"
+    };
+    match parsed.attachments.len() {
+        0 => content.to_string(),
+        1 => format!("Attached {kind}"),
+        n => format!("{n} attached {kind}s"),
     }
 }
 
@@ -315,69 +247,62 @@ pub fn user_message_rail_text(content: &str) -> String {
 // Staging (use-attachments.ts intake)
 // ---------------------------------------------------------------------------
 
-/// Content staged in the composer before upload. Disk files retain only their
-/// path so attachment size does not translate into resident memory.
+/// What a staged attachment holds. Images keep their decoded-at-paint
+/// [`Image`], which feeds thumbnails, the lightbox, the upload and the
+/// post-send cache seed; any other file stays opaque bytes.
 #[derive(Clone)]
-pub enum StagedAttachmentContent {
+pub enum AttachmentContent {
     Image(Arc<Image>),
-    Text(Arc<str>),
-    File(Arc<PathBuf>),
+    File(Arc<Vec<u8>>),
 }
 
+/// A file staged in the composer, before upload.
 #[derive(Clone)]
 pub struct StagedAttachment {
     pub id: String,
-    /// Filename committed on the agent host. Folder-relative components are
-    /// encoded into this basename so recursive selections remain distinguishable.
+    /// File name. Images carry a type-matching extension (use-attachments.ts
+    /// `ensureExtension` — agents sniff images by extension).
     pub name: String,
-    /// User-facing source label, including the selected folder name.
-    pub display_name: String,
-    pub content: StagedAttachmentContent,
-}
-
-pub fn display_basename(name: &str) -> &str {
-    name.rsplit(['/', '\\']).next().unwrap_or(name)
+    pub content: AttachmentContent,
+    /// The composer's chip number when a chip in the draft mentions this
+    /// attachment. `None` for attachments the prompt does not reference
+    /// (appshots, drafts restored from before chips).
+    pub mention: Option<u32>,
 }
 
 impl StagedAttachment {
-    fn reader(&self) -> Result<Box<dyn Read + '_>, String> {
+    pub fn bytes(&self) -> &[u8] {
         match &self.content {
-            StagedAttachmentContent::Image(image) => {
-                Ok(Box::new(Cursor::new(image.bytes.as_slice())))
-            }
-            StagedAttachmentContent::Text(text) => Ok(Box::new(Cursor::new(text.as_bytes()))),
-            StagedAttachmentContent::File(path) => std::fs::File::open(path.as_ref())
-                .map(|file| Box::new(file) as Box<dyn Read>)
-                .map_err(|_| format!("{} could not be read.", self.display_basename())),
+            AttachmentContent::Image(image) => &image.bytes,
+            AttachmentContent::File(bytes) => bytes,
         }
     }
 
-    fn byte_len(&self) -> Option<u64> {
-        match &self.content {
-            StagedAttachmentContent::Image(image) => u64::try_from(image.bytes.len()).ok(),
-            StagedAttachmentContent::Text(text) => u64::try_from(text.len()).ok(),
-            StagedAttachmentContent::File(path) => {
-                std::fs::metadata(path.as_ref()).ok().map(|meta| meta.len())
-            }
-        }
-    }
-
-    pub fn source_path(&self) -> Option<&Path> {
-        match &self.content {
-            StagedAttachmentContent::File(path) => Some(path.as_ref()),
-            StagedAttachmentContent::Image(_) | StagedAttachmentContent::Text(_) => None,
-        }
-    }
-
+    /// The picture, for attachments that are images.
     pub fn image(&self) -> Option<&Arc<Image>> {
         match &self.content {
-            StagedAttachmentContent::Image(image) => Some(image),
-            StagedAttachmentContent::Text(_) | StagedAttachmentContent::File(_) => None,
+            AttachmentContent::Image(image) => Some(image),
+            AttachmentContent::File(_) => None,
         }
     }
 
-    pub fn display_basename(&self) -> &str {
-        display_basename(&self.display_name)
+    fn new(name: String, content: AttachmentContent) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            content,
+            mention: None,
+        }
+    }
+
+    fn from_image(name: String, image: Image) -> Self {
+        Self::new(name, AttachmentContent::Image(Arc::new(image)))
+    }
+
+    fn from_file(name: &str, bytes: Vec<u8>) -> Self {
+        // Attachment refs ride the prompt one per line; a name must not add lines.
+        let name = name.replace(['\r', '\n'], "_");
+        Self::new(name, AttachmentContent::File(Arc::new(bytes)))
     }
 }
 
@@ -414,149 +339,124 @@ pub fn ensure_extension(name: &str, format: ImageFormat) -> String {
     }
 }
 
-/// Stage a file from disk (picker / drop / pasted path). Small images retain a
-/// decoded thumbnail; every other file uploads lazily from its source path.
-/// `Err` carries the user-facing failure message.
+/// Stage a file from disk (picker / drop / pasted path). An image keeps its
+/// thumbnail (a BMP is converted to PNG, which agents can read); any other
+/// regular file is staged as opaque bytes. `Err` carries the user-facing
+/// message (mirrors the old `onError` copy).
 pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
-    let source_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "attachment".to_string());
-    let meta = std::fs::metadata(path).map_err(|_| format!("{source_name} could not be read."))?;
+    if format_by_extension(path).is_none() {
+        return stage_plain_file(path);
+    }
+    let mut staged = stage_file_verbatim(path)?;
+    if let Some(image) = staged
+        .image()
+        .filter(|image| image.format == ImageFormat::Bmp)
+    {
+        let png =
+            bmp_to_png(image).map_err(|_| format!("{} is not a valid image.", staged.name))?;
+        staged.content = AttachmentContent::Image(Arc::new(png));
+        staged.name = Path::new(&staged.name)
+            .with_extension("png")
+            .to_string_lossy()
+            .into_owned();
+    }
+    Ok(staged)
+}
+
+/// Read a regular file within the attachment size limit. `Err` carries the
+/// user-facing message.
+fn read_regular_file(path: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path).map_err(|_| format!("{name} could not be read."))?;
     if !meta.is_file() {
-        return Err(format!("{source_name} is not a file."));
+        return Err(format!("{name} is not a file."));
     }
-    let (name, content) = match format_by_extension(path) {
-        Some(format) if meta.len() <= MAX_ATTACHMENT_PREVIEW_BYTES => {
-            let bytes =
-                std::fs::read(path).map_err(|_| format!("{source_name} could not be read."))?;
-            (
-                ensure_extension(&source_name, format),
-                StagedAttachmentContent::Image(Arc::new(Image::from_bytes(format, bytes))),
-            )
-        }
-        _ => (
-            source_name,
-            StagedAttachmentContent::File(Arc::new(path.to_path_buf())),
-        ),
+    if meta.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!("{name} is too large (24 MB max)."));
+    }
+    std::fs::read(path).map_err(|_| format!("{name} could not be read."))
+}
+
+fn file_name(path: &Path, fallback: &str) -> String {
+    path.file_name().map_or_else(
+        || fallback.to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// Stage a file's bytes exactly as stored, for callers that decode the image
+/// themselves (wallpapers) rather than hand it to an agent.
+pub fn stage_file_verbatim(path: &Path) -> Result<StagedAttachment, String> {
+    let name = file_name(path, "image");
+    let Some(format) = format_by_extension(path) else {
+        return Err(format!("{name} is not a supported image."));
     };
-    Ok(StagedAttachment {
-        id: uuid::Uuid::new_v4().to_string(),
-        display_name: name.clone(),
-        name,
-        content,
-    })
+    let bytes = read_regular_file(path, &name)?;
+    Ok(StagedAttachment::from_image(
+        ensure_extension(&name, format),
+        Image::from_bytes(format, bytes),
+    ))
 }
 
-/// Expand one picker/drop selection. Directories become one staged attachment
-/// per regular descendant, sorted by relative path. Symlinks are rejected
-/// instead of followed so a folder cannot escape its selected tree or cycle.
-pub fn stage_selected_path(path: &Path) -> Result<Vec<StagedAttachment>, String> {
-    let source_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "folder".to_string());
-    let metadata =
-        std::fs::metadata(path).map_err(|_| format!("{source_name} could not be read."))?;
-    if !metadata.is_dir() {
-        return stage_file(path).map(|attachment| vec![attachment]);
-    }
-
-    let mut directories = vec![path.to_path_buf()];
-    let mut files = Vec::new();
-    while let Some(directory) = directories.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|_| format!("{source_name} could not be read."))?;
-        for entry in entries {
-            let entry = entry.map_err(|_| format!("{source_name} could not be read."))?;
-            let entry_path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|_| format!("{} could not be read.", entry_path.display()))?;
-            if file_type.is_symlink() {
-                let relative = entry_path.strip_prefix(path).unwrap_or(&entry_path);
-                return Err(format!(
-                    "{} is a symbolic link; folder attachments don't follow links.",
-                    relative.display()
-                ));
-            }
-            if file_type.is_dir() {
-                directories.push(entry_path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            if files.len() == MAX_FOLDER_ATTACHMENT_FILES {
-                return Err(format!(
-                    "{source_name} contains more than {MAX_FOLDER_ATTACHMENT_FILES} files."
-                ));
-            }
-            files.push(entry_path);
-        }
-    }
-    files.sort();
-    if files.is_empty() {
-        return Err(format!("{source_name} contains no regular files."));
-    }
-
-    let mut attachments = Vec::with_capacity(files.len());
-    for file in files {
-        let relative = file.strip_prefix(path).unwrap_or(&file);
-        let display_path = Path::new(&source_name).join(relative);
-        let display_name = display_path.to_string_lossy().into_owned();
-        let upload_name = folder_upload_name(&display_name)
-            .ok_or_else(|| format!("{display_name} has a path too long to attach."))?;
-        let mut attachment = stage_file(&file)?;
-        attachment.name = upload_name;
-        attachment.display_name = display_name;
-        attachments.push(attachment);
-    }
-    Ok(attachments)
+/// Stage any other regular file as opaque bytes.
+fn stage_plain_file(path: &Path) -> Result<StagedAttachment, String> {
+    let name = file_name(path, "file");
+    let bytes = read_regular_file(path, &name)?;
+    Ok(StagedAttachment::from_file(&name, bytes))
 }
 
-/// Stage an image pasted from the clipboard.
+/// Stage an image pasted from the clipboard. A BMP (what Windows puts there for
+/// a screenshot) is converted to PNG like [`stage_file`] does; one that won't
+/// decode stays as pasted.
 pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
-    let format = image.format;
-    let name = ensure_extension("image", format);
-    StagedAttachment {
-        id: uuid::Uuid::new_v4().to_string(),
-        display_name: name.clone(),
-        name,
-        content: StagedAttachmentContent::Image(Arc::new(image)),
-    }
+    let image = if image.format == ImageFormat::Bmp
+        && let Ok(png) = bmp_to_png(&image)
+    {
+        png
+    } else {
+        image
+    };
+    StagedAttachment::from_image(ensure_extension("image", image.format), image)
 }
 
-/// Stage a large clipboard paste as a UTF-8 text file without touching disk.
-pub fn stage_pasted_text(text: String) -> StagedAttachment {
-    StagedAttachment {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: "pasted-text.txt".to_string(),
-        display_name: "pasted-text.txt".to_string(),
-        content: StagedAttachmentContent::Text(Arc::from(text)),
-    }
+/// Windows screenshots are BMP, but no agent harness inlines BMP and the
+/// agent's `Read` tool can't decode one — so they go out as PNG.
+fn bmp_to_png(bmp: &Image) -> Result<Image, String> {
+    let decoded = image::load_from_memory_with_format(&bmp.bytes, image::ImageFormat::Bmp)
+        .map_err(|e| e.to_string())?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(Image::from_bytes(ImageFormat::Png, png.into_inner()))
+}
+
+/// Stage native macOS capture bytes without a temporary file. The capture
+/// service already encoded PNG and enforces the shared size limit.
+pub fn stage_png_bytes(name: String, bytes: Vec<u8>) -> StagedAttachment {
+    StagedAttachment::from_image(
+        ensure_extension(&name, ImageFormat::Png),
+        Image::from_bytes(ImageFormat::Png, bytes),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Upload (state.ts uploadAttachment) + read-back (state.ts readAttachmentImage)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn with_target(
-    mut params: serde_json::Value,
-    target_device_id: Option<&str>,
-) -> serde_json::Value {
+fn with_target(mut params: serde_json::Value, target_device_id: Option<&str>) -> serde_json::Value {
     if let (Some(target), Some(map)) = (target_device_id, params.as_object_mut()) {
         map.insert("targetDeviceId".into(), target.into());
     }
     params
 }
 
-/// Per-call deadlines: chunk deadlines remain fixed because every chunk is
-/// bounded; commit scales with source size so large files have no size-derived
-/// timeout while a stalled relay still terminates.
+/// Per-call deadlines (desktop state.ts): a stalled-but-open relay link never
+/// fails an RPC on its own, so every attachment call races a timer. The first
+/// chunk gets 90s (a cold dial to a remote device), later chunks 30s; commit
+/// 150s (it must outlast the engine's cross-device assemble); reads 20s.
 const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
-const COMMIT_BASE_TIMEOUT: Duration = Duration::from_secs(150);
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(150);
 const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Race an RPC against `timeout` on the gpui background executor (these
@@ -577,88 +477,151 @@ pub(crate) async fn call_with_timeout(
     }
 }
 
-/// Chunked upload: read at most 45KB at a time, base64 each aligned chunk, then
-/// `UploadCommit{uploadId,fileName}`. Positional `seq` keeps retries idempotent.
+/// Chunks in flight at once. `seq` slots are idempotent engine-side, so
+/// completion order doesn't matter; a small window hides per-chunk latency
+/// without flooding the relay socket.
+const UPLOAD_CONCURRENCY: usize = 3;
+
+/// Whole-attachment deadline. Per-chunk timeouts + retries bound each CALL,
+/// but on a flapping link chunks that succeed on attempt 2-of-3 never trip
+/// the 3-consecutive-failure abort — an upload could lawfully crawl for hours
+/// reading "Sending…" (2026-08-18 user report). Scaled with size, capped:
+/// past this, fail the send with the banner instead of spinning.
+fn attachment_deadline(n_chunks: usize) -> Duration {
+    Duration::from_secs((120 + 15 * n_chunks as u64).min(900))
+}
+
+/// The `(seq, b64 byte-range)` plan for a file's chunks. An empty file still
+/// sends one empty chunk (the commit needs the uploadId staged).
+fn chunk_ranges(b64_len: usize) -> Vec<(u64, std::ops::Range<usize>)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut seq = 0u64;
+    loop {
+        let end = (start + UPLOAD_CHUNK_B64_CHARS).min(b64_len);
+        ranges.push((seq, start..end));
+        start = end;
+        seq += 1;
+        if start >= b64_len {
+            break;
+        }
+    }
+    ranges
+}
+
+/// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per
+/// [`UPLOAD_CHUNK_B64_CHARS`] slice (positional `seq` makes the cheap retry
+/// idempotent), a few chunks in flight at once, then
+/// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
+/// device. The caller mints `upload_id` — the queued-attachment flow derives
+/// its `pending://` refs from the same identity before the bytes move.
+/// `progress` (when given) accumulates uploaded BINARY bytes — the
+/// composer's "Uploading… N%" reads it every paint. Errors return the raw
+/// cause (the composer shows friendly copy).
 pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
-    session_id: &str,
+    chat_id: &str,
+    upload_id: &str,
     attachment: &StagedAttachment,
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<String, String> {
-    let mut reader = attachment.reader()?;
-    let upload_id = uuid::Uuid::new_v4().to_string();
-    let mut raw = vec![0_u8; UPLOAD_CHUNK_BYTES];
-    let mut seq = 0u64;
-    loop {
-        let mut read = 0usize;
-        while read < raw.len() {
-            let count = reader
-                .read(&mut raw[read..])
-                .map_err(|_| format!("{} could not be read.", attachment.display_basename()))?;
-            if count == 0 {
-                break;
-            }
-            read += count;
-        }
-        if read == 0 && seq > 0 {
-            break;
-        }
-        let data = BASE64.encode(&raw[..read]);
+    let b64 = BASE64.encode(attachment.bytes());
+    let ranges = chunk_ranges(b64.len());
+    let deadline = executor.timer(attachment_deadline(ranges.len()));
+    let upload = async {
+        futures::stream::iter(ranges.iter().cloned().map(Ok::<_, String>))
+            .try_for_each_concurrent(UPLOAD_CONCURRENCY, |(seq, range)| {
+                let progress = progress.clone();
+                let upload_id = &upload_id;
+                let b64 = &b64;
+                async move {
+                    let params = with_target(
+                        serde_json::json!({
+                            "chatId": chat_id,
+                            "uploadId": upload_id,
+                            "seq": seq,
+                            "data": &b64[range.clone()],
+                        }),
+                        target_device_id,
+                    );
+                    // The first WINDOW (not just seq 0) gets the cold-dial
+                    // allowance — its chunks all start before the link is warm.
+                    let timeout = if seq < UPLOAD_CONCURRENCY as u64 {
+                        FIRST_CHUNK_TIMEOUT
+                    } else {
+                        CHUNK_TIMEOUT
+                    };
+                    // One transient blip must not abort the upload; `seq`
+                    // slots are idempotent engine-side, so a blind re-send is
+                    // safe (timeouts retry too).
+                    let mut attempt = 0u32;
+                    loop {
+                        match call_with_timeout(
+                            engine,
+                            executor,
+                            methods::UPLOAD_CHUNK,
+                            params.clone(),
+                            timeout,
+                        )
+                        .await
+                        {
+                            Ok(_) => break,
+                            Err(err) if attempt < 2 => {
+                                attempt += 1;
+                                // warn, not debug: the 2026-08-19 incident
+                                // ground through silent timeout/retry cycles
+                                // for minutes with a literally empty log —
+                                // degraded uploads must narrate.
+                                tracing::warn!(error = %err, seq, attempt, "upload chunk retry");
+                                // Stagger by seq so parallel chunks that failed
+                                // together don't re-collide in lockstep.
+                                executor
+                                    .timer(Duration::from_millis(50 * (attempt as u64) * (seq + 1)))
+                                    .await;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    if let Some(progress) = &progress {
+                        // b64 → binary bytes (final chunk's padding rounds up
+                        // by ≤2 bytes — irrelevant for a percentage).
+                        progress.fetch_add(
+                            (range.len() * 3 / 4) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    Ok(())
+                }
+            })
+            .await?;
         let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": data, "sessionId": session_id }),
+            serde_json::json!({ "chatId": chat_id, "uploadId": upload_id, "fileName": attachment.name }),
             target_device_id,
         );
-        let timeout = if seq == 0 {
-            FIRST_CHUNK_TIMEOUT
-        } else {
-            CHUNK_TIMEOUT
-        };
-        let mut attempt = 0u32;
-        loop {
-            match call_with_timeout(
-                engine,
-                executor,
-                methods::UPLOAD_CHUNK,
-                params.clone(),
-                timeout,
-            )
-            .await
-            {
-                Ok(_) => break,
-                Err(err) if attempt < 2 => {
-                    attempt += 1;
-                    tracing::debug!(error = %err, seq, "upload chunk retry");
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        seq = seq.saturating_add(1);
-        if read == 0 {
-            break;
-        }
+        let reply = call_with_timeout(
+            engine,
+            executor,
+            methods::UPLOAD_COMMIT,
+            params,
+            COMMIT_TIMEOUT,
+        )
+        .await?;
+        reply
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "upload commit returned no path".to_string())
+    };
+    futures::pin_mut!(upload);
+    match futures::future::select(upload, deadline).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => Err(format!(
+            "attachment upload exceeded {}s",
+            attachment_deadline(ranges.len()).as_secs()
+        )),
     }
-    let params = with_target(
-        serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name, "sessionId": session_id }),
-        target_device_id,
-    );
-    let commit_seconds = attachment
-        .byte_len()
-        .map(|bytes| bytes / (1024 * 1024))
-        .unwrap_or_default();
-    let reply = call_with_timeout(
-        engine,
-        executor,
-        methods::UPLOAD_COMMIT,
-        params,
-        COMMIT_BASE_TIMEOUT.saturating_add(Duration::from_secs(commit_seconds)),
-    )
-    .await?;
-    reply
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "upload commit returned no path".to_string())
 }
 
 /// A transcript image read back from the owning device.
@@ -668,13 +631,15 @@ pub struct LoadedAttachmentImage {
 }
 
 /// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
-/// the same stuck-offset guard as comet's `readAttachmentImage`).
-pub async fn read_attachment_image(
+/// the same stuck-offset guard as zeron's `readAttachmentImage`). Returns the
+/// file's name, MIME type and bytes.
+pub(crate) async fn read_attachment_bytes(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
     path: &str,
-) -> Option<LoadedAttachmentImage> {
+    expected_raster_mime: Option<&str>,
+) -> Option<(String, String, Vec<u8>)> {
     let mut name = String::new();
     let mut mime = String::new();
     let mut b64 = String::new();
@@ -696,7 +661,14 @@ pub async fn read_attachment_image(
         .ok()?;
         name = chunk.get("name")?.as_str()?.to_string();
         mime = chunk.get("mimeType")?.as_str()?.to_string();
-        b64.push_str(chunk.get("data")?.as_str()?);
+        if expected_raster_mime.is_some_and(|expected| expected != mime) {
+            return None;
+        }
+        let data = chunk.get("data")?.as_str()?;
+        if b64.len().saturating_add(data.len()) > (MAX_ATTACHMENT_BYTES as usize).div_ceil(3) * 4 {
+            return None;
+        }
+        b64.push_str(data);
         done = chunk.get("done")?.as_bool()?;
         if done {
             break;
@@ -707,19 +679,103 @@ pub async fn read_attachment_image(
         }
         offset = next;
     }
-    if !done || b64.is_empty() {
+    if !done {
         return None;
     }
-    let bytes = BASE64.decode(b64.as_bytes()).ok()?;
-    let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
+    // Callers await this on the UI thread; decode the (up to 24 MiB) payload
+    // off it.
+    let bytes = executor
+        .spawn(async move { BASE64.decode(b64.as_bytes()).ok() })
+        .await?;
+    Some((name, mime, bytes))
+}
+
+/// Read back a staged file of any type (a queued message restored for editing).
+pub async fn read_attachment_file(
+    engine: &EngineHandle,
+    executor: &BackgroundExecutor,
+    target_device_id: Option<&str>,
+    path: &str,
+) -> Option<StagedAttachment> {
+    let (name, _, bytes) =
+        read_attachment_bytes(engine, executor, target_device_id, path, None).await?;
+    Some(StagedAttachment::from_file(
+        attachment_display_name(&name),
+        bytes,
+    ))
+}
+
+pub async fn read_attachment_image(
+    engine: &EngineHandle,
+    executor: &BackgroundExecutor,
+    target_device_id: Option<&str>,
+    path: &str,
+    expected_raster_mime: Option<&str>,
+) -> Option<LoadedAttachmentImage> {
+    let (name, mime, bytes) = read_attachment_bytes(
+        engine,
+        executor,
+        target_device_id,
+        path,
+        expected_raster_mime,
+    )
+    .await?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let image = if let Some(expected) = expected_raster_mime {
+        if expected != mime
+            || !matches!(
+                mime.as_str(),
+                "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+            )
+        {
+            return None;
+        }
+        let expected = expected.to_owned();
+        executor
+            .spawn(async move {
+                crate::image_media::decode_generated_image(
+                    bytes,
+                    &expected,
+                    MAX_ATTACHMENT_BYTES as usize,
+                )
+                .ok()
+                .map(|media| media.image)
+            })
+            .await?
+    } else {
+        let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
+        Arc::new(Image::from_bytes(format, bytes))
+    };
     Some(LoadedAttachmentImage {
         name: if name.is_empty() {
             name_from_path(path)
         } else {
             name
         },
-        image: Arc::new(Image::from_bytes(format, bytes)),
+        image,
     })
+}
+
+/// Decode with a fixed allocation budget and retain only a small queue image.
+/// Full resolution is fetched on explicit preview, never retained by queue rows.
+pub(crate) fn queue_thumbnail_image(source: &Image) -> Option<Arc<Image>> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(source.bytes.as_slice()))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let thumb = reader.decode().ok()?.thumbnail(160, 112);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    thumb.write_to(&mut bytes, image::ImageFormat::Png).ok()?;
+    Some(Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        bytes.into_inner(),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -764,25 +820,53 @@ fn retry_delay(attempts: u32) -> Duration {
     Duration::from_millis((2_000u64 << attempts.min(3)).min(15_000))
 }
 
-/// Byte budget for retained encoded images. The decoded copies gpui holds are
-/// proportional (and usually larger), so bounding the encoded side bounds both
-/// — this cache previously grew for the process lifetime with no eviction.
+/// Retained encoded bytes plus estimated CPU/GPU pixels for normalized PNGs.
+/// Generated images are always evictable and individually fit this budget.
+/// Legacy user attachments retain their existing protection behavior.
 const IMAGE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validation policy is part of identity, including in-flight loads and errors.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AttachmentKey {
+    device: String,
+    path: String,
+    raster_mime: Option<String>,
+}
+
+impl AttachmentKey {
+    pub(crate) fn new(device: &str, path: &str, mime: Option<&str>) -> Self {
+        Self {
+            device: device.into(),
+            path: path.into(),
+            raster_mime: mime.map(str::to_owned),
+        }
+    }
+}
 
 #[derive(Default)]
 struct ImageCache {
-    map: HashMap<(String, String), CacheEntry>,
+    map: HashMap<AttachmentKey, CacheEntry>,
     /// Monotonic access clock for LRU ordering.
     tick: u64,
     loaded_bytes: usize,
+    generated_bytes: usize,
     /// Evicted images awaiting `flush_evicted` (freeing needs `&mut App`,
     /// which eviction sites — async load completions — don't always have).
     pending_free: Vec<Arc<Image>>,
 }
 
 impl ImageCache {
-    fn insert_loaded(&mut self, key: (String, String), image: CachedAttachmentImage) {
-        let bytes = image.image.bytes.len();
+    fn insert_loaded(&mut self, key: AttachmentKey, image: CachedAttachmentImage) {
+        // Generated rasters are normalized to PNG; account for their decoded
+        // CPU/GPU copies as well as encoded bytes in the existing cache budget.
+        let pixels = crate::appshots::png_dimensions(&image.image.bytes)
+            .map_or(0, |(w, h)| (w as usize).saturating_mul(h as usize));
+        let bytes = image
+            .image
+            .bytes
+            .len()
+            .saturating_add(pixels.saturating_mul(8));
+        let generated = key.raster_mime.is_some();
         self.tick += 1;
         if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.insert(
             key.clone(),
@@ -793,22 +877,44 @@ impl ImageCache {
             },
         ) {
             self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+            if generated {
+                self.generated_bytes = self.generated_bytes.saturating_sub(bytes);
+            }
             self.pending_free.push(image.image);
         }
-        self.loaded_bytes += bytes;
-        while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
+        self.loaded_bytes = self.loaded_bytes.saturating_add(bytes);
+        if generated {
+            self.generated_bytes = self.generated_bytes.saturating_add(bytes);
+        }
+        let shielded = protected().lock().unwrap().clone();
+        // Separate budgets prevent protected legacy attachments from repeatedly
+        // evicting visible generated previews, or vice versa.
+        while (if generated {
+            self.generated_bytes
+        } else {
+            self.loaded_bytes.saturating_sub(self.generated_bytes)
+        }) > IMAGE_CACHE_BUDGET_BYTES
+        {
             let oldest = self
                 .map
                 .iter()
-                .filter(|(k, _)| **k != key)
+                .filter(|(k, _)| {
+                    **k != key
+                        && k.raster_mime.is_some() == generated
+                        && (k.raster_mime.is_some()
+                            || !shielded.contains(&(k.device.clone(), k.path.clone())))
+                })
                 .filter_map(|(k, e)| match e {
                     CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
                     _ => None,
                 })
-                .min();
+                .min_by_key(|(tick, _)| *tick);
             let Some((_, evict_key)) = oldest else { break };
             if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.remove(&evict_key) {
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+                if generated {
+                    self.generated_bytes = self.generated_bytes.saturating_sub(bytes);
+                }
                 self.pending_free.push(image.image);
             }
         }
@@ -820,17 +926,39 @@ fn cache() -> &'static Mutex<ImageCache> {
     CACHE.get_or_init(|| Mutex::new(ImageCache::default()))
 }
 
-fn key(device_id: &str, path: &str) -> (String, String) {
-    (device_id.to_string(), path.to_string())
+/// Keys shielded from LRU eviction — the open transcript's attachments. The
+/// gpui list caches rendered rows across frames, so a VISIBLE thumbnail's
+/// `last_used` tick can go stale and budget pressure evicted images still on
+/// screen (user report: "images unload before they are scrolled out of
+/// view"). The transcript replaces this set on every row sync; other chats'
+/// images stay evictable, so the budget still bounds the cache overall.
+fn protected() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
+    static PROTECTED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> =
+        OnceLock::new();
+    PROTECTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Replace the eviction shield with the given keys (see [`protected`]).
+pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
+    *protected().lock().unwrap() = keys;
+}
+
+fn key(device_id: &str, path: &str) -> AttachmentKey {
+    AttachmentKey::new(device_id, path, None)
 }
 
 pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
+    attachment_snapshot_for(&key(device_id, path))
+}
+
+pub(crate) fn attachment_snapshot_for(source: &AttachmentKey) -> AttachmentSnapshot {
+    let (device_id, path) = (source.device.as_str(), source.path.as_str());
     let mut cache = cache().lock().unwrap();
     let tick = {
         cache.tick += 1;
         cache.tick
     };
-    match cache.map.get_mut(&key(device_id, path)) {
+    match cache.map.get_mut(source) {
         Some(CacheEntry::Loaded {
             image, last_used, ..
         }) => {
@@ -840,8 +968,55 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
             retry_in: retry_delay(attempts.saturating_sub(1)).saturating_sub(at.elapsed()),
         },
-        _ => AttachmentSnapshot::Loading,
+        Some(CacheEntry::Loading { .. }) => AttachmentSnapshot::Loading,
+        None => {
+            // Queued-send alias: the host materializes `pending://{id}/{name}`
+            // at `{uploads}/{id8}-{name}` and rewrites the persisted ref to
+            // that ABSOLUTE path — one the sender can't know up front (it's
+            // the host's disk). The id8 basename prefix IS derivable though,
+            // so the send seeds the bytes under an alias and this fallback
+            // resolves the rewritten ref instantly instead of blanking the
+            // thumbnail into a skeleton while the bytes round-trip
+            // (2026-08-19 "photo disappears after it finishes sending").
+            if let Some(image) = source
+                .raster_mime
+                .is_none()
+                .then(|| upload_alias_id8(path))
+                .flatten()
+                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
+                    Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
+                    _ => None,
+                })
+            {
+                cache.insert_loaded(key(device_id, path), image.clone());
+                return AttachmentSnapshot::Loaded(image);
+            }
+            AttachmentSnapshot::Loading
+        }
     }
+}
+
+/// The uploadId fragment a committed upload's basename starts with
+/// (`{id8}-{name}` per the engine's `Uploads::pending_target`). `None` when
+/// the path can't be a committed upload.
+fn upload_alias_id8(path: &str) -> Option<String> {
+    let base = std::path::Path::new(path).file_name()?.to_str()?;
+    let (id8, _) = base.split_at_checked(8)?;
+    (base.as_bytes().get(8) == Some(&b'-') && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| id8.to_string())
+}
+
+fn alias_key(device_id: &str, id8: &str) -> AttachmentKey {
+    key(device_id, &format!("upload-alias://{id8}"))
+}
+
+/// Seed the just-sent image under its upload identity so the persisted
+/// message's rewritten absolute ref (host-side path) resolves from the same
+/// local bytes — see the alias fallback in [`attachment_snapshot`].
+pub fn seed_attachment_alias(device_id: &str, upload_id: &str, name: &str, image: Arc<Image>) {
+    let id8: String = upload_id.chars().take(8).collect();
+    let source = alias_key(device_id, &id8);
+    store_loaded_for(&source, name.to_string().into(), image);
 }
 
 /// Release gpui's decoded copies of evicted images: the asset-system entry
@@ -860,8 +1035,12 @@ pub fn flush_evicted(mut window: Option<&mut gpui::Window>, cx: &mut gpui::App) 
 /// (the entry is marked Loading so concurrent renders don't double-fetch).
 /// Errored sources hand out a retry only after their backoff has elapsed.
 pub fn begin_load(device_id: &str, path: &str) -> bool {
+    begin_load_for(&key(device_id, path))
+}
+
+pub(crate) fn begin_load_for(source: &AttachmentKey) -> bool {
     let mut cache = cache().lock().unwrap();
-    let entry = cache.map.entry(key(device_id, path));
+    let entry = cache.map.entry(source.clone());
     match entry {
         std::collections::hash_map::Entry::Vacant(v) => {
             v.insert(CacheEntry::Loading { attempts: 0 });
@@ -880,22 +1059,49 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
     }
 }
 
+/// A cancelled view/task must release its claim so reopening can retry it.
+/// Completed loads are left alone, including completions waiting on a UI notify.
+pub(crate) struct AttachmentLoadGuard(pub AttachmentKey);
+
+impl Drop for AttachmentLoadGuard {
+    fn drop(&mut self) {
+        let mut cache = cache().lock().unwrap();
+        if let Some(entry @ CacheEntry::Loading { .. }) = cache.map.get_mut(&self.0) {
+            let CacheEntry::Loading { attempts } = entry else {
+                unreachable!()
+            };
+            *entry = CacheEntry::Error {
+                attempts: attempts.saturating_add(1),
+                at: Instant::now(),
+            };
+        }
+    }
+}
+
 pub fn store_loaded(device_id: &str, path: &str, name: SharedString, image: Arc<Image>) {
+    store_loaded_for(&key(device_id, path), name, image);
+}
+
+pub(crate) fn store_loaded_for(source: &AttachmentKey, name: SharedString, image: Arc<Image>) {
     cache()
         .lock()
         .unwrap()
-        .insert_loaded(key(device_id, path), CachedAttachmentImage { name, image });
+        .insert_loaded(source.clone(), CachedAttachmentImage { name, image });
 }
 
 pub fn store_error(device_id: &str, path: &str) {
+    store_error_for(&key(device_id, path));
+}
+
+pub(crate) fn store_error_for(source: &AttachmentKey) {
     let mut cache = cache().lock().unwrap();
-    let attempts = match cache.map.get(&key(device_id, path)) {
+    let attempts = match cache.map.get(source) {
         Some(CacheEntry::Loading { attempts }) => attempts + 1,
         Some(CacheEntry::Error { attempts, .. }) => *attempts,
         _ => 1,
     };
     cache.map.insert(
-        key(device_id, path),
+        source.clone(),
         CacheEntry::Error {
             attempts,
             at: Instant::now(),
@@ -909,28 +1115,19 @@ pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image
     store_loaded(device_id, path, name.to_string().into(), image);
 }
 
-/// Resolve an inline-markdown image URL (`![alt](url)`) to an engine-readable
-/// file path. `file://` URLs and absolute paths pass through; relative paths
-/// join the chat's cwd; anything else with a scheme (http, data, …) is not
-/// inline-loadable — the app registers no HTTP client — and stays a link.
-pub fn inline_image_path(url: &str, cwd: Option<&str>) -> Option<String> {
-    let url = url.trim();
-    if let Some(path) = url.strip_prefix("file://") {
-        return path.starts_with('/').then(|| path.to_string());
+/// [`seed_attachment`] for a staged attachment; a file that is not an image
+/// has no thumbnail to seed.
+pub fn seed_staged(device_id: &str, path: &str, att: &StagedAttachment) {
+    if let Some(image) = att.image() {
+        seed_attachment(device_id, path, &att.name, image.clone());
     }
-    if url.starts_with('/') {
-        return Some(url.to_string());
+}
+
+/// [`seed_attachment_alias`] for a staged attachment.
+pub fn seed_staged_alias(device_id: &str, upload_id: &str, att: &StagedAttachment) {
+    if let Some(image) = att.image() {
+        seed_attachment_alias(device_id, upload_id, &att.name, image.clone());
     }
-    if url.is_empty()
-        // A scheme before the first slash (`https:`, `data:`, the mend
-        // sentinel `comet:`) means remote/synthetic.
-        || url.split('/').next().is_some_and(|head| head.contains(':'))
-        // `~` only means home on the DEVICE OWNING the file; never guess it.
-        || url.starts_with('~')
-    {
-        return None;
-    }
-    cwd.map(|cwd| format!("{}/{url}", cwd.trim_end_matches('/')))
 }
 
 // ---------------------------------------------------------------------------
@@ -942,18 +1139,82 @@ pub fn inline_image_path(url: &str, cwd: Option<&str>) -> Option<String> {
 pub struct PreviewImage {
     pub name: SharedString,
     pub image: Arc<Image>,
+    pub(crate) viewer: crate::image_viewer::ImageView,
+    /// Fill behind an image drawn on a transparent canvas (diagrams).
+    pub(crate) plate: Option<gpui::Hsla>,
 }
 
-/// The bare lightbox: dim scrim, the image at ≤85vh/90vw, the file name under
-/// it. Any click closes (the whole dialog is the close button, as in the
-/// original's `cursor-zoom-out` figure).
+impl PreviewImage {
+    pub fn new(name: impl Into<SharedString>, image: Arc<Image>) -> Self {
+        Self {
+            name: name.into(),
+            image,
+            viewer: Default::default(),
+            plate: None,
+        }
+    }
+
+    pub(crate) fn with_plate(mut self, plate: gpui::Hsla) -> Self {
+        self.plate = Some(plate);
+        self
+    }
+}
+
+/// Shared image viewer over a dim scrim. Escape and a click close it;
+/// dragging and zoom controls are consumed by the viewer.
 pub fn lightbox(
-    viewport: Size<gpui::Pixels>,
+    window: &mut gpui::Window,
     preview: &PreviewImage,
+    focus: &gpui::FocusHandle,
     on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    cx: &mut gpui::App,
 ) -> AnyElement {
+    lightbox_with_size(window, preview, focus, None, on_close, cx)
+}
+
+/// Sanitized SVG variants retain their source's natural logical dimensions.
+pub(crate) fn lightbox_with_size(
+    window: &mut gpui::Window,
+    preview: &PreviewImage,
+    focus: &gpui::FocusHandle,
+    natural_size: Option<Size<gpui::Pixels>>,
+    on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    cx: &mut gpui::App,
+) -> AnyElement {
+    let viewport = window.viewport_size();
     let max_h = px(f32::from(viewport.height) * 0.85);
     let max_w = px(f32::from(viewport.width) * 0.9);
+    let natural_size = natural_size.or_else(|| {
+        preview
+            .image
+            .clone()
+            .use_render_image(window, cx)
+            .map(|image| {
+                let dimensions = image.size(0);
+                gpui::size(
+                    px(dimensions.width.0 as f32),
+                    px(dimensions.height.0 as f32),
+                )
+            })
+    });
+    let content = match natural_size {
+        Some(natural) => preview.viewer.render(
+            preview.image.clone(),
+            natural,
+            None,
+            preview.plate,
+            window,
+            cx,
+        ),
+        None => div()
+            .text_color(ink(0.6))
+            .child("Loading image…")
+            .into_any_element(),
+    };
+    let on_close = std::rc::Rc::new(on_close);
+    let close_on_key = on_close.clone();
+    let press_state = preview.viewer.clone();
+    let click_state = preview.viewer.clone();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -961,6 +1222,7 @@ pub fn lightbox(
                 div()
                     .id("attachment-lightbox")
                     .occlude()
+                    .track_focus(focus)
                     .w(viewport.width)
                     .h(viewport.height)
                     .bg(crate::popover::scrim_alpha(0.7))
@@ -969,21 +1231,30 @@ pub fn lightbox(
                     .items_center()
                     .justify_center()
                     .gap(px(12.0))
-                    .cursor_pointer()
-                    .on_click(move |_, window, cx| on_close(window, cx))
-                    .child(
-                        img(preview.image.clone())
-                            .object_fit(ObjectFit::Contain)
-                            .max_h(max_h)
-                            .max_w(max_w)
-                            .rounded(px(6.0))
-                            .shadow_2xl(),
-                    )
+                    .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            close_on_key(window, cx);
+                        }
+                    })
+                    .capture_any_mouse_down(move |event, _, _| {
+                        if event.button == gpui::MouseButton::Left {
+                            press_state.begin_click();
+                        }
+                    })
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        if !click_state.dragged() {
+                            on_close(window, cx);
+                        }
+                    })
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .child(div().w(max_w).h(max_h).child(content))
                     .child(
                         div()
                             .max_w(max_w)
                             .overflow_hidden()
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .text_color(ink(0.45))
                             .child(preview.name.clone()),
                     ),
@@ -998,13 +1269,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn appshot_cards_follow_their_exact_image_reference() {
+        let shot = crate::appshots::tests::shot();
+        let paths = HashMap::from([(shot.screenshot.id.clone(), "/remote/a & b.png".to_string())]);
+        let body = crate::appshots::with_appshots("Look here", &[shot], &paths);
+        let message = with_attachments(
+            &body,
+            &["/remote/ordinary.png".into(), "/remote/a & b.png".into()],
+        );
+        let parsed = parse_user_message_images(&message);
+        assert_eq!(parsed.text, "Look here");
+        assert!(parsed.attachments[0].appshot.is_none());
+        let appshot = parsed.attachments[1].appshot.as_ref().unwrap();
+        assert_eq!(appshot.app_name, "Safari & Notes");
+        assert_eq!(appshot.title(), "A \"window\"");
+    }
+
+    #[test]
+    fn duplicate_or_invalid_appshot_metadata_stays_an_ordinary_attachment() {
+        let body = format!(
+            "Question\n\n{}\n<appshot app=\"One\" image=\"/a.png\">private text</appshot><appshot app=\"Two\" image=\"/a.png\">other text</appshot>",
+            crate::appshots::CONTEXT_MARKER
+        );
+        let parsed = parse_user_message_images(&with_attachments(&body, &["/a.png".into()]));
+        assert!(parsed.attachments[0].appshot.is_none());
+        assert_eq!(parsed.text, "Question");
+    }
+
+    #[test]
+    fn queue_images_have_a_small_retained_pixel_budget() {
+        let source = image::DynamicImage::new_rgba8(2400, 1600);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        source
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let source = Image::from_bytes(ImageFormat::Png, bytes.into_inner());
+        let thumbnail = queue_thumbnail_image(&source).unwrap();
+        let (width, height) = crate::appshots::png_dimensions(&thumbnail.bytes).unwrap();
+        assert!(width <= 160 && height <= 112);
+        assert!(thumbnail.bytes.len() < 160 * 112 * 4);
+    }
+
+    #[test]
+    fn any_regular_file_stages_with_its_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("notes.md", &b"# notes\n"[..]),
+            ("archive.tar.gz", &[0x1f, 0x8b, 0, 0xff][..]),
+            ("LICENSE", b"MIT"),
+            ("empty.txt", b""),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let staged = stage_file(&path).unwrap();
+            assert_eq!(staged.name, name);
+            assert_eq!(staged.bytes(), bytes);
+            assert!(staged.image().is_none());
+        }
+        // An image still keeps its thumbnail.
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"not decoded here").unwrap();
+        assert!(stage_file(&png).unwrap().image().is_some());
+    }
+
+    #[test]
+    fn folders_and_oversize_files_are_refused_with_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(stage_file(dir.path()).err().unwrap().contains("not a file"));
+        let large = dir.path().join("large.bin");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(MAX_ATTACHMENT_BYTES + 1)
+            .unwrap();
+        assert!(stage_file(&large).err().unwrap().contains("too large"));
+        assert!(stage_file(&dir.path().join("missing.md")).is_err());
+    }
+
+    #[test]
+    fn a_staged_name_cannot_add_attachment_lines() {
+        let staged = StagedAttachment::from_file("a\n- injected.md", Vec::new());
+        assert_eq!(staged.name, "a_- injected.md");
+    }
+
+    #[test]
+    fn file_attachments_round_trip_with_their_own_placeholder() {
+        let only_files = with_attachments("", &["/uploads/ab12cd34-notes.md".to_string()]);
+        assert!(only_files.starts_with(FILE_ATTACHMENT_ONLY_TEXT));
+        let parsed = parse_user_message_images(&only_files);
+        assert_eq!(parsed.text, "");
+        assert_eq!(parsed.attachments[0].path, "/uploads/ab12cd34-notes.md");
+        assert_eq!(user_message_rail_text(&only_files), "Attached file");
+
+        // A mixed send reads as files; an image-only send is unchanged.
+        let mixed = with_attachments("", &["/a/cat.png".to_string(), "/a/notes.md".to_string()]);
+        assert!(mixed.starts_with(FILE_ATTACHMENT_ONLY_TEXT));
+        assert_eq!(user_message_rail_text(&mixed), "2 attached files");
+        let images = with_attachments("", &["/a/cat.png".to_string()]);
+        assert!(images.starts_with(ATTACHMENT_ONLY_TEXT));
+        assert!(is_attachment_only_text(ATTACHMENT_ONLY_TEXT));
+        assert!(is_attachment_only_text(FILE_ATTACHMENT_ONLY_TEXT));
+    }
+
+    #[test]
+    fn upload_prefixes_are_not_part_of_the_displayed_name() {
+        assert_eq!(attachment_display_name("ab12cd34-notes.md"), "notes.md");
+        assert_eq!(attachment_display_name("my-notes.md"), "my-notes.md");
+        assert_eq!(
+            attachment_display_name("zzzzzzzz-notes.md"),
+            "zzzzzzzz-notes.md"
+        );
+        assert_eq!(attachment_display_name("notes.md"), "notes.md");
+    }
+
+    #[test]
     fn with_attachments_round_trips_through_parse() {
         let paths = vec!["/data/uploads/ab-cat.png".to_string(), "/x/dog.jpg".into()];
         let content = with_attachments("look at these", &paths);
-        let parsed = parse_user_message_attachments(&content);
+        let parsed = parse_user_message_images(&content);
         assert_eq!(parsed.text, "look at these");
         assert_eq!(parsed.attachments.len(), 2);
-        assert!(parsed.file_attachments.is_empty());
         assert_eq!(parsed.attachments[0].path, "/data/uploads/ab-cat.png");
         assert_eq!(parsed.attachments[0].name, "ab-cat.png");
         assert_eq!(parsed.attachments[1].name, "dog.jpg");
@@ -1015,64 +1398,40 @@ mod tests {
     fn image_only_send_hides_placeholder_body() {
         let content = with_attachments("", &["/a/b.png".to_string()]);
         assert!(content.starts_with(ATTACHMENT_ONLY_TEXT));
-        let parsed = parse_user_message_attachments(&content);
+        let parsed = parse_user_message_images(&content);
         assert_eq!(parsed.text, "");
         assert_eq!(parsed.attachments.len(), 1);
     }
 
     #[test]
-    fn files_and_images_round_trip_as_distinct_attachment_types() {
-        let content = with_attachment_files(
-            "",
-            &["/data/uploads/shot.png".to_string()],
-            &["/data/uploads/example resumes/George Resume.pdf".to_string()],
+    fn appshot_context_is_hidden_but_image_remains() {
+        let body = format!(
+            "Fix the layout\n\n{}\n<appshot app=\"Safari\">secret AX text</appshot>",
+            crate::appshots::CONTEXT_MARKER
         );
-        let parsed = parse_user_message_attachments(&content);
-        assert!(parsed.text.is_empty());
-        assert_eq!(parsed.attachments[0].name, "shot.png");
-        assert_eq!(parsed.file_attachments[0].name, "George Resume.pdf");
-
-        let file_only = with_attachment_files(
-            "",
-            &[],
-            &["/data/uploads/example resumes/George Resume.pdf".to_string()],
-        );
-        assert!(file_only.starts_with(FILE_ATTACHMENT_ONLY_TEXT));
-        let parsed = parse_user_message_attachments(&file_only);
-        assert!(parsed.text.is_empty());
-        assert!(parsed.attachments.is_empty());
-        assert_eq!(parsed.file_attachments.len(), 1);
-    }
-
-    #[test]
-    fn legacy_pasted_text_refs_still_parse_as_files() {
-        let content = concat!(
-            "See the attached text.",
-            "\n\nAttached text (local files — open them to read):",
-            "\n- /data/uploads/pasted-text.txt"
-        );
-        let parsed = parse_user_message_attachments(content);
-        assert!(parsed.text.is_empty());
-        assert_eq!(parsed.file_attachments[0].name, "pasted-text.txt");
+        let content = with_attachments(&body, &["/a/appshot.png".to_string()]);
+        let parsed = parse_user_message_images(&content);
+        assert_eq!(parsed.text, "Fix the layout");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].path, "/a/appshot.png");
     }
 
     #[test]
     fn plain_text_passes_through_unchanged() {
         assert_eq!(with_attachments("hello", &[]), "hello");
-        let parsed = parse_user_message_attachments("hello\n\nno images here");
+        let parsed = parse_user_message_images("hello\n\nno images here");
         assert!(parsed.attachments.is_empty());
-        assert!(parsed.file_attachments.is_empty());
         assert_eq!(parsed.text, "hello\n\nno images here");
     }
 
     #[test]
     fn marker_is_case_insensitive_and_requires_ref_lines() {
-        let parsed = parse_user_message_attachments(
+        let parsed = parse_user_message_images(
             "hi\n\nATTACHED IMAGES (local files — open them to view):\n- /p/q.png",
         );
         assert_eq!(parsed.attachments.len(), 1);
         // A trailer with no valid `- path` lines is left as plain text.
-        let empty = parse_user_message_attachments(
+        let empty = parse_user_message_images(
             "hi\n\nAttached images (local files — open them to view):\nnothing",
         );
         assert!(empty.attachments.is_empty());
@@ -1080,13 +1439,11 @@ mod tests {
     }
 
     #[test]
-    fn rail_text_summarizes_attachment_only_sends() {
+    fn rail_text_summarizes_image_only_sends() {
         let one = with_attachments("", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&one), "Attached image");
         let two = with_attachments("", &["/a/b.png".to_string(), "/c/d.png".into()]);
         assert_eq!(user_message_rail_text(&two), "2 attached images");
-        let file = with_attachment_files("", &[], &["/a/George Resume.pdf".to_string()]);
-        assert_eq!(user_message_rail_text(&file), "Attached file");
         let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");
@@ -1124,75 +1481,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stages_non_image_file_from_directory_with_spaces() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("example resumes");
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("George Resume.pdf");
-        std::fs::write(&path, b"%PDF-1.7 resume").unwrap();
-
-        let attachment = stage_file(&path).expect("PDF should stage as a file attachment");
-        assert_eq!(attachment.name, "George Resume.pdf");
-        assert_eq!(attachment.display_name, "George Resume.pdf");
-        assert_eq!(attachment.source_path(), Some(path.as_path()));
-        assert!(attachment.image().is_none());
+    /// A 1x1 32-bit BI_RGB bitmap as the Windows clipboard produces it: one
+    /// BGRX pixel, the fourth byte unused (zero).
+    fn clipboard_bmp() -> Vec<u8> {
+        let mut bmp = b"BM".to_vec();
+        // File size, reserved, pixel offset, header size, width, height.
+        for field in [58u32, 0, 54, 40, 1, 1] {
+            bmp.extend(field.to_le_bytes());
+        }
+        bmp.extend([1, 0, 32, 0]); // planes, bits per pixel
+        bmp.extend([0; 24]); // BI_RGB, image size, resolution, palette
+        bmp.extend([30, 20, 10, 0]);
+        bmp
     }
 
     #[test]
-    fn stages_folder_recursively_with_relative_labels() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("example resumes");
-        let nested = root.join("engineering");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(root.join("George Resume.pdf"), b"george").unwrap();
-        std::fs::write(nested.join("Borello Tina.docx"), b"tina").unwrap();
-
-        let attachments = stage_selected_path(&root).expect("folder should stage recursively");
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(
-            attachments
-                .iter()
-                .map(|attachment| attachment.display_name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "example resumes/George Resume.pdf",
-                "example resumes/engineering/Borello Tina.docx",
-            ]
-        );
-        assert_eq!(attachments[0].display_basename(), "George Resume.pdf");
-        assert!(attachments[1].name.starts_with(FOLDER_NAME_PREFIX));
-        assert!(attachments[1].name.ends_with(".docx"));
-        assert_eq!(
-            attachments[0].source_path(),
-            Some(root.join("George Resume.pdf").as_path())
-        );
-        assert_eq!(
-            attachments[1].source_path(),
-            Some(nested.join("Borello Tina.docx").as_path())
-        );
+    fn pasted_bmp_screenshot_is_staged_as_an_opaque_png() {
+        let staged = stage_clipboard_image(Image::from_bytes(ImageFormat::Bmp, clipboard_bmp()));
+        assert_eq!(staged.image().unwrap().format, ImageFormat::Png);
+        assert_eq!(staged.name, "image.png");
+        let png = image::load_from_memory(staged.bytes()).unwrap();
+        assert_eq!(png.into_rgba8().get_pixel(0, 0).0, [10, 20, 30, 255]);
     }
 
     #[test]
-    fn empty_folder_returns_visible_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("empty folder");
-        std::fs::create_dir(&root).unwrap();
-        let error = match stage_selected_path(&root) {
-            Ok(_) => panic!("empty folder should fail"),
-            Err(error) => error,
-        };
-        assert_eq!(error, "empty folder contains no regular files.");
+    fn bmp_file_is_staged_as_png_but_wallpapers_keep_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Screenshot 1.BMP");
+        std::fs::write(&path, clipboard_bmp()).unwrap();
+
+        let staged = stage_file(&path).unwrap();
+        assert_eq!(staged.image().unwrap().format, ImageFormat::Png);
+        assert_eq!(staged.name, "Screenshot 1.png");
+        assert!(image::load_from_memory(staged.bytes()).is_ok());
+
+        let verbatim = stage_file_verbatim(&path).unwrap();
+        assert_eq!(verbatim.image().unwrap().format, ImageFormat::Bmp);
+        assert_eq!(verbatim.name, "Screenshot 1.BMP");
+        assert_eq!(verbatim.bytes(), clipboard_bmp());
     }
 
     #[test]
-    fn uploaded_folder_names_restore_relative_labels() {
-        let label = "example resumes/engineering/Borello Tina.docx";
-        let upload_name = folder_upload_name(label).expect("folder label should fit");
+    fn non_bmp_files_are_staged_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        image::RgbImage::new(1, 1).save(&path).unwrap();
+        let staged = stage_file(&path).unwrap();
+        assert_eq!(staged.name, "shot.png");
+        assert_eq!(staged.bytes(), std::fs::read(&path).unwrap());
+    }
+
+    #[test]
+    fn undecodable_bmp_is_refused_for_files_and_kept_for_pastes() {
+        let broken = b"BM not really a bitmap".to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.bmp");
+        std::fs::write(&path, &broken).unwrap();
         assert_eq!(
-            name_from_path(&format!("/uploads/877c9e22-{upload_name}")),
-            label
+            stage_file(&path).err().unwrap(),
+            "broken.bmp is not a valid image."
         );
+
+        let pasted = stage_clipboard_image(Image::from_bytes(ImageFormat::Bmp, broken));
+        assert_eq!(pasted.image().unwrap().format, ImageFormat::Bmp);
+        assert_eq!(pasted.name, "image.bmp");
     }
 
     #[test]
@@ -1205,29 +1557,359 @@ mod tests {
     }
 
     #[test]
-    fn inline_image_paths_resolve_local_sources_only() {
+    fn upload_chunk_fits_the_relay_frame_ceiling() {
+        // Cloudflare caps a WebSocket message at 1 MiB; the chunk rides one
+        // relay frame with a small JSON envelope + uleb header.
+        assert!(UPLOAD_CHUNK_B64_CHARS + 1_024 < 1_048_576);
+        // A slice of the whole-file base64 must stay independently decodable.
+        assert_eq!(UPLOAD_CHUNK_B64_CHARS % 4, 0);
+    }
+
+    #[test]
+    fn chunk_ranges_cover_the_buffer_exactly() {
+        // Empty file: one empty chunk (the commit needs the id staged).
+        assert_eq!(chunk_ranges(0), vec![(0, 0..0)]);
+        // Exact multiple: no trailing empty chunk.
+        let exact = chunk_ranges(UPLOAD_CHUNK_B64_CHARS * 2);
+        assert_eq!(exact.len(), 2);
         assert_eq!(
-            inline_image_path("/tmp/shot.png", None).as_deref(),
-            Some("/tmp/shot.png")
+            exact[1],
+            (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS * 2)
         );
+        // Partial tail.
+        let partial = chunk_ranges(UPLOAD_CHUNK_B64_CHARS + 7);
+        assert_eq!(partial.len(), 2);
         assert_eq!(
-            inline_image_path("file:///tmp/shot.png", None).as_deref(),
-            Some("/tmp/shot.png")
+            partial[1],
+            (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS + 7)
         );
-        // Relative paths anchor on the chat's cwd — and stay links without one.
+        // Ranges tile the buffer: contiguous, in order, fully covering.
+        let mut expected_start = 0;
+        for (seq, range) in &partial {
+            assert_eq!(range.start, expected_start, "seq {seq} contiguous");
+            expected_start = range.end;
+        }
+        assert_eq!(expected_start, UPLOAD_CHUNK_B64_CHARS + 7);
+    }
+
+    #[test]
+    fn attachment_deadline_scales_and_caps() {
+        // A one-chunk screenshot fails within ~2 minutes, not hours.
+        assert_eq!(attachment_deadline(1), Duration::from_secs(135));
+        // A max-size upload is still bounded.
+        assert_eq!(attachment_deadline(1_000), Duration::from_secs(900));
+    }
+}
+
+#[cfg(test)]
+mod generated_image_tests {
+    use super::*;
+
+    #[test]
+    fn generated_image_cache_isolates_policy_aliases_and_load_claims() {
+        let owner = "policy-audit-owner";
+        let path = "/uploads/policy01-image.png";
+        let png = AttachmentKey::new(owner, path, Some("image/png"));
+        let gif = AttachmentKey::new(owner, path, Some("image/gif"));
+        let raw = Arc::new(Image::from_bytes(ImageFormat::Gif, b"GIF89a".to_vec()));
+        seed_attachment(owner, path, "image.gif", raw.clone());
+        seed_attachment_alias(owner, "policy01", "image.gif", raw.clone());
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Loading
+        ));
+        let alias = AttachmentKey::new(owner, "/another/policy01-image.png", Some("image/png"));
+        assert!(matches!(
+            attachment_snapshot_for(&alias),
+            AttachmentSnapshot::Loading
+        ));
+        assert!(begin_load_for(&png));
+        assert!(!begin_load_for(&png));
+        assert!(begin_load_for(&gif));
+        drop(AttachmentLoadGuard(png.clone()));
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot_for(&gif),
+            AttachmentSnapshot::Loading
+        ));
+        store_loaded_for(&gif, "image.gif".into(), raw);
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot_for(&gif),
+            AttachmentSnapshot::Loaded(_)
+        ));
+        let changed = AttachmentKey::new(owner, path, Some("image/jpeg"));
+        assert!(matches!(
+            attachment_snapshot_for(&changed),
+            AttachmentSnapshot::Loading
+        ));
+    }
+
+    #[test]
+    fn generated_image_history_is_evicted_with_decoded_memory_accounting() {
+        let mut cache = ImageCache::default();
+        // Cache accounting reads only IHDR. No large allocations are needed
+        // to exercise the production eviction policy across a long history.
+        for i in 0..100 {
+            let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            bytes.extend_from_slice(&2048_u32.to_be_bytes());
+            bytes.extend_from_slice(&2048_u32.to_be_bytes());
+            cache.insert_loaded(
+                AttachmentKey::new("bounded-history", &format!("/{i}.png"), Some("image/png")),
+                CachedAttachmentImage {
+                    name: "generated.png".into(),
+                    image: Arc::new(Image::from_bytes(ImageFormat::Png, bytes)),
+                },
+            );
+            assert!(cache.loaded_bytes <= IMAGE_CACHE_BUDGET_BYTES);
+            // The real render loop calls flush_evicted to release these CPU/GPU assets.
+            cache.pending_free.clear();
+        }
+        assert!(!cache.map.contains_key(&AttachmentKey::new(
+            "bounded-history",
+            "/0.png",
+            Some("image/png")
+        )));
+        assert!(cache.map.contains_key(&AttachmentKey::new(
+            "bounded-history",
+            "/99.png",
+            Some("image/png")
+        )));
+    }
+
+    #[test]
+    fn generated_image_decoder_checks_actual_type_and_downsamples() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(3072, 16)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = png.into_inner();
+        assert!(
+            crate::image_media::decode_generated_image(
+                bytes.clone(),
+                "image/jpeg",
+                MAX_ATTACHMENT_BYTES as usize
+            )
+            .is_err()
+        );
+        let decoded = crate::image_media::decode_generated_image(
+            bytes,
+            "image/png",
+            MAX_ATTACHMENT_BYTES as usize,
+        )
+        .unwrap();
+        assert_eq!(decoded.width, 2048.0);
+        assert!(decoded.bytes < IMAGE_CACHE_BUDGET_BYTES);
+        assert!(
+            crate::image_media::decode_generated_image(
+                b"GIF89a".to_vec(),
+                "image/gif",
+                MAX_ATTACHMENT_BYTES as usize
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_image_animation_retains_only_first_static_frame() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                        16,
+                        16,
+                        image::Rgba(color),
+                    )))
+                    .unwrap();
+            }
+        }
+        let decoded = crate::image_media::decode_generated_image(
+            bytes,
+            "image/gif",
+            MAX_ATTACHMENT_BYTES as usize,
+        )
+        .unwrap();
         assert_eq!(
-            inline_image_path("shots/a.png", Some("/repo/")).as_deref(),
-            Some("/repo/shots/a.png")
+            image::guess_format(&decoded.image.bytes).unwrap(),
+            image::ImageFormat::Png
         );
-        assert_eq!(inline_image_path("shots/a.png", None), None);
-        // Remote/synthetic schemes and home-relative guesses never load.
-        assert_eq!(
-            inline_image_path("https://x.dev/i.png", Some("/repo")),
-            None
+        let pixels = image::load_from_memory(&decoded.image.bytes)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    struct ImageRpc {
+        calls: Arc<Mutex<Vec<serde_json::Value>>>,
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for ImageRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            assert_eq!(method, methods::READ_ATTACHMENT_CHUNK);
+            self.calls.lock().unwrap().push(params);
+            zeron_rpc::RpcReply::value(
+                &serde_json::json!({"name":"generated.png", "mimeType":"image/png", "data":BASE64.encode(&self.bytes), "nextOffset": self.bytes.len(), "done":true}),
+            )
+        }
+    }
+
+    struct FileRpc(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for FileRpc {
+        async fn handle(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            zeron_rpc::RpcReply::value(&serde_json::json!({
+                "name": "ab12cd34-notes.md",
+                "mimeType": "application/octet-stream",
+                "data": BASE64.encode(&self.0),
+                "nextOffset": self.0.len(),
+                "done": true,
+            }))
+        }
+    }
+
+    #[test]
+    fn chips_stand_in_for_their_attachments() {
+        use zeron_proto::attachment_mentions::attachment_mention_link;
+        let paths: Vec<String> = [
+            "/uploads/ab12cd34-Image_1.png",
+            "pending://att-2/my notes.md",
+            "/uploads/ef56ab78-Image_3.png",
+            "/uploads/0a1b2c3d-Cargo.toml",
+        ]
+        .map(String::from)
+        .to_vec();
+        let text = format!(
+            "compare {} with {}",
+            attachment_mention_link(1, None),
+            attachment_mention_link(2, Some("my notes.md")),
         );
-        assert_eq!(inline_image_path("data:image/png;base64,xx", None), None);
-        assert_eq!(inline_image_path("comet:pending-link", Some("/repo")), None);
-        assert_eq!(inline_image_path("~/shot.png", Some("/repo")), None);
-        assert_eq!(inline_image_path("", Some("/repo")), None);
+        // Image 3 and Cargo.toml have no chip, so they keep their tiles.
+        assert_eq!(unchipped_attachments(&text, &paths), [&paths[2], &paths[3]]);
+        // A committed upload sanitizes the name the chip still carries.
+        let committed = vec!["/uploads/12345678-my_notes.md".to_string()];
+        assert!(unchipped_attachments(&text, &committed).is_empty());
+        // Plain text keeps every tile.
+        assert_eq!(unchipped_attachments("Image 1", &paths).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_queued_file_reads_back_with_its_bytes_and_display_name() {
+        let executor = gpui_platform::background_executor();
+        for bytes in [b"# notes\n".to_vec(), Vec::new()] {
+            let engine = EngineHandle::from_test_client(zeron_rpc::memory_client(Arc::new(
+                FileRpc(bytes.clone()),
+            )));
+            let file = read_attachment_file(&engine, &executor, None, "/uploads/ab12cd34-notes.md")
+                .await
+                .unwrap();
+            assert_eq!(file.name, "notes.md");
+            assert_eq!(file.bytes(), bytes);
+            assert!(file.image().is_none());
+            // An image read-back never accepts an empty body.
+            if bytes.is_empty() {
+                let image = read_attachment_image(
+                    &engine,
+                    &executor,
+                    None,
+                    "/uploads/ab12cd34-notes.md",
+                    None,
+                )
+                .await;
+                assert!(image.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_image_chunk_reader_targets_owner_and_bounds_decode() {
+        let executor = gpui_platform::background_executor();
+        for (width, target, expected, succeeds) in [
+            (64, Some("remote-owner"), "image/png", true),
+            (64, None, "image/png", true),
+            (4097, None, "image/png", false),
+            (64, None, "image/gif", false),
+        ] {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(width, 1)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            let calls = Arc::new(Mutex::new(vec![]));
+            let engine =
+                EngineHandle::from_test_client(zeron_rpc::memory_client(Arc::new(ImageRpc {
+                    calls: calls.clone(),
+                    bytes: png.into_inner(),
+                })));
+            let loaded = read_attachment_image(
+                &engine,
+                &executor,
+                target,
+                "/profile/uploads/image.png",
+                Some(expected),
+            )
+            .await;
+            assert_eq!(loaded.is_some(), succeeds);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["path"], "/profile/uploads/image.png");
+            assert_eq!(
+                calls[0].get("targetDeviceId").and_then(|v| v.as_str()),
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn generated_image_cancelled_load_releases_claim_without_losing_completed_images() {
+        let owner = "cancelled-generated-owner";
+        let path = "/fixture/cancelled-generated.png";
+        assert!(begin_load(owner, path));
+        drop(AttachmentLoadGuard(key(owner, path)));
+        assert!(matches!(
+            attachment_snapshot(owner, path),
+            AttachmentSnapshot::Error { .. }
+        ));
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new()));
+        store_loaded(owner, path, "generated.png".into(), image);
+        drop(AttachmentLoadGuard(key(owner, path)));
+        assert!(matches!(
+            attachment_snapshot(owner, path),
+            AttachmentSnapshot::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn generated_image_decode_accepts_attachment_byte_cap_but_rejects_excess() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut bytes = png.into_inner();
+        // Padding represents a large source with small dimensions; the intake
+        // cap is 24 MiB, independent of the workspace preview's 8 MiB cap.
+        bytes.resize(9 * 1024 * 1024, 0);
+        assert!(
+            crate::image_media::decode_raster_image(bytes.clone(), MAX_ATTACHMENT_BYTES as usize)
+                .is_ok()
+        );
+        assert!(crate::image_media::decode_raster_image(bytes, 8 * 1024 * 1024).is_err());
     }
 }

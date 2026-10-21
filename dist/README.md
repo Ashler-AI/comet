@@ -1,212 +1,142 @@
-# Packaging
+# Crew Canary packaging
 
-App icons are sourced from `assets/brand`:
+This upstream-port branch delivers **private/manual canary artifacts**, not a
+replacement for signed Crew staging/production releases. It does not publish a
+shared bucket, public manifest, `latest` pointer, or release channel. Packaging
+does not modify existing Crew apps, services or profiles. The separately approved
+staging broker deployment is recorded in the [port status](../docs/UPSTREAM-PORT-PLAN.md).
 
-| Target | Source |
-| --- | --- |
-| macOS `.icns` | `assets/brand/png/crew-icon-macos-1024.png` |
-| Linux hicolor | `assets/brand/png/crew-icon-1024.png` and `assets/brand/crew-icon.svg` |
-| iOS AppIcon | `assets/brand/png/crew-icon-1024.png` copied to `Assets.xcassets/AppIcon.appiconset/AppIcon1024.png` |
+## Brand artwork
 
-## Linux (implemented)
+`dist/zeron.svg` is the Crew mark: the original 46-unit four-piece square in
+`#fafafa`, a 10-unit `#09de5e` core, and solid black. No frame, shadow, or nested
+tile is added. The mark occupies 46/72 of the artboard, preserving its geometry
+while leaving app-icon safe area. Internal `zeron` filenames remain compatible
+with existing consumers.
 
-```sh
-scripts/package-linux.sh            # release build (thin LTO, stripped)
-PROFILE=debug scripts/package-linux.sh   # fast smoke package
-```
+Regenerate the desktop, launcher, landing-page and iOS artwork with
+`python3 scripts/gen-brand-icons.py` (Pillow required only for regeneration).
+The shared and iOS PNGs are opaque 1024×1024 RGB; iOS applies its own corner mask
+and derives dark/tinted appearances from this universal asset. The macOS PNG is
+1024×1024 RGBA with only the platform tile's exterior transparent. Packaging
+uses the existing `sips`/`iconutil` path to make `.icns`; the dev launcher refreshes
+its cached icon when the source changes. Repackage/reinstall Canary to pick up
+new bundle assets; generation alone never changes a running/installed app.
 
-Produces `target/package/comet-<version>-linux-<arch>.tar.gz` containing:
-
-- `comet` — the binary (headed by default; `comet headless` runs the engine alone)
-- `comet.desktop` — XDG desktop entry
-- `comet.png` / `comet.svg` — raster and scalable Crew app icons
-- `crew-web/` — the [Scaffold session web view assets](../README.md#scaffold-session-web-view);
-  the bundled `install.sh` does not install or launch these assets. Scaffold image
-  assembly supplies their runtime location and Node separately.
-- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`,
-  including both the `1024x1024` and scalable hicolor icon paths
-
-The release profile in the root `Cargo.toml` sets `lto = "thin"` and
-`strip = "symbols"` for distribution builds.
 
 ## macOS
 
-Use an Apple-silicon macOS host with the checked-in Rust toolchain and Xcode
-command-line tools. Packaging builds the native `comet` executable; it never
-creates a shell wrapper that launches another installed app.
-
-### Signed distribution (default)
-
-Provision a **Developer ID Application** certificate and its private key in a
-keychain. Store notarization credentials with `xcrun notarytool store-credentials`
-under a profile you choose, then run:
+From this worktree on a macOS host:
 
 ```sh
-CODESIGN_IDENTITY="Developer ID Application: Your Organization (ABCDE12345)" \
-COMET_MACOS_SIGNING_TEAM_ID=ABCDE12345 \
-NOTARYTOOL_KEYCHAIN_PROFILE=crew-distribution \
-scripts/package-macos.sh
+ASHLER_INCREMENTAL_TSC_CHECKS=false scripts/package-macos.sh
+open --env ASHLER_INCREMENTAL_TSC_CHECKS=false --env COMET_IPC_PORT=27954 \
+  --env "COMET_DATA_DIR=$HOME/.crew-upstream-canary" \
+  'target/package/Crew Canary.app' --args \
+  --ipc-port 27954 --data-dir "$HOME/.crew-upstream-canary"
 ```
 
-`CODESIGN_IDENTITY` must be the exact certificate name or SHA-1 fingerprint of a
-valid Developer ID Application identity. `COMET_MACOS_SIGNING_TEAM_ID` is the
-expected Apple team (exactly 10 uppercase alphanumeric characters), independently
-configured rather than inferred from signing or notarization credentials. The
-selected certificate's team must match before compilation or notarization.
-The validated team is compiled into the updater's distribution trust policy.
-`CODESIGN_KEYCHAIN` optionally restricts signing and the notarization profile to
-one keychain. Missing or invalid credentials fail before compilation; there is
-no automatic ad-hoc fallback. The notarization profile is also authenticated
-before compilation.
+The script builds the upstream Cargo package/binary `zeron` with `--locked
+--release`, discovers Cargo's actual target directory, and copies that exact
+artifact into `target/package/Crew Canary.app/Contents/MacOS/comet`. Internal
+Cargo/crate and artwork filenames deliberately retain upstream names.
 
-The script signs the executable and bundle with hardened runtime, a secure
-timestamp, and an explicit version-independent designated requirement: exact
-bundle identifier, Apple's Developer ID Application trust chain, and the leaf
-certificate's team OU. It never pins an executable cdhash, certificate serial,
-certificate fingerprint, or app version. It notarizes and staples the app, then
-creates, signs, notarizes and staples the DMG. The read-only verifier checks the
-final app and the app extracted from the updater archive without re-signing.
-Signature, stable requirement, ticket and Gatekeeper checks must succeed.
-Apple notarization requires network access and working Apple Developer
-credentials. Failures stop packaging; do not distribute intermediate files.
+Pin the launch coordinates when running from another Crew agent session: its
+inherited `COMET_IPC_PORT` addresses that session's engine, not Canary. For the
+existing lightweight local build cache, use `CARGO_BUILD_JOBS=2`,
+`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0` and `CREW_PACKAGE_PROFILE=dev`.
+Do not switch these flags between incremental smoke runs: Cargo rebuilds the
+dependency graph for a different profile configuration.
 
-Production preserves the installed identity **`ai.ashler.comet`**, bundle name
-**`Crew.app`**, executable `Contents/MacOS/comet`, and updater artifact contract:
+The bundle has identifier `ai.ashler.crew.upstream-canary`, display name
+`Crew Canary`, and registers **only** `crew-upstream-canary:`. Runtime defaults
+are `~/.crew-upstream-canary` and IPC port `27954`; the bundle does not replace
+Crew.app or register its production/staging schemes. Move only Crew Canary.app
+to Applications if a persistent installation is wanted.
+New worktrees default to the selected data directory's `worktrees` folder,
+not another installed client's `~/.zeron/worktrees`. Explicit existing worktree
+paths and user-selected custom locations remain unchanged.
 
-- `target/package/comet-<version>-macos-arm64.dmg`
-- `target/package/comet-<version>-macos-arm64-app.tar.gz` (contains `Crew.app`)
+Artifacts:
 
-Both contain the same signed, stapled app. Keep the bundle identifier and Apple
-team stable across releases. Developer ID certificate renewal/rotation within
-that team preserves the designated requirement; changing teams is an identity
-migration, not routine credential rotation. Do not change the configured team
-to bypass a failed release verification.
+- `target/package/Crew Canary.app`
+- `target/package/crew-upstream-canary-<version>-macos-<arch>.dmg`
+- `target/package/crew-upstream-canary-<version>-macos-<arch>-app.tar.gz`
 
-Previous ad-hoc installs have cdhash-bound permission identities and need a
-one-time regrant when moving to this Developer ID-signed identity. Users grant
-Accessibility and Screen Recording to the actual running Crew app in macOS
-System Settings; signing cannot grant these permissions. Subsequent versions
-with the same stable requirement preserve the identity used by those grants.
+Ad-hoc signing is the local default. Set `CODESIGN_IDENTITY` for an explicitly
+selected Developer ID. Optional `NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, and
+`NOTARY_ISSUER_ID` submit to Apple and staple the bundle and disk image. Neither
+signing nor notarization creates or enables a release channel.
 
-The installed updater uses macOS's built-in `codesign`, `csreq`, and Gatekeeper
-(`spctl`) checks; customers do not need Xcode or Command Line Tools. The `stapler`
-checks below run only on packaging/release verification hosts. The updater
-checks the signed identity, stable requirement, and Gatekeeper acceptance again
-after copying the bundle and before moving the installed app.
+For an additional debug-only instance, `scripts/run-macos-dev.sh` builds
+`target/macos-dev/Crew Canary Dev.app`, uses bundle identifier
+`ai.ashler.crew.upstream-canary.dev`, a separate data directory under
+`target/macos-dev/data`, and IPC port `27955`. `COMET_DEV_BUILD_ONLY=1` builds
+without launching. `COMET_DEV_DATA_DIR`, `COMET_DEV_IPC_PORT` and
+`COMET_DEV_CODESIGN_IDENTITY` select the development profile and signing identity.
 
-To verify an extracted release without signing or notarization credentials:
+## Linux and Scaffold runtime
 
 ```sh
-COMET_MACOS_SIGNING_TEAM_ID=ABCDE12345 \
-scripts/verify-macos-app.sh /path/to/Crew.app ai.ashler.comet
+ASHLER_INCREMENTAL_TSC_CHECKS=false scripts/package-linux.sh
+# PROFILE=debug is available for local fixture packages.
 ```
 
-The verifier is read-only and rejects ad-hoc, wrong-team, wrong-identifier,
-unstable-requirement, damaged, unstapled, and untrusted bundles. Staging uses
-`ai.ashler.comet.staging` as its expected identifier instead.
+Output: `target/package/crew-upstream-canary-<version>-linux-<arch>.tar.gz`.
+The archive root has the same stem and contains `comet`, licenses,
+`crew-upstream-canary.desktop`, `crew-upstream-canary.png`, and `install.sh`.
 
-### Independent native staging app
+The manual installer stores immutable binary-digest-qualified versions under
+`~/.crew-upstream-canary/app/<version>-<sha256>`, changes only that directory's
+`current` link, and links `~/.local/bin/crew-upstream-canary`. Desktop entry and
+icon names are also canary-specific. It does not overwrite a shared `comet`
+launcher, touch existing Crew/Zeron data, or install/restart any service. A new
+artifact of the same workspace version gets a distinct installation directory.
+The Scaffold handoff must select this exact binary with its SHA-256 and the
+checked-in `scaffold-runtime-version.txt` contract, not a mutable release feed.
+
+`bash scripts/test-linux-desktop-entry.sh` is an offline Linux regression for
+launcher quoting, XDG paths, repeated installation, same-version new artifacts,
+and preservation of existing installations. It uses a throwaway HOME.
+
+## Build-only workflow and update policy
+
+`.github/workflows/release.yml` is **Crew Canary artifacts**. Manual dispatch
+requires the exact reviewed SHA and builds that immutable `github.sha`, uploading
+private Actions artifacts with archive `SHA256SUMS`, raw Linux executable
+`COMET_SHA256SUMS`, and `provenance.json`, and has only `contents: read`.
+`COMET_SHA256SUMS` names the extracted archive-root `comet` file; its digest
+is the value for `COMET_SCAFFOLD_RUNTIME_SHA256`, not the archive digest.
+It does not deploy, publish GitHub Releases, use shared release credentials, or
+change signed stable/staging channels. Dispatch the registered workflow after review:
 
 ```sh
-COMET_PACKAGE_ENVIRONMENT=staging \
-CODESIGN_IDENTITY="Developer ID Application: Your Organization (ABCDE12345)" \
-COMET_MACOS_SIGNING_TEAM_ID=ABCDE12345 \
-NOTARYTOOL_KEYCHAIN_PROFILE=crew-distribution \
-scripts/package-macos.sh
+gh workflow run release.yml --repo Ashler-AI/comet --ref crew/upstream-canary \
+  -f "reviewed_sha=${REVIEWED_SHA:?Set the exact reviewed integration commit}"
 ```
 
-This builds **`Crew Staging.app`** with the stable distinct bundle identity
-**`ai.ashler.comet.staging`** and compiles both `COMET_DEFAULT_ENVIRONMENT=staging`
-and `COMET_PACKAGE_ENVIRONMENT=staging` into its own native executable. Build
-outputs use `target/staging`; distribution outputs are isolated under
-`target/package/staging/comet-staging-<version>-macos-arm64*`. Production defaults
-to `COMET_PACKAGE_ENVIRONMENT=production`; an explicitly conflicting
-`COMET_DEFAULT_ENVIRONMENT` is rejected rather than silently building the wrong
-environment.
+Verify that the run's `headSha` is the reviewed commit before consuming its private
+artifacts. Edge deployment is a separate operator action: from `edge/`, run
+`npx wrangler deploy --env canary` only after that revision passes CI. The isolated
+controller uses Platform's `internal/scaffold/scripts/deploy-upstream-canary.mjs`.
 
-Standalone staging defaults to `~/.comet-native-staging`, managed worktrees under
-`~/.comet-native-staging/worktrees`, IPC port `27655`, and launchd label
-`ai.ashler.comet.staging`, while preserving explicit runtime overrides. Do not
-point staging's `COMET_WORKTREES_DIR` at production's managed root: that root
-defines which checkouts staging may automatically clean up. Staging has its own
-macOS permission grants. Its bundle deliberately does
-not register the shared `comet://` invitation scheme, which has no environment
-discriminator, so installing it cannot steal production invitation links.
+`zeron-update::AUTOMATIC_UPDATES_SUPPORTED` is false for this branch. Direct
+CLI/UI checks, staging and apply paths fail closed before a shared channel can
+be contacted or an install replaced. Environment URL overrides cannot opt in.
+The dormant upstream downloader remains for mergeability; eventual signed Crew
+delivery must port the authenticated/signed candidate contract, not merely flip
+this constant or expose a public feed. Windows packaging/update assets are
+retained upstream tooling, not Crew Canary delivery artifacts; this workflow
+does not build or distribute them. iOS is packaged by its separate workstream.
 
-**Standalone staging and production keep separate update identities.** On a fresh
-build (`candidate_run_id` empty), the release workflow packages, signs, notarizes,
-and verifies both `Crew.app` and `Crew Staging.app` with the same independently
-pinned Apple team. The Actions artifacts remain `macos-arm64` and
-`macos-staging-arm64`; the latter contains:
-
-- `comet-staging-<version>-macos-arm64.dmg`
-- `comet-staging-<version>-macos-arm64-app.tar.gz` (contains `Crew Staging.app`)
-- `SHA256SUMS`
-
-Immutable candidates include both macOS variants and the selected Linux artifacts.
-Staging publication advances `desktop-staging-manifest.json`,
-`desktop-staging-SHA256SUMS`, and `desktop-staging-latest.txt` for `Crew Staging.app`.
-The existing `desktop-*` channel remains the production-identity candidate, so
-production promotion can reuse those exact bytes. Production publication excludes
-all standalone staging artifacts and aliases. Candidate reuse requires both
-verified macOS variants; older candidates without staging metadata must be rebuilt.
-
-Both installed apps use Settings → Crew update to download their own signed bundle,
-then **Restart to update** to apply it. The package environment is pinned at build
-time: staging accepts only `ai.ashler.comet.staging`, production accepts only
-`ai.ashler.comet`. The updater verifies downloaded, cached, copied, and installed
-bundles before replacing anything; environment variables or feed contents cannot
-switch identities. Versions through 0.1.110 disabled standalone staging updates
-and need one manual installation of the fixed signed staging build to bootstrap.
-
-### Explicit local-only ad-hoc packaging
-
-```sh
-COMET_MACOS_SIGNING=adhoc scripts/package-macos.sh
-COMET_MACOS_SIGNING=adhoc COMET_PACKAGE_ENVIRONMENT=staging scripts/package-macos.sh
-```
-
-Ad-hoc mode is rejected in CI and when `CODESIGN_IDENTITY` is also supplied. It
-does not require a team or notarization profile, skips notarization, and writes only to `target/package/local` or
-`target/package/staging/local`, never the distribution artifact paths. These
-bundles are for local development, not distribution or durable macOS permission
-identity. Do not use them to replace a signed installation for permission testing.
-
-### Release CI credentials
-
-`.github/workflows/release.yml` requires these repository/organization Actions
-secrets accessible to the `macos` job (their availability is not implied by the
-checked-in workflow):
-
-Also set the public Actions variable **`MACOS_SIGNING_TEAM_ID`** to the expected
-10-character Apple team. This immutable-by-policy release trust root is exposed
-as `COMET_MACOS_SIGNING_TEAM_ID`, including credential-free candidate verification.
-It must not be derived from the notarization secret or changed for certificate
-renewal. `MACOS_NOTARY_TEAM_ID` must match it; CI rejects a conflict before
-importing credentials.
-
-| Secret | Value |
-| --- | --- |
-| `MACOS_CERTIFICATE_P12_BASE64` | Base64-encoded Developer ID Application certificate **and private key**, exported as PKCS#12 |
-| `MACOS_CERTIFICATE_PASSWORD` | Nonempty password protecting that PKCS#12 export |
-| `MACOS_CODESIGN_IDENTITY` | Exact Developer ID Application certificate name or SHA-1 fingerprint |
-| `MACOS_NOTARY_APPLE_ID` | Apple account authorized to notarize for the signing team |
-| `MACOS_NOTARY_APP_PASSWORD` | App-specific password for that Apple account |
-| `MACOS_NOTARY_TEAM_ID` | Developer team ID matching the signing identity |
-
-The job fails closed when any credential is absent. It imports the certificate
-into a temporary, explicitly selected keychain and appends that keychain to the
-runner's search list so `codesign` can discover its private key and certificate
-chain. Existing search entries and the default keychain are preserved. The job
-authenticates notarization and signs/verifies a disposable executable copy before
-compilation, removes the PKCS#12 file and probe afterward, and deletes the keychain (including its
-search-list entry) in an `always()` cleanup step. No certificates or credentials
-are checked into this repository. The
-workflow must not enable shell tracing around secrets.
-
-Existing `candidate_run_id` promotion still reuses an immutable prior candidate
-without rebuilding or re-signing it. Every candidate must pass the
-`verify-macos-candidate` release gate before publishing, including reused candidates. Older ad-hoc
-or otherwise unverifiable candidates are rejected, not retroactively signed or
-notarized. For the initial signed rollout, select a candidate produced by this
-signing workflow.
+The **refresh agents after Crew updates** preference is retained independently
+of per-agent monitoring. The coordinator imports `harnessAutoUpdate` from an
+explicitly copied `<data_dir>/update-prefs.json` into `harness-update-prefs.json`
+without reading the live legacy store. Subsequent changes persist atomically.
+Manual canary delivery preserves the value but does not execute the post-update
+hook. Supported signed delivery calls `post_update_refresh(data_dir, true)` on
+boot: only a version transition triggers sequential enabled/installed-agent
+checks and applicable updates through existing idle/update locks. Explicit
+per-agent Off and `COMET_UPDATE_HARNESSES=0|false|no` remain respected. OMP uses
+its native `omp update` and `can1357/oh-my-pi` release metadata, never Pi's npm
+installer. Local typechecks are intentionally not part of this workflow.

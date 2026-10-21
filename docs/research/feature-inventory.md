@@ -1,6 +1,6 @@
-# Comet — Complete Feature Inventory (parity checklist for the native rewrite)
+# Zeron — Complete Feature Inventory (parity checklist for the native rewrite)
 
-Source: exploration of ~/github/comet on 2026-07-19. Rewrite keeps ONLY the Loro path; token-usage
+Source: exploration of ~/github/zeron on 2026-07-19. Rewrite keeps ONLY the Loro path; token-usage
 display EXCLUDED. File paths refer to the reference repo.
 
 ## 0. Architecture orientation
@@ -12,19 +12,19 @@ display EXCLUDED. File paths refer to the reference repo.
   (run/steer/interrupt/respondInput) = durable doc entries executed by the chat's host.
 - DROP: messages sync over Postgres logical replication, device-addressed run RPCs,
   WatchMessages, WebRTC + signaling.
-- NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Postgres-based in comet — the rewrite
+- NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Postgres-based in zeron — the rewrite
   must re-home it (decision: per-org workspace Loro doc, see ARCHITECTURE.md).
 
 ## 1. Desktop app
 ### 1.1 Window shell
 - 1320x880 (min 900x600), frameless-inset title bar, traffic lights {14,15}, opaque #0a0a0a bg.
 - External links open in OS browser; single-instance lock; dev vs packaged ports (26634/26654) and
-  data dirs (.comet-dev/.comet). Fullscreen hides traffic lights -> cluster reflows.
+  data dirs (.zeron-dev/.zeron). Fullscreen hides traffic lights -> cluster reflows.
 
 ### 1.2 App phases (App.tsx)
 - Three phases with crossfade: Gate (loading/reconnect/login card over bg-grid), OrgGate ("Create
   your workspace" + existing org memberships + "Use a different account"), app (router).
-- Boot Splash: comet-wave loader, fades out (splash-out) once connected && authReady (15s cap),
+- Boot Splash: zeron-wave loader, fades out (splash-out) once connected && authReady (15s cap),
   never returns mid-session.
 
 ### 1.3 Shell layout (__root.tsx)
@@ -75,7 +75,7 @@ display EXCLUDED. File paths refer to the reference repo.
 - Pickers: HarnessModelPicker (harness rail + models, harness locked once chat exists),
   TraitsPicker (reasoning + advertised model options; trigger shows non-defaults "High · 1M · Fast"),
   RepoPicker (search, Open folder… in-app browser w/ breadcrumbs + keys + skeletons, Clone from
-  URL…, Create new repo…), BranchPicker (search + isolated-worktree toggle ~/.comet/worktrees/…).
+  URL…, Create new repo…), BranchPicker (search + isolated-worktree toggle ~/.zeron/worktrees/…).
 
 ### 1.8 Conversation / transcript
 - ONE transcript source = doc projection. Optimistic echoes until first doc frame.
@@ -114,7 +114,7 @@ display EXCLUDED. File paths refer to the reference repo.
   elapsed; "Sending…" bridge; staleness-checked; survives reload; shows for remote runs.
 - fade-in 0.5s cubic-bezier(0.16,1,0.3,1) translateY 4->0 (entrances)
 - splash-out 0.5s opacity+translateY -6, 0.15s delay
-- comet-pulse 2.4s infinite staggered cell opacity 0.08->1 scale 0.9->1
+- zeron-pulse 2.4s infinite staggered cell opacity 0.08->1 scale 0.9->1
 - gradient-spin-pulse per-cell phase wave, 750ms
 - menu-in 0.14s scale 0.96 + translateY -2 (popovers, transform-origin tracks anchor)
 - dialog-in 0.18s scale 0.96->1
@@ -139,13 +139,11 @@ display EXCLUDED. File paths refer to the reference repo.
 - UploadChunk/UploadCommit; ReadAttachment(stream)/ReadAttachmentChunk
 - OpenTerminal{chatId,cols,rows}->TerminalSession; SubscribeTerminal{id,afterSeq?}->stream
   (Data{seq,data}|Exit{seq,code,signal?}); WriteTerminal; ResizeTerminal; CloseTerminal
-- ReadCheckoutDiff{checkoutId,checksum,targetDeviceId?}->{diff?} fetches one
-  exact current bounded patch; stale checksums return no diff.
 - ListAgentAccounts{forceUsage?}; ActivateAgentAccount; ForgetAgentAccount; StartAgentLogin ->
   {loginId,url,mode:paste-code|browser}; CompleteAgentLogin{code}; PollAgentLogin; CancelAgentLogin
 ### DataRpc (IPC-only)
 - WatchDevices/WatchChats{deviceId?}/WatchSessions{deviceId?}/WatchDocMessages{chatId}(KEEP)/
-  WatchCheckoutDiffs(summary-only) -> streams. (WatchMessages, WatchUsage DROPPED.)
+  WatchCheckoutDiffs -> streams. (WatchMessages, WatchUsage DROPPED.)
 - QueueCommand{chatId,kind,payload}->{commandId}
 - Mutate: CreateChat, SetChatConfig, SetChatArchived, RenameChat, RenameDevice, DeleteChat,
   MarkChatSeen
@@ -176,14 +174,13 @@ display EXCLUDED. File paths refer to the reference repo.
   presence; warm-opens recent chats (14d, cap 30); cold via device-room nudge; L2 tail GET.
 - 3.4 Terminals: pty; bounded 1MB replay; owner re-checked; live shells survive detach; exited
   buffers 30min TTL; max 32; SubscribeTerminal replays then tails.
-- 3.5 Repos/diffs: list/add/clone/create; branches; worktrees ~/.comet/worktrees/<repo>/<name>;
+- 3.5 Repos/diffs: list/add/clone/create; branches; worktrees ~/.zeron/worktrees/<repo>/<name>;
   checkoutIdentity; CheckoutDiffSync: fs watchers + 2min repair, git diff (name-status + numstat +
   patch incl untracked), 3MiB cap, sha256; publishes DiffSidecar to chat DOs; GitMetadataSync
   watches HEAD -> chat.branch; folder listing in disposable worker w/ 6s timeout.
-- 3.7 Auth: verified Google Cloud IAP principal through Scaffold's existing access path;
-  capabilities bound to explicit project/deployment/session scope; explicit local mock principal
-  mode. Uploads: chunked staging -> durable file. Agent accounts: claude-swap (Keychain
-  "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
+- 3.7 Auth: WorkOS auth-code + loopback callback; headless paste-code; refresh persisted; org
+  gate; dev mode bearer. Uploads: chunked staging -> durable file. Agent accounts: claude-swap
+  (Keychain "Claude Code-credentials" / ~/.claude/.credentials.json + ~/.claude.json; Codex
   $CODEX_HOME/auth.json); detect live, swap to activate, plan labels, usage probes, OAuth flows.
   Device-room host: one wss to device DO; serves full ControlRpc via virtual sockets over
   {s,k,to,from} frames; nudges. Peers: dials other devices' relay DOs, link caching.
@@ -198,6 +195,14 @@ display EXCLUDED. File paths refer to the reference repo.
   ([1m] suffix), fast mode, always-thinking models, AskUserQuestion -> requestInput, steering via
   persistent streaming input, system:init dedup, subagent frame filtering, rate-limit events.
 - Codex: app-server JSON-RPC (thread/start, sendUserMessage, sandbox policy, service tier).
+  Generated images: `imageGeneration` / `image_generation` shows a lifecycle chip and
+  an inline assistant image, with the existing attachment lightbox. Only `savedPath`
+  under `$CODEX_HOME/generated_images` is accepted; PNG/JPEG/WebP/GIF signatures,
+  24 MiB intake cap, atomic copy into profile uploads, metadata-only session parts.
+  Readers use the message owner, then chat host/local fallbacks over attachment RPC.
+  Missing/offline media shows an unavailable placeholder with the existing retry ladder.
+  Inline `result`, SVG, workspace export, and regeneration are outside this feature.
+  Validation: [generated image checks](../generated-images-validation.md).
 - Cursor: turn-boundary steering. Mock for tests.
 
 ## 5. Session doc schema (MUST stay shape-compatible with TS packages/session-doc)
@@ -209,7 +214,7 @@ display EXCLUDED. File paths refer to the reference repo.
 - commands LoroList<LoroMap{id, kind, payload, issuedBy, issuedAt, basedOn?, expiresAt?, status,
   resolution?}>. Rules: (1) each device appends only its own immutable entries; (2) host sole
   outcome writer (composer may cancel own pending); (3) evaluateCommand: processed-id dedupe ->
-  skip; TTL -> expired; newer same-kind steer/interrupt -> superseded; interrupt past basedOn.turnId
+  skip; TTL -> expired; newer interrupt -> superseded (distinct steer messages are retained); interrupt past basedOn.turnId
   -> superseded; else execute. TTL 24h.
 - splitMessageEntry at part boundaries (text chunked by code points) so no op > MSG_INLINE_MAX
   256KB; continuationId = "root#cN"; joinContinuations render-time inverse.
@@ -225,9 +230,9 @@ display EXCLUDED. File paths refer to the reference repo.
 - Worker routes: /health; /session/:chatId/ws (loro room); /tail/:chatId; /stats/:chatId;
   /diff/:chatId GET/POST; /snapshot/:chatId; /append/:chatId; /seed/:chatId;
   /device/:deviceId/ws?role=host|client&connId=; /device/:id/sidecar/:name; /device/:id/status;
-  /device/:id/nudge; /attachments/:sha256 PUT/GET/HEAD (content-addressed R2
-  `att/{projectScope}/{verifiedPrincipal}/{sha}`, 32MB, server-side hash verify).
-- Auth: Scaffold control-plane bearer introspection at edge; DOs see only Worker-stamped verified principal, authorized scope, and capabilities; participant grants bind principals to capabilities.
+  /device/:id/nudge; /attachments/:sha256 PUT/GET/HEAD (content-addressed R2 att/{user}/{sha},
+  32MB, server-side hash verify).
+- Auth: WorkOS JWKS at edge; DOs see only Worker-stamped identity; ownership claim-on-first-join.
 - SessionRoom DO: hibernatable WS, updates log (5s flush), snapshot blob, lazy tail, diff blob,
   %EPH presence; two-level compaction (log-fold @8MB lossless; history-trim shallow snapshot at
   daily frontier checkpoints >= RETAIN_DAYS); daily alarm -> checkpoint + trim + R2
@@ -237,10 +242,9 @@ display EXCLUDED. File paths refer to the reference repo.
   socket; relay control frames; durable nudges (replayed on host join, dedup, cap 256); sidecar
   slots (repos snapshot); /status /nudge.
 
-## 7. Scaffold control-plane access at the edge
-- Keep: IAP session introspection and project/deployment/session-scoped participant grants.
-- Drop from the historical upstream design: legacy code exchange/refresh, organization APIs,
-  entity push/query, application databases, signaling, and the separate server deployment.
+## 7. Server -> folded into edge for native
+- Keep: WorkOS code exchange/refresh, org list/create (move to edge Worker routes).
+- Drop: entity push/query, Postgres, signaling, Fly deploy of separate server.
 
 ## 8. EXCLUDED (token usage display)
 - WatchUsage RPC, UsageStats/UsageDay, backend usage aggregation, profile heatmap/hero/stats,

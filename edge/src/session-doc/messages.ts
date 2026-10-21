@@ -21,9 +21,17 @@ export type SessionMessageRole = "user" | "assistant" | "system";
  */
 export interface DocMessagePart {
   readonly id: string;
-  readonly kind: "text" | "tool" | "input" | "error";
+  readonly kind: "text" | "reasoning" | "tool" | "input" | "error" | "image";
   /** kind === "text" — LoroText in the doc, string in mirror state. */
   readonly text?: string;
+  readonly path?: string;
+  readonly name?: string;
+  readonly mimeType?: string;
+  /** kind === "reasoning" — LoroText in the doc. Deliberately NOT `text`:
+   * old readers' unknown-kind fallback renders `text` as prose, so reasoning
+   * on this field degrades to an invisible empty part instead of leaking
+   * raw thinking into old transcripts. */
+  readonly reasoning?: string;
   /** kind === "tool" — render-only (§1.2). */
   readonly call?: RenderToolCall;
   readonly isError?: boolean;
@@ -40,8 +48,12 @@ export const toDocParts = (
 ): ReadonlyArray<DocMessagePart> =>
   parts.map((p): DocMessagePart => {
     switch (p.kind) {
+      case "image":
+        return { id: p.id, kind: "image", path: p.path, name: p.name, mimeType: p.mimeType };
       case "text":
         return { id: p.id, kind: "text", text: p.text };
+      case "reasoning":
+        return { id: p.id, kind: "reasoning", reasoning: p.text };
       case "tool":
         return {
           id: p.id,
@@ -68,6 +80,10 @@ export const fromDocParts = (
 ): ReadonlyArray<SessionMessagePart> =>
   parts.map((p): SessionMessagePart => {
     switch (p.kind) {
+      case "image":
+        return typeof p.path === "string" && p.path.length > 0 && typeof p.name === "string" && p.name.length > 0 && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(p.mimeType ?? "")
+          ? { kind: "image", id: p.id, path: p.path, name: p.name, mimeType: p.mimeType! }
+          : { kind: "error", id: p.id, message: "Generated image unavailable" };
       case "tool":
         return p.call
           ? {
@@ -86,6 +102,8 @@ export const fromDocParts = (
         };
       case "error":
         return { kind: "error", id: p.id, message: p.message ?? "" };
+      case "reasoning":
+        return { kind: "reasoning", id: p.id, text: p.reasoning ?? "" };
       default:
         return { kind: "text", id: p.id, text: p.text ?? "" };
     }
@@ -93,29 +111,15 @@ export const fromDocParts = (
 
 /** Streaming lifecycle (§6): the stream IS the transcript being written.
  * Host recovery marks abandoned streams `aborted`, preserving a crashed
- * turn's partial output on every device. User entries are normally `complete`;
- * followups are `queued` until their next-turn boundary or `steered` when
- * routed to the active harness's steering boundary. */
-export type SessionMessageStatus =
-  | "streaming"
-  | "complete"
-  | "aborted"
-  | "queued"
-  | "steered";
+ * turn's partial output on every device. User/system entries are always
+ * `complete`. */
+export type SessionMessageStatus = "streaming" | "complete" | "aborted";
 
 export interface SessionTokenUsage {
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly reasoningTokens?: number;
   readonly cachedInputTokens?: number;
-}
-
-/** Native peer-command identity. Never inferred from transcript text. */
-export interface PeerMessageProvenance {
-  readonly commandId: string;
-  readonly sourceChatId: string;
-  readonly threadId: string;
-  readonly replyTo?: string;
 }
 
 /** One entry in the doc's `messages` list. Writer discipline (§1.1): any peer
@@ -134,30 +138,7 @@ export interface SessionMessageEntry {
   /** Set on continuation entries produced by the segment split cap; points at
    * the root entry's id. Renderers concatenate parts in list order. */
   readonly continuationOf?: string;
-  readonly peerMessage?: PeerMessageProvenance;
 }
-
-const nonblank = (value: unknown): value is string =>
-  typeof value === "string" && value.trim().length > 0;
-
-/** Unsupported metadata is deliberately not a reason to hide a message. */
-export const isPeerMessageEntry = (entry: SessionMessageEntry): boolean => {
-  const peer = entry.peerMessage;
-  return entry.role === "user" && entry.continuationOf == null
-    && peer != null && typeof peer === "object" && !Array.isArray(peer)
-    && nonblank(peer.commandId) && peer.commandId === entry.id
-    && nonblank(peer.sourceChatId) && nonblank(peer.threadId)
-    && (peer.replyTo == null || nonblank(peer.replyTo));
-};
-
-const samePeerMessage = (
-  left: PeerMessageProvenance,
-  right: PeerMessageProvenance | undefined
-): boolean => right != null && typeof right === "object" && !Array.isArray(right)
-  && left.commandId === right.commandId
-  && left.sourceChatId === right.sourceChatId
-  && left.threadId === right.threadId
-  && (left.replyTo ?? null) === (right.replyTo ?? null);
 
 const encoder = new TextEncoder();
 const partBytes = (part: DocMessagePart): number =>
@@ -186,15 +167,19 @@ export const splitMessageEntry = (
   // near the cap under the render-only policy but are kept whole regardless.
   const atoms: DocMessagePart[] = [];
   entry.parts.forEach((part, i) => {
-    if (part.kind === "text" && part.text !== undefined && sizes[i]! > maxBytes) {
-      const text = part.text;
+    const body = part.kind === "text" ? part.text : part.kind === "reasoning" ? part.reasoning : undefined;
+    if ((part.kind === "text" || part.kind === "reasoning") && body !== undefined && sizes[i]! > maxBytes) {
       // Chunk by code points to avoid splitting surrogate pairs. Budget in
       // UTF-16 units approximated from the byte cap; JSON escaping overhead is
       // covered by the 4x safety divisor.
       const chunkLen = Math.max(1, Math.floor(maxBytes / 4));
       let n = 0;
-      for (let off = 0; off < text.length; off += chunkLen, n++) {
-        atoms.push({ kind: "text", id: `${part.id}#t${n}`, text: text.slice(off, off + chunkLen) });
+      for (let off = 0; off < body.length; off += chunkLen, n++) {
+        const id = `${part.id}#t${n}`;
+        const slice = body.slice(off, off + chunkLen);
+        atoms.push(
+          part.kind === "text" ? { kind: "text", id, text: slice } : { kind: "reasoning", id, reasoning: slice }
+        );
       }
     } else {
       atoms.push(part);
@@ -238,25 +223,13 @@ export const joinContinuations = (
   if (!entries.some((e) => e.continuationOf)) return entries;
   const rootIndex = new Map<string, number>();
   const order: SessionMessageEntry[] = [];
-  // Only joined roots own mutable part arrays; leave input entries untouched.
-  const joinedParts = new Map<number, DocMessagePart[]>();
   for (const entry of entries) {
     if (entry.continuationOf) {
       const at = rootIndex.get(entry.continuationOf);
       if (at !== undefined) {
         const root = order[at]!;
-        // Never pull ordinary or unsupported content under a hidden peer root.
-        if (root.role === entry.role
-          && (!isPeerMessageEntry(root) || samePeerMessage(root.peerMessage!, entry.peerMessage))) {
-          let parts = joinedParts.get(at);
-          if (!parts) {
-            parts = [...root.parts];
-            joinedParts.set(at, parts);
-            order[at] = { ...root, parts };
-          }
-          for (const part of entry.parts) parts.push(part);
-          continue;
-        }
+        order[at] = { ...root, parts: [...root.parts, ...entry.parts] };
+        continue;
       }
       // Orphan continuation (root trimmed or not yet synced): surface as-is
       // rather than dropping content.

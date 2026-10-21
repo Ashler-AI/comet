@@ -1,4 +1,4 @@
-//! Loaders: the comet pulse loader, the gradient matrix spinner, and the boot
+//! Loaders: the zeron pulse loader, the gradient matrix spinner, and the boot
 //! splash content. All motion routes through `crate::motion` pure helpers, so
 //! the math is unit-tested and these elements are testable-by-compile.
 //!
@@ -6,28 +6,30 @@
 //! come from [`motion::staggered_phase`], so all cells stay phase-locked.
 //! Cells animate inside fixed-size slots — opacity and inner size
 //! are paint-local and never move surrounding layout. Reduced motion snaps every
-//! cell to its rest state automatically (gpui `reduce_motion`).
+//! cell to its rest state automatically (gpui `reduce_motion`). Activity grids
+//! retain a gentle brightness pulse with system reduced motion; explicit On
+//! and background pause keep them still.
 
 use gpui::{
-    AnyElement, App, EntityId, Hsla, IntoElement, ParentElement, PathBuilder, SharedString, Styled,
-    canvas, div, point, px,
+    AnyElement, App, AppContext, Context, Entity, EntityId, IntoElement, ParentElement,
+    PathBuilder, Render, RenderOnce, SharedString, Styled, Window, canvas, div, point, px,
 };
 
-use crate::motion::{self, ARC_SPIN, COMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
-use crate::theme::Theme;
+use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
+use crate::theme::{GlyphPalette, Theme};
 
-// Shared with the terminal viewport (`comet_proto::motion`) so both animate the
+// Shared with the terminal viewport (`zeron_proto::motion`) so both animate the
 // same loaders from the same numbers.
-pub use comet_proto::motion::{
-    COMET_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger,
+pub use zeron_proto::motion::{
+    MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, ZERON_CELLS, mark_cell_stagger,
 };
 
-/// The animated comet mark (comet-loader.tsx `CometLoader`): the full logo
+/// The animated zeron mark (zeron-loader.tsx `ZeronLoader`): the full logo
 /// pixel grid with a light wave sweeping tail→head. Each cell rests dim
 /// (opacity 0.08, scale 0.9) and flares to full as the crest passes; per-cell
 /// stagger follows the flight axis. `height_px` sets the mark's height (width
 /// follows the 820:940 canvas).
-pub fn comet_mark_loader(
+pub fn zeron_mark_loader(
     _id: &'static str,
     theme: &Theme,
     height_px: f32,
@@ -37,7 +39,7 @@ pub fn comet_mark_loader(
     let color = theme.text;
     let scale = height_px / 940.0;
     let cell = 100.0 * scale;
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&ZERON_PULSE, view, cx);
     div()
         .relative()
         .w(px(820.0 * scale))
@@ -55,7 +57,7 @@ pub fn comet_mark_loader(
                 .justify_center()
                 .child({
                     // Negative CSS delay ⇒ the cell starts mid-cycle:
-                    // the stagger ADDS phase (comet-loader.tsx delayFor).
+                    // the stagger ADDS phase (zeron-loader.tsx delayFor).
                     let phase = (delta + stagger).rem_euclid(1.0);
                     div()
                         .rounded(px(16.0 * scale))
@@ -66,12 +68,12 @@ pub fn comet_mark_loader(
         }))
 }
 
-/// The comet wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
+/// The zeron wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
 /// over 2.4s with a 0.15s stagger per cell.
 ///
 /// `id` scopes the per-cell animation state — give each loader instance a
 /// distinct id.
-pub fn comet_loader(
+pub fn zeron_loader(
     _id: &'static str,
     theme: &Theme,
     cell_px: f32,
@@ -80,13 +82,13 @@ pub fn comet_loader(
 ) -> impl IntoElement {
     let color = theme.text;
     let slot = cell_px;
-    let delta = motion::pulse_delta(&COMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&ZERON_PULSE, view, cx);
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(slot / 2.0))
-        .children((0..COMET_CELLS).map(move |i| {
+        .children((0..ZERON_CELLS).map(move |i| {
             // Fixed slot; the animated cell breathes inside it.
             div()
                 .size(px(slot))
@@ -104,9 +106,9 @@ pub fn comet_loader(
         }))
 }
 
-pub use comet_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
+pub use zeron_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
-/// The gradient matrix spinner (WorkingIndicator), ported from comet's
+/// The gradient matrix spinner (WorkingIndicator), ported from zeron's
 /// gradient-spin.tsx: a 3×3 grid of round cells tinted per row from the
 /// sunrise gradient. Each cell pulses opacity once per 750ms period; the
 /// per-cell phase follows the "arrow-up" pattern (the pulse enters at the
@@ -121,7 +123,7 @@ pub fn gradient_spinner(
 ) -> impl IntoElement {
     let center = (MATRIX_SIDE as f32 - 1.0) / 2.0;
     let max = MATRIX_SIDE as f32 - 1.0 + center;
-    let delta = motion::pulse_delta_slow(&GRADIENT_SPIN, view, cx);
+    let pulse = motion::activity_pulse_slow(view, cx);
     div()
         .flex()
         .flex_col()
@@ -141,19 +143,102 @@ pub fn gradient_spinner(
                         .size(px(cell_px))
                         .rounded(px(cell_px / 2.0))
                         .bg(tint)
-                        .opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
+                        .opacity(pulse.opacity(phase, GSPIN_DIM))
                 }))
         }))
 }
 
-/// A 2×3 miniature of [`gradient_spinner`] sized for a status-dot slot
-/// (sessions-sidebar working rows): same row tints and pulse timing, but the
-/// brightness SNAKES around the grid's perimeter (every cell of a 2×3 grid is
-/// on the ring) instead of sweeping as a vertical wave — a tiny radial chase.
-/// ~6×10px footprint at the default 2.5px cells.
-pub fn mini_gradient_spinner(
+/// A 2×3 activity glyph sized for compact status slots. Its color is an
+/// explicit accent-preset role supplied by the caller, while brightness snakes
+/// around the grid's perimeter as a tiny radial chase.
+pub fn mini_glyph_spinner(
     key: impl Into<SharedString>,
     cell_px: f32,
+    palette: GlyphPalette,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
+    mini_spinner_tinted(key, cell_px, palette.rows(), view, cx)
+}
+
+/// Grayscale variant for surfaces where an accent would pull focus (the
+/// sidebar connection line): same grid, snake, and timing, color left to the
+/// caller.
+pub fn mini_mono_spinner(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    tint: gpui::Hsla,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
+    mini_spinner_tinted(key, cell_px, [tint; 3], view, cx)
+}
+
+fn mini_spinner_tinted(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    row_tints: [gpui::Hsla; 3],
+    _view: EntityId,
+    _cx: &mut App,
+) -> impl IntoElement {
+    MiniSpinner {
+        key: key.into(),
+        cell_px,
+        row_tints,
+    }
+}
+
+#[derive(IntoElement)]
+struct MiniSpinner {
+    key: SharedString,
+    cell_px: f32,
+    row_tints: [gpui::Hsla; 3],
+}
+
+impl RenderOnce for MiniSpinner {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Keep pulse invalidation separate from container state changes so
+        // cached sibling rows can be reused while these six cells animate.
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<MiniSpinnerView>>, _| {
+                let view = previous.unwrap_or_else(|| {
+                    cx.new(|_| MiniSpinnerView {
+                        cell_px: self.cell_px,
+                        row_tints: self.row_tints,
+                    })
+                });
+                view.update(cx, |view, cx| {
+                    if view.cell_px != self.cell_px || view.row_tints != self.row_tints {
+                        view.cell_px = self.cell_px;
+                        view.row_tints = self.row_tints;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        view.cached(
+            gpui::StyleRefinement::default()
+                .w(px(self.cell_px * 2.5))
+                .h(px(self.cell_px * 4.0)),
+        )
+    }
+}
+
+struct MiniSpinnerView {
+    cell_px: f32,
+    row_tints: [gpui::Hsla; 3],
+}
+
+impl Render for MiniSpinnerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        mini_spinner_cells(self.cell_px, self.row_tints, cx.entity_id(), cx)
+    }
+}
+
+fn mini_spinner_cells(
+    cell_px: f32,
+    row_tints: [gpui::Hsla; 3],
     view: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
@@ -163,14 +248,13 @@ pub fn mini_gradient_spinner(
     /// (0,0) → (0,1) → (1,1) → (2,1) → (2,0) → (1,0).
     const RING: [[usize; COLS]; ROWS] = [[0, 1], [5, 2], [4, 3]];
     const RING_LEN: f32 = (COLS * ROWS) as f32;
-    let _key = key.into();
-    let delta = motion::pulse_delta_slow(&GRADIENT_SPIN, view, cx);
+    let pulse = motion::activity_pulse(view, cx);
     div()
         .flex()
         .flex_col()
         .gap(px(cell_px / 2.0))
         .children((0..ROWS).map(move |row| {
-            let tint: gpui::Hsla = gpui::rgb(GSPIN_ROW_TINTS[row]).into();
+            let tint = row_tints[row];
             div()
                 .flex()
                 .flex_row()
@@ -181,66 +265,218 @@ pub fn mini_gradient_spinner(
                         .size(px(cell_px))
                         .rounded(px(cell_px / 2.0))
                         .bg(tint)
-                        .opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
+                        .opacity(pulse.opacity(phase, GSPIN_DIM))
                 }))
         }))
 }
 
-/// The thin activity arc for the session rows' top-right status slot (the
-/// macOS-style open ring in the reference shot): a hairline 300° stroke
-/// rotating once per [`ARC_SPIN`] period, phase-locked on the shared pulse
-/// clock. Reduced motion paints the arc static.
-pub fn arc_spinner(color: Hsla, diameter: f32, view: EntityId, cx: &mut App) -> impl IntoElement {
-    let phase = motion::pulse_delta(&ARC_SPIN, view, cx);
-    let stroke = 1.5f32;
-    div().size(px(diameter)).flex_none().child(canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let r = diameter / 2.0 - stroke / 2.0;
-            let center = bounds.center();
-            let at = |angle: f32| {
-                point(
-                    center.x + px(r * angle.cos()),
-                    center.y + px(r * angle.sin()),
-                )
-            };
-            let start = phase * std::f32::consts::TAU;
-            let sweep = std::f32::consts::TAU * (300.0 / 360.0);
-            let mut pb = PathBuilder::stroke(px(stroke));
-            pb.move_to(at(start));
-            // Two half-sweep segments keep each SVG arc under 180° — no
-            // large-arc flag ambiguity.
-            pb.arc_to(
-                point(px(r), px(r)),
-                px(0.0),
-                false,
-                true,
-                at(start + sweep / 2.0),
-            );
-            pb.arc_to(point(px(r), px(r)), px(0.0), false, true, at(start + sweep));
-            if let Ok(path) = pb.build() {
-                window.paint_path(path, color);
-            }
+/// A rounded fill that breathes on the zeron pulse clock between `floor` and
+/// `peak` opacity, filling whatever positioned box it is placed in. Like [`pulse_dot`] it repaints from its own cached
+/// view, so the surrounding chrome stays still.
+pub fn pulse_glow(
+    key: impl Into<SharedString>,
+    radius: f32,
+    tint: gpui::Hsla,
+    floor: f32,
+    peak: f32,
+) -> impl IntoElement {
+    PulseGlow {
+        key: key.into(),
+        style: GlowStyle {
+            radius,
+            tint,
+            floor,
+            peak,
         },
-    ))
+    }
 }
 
-/// Full-window boot splash (comet App.tsx `Splash`): the animated comet mark
-/// (`h-16`) over the app background with an uppercase tracked "Loading" line.
-/// While `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px
-/// lift); the shell removes it once [`SPLASH_OUT`] has run its course.
+#[derive(Clone, Copy, PartialEq)]
+struct GlowStyle {
+    radius: f32,
+    tint: gpui::Hsla,
+    floor: f32,
+    peak: f32,
+}
+
+#[derive(IntoElement)]
+struct PulseGlow {
+    key: SharedString,
+    style: GlowStyle,
+}
+
+impl RenderOnce for PulseGlow {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let style = self.style;
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<PulseGlowView>>, _| {
+                let view = previous.unwrap_or_else(|| cx.new(|_| PulseGlowView { style }));
+                view.update(cx, |view, cx| {
+                    if view.style != style {
+                        view.style = style;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        view.cached(gpui::StyleRefinement::default().size_full())
+    }
+}
+
+struct PulseGlowView {
+    style: GlowStyle,
+}
+
+impl Render for PulseGlowView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let GlowStyle {
+            radius,
+            tint,
+            floor,
+            peak,
+        } = self.style;
+        let delta = motion::pulse_delta_slow(&ZERON_PULSE, cx.entity_id(), cx);
+        // pulse_opacity spans 0.08..1; renormalise to 0..1 before mapping.
+        let wave = (motion::pulse_opacity(delta) - 0.08) / 0.92;
+        div()
+            .size_full()
+            .rounded(px(radius))
+            .bg(tint)
+            .opacity(motion::lerp(floor, peak, wave))
+    }
+}
+
+/// Stroke width of [`upload_progress_ring`].
+const RING_STROKE: f32 = 2.5;
+/// Polyline segments for a full circle — plenty for a ≤40px ring.
+const RING_SEGMENTS: f32 = 64.0;
+
+/// Radial upload-progress ring with the percent centered — overlaid on a
+/// sending echo's attachment thumbnail while its bytes cross the relay
+/// (2026-08-18 "Sending… forever" report; the thumbnail is where the wait
+/// visibly belongs). A faint full track plus a bright arc growing clockwise
+/// from 12 o'clock; gpui paths have no arc primitive, so both are stroked
+/// polylines. Fixed white-on-wash palette: the caller dims the image behind
+/// it, which reads in both themes.
+pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
+    let ring = progress_arc(
+        percent,
+        diameter,
+        gpui::hsla(0.0, 0.0, 1.0, 0.22),
+        gpui::hsla(0.0, 0.0, 1.0, 0.95),
+    );
+    div()
+        .relative()
+        .size(px(diameter))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(ring)
+        .child(
+            div()
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.95))
+                .child(SharedString::from(format!("{percent}%"))),
+        )
+        .into_any_element()
+}
+
+/// [`upload_progress_ring`] without the percent, in the caller's colors: for
+/// a spot too small to label, such as a sent chip's icon well.
+pub fn upload_progress_arc(
+    percent: u8,
+    diameter: f32,
+    track: gpui::Hsla,
+    arc: gpui::Hsla,
+) -> AnyElement {
+    div()
+        .relative()
+        .size(px(diameter))
+        .child(progress_arc(percent, diameter, track, arc))
+        .into_any_element()
+}
+
+/// A faint full track plus an arc growing clockwise from 12 o'clock, filling
+/// its parent.
+fn progress_arc(
+    percent: u8,
+    diameter: f32,
+    track: gpui::Hsla,
+    arc: gpui::Hsla,
+) -> gpui::Canvas<()> {
+    let frac = f32::from(percent.min(100)) / 100.0;
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let radius = diameter / 2.0 - RING_STROKE;
+            let mut paint_arc = |sweep: f32, color: gpui::Hsla| {
+                if sweep <= 0.0 {
+                    return;
+                }
+                let steps = ((RING_SEGMENTS * sweep).ceil() as usize).max(2);
+                let at = |i: usize| {
+                    // Clockwise from 12 o'clock.
+                    let theta = -std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::TAU * sweep * (i as f32 / steps as f32);
+                    point(
+                        center.x + px(radius * theta.cos()),
+                        center.y + px(radius * theta.sin()),
+                    )
+                };
+                let mut builder = PathBuilder::stroke(px(RING_STROKE));
+                builder.move_to(at(0));
+                for i in 1..=steps {
+                    builder.line_to(at(i));
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            paint_arc(1.0, track);
+            paint_arc(frac, arc);
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// Full-window boot splash: the app's dot loader (the same [`gradient_spinner`]
+/// the session list and the reconnecting line pulse — user request, replacing
+/// the hero ascii) over the app background with a quiet status line. While
+/// `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px lift); the
+/// shell removes it once [`SPLASH_OUT`] has run its course.
 pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App) -> AnyElement {
     let content = div()
         .absolute()
         .inset_0()
-        .bg(theme.bg)
+        // Frosted glass, not the opaque page tone (user request): the boot
+        // overlay reads like the rest of the chrome — the frost tint over
+        // the blurred window background (opaque platforms get the surface
+        // tone, since `glass()` collapses to it there).
+        .bg(theme.glass())
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(28.0))
-        .child(comet_mark_loader("boot-splash", theme, 64.0, view, cx))
-        .child(loading_word(theme));
+        .gap(px(12.0))
+        // Cell 2.5 — the size every other surface runs this spinner at (the
+        // "Sending…" strip, the transcript working trailer).
+        .child(gradient_spinner(
+            "boot-splash-spinner",
+            theme,
+            2.5,
+            view,
+            cx,
+        ))
+        .child(
+            div()
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from("Setting up Zeron environment")),
+        );
     if fading {
         motion::splash_out("boot-splash-out", content).into_any_element()
     } else {
@@ -248,24 +484,11 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
     }
 }
 
-/// "L O A D I N G" — `text-[11px] uppercase tracking-[0.32em]
-/// text-muted-foreground/70`; tracking approximated with thin spaces (gpui has
-/// no letter-spacing at the pinned rev).
-pub fn loading_word(theme: &Theme) -> impl IntoElement {
-    div()
-        .text_size(px(11.0))
-        .text_color(theme.text_muted.opacity(0.7))
-        .child(SharedString::from(
-            "L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G",
-        ))
-}
-
 // Compile-time proof the specs referenced here stay wired to the catalog.
 const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);
-    assert!(COMET_PULSE.duration_ms == 2400);
+    assert!(ZERON_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
-    assert!(ARC_SPIN.duration_ms == 900);
 };
 
 #[cfg(test)]

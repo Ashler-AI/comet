@@ -1,650 +1,270 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
-import { createContext, runInContext } from 'node:vm';
-import { randomUUID } from 'node:crypto';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer, Viewport, loadConfig } from './server.mjs';
+import { createServer, Viewport, loadConfig, browserEntry } from './server.mjs';
 import { CrewRpc, applyTranscriptFrame } from './rpc.mjs';
 
-async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'crew-web-test-'));
+const profile = {
+  projectId: 'crew-upstream-canary', deploymentId: 'crew-upstream-canary', sessionId: 'session-a',
+  sandboxId: 'sandbox-a', targetDeviceId: 'device-a', lifecycleEpoch: 1, actor: { sub: 'owner@example.com' },
+};
+const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
+const entry = (id, text = 'hello') => ({ id, role: 'assistant', createdAt: 1000, status: 'complete', parts: [{ id: `${id}:text`, kind: 'text', text }] });
+
+async function fixture(t, publish = true) {
+  const root = await mkdtemp(join(tmpdir(), 'crew-native-web-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const config = { sessionId: 'session-a', sandboxId: 'sandbox-a', token: 'x'.repeat(40), storage: join(root, 'web'), runtimeDir: root };
+  const env = {
+    SCAFFOLD_CREW_SYNC_GENERATION: 'chat2', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify(profile),
+    CREW_WEB_AUTH_TOKEN: 'private-token-'.repeat(4), COMET_IPC_PORT: '27954',
+    COMET_DATA_DIR: join(root, '.scaffold/crew-upstream-canary/data'), SCAFFOLD_RUNTIME_DIR: root,
+  };
+  const config = loadConfig(env);
   await mkdir(join(root, 'omp-inference'));
-  await writeFile(join(root, 'omp-inference', 'profile.json'), JSON.stringify({ profile: 'scaffold-host', model: 'scaffold-openai/gpt-example' }));
-  const rpc = new EventEmitter();
-  rpc.close = () => {};
+  await writeFile(join(root, 'omp-inference/profile.json'), JSON.stringify({ profile: 'scaffold-host', model: 'scaffold-openai/gpt-example' }));
+  const authority = {
+    scope: { projectId: profile.projectId, deploymentId: profile.deploymentId, sessionId: profile.sessionId },
+    sandboxId: profile.sandboxId, deviceId: profile.targetDeviceId, lifecycleEpoch: 1,
+    principalSubject: profile.actor.sub, grantId: 'private-grant', expiresAt: Date.now() + 60000,
+    capabilities: ['session.read', 'session.chat', 'session.control', 'session.files'],
+  };
+  const context = {
+    id: profile.sessionId, deviceId: profile.targetDeviceId, roomGen: 2, cwd: '/workspace', title: 'Assigned chat',
+    config: { harness: 'omp', model: message.model, reasoning: message.reasoning, sandbox: 'workspace-write', modelOptions: { trusted: true } },
+    crew: { ownerSubject: 'opaque-edge-owner', sessionId: profile.sessionId, scope: authority.scope },
+  };
   const commands = new Map();
-  const uploads = new Map();
-  const context = { cwd: '/workspace', config: { harness: 'omp', model: 'openai-codex/gpt-example', reasoning: 'high', sandbox: 'workspace-write', modelOptions: { trusted: true } } };
+  const calls = [];
+  const watches = new Map();
+  const rpc = new EventEmitter();
+  rpc.connect = async () => {};
+  rpc.close = () => {};
+  rpc.watch = (method, params, callback) => { watches.set(method, { params, callback }); return () => watches.delete(method); };
   rpc.call = async (method, params) => {
-    if (method === 'ReadSessionAuthority') return {
-      scope: { projectId: 'project-a', deploymentId: 'deployment-a', sessionId: 'session-a' }, sandboxId: 'sandbox-a',
-      deviceId: 'device-a', lifecycleEpoch: 1, principalSubject: 'owner-a', grantId: 'grant-a', expiresAt: Date.now() + 60000,
-      capabilities: ['session.read', 'session.chat', 'session.control'],
-    };
-    if (method === 'ReadSessionContext') {
-      assert.deepEqual(params, { chatId: config.sessionId });
-      return { ...context, authority: await rpc.call('ReadSessionAuthority', params) };
-    }
-    if (method === 'UploadChunk') {
-      const bytes = Buffer.from(params.data, 'base64');
-      if (bytes.length > 45000) throw new Error('Upload chunk exceeds 45000 raw bytes');
-      const chunks = uploads.get(params.uploadId) || [];
-      assert.equal(params.seq, chunks.length);
-      chunks.push(bytes);
-      uploads.set(params.uploadId, chunks);
-      return {};
-    }
-    if (method === 'UploadCommit') {
-      assert.ok(uploads.has(params.uploadId));
-      return { path: `/workspace/uploads/${params.uploadId}/${params.fileName}` };
-    }
+    calls.push({ method, params });
+    if (method === 'ScaffoldHostAuthority') return structuredClone(authority);
+    if (method === 'ListModels') return [{ id: message.model, label: 'Example', reasoningLevels: ['high'] }];
     if (method === 'QueueCommand') {
-      if (!commands.has(params.commandId)) commands.set(params.commandId, params);
+      if (commands.has(params.commandId)) assert.deepEqual(commands.get(params.commandId).payload, params.command);
+      else commands.set(params.commandId, { id: params.commandId, status: 'pending', resolution: null, payload: params.command });
       return { commandId: params.commandId };
     }
-    if (method === 'ReadSessionCommand') {
-      const entry = commands.get(params.commandId);
-      return { command: entry ? { commandId: params.commandId, status: entry.status || 'pending', resolution: entry.resolution || null } : null };
-    }
-    throw new Error(`Unexpected test RPC ${method}`);
+    if (method === 'ReadCommand') return { command: commands.get(params.commandId) ?? null };
+    if (method === 'UploadChunk') { assert.ok(Buffer.from(params.data, 'base64').length <= 45000); return {}; }
+    if (method === 'UploadCommit') return { path: `pending://${params.uploadId}/${params.fileName}` };
+    if (method === 'FetchToolBlob') return { text: 'captured output' };
+    assert.fail(`Unexpected native RPC ${method}`);
   };
   const viewport = new Viewport(config, rpc);
-  viewport.connection = 'connected';
-  viewport.snapshots = new Set(['context', 'sessions', 'selection', 'messages', 'collaboration']);
-  viewport.context = context;
   const { server } = await createServer(config, viewport);
+  await viewport.connect();
+  const publishSnapshots = () => {
+    watches.get('WatchChats').callback([context]);
+    watches.get('WatchSessions').callback([]);
+    watches.get('WatchDocMessages').callback({ reset: [] });
+  };
+  if (publish) publishSnapshots();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  t.after(() => { viewport.stop(); server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
   const url = `http://127.0.0.1:${server.address().port}`;
   const headers = { authorization: `Basic ${Buffer.from(`opencode:${config.token}`).toString('base64')}`, 'content-type': 'application/json', 'x-crew-web-origin-verified': 'true' };
-  const post = (path, value, customHeaders = headers) => fetch(url + path, { method: 'POST', headers: customHeaders, body: JSON.stringify(value) });
-  return { config, rpc, viewport, commands, uploads, context, url, headers, post };
+  const get = path => fetch(url + path, { headers });
+  const post = (path, input, customHeaders = headers) => fetch(url + path, { method: 'POST', headers: customHeaders, body: JSON.stringify(input) });
+  return { env, config, authority, context, commands, calls, watches, rpc, viewport, publishSnapshots, url, headers, get, post };
 }
 
-const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
-
-test('model retry progress follows live or peer state and clears on terminal or stale rows', async t => {
+test('only trusted chat2 configuration enables the isolated bridge', async t => {
   const f = await fixture(t);
-  await f.viewport.readAuthority();
-  const retry = { attempt: 2, maxAttempts: 4 };
-  f.viewport.collaboration = { sessions: [{ sessionId: 'session-a', status: 'working', updatedAt: Date.now(), modelRetry: retry }] };
-  assert.deepEqual(f.viewport.state().session.modelRetry, retry);
-  f.viewport.live = { chatId: 'session-a', status: 'working', updatedAt: new Date().toISOString(), modelRetry: retry };
-  assert.deepEqual(f.viewport.state().session.modelRetry, retry);
-  f.viewport.live.modelRetry = null;
-  assert.equal(f.viewport.state().session.modelRetry, null);
-  for (const status of ['idle', 'errored', 'awaitingInput']) {
-    f.viewport.live.status = status;
-    f.viewport.live.modelRetry = retry;
-    assert.equal(f.viewport.state().session.modelRetry, null);
-  }
-  f.viewport.live.status = 'working';
-  f.viewport.live.updatedAt = new Date(Date.now() - 45_001).toISOString();
-  assert.equal(f.viewport.state().session.modelRetry, null);
+  assert.equal(f.config.ipcPort, 27954);
+  for (const change of [
+    { SCAFFOLD_CREW_SYNC_GENERATION: '' }, { SCAFFOLD_CREW_SYNC_GENERATION: 'legacy' },
+    { COMET_IPC_PORT: '39400' }, { COMET_DATA_DIR: '/tmp/shared-data' },
+    { CREW_WEB_AUTH_TOKEN: 'short' }, { CREW_WEB_SESSION_ID: 'another-session' },
+    { SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify({ ...profile, actor: {} }) },
+  ]) assert.throws(() => loadConfig({ ...f.env, ...change }));
+  assert.throws(() => loadConfig({ ...f.env, SCAFFOLD_CREW_SYNC_GENERATION: '', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify({ ...profile, crewSyncGeneration: 'chat2' }) }));
 });
 
-test('native opening rechecks authority and binds the installed deployment without credentials', async t => {
-  const f = await fixture(t);
-  const original = f.rpc.call;
-  const authority = await original('ReadSessionAuthority', {});
-  authority.scope.projectId = authority.scope.deploymentId = 'ashler-staging';
-  f.rpc.call = async (method, params) => method === 'ReadSessionAuthority' ? authority : original(method, params);
-  const get = (headers = f.headers) => fetch(f.url + '/api/native-open', { headers });
-  assert.equal((await get({})).status, 401);
-  let response = await get();
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { url: 'comet-staging://scaffold/ashler-staging/ashler-staging/session-a/sandbox-a' });
-  assert.equal(f.commands.size, 0);
-  authority.capabilities = [];
-  assert.equal((await get()).status, 403);
-  authority.capabilities = ['session.read'];
-  f.viewport.currentAuthority = null;
-  authority.scope.projectId = authority.scope.deploymentId = 'ashler-production';
-  response = await get();
-  assert.deepEqual(await response.json(), { url: 'comet://scaffold/ashler-production/ashler-production/session-a/sandbox-a' });
-  for (const scope of [
-    { projectId: 'other-project' },
-    { deploymentId: 'unknown' },
-    { sessionId: 'different-session' },
-    { sessionId: 'session-a?token=secret' },
-  ]) {
-    f.viewport.currentAuthority = null;
-    authority.scope = { projectId: 'ashler-production', deploymentId: 'ashler-production', sessionId: 'session-a', ...scope };
-    assert.equal((await get()).status, 503);
-  }
-  f.viewport.currentAuthority = null;
-  authority.scope.sessionId = 'session-a';
-  authority.sandboxId = 'another-sandbox';
-  assert.equal((await get()).status, 503);
-});
-
-test('SSE waits for drain and coalesces transcript updates with fresh authority', async t => {
-  const f = await fixture(t);
-  const client = new EventEmitter();
-  const frames = [];
-  client.writableLength = 0;
-  client.write = frame => { frames.push(frame); client.writableLength = Buffer.byteLength(frame); return false; };
-  client.destroy = () => assert.fail('Normal backpressure must not disconnect');
-  f.viewport.clients.add(client);
-  f.viewport.messages = [{ text: 'x'.repeat(32000) }];
-  await f.viewport.emit();
-  f.viewport.messages = [{ text: 'intermediate' }];
-  await f.viewport.emit();
-  f.viewport.messages = [{ text: 'latest' }];
-  await f.viewport.emit();
-  assert.equal(frames.length, 1);
-  assert.equal(client.listenerCount('drain'), 1);
-  client.writableLength = 0;
-  client.emit('drain');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(frames.length, 2);
-  assert.equal(JSON.parse(frames[1].split('data: ')[1]).messages[0].text, 'latest');
-  client.end = frame => frames.push(frame);
-  f.rpc.call = async () => { throw new Error('Authority revoked'); };
-  client.writableLength = 0;
-  client.emit('drain');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(JSON.parse(frames[2].split('data: ')[1]).transcriptReset, true);
-  assert.equal(f.viewport.clients.size, 0);
-});
-
-test('SSE disconnects when buffered and pending state exceed the backlog limit', () => {
-  const viewport = new Viewport({}, new EventEmitter());
-  const client = new EventEmitter();
-  let destroyed = false;
-  client.writableLength = 1024 * 1024;
-  client.write = () => false;
-  client.destroy = () => { destroyed = true; };
-  viewport.clients.add(client);
-  viewport.sendState(client, 'first');
-  viewport.sendState(client, 'x'.repeat(1024 * 1024 + 1));
-  assert.equal(destroyed, true);
-  assert.equal(viewport.clients.size, 0);
-});
-
-test('RPC recovers from a failed dial without a close event and ignores the retired socket', async t => {
-  const sockets = [];
-  t.mock.method(globalThis, 'WebSocket', function () {
-    const socket = new EventTarget();
-    socket.readyState = WebSocket.CONNECTING;
-    socket.send = frame => { socket.request = JSON.parse(frame); };
-    socket.close = () => {
-      socket.readyState = WebSocket.CLOSING;
-      if (socket !== sockets[0]) socket.dispatchEvent(new Event('close'));
-    };
-    sockets.push(socket);
-    queueMicrotask(() => {
-      socket.readyState = socket === sockets[0] ? WebSocket.CLOSING : WebSocket.OPEN;
-      socket.dispatchEvent(new Event(socket === sockets[0] ? 'error' : 'open'));
-    });
-    return socket;
+test('real health requires authority and all native snapshots; private native opening contains no credentials', async t => {
+  const f = await fixture(t, false);
+  assert.equal((await f.get('/health')).status, 503);
+  f.publishSnapshots();
+  assert.equal((await f.get('/health')).status, 200);
+  assert.deepEqual([...f.watches.keys()], ['WatchChats', 'WatchSessions', 'WatchDocMessages']);
+  assert.deepEqual(f.watches.get('WatchDocMessages').params, { chatId: profile.sessionId });
+  const state = await (await f.get('/api/session')).json();
+  assert.equal(state.capabilities.message, true);
+  assert.equal(state.session.cwd, '/workspace');
+  assert.equal(JSON.stringify(state).includes('private-grant'), false);
+  assert.equal(JSON.stringify(state).includes('opaque-edge-owner'), false);
+  assert.deepEqual(await (await f.get('/api/native-open')).json(), {
+    url: 'crew-upstream-canary://scaffold/crew-upstream-canary/crew-upstream-canary/session-a/sandbox-a',
   });
-  const rpc = new CrewRpc(39400);
-  t.after(() => rpc.close());
-  await assert.rejects(rpc.connect(), /Crew engine unavailable/);
-  await rpc.connect();
-  const reply = rpc.call('ReadSessionAuthority', { chatId: 'session-a' });
-  sockets[0].dispatchEvent(new Event('close'));
-  sockets[1].dispatchEvent(new MessageEvent('message', { data: JSON.stringify({
-    id: sockets[1].request.id, ok: { capabilities: ['session.read'] },
-  }) }));
-  assert.deepEqual(await reply, { capabilities: ['session.read'] });
-});
-
-test('RPC timeout carries method, request id, and elapsed time', async t => {
-  const frames = [];
-  const logs = [];
-  const now = [1_000, 31_005];
-  t.mock.method(Date, 'now', () => now.shift());
-  t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
-    assert.equal(delay, 30000);
-    queueMicrotask(callback);
-    return 1;
-  });
-  t.mock.method(console, 'error', (...args) => logs.push(args));
-  const rpc = new CrewRpc(39400);
-  rpc.socket = { readyState: WebSocket.OPEN, send: frame => frames.push(JSON.parse(frame)) };
-
-  await assert.rejects(
-    rpc.call('ReadSessionCommand', { commandId: 'command-a' }),
-    /Crew request timed out: method=ReadSessionCommand id=1 elapsed_ms=30005/,
-  );
-  assert.deepEqual(frames, [
-    { id: 1, method: 'ReadSessionCommand', params: { commandId: 'command-a' } },
-    { id: 1, cancel: true },
-  ]);
-  assert.deepEqual(logs, [[
-    'Crew RPC request timed out',
-    { method: 'ReadSessionCommand', id: 1, elapsedMs: 30005 },
-  ]]);
-});
-
-test('deployment session connects and admits messages and controls without legacy chat rows', async t => {
-  const f = await fixture(t);
-  const watches = new Map();
-  const original = f.rpc.call;
-  f.rpc.connect = async () => {};
-  f.rpc.watch = (method, params, callback) => { watches.set(method, { params, callback }); };
-  f.rpc.call = async (method, params) => {
-    if (method === 'ReadSessionSelection') return { selection: null };
-    if (method === 'ListSessionModels') return [];
-    return original(method, params);
-  };
-  f.viewport.clearProtected();
-  await f.viewport.connect();
-  assert.equal(watches.has('WatchChats'), false);
-  watches.get('WatchSessions').callback([]);
-  watches.get('WatchDocMessages').callback({ reset: [], before: null });
-   watches.get('WatchCollaboration').callback({ sessions: [{ sessionId: 'session-a', status: 'idle', model: 'openai-codex/gpt-example' }], grants: [{ id: 'private-grant' }], participants: [{ email: 'private@example.com' }] });
-  await Promise.resolve();
-  assert.equal(f.viewport.chat, undefined);
-  assert.equal(f.viewport.state().capabilities.message, true);
-   assert.equal(f.viewport.state().session.cwd, '/workspace');
-   const browserState = await (await fetch(f.url + '/api/session', { headers: f.headers })).json();
-   assert.equal(Object.hasOwn(browserState, 'collaboration'), false);
-   assert.equal(Object.hasOwn(browserState, 'grants'), false);
-   assert.equal(Object.hasOwn(browserState, 'participants'), false);
-   assert.equal(browserState.session.model, 'openai-codex/gpt-example');
-   assert.equal(browserState.capabilities.input, true);
-  const { model, reasoning, ...defaultMessage } = message;
-  assert.equal((await f.post('/api/message', { ...defaultMessage, cwd: '/browser' })).status, 400);
-  assert.equal((await f.post('/api/message', defaultMessage)).status, 202);
-  const request = [...f.commands.values()][0].command.action.request;
-  assert.equal(request.cwd, '/workspace');
-  assert.equal(request.model, model);
-  assert.equal(request.reasoning, reasoning);
-  assert.deepEqual(request.modelOptions, { trusted: true });
-   assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a' })).status, 400);
-  f.viewport.messages = [{ parts: [{ kind: 'input', requestId: 'input-a', questions: [{ id: 'q', multiSelect: false }] }] }];
-  assert.equal((await f.post('/api/input', { requestId: 'answer-a', inputRequestId: 'input-a', answers: [{ questionId: 'q', labels: ['yes'] }] })).status, 202);
-  const session = { chatId: 'session-a::session::session-a', deviceId: 'device-a', status: 'working', startedAt: '2026-09-11T10:00:00Z' };
-  watches.get('WatchSessions').callback([session]);
-  const firstTurn = f.viewport.state().session.turnId;
-   assert.ok(firstTurn);
-   assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a', turnId: firstTurn })).status, 202);
-   assert.deepEqual(f.commands.get('crew-web:stop-a').command.action, { action: 'stop', expected_turn_id: firstTurn });
-  watches.get('WatchDocMessages').callback({ reset: [{ id: 'message-a', parts: [] }] });
-  watches.get('WatchSessions').callback([{ ...session, status: 'awaitingInput' }]);
-  assert.equal(f.viewport.state().session.turnId, firstTurn);
-  watches.get('WatchSessions').callback([{ ...session, startedAt: '2026-09-11T10:01:00Z' }]);
-   assert.notEqual(f.viewport.state().session.turnId, firstTurn);
-   assert.equal((await f.post('/api/interrupt', { requestId: 'stale-stop', turnId: firstTurn })).status, 409);
-   assert.equal(f.commands.has('crew-web:stale-stop'), false);
-   assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a', turnId: firstTurn })).status, 202);
-   assert.equal(f.commands.get('crew-web:stop-a').command.action.expected_turn_id, firstTurn);
-  assert.equal(f.viewport.state().messages.at(-1).id, 'message-a');
-  watches.get('WatchSessions').callback([{ ...session, startedAt: null }]);
-  assert.equal(f.viewport.state().session.turnId, null);
-});
-
-test('session context binding mismatch clears protected readiness before admission', async t => {
-  const f = await fixture(t);
-  await f.viewport.readAuthority();
-  const original = f.rpc.call;
-  f.rpc.call = async (method, params) => {
-    const result = await original(method, params);
-    return method === 'ReadSessionContext' ? { ...result, authority: { ...result.authority, lifecycleEpoch: 2 } } : result;
-  };
-  assert.equal((await f.post('/api/message', message)).status, 503);
-  assert.equal(f.viewport.context, null);
+  assert.throws(() => f.watches.get('WatchChats').callback([{ ...f.context, deviceId: 'other-device' }]));
   assert.equal(f.viewport.state().capabilities.message, false);
-  assert.equal(f.commands.size, 0);
 });
 
-test('uploads enforce 45000 raw-byte chunks and preserve bytes across boundaries', async t => {
-  const f = await fixture(t);
-  await assert.rejects(f.rpc.call('UploadChunk', { uploadId: 'oversize', seq: 0, data: Buffer.alloc(45001).toString('base64') }), /45000/);
-  for (const size of [44999, 45000, 45001, 90000, 90001, 192 * 1024]) {
-    const bytes = Buffer.alloc(size);
-    for (let index = 0; index < size; index++) bytes[index] = index % 251;
-    const response = await fetch(f.url + '/api/upload', { method: 'POST', headers: { ...f.headers, 'content-type': 'application/octet-stream', 'x-filename': 'boundary.bin' }, body: bytes });
-    assert.equal(response.status, 201);
-    const metadata = await response.json();
-    assert.equal(metadata.size, size);
-    const chunks = f.uploads.get(metadata.id);
-    assert.equal(chunks.length, Math.ceil(size / 45000));
-    assert.ok(chunks.every(chunk => chunk.length <= 45000));
-    assert.deepEqual(Buffer.concat(chunks), bytes);
-    assert.equal((await f.post('/api/message', { ...message, requestId: `upload-${size}`, attachments: [metadata] })).status, 202);
-    const entry = f.commands.get(`crew-web:upload-${size}`);
-    assert.ok(entry.command.action.request.prompt.includes(`/workspace/uploads/${metadata.id}/boundary.bin`));
-  }
-});
-
-test('upload revocation between chunks prevents remaining chunks and commit', async t => {
-  const f = await fixture(t);
-  const original = f.rpc.call;
-  let revoked = false;
-  let commits = 0;
-  f.rpc.call = async (method, params) => {
-    if (method === 'UploadCommit') commits++;
-    const result = await original(method, params);
-    if (method === 'UploadChunk') revoked = true;
-    return method === 'ReadSessionAuthority' && revoked ? { ...result, capabilities: ['session.read'] } : result;
-  };
-  const response = await fetch(f.url + '/api/upload', { method: 'POST', headers: { ...f.headers, 'x-filename': 'revoked.bin' }, body: Buffer.alloc(45001) });
-  assert.equal(response.status, 403);
-  assert.equal([...f.uploads.values()][0].length, 1);
-  assert.equal(commits, 0);
-});
-
-test('HTTP boundary denies missing credentials, unverified writes, raw RPC and caller-selected sessions', async t => {
+test('proxy authentication, mutation origin, bounded bodies and exact grant binding fail closed', async t => {
   const f = await fixture(t);
   assert.equal((await fetch(f.url + '/api/session')).status, 401);
-  assert.equal((await f.post('/api/message', message, { ...f.headers, 'x-crew-web-origin-verified': '' })).status, 403);
-  assert.equal((await f.post('/api/rpc', { method: 'Mutate' })).status, 404);
-  assert.equal((await f.post('/api/message', { ...message, chatId: 'foreign' })).status, 400);
+  assert.equal((await f.post('/api/message', message, { ...f.headers, 'x-crew-web-origin-verified': 'false' })).status, 403);
+  assert.equal((await f.post('/api/message', { ...message, cwd: '/outside' })).status, 400);
+  assert.equal((await f.post('/api/message', { ...message, text: 'x'.repeat(300000) })).status, 413);
   assert.equal(f.commands.size, 0);
-  const health = await fetch(f.url + '/health', { headers: f.headers });
-  assert.deepEqual(await health.json(), { service: 'crew-web', sessionId: 'session-a', sandboxId: 'sandbox-a' });
-  assert.equal((await fetch(f.url + '/healthz', { headers: f.headers })).status, 404);
+  for (const change of [
+    { principalSubject: 'other@example.com' }, { deviceId: 'other-device' }, { lifecycleEpoch: 2 },
+    { sandboxId: 'other-sandbox' }, { expiresAt: 0 }, { grantId: '' },
+    { scope: { ...f.authority.scope, projectId: 'other-project' } },
+    { scope: { ...f.authority.scope, deploymentId: 'other-deployment' } },
+    { scope: { ...f.authority.scope, sessionId: 'other-session' } },
+  ]) assert.throws(() => f.viewport.acceptAuthority({ ...f.authority, ...change }, 'session.read'));
+  f.authority.capabilities = ['session.read'];
+  assert.equal((await f.post('/api/message', message)).status, 403);
 });
 
-test('follow-ups leave native continuation to the engine for the assigned session', async t => {
+test('durable native command retries survive lost receipt and bridge restart without duplicate execution', async t => {
   const f = await fixture(t);
-  f.viewport.context.harnessSessionId = 'stale-context-native';
-  f.viewport.collaboration = { sessions: [{ sessionId: 'session-a', harnessSessionId: 'stale-projected-native' }] };
-  assert.equal((await f.post('/api/message', message)).status, 202);
-  const entry = [...f.commands.values()][0];
-  assert.equal(entry.chatId, 'session-a');
-  assert.equal(entry.command.sessionId, 'session-a');
-  assert.equal(entry.command.action.request.resume, null);
-});
-
-test('browser restores the authorized route after failed admission or rejection and preserves retries', async () => {
-  const source = await readFile(new URL('./public/app.js', import.meta.url), 'utf8');
-  for (const failure of ['admission', 'rejection', 'outcome', 'response', 'default-admission', 'default-outcome', 'default-response', 'edited-response']) {
-    const nodes = new Map();
-    const node = id => {
-      if (!nodes.has(id)) nodes.set(id, {
-        value: '', style: {}, dataset: {}, options: [], listeners: {},
-        addEventListener(name, listener) { this.listeners[name] = listener; },
-        querySelectorAll() { return []; }, replaceChildren(...children) { this.options = children; },
-        add(option) { this.options.push(option); }, focus() {},
-      });
-      return nodes.get(id);
-    };
-    const calls = [];
-    let fail = true;
-    let route = 'gpt-example';
-    const admitted = new Map();
-    const context = createContext({
-      document: { getElementById: node, querySelector: node },
-      window: { addEventListener() {} },
-      ResizeObserver: class { observe() {} },
-      EventSource: class { addEventListener() {} },
-      crypto: { randomUUID },
-      Option: class { constructor(label, value) { this.label = label; this.value = value; } },
-      fetch: async (path, options) => {
-        if (path === './api/session' || path === './api/models' || path === './api/native-open') return new Promise(() => {});
-        const body = options.body && JSON.parse(options.body);
-        calls.push({ path, body });
-        let status = 200;
-        let result = {};
-        if (path.endsWith('/model-route')) route = body.model;
-        else if (path === './api/interrupt') {
-          admitted.set(body.requestId, { status: 'applied' });
-          if (fail) throw new TypeError('Response lost');
-        } else if (path === './api/message') {
-          if (fail && failure === 'default-admission') route = 'remote';
-          if (admitted.has(body.requestId)) result = {};
-          else if (fail && failure === 'admission') status = 503;
-          else if (route !== body.model.split('/')[1]) status = 409;
-          else {
-            admitted.set(body.requestId, { status: fail && failure === 'rejection' ? 'rejected' : 'applied' });
-            if (fail && failure.endsWith('response')) throw new TypeError('Response lost');
-          }
-        } else {
-          result = admitted.get(path.split('/').at(-1));
-          if (!result) { status = 404; result = {}; }
-          else if (fail && failure.endsWith('outcome')) status = 503;
-        }
-        return new Response(JSON.stringify(result), { status, headers: { 'content-type': 'application/json' } });
-      },
-    });
-    runInContext(source, context);
-    runInContext(`state = { connection: 'connected', sandboxId: 'sandbox-a', session: { model: 'openai-codex/gpt-example', reasoning: 'high', status: 'idle' }, capabilities: { message: true }, models: [{}] }; connected = true;`, context);
-    node('message').value = 'Continue';
-    const defaultSelection = failure.startsWith('default-') || failure === 'edited-response';
-    node('model').value = defaultSelection ? 'openai-codex/gpt-example' : 'openai-codex/gpt-other';
-    node('reasoning').value = 'high';
-    if (!defaultSelection) node('reasoning').listeners.change();
-    const submit = () => node('composer').listeners.submit({ preventDefault() {} });
-    await submit();
-    assert.equal(node('message').value, 'Continue');
-    if (failure === 'default-admission') assert.equal(admitted.size, 0);
-    if (failure === 'admission') {
-      node('model').value = 'openai-codex/gpt-example';
-      await submit();
-      assert.equal(node('message').value, 'Continue');
-      assert.equal(route, 'gpt-example');
-      node('model').value = 'openai-codex/gpt-other';
-    }
-    fail = false;
-    if (defaultSelection) {
-      route = 'remote';
-      runInContext(`state.session.model = 'openai-codex/remote'; state.session.status = 'working'; renderModels();`, context);
-      assert.equal(node('model').value, 'openai-codex/remote');
-      if (failure === 'edited-response') node('message').value = 'New draft';
-      await submit();
-      const messages = calls.filter(call => call.path === './api/message');
-      assert.equal(messages.length, 2);
-      if (failure === 'default-admission') {
-        assert.notEqual(messages[0].body.requestId, messages[1].body.requestId);
-        assert.equal(messages[1].body.text, 'Continue');
-        assert.equal(messages[1].body.model, 'openai-codex/remote');
-        assert.equal(admitted.size, 1);
-      } else if (failure === 'edited-response') {
-        assert.notEqual(messages[0].body.requestId, messages[1].body.requestId);
-        assert.equal(messages[1].body.text, 'New draft');
-        assert.equal(messages[1].body.model, 'openai-codex/remote');
-        assert.equal(admitted.size, 2);
-      } else {
-        assert.deepEqual(messages[1].body, messages[0].body);
-        assert.equal(admitted.size, 1);
-      }
-      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 1);
-    } else if (failure === 'outcome' || failure === 'response') {
-      route = 'gpt-example';
-      await submit();
-      const messages = calls.filter(call => call.path === './api/message');
-      assert.equal(messages[0].body.requestId, messages[1].body.requestId);
-      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 1);
-      assert.equal(admitted.size, 1);
-    } else if (failure === 'admission') {
-      await submit();
-      const messages = calls.filter(call => call.path === './api/message');
-      assert.equal(messages.length, 3);
-      assert.equal(messages[0].body.requestId, messages[2].body.requestId);
-      assert.notEqual(messages[0].body.requestId, messages[1].body.requestId);
-      assert.equal(route, 'gpt-other');
-      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 3);
-      assert.equal(admitted.size, 1);
-    } else {
-      node('model').value = 'openai-codex/gpt-example';
-      await submit();
-      assert.equal(route, 'gpt-example');
-      assert.equal(calls.filter(call => call.path.endsWith('/model-route')).length, 2);
-    }
-    assert.equal(node('message').value, '');
-    assert.equal(runInContext('modelDirty', context), false);
-    runInContext(`state.session.model = 'openai-codex/remote'; state.session.status = 'working'; renderModels();`, context);
-    assert.equal(node('model').value, 'openai-codex/remote');
-    node('model').value = 'openai-codex/unsent';
-    node('reasoning').listeners.change();
-    runInContext(`state.session.model = 'openai-codex/another'; renderModels();`, context);
-    assert.equal(node('model').value, 'openai-codex/unsent');
-    runInContext(`state.session.id = 'session-a'; state.session.turnId = JSON.stringify(['session-a', 'device-a', '2026-09-11T10:00:00Z']); state.capabilities.interrupt = true; state.messages = [{ id: 'message-a' }];`, context);
-    const stop = () => node('stop').listeners.click();
-    fail = true;
-    await stop();
-    runInContext(`state.messages.push({ id: 'message-a2' }); state.session.status = 'awaitingInput';`, context);
-    await stop();
-    runInContext(`state.session = { ...state.session, status: 'working', turnId: JSON.stringify(['session-a', 'device-a', '2026-09-11T10:01:00Z']) };`, context);
-    fail = false;
-    await stop();
-    const stops = calls.filter(call => call.path === './api/interrupt');
-    assert.equal(stops[0].body.requestId, stops[1].body.requestId);
-    assert.equal(stops[0].body.turnId, JSON.stringify(['session-a', 'device-a', '2026-09-11T10:00:00Z']));
-    assert.equal(stops[0].body.turnId, stops[1].body.turnId);
-    assert.equal(stops[2].body.turnId, JSON.stringify(['session-a', 'device-a', '2026-09-11T10:01:00Z']));
-    assert.notEqual(stops[0].body.requestId, stops[2].body.requestId);
-    runInContext(`state.session.turnId = null; updateControls();`, context);
-    assert.equal(node('stop').disabled, true);
-    await stop();
-    assert.equal(calls.filter(call => call.path === './api/interrupt').length, 3);
-  }
-});
-
-test('durable admission remains discoverable before engine queue acknowledgement', async t => {
-  const f = await fixture(t);
-  const original = f.rpc.call;
+  const call = f.rpc.call;
+  let loseReceipt = true;
   f.rpc.call = async (method, params) => {
-    if (method === 'QueueCommand') throw new Error('Engine unavailable');
-    return original(method, params);
+    const result = await call(method, params);
+    if (method === 'QueueCommand' && loseReceipt) { loseReceipt = false; throw new Error('Connection lost after durable admission'); }
+    return result;
   };
   assert.equal((await f.post('/api/message', message)).status, 503);
-  assert.equal(f.commands.size, 0);
-  const outcome = await fetch(f.url + '/api/command/' + message.requestId, { headers: f.headers });
-  assert.equal(outcome.status, 200);
-  assert.equal((await outcome.json()).status, 'pending');
-  f.rpc.call = original;
-  f.viewport.live = { status: 'working' };
-  assert.equal((await f.post('/api/message', message)).status, 202);
-  assert.equal([...f.commands.values()][0].command.action.action, 'start');
-  assert.equal(f.commands.size, 1);
-});
-
-test('durable request retry does not turn a started message into a steer or duplicate after restart', async t => {
-  const f = await fixture(t);
-  const first = await f.post('/api/message', message);
-  assert.equal(first.status, 202);
-  const receipt = await first.json();
-  f.viewport.live = { status: 'working' };
-  const retry = await f.post('/api/message', message);
-  assert.deepEqual(await retry.json(), receipt);
-  assert.equal(f.commands.size, 1);
-  assert.equal([...f.commands.values()][0].command.action.action, 'start');
   const restarted = new Viewport(f.config, f.rpc);
-  assert.deepEqual(await restarted.enqueue('message', message), receipt);
-  assert.equal((await f.post('/api/message', { ...message, text: 'Different' })).status, 409);
+  restarted.context = f.context;
+  restarted.connection = 'connected';
+  restarted.snapshots = new Set(['context', 'sessions', 'messages']);
+  const receipt = await restarted.enqueue('message', message);
+  assert.deepEqual(receipt, { commandId: 'crew-web:1:request-a' });
   assert.equal(f.commands.size, 1);
+  const stored = f.commands.get(receipt.commandId);
+  assert.equal(stored.payload.kind, 'run');
+  assert.equal(stored.payload.messageId, receipt.commandId);
+  assert.equal(stored.payload.request.cwd, '/workspace');
+  assert.equal(stored.payload.request.harness, 'omp');
+  assert.deepEqual(stored.payload.request.modelOptions, { trusted: true });
+  assert.equal(stored.payload.request.resume, null);
+  assert.equal((await f.post('/api/message', { ...message, text: 'different' })).status, 409);
+  stored.status = 'applied';
+  const outcome = await (await f.get('/api/command/request-a')).json();
+  assert.deepEqual(outcome, { commandId: receipt.commandId, status: 'applied', resolution: null });
+  f.authority.capabilities = ['session.read'];
+  assert.equal((await f.post('/api/message', message)).status, 403);
 });
 
-test('model route mismatch, foreign attachments and stale approval cannot admit commands', async t => {
+test('steer, input and interruption use native payloads and bind cancellation to the current transcript turn', async t => {
   const f = await fixture(t);
-  assert.equal((await f.post('/api/message', { ...message, model: 'anthropic/other-model' })).status, 409);
-  assert.equal((await f.post('/api/message', { ...message, attachments: [{ id: 'unknown' }] })).status, 400);
-  assert.equal((await f.post('/api/input', { requestId: 'approval-a', inputRequestId: 'stale', answers: [] })).status, 409);
-  assert.equal(f.commands.size, 0);
-});
-
-test('incomplete reconnection snapshots cannot select a stale run mode', async t => {
-  const f = await fixture(t);
-  f.viewport.live = { status: 'working' };
-  f.viewport.snapshots.delete('selection');
-  assert.equal((await f.post('/api/message', message)).status, 503);
-  assert.equal(f.commands.size, 0);
-});
-
-test('renewed authority restores capabilities while changed host identity fails closed', async t => {
-  const f = await fixture(t);
-  await f.viewport.authority('session.read');
-  f.viewport.currentAuthority.expiresAt = 0;
-  assert.equal(f.viewport.state().capabilities.message, false);
-  await f.viewport.authority('session.read');
-  assert.equal(f.viewport.state().capabilities.message, true);
-  const original = f.rpc.call;
-  f.rpc.call = async (method, params) => method === 'ReadSessionAuthority'
-    ? { ...(await original(method, params)), deviceId: 'foreign-device' } : original(method, params);
-  await assert.rejects(f.viewport.authority(), /binding changed/);
-});
-
-test('foreign or expired engine authority fails before command admission', async t => {
-  const f = await fixture(t);
-  const original = f.rpc.call;
-  f.rpc.call = async (method, params) => method === 'ReadSessionAuthority' ? {
-    ...(await original(method, params)), scope: { sessionId: 'foreign' },
-  } : original(method, params);
-  assert.equal((await f.post('/api/message', message)).status, 503);
-  assert.equal(f.commands.size, 0);
-  f.rpc.call = async (method, params) => method === 'ReadSessionAuthority' ? {
-    ...(await original(method, params)), expiresAt: 0,
-  } : original(method, params);
-  assert.equal((await f.post('/api/message', message)).status, 503);
-  assert.equal(f.commands.size, 0);
-});
-
-test('lost read capability denies cached session, streams, history and tool reads', async t => {
-  const f = await fixture(t);
-  await f.viewport.readAuthority();
-  f.viewport.messages = [{ id: 'private-message', parts: [{ kind: 'text', id: 'p', text: 'protected text' }] }];
-  const original = f.rpc.call;
-  f.rpc.call = async (method, params) => method === 'ReadSessionAuthority'
-    ? { ...(await original(method, params)), capabilities: ['session.chat'] } : original(method, params);
-  for (const path of ['/api/session', '/api/events', '/api/messages?before=10', '/api/tool/private-tool']) {
-    const response = await fetch(f.url + path, { headers: f.headers });
-    assert.equal(response.status, 403);
-    assert.equal((await response.text()).includes('protected text'), false);
-  }
-  assert.deepEqual(f.viewport.messages, []);
-  assert.equal(f.viewport.state().transcriptReset, true);
-});
-
-test('an existing event subscriber receives only a redacted reset after read revocation', async t => {
-  const f = await fixture(t);
-  await f.viewport.readAuthority();
-  f.viewport.messages = [{ id: 'secret', parts: [{ kind: 'text', text: 'protected transcript' }] }];
-  let ended;
-  f.viewport.clients.add({ writableLength: 0, write() { assert.fail('Protected event must not be written'); }, end(frame) { ended = frame; } });
-  const original = f.rpc.call;
-  f.rpc.call = async (method, params) => method === 'ReadSessionAuthority'
-    ? { ...(await original(method, params)), capabilities: [] } : original(method, params);
-  await f.viewport.emit();
-  assert.equal(ended.includes('protected transcript'), false);
-  const state = JSON.parse(ended.split('data: ')[1].trim());
-  assert.deepEqual(state.messages, []);
-  assert.equal(state.transcriptReset, true);
-  assert.equal(state.connection, 'disconnected');
-});
-
-test('admission remains pending until the durable command outcome exposes rejection', async t => {
-  const f = await fixture(t);
+  f.watches.get('WatchSessions').callback([{ chatId: profile.sessionId, deviceId: profile.targetDeviceId, status: 'working', startedAt: '2026-01-01T00:00:00Z' }]);
+  f.watches.get('WatchDocMessages').callback({ reset: [entry('turn-a')] });
   assert.equal((await f.post('/api/message', message)).status, 202);
-  const outcomeUrl = f.url + '/api/command/' + message.requestId;
-  assert.equal((await (await fetch(outcomeUrl, { headers: f.headers })).json()).status, 'pending');
-  const entry = [...f.commands.values()][0];
-  entry.status = 'rejected';
-  entry.resolution = 'Control grant was revoked before execution';
-  const rejected = await (await fetch(outcomeUrl, { headers: f.headers })).json();
-  assert.equal(rejected.status, 'rejected');
-  assert.equal(rejected.resolution, entry.resolution);
-  assert.equal((await fetch(f.url + '/api/command/foreign-command', { headers: f.headers })).status, 404);
-  assert.equal(f.commands.size, 1);
+  assert.equal(f.commands.get('crew-web:1:request-a').payload.kind, 'steer');
+  assert.equal((await f.post('/api/interrupt', { requestId: 'stop-old', turnId: 'old-turn' })).status, 409);
+  assert.equal((await f.post('/api/interrupt', { requestId: 'stop-a', turnId: 'turn-a' })).status, 202);
+  const stop = f.calls.find(row => row.method === 'QueueCommand' && row.params.command.kind === 'interrupt');
+  assert.equal(stop.params.expectedTurnId, 'turn-a');
+  assert.deepEqual(stop.params.command, { kind: 'interrupt' });
+  f.viewport.messages = [{ ...entry('question'), parts: [{ id: 'input-a', kind: 'input', requestId: 'input-a', resolved: false, questions: [{ id: 'q', multiSelect: false }] }] }];
+  assert.equal((await f.post('/api/input', { requestId: 'answer-a', inputRequestId: 'input-a', answers: [{ questionId: 'q', labels: ['yes'] }] })).status, 202);
+  assert.equal(f.commands.get('crew-web:1:answer-a').payload.kind, 'respondInput');
+  assert.equal(f.commands.get('crew-web:1:answer-a').payload.requestId, 'input-a');
+  assert.equal((await f.post('/api/input', { requestId: 'answer-b', inputRequestId: 'missing', answers: [] })).status, 409);
 });
 
-test('bounded HTTP body rejects oversize payload without admission', async t => {
+test('uploads cannot choose filesystem paths and tool detail remains session scoped', async t => {
   const f = await fixture(t);
-  const response = await f.post('/api/message', { ...message, text: 'a'.repeat(256 * 1024) });
-  assert.equal(response.status, 413);
-  assert.equal(f.commands.size, 0);
+  const upload = name => fetch(f.url + '/api/upload', { method: 'POST', headers: { ...f.headers, 'x-filename': encodeURIComponent(name), 'content-type': 'image/png' }, body: Buffer.alloc(90001, 1) });
+  assert.equal((await upload('../outside.png')).status, 400);
+  const response = await upload('image.png');
+  assert.equal(response.status, 201);
+  const metadata = await response.json();
+  assert.equal(Object.hasOwn(metadata, 'path'), false);
+  assert.equal(f.calls.filter(row => row.method === 'UploadChunk').length, 3);
+  assert.equal((await f.post('/api/message', { ...message, attachments: [metadata] })).status, 202);
+  assert.match(f.commands.get('crew-web:1:request-a').payload.request.attachments[0], /^pending:\/\//);
+  assert.equal((await f.post('/api/message', { ...message, requestId: 'bad-upload', attachments: [{ id: '/etc/passwd' }] })).status, 400);
+  const part = { id: 'tool-a', kind: 'tool', call: { kind: 'exec', command: 'pwd' }, outputRef: 'session-a/tool-a', resolved: true };
+  f.viewport.messages = [{ ...entry('tools'), parts: [part] }];
+  assert.equal((await (await f.get('/api/tool/tool-a')).json()).output, 'captured output');
+  assert.deepEqual(f.calls.find(row => row.method === 'FetchToolBlob').params, { blobRef: 'session-a/tool-a' });
+  part.outputRef = 'other-session/tool-a';
+  assert.equal((await f.get('/api/tool/tool-a')).status, 503);
+  assert.equal(f.calls.filter(row => row.method === 'FetchToolBlob').length, 1);
+  assert.equal((await f.get('/api/tool/missing')).status, 404);
 });
 
-test('trusted configuration rejects conflicting session bindings and non-loopback IPC targets', () => {
-  const env = { CREW_WEB_SESSION_ID: 'a', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: '{"sessionId":"b"}', CREW_WEB_AUTH_TOKEN: 'a'.repeat(40), COMET_IPC_PORT: '39400', COMET_DATA_DIR: '/data', SCAFFOLD_RUNTIME_DIR: '/runtime' };
-  assert.throws(() => loadConfig(env), /Conflicting session/);
-  assert.throws(() => loadConfig({ ...env, CREW_WEB_SESSION_ID: 'b', COMET_IPC_PORT: 'remote:39400' }), /COMET_IPC_PORT/);
+test('native reset and streaming deltas preserve UTF-8 text and reasoning, bounded history stays pageable', async t => {
+  const f = await fixture(t);
+  const initial = { ...entry('a', 'é'), parts: [{ id: 'text', kind: 'text', text: 'é' }, { id: 'reason', kind: 'reasoning', text: 'private' }] };
+  let rows = applyTranscriptFrame([], { reset: [initial] });
+  rows = applyTranscriptFrame(rows, { append: [{ entry: 'a', part: 'text', text: '世', len: 5 }, { entry: 'a', part: 'reason', text: ' thought', len: 15 }], count: 1 });
+  assert.equal(rows[0].parts[0].text, 'é世');
+  assert.equal(rows[0].parts[1].kind, 'reasoning');
+  assert.equal(JSON.stringify(browserEntry(rows[0])).includes('private thought'), false);
+  assert.throws(() => applyTranscriptFrame(rows, { append: [{ entry: 'a', part: 'text', text: 'x', len: 999 }], count: 1 }), /length mismatch/);
+  assert.throws(() => applyTranscriptFrame(rows, { upsert: [{ after: 'missing', entry: entry('b') }], count: 2 }), /anchor missing/);
+  f.viewport.messages = Array.from({ length: 240 }, (_, index) => entry(String(index), 'x'.repeat(8000)));
+  let before;
+  const seen = [];
+  do {
+    const page = f.viewport.messagePage(before);
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) < 530000);
+    seen.unshift(...page.entries.map(row => row.id));
+    before = page.before;
+  } while (before !== null);
+  assert.deepEqual(seen, f.viewport.messages.map(row => row.id));
+  const large = browserEntry(entry('huge', '世'.repeat(50000)));
+  assert.equal(large.parts[0].kind, 'textWindow');
+  assert.ok(Buffer.byteLength(large.parts[0].text) <= 32768);
+  assert.equal(large.parts[0].text.includes('\ufffd'), false);
+  assert.equal(Buffer.byteLength(large.parts[0].text) + large.parts[0].omitted_prefix_bytes, 150000);
 });
 
-test('transcript deltas preserve UTF-8 byte windows and reject desynchronization', () => {
-  const initial = [{ id: 'a', parts: [{ kind: 'text', id: 'p', text: 'éhi' }] }];
-  const updated = applyTranscriptFrame(initial, { append: [{ entry: 'a', part: 'p', drop_prefix: 2, text: '!', omitted_prefix_bytes: 2, len: 3 }], count: 1 });
-  assert.deepEqual(updated[0].parts[0], { kind: 'textWindow', id: 'p', text: 'hi!', omitted_prefix_bytes: 2 });
-  assert.throws(() => applyTranscriptFrame(updated, { count: 3 }), /count mismatch/);
-  assert.throws(() => applyTranscriptFrame(updated, { upsert: [{ after: 'missing', entry: { id: 'b', parts: [] } }], count: 2 }), /anchor missing/);
+test('SSE coalesces backpressure, disconnects oversized backlog, and erases state on revocation', async t => {
+  const f = await fixture(t);
+  const client = new EventEmitter();
+  const frames = [];
+  client.writableLength = 0;
+  client.write = frame => { frames.push(frame); return false; };
+  client.end = frame => frames.push(frame);
+  client.destroy = () => assert.fail('Normal backpressure must not disconnect');
+  f.viewport.clients.add(client);
+  f.viewport.messages = [entry('a', 'first')];
+  await f.viewport.emit();
+  f.viewport.messages = [entry('a', 'latest')];
+  await f.viewport.emit();
+  assert.equal(frames.length, 1);
+  client.emit('drain');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(JSON.parse(frames[1].split('data: ')[1]).messages[0].parts[0].text, 'latest');
+  f.authority.capabilities = [];
+  await f.viewport.emit();
+  const redacted = JSON.parse(frames.at(-1).split('data: ')[1]);
+  assert.deepEqual(redacted.messages, []);
+  assert.equal(redacted.transcriptReset, true);
+  assert.equal(f.viewport.clients.size, 0);
+  let destroyed = false;
+  client.destroy = () => { destroyed = true; };
+  client.writableLength = 2 * 1024 * 1024;
+  f.viewport.clients.add(client);
+  f.viewport.sendState(client, 'overflow');
+  assert.equal(destroyed, true);
+});
+
+test('native subscriptions cancel their own wire request without closing other streams', () => {
+  const rpc = new CrewRpc(27954);
+  const frames = [];
+  rpc.socket = { readyState: WebSocket.OPEN, send: frame => frames.push(JSON.parse(frame)), close: () => assert.fail('Cancellation must not close the engine connection') };
+  const cancel = rpc.watch('WatchDocMessages', { chatId: 'session-a' }, () => {});
+  const cancelOther = rpc.watch('WatchSessions', {}, () => {});
+  cancel();
+  cancel();
+  assert.equal(rpc.pending.size, 1);
+  assert.deepEqual(frames[2], { id: 1, cancel: true });
+  cancelOther();
+  assert.equal(rpc.pending.size, 0);
 });

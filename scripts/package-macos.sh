@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Native macOS bundles. Production preserves Crew.app and comet-<version>-macos-arm64*.
 # COMET_PACKAGE_ENVIRONMENT=staging builds an independent Crew Staging.app.
+# Unselected local packaging retains the isolated Canary flavor.
 # Distribution requires Developer ID signing and a notarytool keychain profile.
 # COMET_MACOS_SIGNING=adhoc explicitly opts into local-only, non-distribution output.
 set -euo pipefail
@@ -23,10 +24,17 @@ if [[ "$ARCH" != "arm64" ]]; then
   exit 1
 fi
 
-PACKAGE_ENVIRONMENT="${COMET_PACKAGE_ENVIRONMENT:-production}"
+PACKAGE_ENVIRONMENT="${COMET_PACKAGE_ENVIRONMENT:-canary}"
 OUT_DIR="$ROOT/target/package"
 BUILD_DIR="$(python3 "$ROOT/scripts/local-cargo.py" --print-target-dir)"
 case "$PACKAGE_ENVIRONMENT" in
+  canary)
+    APP_NAME="Crew Canary"
+    BUNDLE_ID="ai.ashler.crew.upstream-canary"
+    ARTIFACT_PREFIX="crew-upstream-canary"
+    OUT_DIR="$OUT_DIR/canary"
+    BUILD_DIR="$BUILD_DIR/canary"
+    ;;
   production)
     APP_NAME="Crew"
     BUNDLE_ID="ai.ashler.comet"
@@ -39,7 +47,7 @@ case "$PACKAGE_ENVIRONMENT" in
     OUT_DIR="$OUT_DIR/staging"
     BUILD_DIR="$BUILD_DIR/staging"
     ;;
-  *) echo "COMET_PACKAGE_ENVIRONMENT must be production or staging" >&2; exit 1 ;;
+  *) echo "COMET_PACKAGE_ENVIRONMENT must be canary, production or staging" >&2; exit 1 ;;
 esac
 if [[ -n "${COMET_DEFAULT_ENVIRONMENT:-}" && "$COMET_DEFAULT_ENVIRONMENT" != "$PACKAGE_ENVIRONMENT" ]]; then
   echo "COMET_DEFAULT_ENVIRONMENT must match COMET_PACKAGE_ENVIRONMENT" >&2
@@ -147,8 +155,8 @@ APP_TARBALL="$OUT_DIR/$ARTIFACT_PREFIX-$VERSION-macos-$ARCH-app.tar.gz"
 cd "$ROOT"
 BUILD_BIN="$(mktemp)"
 trap 'rm -f "$BUILD_BIN"' EXIT
-python3 scripts/local-cargo.py build --release -p comet --target-dir "$BUILD_DIR" \
-  --copy-binary release/comet "$BUILD_BIN"
+python3 scripts/local-cargo.py build --locked --release -p zeron --target-dir "$BUILD_DIR" \
+  --copy-binary release/zeron "$BUILD_BIN"
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -161,11 +169,24 @@ sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info
 if [[ "$PACKAGE_ENVIRONMENT" == staging ]]; then
   # Keep production and staging app links bound to their respective installs.
   /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 comet-staging" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :LSEnvironment:ZERON_CALLBACK_PORT string 0" "$APP/Contents/Info.plist"
+elif [[ "$PACKAGE_ENVIRONMENT" == canary ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 crew-upstream-canary" "$APP/Contents/Info.plist"
+else
+  /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 comet" "$APP/Contents/Info.plist"
 fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.session" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile comet.icns" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 
+mkdir -p "$APP/Contents/Resources/licenses/fonts"
+cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
+cp "$ROOT/THIRD_PARTY_NOTICES.md" "$ROOT/LICENSE" "$APP/Contents/Resources/licenses/"
+cp "$ROOT/crates/voice/NOTICE.md" "$APP/Contents/Resources/licenses/parakeet-v3.txt"
+
 # The Dock icon uses the brand's Apple-squircle variant.
-ICON_SRC="$ROOT/assets/brand/png/crew-icon-macos-1024.png"
+ICON_SRC="$ROOT/dist/macos/icon-1024.png"
 ICONSET="$OUT_DIR/comet.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
@@ -177,8 +198,8 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/comet.icns"
 rm -rf "$ICONSET"
 
 # Sign inside-out rather than relying on --deep to repair nested signatures.
-codesign "${SIGN_ARGS[@]}" ${APP_SIGN_ARGS[@]+"${APP_SIGN_ARGS[@]}"} "$APP/Contents/MacOS/comet"
-codesign "${SIGN_ARGS[@]}" ${APP_SIGN_ARGS[@]+"${APP_SIGN_ARGS[@]}"} "$APP"
+codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/dist/macos/Zeron.entitlements" ${APP_SIGN_ARGS[@]+"${APP_SIGN_ARGS[@]}"} "$APP/Contents/MacOS/comet"
+codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/dist/macos/Zeron.entitlements" ${APP_SIGN_ARGS[@]+"${APP_SIGN_ARGS[@]}"} "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 NOTARY_DIR="$(mktemp -d)"

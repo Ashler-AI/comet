@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AgentSessionRecord, AuthState, Chat, ChatIndicator, Session, SessionEnvironmentSource, SessionStatus, Space};
+use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -33,12 +33,11 @@ pub enum Indicator {
     Working,
     AwaitingInput,
     Errored,
-    /// The last owner status was active, but its liveness has expired.
-    Unreachable,
 }
 
-/// Active owner state older than this is unreachable, never evidence of idle
-/// or successful completion. Engines heartbeat well inside this window.
+/// A `Working`/`AwaitingInput` session older than this is treated as dead — a
+/// crashed backend must never show an eternal "Working" (feature-inventory
+/// §1.12). Engines heartbeat sessions well inside this window.
 pub const SESSION_STALE_MS: i64 = 45_000;
 
 /// Staleness-checked indicator for a session row. Pure.
@@ -54,7 +53,7 @@ pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Ind
                 .signed_duration_since(session.updated_at)
                 .num_milliseconds();
             if age_ms > SESSION_STALE_MS {
-                Indicator::Unreachable
+                Indicator::None
             } else if session.status == SessionStatus::Working {
                 Indicator::Working
             } else {
@@ -64,95 +63,21 @@ pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Ind
     }
 }
 
-/// Staleness-checked indicator for a shared remote agent session.
-///
-/// Collaboration sessions use millisecond timestamps rather than chrono
-/// values, but follow the same expiry contract as local sessions.
-pub fn effective_agent_indicator(
-    session: Option<&AgentSessionRecord>,
-    now: DateTime<Utc>,
-) -> Indicator {
-    let Some(session) = session else {
-        return Indicator::None;
-    };
-    match session.status {
-        None | Some(SessionStatus::Idle) => Indicator::None,
-        Some(SessionStatus::Errored) => Indicator::Errored,
-        Some(SessionStatus::Working | SessionStatus::AwaitingInput) => {
-            let updated_at = session.updated_at.unwrap_or(session.created_at);
-            if now.timestamp_millis().saturating_sub(updated_at) > SESSION_STALE_MS {
-                Indicator::Unreachable
-            } else if session.status == Some(SessionStatus::Working) {
-                Indicator::Working
-            } else {
-                Indicator::AwaitingInput
-            }
-        }
-    }
+/// Subagents running under a chat, staleness-checked like
+/// [`effective_indicator`]: a session row nobody has refreshed inside
+/// [`SESSION_STALE_MS`] belongs to a dead engine and counts nothing. Pure.
+pub fn running_subagents(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .map_or(0, |s| s.running_subagents)
 }
 
-/// Select the genuine writer heartbeat for one public thread, including children.
-pub fn owner_thread_activity<'a>(
-    records: &'a [AgentSessionRecord],
-    canonical: &AgentSessionRecord,
-    now: i64,
-) -> Option<&'a AgentSessionRecord> {
-    if canonical.session_id != canonical.chat_id { return None; }
-    let matching_environment = |record: &AgentSessionRecord| match (&canonical.environment, &record.environment) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
-            let source_matches = match (&a.source, &b.source) {
-                (SessionEnvironmentSource::Local, SessionEnvironmentSource::Local) => true,
-                (SessionEnvironmentSource::Scaffold { sandbox_id: a, lifecycle: al, lifecycle_epoch: ae, .. },
-                 SessionEnvironmentSource::Scaffold { sandbox_id: b, lifecycle: bl, lifecycle_epoch: be, .. }) => a == b && al == bl && ae == be,
-                _ => false,
-            };
-            source_matches && a.owner_principal == b.owner_principal
-                && a.scope.project_id == b.scope.project_id && a.scope.deployment_id == b.scope.deployment_id
-                && a.database_environment == b.database_environment
-        }
-        _ => false,
-    };
-    records.iter().filter(|record| {
-        record.chat_id == canonical.chat_id && record.owner_subject == canonical.owner_subject
-            && record.owner_device_id == canonical.owner_device_id && record.source == canonical.source
-            && matching_environment(record)
-    }).filter_map(|record| {
-        let status = record.status?;
-        let at = record.updated_at.unwrap_or(record.created_at);
-        let updated_at = DateTime::<Utc>::from_timestamp_millis(at)?;
-        let fresh = now.saturating_sub(at) <= SESSION_STALE_MS;
-        let rank = match status {
-            SessionStatus::AwaitingInput if fresh => 4,
-            SessionStatus::Working if fresh => 3,
-            SessionStatus::AwaitingInput | SessionStatus::Working => 2,
-            SessionStatus::Idle | SessionStatus::Errored => 1,
-        };
-        Some((record, updated_at, rank))
-    }).max_by(|(a, at, ar), (b, bt, br)| {
-        ar.cmp(br).then_with(|| at.cmp(bt))
-            .then_with(|| (a.status == Some(SessionStatus::Errored)).cmp(&(b.status == Some(SessionStatus::Errored))))
-            .then_with(|| a.session_id.cmp(&b.session_id))
-    }).map(|(record, _, _)| record)
-}
-
-/// Fresh active state wins; expired active state stays visibly unreachable
-/// instead of manufacturing completion. Terminal/history rows use the synced
-/// seen marker via [`crate::chat_indicator`].
+/// The full display status for a chat row / tab dot: live states win, then the
+/// synced seen marker decides completed-vs-idle. Staleness gating rides on
+/// [`effective_indicator`]; the derivation itself is [`crate::chat_indicator`].
 pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
-    display_indicator(chat, effective_indicator(session, now))
-}
-
-/// Keep sidebar completion/seen semantics identical for either activity source.
-pub fn display_indicator(chat: &Chat, indicator: Indicator) -> ChatIndicator {
-    match indicator {
-        Indicator::Working => ChatIndicator::Working,
-        Indicator::AwaitingInput => ChatIndicator::AwaitingInput,
-        Indicator::Unreachable => ChatIndicator::Unreachable,
-        Indicator::Errored if chat.unseen() => ChatIndicator::Errored,
-        _ if chat.unseen() => ChatIndicator::Completed,
-        _ => ChatIndicator::Idle,
-    }
+    let live = session.filter(|s| effective_indicator(Some(s), now) != Indicator::None);
+    crate::chat_indicator(chat, live)
 }
 
 /// Attention bucket for the sidebar's Active list — lower is more urgent.
@@ -160,7 +85,6 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
     match status {
         ChatIndicator::AwaitingInput => 0,
         ChatIndicator::Errored => 1,
-        ChatIndicator::Unreachable => 1,
         ChatIndicator::Working => 2,
         ChatIndicator::Completed => 3,
         ChatIndicator::Idle => 4,
@@ -207,6 +131,30 @@ pub fn sort_spaces(spaces: &mut [Space]) {
     });
 }
 
+/// The project a space belongs to: spaces sharing a repository identity —
+/// clones and worktrees of one repository, on any device — are one project.
+/// A space without an identity is a project of its own. Pure.
+pub fn project_key(space: &Space) -> String {
+    match space.repository_id.as_deref() {
+        Some(repository_id) => format!("repo:{repository_id}"),
+        None => space.id.clone(),
+    }
+}
+
+/// The space that speaks for `space`'s whole project: the oldest member, id
+/// tiebreak. Its name and color stand for every member, and the choice is
+/// the same on every device, so a repository looks alike everywhere. Pure.
+pub fn representative_space<'a>(spaces: &'a [Space], space: &'a Space) -> &'a Space {
+    let Some(repository_id) = space.repository_id.as_deref() else {
+        return space;
+    };
+    spaces
+        .iter()
+        .filter(|s| s.repository_id.as_deref() == Some(repository_id))
+        .min_by_key(|s| (s.created_at, s.id.as_str()))
+        .unwrap_or(space)
+}
+
 /// Sidebar order: `last_message_at` desc, falling back to `created_at`; ties
 /// break by `created_at` desc then id so the sort is total and stable across
 /// devices. Pure.
@@ -224,69 +172,201 @@ pub fn sort_chats(chats: &mut [Chat]) {
 // Boot gate
 // ---------------------------------------------------------------------------
 
-/// The app gate (comet's App.tsx phases). Pure.
+/// The app gate (zeron's App.tsx phases). Pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatePhase {
     /// Booting / probing — splash covers this.
     Loading,
     /// Engine unreachable and embedding failed.
     Failed(String),
-    /// Engine is signed out.
+    /// Engine up, but signed out — show the sign-in card.
     SignIn,
+    /// Signed in but no organization selected — "Create your workspace".
+    OrgGate,
     /// Render the shell.
     Ready,
 }
 
-/// `auth = None` means "engine doesn't report auth yet" (dev mode) and gates
-/// nothing.
-pub fn gate_phase(connection: &ConnectionStatus, auth: Option<&AuthState>) -> GatePhase {
+/// Missing scope is treated as synced. Current engines always publish
+/// [`WorkspaceScope`] before becoming ready, while old daemons are deliberately
+/// kept behind the account gate instead of being mistaken for local runtimes.
+pub fn gate_phase(
+    connection: &ConnectionStatus,
+    workspace_scope: Option<WorkspaceScope>,
+    auth: Option<&AuthState>,
+) -> GatePhase {
     match connection {
         ConnectionStatus::Connecting => GatePhase::Loading,
         ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
-        ConnectionStatus::Ready => match auth {
-            Some(AuthState::SignedOut) => GatePhase::SignIn,
-            _ => GatePhase::Ready,
+        ConnectionStatus::Ready => match workspace_scope.unwrap_or(WorkspaceScope::Synced) {
+            WorkspaceScope::Local | WorkspaceScope::Development => GatePhase::Ready,
+            WorkspaceScope::Synced => match auth {
+                Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
+                Some(AuthState::SignedIn { .. }) => GatePhase::Ready,
+                Some(AuthState::SignedOut) | None => GatePhase::SignIn,
+            },
         },
     }
 }
 
-/// Parse AuthStatus while accepting the previous organization-shaped frame as
-/// a migration input. New frames always carry `projectScope`.
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    fn space(id: &str, device: &str, repository: Option<&str>, minutes: i64) -> Space {
+        Space {
+            id: id.into(),
+            device_id: device.into(),
+            path: format!("/{device}/{id}"),
+            name: None,
+            git_detected: repository.is_some(),
+            git_checked_at: None,
+            checkout_id: None,
+            repository_id: repository.map(str::to_string),
+            created_at: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::minutes(minutes),
+        }
+    }
+
+    #[test]
+    fn spaces_sharing_a_repository_are_one_project_led_by_the_oldest() {
+        let spaces = vec![
+            space("laptop", "mac", Some("github.com/o/r"), 2),
+            space("server", "vps", Some("github.com/o/r"), 1),
+            space("notes", "mac", None, 0),
+        ];
+        assert_eq!(project_key(&spaces[0]), "repo:github.com/o/r");
+        assert_eq!(project_key(&spaces[0]), project_key(&spaces[1]));
+        assert_eq!(project_key(&spaces[2]), "notes");
+        assert_eq!(representative_space(&spaces, &spaces[0]).id, "server");
+        assert_eq!(representative_space(&spaces, &spaces[1]).id, "server");
+        assert_eq!(representative_space(&spaces, &spaces[2]).id, "notes");
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::UserProfile;
+
+    fn user() -> UserProfile {
+        UserProfile {
+            id: "user-1".into(),
+            email: "user@example.com".into(),
+            name: None,
+        }
+    }
+
+    fn running_session(running: u32, updated_at: DateTime<Utc>) -> Session {
+        Session {
+            last_completed_turn: None,
+            chat_id: "chat".into(),
+            device_id: "dev".into(),
+            status: SessionStatus::Working,
+            started_at: None,
+            updated_at,
+            running_subagents: running,
+        }
+    }
+
+    #[test]
+    fn running_subagents_count_only_while_the_session_row_is_fresh() {
+        let now = Utc::now();
+        let fresh = running_session(3, now - chrono::Duration::seconds(10));
+        assert_eq!(running_subagents(Some(&fresh), now), 3);
+        // A crashed engine's row must not badge a chat forever.
+        let stale = running_session(
+            3,
+            now - chrono::Duration::milliseconds(SESSION_STALE_MS + 1),
+        );
+        assert_eq!(running_subagents(Some(&stale), now), 0);
+        assert_eq!(running_subagents(None, now), 0);
+    }
+
+    #[test]
+    fn workspace_scope_controls_the_auth_gate() {
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Local),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::Ready
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::SignIn
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::NeedsOrganization { user: user() }),
+            ),
+            GatePhase::OrgGate
+        );
+    }
+
+    #[test]
+    fn development_and_local_never_use_the_workos_gate() {
+        for scope in [WorkspaceScope::Local, WorkspaceScope::Development] {
+            for auth in [
+                AuthState::SignedOut,
+                AuthState::NeedsOrganization { user: user() },
+                AuthState::SignedIn {
+                    user: user(),
+                    org_id: Some("org-1".into()),
+                },
+            ] {
+                assert_eq!(
+                    gate_phase(&ConnectionStatus::Ready, Some(scope), Some(&auth)),
+                    GatePhase::Ready
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_scope_falls_back_to_a_synced_gate() {
+        assert_eq!(
+            gate_phase(&ConnectionStatus::Ready, None, None),
+            GatePhase::SignIn
+        );
+    }
+}
+
+/// Parse an `AuthStatus` frame tolerantly. The engine currently serializes its
+/// own enum (`{"_tag": "SignedIn", ...}`) while the proto type expects
+/// `{"state": "signedIn", ...}` — accept both so either side can converge
+/// without breaking a viewport.
 pub fn parse_auth_state(value: &serde_json::Value) -> Option<AuthState> {
     if let Ok(state) = serde_json::from_value::<AuthState>(value.clone()) {
         return Some(state);
     }
-    let tag = value
-        .get("state")
-        .or_else(|| value.get("_tag"))
-        .and_then(|tag| tag.as_str())?;
-    if matches!(
-        tag,
-        "signedOut" | "SignedOut" | "needsOrganization" | "NeedsOrganization"
-    ) {
-        return Some(AuthState::SignedOut);
-    }
-    if !matches!(tag, "signedIn" | "SignedIn") {
-        return None;
-    }
-    let user = value.get("user")?;
-    let profile = crate::UserProfile {
-        id: user.get("id")?.as_str()?.to_string(),
-        email: user.get("email")?.as_str()?.to_string(),
-        name: user
-            .get("name")
-            .and_then(|name| name.as_str())
-            .map(str::to_string),
+    let tag = value.get("_tag").and_then(|t| t.as_str())?;
+    let user = || -> Option<crate::UserProfile> {
+        let u = value.get("user")?;
+        Some(crate::UserProfile {
+            id: u.get("id")?.as_str()?.to_string(),
+            email: u.get("email")?.as_str()?.to_string(),
+            name: u.get("name").and_then(|n| n.as_str()).map(str::to_string),
+        })
     };
-    let project_scope = value
-        .get("projectScope")
-        .or_else(|| value.get("orgId"))
-        .and_then(|scope| scope.as_str())?
-        .to_string();
-    Some(AuthState::SignedIn {
-        user: profile,
-        project_scope,
-    })
+    match tag {
+        "SignedOut" => Some(AuthState::SignedOut),
+        "NeedsOrganization" => Some(AuthState::NeedsOrganization { user: user()? }),
+        "SignedIn" => Some(AuthState::SignedIn {
+            user: user()?,
+            org_id: value
+                .get("orgId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +385,9 @@ pub fn project_label(cwd: Option<&str>) -> String {
     let Some(cwd) = cwd.map(str::trim).filter(|c| !c.is_empty()) else {
         return "No project".to_string();
     };
+    if crate::projectless::is_projectless_cwd(Some(cwd)) {
+        return "No project".to_string();
+    }
     std::path::Path::new(cwd.trim_end_matches(['/', '\\']))
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -330,7 +413,7 @@ pub fn group_chats<'a>(chats: impl IntoIterator<Item = &'a Chat>) -> Vec<ChatGro
 }
 
 /// Compact relative time ("now", "5m", "3h", "2d", "1w", …) — no "ago" suffix;
-/// port of comet's `formatTimeAgo`.
+/// port of zeron's `formatTimeAgo`.
 pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let s = now.signed_duration_since(then).num_seconds().max(0);
     // Under a minute reads as "now" — otherwise 45–59s floors to a bare "0m".
@@ -360,14 +443,15 @@ pub fn format_time_ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{}y", d / 365)
 }
 
-/// Session-row sub-line, "project · branch" (comet `chatLocation`): the repo
-/// checkout identity. Either part may be missing; empty when both are.
+/// Session-row sub-line, "project · branch" (zeron `chatLocation`): the repo
+/// checkout identity. Either part may be missing; empty when both are. A
+/// projectless chat names no project and no folder.
 pub fn chat_location(chat: &Chat) -> Option<String> {
     let project = chat
         .cwd
         .as_deref()
         .map(str::trim)
-        .filter(|c| !c.is_empty())
+        .filter(|c| !crate::projectless::is_projectless_cwd(Some(c)))
         .map(|c| project_label(Some(c)));
     let reference = chat
         .branch
@@ -405,47 +489,11 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// Per-kind chip label + one-line detail. Labels match comet's `describeTool`
+/// Per-kind chip label + one-line detail. Labels match zeron's `describeTool`
 /// (tool-chip.tsx) exactly, so the two viewports name a tool identically.
 pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
     let (label, detail) = tool_chip_content_raw(call);
     (label, single_line(&detail))
-}
-
-fn agent_activity_detail(agents: &[crate::AgentActivity]) -> String {
-    use crate::AgentActivityStatus;
-    if let [agent] = agents {
-        let status = match agent.status {
-            AgentActivityStatus::Pending => "pending",
-            AgentActivityStatus::Running => "running",
-            AgentActivityStatus::Completed => "completed",
-            AgentActivityStatus::Failed => "failed",
-            AgentActivityStatus::Cancelled => "cancelled",
-        };
-        return format!("{} · {} · {status}", agent.id, agent.role);
-    }
-    let active = agents
-        .iter()
-        .filter(|agent| {
-            matches!(
-                agent.status,
-                AgentActivityStatus::Pending | AgentActivityStatus::Running
-            )
-        })
-        .count();
-    if active > 0 {
-        format!("{} agents · {active} active", agents.len())
-    } else {
-        let failed = agents
-            .iter()
-            .filter(|agent| agent.status == AgentActivityStatus::Failed)
-            .count();
-        if failed > 0 {
-            format!("{} agents · {failed} failed", agents.len())
-        } else {
-            format!("{} agents · completed", agents.len())
-        }
-    }
 }
 
 fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
@@ -472,60 +520,16 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             let done = items.iter().filter(|i| i.done).count();
             ("Todo", format!("{done}/{} done", items.len()))
         }
-        ToolCall::Agent { agents } => (
-            if agents.len() == 1 { "Agent" } else { "Agents" },
-            agent_activity_detail(agents),
-        ),
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
-        ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
-    }
-}
-
-/// The full (multiline) input of a tool call for the expanded detail pane —
-/// unlike [`tool_chip_content`] this is NOT single-lined: an `Exec` shows the
-/// whole script, a write shows its content, an unknown/MCP tool its raw JSON
-/// args. `None` when the call carries nothing beyond the chip line.
-pub fn tool_call_input_text(call: &crate::ToolCall) -> Option<String> {
-    use crate::ToolCall;
-    fn pretty(value: &serde_json::Value) -> String {
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-    }
-    match call {
-        ToolCall::Exec { command } => Some(command.clone()),
-        ToolCall::ReadFile { path } => Some(path.clone()),
-        ToolCall::WriteFile { path, content } => Some(match content {
-            Some(content) => format!("{path}\n\n{content}"),
-            None => path.clone(),
-        }),
-        ToolCall::EditFile {
-            path,
-            old_string,
-            new_string,
-        } => {
-            let mut out = path.clone();
-            if let Some(old) = old_string {
-                out.push_str("\n\n--- old\n");
-                out.push_str(old);
-            }
-            if let Some(new) = new_string {
-                out.push_str("\n\n+++ new\n");
-                out.push_str(new);
-            }
-            Some(out)
-        }
-        ToolCall::ApplyPatch { path } => path.clone(),
-        ToolCall::Search { pattern, path } => Some(match path {
-            Some(path) => format!("{pattern} in {path}"),
-            None => pattern.clone(),
-        }),
-        ToolCall::Glob { pattern } => Some(pattern.clone()),
-        ToolCall::WebFetch { url, prompt } => Some(match prompt {
-            Some(prompt) => format!("{url}\n\n{prompt}"),
-            None => url.clone(),
-        }),
-        ToolCall::WebSearch { query } => Some(query.clone()),
-        ToolCall::Todo { .. } | ToolCall::Agent { .. } => None,
-        ToolCall::Mcp { input, .. } | ToolCall::Unknown { input, .. } => input.as_ref().map(pretty),
+        // Subagent spawns decode as Unknown named "Agent[: <description>]"
+        // (every native driver's convention): label them "Agent" with the
+        // description as the detail — "Tool · Agent: scan repo" read as two
+        // labels fighting.
+        ToolCall::Unknown { name, .. } => match name.strip_prefix("Agent: ") {
+            Some(description) => ("Agent", description.to_owned()),
+            None if name == "Agent" => ("Agent", String::new()),
+            None => ("Tool", name.clone()),
+        },
     }
 }
 
@@ -541,7 +545,6 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     let mut searches = 0usize;
     let mut fetches = 0usize;
     let mut todos = 0usize;
-    let mut agents = 0usize;
     let mut other = 0usize;
     let mut failed = 0usize;
     for (call, is_error) in tools {
@@ -567,7 +570,6 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
             }
             ToolCall::WebFetch { .. } => fetches += 1,
             ToolCall::Todo { .. } => todos += 1,
-            ToolCall::Agent { agents: activity } => agents += activity.len(),
             ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => other += 1,
         }
     }
@@ -590,9 +592,6 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     if todos > 0 {
         segments.push("updated todos".to_string());
     }
-    if agents > 0 {
-        segments.push(format!("used {}", plural(agents, "agent", "agents")));
-    }
     if other > 0 {
         segments.push(format!("called {}", plural(other, "tool", "tools")));
     }
@@ -603,7 +602,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
         segments.push(format!("{failed} failed"));
     }
     let mut summary = segments.join(" · ");
-    // Capitalize the first segment only (comet's style).
+    // Capitalize the first segment only (zeron's style).
     if let Some(first) = summary.get(0..1) {
         let upper = first.to_uppercase();
         summary.replace_range(0..1, &upper);
@@ -611,83 +610,11 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     summary
 }
 
-#[cfg(test)]
-mod agent_activity_tests {
-    use super::*;
-    use crate::{AgentActivity, AgentActivityStatus, ToolCall};
-
-    fn activity(status: AgentActivityStatus) -> ToolCall {
-        ToolCall::Agent {
-            agents: vec![AgentActivity {
-                id: "PleasantBeetle".into(),
-                role: "scout".into(),
-                status,
-                model: Some("anthropic/claude-opus-5:xhigh".into()),
-            }],
-        }
-    }
-
-    #[test]
-    fn activity_chip_reports_identity_role_and_lifecycle() {
-        assert_eq!(
-            tool_chip_content(&activity(AgentActivityStatus::Running)),
-            ("Agent", "PleasantBeetle · scout · running".to_string())
-        );
-        assert_eq!(
-            tool_group_summary(&[(activity(AgentActivityStatus::Completed), false)]),
-            "Used 1 agent"
-        );
-    }
-
-    #[test]
-    fn detail_input_text_keeps_full_multiline_inputs() {
-        assert_eq!(
-            tool_call_input_text(&ToolCall::Exec {
-                command: "set -e\ncargo test".into()
-            })
-            .as_deref(),
-            Some("set -e\ncargo test")
-        );
-        assert_eq!(
-            tool_call_input_text(&ToolCall::WriteFile {
-                path: "/x".into(),
-                content: Some("body".into()),
-            })
-            .as_deref(),
-            Some("/x\n\nbody")
-        );
-        // Unknown tools render their raw JSON args (the omp harness shape).
-        let input = tool_call_input_text(&ToolCall::Unknown {
-            name: "Reading files".into(),
-            input: Some(serde_json::json!({ "path": "a.rs" })),
-        })
-        .expect("json input");
-        assert!(input.contains("\"path\": \"a.rs\""));
-        // Nothing beyond the chip line for todo/agent chips.
-        assert_eq!(
-            tool_call_input_text(&ToolCall::Todo { items: vec![] }),
-            None
-        );
-    }
-
-    #[test]
-    fn tool_output_truncation_marks_the_cut_at_a_char_boundary() {
-        let long = "é".repeat(crate::TOOL_OUTPUT_CAP_BYTES); // 2 bytes each
-        let capped = crate::truncate_tool_output(long);
-        assert!(capped.len() <= crate::TOOL_OUTPUT_CAP_BYTES + "\n… [output truncated]".len());
-        assert!(capped.ends_with("… [output truncated]"));
-        assert_eq!(
-            crate::truncate_tool_output("short".into()),
-            "short".to_string()
-        );
-    }
-}
-
 /// The status-dot palette, as oklch triples (L, C, H°).
 ///
 /// Colors live here rather than in the viewport because the *meaning* of a
 /// dot is part of the protocol, not the presentation — a given status must
-/// read the same on every surface. `comet-ui` has the oklch→sRGB math.
+/// read the same on every surface. `zeron-ui` has the oklch→sRGB math.
 pub mod dot {
     /// Running. Pink, not amber: the harsh yellow read as a warning, and running
     /// is routine (user request).
@@ -704,7 +631,7 @@ pub mod dot {
 // Checkout selection (new sessions)
 // ---------------------------------------------------------------------------
 
-/// Where a new session runs (`local | worktree`).
+/// Where a new session runs (t3code's env-mode: `local | worktree`).
 ///
 /// "Current worktree" is deliberately **not** a third mode — it is `Local` when
 /// the picked ref already happens to be materialized as a worktree, in which
@@ -728,7 +655,7 @@ pub enum CheckoutPlan {
     CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
-    /// `CreateWorktree` off `base` on send (the engine mints a `comet/<name>`
+    /// `CreateWorktree` off `base` on send (the engine mints a `zeron/<name>`
     /// branch). `base: None` = refs never loaded — send falls back to the space
     /// folder rather than failing.
     NewWorktree { base: Option<String> },
@@ -749,7 +676,7 @@ pub fn checkout_plan(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> Che
     }
 }
 
-/// Label of the checkout-kind trigger.
+/// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel`).
 pub fn checkout_label(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> &'static str {
     match kind {
         CheckoutKind::NewWorktree => "New worktree",

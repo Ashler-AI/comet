@@ -1,32 +1,51 @@
-import type { ApnsEnv, NotificationCredentialEnv } from "./notifications";
+export interface Env {
+  AUTH_GRANTS: DurableObjectNamespace;
+  ENVIRONMENT: string;
+  SCAFFOLD_CONTROL_PLANE_URL: string;
+  SCAFFOLD_PROJECT_SCOPE: string;
+  SCAFFOLD_DEPLOYMENT_ID: string;
+  SCAFFOLD_REQUIRED_CAPABILITIES: string;
+  SESSION_ROOMS: DurableObjectNamespace;
+  DEVICE_ROOMS: DurableObjectNamespace;
+  PREVIEW_ROOMS: DurableObjectNamespace;
+  /** Per-user workspace registries (`reg1/{orgId}/{userId}`) — the row-table
+   * replacement for the Loro workspace doc (docs/registry-sync.md). */
+  REGISTRY_ROOMS: DurableObjectNamespace;
+  /** chat2 session rooms (`chat2/{chatId}`) — dumb authenticated log relays
+   * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
+  CHAT_ROOMS: DurableObjectNamespace;
+  BLOBS: R2Bucket;
+  /** Isolated authenticated release artifacts; never an upstream or shared Crew bucket. */
+  RELEASES: R2Bucket;
+  /** Scaffold resource-bound tokens, or local-only development credentials. */
+  AUTH_MODE: string;
+  /** APNs auth key (contents of AuthKey_XXXX.p8, wrangler secret) and its
+   * key id. Unset ⇒ session notifications are decided and logged, not sent. */
+  APNS_KEY_P8?: string;
+  APNS_KEY_ID?: string;
+  /** Explicit Apple team and canary bundle id; no upstream credential fallback. */
+  APNS_TEAM_ID?: string;
+  APNS_TOPIC?: string;
+}
 
-export type Env = Cloudflare.Env & ApnsEnv & NotificationCredentialEnv;
+/** APNs settings, when push is set up for this deployment. */
+export const apnsConfig = (env: Env) =>
+  env.APNS_KEY_P8 && env.APNS_KEY_ID && env.APNS_TEAM_ID && env.APNS_TOPIC
+    ? {
+        keyP8: env.APNS_KEY_P8,
+        keyId: env.APNS_KEY_ID,
+        teamId: env.APNS_TEAM_ID,
+        topic: env.APNS_TOPIC
+      }
+    : undefined;
 
-/** Trusted identity headers are replaced after authentication before DO forwarding. */
-export const AUTH_USER_HEADER = "x-comet-auth-user";
-export const AUTH_PROJECT_HEADER = "x-comet-auth-project";
-export const AUTH_CAPABILITIES_HEADER = "x-comet-auth-capabilities";
-export const AUTH_GRANT_HEADER = "x-comet-auth-grant";
-export const ROOM_KIND_HEADER = "x-comet-room-kind";
-export const GRANT_EVENT_HEADER = "x-comet-internal-grant-event";
-export const DEVICE_HOST_AUTH_HEADER = "x-comet-internal-device-host-auth";
-export const SESSION_OWNER_AUTH_HEADER = "x-comet-internal-session-owner-auth";
-export const NOTIFICATION_BEARER_HEADER = "x-comet-notification-bearer";
-/** Compatibility declaration, never authentication or capability authority. */
-export const SYNC_PROTOCOL_QUERY = "syncProtocol";
-export const DURABLE_SYNC_PROTOCOL = "durable-records-v1";
-export const SYNC_PROTOCOL_HEADER = "x-comet-sync-protocol";
-export const CREW_UPDATE_REQUIRED = "Crew update required for durable sync";
+/** Header the Worker stamps on requests it forwards into DOs after verifying
+ * the caller's JWT. DOs trust it blindly — they are only reachable through
+ * the Worker (design §2: "DO never sees an unauthenticated frame"). */
+export const AUTH_USER_HEADER = "x-zeron-auth-user";
 
-export const stripTrustedAuthHeaders = (headers: Headers): void => {
-  headers.delete(AUTH_USER_HEADER);
-  headers.delete(AUTH_PROJECT_HEADER);
-  headers.delete(AUTH_CAPABILITIES_HEADER);
-  headers.delete(AUTH_GRANT_HEADER);
-  headers.delete(DEVICE_HOST_AUTH_HEADER);
-  headers.delete(SESSION_OWNER_AUTH_HEADER);
-  headers.delete(GRANT_EVENT_HEADER);
-  headers.delete(ROOM_KIND_HEADER);
-  headers.delete(NOTIFICATION_BEARER_HEADER);
-  headers.delete(SYNC_PROTOCOL_HEADER);
-};
+/** Header the Worker stamps on requests forwarded into workspace-doc rooms
+ * (`ws/{orgId}`). Membership (JWT org claim == orgId) is enforced at the
+ * Worker; the SessionRoom DO sees this and skips its per-chat
+ * claim-on-first-join ownership discipline for the room. */
+export const ROOM_KIND_HEADER = "x-zeron-room-kind";

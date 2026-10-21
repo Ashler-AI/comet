@@ -1,25 +1,28 @@
 //! Sticky composer defaults — the new-chat "remember my last picks" store
-//! (comet parity: localStorage `comet.composer.defaults:v1`, defaults.ts).
+//! (zeron parity: localStorage `zeron.composer.defaults:v1`, defaults.ts).
 //!
 //! A small JSON file beside `ui-settings.json` (that file is the shell's and
 //! is saved debounced from its own boot-time copy, so the composer keeps its
 //! own file rather than racing it): last harness, last model per harness
 //! (id + label, so the chip names the pick before the model list loads),
-//! ordered favorite model selectors, last reasoning level, and whether the
-//! next session should use the current checkout or a fresh worktree. Written
-//! synchronously on every pick.
+//! last reasoning level, and last model option picks per harness. Written
+//! synchronously on every pick (picks are rare); corrupt or missing files fall
+//! back to defaults.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{HarnessId, ReasoningLevel};
+use zeron_proto::{HarnessId, ReasoningLevel};
 
 const FILE_NAME: &str = "composer-defaults.json";
 
-/// Remembered model per harness — id plus display label, mirroring comet's
+/// Model option picks: option id → choice id (the `ChatConfig` shape).
+pub type ModelOptions = serde_json::Map<String, serde_json::Value>;
+
+/// Remembered model per harness — id plus display label, mirroring zeron's
 /// `modelByHarness` storing the full `Model` object "so the pill never flashes
 /// a raw id or 'Default'".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,6 +32,15 @@ pub struct RememberedModel {
     pub label: String,
 }
 
+/// One starred model in the picker (t3code client-settings `favorites`,
+/// keyed `provider:model`) — harness + model id, insertion-ordered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteModel {
+    pub harness: HarnessId,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ComposerDefaults {
@@ -36,19 +48,31 @@ pub struct ComposerDefaults {
     pub harness: Option<HarnessId>,
     /// Last model picked, per harness (restored on harness switch).
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
-    /// Provider-qualified model selectors pinned from the model browser.
-    /// Order is pin order and drives the Favorites view.
-    pub favorite_model_ids: Vec<String>,
-    /// Last reasoning level picked (global, like comet's `reasoning` key).
+    /// Last reasoning level picked (global, like zeron's `reasoning` key).
+    /// The fallback for models with no level of their own yet.
     pub reasoning: Option<ReasoningLevel>,
-    /// Whether the last new-session draft used a fresh isolated worktree.
-    /// Missing in older files means the current checkout.
-    pub new_worktree: bool,
+    /// Last reasoning level picked per harness and model id, so switching
+    /// back to a model (or its provider) restores the effort it was run at.
+    pub reasoning_by_model: HashMap<HarnessId, HashMap<String, ReasoningLevel>>,
+    /// Last non-default model option picks (option id → choice id), per
+    /// harness and model id. Model-scoped because each pick was validated
+    /// against that model's catalog row, so it stays safe to send before the
+    /// catalog reloads (the Claude harness appends `[1m]` to any model id).
+    pub model_options_by_model: HashMap<HarnessId, HashMap<String, ModelOptions>>,
     /// Every model label ever seen (id → label), fed from catalog loads.
     /// The chip's fallback while a harness's list is still loading — a
     /// session whose configured model differs from the remembered pick
     /// would otherwise flash the raw id on switch.
     pub model_labels: HashMap<String, String>,
+    /// Last device picked for new sessions (the composer's device selector).
+    pub device: Option<String>,
+    /// Last project picked for new sessions; `None` + `no_project` = the
+    /// remembered "Don't work in a project" state.
+    pub project: Option<String>,
+    /// Remembered "Don't work in a project" opt-out.
+    pub no_project: bool,
+    /// Starred models (the picker's favorites rail), in starring order.
+    pub favorites: Vec<FavoriteModel>,
 }
 
 impl ComposerDefaults {
@@ -70,11 +94,27 @@ impl ComposerDefaults {
     pub fn save(&self, data_dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let path = Self::path(data_dir);
-        let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(self)
+        // Each writer owns its temporary file; overlapping windows must not
+        // truncate or rename one another's in-progress writes.
+        let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        let json = serde_json::to_vec_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            std::fs::File::open(data_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {
@@ -86,38 +126,78 @@ impl ComposerDefaults {
         self.model_by_harness.get(&harness)
     }
 
-    /// Remember a pick (comet `saveDefaults({ harness, modelByHarness })`).
+    /// Remember a pick (zeron `saveDefaults({ harness, modelByHarness })`).
     pub fn remember_model(&mut self, harness: HarnessId, id: String, label: String) {
         self.harness = Some(harness);
         self.model_by_harness
             .insert(harness, RememberedModel { id, label });
     }
 
-    /// Toggle a provider-qualified selector in the ordered Favorites list.
-    /// Returns the model's new favorite state.
-    pub fn toggle_favorite_model(&mut self, id: &str) -> bool {
-        if let Some(index) = self
-            .favorite_model_ids
-            .iter()
-            .position(|favorite| favorite == id)
-        {
-            self.favorite_model_ids.remove(index);
-            false
-        } else {
-            self.favorite_model_ids.push(id.to_string());
-            true
-        }
+    /// The remembered option picks for one model, if any.
+    pub fn model_options_for(&self, harness: HarnessId, model: &str) -> Option<&ModelOptions> {
+        self.model_options_by_model.get(&harness)?.get(model)
     }
 
-    pub fn is_favorite_model(&self, id: &str) -> bool {
-        self.favorite_model_ids
-            .iter()
-            .any(|favorite| favorite == id)
+    /// Mutable option picks for one model, created empty on first use.
+    pub fn model_options_mut(&mut self, harness: HarnessId, model: &str) -> &mut ModelOptions {
+        self.model_options_by_model
+            .entry(harness)
+            .or_default()
+            .entry(model.to_string())
+            .or_default()
+    }
+
+    /// The remembered reasoning level for one model, else the global one.
+    pub fn reasoning_for(&self, harness: HarnessId, model: Option<&str>) -> Option<ReasoningLevel> {
+        model
+            .and_then(|model| self.reasoning_by_model.get(&harness)?.get(model).copied())
+            .or(self.reasoning)
+    }
+
+    /// Remember a reasoning pick for one model (and as the global fallback).
+    pub fn remember_reasoning(
+        &mut self,
+        harness: HarnessId,
+        model: Option<&str>,
+        level: ReasoningLevel,
+    ) {
+        self.reasoning = Some(level);
+        if let Some(model) = model {
+            self.reasoning_by_model
+                .entry(harness)
+                .or_default()
+                .insert(model.to_string(), level);
+        }
     }
 
     /// The cached display label for a model id, if ever seen.
     pub fn label_for(&self, id: &str) -> Option<&str> {
         self.model_labels.get(id).map(String::as_str)
+    }
+
+    /// Whether a model is starred.
+    pub fn is_favorite(&self, harness: HarnessId, model: &str) -> bool {
+        self.favorites
+            .iter()
+            .any(|f| f.harness == harness && f.model == model)
+    }
+
+    /// Star/unstar a model; returns whether it is starred AFTER the toggle.
+    pub fn toggle_favorite(&mut self, harness: HarnessId, model: &str) -> bool {
+        if let Some(at) = self
+            .favorites
+            .iter()
+            .position(|f| f.harness == harness && f.model == model)
+        {
+            self.favorites.remove(at);
+            false
+        } else {
+            self.favorites.push(FavoriteModel {
+                harness,
+                model: model.to_string(),
+            });
+            true
+        }
     }
 
     /// Merge a loaded catalog into the label cache. Returns whether anything
@@ -147,7 +227,6 @@ mod tests {
         let mut defaults = ComposerDefaults {
             harness: Some(HarnessId::ClaudeCode),
             reasoning: Some(ReasoningLevel::XHigh),
-            new_worktree: true,
             ..Default::default()
         };
         defaults.remember_model(
@@ -156,13 +235,9 @@ mod tests {
             "Fable 5".into(),
         );
         defaults.remember_model(HarnessId::Codex, "gpt-5.2-codex".into(), "GPT-5.2".into());
-        let latest = "openrouter/~deepseek/deepseek-v4-flash-latest";
-        defaults.remember_model(
-            HarnessId::Omp,
-            latest.into(),
-            "DeepSeek V4 Flash Latest".into(),
-        );
-        defaults.toggle_favorite_model(latest);
+        defaults
+            .model_options_mut(HarnessId::ClaudeCode, "claude-fable-5")
+            .insert("contextWindow".into(), "1m".into());
         defaults.save(dir.path()).unwrap();
         let loaded = ComposerDefaults::load(dir.path());
         assert_eq!(loaded, defaults);
@@ -170,22 +245,6 @@ mod tests {
             loaded.model_for(HarnessId::ClaudeCode).map(|m| &*m.label),
             Some("Fable 5")
         );
-        assert_eq!(
-            loaded
-                .model_for(HarnessId::Omp)
-                .map(|model| model.id.as_str()),
-            loaded.favorite_model_ids.first().map(String::as_str)
-        );
-    }
-
-    #[test]
-    fn older_defaults_keep_current_checkout() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(ComposerDefaults::path(dir.path()), r#"{"harness":"codex"}"#).unwrap();
-        let loaded = ComposerDefaults::load(dir.path());
-        assert_eq!(loaded.harness, Some(HarnessId::Codex));
-        assert!(!loaded.new_worktree);
-        assert!(loaded.favorite_model_ids.is_empty());
     }
 
     #[test]
@@ -203,6 +262,48 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_projectless_saves_leave_a_complete_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = dir.path();
+                scope.spawn(move || {
+                    let defaults = ComposerDefaults {
+                        device: Some(format!("device-{i}")),
+                        no_project: true,
+                        ..Default::default()
+                    };
+                    for _ in 0..10 {
+                        defaults.save(path).unwrap();
+                        let saved = ComposerDefaults::load(path);
+                        assert!(saved.no_project);
+                        assert!(saved.project.is_none());
+                        assert!(saved.device.is_some());
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn favorites_toggle_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut defaults = ComposerDefaults::default();
+        assert!(defaults.toggle_favorite(HarnessId::ClaudeCode, "claude-opus-5"));
+        assert!(defaults.toggle_favorite(HarnessId::Codex, "gpt-5.2-codex"));
+        assert!(defaults.is_favorite(HarnessId::ClaudeCode, "claude-opus-5"));
+        // Same id under a different harness is a distinct star.
+        assert!(!defaults.is_favorite(HarnessId::Codex, "claude-opus-5"));
+        defaults.save(dir.path()).unwrap();
+        assert_eq!(ComposerDefaults::load(dir.path()), defaults);
+        // Untoggle removes, preserving the other's order.
+        assert!(!defaults.toggle_favorite(HarnessId::ClaudeCode, "claude-opus-5"));
+        assert!(!defaults.is_favorite(HarnessId::ClaudeCode, "claude-opus-5"));
+        assert!(defaults.is_favorite(HarnessId::Codex, "gpt-5.2-codex"));
+    }
+
+    #[test]
     fn remember_model_updates_harness_and_row() {
         let mut defaults = ComposerDefaults::default();
         defaults.remember_model(HarnessId::Codex, "m1".into(), "One".into());
@@ -213,22 +314,5 @@ mod tests {
             Some("m2")
         );
         assert!(defaults.model_for(HarnessId::ClaudeCode).is_none());
-    }
-
-    #[test]
-    fn favorites_preserve_pin_order_and_toggle_cleanly() {
-        let mut defaults = ComposerDefaults::default();
-        assert!(defaults.toggle_favorite_model("openrouter/~deepseek/deepseek-v4-flash-latest"));
-        assert!(defaults.toggle_favorite_model("openai/gpt-5.4"));
-        assert_eq!(
-            defaults.favorite_model_ids,
-            [
-                "openrouter/~deepseek/deepseek-v4-flash-latest",
-                "openai/gpt-5.4"
-            ]
-        );
-        assert!(defaults.is_favorite_model("openai/gpt-5.4"));
-        assert!(!defaults.toggle_favorite_model("openrouter/~deepseek/deepseek-v4-flash-latest"));
-        assert_eq!(defaults.favorite_model_ids, ["openai/gpt-5.4"]);
     }
 }

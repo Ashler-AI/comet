@@ -16,15 +16,15 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
+use parking_lot::{Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
-use comet_harness::InferenceRoute;
-use comet_proto::HarnessId;
+use zeron_harness::InferenceRoute;
+use zeron_proto::HarnessId;
 
 use crate::scaffold::{AgentInferenceAuthority, AgentInferenceProxyRequest, ScaffoldClient};
 use crate::{EngineError, new_id};
@@ -35,7 +35,6 @@ struct InferenceRouteRequest {
     provider: String,
     model: String,
     requested_account_id: Option<String>,
-    lifecycle_epoch: u64,
 }
 
 const MAX_CONNECTIONS: usize = 64;
@@ -52,18 +51,10 @@ pub(crate) struct InferenceRelay {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExpiredRoute {
-    pub(crate) logical_session_id: String,
-    pub(crate) lifecycle_epoch: u64,
-}
-
 struct Inner {
     client: ScaffoldClient,
     port: u16,
     route_state: Mutex<RouteState>,
-    route_expired_tx: broadcast::Sender<ExpiredRoute>,
-    next_lifecycle_epoch: AtomicU64,
 }
 
 struct Route {
@@ -72,7 +63,7 @@ struct Route {
     local_session_id: Option<String>,
     owner_subject: String,
     authority: AsyncMutex<AuthorityState>,
-    cancellation: comet_harness::CancellationToken,
+    cancellation: zeron_harness::CancellationToken,
 }
 
 impl Route {
@@ -92,8 +83,6 @@ struct AuthorityState {
 struct RouteState {
     active: HashMap<String, Arc<Route>>,
     retired: HashMap<String, RetiredRoute>,
-    /// Last account confirmed by Agent Auth response headers for each local chat.
-    selected_accounts: HashMap<String, String>,
 }
 
 struct RetiredRoute {
@@ -101,7 +90,6 @@ struct RetiredRoute {
     local_session_id: Option<String>,
     owner_subject: String,
     provider: String,
-    lifecycle_epoch: u64,
     retired_at: Instant,
 }
 
@@ -144,7 +132,6 @@ impl RouteState {
 struct RelayStreamContext {
     session_id: String,
     request_id: String,
-    upstream_request_id: Option<String>,
 }
 
 struct InstrumentedRelayStream {
@@ -159,7 +146,7 @@ struct InstrumentedRelayStream {
 impl InstrumentedRelayStream {
     fn new(
         upstream: RelayByteStream,
-        cancellation: comet_harness::CancellationToken,
+        cancellation: zeron_harness::CancellationToken,
         context: RelayStreamContext,
         status: StatusCode,
     ) -> Self {
@@ -173,17 +160,16 @@ impl InstrumentedRelayStream {
         }
     }
 
-    fn finish(&mut self, outcome: &'static str, error: Option<&(dyn Error + Send + Sync + 'static)>) {
+    fn finish(&mut self, outcome: &'static str, error: Option<&(dyn Error + Send + Sync)>) {
         self.terminated = true;
         if let Some(error) = error {
             tracing::warn!(
                 outcome,
                 session_id = %self.context.session_id,
                 request_id = %self.context.request_id,
-                upstream_request_id = ?self.context.upstream_request_id,
                 status = self.status.as_u16(),
                 bytes_received = self.bytes_received,
-                cause = %crate::scaffold::classify_transport_error(error),
+                err = %error,
                 "inference relay response stream terminated"
             );
         } else {
@@ -191,7 +177,6 @@ impl InstrumentedRelayStream {
                 outcome,
                 session_id = %self.context.session_id,
                 request_id = %self.context.request_id,
-                upstream_request_id = ?self.context.upstream_request_id,
                 status = self.status.as_u16(),
                 bytes_received = self.bytes_received,
                 "inference relay response stream terminated"
@@ -238,17 +223,8 @@ impl Drop for InstrumentedRelayStream {
     }
 }
 
-fn diagnostic_request_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        && !["sk-", "sk_", "ia2", "cs1", "eyj"].iter().any(|prefix| {
-            value.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        })
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock()
 }
 
 fn inference_binding(
@@ -257,10 +233,7 @@ fn inference_binding(
 ) -> Option<(&'static str, String)> {
     // ACP agents own their CLI credentials. A provider-prefixed model id is
     // not evidence that they implement Crew's Agent Auth relay contract.
-    if matches!(
-        harness,
-        HarnessId::Devin | HarnessId::Grok | HarnessId::Hermes | HarnessId::Pi
-    ) {
+    if !matches!(harness, HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex) {
         return None;
     }
     let selected = selected_model
@@ -310,7 +283,6 @@ fn inference_route_request(
     harness: HarnessId,
     selected_model: Option<&str>,
     requested_account_id: Option<&str>,
-    lifecycle_epoch: u64,
 ) -> Result<Option<InferenceRouteRequest>, EngineError> {
     let Some((provider, model)) = inference_binding(harness, selected_model) else {
         return Ok(None);
@@ -326,7 +298,6 @@ fn inference_route_request(
         provider: provider.to_string(),
         model,
         requested_account_id,
-        lifecycle_epoch,
     }))
 }
 
@@ -344,49 +315,17 @@ impl InferenceRelay {
         let listener = StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        let (route_expired_tx, _) = broadcast::channel(64);
         let relay = Self {
             inner: Arc::new(Inner {
                 client,
                 port,
                 route_state: Mutex::new(RouteState::default()),
-                route_expired_tx,
-                next_lifecycle_epoch: AtomicU64::new(0),
             }),
         };
         let runtime_listener = TcpListener::from_std(listener)?;
         let serving = relay.clone();
         tokio::spawn(async move { serving.serve(runtime_listener).await });
         Ok(relay)
-    }
-
-    pub(crate) fn subscribe_expired_routes(&self) -> broadcast::Receiver<ExpiredRoute> {
-        self.inner.route_expired_tx.subscribe()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn notify_expired_route(&self, logical_session_id: &str, lifecycle_epoch: u64) {
-        let _ = self.inner.route_expired_tx.send(ExpiredRoute {
-            logical_session_id: logical_session_id.to_string(),
-            lifecycle_epoch,
-        });
-    }
-
-    pub(crate) fn selected_account_id(&self, session_id: &str) -> Option<String> {
-        lock(&self.inner.route_state)
-            .selected_accounts
-            .get(session_id)
-            .cloned()
-    }
-
-    fn record_selected_account(&self, session_id: &str, account_id: &str) {
-        let account_id = account_id.trim();
-        if account_id.is_empty() {
-            return;
-        }
-        lock(&self.inner.route_state)
-            .selected_accounts
-            .insert(session_id.to_string(), account_id.to_string());
     }
 
     pub(crate) async fn prepare(
@@ -396,11 +335,6 @@ impl InferenceRelay {
         model: Option<&str>,
         requested_account_id: Option<&str>,
     ) -> Result<Option<InferenceRoute>, EngineError> {
-        let lifecycle_epoch = self
-            .inner
-            .next_lifecycle_epoch
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
         let agent_auth_session_id = agent_auth_logical_session_id(session_id);
         let local_session_id =
             matches!(&agent_auth_session_id, Cow::Owned(_)).then(|| session_id.to_string());
@@ -409,7 +343,6 @@ impl InferenceRelay {
             harness,
             model,
             requested_account_id,
-            lifecycle_epoch,
         )?
         else {
             tracing::debug!(?harness, "inference relay skipped for unsupported harness");
@@ -418,7 +351,7 @@ impl InferenceRelay {
         let authority = self
             .inner
             .client
-            .issue_agent_inference_authority(&comet_harness::CancellationToken::new())
+            .issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
             .await
             .map_err(|error| {
                 EngineError::Other(format!("Agent Auth authority issuance failed: {error}"))
@@ -431,7 +364,7 @@ impl InferenceRelay {
             request,
             local_session_id,
             owner_subject: owner_subject.clone(),
-            cancellation: comet_harness::CancellationToken::new(),
+            cancellation: zeron_harness::CancellationToken::new(),
             authority: AsyncMutex::new(AuthorityState {
                 authority,
                 expires_at,
@@ -476,7 +409,6 @@ impl InferenceRelay {
                             local_session_id: route.local_session_id.clone(),
                             owner_subject: route.owner_subject.clone(),
                             provider: route.request.provider.clone(),
-                            lifecycle_epoch: route.request.lifecycle_epoch,
                             retired_at,
                         },
                     );
@@ -541,7 +473,6 @@ impl InferenceRelay {
                             route.session_id().to_string(),
                             route.owner_subject.clone(),
                             route.provider.clone(),
-                            route.lifecycle_epoch,
                         )
                     })
                 })
@@ -549,7 +480,7 @@ impl InferenceRelay {
                 None
             };
             let retired_route =
-                if let Some((session_id, owner_subject, provider, lifecycle_epoch)) = retired {
+                if let Some((session_id, owner_subject, provider)) = retired {
                     let replacement = state
                         .active
                         .values()
@@ -571,7 +502,7 @@ impl InferenceRelay {
                             .active
                             .values()
                             .any(|candidate| candidate.session_id() == session_id);
-                        Some((session_id, lifecycle_epoch, restart_required))
+                        Some(restart_required)
                     }
                 } else {
                     None
@@ -579,13 +510,7 @@ impl InferenceRelay {
             (route, retired_route)
         };
         let Some(route) = route else {
-            if let Some((session_id, lifecycle_epoch, restart_required)) = retired_session {
-                if restart_required {
-                    let _ = self.inner.route_expired_tx.send(ExpiredRoute {
-                        logical_session_id: session_id,
-                        lifecycle_epoch,
-                    });
-                }
+            if let Some(restart_required) = retired_session {
                 return json_response(
                     StatusCode::GONE,
                     json!({ "error": "inference_route_expired", "restart_required": restart_required }),
@@ -650,23 +575,17 @@ impl InferenceRelay {
         let request_id = headers
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
-            .filter(|value| diagnostic_request_id(value))
+            .filter(|value| !value.is_empty() && value.len() <= 128)
             .map(str::to_string)
             .unwrap_or_else(new_id);
         let stream_context = RelayStreamContext {
             session_id: route.request.logical_session_id.clone(),
             request_id: request_id.clone(),
-            upstream_request_id: None,
         };
         let authority = match self.current_authority(&route).await {
             Ok(authority) => authority,
-            Err(_) => {
-                tracing::warn!(
-                    session_id = %stream_context.session_id,
-                    request_id = %request_id,
-                    error_code = "agent_auth_unavailable",
-                    "inference relay authority refresh failed"
-                );
+            Err(error) => {
+                tracing::warn!(err = %error, "inference relay authority refresh failed");
                 return json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     json!({ "error": "agent_auth_unavailable" }),
@@ -692,24 +611,9 @@ impl InferenceRelay {
             })
             .await;
         match upstream {
-            Ok(response) => {
-                if let Some(account_id) = response
-                    .headers()
-                    .get("x-agent-auth-selected-account-id")
-                    .and_then(|value| value.to_str().ok())
-                {
-                    self.record_selected_account(route.session_id(), account_id);
-                }
-                stream_response(response, cancellation, stream_context)
-            }
+            Ok(response) => stream_response(response, cancellation, stream_context),
             Err(error) => {
-                tracing::warn!(
-                    session_id = %stream_context.session_id,
-                    request_id = %request_id,
-                    cause = ?error.transport_cause(),
-                    error_code = "inference_upstream_unavailable",
-                    "inference relay upstream failed"
-                );
+                tracing::warn!(err = %error, "inference relay upstream failed");
                 json_response(
                     StatusCode::BAD_GATEWAY,
                     json!({ "error": "inference_upstream_unavailable" }),
@@ -722,17 +626,24 @@ impl InferenceRelay {
         &self,
         route: &Route,
     ) -> Result<AgentInferenceAuthority, EngineError> {
+        // A cached authority must not outlive a sign-out/profile switch.
+        self.inner.client.require_auth().await
+            .map_err(|error| EngineError::Other(error.to_string()))?;
         let mut current = route.authority.lock().await;
         if current.expires_at <= Utc::now() + TimeDelta::seconds(REFRESH_SKEW_SECONDS) {
             let authority = self
                 .inner
                 .client
-                .issue_agent_inference_authority(&comet_harness::CancellationToken::new())
+                .issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
                 .await
                 .map_err(|error| {
                     EngineError::Other(format!("Agent Auth authority renewal failed: {error}"))
                 })?;
             let expires_at = validate_authority(&authority)?;
+            if authority.principal_id != route.owner_subject {
+                route.cancellation.cancel();
+                return Err(EngineError::Other("Agent Auth route owner changed".into()));
+            }
             *current = AuthorityState {
                 authority,
                 expires_at,
@@ -852,15 +763,11 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<RelayB
 
 fn stream_response(
     upstream: reqwest::Response,
-    cancellation: comet_harness::CancellationToken,
-    mut context: RelayStreamContext,
+    cancellation: zeron_harness::CancellationToken,
+    context: RelayStreamContext,
 ) -> Response<RelayBody> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    context.upstream_request_id = headers.get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| diagnostic_request_id(value))
-        .map(str::to_string);
     let upstream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
@@ -871,7 +778,7 @@ fn instrumented_streamed_response(
     status: StatusCode,
     headers: HeaderMap,
     stream: RelayByteStream,
-    cancellation: comet_harness::CancellationToken,
+    cancellation: zeron_harness::CancellationToken,
     context: RelayStreamContext,
 ) -> Response<RelayBody> {
     let stream = InstrumentedRelayStream::new(stream, cancellation, context, status);

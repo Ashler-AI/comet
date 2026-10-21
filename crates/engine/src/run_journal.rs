@@ -1,26 +1,24 @@
-//! Per-session on-disk event journal (port of comet's `run-journal.ts`, JSONL-shaped).
+//! Per-session on-disk event journal (port of zeron's `run-journal.ts`, JSONL-shaped).
 //!
 //! One append-only JSONL file per chat under `{data_dir}/journals/{chat_id}.jsonl`; each
 //! line is `{"seq": n, "event": AgentEvent}` with a monotonically increasing `seq`. The
 //! journal is the durable replay source for live streams (`Subscribe` = replay then tail
-//! the broadcast hub) and a crash-recovery gauge. Missing `Done` means the stream
-//! was abandoned; the identity-bound recovery sidecar also retains active requests
-//! across planned engine interruption. User Stop and settled turns retire that
-//! sidecar durably. Recovery enumerates exact room candidates on demand so reopening
-//! one room never reads every other transcript journal.
+//! the broadcast hub) and the crash-recovery gauge: a journal whose LAST event is not
+//! `Done` belongs to a run that died mid-stream — boot recovery stamps its doc entry
+//! `aborted` and closes the journal with a synthetic `Done`.
 //!
 //! Bounded-window compaction is deferred (whole file kept for now, per M2 scope); a torn
 //! trailing line from a crash mid-write is tolerated everywhere.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use comet_proto::AgentEvent;
+use zeron_proto::AgentEvent;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -31,42 +29,17 @@ pub enum JournalError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct JournalLine<E = AgentEvent> {
+struct JournalLine {
     seq: u64,
-    event: E,
+    event: AgentEvent,
 }
 
 struct ChatJournal {
-    file: BufWriter<File>,
+    file: File,
     next_seq: u64,
     /// True when the file ends without a newline (torn write) — the next append
     /// starts with one so the torn line stays isolated.
     needs_newline: bool,
-    harness_session: HarnessSessionMetadata,
-}
-
-#[derive(Default)]
-struct HarnessSessionMetadata {
-    cwd: String,
-    last: Option<(String, String)>,
-}
-
-impl HarnessSessionMetadata {
-    fn observe(&mut self, event: &AgentEvent) {
-        let session_id = match event {
-            AgentEvent::SessionStarted { session_id, cwd, .. } => {
-                self.cwd.clone_from(cwd);
-                session_id
-            }
-            AgentEvent::Done { session_id: Some(session_id), .. } => session_id,
-            _ => return,
-        };
-        if !session_id.is_empty() {
-            let last = self.last.get_or_insert_with(|| (String::new(), String::new()));
-            last.0.clone_from(session_id);
-            last.1.clone_from(&self.cwd);
-        }
-    }
 }
 
 /// Append-only JSONL journal store, one file per chat.
@@ -99,133 +72,7 @@ impl RunJournal {
         self.dir.join(format!("{}.resume", sanitize_id(chat_id)))
     }
 
-    pub(crate) fn save_context<T: Serialize>(
-        &self,
-        chat_id: &str,
-        context: &T,
-    ) -> Result<(), JournalError> {
-        self.save_record(chat_id, "context", context)
-    }
-
-    fn save_record<T: Serialize>(
-        &self,
-        chat_id: &str,
-        extension: &str,
-        context: &T,
-    ) -> Result<(), JournalError> {
-        let _guard = self.lock();
-        let path = self
-            .dir
-            .join(format!("{}.{}", sanitize_id(chat_id), extension));
-        let temporary = path.with_extension(format!("{extension}.tmp"));
-        let bytes = serde_json::to_vec(&(chat_id, context))?;
-        let mut file = File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(temporary, path)?;
-        File::open(&self.dir)?.sync_all()?;
-        Ok(())
-    }
-
-    pub(crate) fn read_context<T: serde::de::DeserializeOwned>(
-        &self,
-        chat_id: &str,
-    ) -> Result<Option<T>, JournalError> {
-        self.read_record(chat_id, "context")
-    }
-
-    fn read_record<T: serde::de::DeserializeOwned>(
-        &self,
-        chat_id: &str,
-        extension: &str,
-    ) -> Result<Option<T>, JournalError> {
-        let path = self
-            .dir
-            .join(format!("{}.{}", sanitize_id(chat_id), extension));
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let (stored_id, context): (String, T) = serde_json::from_slice(&bytes)?;
-        if stored_id != chat_id {
-            return Err(std::io::Error::other("session_context_binding_mismatch").into());
-        }
-        Ok(Some(context))
-    }
-
-    pub(crate) fn save_recovery<T: Serialize>(
-        &self,
-        chat_id: &str,
-        recovery: &T,
-    ) -> Result<(), JournalError> {
-        self.save_record(chat_id, "recovery", recovery)
-    }
-
-    pub(crate) fn read_recovery<T: serde::de::DeserializeOwned>(
-        &self,
-        chat_id: &str,
-    ) -> Result<Option<T>, JournalError> {
-        Ok(self
-            .read_record::<Option<T>>(chat_id, "recovery")?
-            .flatten())
-    }
-
-    pub(crate) fn recovery_retired(&self, chat_id: &str) -> Result<bool, JournalError> {
-        Ok(matches!(
-            self.read_record::<Option<serde_json::Value>>(chat_id, "recovery")?,
-            Some(None)
-        ))
-    }
-
-    pub(crate) fn retire_recovery(&self, chat_id: &str) -> Result<(), JournalError> {
-        self.save_record(chat_id, "recovery", &Option::<serde_json::Value>::None)
-    }
-
-    fn clear_recovery(&self, chat_id: &str) -> Result<(), JournalError> {
-        let _guard = self.lock();
-        match std::fs::remove_file(self.dir.join(format!("{}.recovery", sanitize_id(chat_id)))) {
-            Ok(()) => File::open(&self.dir)?.sync_all()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
-    }
-
-    /// Journals and requests awaiting startup, restricted before reading sidecars
-    /// when a single room reconnects. Terminal journals remain candidates so a
-    /// crash between Done and its document mirror can be repaired without rerunning.
-    pub(crate) fn recovery_candidates(&self, room: Option<&str>) -> Result<Vec<String>, JournalError> {
-        let prefix = room.map(sanitize_id);
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let path = entry?.path();
-            if !matches!(path.extension().and_then(|extension| extension.to_str()), Some("jsonl" | "recovery")) {
-                continue;
-            }
-            if let Some(prefix) = prefix.as_deref()
-                && !path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| {
-                    stem == prefix || stem.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with("__session__"))
-                })
-            {
-                continue;
-            }
-            match self.chat_id_for(&path) {
-                Ok(Some(chat_id)) if room.is_none_or(|room| {
-                    chat_id == room || chat_id.strip_prefix(room).is_some_and(|suffix| suffix.starts_with("::session::"))
-                }) => ids.push(chat_id),
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::error!(path = %path.display(), %error, "skipping invalid Crew recovery binding")
-                }
-            }
-        }
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
-    }
-
-    /// Auto-resume revival budget (comet `resumeAttempt`/`MAX_AUTO_RESUME`):
+    /// Auto-resume revival budget (zeron `resumeAttempt`/`MAX_AUTO_RESUME`):
     /// persisted beside the journal so a run that CRASHES THE ENGINE cannot
     /// revive itself in an infinite boot loop.
     pub fn resume_attempts(&self, chat_id: &str) -> u32 {
@@ -263,15 +110,13 @@ impl RunJournal {
             }
             let path = self.path_for(chat_id);
             let (next_seq, needs_newline) = scan_tail(&path)?;
-            let harness_session = read_harness_session(&path)?;
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
             files.insert(
                 chat_id.to_string(),
                 ChatJournal {
-                    file: BufWriter::with_capacity(8 * 1024, file),
+                    file,
                     next_seq,
                     needs_newline,
-                    harness_session,
                 },
             );
         }
@@ -282,26 +127,25 @@ impl RunJournal {
             )));
         };
         let seq = journal.next_seq;
-        // Serialize the borrowed event through one bounded buffer. A progressive
-        // tool call must not clone the payload, materialize a full JSON string,
-        // then copy that string into a second whole-line allocation.
+        let line = serde_json::to_string(&JournalLine {
+            seq,
+            event: event.clone(),
+        })?;
+        let mut buf = Vec::with_capacity(line.len() + 2);
         if journal.needs_newline {
-            journal.file.write_all(b"\n")?;
+            buf.push(b'\n');
         }
-        serde_json::to_writer(&mut journal.file, &JournalLine { seq, event })?;
-        journal.file.write_all(b"\n")?;
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        journal.file.write_all(&buf)?;
         journal.file.flush()?;
-        if matches!(event, AgentEvent::Done { .. }) {
-            journal.file.get_ref().sync_all()?;
-        }
         journal.needs_newline = false;
         journal.next_seq = seq + 1;
-        journal.harness_session.observe(event);
         Ok(seq)
     }
 
     /// Events with `seq > after_seq`, in order. A cursor ahead of the last issued seq is
-    /// from a previous era (file replaced) — falls back to a full replay, mirroring comet.
+    /// from a previous era (file replaced) — falls back to a full replay, mirroring zeron.
     pub fn replay(
         &self,
         chat_id: &str,
@@ -319,41 +163,17 @@ impl RunJournal {
 
     /// The last event in a chat's journal, if any (ignores a torn tail line).
     pub fn last_event(&self, chat_id: &str) -> Result<Option<(u64, AgentEvent)>, JournalError> {
-        let (last, _) = read_tail(&self.path_for(chat_id))?;
-        Ok(last.map(|line| (line.seq,line.event)))
+        last_valid_line(&self.path_for(chat_id))
     }
 
-    /// Latest provider binding, without replaying tool payloads. The capped
-    /// writer cache includes absence and is updated only after durable append.
-    pub fn last_harness_session(&self, chat_id: &str) -> Result<Option<(String, String)>, JournalError> {
-        if let Some(journal) = self.lock().get(chat_id) {
-            return Ok(journal.harness_session.last.clone());
-        }
-        Ok(read_harness_session(&self.path_for(chat_id))?.last)
-    }
-
-    fn chat_id_for(&self, path: &Path) -> Result<Option<String>, JournalError> {
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            return Ok(None);
-        };
-        // Filenames are sanitized; execution keys can contain ::session::. The
-        // bound sidecar retains the actual key needed to open the same history.
-        for extension in ["recovery", "context"] {
-            match std::fs::read(path.with_extension(extension)) {
-                Ok(bytes) => {
-                    let (chat_id, _): (String, serde_json::Value) = serde_json::from_slice(&bytes)?;
-                    if sanitize_id(&chat_id) != stem {
-                        return Err(
-                            std::io::Error::other("session_context_binding_mismatch").into()
-                        );
-                    }
-                    return Ok(Some(chat_id));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(Some(stem.to_string()))
+    /// Valid events newest-first, read backwards from the end of the file — for
+    /// callers that want the most recent match and can stop early instead of
+    /// materialising the whole journal like `replay` does.
+    pub fn events_rev(
+        &self,
+        chat_id: &str,
+    ) -> Result<impl Iterator<Item = Result<(u64, AgentEvent), JournalError>>, JournalError> {
+        RevEvents::open(&self.path_for(chat_id))
     }
 
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
@@ -366,62 +186,22 @@ impl RunJournal {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let chat_id = match self.chat_id_for(&path) {
-                Ok(Some(chat_id)) => chat_id,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::error!(path = %path.display(), %error, "skipping invalid Crew journal binding");
-                    continue;
-                }
+            let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
             };
-            let last = match read_tail(&path) {
-                Ok((event,_)) => event.map(|line| (line.seq,line.event)),
-                Err(error) => {
-                    tracing::error!(path = %path.display(), %error, "skipping unreadable Crew journal");
-                    continue;
-                }
-            };
-            match last {
+            // Tail read only: journals reach tens of MB and boot scans every one.
+            match last_valid_line(&path)? {
                 Some((_, AgentEvent::Done { .. })) | None => {}
-                Some(_) => stale.push(chat_id),
+                Some(_) => stale.push(chat_id.to_string()),
             }
         }
         stale.sort();
         Ok(stale)
     }
 
-    /// Chat ids with a journal in this identity-scoped store. A shared room can
-    /// replicate chat documents, but it cannot create these local files.
-    pub fn session_ids(&self) -> Result<Vec<String>, JournalError> {
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-                continue;
-            }
-            match self.chat_id_for(&path) {
-                Ok(Some(chat_id)) => ids.push(chat_id),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(path = %path.display(), %error, "skipping invalid Crew journal binding")
-                }
-            }
-        }
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
-    }
-
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
-        self.clear_recovery(chat_id)?;
-        let context_path = self.dir.join(format!("{}.context", sanitize_id(chat_id)));
-        match std::fs::remove_file(context_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
         let path = self.path_for(chat_id);
         if path.exists() {
             std::fs::remove_file(path)?;
@@ -439,94 +219,181 @@ fn read_lines(path: &Path) -> Result<Vec<(u64, AgentEvent)>, JournalError> {
     };
     let mut out = Vec::new();
     for line in BufReader::new(file).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JournalLine>(&line) {
-            Ok(parsed) => out.push((parsed.seq, parsed.event)),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "journal: skipping malformed line");
-            }
+        if let Some(parsed) = parse_line(path, &line?) {
+            out.push(parsed);
         }
     }
     Ok(out)
 }
 
-/// Cold/reopened metadata lookup reuses one line buffer and ignores unrelated
-/// JSON values. Only real SessionStarted/Done records undergo event decoding;
-/// malformed metadata and torn lines follow replay's existing skip contract.
-fn read_harness_session(path: &Path) -> Result<HarnessSessionMetadata, JournalError> {
-    #[derive(Deserialize)]
-    struct EventKind {
-        #[serde(rename = "type")]
-        kind: String,
+/// One journal line → `(seq, event)`; blank lines are skipped silently, malformed
+/// ones (torn tail writes) with a warning.
+fn parse_line(path: &Path, line: &str) -> Option<(u64, AgentEvent)> {
+    if line.trim().is_empty() {
+        return None;
     }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HarnessSessionMetadata::default()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut metadata = HarnessSessionMetadata::default();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 { break; }
-        if line.trim().is_empty() { continue; }
-        let parsed = serde_json::from_str::<JournalLine<EventKind>>(&line);
-        match parsed {
-            Ok(parsed) if matches!(parsed.event.kind.as_str(), "sessionStarted" | "done") => {
-                match serde_json::from_str::<JournalLine>(&line) {
-                    Ok(parsed) => metadata.observe(&parsed.event),
-                    Err(error) => tracing::warn!(path = %path.display(), %error, "journal: skipping malformed metadata"),
-                }
-            }
-            Ok(_) => {},
-            Err(error) => tracing::warn!(path = %path.display(), %error, "journal: skipping malformed line"),
+    match serde_json::from_str::<JournalLine>(line) {
+        Ok(parsed) => Some((parsed.seq, parsed.event)),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "journal: skipping malformed line");
+            None
         }
     }
-    Ok(metadata)
 }
 
-/// Read backwards in fixed blocks. Tail queries must not materialize all prior
-/// tool argument prefixes merely to locate one event or its sequence number.
-fn read_tail(path: &Path) -> Result<(Option<JournalLine>, bool), JournalError> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None,false)),
-        Err(error) => return Err(error.into()),
-    };
-    let mut position = file.metadata()?.len();
-    if position == 0 { return Ok((None,false)); }
-    file.seek(SeekFrom::Start(position-1))?;
-    let mut final_byte=[0u8;1]; file.read_exact(&mut final_byte)?;
-    let needs_newline=final_byte[0] != b'\n';
-    let mut block=[0u8;8192];
-    let mut line=Vec::new();
-    while position > 0 {
-        let count=position.min(block.len() as u64) as usize;
-        position -= count as u64;
-        file.seek(SeekFrom::Start(position))?;
-        file.read_exact(&mut block[..count])?;
-        for byte in block[..count].iter().rev() {
-            if *byte == b'\n' {
-                if !line.is_empty() {
-                    line.reverse();
-                    if let Ok(event) = serde_json::from_slice::<JournalLine>(&line) { return Ok((Some(event),needs_newline)); }
-                    line.clear();
-                }
-            } else { line.push(*byte); }
-        }
-    }
-    line.reverse();
-    Ok((serde_json::from_slice::<JournalLine>(&line).ok(),needs_newline))
+/// The last valid event in the file — what `read_lines(path).last()` returns, without
+/// reading more than the tail.
+fn last_valid_line(path: &Path) -> Result<Option<(u64, AgentEvent)>, JournalError> {
+    RevEvents::open(path)?.next().transpose()
 }
 
-/// Next seq and torn-write isolation use the same bounded tail reader.
+/// Next seq (last valid seq + 1, starting at 1) and whether the file ends mid-line.
 fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
-    let (last,needs_newline)=read_tail(path)?;
-    Ok((last.map_or(1,|line| line.seq+1),needs_newline))
+    let Some(mut lines) = RevLines::open(path)? else {
+        return Ok((1, false));
+    };
+    let needs_newline = lines.ends_mid_line()?;
+    let next_seq = RevEvents::from_lines(path, Some(lines))
+        .next()
+        .transpose()?
+        .map(|(seq, _)| seq + 1)
+        .unwrap_or(1);
+    Ok((next_seq, needs_newline))
+}
+
+/// First tail-read size. Journal lines are usually far shorter; a longer line grows the
+/// read geometrically, so a multi-MB line costs O(len) rather than O(len²).
+const TAIL_CHUNK: usize = 64 * 1024;
+
+/// Raw lines of a file, last to first, read backwards in chunks — memory is bounded by
+/// the longest line rather than the file. `\n` separators are stripped (a preceding `\r`
+/// is left in place; JSON parsing treats it as whitespace), so a file ending in `\n`
+/// yields an empty line first, which callers skip like any blank line.
+struct RevLines {
+    file: File,
+    /// File offset of `buf[0]`; bytes before it have not been read yet.
+    pos: u64,
+    /// Read but not yet yielded: the file's bytes `[pos, pos + buf.len())`.
+    buf: Vec<u8>,
+    finished: bool,
+}
+
+impl RevLines {
+    /// `None` when the file does not exist (an empty journal, as `read_lines` treats it).
+    fn open(path: &Path) -> std::io::Result<Option<Self>> {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let pos = file.metadata()?.len();
+        Ok(Some(Self {
+            file,
+            pos,
+            buf: Vec::new(),
+            finished: false,
+        }))
+    }
+
+    /// Prepend the previous chunk of the file to `buf` (at least as large as `buf`).
+    fn fill(&mut self) -> std::io::Result<()> {
+        let want = TAIL_CHUNK.max(self.buf.len()) as u64;
+        let n = want.min(self.pos);
+        self.pos -= n;
+        let mut chunk = vec![0u8; n as usize];
+        self.file.seek(SeekFrom::Start(self.pos))?;
+        self.file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&self.buf);
+        self.buf = chunk;
+        Ok(())
+    }
+
+    /// True when the file is non-empty and its last byte is not `\n` (a torn write).
+    /// Call before the first `next_line`.
+    fn ends_mid_line(&mut self) -> std::io::Result<bool> {
+        if self.buf.is_empty() && self.pos > 0 {
+            self.fill()?;
+        }
+        Ok(self.buf.last().is_some_and(|b| *b != b'\n'))
+    }
+
+    fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            if self.finished {
+                return Ok(None);
+            }
+            if let Some(i) = self.buf.iter().rposition(|b| *b == b'\n') {
+                let line = self.buf.split_off(i + 1);
+                self.buf.truncate(i);
+                return Ok(Some(line));
+            }
+            if self.pos == 0 {
+                self.finished = true;
+                return Ok(Some(std::mem::take(&mut self.buf)));
+            }
+            self.fill()?;
+        }
+    }
+}
+
+/// Valid journal events newest-first: `read_lines` in reverse, with the same
+/// blank/malformed-line skipping, reading only as far back as the caller iterates.
+struct RevEvents {
+    path: PathBuf,
+    /// `None` once exhausted, after an I/O error, or when the file does not exist.
+    lines: Option<RevLines>,
+}
+
+impl RevEvents {
+    fn open(path: &Path) -> Result<Self, JournalError> {
+        Ok(Self::from_lines(path, RevLines::open(path)?))
+    }
+
+    fn from_lines(path: &Path, lines: Option<RevLines>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            lines,
+        }
+    }
+}
+
+impl Iterator for RevEvents {
+    type Item = Result<(u64, AgentEvent), JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let raw = match self.lines.as_mut()?.next_line() {
+                Ok(Some(raw)) => raw,
+                Ok(None) => {
+                    self.lines = None;
+                    return None;
+                }
+                Err(err) => {
+                    self.lines = None;
+                    return Some(Err(err.into()));
+                }
+            };
+            // A torn write can split a multi-byte char: treat it as malformed too.
+            let Ok(line) = std::str::from_utf8(&raw) else {
+                tracing::warn!(path = %self.path.display(), "journal: skipping non-UTF-8 line");
+                continue;
+            };
+            if let Some(parsed) = parse_line(&self.path, line) {
+                return Some(Ok(parsed));
+            }
+        }
+    }
+}
+
+/// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
+/// arbitrary journals directory — profile import copies these files between
+/// profiles without opening a `RunJournal`.
+pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
+    let stem = sanitize_id(chat_id);
+    (
+        dir.join(format!("{stem}.jsonl")),
+        dir.join(format!("{stem}.resume")),
+    )
 }
 
 /// Chat ids become file names; anything outside a conservative set is replaced so a
@@ -547,175 +414,10 @@ fn sanitize_id(chat_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comet_proto::DoneStatus;
+    use zeron_proto::DoneStatus;
 
     fn text(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
-    }
-
-    #[test]
-    fn resume_metadata_preserves_bindings_without_replaying_tool_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut journal = RunJournal::open(dir.path()).unwrap();
-        let started = |id: &str, cwd: &str| AgentEvent::SessionStarted {
-            harness: comet_proto::HarnessId::Mock, model: "test".into(), tools: Vec::new(),
-            cwd: cwd.into(), session_id: id.into(), assistant_message_id: "assistant".into(),
-        };
-        let finished = |id: &str| AgentEvent::Done {
-            status: DoneStatus::Completed, result: None, error: None, session_id: Some(id.into()),
-        };
-        let tool = AgentEvent::ToolCall { id: "large".into(), call: comet_proto::ToolCall::Exec {
-            command: "{\"type\":\"sessionStarted\",\"sessionId\":\"spoof\",\"cwd\":\"/wrong\"}\nα".repeat(6000),
-        } };
-        assert_eq!(journal.last_harness_session("chat").unwrap(), None);
-        journal.append("chat", &tool).unwrap();
-        assert_eq!(journal.last_harness_session("chat").unwrap(), None);
-        journal = RunJournal::open(dir.path()).unwrap();
-        assert_eq!(journal.last_harness_session("chat").unwrap(), None, "cold no-ID history must ignore embedded metadata");
-        let mut expected = vec![(1, tool.clone())];
-        for (event, binding) in [
-            (finished("done-only"), ("done-only", "")),
-            (started("early", "/early"), ("early", "/early")),
-            (tool, ("early", "/early")),
-            (finished("promoted"), ("promoted", "/early")),
-            (started("", "/empty"), ("promoted", "/early")),
-            (finished(""), ("promoted", "/early")),
-            (finished("switched"), ("switched", "/empty")),
-            (started("late", "/late"), ("late", "/late")),
-            (done(), ("late", "/late")),
-        ] {
-            let seq = journal.append("chat", &event).unwrap();
-            expected.push((seq, event));
-            assert_eq!(journal.last_harness_session("chat").unwrap(), Some((binding.0.into(), binding.1.into())));
-        }
-        assert_eq!(journal.replay("chat", 0).unwrap(), expected);
-        drop(journal);
-        let mut file = OpenOptions::new().append(true).open(dir.path().join("chat.jsonl")).unwrap();
-        file.write_all(b"{\"seq\":998,\"event\":{\"type\":\"sessionStarted\",\"cwd\":\"/bad\",\"sessionId\":\"invalid\"}}\n").unwrap();
-        file.write_all(b"{\"seq\":999,\"event\":{\"type\":\"done\",\"status\":\"invalid\",\"sessionId\":\"invalid\"}}\n").unwrap();
-        file.write_all(b"{\"seq\":1000,\"event\":{\"type\":\"sessionStarted\",\"sessionId\":\"torn\"").unwrap();
-        drop(file);
-        let journal = RunJournal::open(dir.path()).unwrap();
-        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("late".into(), "/late".into())));
-        assert_eq!(journal.replay("chat", 0).unwrap(), expected, "invalid metadata must not alter replay or routing");
-        let event = finished("after-reopen");
-        let seq = journal.append("chat", &event).unwrap();
-        expected.push((seq, event));
-        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("after-reopen".into(), "/late".into())));
-        for index in 0..20 { journal.append(&format!("other-{index}"), &done()).unwrap(); }
-        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("after-reopen".into(), "/late".into())));
-        let event = started("after-eviction", "/evicted");
-        let seq = journal.append("chat", &event).unwrap();
-        expected.push((seq, event));
-        assert_eq!(journal.last_harness_session("chat").unwrap(), Some(("after-eviction".into(), "/evicted".into())));
-        assert_eq!(journal.replay("chat", 0).unwrap(), expected);
-        journal.discard("chat").unwrap();
-        assert_eq!(journal.last_harness_session("chat").unwrap(), None);
-    }
-
-    #[test]
-    fn tail_lookup_handles_large_records_and_multiblock_torn_writes() {
-        let dir=tempfile::tempdir().unwrap();
-        let journal=RunJournal::open(dir.path()).unwrap();
-        for prefix in 1..32 { journal.append("large",&text(&"history".repeat(prefix*1024))).unwrap(); }
-        let command="αβγ tool arguments ".repeat(20_000);
-        let last=AgentEvent::ToolCall { id:"last-tool".into(),call:comet_proto::ToolCall::Exec { command:command.clone() } };
-        let seq=journal.append("large",&last).unwrap();
-        assert_eq!(journal.last_event("large").unwrap(),Some((seq,last.clone())));
-        drop(journal);
-        let path=dir.path().join("large.jsonl");
-        let mut file=OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"{\"seq\":999,\"event\":\"").unwrap();
-        file.write_all(&vec![b'x';24*1024]).unwrap(); drop(file);
-        let reopened=RunJournal::open(dir.path()).unwrap();
-        assert_eq!(reopened.last_event("large").unwrap(),Some((seq,last)));
-        assert_eq!(reopened.append("large",&done()).unwrap(),seq+1);
-        assert!(matches!(reopened.last_event("large").unwrap(),Some((n,AgentEvent::Done {..})) if n==seq+1));
-        assert!(reopened.stale_sessions().unwrap().is_empty());
-    }
-
-    #[test]
-    fn context_recovery_rejects_aliases_corruption_and_discarded_evidence() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = RunJournal::open(dir.path()).unwrap();
-        journal
-            .save_context("chat::session::chat", &"accepted")
-            .unwrap();
-        assert!(
-            journal
-                .read_context::<String>("chat__session__chat")
-                .is_err()
-        );
-        std::fs::write(dir.path().join("chat__session__chat.context"), b"truncated").unwrap();
-        assert!(
-            journal
-                .read_context::<String>("chat::session::chat")
-                .is_err()
-        );
-        journal
-            .save_context("chat::session::chat", &"replacement")
-            .unwrap();
-        journal.discard("chat::session::chat").unwrap();
-        assert!(
-            journal
-                .read_context::<String>("chat::session::chat")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn pending_recovery_survives_done_and_reopen_until_retired() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = RunJournal::open(dir.path()).unwrap();
-        let request = serde_json::json!({"messageId": "original", "resume": "native-id", "attachments": ["/tmp/image.png"]});
-        journal
-            .save_recovery("chat::session::chat", &request)
-            .unwrap();
-        journal.append("chat::session::chat", &done()).unwrap();
-        drop(journal);
-        let journal = RunJournal::open(dir.path()).unwrap();
-        assert_eq!(journal.session_ids().unwrap(), vec!["chat::session::chat"]);
-        assert_eq!(
-            journal.recovery_candidates(None).unwrap(),
-            vec!["chat::session::chat"]
-        );
-        assert_eq!(
-            journal
-                .read_recovery::<serde_json::Value>("chat::session::chat")
-                .unwrap(),
-            Some(request)
-        );
-        assert!(
-            journal
-                .read_recovery::<serde_json::Value>("chat__session__chat")
-                .is_err()
-        );
-        journal.retire_recovery("chat::session::chat").unwrap();
-        drop(journal);
-        assert!(
-            RunJournal::open(dir.path())
-                .unwrap()
-                .recovery_retired("chat::session::chat")
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn recovery_candidates_scope_exact_room_and_private_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = RunJournal::open(dir.path()).unwrap();
-        journal.append("room", &done()).unwrap();
-        journal.retire_recovery("room").unwrap();
-        // A request can be durable before the harness emits its first event.
-        journal.save_recovery("room::session::child", &"pending").unwrap();
-        journal.save_recovery("room-extra", &"unrelated").unwrap();
-        // Sanitized prefixes are only a cheap prefilter, never room authority.
-        journal.save_recovery("room__session__unrelated", &"other room").unwrap();
-        assert_eq!(journal.recovery_candidates(Some("room")).unwrap(),
-            vec!["room", "room::session::child"]);
-        assert_eq!(journal.recovery_candidates(None).unwrap().len(), 4);
-        assert!(journal.recovery_candidates(Some("roo")).unwrap().is_empty());
     }
 
     fn done() -> AgentEvent {
@@ -725,29 +427,6 @@ mod tests {
             error: None,
             session_id: None,
         }
-    }
-
-    #[test]
-    fn large_escaped_events_flush_from_bounded_journal_buffer() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = RunJournal::open(dir.path()).unwrap();
-        let command = "α\"quoted\"\\path\n\t".repeat(24 * 1024);
-        assert!(command.len() > 300 * 1024);
-        let event = AgentEvent::ToolCall {
-            id: "large-tool".into(),
-            call: comet_proto::ToolCall::Exec { command },
-        };
-        assert_eq!(journal.append("large", &event).unwrap(), 1);
-        assert!(journal.lock().get("large").unwrap().file.capacity() <= 8 * 1024);
-        // Separate readers must see the complete event before the writer is
-        // dropped, including escapes and UTF-8 spanning buffer boundaries.
-        assert_eq!(journal.last_event("large").unwrap(), Some((1, event.clone())));
-        assert_eq!(journal.replay("large", 0).unwrap(), vec![(1, event)]);
-        assert_eq!(journal.append("large", &done()).unwrap(), 2);
-        drop(journal);
-        let reopened = RunJournal::open(dir.path()).unwrap();
-        assert_eq!(reopened.append("large", &text("next")).unwrap(), 3);
-        assert_eq!(reopened.last_event("large").unwrap(), Some((3, text("next"))));
     }
 
     #[test]
@@ -792,18 +471,6 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_list_identity_local_journals() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = RunJournal::open(dir.path()).unwrap();
-        journal.append("chat-b", &text("b")).unwrap();
-        journal.append("chat-a", &text("a")).unwrap();
-        journal.append("chat-a", &done()).unwrap();
-        std::fs::write(dir.path().join("ignored.resume"), "1").unwrap();
-
-        assert_eq!(journal.session_ids().unwrap(), vec!["chat-a", "chat-b"]);
-    }
-
-    #[test]
     fn torn_tail_line_is_tolerated() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -823,5 +490,173 @@ mod tests {
         let all = journal.replay("chat-1", 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].0, 2);
+    }
+
+    fn line(seq: u64, event: AgentEvent) -> String {
+        serde_json::to_string(&JournalLine { seq, event }).unwrap()
+    }
+
+    fn rev_lines(path: &Path) -> Vec<Vec<u8>> {
+        let Some(mut lines) = RevLines::open(path).unwrap() else {
+            return Vec::new();
+        };
+        std::iter::from_fn(|| lines.next_line().unwrap()).collect()
+    }
+
+    /// Journal contents covering the tail reader's edge cases; each must read the same
+    /// backwards as the full forward parse did.
+    fn tail_cases() -> Vec<(&'static str, Vec<u8>)> {
+        let huge = "x".repeat(5 * TAIL_CHUNK + 123);
+        let a = line(1, text("a"));
+        let b = line(2, text("b"));
+        let big = line(3, text(&huge));
+        let fin = line(4, done());
+        vec![
+            ("empty", Vec::new()),
+            ("only-newlines", b"\n\n\r\n  \n".to_vec()),
+            ("trailing-newline", format!("{a}\n{b}\n").into_bytes()),
+            ("no-trailing-newline", format!("{a}\n{b}").into_bytes()),
+            ("crlf", format!("{a}\r\n{b}\r\n").into_bytes()),
+            (
+                "blank-lines-at-end",
+                format!("{a}\n{b}\n\n  \n").into_bytes(),
+            ),
+            (
+                "garbage-last-line",
+                format!("{a}\n{b}\n{{\"seq\":3,\"event\":{{\"type\":\"textD").into_bytes(),
+            ),
+            (
+                "garbage-then-newline",
+                format!("{a}\n{b}\nnot json\n\n").into_bytes(),
+            ),
+            ("all-garbage", b"nope\n{\"seq\":\nstill nope".to_vec()),
+            (
+                "multi-chunk-last-line",
+                format!("{a}\n{big}\n").into_bytes(),
+            ),
+            (
+                "multi-chunk-last-line-unterminated",
+                format!("{a}\n{big}").into_bytes(),
+            ),
+            (
+                "multi-chunk-middle-line",
+                format!("{a}\n{big}\n{fin}\n").into_bytes(),
+            ),
+            (
+                "multi-chunk-garbage-tail",
+                format!("{a}\n{b}\n{}", &big[..big.len() - 7]).into_bytes(),
+            ),
+            ("multi-chunk-only-line", big.clone().into_bytes()),
+        ]
+    }
+
+    #[test]
+    fn rev_lines_are_forward_lines_reversed() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in tail_cases() {
+            let path = dir.path().join(format!("{name}.jsonl"));
+            std::fs::write(&path, &bytes).unwrap();
+            let mut expected: Vec<Vec<u8>> =
+                bytes.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+            expected.reverse();
+            assert_eq!(rev_lines(&path), expected, "{name}");
+        }
+        assert!(rev_lines(&dir.path().join("missing.jsonl")).is_empty());
+    }
+
+    #[test]
+    fn tail_reads_match_a_full_forward_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in tail_cases() {
+            let path = dir.path().join(format!("{name}.jsonl"));
+            std::fs::write(&path, &bytes).unwrap();
+            let all = read_lines(&path).unwrap();
+
+            // Every valid event, newest-first.
+            let mut expected = all.clone();
+            expected.reverse();
+            let rev: Vec<_> = RevEvents::open(&path)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(rev, expected, "{name}");
+
+            assert_eq!(
+                last_valid_line(&path).unwrap(),
+                all.last().cloned(),
+                "{name}"
+            );
+            let old_scan_tail = (
+                all.last().map(|(seq, _)| seq + 1).unwrap_or(1),
+                bytes.last().is_some_and(|b| *b != b'\n'),
+            );
+            assert_eq!(scan_tail(&path).unwrap(), old_scan_tail, "{name}");
+        }
+        let missing = dir.path().join("missing.jsonl");
+        assert_eq!(last_valid_line(&missing).unwrap(), None);
+        assert_eq!(scan_tail(&missing).unwrap(), (1, false));
+    }
+
+    #[test]
+    fn stale_sessions_unchanged_by_tail_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in tail_cases() {
+            std::fs::write(dir.path().join(format!("{name}.jsonl")), bytes).unwrap();
+        }
+        std::fs::write(dir.path().join("ignored.resume"), "2").unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+
+        // The pre-tail-read implementation: full parse, inspect the last event.
+        let mut expected = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let last = read_lines(&path).unwrap().into_iter().next_back();
+            if matches!(last, Some((_, ref event)) if !matches!(event, AgentEvent::Done { .. })) {
+                expected.push(path.file_stem().unwrap().to_str().unwrap().to_string());
+            }
+        }
+        expected.sort();
+        assert_eq!(journal.stale_sessions().unwrap(), expected);
+        assert!(expected.contains(&"multi-chunk-garbage-tail".to_string()));
+        assert!(!expected.contains(&"multi-chunk-middle-line".to_string()));
+    }
+
+    #[test]
+    fn append_after_multi_chunk_torn_tail_isolates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat-1.jsonl");
+        let big = line(7, text(&"y".repeat(3 * TAIL_CHUNK)));
+        std::fs::write(
+            &path,
+            format!("{}\n{}", line(6, text("a")), &big[..big.len() / 2]),
+        )
+        .unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(journal.append("chat-1", &text("b")).unwrap(), 7);
+        assert!(matches!(
+            journal.last_event("chat-1").unwrap(),
+            Some((7, AgentEvent::TextDelta { .. }))
+        ));
+        assert_eq!(journal.replay("chat-1", 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn non_utf8_tail_line_is_skipped_as_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat-1.jsonl");
+        let mut bytes = format!("{}\n", line(1, done())).into_bytes();
+        // A torn write that split a multi-byte char.
+        bytes
+            .extend_from_slice(b"{\"seq\":2,\"event\":{\"type\":\"textDelta\",\"text\":\"\xE2\x82");
+        std::fs::write(&path, bytes).unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert!(matches!(
+            journal.last_event("chat-1").unwrap(),
+            Some((1, AgentEvent::Done { .. }))
+        ));
+        assert!(journal.stale_sessions().unwrap().is_empty());
     }
 }

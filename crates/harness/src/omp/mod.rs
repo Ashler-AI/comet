@@ -1,57 +1,36 @@
-//! OMP harness adapter over OMP's native RPC mode (`omp --mode rpc`).
-//!
-//! Comet owns execution through JSONL frames on the child's stdio. Desktop
-//! catalogs combine Scaffold defaults with local `models --json` entries;
-//! Scaffold hosts retain their authority-scoped catalog. One persistent child
-//! serves every turn, and followups steer between tool calls instead
-//! of queueing behind it — the reason this adapter left ACP, whose
-//! `session/prompt` is strictly turn-serial. The ACP client in [`rpc`] and
-//! the [`run_acp`] loop remain solely for Prime Agent.
+//! Native OMP RPC, exact session-journal ownership, and supervised execution.
 
-pub(crate) mod rpc;
-pub(crate) mod rpc_mode;
+mod rpc_mode;
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
-use std::future::Future;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::io::AsyncBufReadExt as _;
-use tokio::process::{Child, Command};
+use crate::process::{Command, Stdio as ManagedStdio};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use comet_proto::{
-    AgentActivity, AgentActivityStatus, AgentEvent, DoneStatus, HarnessCommand, HarnessId, Model,
-    OmpAdvisorConfig, OmpAdvisorSyncBacklog, ReasoningLevel, RunRequest, SteeringMode, TodoItem,
-    ToolCall, UserInputQuestion,
+use zeron_proto::{
+    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, SlashCommand, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, InferenceRoute, RunControls};
-use rpc::{Incoming, RpcClient};
-
-const ACP_PROTOCOL_VERSION: i64 = 1;
+use crate::{Harness, HarnessError, RunControls};
 /// Oldest OMP this engine can drive — the floor behind the "Update required"
 /// state in Settings → Agents. Tracks the version this release was verified
 /// against (also the installer's pinned bootstrap).
 pub const MIN_OMP_VERSION: &str = "17.2.9";
-const ACP_INITIALIZE_DEADLINE: Duration = Duration::from_secs(15);
-const ACP_SESSION_DEADLINE: Duration = Duration::from_secs(30);
-const ACP_CONFIGURE_DEADLINE: Duration = Duration::from_secs(15);
-const ACP_PROMPT_INACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(300);
 // Cold project capability discovery can legitimately exceed the old 15-second
 // boundary in large repositories. Warm launches still return as soon as ready.
 const RPC_STARTUP_DEADLINE: Duration = Duration::from_secs(60);
-const MODEL_CATALOG_DEADLINE: Duration = Duration::from_secs(30);
 // Includes the startup boundary plus the command stream's two-second settle.
 const RPC_COMMAND_CATALOG_DEADLINE: Duration = Duration::from_secs(65);
 const SCAFFOLD_PROFILE: &str = "scaffold-host";
@@ -66,13 +45,9 @@ const SCAFFOLD_INFERENCE_EXTENSION_BYTES: u64 = 64 * 1024;
 // Agent Auth accepts at most 8 MiB per inference request. OMP's 3840x2400
 // Computer default can retain multi-megabyte PNGs in Responses history, so use
 // its documented coordinate-safe capture cap for every Comet-owned OMP run.
-const OMP_RUN_CONFIG: &[u8] = br#"retry:
-  enabled: true
-  maxRetries: 3
-  baseDelayMs: 1000
-  provider:
-    maxRetries: 0
-computer:
+// Leave retries to OMP's configured, replay-aware turn recovery. Crew must not
+// turn recoverable provider failures into terminal RPC errors.
+const OMP_RUN_CONFIG: &[u8] = br#"computer:
   maxWidth: 1280
   maxHeight: 896
 "#;
@@ -334,6 +309,7 @@ fn run_omp_supervisor(_args: impl Iterator<Item = OsString>) -> Result<(), Harne
 #[derive(Debug)]
 pub(crate) struct OmpRunConfig {
     path: PathBuf,
+    gateway: Option<crate::scratch::ScratchDir>,
 }
 
 impl OmpRunConfig {
@@ -357,7 +333,7 @@ impl OmpRunConfig {
             let _ = std::fs::remove_file(&path);
             return Err(error.into());
         }
-        Ok(Self { path })
+        Ok(Self { path, gateway: None })
     }
 
     fn apply(&self, command: &mut Command, inherited: Option<&std::ffi::OsStr>) {
@@ -545,11 +521,6 @@ fn configure_scaffold_inference_profile_at(
 }
 
 const OMP_SESSION_HEADER_BYTES: u64 = 64 * 1024;
-
-fn acp_assistant_message_id(session_id: &str, run_nonce: &uuid::Uuid, turn_number: u64) -> String {
-    format!("acp-{session_id}-{run_nonce}-{turn_number}")
-}
-
 /// OMP's `--thinking` flag ladder (off|minimal|low|medium|high|xhigh|max).
 /// Levels above OMP's ladder clamp to max.
 fn thinking_flag(level: ReasoningLevel) -> &'static str {
@@ -564,15 +535,6 @@ fn thinking_flag(level: ReasoningLevel) -> &'static str {
         | ReasoningLevel::Ultracode
         | ReasoningLevel::Ultrathink => "max",
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdvisorConfigUpdate {
-    Enabled(bool),
-    Model(String),
-    Subagents(bool),
-    SyncBacklog(OmpAdvisorSyncBacklog),
-    ImmuneTurns(u32),
 }
 /// Whether another process currently owns an OMP session journal for writing.
 ///
@@ -728,7 +690,7 @@ fn parse_lsof_writer_paths(stdout: &[u8]) -> Option<HashSet<Vec<u8>>> {
     Some(writers)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn fdinfo_text_is_write_capable(text: &str) -> Option<bool> {
     let flags = text.lines().find_map(|line| {
         line.strip_prefix("flags:")
@@ -1319,44 +1281,6 @@ fn omp_session_dirs(scaffold_host: bool) -> Vec<PathBuf> {
     dirs.push(agent_dir.join("sessions"));
     dirs
 }
-
-fn omp_agent_dir(scaffold_host: bool) -> PathBuf {
-    omp_session_dirs(scaffold_host)
-        .into_iter()
-        .next()
-        .and_then(|sessions| sessions.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from(".omp/agent"))
-}
-
-fn configure_inference_gateway(
-    command: &mut Command,
-    agent_dir: &Path,
-    inference: &InferenceRoute,
-    scaffold_host: bool,
-) -> Result<(), HarnessError> {
-    let provider = crate::auth_gateway::provider(&inference.provider).ok_or_else(|| {
-        HarnessError::Protocol(format!(
-            "unsupported shared inference provider: {}",
-            inference.provider
-        ))
-    })?;
-    if scaffold_host {
-        // Scaffold disables extension discovery; preserve its explicit adapter.
-        if !agent_dir.join("extensions/omp-auth-gateway.ts").is_file() {
-            let extension = crate::auth_gateway::install_prime_extension(agent_dir)?;
-            command.arg("--extension").arg(extension);
-        }
-    } else {
-        crate::auth_gateway::install_extension(agent_dir)?;
-    }
-    let model = inference
-        .model
-        .rsplit_once('/')
-        .map_or(inference.model.as_str(), |(_, model)| model);
-    command.args(["--model", &format!("{provider}/{model}")]);
-    Ok(())
-}
-
 fn session_file_id(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file.take(OMP_SESSION_HEADER_BYTES));
@@ -1402,9 +1326,7 @@ fn resolve_session(
             "Crew session journal does not exist".into(),
         ));
     }
-    // Preserve native UUID lookup when the journal is outside our configured roots;
-    // the RPC handshake must still return exactly this identity.
-    Ok((selector.to_owned(), None))
+    Err(HarnessError::Protocol("Could not resolve the exact OMP journal; refusing an unverified resume".into()))
 }
 
 fn matching_session_files(session_dirs: &[PathBuf], session_id: &str) -> (Vec<PathBuf>, bool) {
@@ -1456,7 +1378,7 @@ impl ForkSnapshotState {
                 self.last_user_boundary = Some(boundary);
                 self.completed_after_last_user = false;
             }
-            Some("assistant") if stop_reason != Some("toolUse") => {
+            Some("assistant") if matches!(stop_reason, Some("stop" | "length")) => {
                 self.completed_after_last_user = true;
             }
             _ => {}
@@ -1487,6 +1409,8 @@ struct ForkRecord<'a> {
 struct ForkMessage<'a> {
     #[serde(default)]
     role: Option<&'a str>,
+    #[serde(rename = "stopReason", default)]
+    stop_reason: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -1508,8 +1432,8 @@ fn fork_snapshot_len(bytes: &[u8], active: bool) -> Result<usize, HarnessError> 
         })?;
         if record.kind == Some("message") {
             state.observe(
-                record.message.and_then(|message| message.role),
-                record.stop_reason,
+                record.message.as_ref().and_then(|message| message.role),
+                record.stop_reason.or_else(|| record.message.as_ref().and_then(|message| message.stop_reason)),
                 offset as u64,
             );
         }
@@ -1521,41 +1445,77 @@ fn fork_session_file(
     session_dirs: &[PathBuf],
     source_session_id: &str,
 ) -> Result<String, HarnessError> {
+    fork_session_to(session_dirs, source_session_id, None)
+}
+
+/// Copy a completed-turn native branch without stopping its calling agent.
+/// The durable caller supplies a private target and immutable branch identity.
+pub fn fork_native_session(source: &str, target: &Path, id: &str) -> Result<String, HarnessError> {
+    fork_session_to(&omp_session_dirs(false), source, Some((target, id)))
+}
+
+/// Attachment roots follow the exact resolved journal, never an unrelated live store.
+pub fn native_session_blob_dir(source: &str) -> Result<PathBuf, HarnessError> {
+    let (_, path) = resolve_session(&omp_session_dirs(false), source)?;
+    let path = path.ok_or_else(|| HarnessError::Protocol("Native journal unavailable".into()))?;
+    if let Some(sessions) = path.ancestors().find(|path| path.file_name().is_some_and(|name| name == "sessions")) {
+        return Ok(sessions.parent().ok_or_else(|| HarnessError::Protocol("Native store has no parent".into()))?.join("blobs"));
+    }
+    Ok(path.parent().ok_or_else(|| HarnessError::Protocol("Native journal has no parent".into()))?.join("blobs"))
+}
+
+fn fork_session_to(
+    session_dirs: &[PathBuf],
+    source_session_id: &str,
+    destination: Option<(&Path, &str)>,
+) -> Result<String, HarnessError> {
     let (source_session_id, source_path) = resolve_session(session_dirs, source_session_id)?;
     let source_path = source_path.ok_or_else(|| {
         HarnessError::Protocol("Could not resolve exactly one Crew session journal to fork".into())
     })?;
     let source_path = &source_path;
-    let source = std::fs::File::open(source_path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let source = options.open(source_path)?;
     let byte_count = source.metadata()?.len();
     if byte_count == 0 {
         return Err(HarnessError::Protocol(
             "OMP session journal is empty".into(),
         ));
     }
-    let active = match session_writer_state(source_path) {
-        SessionWriterState::Active => true,
-        SessionWriterState::Inactive => false,
-        SessionWriterState::Unknown => {
-            return Err(HarnessError::Protocol(
-                "Could not verify the OMP source journal while forking".into(),
-            ));
-        }
-    };
-
-    let fork_session_id = uuid::Uuid::new_v4().to_string();
-    let parent = source_path.parent().ok_or_else(|| {
-        HarnessError::Protocol("OMP session journal has no parent directory".into())
-    })?;
-    let target = parent.join(format!("crew-fork-{fork_session_id}.jsonl"));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+    let writers = session_writer_pids(source_path).ok_or_else(|| HarnessError::Protocol(
+        "Could not verify the OMP source journal while forking".into()))?;
+    if writers.len() > 1 {
+        return Err(HarnessError::Protocol("Native source has multiple writers; refusing an ambiguous snapshot".into()));
     }
-    let mut output = options.open(&target)?;
+    #[cfg(unix)]
+    if !writers.is_empty() {
+        let mut owned = Vec::new();
+        supervised_descendants(std::process::id(), &mut owned);
+        if writers.iter().any(|pid| !owned.iter().any(|(child, birth)|
+            child == pid && process_birth(*pid).as_ref() == Some(birth))) {
+            return Err(HarnessError::Protocol("Native source has a writer not owned by this engine".into()));
+        }
+    }
+    #[cfg(not(unix))]
+    if !writers.is_empty() {
+        return Err(HarnessError::Protocol("Active native snapshot ownership is unavailable on this platform".into()));
+    }
+    let active = !writers.is_empty();
+
+    let fork_session_id = destination.map(|(_, id)| id.to_owned())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let target = destination.map(|(path, _)| path.to_owned()).unwrap_or_else(|| {
+        source_path.parent().expect("resolved session parent")
+            .join(format!("crew-fork-{fork_session_id}.jsonl"))
+    });
+    let parent = target.parent().ok_or_else(|| HarnessError::Protocol("Native fork has no parent".into()))?;
+    let mut output = tempfile::NamedTempFile::new_in(parent)?;
     let result = (|| -> Result<(), HarnessError> {
         let mut reader = BufReader::new(source.take(byte_count));
         let mut line = Vec::new();
@@ -1613,8 +1573,8 @@ fn fork_session_file(
             }
             if record.kind == Some("message") {
                 snapshot.observe(
-                    record.message.and_then(|message| message.role),
-                    record.stop_reason,
+                    record.message.as_ref().and_then(|message| message.role),
+                    record.stop_reason.or_else(|| record.message.as_ref().and_then(|message| message.stop_reason)),
                     output_bytes,
                 );
             }
@@ -1629,43 +1589,26 @@ fn fork_session_file(
                 "OMP session journal has no session header".into(),
             ));
         }
-        output.set_len(snapshot.snapshot_len(active, output_bytes)?)?;
-        output.sync_all()?;
+        output.as_file().set_len(snapshot.snapshot_len(active, output_bytes)?)?;
+        output.as_file().sync_all()?;
         Ok(())
     })();
-    if let Err(error) = result {
-        drop(output);
-        let _ = std::fs::remove_file(&target);
-        return Err(error);
-    }
+    result?;
+    output.persist_noclobber(&target).map_err(|error| HarnessError::Io(error.error))?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(fork_session_id)
 }
 
 fn resolve_omp_executable() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("OMP_EXECUTABLE").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(path));
+        return crate::executable::validate_native_override(Path::new(&path)).ok();
     }
-    let executable = if cfg!(windows) { "omp.exe" } else { "omp" };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(executable))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(std::env::split_paths(shell_path).map(|dir| dir.join(executable)));
+    let mut extra = vec![PathBuf::from("/usr/local/bin/omp")];
+    if let Some(home) = crate::executable::home_dir() {
+        extra.push(home.join(".local/bin/omp"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local/bin").join(executable));
-    }
-    candidates.push(PathBuf::from("/usr/local/bin").join(executable));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|dir| dir.join(executable)),
-    );
-    candidates.into_iter().find(|path| path.exists())
+    crate::executable::find_on_paths("omp", extra)
 }
 
 /// The installed `omp` executable, if any — the engine's update inventory
@@ -1877,8 +1820,11 @@ impl OmpHarness {
     }
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
-        self.executable.clone().or_else(resolve_omp_executable).ok_or_else(|| {
-            HarnessError::NotInstalled("omp (searched OMP_EXECUTABLE, PATH, login-shell PATH, ~/.local/bin, /usr/local/bin, and Node manager bins)".into())
+        if let Some(executable) = &self.executable {
+            return crate::executable::validate_native_override(executable);
+        }
+        resolve_omp_executable().ok_or_else(|| {
+            HarnessError::NotInstalled("omp (install Crew's pinned native OMP runtime or set OMP_EXECUTABLE)".into())
         })
     }
 
@@ -1919,9 +1865,9 @@ impl OmpHarness {
             command.current_dir(cwd);
         }
         command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdin(ManagedStdio::piped())
+            .stdout(ManagedStdio::piped())
+            .stderr(ManagedStdio::piped())
             .kill_on_drop(!(supervised && self.supervisor_executable.is_some()));
         command
     }
@@ -1945,15 +1891,16 @@ impl OmpHarness {
 
     fn configure_rpc_mode(&self, command: &mut Command) {
         command.env_remove("COMET_EXECUTABLE");
+        command.env("ASHLER_INCREMENTAL_TSC_CHECKS", "false");
+        if let Some(executable) = &self.supervisor_executable {
+            command.env("COMET_EXECUTABLE", executable);
+        }
         if self.scaffold_host {
             command.env("CI", "true");
             command.env_remove(LOCAL_RUNTIME_ENV);
         } else {
             command.env("CI", "false");
             command.env(LOCAL_RUNTIME_ENV, "1");
-            if let Some(executable) = &self.supervisor_executable {
-                command.env("COMET_EXECUTABLE", executable);
-            }
         }
         command.args(["--mode", "rpc", "--approval-mode", "yolo"]);
         if self.scaffold_host {
@@ -2020,146 +1967,6 @@ impl OmpHarness {
         command
     }
 }
-
-fn omp_config_command(cwd: &str) -> Result<Command, HarnessError> {
-    let executable = resolve_omp_executable().ok_or_else(|| {
-        HarnessError::NotInstalled(
-            "omp (searched OMP_EXECUTABLE, PATH, login-shell PATH, ~/.local/bin, \
-             /usr/local/bin, and Node manager bins)"
-                .into(),
-        )
-    })?;
-    let mut command = Command::new(&executable);
-    crate::compose_child_path(&mut command, &executable);
-    if !cwd.is_empty() {
-        command.current_dir(cwd);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    Ok(command)
-}
-
-async fn run_omp_config(cwd: &str, args: &[&str]) -> Result<Value, HarnessError> {
-    let output = omp_config_command(cwd)?
-        .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false")
-        .args(args)
-        .output()
-        .await?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(HarnessError::Protocol(if message.is_empty() {
-            format!("OMP config command failed with {}", output.status)
-        } else {
-            message
-        }));
-    }
-    serde_json::from_slice(&output.stdout).map_err(|error| {
-        HarnessError::Protocol(format!("OMP config returned invalid JSON: {error}"))
-    })
-}
-
-fn parse_advisor_config(settings: &Value) -> Result<OmpAdvisorConfig, HarnessError> {
-    let value = |key: &str| settings.get(key).and_then(|setting| setting.get("value"));
-    let enabled = value("advisor.enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let subagents = value("advisor.subagents")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let sync_backlog = match value("advisor.syncBacklog")
-        .and_then(Value::as_str)
-        .unwrap_or("off")
-    {
-        "off" => OmpAdvisorSyncBacklog::Off,
-        "1" => OmpAdvisorSyncBacklog::One,
-        "3" => OmpAdvisorSyncBacklog::Three,
-        "5" => OmpAdvisorSyncBacklog::Five,
-        other => {
-            return Err(HarnessError::Protocol(format!(
-                "OMP returned an unsupported advisor.syncBacklog value: {other}"
-            )));
-        }
-    };
-    let immune_turns = value("advisor.immuneTurns")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(3);
-    let model = value("modelRoles")
-        .and_then(Value::as_object)
-        .and_then(|roles| roles.get("advisor"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    Ok(OmpAdvisorConfig {
-        enabled,
-        model,
-        subagents,
-        sync_backlog,
-        immune_turns,
-    })
-}
-
-pub async fn read_advisor_config(cwd: &str) -> Result<OmpAdvisorConfig, HarnessError> {
-    let settings = run_omp_config(cwd, &["config", "list", "--json"]).await?;
-    parse_advisor_config(&settings)
-}
-
-pub async fn read_session_config(cwd: &str) -> Result<Value, HarnessError> {
-    let runtime_dir = std::env::var_os("SCAFFOLD_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            HarnessError::Protocol("SCAFFOLD_RUNTIME_DIR is required for Scaffold OMP".into())
-        })?;
-    let profile = scaffold_inference_profile_at(&runtime_dir)?;
-    let settings = run_omp_config(
-        cwd,
-        &["--profile", SCAFFOLD_PROFILE, "config", "list", "--json"],
-    )
-    .await?;
-    Ok(serde_json::json!({
-        "harness": "omp",
-        "model": profile.model,
-        "reasoning": settings.pointer("/defaultThinkingLevel/value"),
-        "modelOptions": {},
-        "sandbox": "workspace-write",
-    }))
-}
-
-pub async fn update_advisor_config(
-    cwd: &str,
-    update: AdvisorConfigUpdate,
-) -> Result<OmpAdvisorConfig, HarnessError> {
-    let (key, value) = match update {
-        AdvisorConfigUpdate::Enabled(value) => ("advisor.enabled", value.to_string()),
-        AdvisorConfigUpdate::Subagents(value) => ("advisor.subagents", value.to_string()),
-        AdvisorConfigUpdate::SyncBacklog(value) => {
-            ("advisor.syncBacklog", value.value().to_string())
-        }
-        AdvisorConfigUpdate::ImmuneTurns(value) => ("advisor.immuneTurns", value.to_string()),
-        AdvisorConfigUpdate::Model(model) => {
-            let model = model.trim();
-            if model.is_empty() {
-                return Err(HarnessError::Protocol(
-                    "Advisor model cannot be empty".into(),
-                ));
-            }
-            let current = run_omp_config(cwd, &["config", "get", "modelRoles", "--json"]).await?;
-            let mut roles = current
-                .get("value")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            roles.insert("advisor".into(), Value::String(model.to_string()));
-            ("modelRoles", Value::Object(roles).to_string())
-        }
-    };
-    run_omp_config(cwd, &["config", "set", key, &value, "--json"]).await?;
-    read_advisor_config(cwd).await
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OmpCatalog {
@@ -2218,73 +2025,24 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .collect())
 }
 
-fn desktop_models(mut local: Vec<Model>) -> Vec<Model> {
+pub(crate) fn scaffold_models() -> Vec<Model> {
     #[derive(Deserialize)]
     struct Catalog {
         models: Vec<Model>,
     }
     let bundled: Catalog = serde_json::from_str(include_str!("scaffold-models.json"))
         .expect("checked-in Scaffold model catalog must be valid");
+    bundled.models
+}
+
+fn desktop_models(mut local: Vec<Model>) -> Vec<Model> {
     let local_ids: HashSet<_> = local.iter().map(|model| model.id.as_str()).collect();
-    let defaults: Vec<_> = bundled
-        .models
+    let defaults: Vec<_> = scaffold_models()
         .into_iter()
         .filter(|model| !local_ids.contains(model.id.as_str()))
         .collect();
     local.extend(defaults);
     local
-}
-
-/// Catalog subprocesses own their process group until output and exit complete.
-pub(crate) async fn model_catalog_output(
-    command: &mut Command,
-    label: &str,
-    supervised: bool,
-) -> Result<std::process::Output, HarnessError> {
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .kill_on_drop(!supervised);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().process_group(0);
-    }
-    // Keep the unreaped child with its guard: even an exited leader can have
-    // descendants holding its pipes open. Its PID cannot be reused until wait.
-    struct CatalogChild {
-        child: Child,
-        supervised: bool,
-    }
-    impl Drop for CatalogChild {
-        fn drop(&mut self) {
-            #[cfg(unix)]
-            if let Some(pid) = self.child.id() {
-                let group = pid as i32;
-                // SAFETY: this is our still-unreaped child, launched with group 0.
-                // macOS getpgid returns ESRCH for an exited unreaped leader,
-                // even while its descendants still occupy our owned group.
-                unsafe {
-                    if group > 1 && libc::getpgrp() != group {
-                        libc::kill(-group, if self.supervised { libc::SIGTERM } else { libc::SIGKILL });
-                    }
-                }
-            }
-        }
-    }
-    let mut process = CatalogChild { child: command.spawn()?, supervised };
-    let mut stdout = process.child.stdout.take().expect("model catalog stdout is piped");
-    let mut stderr = process.child.stderr.take().expect("model catalog stderr is piped");
-    let mut output = Vec::new();
-    let mut errors = Vec::new();
-    let status = tokio::time::timeout(MODEL_CATALOG_DEADLINE, async {
-        use tokio::io::AsyncReadExt as _;
-        tokio::try_join!(stdout.read_to_end(&mut output), stderr.read_to_end(&mut errors))?;
-        process.child.wait().await
-    })
-    .await
-    .map_err(|_| HarnessError::Protocol(format!(
-        "{label} model discovery timed out after 30s. Check agent credentials and retry."
-    )))??;
-    Ok(std::process::Output { status, stdout: output, stderr: errors })
 }
 
 #[async_trait]
@@ -2303,6 +2061,20 @@ impl Harness for OmpHarness {
     /// followups alter the live turn instead of queueing behind it.
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
+    }
+    fn installed(&self) -> bool { self.resolve_executable().is_ok() }
+    fn executable_path(&self) -> Option<PathBuf> { self.resolve_executable().ok() }
+    fn deterministic_turn_end(&self) -> bool { true }
+    fn stops_turn_in_place(&self) -> bool { true }
+    fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
+        let files: Vec<_> = omp_session_dirs(self.scaffold_host).iter()
+            .filter_map(|sessions| sessions.parent())
+            .flat_map(|root| ["models.json", "settings.json", "auth.json"].map(|name| root.join(name)))
+            .collect();
+        crate::model_context::context(self.id(), &self.resolve_executable()?, &files).map(Some)
+    }
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.commands_for(&std::env::current_dir()?).await
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[]
@@ -2339,12 +2111,15 @@ impl Harness for OmpHarness {
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
-        let mut command = self.base_command(&executable, "", false, true);
+        let mut command = self.base_command(&executable, "", false, false);
         if self.scaffold_host {
             command.args(["--profile", SCAFFOLD_PROFILE]);
         }
-        command.args(["models", "--json"]).stdin(Stdio::null());
-        let output = model_catalog_output(&mut command, "OMP", self.supervisor_executable.is_some()).await?;
+        let output = command
+            .args(["models", "--json"])
+            .stdin(ManagedStdio::null())
+            .output()
+            .await?;
         if !output.status.success() {
             let tail = crate::StderrTail::default();
             for line in String::from_utf8_lossy(&output.stderr).lines() {
@@ -2364,7 +2139,8 @@ impl Harness for OmpHarness {
         })
     }
 
-    async fn commands(&self, cwd: &str) -> Result<Vec<HarnessCommand>, HarnessError> {
+    async fn commands_for(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
+        let cwd = cwd.to_str().ok_or_else(|| HarnessError::Protocol("OMP cwd is not UTF-8".into()))?;
         let executable = self.resolve_executable()?;
         let mut child = self
             .command_catalog_command(&executable, cwd)
@@ -2415,6 +2191,7 @@ impl Harness for OmpHarness {
         mut request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let executable = self.resolve_executable()?;
         if let Some(fork_from) = controls
             .context
@@ -2461,7 +2238,7 @@ impl Harness for OmpHarness {
         }
         let mut command = self.run_command(&executable, &request);
         request.resume = canonical_resume;
-        let run_config = OmpRunConfig::create()?;
+        let mut run_config = OmpRunConfig::create()?;
         run_config.apply(
             &mut command,
             std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(),
@@ -2472,12 +2249,18 @@ impl Harness for OmpHarness {
             .as_ref()
             .and_then(|context| context.inference.as_ref())
         {
-            configure_inference_gateway(
-                &mut command,
-                &omp_agent_dir(self.scaffold_host),
-                inference,
-                self.scaffold_host,
-            )?;
+            let gateway = crate::scratch::ScratchDir::new("omp-agent-auth")?;
+            let extension = gateway.path().join("agent-auth.ts");
+            std::fs::write(&extension, include_str!("auth_gateway.ts"))?;
+            command.arg("--extension").arg(extension);
+            let provider = match inference.provider.as_str() {
+                "openai" => "comet-openai",
+                "anthropic" => "comet-anthropic",
+                _ => return Err(HarnessError::Protocol("Unsupported Agent Auth provider".into())),
+            };
+            let model = inference.model.rsplit('/').next().unwrap_or(&inference.model);
+            command.args(["--model", &format!("{provider}/{model}")]);
+            run_config.gateway = Some(gateway);
         } else if self.scaffold_host {
             configure_scaffold_inference_profile(&mut command, request.model.as_deref())?;
         }
@@ -2549,2566 +2332,69 @@ impl Harness for OmpHarness {
         )
     }
 }
-
-async fn request_acp_startup(
-    client: &RpcClient,
-    incoming: &mut mpsc::Receiver<Incoming>,
-    controls: &RunControls,
-    method: &str,
-    params: Value,
-) -> Result<Value, HarnessError> {
-    let requested_session = params.get("sessionId").cloned();
-    let request = client.request(method, params);
-    tokio::pin!(request);
-    let mut latest_config: Option<(Value, Value)> = None;
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut request => {
-                let mut result = result?;
-                while let Ok(item) = incoming.try_recv() {
-                    if matches!(item, Incoming::Eof) {
-                        return Err(HarnessError::Protocol("ACP agent exited during startup".into()));
-                    }
-                    if let Some(config) = startup_incoming(client, controls, item) {
-                        latest_config = Some(config);
-                    }
-                }
-                if let Some((session_id, config)) = latest_config
-                    && result.get("sessionId").or(requested_session.as_ref()) == Some(&session_id)
-                {
-                    result["configOptions"] = config;
-                }
-                return Ok(result);
-            }
-            _ = controls.interrupt.cancelled() => return Err(HarnessError::Protocol("ACP startup cancelled".into())),
-            item = incoming.recv() => match item {
-                Some(Incoming::Eof) | None => return Err(HarnessError::Protocol("ACP agent exited during startup".into())),
-                Some(item) => {
-                    if let Some(config) = startup_incoming(client, controls, item) {
-                        latest_config = Some(config);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn startup_incoming(
-    client: &RpcClient,
-    controls: &RunControls,
-    incoming: Incoming,
-) -> Option<(Value, Value)> {
-    match incoming {
-        Incoming::Request { id, method, params } if method == "session/request_permission" => {
-            handle_permission_request(id, params, client.clone(), &controls.request_input)
-        }
-        Incoming::Request { id, method, params } if method == "elicitation/create" => {
-            handle_elicitation_request(id, params, client.clone(), &controls.request_input)
-        }
-        Incoming::Request { id, .. } => {
-            client.respond_error(&id, -32601, "unsupported ACP client method")
-        }
-        Incoming::Notification { method, params }
-            if method == "session/update"
-                && params["update"]["sessionUpdate"] == "config_option_update"
-                && params["update"]["configOptions"].is_array() =>
-        {
-            return Some((
-                params["sessionId"].clone(),
-                params["update"]["configOptions"].clone(),
-            ));
-        }
-        // session/load replays history; Crew already has that transcript.
-        _ => {}
-    }
-    None
-}
-
-async fn set_config_option(
-    client: &RpcClient,
-    incoming: &mut mpsc::Receiver<Incoming>,
-    controls: &RunControls,
-    session_id: &str,
-    config_id: &str,
-    value: Value,
-) -> Result<(), HarnessError> {
-    request_acp_startup(
-        client,
-        incoming,
-        controls,
-        "session/set_config_option",
-        json!({
-            "sessionId": session_id,
-            "configId": config_id,
-            "value": value,
-        }),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn configure_session(
-    client: &RpcClient,
-    incoming: &mut mpsc::Receiver<Incoming>,
-    controls: &RunControls,
-    session_id: &str,
-    state: &Value,
-    request: &RunRequest,
-) -> Result<(), HarnessError> {
-    if let Some(model) = request.model.as_deref().filter(|model| *model != "default") {
-        if let Some(option) = crate::acp::config_option(state, "model", &["model"]) {
-            let config_id = option
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| HarnessError::Protocol("ACP model option has no id".into()))?;
-            let advertised = crate::acp::models_from_session(state);
-            if !advertised.iter().any(|candidate| candidate.id == model) {
-                return Err(HarnessError::Protocol(format!(
-                    "ACP agent does not advertise requested model {model}"
-                )));
-            }
-            set_config_option(
-                client,
-                incoming,
-                controls,
-                session_id,
-                config_id,
-                Value::String(model.into()),
-            )
-            .await?;
-        } else if state
-            .pointer("/models/availableModels")
-            .and_then(Value::as_array)
-            .is_some_and(|models| models.iter().any(|candidate| candidate["modelId"] == model))
-        {
-            request_acp_startup(
-                client,
-                incoming,
-                controls,
-                "session/set_model",
-                json!({"sessionId": session_id, "modelId": model}),
-            )
-            .await?;
-        } else {
-            return Err(HarnessError::Protocol(format!(
-                "ACP agent does not advertise requested model {model}"
-            )));
-        }
-    }
-    if let Some(reasoning) = request.reasoning {
-        let option = crate::acp::config_option(
-            state,
-            "thought_level",
-            &["thinking", "reasoning", "thought_level"],
-        )
-        .ok_or_else(|| {
-            HarnessError::Protocol("ACP agent did not advertise reasoning configuration".into())
-        })?;
-        let config_id = option
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| HarnessError::Protocol("ACP reasoning option has no id".into()))?;
-        let value = serde_json::to_value(reasoning).map_err(|error| {
-            HarnessError::Protocol(format!("Could not encode ACP reasoning: {error}"))
-        })?;
-        set_config_option(client, incoming, controls, session_id, config_id, value).await?;
-    }
-    for (option_id, value) in &request.model_options {
-        let option =
-            crate::acp::config_option(state, "", &[option_id.as_str()]).ok_or_else(|| {
-                HarnessError::Protocol(format!(
-                    "ACP agent does not advertise requested option {option_id}"
-                ))
-            })?;
-        if matches!(
-            option.get("category").and_then(Value::as_str),
-            Some("model" | "thought_level" | "mode")
-        ) || matches!(
-            option_id.as_str(),
-            "model" | "thinking" | "reasoning" | "thought_level" | "mode"
-        ) {
-            return Err(HarnessError::Protocol(format!(
-                "ACP option {option_id} cannot override the selected model, reasoning or approval policy"
-            )));
-        }
-        set_config_option(
-            client,
-            incoming,
-            controls,
-            session_id,
-            option_id,
-            value.clone(),
-        )
-        .await?;
-    }
-    Ok(())
-}
-pub(crate) struct AcpProcess {
-    child: Child,
-    client: RpcClient,
-    incoming: mpsc::Receiver<Incoming>,
-    stderr_tail: crate::StderrTail,
-}
-
-impl AcpProcess {
-    pub(crate) fn new(
-        child: Child,
-        client: RpcClient,
-        incoming: mpsc::Receiver<Incoming>,
-        stderr_tail: crate::StderrTail,
-    ) -> Self {
-        Self {
-            child,
-            client,
-            incoming,
-            stderr_tail,
-        }
-    }
-}
-
-pub(crate) struct AcpRunOptions {
-    pub harness: HarnessId,
-    pub process_label: &'static str,
-    pub preloaded_session_id: Option<String>,
-    pub reported_session_dir: Option<PathBuf>,
-    pub configure_session: bool,
-    pub persistent: bool,
-}
-
-fn stage_timeout_message(process_label: &str, stage: &str, deadline: Duration) -> String {
-    format!(
-        "{process_label} {stage} timed out after {}s",
-        deadline.as_secs()
-    )
-}
-
-async fn run_stage<T, F>(
-    process_label: &str,
-    stage: &str,
-    deadline: Duration,
-    future: F,
-) -> Result<T, HarnessError>
-where
-    F: Future<Output = Result<T, HarnessError>>,
-{
-    tracing::debug!(
-        target: "comet_harness::omp",
-        process = process_label,
-        stage = stage,
-        timeout_ms = deadline.as_millis() as u64,
-        "ACP stage started"
-    );
-    match tokio::time::timeout(deadline, future).await {
-        Ok(Ok(value)) => {
-            tracing::debug!(
-                target: "comet_harness::omp",
-                process = process_label,
-                stage = stage,
-                "ACP stage completed"
-            );
-            Ok(value)
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(
-                target: "comet_harness::omp",
-                process = process_label,
-                stage = stage,
-                error = %error,
-                "ACP stage failed"
-            );
-            Err(error)
-        }
-        Err(_) => {
-            let message = stage_timeout_message(process_label, stage, deadline);
-            tracing::warn!(
-                target: "comet_harness::omp",
-                process = process_label,
-                stage = stage,
-                error = %message,
-                "ACP stage timed out"
-            );
-            Err(HarnessError::Protocol(message))
-        }
-    }
-}
-
-async fn wait_for_reported_session(dir: &Path) -> Option<String> {
-    for _ in 0..50 {
-        let newest = std::fs::read_dir(dir)
-            .ok()?
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let path = entry.path();
-                let is_session = matches!(
-                    path.extension().and_then(|extension| extension.to_str()),
-                    Some("json" | "jsonl")
-                );
-                if !is_session {
-                    return None;
-                }
-                let modified = entry.metadata().ok()?.modified().ok()?;
-                Some((modified, path))
-            })
-            .max_by_key(|(modified, _)| *modified)
-            .map(|(_, path)| path.to_string_lossy().into_owned());
-        if newest.is_some() {
-            return newest;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    None
-}
-
-pub(crate) async fn run_acp(
-    process: AcpProcess,
-    request: RunRequest,
-    controls: RunControls,
-    events: mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    interrupt_grace: Duration,
-    options: AcpRunOptions,
-) -> Result<(), HarnessError> {
-    let AcpProcess {
-        mut child,
-        client,
-        mut incoming,
-        stderr_tail,
-    } = process;
-    let initialized = run_stage(
-        options.process_label,
-        "initialize",
-        ACP_INITIALIZE_DEADLINE,
-        request_acp_startup(
-            &client,
-            &mut incoming,
-            &controls,
-            "initialize",
-            json!({
-                "protocolVersion": ACP_PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "elicitation": { "form": {}, "url": {} }
-                },
-                "clientInfo": { "name": "ashler-comet", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        ),
-    )
-    .await?;
-    if initialized.get("protocolVersion").and_then(Value::as_i64) != Some(ACP_PROTOCOL_VERSION) {
-        return Err(HarnessError::Protocol(format!(
-            "{} protocol version mismatch — update the agent CLI or Crew",
-            options.process_label
-        )));
-    }
-
-    let (session_id, reported_session_id, mut session_state) =
-        if let Some(reported_session_id) = options.preloaded_session_id.clone() {
-            let state = run_stage(
-                options.process_label,
-                "session/new",
-                ACP_SESSION_DEADLINE,
-                request_acp_startup(
-                    &client,
-                    &mut incoming,
-                    &controls,
-                    "session/new",
-                    json!({ "cwd": request.cwd, "mcpServers": [] }),
-                ),
-            )
-            .await?;
-            let session_id = state
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    HarnessError::Protocol(format!(
-                        "{} session/new response had no sessionId",
-                        options.process_label
-                    ))
-                })?
-                .to_string();
-            (session_id, reported_session_id, state)
-        } else if let Some(session_id) = request.resume.as_deref() {
-            let method = if initialized
-                .pointer("/agentCapabilities/loadSession")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                "session/load"
-            } else if initialized
-                .pointer("/agentCapabilities/sessionCapabilities/resume")
-                .is_some()
-            {
-                "session/resume"
-            } else {
-                return Err(HarnessError::Protocol(format!(
-                    "{} did not advertise session load or resume",
-                    options.process_label
-                )));
-            };
-            let state = run_stage(
-                options.process_label,
-                method,
-                ACP_SESSION_DEADLINE,
-                request_acp_startup(
-                    &client,
-                    &mut incoming,
-                    &controls,
-                    method,
-                    json!({ "sessionId": session_id, "cwd": request.cwd, "mcpServers": [] }),
-                ),
-            )
-            .await?;
-            (session_id.to_string(), session_id.to_string(), state)
-        } else {
-            let state = run_stage(
-                options.process_label,
-                "session/new",
-                ACP_SESSION_DEADLINE,
-                request_acp_startup(
-                    &client,
-                    &mut incoming,
-                    &controls,
-                    "session/new",
-                    json!({ "cwd": request.cwd, "mcpServers": [] }),
-                ),
-            )
-            .await?;
-            let session_id = state
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    HarnessError::Protocol(format!(
-                        "{} session/new response had no sessionId",
-                        options.process_label
-                    ))
-                })?
-                .to_string();
-            (session_id.clone(), session_id, state)
-        };
-    if options.harness == HarnessId::Devin
-        && let Some(model) = request.model.as_deref().filter(|model| *model != "default")
-        && !crate::acp::models_from_session(&session_state)
-            .iter()
-            .any(|candidate| candidate.id == model)
-    {
-        // Devin refreshes its bundled catalog after session/new. Wait for the
-        // exact selected variant rather than silently choosing a family alias.
-        run_stage(
-            options.process_label,
-            "model refresh",
-            Duration::from_secs(10),
-            async {
-                loop {
-                    match incoming.recv().await {
-                        Some(Incoming::Notification { method, params })
-                            if method == "session/update"
-                                && params["sessionId"] == session_id
-                                && params["update"]["sessionUpdate"] == "config_option_update" =>
-                        {
-                            session_state["configOptions"] =
-                                params["update"]["configOptions"].clone();
-                            if crate::acp::models_from_session(&session_state)
-                                .iter()
-                                .any(|candidate| candidate.id == model)
-                            {
-                                return Ok(());
-                            }
-                        }
-                        Some(Incoming::Eof) | None => {
-                            return Err(HarnessError::Protocol(
-                                "Devin exited while refreshing models".into(),
-                            ));
-                        }
-                        Some(item) => {
-                            handle_session_incoming(
-                                item,
-                                &client,
-                                options.harness,
-                                &controls.request_input,
-                                &events,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            },
-        )
-        .await?;
-    }
-    if options.configure_session {
-        run_stage(
-            options.process_label,
-            "session/configure",
-            ACP_CONFIGURE_DEADLINE,
-            configure_session(
-                &client,
-                &mut incoming,
-                &controls,
-                &session_id,
-                &session_state,
-                &request,
-            ),
-        )
-        .await?;
-    }
-    let reported_session_id = if options.preloaded_session_id.is_none() {
-        if let Some(dir) = options.reported_session_dir.as_deref() {
-            wait_for_reported_session(dir).await.ok_or_else(|| {
-                HarnessError::Protocol(format!(
-                    "{} session/report timed out waiting for a durable session file",
-                    options.process_label
-                ))
-            })?
-        } else {
-            reported_session_id
-        }
-    } else {
-        reported_session_id
-    };
-    let message_id_run_nonce = uuid::Uuid::new_v4();
-    let mut turn_number = 0_u64;
-    let mut assistant_message_id =
-        acp_assistant_message_id(&session_id, &message_id_run_nonce, turn_number);
-    if events
-        .send(Ok(AgentEvent::SessionStarted {
-            harness: options.harness,
-            model: request.model.clone().unwrap_or_else(|| "default".into()),
-            tools: vec![],
-            cwd: request.cwd.clone(),
-            session_id: reported_session_id.clone(),
-            assistant_message_id: assistant_message_id.clone(),
-        }))
-        .await
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    let mut first_prompt = Vec::with_capacity(request.attachments.len() + 1);
-    for attachment in &request.attachments {
-        let bytes = std::fs::read(attachment)?;
-        let mime_type = match Path::new(attachment)
-            .extension()
-            .and_then(|value| value.to_str())
-        {
-            Some("png") => "image/png",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            _ => "image/jpeg",
-        };
-        first_prompt.push(json!({
-            "type": "image",
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            "mimeType": mime_type,
-            "uri": format!("file://{attachment}")
-        }));
-    }
-    first_prompt.push(json!({ "type": "text", "text": request.prompt }));
-
-    let RunControls {
-        request_input,
-        mut steering,
-        interrupt,
-        context: _,
-    } = controls;
-    let mut queued_prompts = VecDeque::new();
-    let mut steering_open = true;
-    let mut prompt_blocks = first_prompt;
-    let mut acp_closed = false;
-
-    loop {
-        tracing::debug!(
-            target: "comet_harness::omp",
-            process = options.process_label,
-            stage = "session/prompt",
-            turn = turn_number,
-            inactivity_log_interval_ms = ACP_PROMPT_INACTIVITY_LOG_INTERVAL.as_millis() as u64,
-            "ACP stage started"
-        );
-        let prompt_id =
-            (options.harness == HarnessId::Grok).then(|| uuid::Uuid::new_v4().to_string());
-        let mut prompt_params = json!({ "sessionId": session_id, "prompt": prompt_blocks });
-        if let Some(id) = &prompt_id {
-            prompt_params["_meta"] = json!({ "promptId": id, "requestId": id });
-        }
-        let prompt = client.request("session/prompt", prompt_params);
-        tokio::pin!(prompt);
-        let mut awaiting_first_activity = options.harness == HarnessId::Grok;
-        let inactivity = tokio::time::sleep(if awaiting_first_activity {
-            Duration::from_secs(30)
-        } else {
-            ACP_PROMPT_INACTIVITY_LOG_INTERVAL
-        });
-        tokio::pin!(inactivity);
-
-        let response = loop {
-            tokio::select! {
-                // Biased: a delivered final response must win over the EOF
-                // already queued behind it — agents that exit right after
-                // `end_turn` are ending cleanly, not crashing.
-                biased;
-                response = &mut prompt => match response {
-                    Ok(response) => break response,
-                    Err(error) => {
-                        // Prefer the richer crash context (exit status +
-                        // stderr tail) when the child is already gone.
-                        let error = match child.try_wait() {
-                            Ok(Some(status)) => HarnessError::Protocol(crate::crash_message(
-                                options.process_label,
-                                Some(status),
-                                &stderr_tail,
-                            )),
-                            _ => error,
-                        };
-                        tracing::warn!(
-                            target: "comet_harness::omp",
-                            process = options.process_label,
-                            stage = "session/prompt",
-                            error = %error,
-                            "ACP stage failed"
-                        );
-                        return Err(error);
-                    }
-                },
-                steer = steering.recv(), if steering_open => match steer {
-                    Some(steer) => queued_prompts.push_back(steer.prompt),
-                    None => steering_open = false,
-                },
-                _ = interrupt.cancelled() => {
-                    client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
-                    let _ = tokio::time::timeout(interrupt_grace, child.wait()).await;
-                    let _ = child.kill().await;
-                    events.send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Interrupted,
-                        result: None,
-                        error: None,
-                        session_id: Some(reported_session_id.clone()),
-                    })).await.ok();
-                    return Ok(());
-                }
-                item = incoming.recv() => {
-                    awaiting_first_activity = false;
-                    inactivity.as_mut().reset(Instant::now() + ACP_PROMPT_INACTIVITY_LOG_INTERVAL);
-                    match item {
-                        Some(item) => {
-                            if let Incoming::Notification { method, params } = &item
-                                && method == "_x.ai/session/prompt_complete"
-                                && params["sessionId"] == session_id
-                                && prompt_id.as_deref().is_some_and(|id| params["promptId"].as_str() == Some(id))
-                            {
-                                break params.clone();
-                            }
-                            if !handle_session_incoming(
-                                item,
-                                &client,
-                                options.harness,
-                                &request_input,
-                                &events,
-                            )
-                            .await
-                            {
-                                return Err(HarnessError::Protocol(crate::crash_message(
-                                    options.process_label,
-                                    child.try_wait().ok().flatten(),
-                                    &stderr_tail,
-                                )));
-                            }
-                        }
-                        None => {
-                            return Err(HarnessError::Protocol(crate::crash_message(
-                                options.process_label,
-                                child.try_wait().ok().flatten(),
-                                &stderr_tail,
-                            )));
-                        }
-                    }
-                }
-                _ = &mut inactivity => {
-                    if awaiting_first_activity {
-                        return Err(HarnessError::Protocol("Grok ACP did not respond within 30 seconds; check the agent CLI's startup and authentication".into()));
-                    }
-                    tracing::warn!(
-                        target: "comet_harness::omp",
-                        process = options.process_label,
-                        stage = "session/prompt",
-                        inactivity_ms = ACP_PROMPT_INACTIVITY_LOG_INTERVAL.as_millis() as u64,
-                        "ACP prompt remains active without notifications"
-                    );
-                    inactivity
-                        .as_mut()
-                        .reset(Instant::now() + ACP_PROMPT_INACTIVITY_LOG_INTERVAL);
-                }
-                _ = events.closed() => {
-                    let _ = child.kill().await;
-                    return Ok(());
-                }
-            }
-        };
-
-        while let Ok(item) = incoming.try_recv() {
-            if !handle_session_incoming(item, &client, options.harness, &request_input, &events)
-                .await
-            {
-                acp_closed = true;
-                break;
-            }
-        }
-        tracing::debug!(
-            target: "comet_harness::omp",
-            process = options.process_label,
-            stage = "session/prompt",
-            turn = turn_number,
-            "ACP stage completed"
-        );
-        if let Some(usage) = response.get("usage") {
-            events
-                .send(Ok(AgentEvent::Usage {
-                    input_tokens: usage
-                        .get("inputTokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    output_tokens: usage
-                        .get("outputTokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                }))
-                .await
-                .ok();
-        }
-        let reason = response
-            .get("stopReason")
-            .and_then(Value::as_str)
-            .unwrap_or("end_turn");
-        let status = if reason == "cancelled" {
-            DoneStatus::Interrupted
-        } else {
-            DoneStatus::Completed
-        };
-        if events
-            .send(Ok(AgentEvent::Done {
-                status,
-                result: None,
-                error: None,
-                session_id: Some(reported_session_id.clone()),
-            }))
-            .await
-            .is_err()
-        {
-            let _ = child.kill().await;
-            return Ok(());
-        }
-        if !options.persistent {
-            return Ok(());
-        }
-        if acp_closed {
-            // The agent closed its stream after finishing the turn (end_turn
-            // received, Done delivered). Some ACP agents exit per conversation
-            // even when we run them persistently — a clean end, not a crash.
-            tracing::debug!(
-                target: "comet_harness::omp",
-                process = options.process_label,
-                "ACP stream closed after a completed turn; ending persistent session"
-            );
-            return Ok(());
-        }
-
-        let next_prompt = loop {
-            if let Some(prompt) = queued_prompts.pop_front() {
-                break prompt;
-            }
-            if !steering_open {
-                let _ = child.kill().await;
-                return Ok(());
-            }
-            tokio::select! {
-                steer = steering.recv() => match steer {
-                    Some(steer) => break steer.prompt,
-                    None => steering_open = false,
-                },
-                _ = interrupt.cancelled() => {
-                    let _ = child.kill().await;
-                    events.send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Interrupted,
-                        result: None,
-                        error: None,
-                        session_id: Some(reported_session_id.clone()),
-                    })).await.ok();
-                    return Ok(());
-                }
-                item = incoming.recv() => match item {
-                    Some(Incoming::Eof) | None => {
-                        // Stream closed while idle between turns: the previous
-                        // turn completed, so this is the same clean per-turn
-                        // exit as above — never a crash report.
-                        tracing::debug!(
-                            target: "comet_harness::omp",
-                            process = options.process_label,
-                            "ACP stream closed between turns; ending persistent session"
-                        );
-                        return Ok(());
-                    }
-                    Some(item) => {
-                        if !handle_session_incoming(
-                            item,
-                            &client,
-                            options.harness,
-                            &request_input,
-                            &events,
-                        )
-                        .await
-                        {
-                            return Err(HarnessError::Protocol(crate::crash_message(
-                                options.process_label,
-                                child.try_wait().ok().flatten(),
-                                &stderr_tail,
-                            )));
-                        }
-                    }
-                },
-                _ = events.closed() => {
-                    let _ = child.kill().await;
-                    return Ok(());
-                }
-            }
-        };
-
-        turn_number += 1;
-        let next_assistant_message_id =
-            acp_assistant_message_id(&session_id, &message_id_run_nonce, turn_number);
-        if events
-            .send(Ok(AgentEvent::Steered {
-                assistant_message_id: Some(assistant_message_id),
-                next_assistant_message_id: Some(next_assistant_message_id.clone()),
-            }))
-            .await
-            .is_err()
-        {
-            let _ = child.kill().await;
-            return Ok(());
-        }
-        assistant_message_id = next_assistant_message_id;
-        prompt_blocks = vec![json!({ "type": "text", "text": next_prompt })];
-    }
-}
-
 pub(crate) type RequestInputFn = Box<
     dyn Fn(
             Vec<UserInputQuestion>,
-        ) -> tokio::sync::oneshot::Receiver<Vec<comet_proto::UserInputAnswer>>
+        ) -> tokio::sync::oneshot::Receiver<Vec<zeron_proto::UserInputAnswer>>
         + Send
         + Sync,
 >;
 
-async fn handle_session_incoming(
-    incoming: Incoming,
-    client: &RpcClient,
-    harness: HarnessId,
-    request_input: &RequestInputFn,
-    events: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
-) -> bool {
-    match incoming {
-        Incoming::Notification { method, params } => {
-            if method == "session/update"
-                && let Some(event) = normalize_update(&params, harness)
-            {
-                events.send(Ok(event)).await.ok();
-            }
-            true
-        }
-        Incoming::Request { id, method, params } if method == "session/request_permission" => {
-            // Never auto-answer an agent's permission request. Even when the
-            // run requests auto-approval, provider safety gates stay interactive.
-            handle_permission_request(id, params, client.clone(), request_input);
-            true
-        }
-        Incoming::Request { id, method, params } if method == "elicitation/create" => {
-            handle_elicitation_request(id, params, client.clone(), request_input);
-            true
-        }
-        Incoming::Request { id, .. } => {
-            client.respond_error(&id, -32601, "unsupported ACP client method");
-            true
-        }
-        Incoming::Eof => false,
-    }
-}
-
-fn handle_permission_request(
-    id: Value,
-    params: Value,
-    client: RpcClient,
-    request_input: &RequestInputFn,
-) {
-    let options = params
-        .get("options")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let labels: Vec<String> = options
-        .iter()
-        .filter_map(|option| {
-            option
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect();
-    let title = params
-        .pointer("/toolCall/title")
-        .and_then(Value::as_str)
-        .unwrap_or("agent tool");
-    let receiver = request_input(vec![UserInputQuestion {
-        id: "permission".into(),
-        header: "Permission".into(),
-        question: format!("Allow {title}?"),
-        options: labels,
-        multi_select: false,
-    }]);
-    tokio::spawn(async move {
-        let selected = receiver
-            .await
-            .ok()
-            .and_then(|answers| answers.into_iter().flat_map(|answer| answer.labels).next());
-        let option_id = selected.as_deref().and_then(|label| {
-            options
-                .iter()
-                .find(|option| option.get("name").and_then(Value::as_str) == Some(label))
-                .and_then(|option| option.get("optionId"))
-                .and_then(Value::as_str)
-        });
-        match option_id {
-            Some(option_id) => client.respond(
-                &id,
-                json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-            ),
-            None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
-        }
-    });
-}
-
-fn handle_elicitation_request(
-    id: Value,
-    params: Value,
-    client: RpcClient,
-    request_input: &RequestInputFn,
-) {
-    let questions = crate::approval::elicitation_questions(&params);
-    let receiver = request_input(questions.clone());
-    tokio::spawn(async move {
-        let answers = receiver.await.unwrap_or_default();
-        client.respond(
-            &id,
-            crate::approval::elicitation_response(&params, &questions, &answers),
-        );
-    });
-}
-
-fn content_text(content: &Value) -> Option<&str> {
-    content.get("text").and_then(Value::as_str)
-}
-
-/// Tool output text from a terminal `tool_call_update`. OMP's completed
-/// update carries the accumulated output as `rawOutput.content:
-/// [{type:"text", text}]` (observed live; the `content` field echoes the
-/// INPUT first, so `rawOutput` is the clean source). Non-conforming shapes
-/// degrade to the raw JSON so an unfamiliar tool still shows something.
-fn tool_output_text(update: &Value) -> Option<String> {
-    let Some(raw) = update.get("rawOutput").filter(|raw| !raw.is_null()) else {
-        let text = update
-            .get("content")?
-            .as_array()?
-            .iter()
-            .filter(|block| block["type"] == "content")
-            .filter_map(|block| block.get("content").and_then(content_text))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return (!text.is_empty()).then_some(text);
-    };
-    if let Some(text) = raw.as_str() {
-        return (!text.is_empty()).then(|| text.to_string());
-    }
-    if let Some(blocks) = raw.get("content").and_then(Value::as_array) {
-        let joined = blocks
-            .iter()
-            .filter_map(content_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !joined.is_empty() {
-            return Some(joined);
-        }
-    }
-    (!raw.is_null()).then(|| serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string()))
-}
-
-pub(crate) fn agent_activity_status(status: &str) -> AgentActivityStatus {
-    match status {
-        "pending" => AgentActivityStatus::Pending,
-        "completed" | "done" | "idle" => AgentActivityStatus::Completed,
-        "failed" => AgentActivityStatus::Failed,
-        "cancelled" | "canceled" => AgentActivityStatus::Cancelled,
-        _ => AgentActivityStatus::Running,
-    }
-}
-
-fn pending_agent_activities(update: &Value) -> Option<Vec<AgentActivity>> {
-    let tasks = update.pointer("/rawInput/tasks")?.as_array()?;
-    (!tasks.is_empty()).then(|| {
-        tasks
-            .iter()
-            .enumerate()
-            .map(|(index, task)| AgentActivity {
-                id: task
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("Agent {}", index + 1)),
-                role: task
-                    .get("agent")
-                    .and_then(Value::as_str)
-                    .unwrap_or("task")
-                    .to_string(),
-                status: AgentActivityStatus::Pending,
-                model: None,
-            })
-            .collect()
-    })
-}
-
-fn updated_agent_activities(update: &Value) -> Option<Vec<AgentActivity>> {
-    let progress = update.pointer("/rawOutput/details/progress")?.as_array()?;
-    (!progress.is_empty()).then(|| {
-        progress
-            .iter()
-            .enumerate()
-            .map(|(index, activity)| AgentActivity {
-                id: activity
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("Agent {}", index + 1)),
-                role: activity
-                    .get("agent")
-                    .and_then(Value::as_str)
-                    .unwrap_or("task")
-                    .to_string(),
-                status: agent_activity_status(
-                    activity
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("running"),
-                ),
-                model: activity
-                    .get("resolvedModel")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            })
-            .collect()
-    })
-}
-
-fn plan_items(update: &Value) -> Vec<TodoItem> {
-    update
-        .get("entries")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let text = entry
-                .get("content")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())?;
-            Some(TodoItem {
-                text: text.to_string(),
-                done: entry.get("status").and_then(Value::as_str) == Some("completed"),
-            })
-        })
-        .collect()
-}
-
-fn normalize_update(params: &Value, harness: HarnessId) -> Option<AgentEvent> {
-    let update = params.get("update")?;
-    match update.get("sessionUpdate")?.as_str()? {
-        "agent_message_chunk" => Some(AgentEvent::TextDelta {
-            text: content_text(update.get("content")?)?.into(),
-        }),
-        "agent_thought_chunk" => Some(AgentEvent::ReasoningDelta {
-            text: content_text(update.get("content")?)?.into(),
-        }),
-        "session_info_update" => update
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .map(|title| AgentEvent::SessionTitleChanged {
-                title: title.to_string(),
-            }),
-        "plan" => Some(AgentEvent::ToolCall {
-            id: "omp-plan".into(),
-            call: ToolCall::Todo {
-                items: plan_items(update),
-            },
-        }),
-        "tool_call" => {
-            let title = update
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("Agent tool");
-            let call = if let Some(agents) = pending_agent_activities(update) {
-                ToolCall::Agent { agents }
-            } else if harness == HarnessId::PrimeAgent && title == "IPython cell" {
-                update
-                    .pointer("/rawInput/code")
-                    .and_then(Value::as_str)
-                    .filter(|code| !code.trim().is_empty())
-                    .map(|code| ToolCall::Exec {
-                        command: code.to_string(),
-                    })
-                    .unwrap_or_else(|| ToolCall::Unknown {
-                        name: title.into(),
-                        input: update.get("rawInput").cloned(),
-                    })
-            } else {
-                ToolCall::Unknown {
-                    name: title.into(),
-                    input: update.get("rawInput").cloned(),
-                }
-            };
-            Some(AgentEvent::ToolCall {
-                id: update.get("toolCallId")?.as_str()?.into(),
-                call,
-            })
-        }
-        "tool_call_update" => {
-            let id = update
-                .get("toolCallId")
-                .and_then(Value::as_str)
-                .unwrap_or("omp-tool")
-                .to_string();
-            if let Some(agents) = updated_agent_activities(update) {
-                Some(AgentEvent::ToolCall {
-                    id,
-                    call: ToolCall::Agent { agents },
-                })
-            } else {
-                let status = update.get("status").and_then(Value::as_str).unwrap_or("");
-                matches!(status, "completed" | "failed").then(|| AgentEvent::ToolResult {
-                    id,
-                    is_error: status == "failed",
-                    output: tool_output_text(update).map(comet_proto::truncate_tool_output),
-                })
-            }
-        }
-        "usage_update" => None,
-        _ => None,
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
-    async fn model_discovery_timeout_and_drop_kill_the_process_group() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        for (timeout, exit_parent) in [(false, false), (true, false), (true, true)] {
-            let dir = tempfile::tempdir().unwrap();
-            let executable = dir.path().join("catalog");
-            let pids = dir.path().join("pids");
-            std::fs::write(&executable, format!(
-                "#!/bin/sh\nsleep 600 &\nprintf '%s\\n%s\\n' $$ $! > '{}'\n{}\n",
-                pids.display(), if exit_parent { "exit 0" } else { "wait" }
-            )).unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let harness = OmpHarness::new().with_executable(executable);
-            let mut discovery = Box::pin(harness.models());
-            assert!(futures::poll!(discovery.as_mut()).is_pending());
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            let ids = loop {
-                let ids = std::fs::read_to_string(&pids).unwrap_or_default()
-                    .lines().filter_map(|line| line.parse::<u32>().ok()).collect::<Vec<_>>();
-                if ids.len() == 2 { break ids; }
-                assert!(std::time::Instant::now() < deadline, "catalog did not start");
-                std::thread::sleep(Duration::from_millis(5));
-            };
-            if timeout {
-                tokio::time::advance(MODEL_CATALOG_DEADLINE).await;
-                assert!(discovery.await.unwrap_err().to_string().contains("model discovery timed out"));
-            } else {
-                drop(discovery);
-            }
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while ids.iter().any(|pid| process_birth(*pid).is_some()) {
-                assert!(std::time::Instant::now() < deadline,
-                    "catalog process group survived cancellation: timeout={timeout}, exit_parent={exit_parent}, alive={:?}",
-                    ids.iter().filter(|pid| process_birth(**pid).is_some()).collect::<Vec<_>>());
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-    }
-
     #[test]
-    fn lsof_probe_ignores_readers_and_requires_access_fields() {
-        let output = b"p10\nf3\nar\nnsession.jsonl\np11\nf4\naw\nnsession.jsonl\np12\nf5\nau\nnsession.jsonl\n";
-        assert_eq!(parse_lsof_writer_pids(output), Some(vec![11, 12]));
-        assert_eq!(
-            parse_lsof_writer_pids(b"p10\nf3\nar\nnsession.jsonl\n"),
-            Some(Vec::new())
-        );
-        assert_eq!(
-            parse_lsof_writer_pids(b"p10\nf3\na \nnsession.jsonl\n"),
-            None
-        );
-        assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nnsession.jsonl\n"), None);
-    }
-
-    #[test]
-    fn linux_fdinfo_and_proc_stat_classify_ownership() {
-        assert_eq!(
-            fdinfo_text_is_write_capable("flags:\t0100000\n"),
-            Some(false)
-        );
-        assert_eq!(
-            fdinfo_text_is_write_capable("flags:\t0100001\n"),
-            Some(true)
-        );
-        assert_eq!(
-            fdinfo_text_is_write_capable("flags:\t0100002\n"),
-            Some(true)
-        );
+    fn ownership_probe_distinguishes_readers_writers_and_incomplete_evidence() {
+        assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nar\nnx\np11\nf4\naw\nnx\n"), Some(vec![11]));
+        assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nar\nnx\n"), Some(vec![]));
+        assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nnx\n"), None);
+        assert_eq!(fdinfo_text_is_write_capable("flags:\t0100000\n"), Some(false));
+        assert_eq!(fdinfo_text_is_write_capable("flags:\t0100002\n"), Some(true));
         assert_eq!(fdinfo_text_is_write_capable("pos:\t0\n"), None);
-        assert_eq!(
-            linux_parent_and_group("321 (worker name) S 42 77 77 0 -1 0"),
-            Some((42, 77))
-        );
+        assert_eq!(linux_parent_and_group("321 (worker name) S 42 77 77 0 -1 0"), Some((42, 77)));
     }
 
     #[test]
-    fn supervised_run_wraps_only_the_persistent_rpc_process() {
-        let command = OmpHarness::new()
-            .with_supervisor_executable("/opt/comet/bin/comet")
-            .run_command(Path::new("/opt/omp/bin/omp"), &run_request(None));
-        assert_eq!(command.as_std().get_program(), "/opt/comet/bin/comet");
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(args[0], OMP_SUPERVISOR_MARKER);
-        assert_eq!(args[1], std::process::id().to_string());
-        assert_eq!(args[2], "/opt/omp/bin/omp");
-        assert_eq!(&args[3..7], ["--mode", "rpc", "--approval-mode", "yolo"]);
-
-        let catalog = OmpHarness::new()
-            .with_supervisor_executable("/opt/comet/bin/comet")
-            .command_catalog_command(Path::new("/opt/omp/bin/omp"), "/tmp");
-        assert_eq!(catalog.as_std().get_program(), "/opt/omp/bin/omp");
-    }
-    fn configured_env(command: &Command, key: &str) -> Option<String> {
-        command
-            .as_std()
-            .get_envs()
-            .find(|(name, _)| name.to_string_lossy() == key)
-            .and_then(|(_, value)| value)
-            .map(|value| value.to_string_lossy().into_owned())
-    }
-    #[cfg(unix)]
-    #[test]
-    fn batched_writer_probe_ignores_readers_with_one_process() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
-
-        let temp = tempfile::tempdir().unwrap();
-        let real = temp.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let active_real = real.join("active.jsonl");
-        let alias = temp.path().join("alias");
-        symlink(&real, &alias).unwrap();
-        let active = alias.join("active.jsonl");
-        let inactive = temp.path().join("inactive.jsonl");
-        std::fs::write(&active_real, "{}\n").unwrap();
-        std::fs::write(&inactive, "{}\n").unwrap();
-        let active_identity = std::fs::canonicalize(&active_real).unwrap();
-        let probe = temp.path().join("probe.sh");
-        std::fs::write(
-            &probe,
-            format!(
-                "#!/bin/sh\nset -eu\nprintf x >> \"$0.count\"\n\
-                 [ \"$#\" -eq 5 ]\n[ \"$1\" = \"-F\" ]\n[ \"$2\" = \"pfan\" ]\n\
-                 [ \"$3\" = \"--\" ]\nprintf 'p10\\nf3\\naw\\nn{}\\np11\\nf4\\nar\\nn%s\\n' \"$5\"\nexit 1\n",
-                active_identity.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&probe).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&probe, permissions).unwrap();
-
-        let states =
-            session_writer_states_with(&[active, inactive], &probe).expect("probe should run");
-
-        assert_eq!(
-            states,
-            [SessionWriterState::Active, SessionWriterState::Inactive]
-        );
-        assert_eq!(
-            std::fs::read(format!("{}.count", probe.display())).unwrap(),
-            b"x"
-        );
-    }
-
-    #[test]
-    fn active_fork_snapshot_stops_after_the_current_user_message() {
+    fn active_fork_excludes_unsettled_tool_records_and_preserves_user_boundary() {
         let bytes = concat!(
-            "{\"type\":\"session\",\"id\":\"native-source\",\"cwd\":\"/repo\"}\n",
-            "{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\"}}\n",
-            "{\"type\":\"message\",\"id\":\"a1\",\"stopReason\":\"toolUse\",\"message\":{\"role\":\"assistant\"}}\n",
-            "{\"type\":\"message\",\"id\":\"u2\",\"message\":{\"role\":\"user\"}}\n",
-            "{\"type\":\"custom\",\"id\":\"running-tool\"}\n",
-        )
-        .as_bytes();
-        let prefix = &bytes[..fork_snapshot_len(bytes, true).unwrap()];
-        let prefix = std::str::from_utf8(prefix).unwrap();
-        assert!(prefix.contains("\"id\":\"u2\""));
-        assert!(!prefix.contains("running-tool"));
-
-        let completed = concat!(
-            "{\"type\":\"session\",\"id\":\"native-source\",\"cwd\":\"/repo\"}\n",
-            "{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\"}}\n",
-            "{\"type\":\"message\",\"id\":\"a1\",\"stopReason\":\"stop\",\"message\":{\"role\":\"assistant\"}}\n",
-            "{\"type\":\"custom\",\"id\":\"after-turn\"}\n",
-        )
-        .as_bytes();
-        assert_eq!(fork_snapshot_len(completed, true).unwrap(), completed.len());
+            "{\"type\":\"session\",\"id\":\"source\",\"cwd\":\"/repo\"}\n",
+            "{\"type\":\"message\",\"id\":\"user\",\"message\":{\"role\":\"user\"}}\n",
+            "{\"type\":\"message\",\"id\":\"tool\",\"stopReason\":\"toolUse\",\"message\":{\"role\":\"assistant\"}}\n",
+        ).as_bytes();
+        let boundary = fork_snapshot_len(bytes, true).unwrap();
+        assert!(std::str::from_utf8(&bytes[..boundary]).unwrap().contains("\"user\""));
+        assert!(!std::str::from_utf8(&bytes[..boundary]).unwrap().contains("\"tool\""));
+        assert_eq!(fork_snapshot_len(bytes, false).unwrap(), bytes.len());
     }
 
     #[test]
-    fn fork_session_file_rewrites_only_the_native_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let sessions = temp.path().join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let source = sessions.join("source.jsonl");
-        let bytes = concat!(
-            "{\"type\":\"title\",\"title\":\"Source\"}\n",
-            "{\"type\":\"session\",\"version\":3,\"id\":\"native-source\",\"cwd\":\"/repo\"}\n",
-            "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"keep me\"}}\n",
-        );
+    fn active_snapshot_never_includes_nested_tool_use_or_partial_tail() {
+        let header = "{\"type\":\"session\",\"id\":\"source\",\"cwd\":\"/repo\"}\n";
+        let user = "{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n";
+        let running = format!("{header}{user}{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"toolUse\"}}}}\n{{\"partial\":");
+        assert_eq!(fork_snapshot_len(running.as_bytes(), true).unwrap(), header.len() + user.len());
+        let complete = format!("{header}{user}{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\"}}}}\n");
+        assert_eq!(fork_snapshot_len(complete.as_bytes(), true).unwrap(), complete.len());
+    }
+
+    #[test]
+    fn native_branch_has_distinct_identity_and_cannot_overwrite_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jsonl");
+        let target = dir.path().join("branch.jsonl");
+        let bytes = b"{\"type\":\"session\",\"id\":\"source\",\"cwd\":\"/repo\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n";
         std::fs::write(&source, bytes).unwrap();
-
-        let fork_id = fork_session_file(std::slice::from_ref(&sessions), "native-source").unwrap();
-        assert_ne!(fork_id, "native-source");
-        assert_eq!(std::fs::read_to_string(&source).unwrap(), bytes);
-        let fork_path = sessions.join(format!("crew-fork-{fork_id}.jsonl"));
-        let fork = std::fs::read_to_string(fork_path).unwrap();
-        assert!(fork.contains(&format!("\"id\":\"{fork_id}\"")));
-        assert!(!fork.contains("\"id\":\"native-source\""));
-        assert!(fork.contains("\"id\":\"m1\""));
-        assert!(fork.contains("\"content\":\"keep me\""));
-    }
-
-    #[test]
-    fn fork_session_file_preserves_history_larger_than_64_mib() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source.jsonl");
-        let header = b"{\"type\":\"session\",\"id\":\"native-source\",\"cwd\":\"/repo\"}\n";
-        let record = format!(
-            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}}}}\n",
-            "x".repeat(1024)
-        );
-        let record_count = (64 * 1024 * 1024) / record.len() + 1;
-        {
-            let mut output = std::io::BufWriter::new(std::fs::File::create(&source).unwrap());
-            output.write_all(header).unwrap();
-            for _ in 0..record_count {
-                output.write_all(record.as_bytes()).unwrap();
-            }
-            output.flush().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        fork_native_session(source.to_str().unwrap(), &target, &id).unwrap();
+        assert_eq!(session_file_id(&target).as_deref(), Some(id.as_str()));
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        let snapshot = std::fs::read(&target).unwrap();
+        assert!(fork_native_session(source.to_str().unwrap(), &target, &id).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), snapshot);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o077, 0);
         }
-
-        let fork_id = fork_session_file(&[temp.path().to_path_buf()], "native-source").unwrap();
-        let fork = temp.path().join(format!("crew-fork-{fork_id}.jsonl"));
-        let mut original = BufReader::new(std::fs::File::open(&source).unwrap());
-        let mut forked = BufReader::new(std::fs::File::open(&fork).unwrap());
-        let mut line = String::new();
-        original.read_line(&mut line).unwrap();
-        assert_eq!(line.as_bytes(), header);
-        line.clear();
-        forked.read_line(&mut line).unwrap();
-        let fork_header: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(fork_header["id"], fork_id);
-        assert_eq!(fork_header["cwd"], "/repo");
-        for _ in 0..record_count {
-            for reader in [&mut original, &mut forked] {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                assert_eq!(line, record);
-            }
-        }
-        assert!(original.fill_buf().unwrap().is_empty());
-        assert!(forked.fill_buf().unwrap().is_empty());
-    }
-
-    #[test]
-    fn fork_session_file_rejects_oversized_record_without_leaving_a_fork() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source.jsonl");
-        {
-            let mut output = std::fs::File::create(&source).unwrap();
-            output
-                .write_all(b"{\"type\":\"session\",\"id\":\"native-source\"}\n")
-                .unwrap();
-            // A valid JSON record whose whitespace alone crosses the bound.
-            std::io::copy(
-                &mut std::io::repeat(b' ').take(OMP_SESSION_FORK_RECORD_MAX_BYTES),
-                &mut output,
-            )
-            .unwrap();
-            output.write_all(b"{}\n").unwrap();
-        }
-
-        assert!(matches!(
-            fork_session_file(&[temp.path().to_path_buf()], "native-source"),
-            Err(HarnessError::Protocol(_))
-        ));
-        let remaining = std::fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>();
-        assert_eq!(remaining, [source]);
-    }
-
-    #[test]
-    fn resumed_acp_runs_use_distinct_assistant_message_ids() {
-        let session_id = "same-durable-session";
-        let first_run = uuid::Uuid::from_u128(1);
-        let resumed_run = uuid::Uuid::from_u128(2);
-
-        assert_ne!(
-            acp_assistant_message_id(session_id, &first_run, 0),
-            acp_assistant_message_id(session_id, &resumed_run, 0)
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_config_preserves_inherited_overlays_and_scrubs_inherited_environment() {
-        let temp = tempfile::tempdir().unwrap();
-        let user_a = temp.path().join("user a.yml");
-        let user_b = temp.path().join("user-b.yml");
-        let stale = temp.path().join("missing.yml");
-        std::fs::write(&user_a, "").unwrap();
-        std::fs::write(&user_b, "").unwrap();
-        let relative = Path::new("config/overrides.yml");
-        let home = Path::new("~/overrides.yml");
-        let inherited =
-            std::env::join_paths([user_a.as_path(), &stale, relative, home, &user_b]).unwrap();
-        let config = OmpRunConfig::create().unwrap();
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg("test \"${PI_CONFIG_FILES+x}\" != x || exit 1; printf '%s\\n' \"$@\"")
-            .arg("overlay-probe")
-            .env(PI_CONFIG_FILES_ENV, &inherited);
-        config.apply(&mut command, Some(&inherited));
-        let output = command.output().await.unwrap();
-        assert!(
-            output.status.success(),
-            "overlay environment leaked to child"
-        );
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
-            format!(
-                "--config\n{}\n--config\n{}\n--config\n{}\n--config\n{}\n--config\n{}\n--config\n{}\n",
-                user_a.display(),
-                stale.display(),
-                relative.display(),
-                home.display(),
-                user_b.display(),
-                config.path.display()
-            )
-        );
-    }
-
-    #[test]
-    fn run_config_is_removed_after_owner_drops() {
-        let path;
-        {
-            let config = OmpRunConfig::create().unwrap();
-            path = config.path.clone();
-        }
-        assert!(!path.exists(), "temporary OMP overlay must be removed");
-    }
-
-    #[test]
-    fn local_commands_are_marked_while_scaffold_commands_stay_ci() {
-        let local =
-            OmpHarness::new().rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
-        let scaffold = OmpHarness::scaffold_host().rpc_mode_command(
-            Path::new("/usr/local/bin/omp"),
-            "/workspace",
-            true,
-        );
-
-        assert_eq!(configured_env(&local, "CI").as_deref(), Some("false"));
-        assert_eq!(
-            configured_env(&local, LOCAL_RUNTIME_ENV).as_deref(),
-            Some("1")
-        );
-        assert_eq!(configured_env(&scaffold, "CI").as_deref(), Some("true"));
-        assert_eq!(
-            configured_env(&scaffold, LOCAL_RUNTIME_ENV),
-            None,
-            "Scaffold must not mark commands as local"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_handoff_executable_reaches_local_child_but_not_scaffold() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let temp = tempfile::tempdir().unwrap();
-        let probe = temp.path().join("omp-probe");
-        std::fs::write(&probe, "#!/bin/sh\nprintf '%s\\n' \"${COMET_EXECUTABLE-unset}\" \"${COMET_LOCAL_AGENT_RUNTIME-unset}\"\n").unwrap();
-        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let supervisor = temp
-            .path()
-            .join("Crew With Spaces.app/Contents/MacOS/comet");
-        let cwd = temp.path().to_str().unwrap();
-        let local = OmpHarness::new()
-            .with_supervisor_executable(&supervisor)
-            .with_auth_broker_environment(AuthBrokerEnvironment::default())
-            .rpc_mode_command(&probe, cwd, false)
-            .output()
-            .await
-            .unwrap();
-        assert!(local.status.success());
-        assert_eq!(
-            String::from_utf8(local.stdout).unwrap(),
-            format!("{}\n1\n", supervisor.display())
-        );
-
-        let scaffold = OmpHarness::scaffold_host()
-            .with_supervisor_executable(&supervisor)
-            .with_auth_broker_environment(AuthBrokerEnvironment::default())
-            .rpc_mode_command(&probe, cwd, false)
-            .output()
-            .await
-            .unwrap();
-        assert!(scaffold.status.success());
-        assert_eq!(
-            String::from_utf8(scaffold.stdout).unwrap(),
-            "unset\nunset\n"
-        );
-    }
-
-    #[test]
-    fn scaffold_command_invokes_only_omp_rpc_mode_with_hardening() {
-        let harness = OmpHarness::scaffold_host()
-            .with_auth_broker_environment(AuthBrokerEnvironment::default());
-        let command = harness.rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
-        let args: Vec<String> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args.first().map(String::as_str), Some("--mode"));
-        assert_eq!(args.get(1).map(String::as_str), Some("rpc"));
-        for required in [
-            "--approval-mode",
-            "yolo",
-            "--profile",
-            SCAFFOLD_PROFILE,
-            "--no-extensions",
-            "--no-skills",
-            "--no-rules",
-        ] {
-            assert!(args.iter().any(|argument| argument == required));
-        }
-        assert!(
-            !args.iter().any(|argument| argument == "claude"
-                || argument == "codex"
-                || argument == "opencode")
-        );
-    }
-
-    fn run_request(resume: Option<&str>) -> RunRequest {
-        RunRequest {
-            prompt: "test".into(),
-            model: None,
-            agent_account_id: None,
-            reasoning: None,
-            model_options: serde_json::Map::new(),
-            cwd: "/workspace".into(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-            auto_approve: true,
-            resume: resume.map(str::to_string),
-            attachments: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn run_command_stays_yolo_and_threads_run_flags() {
-        let request = RunRequest {
-            model: Some("anthropic/claude-haiku-4-5".into()),
-            reasoning: Some(ReasoningLevel::XHigh),
-            ..run_request(Some("session-1"))
-        };
-        let command = OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &request);
-        let args: Vec<String> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
-        for expected in [
-            ["--mode", "rpc"],
-            ["--approval-mode", "yolo"],
-            ["--model", "anthropic/claude-haiku-4-5"],
-            ["--thinking", "xhigh"],
-            ["--resume", "session-1"],
-        ] {
-            assert_eq!(args.iter().filter(|arg| *arg == expected[0]).count(), 1);
-            assert!(args.windows(2).any(|pair| pair == expected));
-        }
-    }
-
-    #[test]
-    fn run_command_omits_default_model_and_absent_flags() {
-        for model in [None, Some("default".to_string())] {
-            let request = RunRequest {
-                model,
-                ..run_request(None)
-            };
-            let command = OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &request);
-            let args: Vec<String> = command
-                .as_std()
-                .get_args()
-                .map(|value| value.to_string_lossy().into_owned())
-                .collect();
-            for expected in [["--mode", "rpc"], ["--approval-mode", "yolo"]] {
-                assert_eq!(args.iter().filter(|arg| *arg == expected[0]).count(), 1);
-                assert!(args.windows(2).any(|pair| pair == expected));
-            }
-            for absent in ["--model", "--thinking", "--resume"] {
-                assert!(!args.iter().any(|arg| arg == absent));
-            }
-        }
-    }
-
-    #[test]
-    fn shared_inference_uses_an_explicit_gateway_extension_and_provider() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut request = run_request(None);
-        request.model = Some("gpt-5.6-sol".into());
-        let mut command =
-            OmpHarness::scaffold_host().run_command(Path::new("/usr/local/bin/omp"), &request);
-        configure_inference_gateway(
-            &mut command,
-            temp.path(),
-            &InferenceRoute {
-                base_url: "http://127.0.0.1:41234".into(),
-                token: "local-inference-token".into(),
-                provider: "openai".into(),
-                model: "gpt-5.6-sol".into(),
-            },
-            true,
-        )
-        .unwrap();
-        let args: Vec<String> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
-        let extension = temp.path().join("comet-runtime/agent-auth-gateway.ts");
-        assert!(extension.is_file());
-        assert!(args.windows(2).any(|pair| {
-            pair == [
-                "--extension".to_string(),
-                extension.to_string_lossy().into_owned(),
-            ]
-        }));
-        assert_eq!(
-            &args[args.len() - 2..],
-            ["--model", "comet-openai/gpt-5.6-sol"]
-        );
-    }
-
-    #[test]
-    fn shared_inference_desktop_installs_discoverable_gateway_without_duplicate_flag() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut command =
-            OmpHarness::new().run_command(Path::new("/usr/local/bin/omp"), &run_request(None));
-        configure_inference_gateway(
-            &mut command,
-            temp.path(),
-            &InferenceRoute {
-                base_url: "http://127.0.0.1:41234".into(),
-                token: "local-inference-token".into(),
-                provider: "openai".into(),
-                model: "gpt-6-astra".into(),
-            },
-            false,
-        )
-        .unwrap();
-        assert!(
-            temp.path()
-                .join("extensions/crew-auth-gateway.ts")
-                .is_file()
-        );
-        assert!(
-            temp.path()
-                .join("comet-runtime/agent-auth-gateway.ts")
-                .is_file()
-        );
-        assert!(!temp.path().join("extensions/omp-auth-gateway.ts").exists());
-        assert!(!command.as_std().get_args().any(|arg| arg == "--extension"));
-    }
-
-    #[test]
-    fn scaffold_inference_profile_pins_the_model_and_explicit_extension() {
-        let runtime_dir = tempfile::tempdir().unwrap();
-        let profile_dir = runtime_dir.path().join("omp-inference");
-        std::fs::create_dir_all(&profile_dir).unwrap();
-        let profile_path = profile_dir.join("profile.json");
-        std::fs::write(
-            &profile_path,
-            r#"{"profile":"scaffold-host","model":"scaffold-openai/gpt-6-astra"}"#,
-        )
-        .unwrap();
-
-        let selection =
-            scaffold_inference_selection_at(runtime_dir.path(), Some("openai-codex/gpt-6-astra"))
-                .unwrap();
-
-        assert_eq!(selection.model, "scaffold-openai/gpt-6-astra");
-        assert!(selection.extension_path.is_none());
-        assert_eq!(
-            scaffold_inference_selection_at(runtime_dir.path(), Some("openai/gpt-6-astra"))
-                .unwrap()
-                .model,
-            "scaffold-openai/gpt-6-astra"
-        );
-        assert!(
-            scaffold_inference_selection_at(
-                runtime_dir.path(),
-                Some("openai-codex/gpt-5.6-terra"),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("does not match")
-        );
-
-        assert_eq!(
-            scaffold_inference_profile_at(runtime_dir.path())
-                .unwrap()
-                .model,
-            "scaffold-openai/gpt-6-astra"
-        );
-        std::fs::write(
-            &profile_path,
-            r#"{"profile":"scaffold-host","model":"openai-codex/gpt-5.6-sol"}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            scaffold_inference_profile_at(runtime_dir.path()),
-            Err(HarnessError::Protocol(_))
-        ));
-
-        let extension_path = runtime_dir.path().join("scaffold-anthropic-provider.ts");
-        std::fs::write(&extension_path, "export default function provider() {}\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&extension_path, std::fs::Permissions::from_mode(0o600))
-                .unwrap();
-        }
-        std::fs::write(
-            &profile_path,
-            serde_json::to_vec(&json!({
-                "profile": "scaffold-host",
-                "model": "scaffold-anthropic/claude-opus-4-1",
-                "extensionPath": extension_path,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let selection =
-            scaffold_inference_selection_at(runtime_dir.path(), Some("anthropic/claude-opus-4-1"))
-                .unwrap();
-        assert_eq!(selection.model, "scaffold-anthropic/claude-opus-4-1");
-        assert_eq!(
-            selection.extension_path.as_deref(),
-            Some(extension_path.as_path())
-        );
-
-        let mut command = Command::new("/usr/local/bin/omp");
-        command.arg("--no-extensions");
-        configure_scaffold_inference_profile_at(
-            &mut command,
-            runtime_dir.path(),
-            Some("anthropic/claude-opus-4-1"),
-        )
-        .unwrap();
-        let args: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.windows(2).any(|pair| {
-            pair == [
-                "--extension".to_string(),
-                extension_path.to_string_lossy().into_owned(),
-            ]
-        }));
-        assert_eq!(
-            &args[args.len() - 2..],
-            ["--model", "scaffold-anthropic/claude-opus-4-1"]
-        );
-
-        std::fs::write(
-            &profile_path,
-            r#"{"profile":"scaffold-host","model":"scaffold-anthropic/claude-opus-4-1"}"#,
-        )
-        .unwrap();
-        assert!(
-            scaffold_inference_selection_at(runtime_dir.path(), Some("anthropic/claude-opus-4-1"),)
-                .unwrap_err()
-                .to_string()
-                .contains("requires an explicit extension")
-        );
-    }
-
-    #[test]
-    fn broker_configuration_is_environment_only_and_scaffold_stays_isolated() {
-        let temp = tempfile::tempdir().unwrap();
-        let token_file = temp.path().join("broker.token");
-        std::fs::write(&token_file, "super-secret-token\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let harness =
-            OmpHarness::scaffold_host().with_auth_broker_environment(AuthBrokerEnvironment {
-                url: Some("https://broker.example.test".into()),
-                token: Some("workstation-token-must-not-leak".into()),
-                token_file: Some(token_file.clone().into_os_string()),
-            });
-        let catalog_command =
-            harness.command_catalog_command(Path::new("/usr/local/bin/omp"), "/workspace");
-        let catalog_process = catalog_command.as_std();
-        assert!(catalog_process.get_envs().any(|(key, value)| {
-            key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV) && value.is_none()
-        }));
-        assert!(catalog_process.get_envs().any(|(key, value)| {
-            key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_FILE_ENV) && value.is_none()
-        }));
-        assert!(
-            token_file.exists(),
-            "command discovery must preserve the token for the persistent RPC child"
-        );
-
-        let command = harness.rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
-        let process = command.as_std();
-        let args: Vec<_> = process
-            .get_args()
-            .map(|value| value.to_string_lossy())
-            .collect();
-        assert_eq!(
-            args,
-            [
-                "--mode",
-                "rpc",
-                "--approval-mode",
-                "yolo",
-                "--profile",
-                SCAFFOLD_PROFILE,
-                "--no-extensions",
-                "--no-skills",
-                "--no-rules"
-            ]
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|value| value.contains("super-secret-token"))
-        );
-        let environment: std::collections::BTreeMap<_, _> = process
-            .get_envs()
-            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
-            .collect();
-        assert_eq!(
-            environment.get(std::ffi::OsStr::new(AUTH_BROKER_URL_ENV)),
-            Some(&std::ffi::OsString::from("https://broker.example.test"))
-        );
-        assert_eq!(
-            environment.get(std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV)),
-            Some(&std::ffi::OsString::from("super-secret-token"))
-        );
-        assert!(!token_file.exists(), "broker token file must be single use");
-        for name in [
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "CODEX_API_KEY",
-            "CLAUDE_CONFIG_DIR",
-            "CODEX_HOME",
-        ] {
-            assert!(
-                process
-                    .get_envs()
-                    .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() })
-            );
-        }
-
-        let insecure_file = temp.path().join("insecure-broker.token");
-        std::fs::write(&insecure_file, "must-not-propagate\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&insecure_file, std::fs::Permissions::from_mode(0o644))
-                .unwrap();
-        }
-        let insecure = OmpHarness::scaffold_host()
-            .with_auth_broker_environment(AuthBrokerEnvironment {
-                url: Some("https://broker.example.test".into()),
-                token: Some("workstation-token-must-not-leak".into()),
-                token_file: Some(insecure_file.clone().into_os_string()),
-            })
-            .rpc_mode_command(Path::new("/usr/local/bin/omp"), "/workspace", true);
-        assert!(insecure.as_std().get_envs().any(|(key, value)| {
-            key == std::ffi::OsStr::new(AUTH_BROKER_TOKEN_ENV) && value.is_none()
-        }));
-        assert!(
-            !insecure_file.exists(),
-            "rejected token files must still be removed"
-        );
-    }
-
-    #[test]
-    fn parses_advisor_config_from_omp_settings() {
-        let config = parse_advisor_config(&json!({
-            "advisor.enabled": {"value": true},
-            "advisor.subagents": {"value": true},
-            "advisor.syncBacklog": {"value": "5"},
-            "advisor.immuneTurns": {"value": 8},
-            "modelRoles": {"value": {
-                "advisor": "anthropic/claude-opus-5:xhigh",
-                "task": "openai-codex/gpt-5.6-sol"
-            }}
-        }))
-        .unwrap();
-
-        assert!(config.enabled);
-        assert_eq!(config.model, "anthropic/claude-opus-5:xhigh");
-        assert!(config.subagents);
-        assert_eq!(config.sync_backlog, OmpAdvisorSyncBacklog::Five);
-        assert_eq!(config.immune_turns, 8);
-    }
-
-    #[test]
-    fn rejects_advisor_backlog_values_comet_cannot_render() {
-        let error = parse_advisor_config(&json!({
-            "advisor.syncBacklog": {"value": "2"}
-        }))
-        .unwrap_err();
-        assert!(error.to_string().contains("advisor.syncBacklog"));
-    }
-
-    #[test]
-    fn normalizes_text_reasoning_and_tool_updates() {
-        assert_eq!(
-            normalize_update(
-                &json!({"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}),
-                HarnessId::Omp,
-            ),
-            Some(AgentEvent::TextDelta { text: "hi".into() })
-        );
-        assert_eq!(
-            normalize_update(
-                &json!({"update":{"sessionUpdate":"session_info_update","title":"Probe title"}}),
-                HarnessId::Omp,
-            ),
-            Some(AgentEvent::SessionTitleChanged {
-                title: "Probe title".into()
-            })
-        );
-        assert_eq!(
-            normalize_update(
-                &json!({"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"why"}}}),
-                HarnessId::Omp,
-            ),
-            Some(AgentEvent::ReasoningDelta { text: "why".into() })
-        );
-        assert_eq!(
-            normalize_update(
-                &json!({"update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"failed"}}),
-                HarnessId::Omp,
-            ),
-            Some(AgentEvent::ToolResult {
-                id: "t1".into(),
-                is_error: true,
-                output: None,
-            })
-        );
-        // The observed completed-update shape: output rides `rawOutput.content`
-        // as text blocks (`content` echoes the input first — never used).
-        assert_eq!(
-            normalize_update(
-                &json!({"update":{
-                    "sessionUpdate":"tool_call_update","toolCallId":"t2","status":"completed",
-                    "rawOutput": {"content":[{"type":"text","text":"hello\n/tmp"}], "details":{}},
-                    "content": [{"type":"content","content":{"type":"text","text":"$ echo hello"}}]
-                }}),
-                HarnessId::Omp,
-            ),
-            Some(AgentEvent::ToolResult {
-                id: "t2".into(),
-                is_error: false,
-                output: Some("hello\n/tmp".into()),
-            })
-        );
-    }
-
-    #[test]
-    fn normalizes_omp_plan_updates_as_persistent_todos() {
-        let update = json!({
-            "update": {
-                "sessionUpdate": "plan",
-                "entries": [
-                    {"content": "Inspect the failure", "priority": "medium", "status": "completed"},
-                    {"content": "Ship the fix", "priority": "high", "status": "in_progress"},
-                    {"content": "   ", "status": "pending"}
-                ]
-            }
-        });
-
-        assert_eq!(
-            normalize_update(&update, HarnessId::Omp),
-            Some(AgentEvent::ToolCall {
-                id: "omp-plan".into(),
-                call: ToolCall::Todo {
-                    items: vec![
-                        TodoItem {
-                            text: "Inspect the failure".into(),
-                            done: true,
-                        },
-                        TodoItem {
-                            text: "Ship the fix".into(),
-                            done: false,
-                        },
-                    ],
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn normalizes_task_subagent_lifecycle() {
-        let initial = json!({
-            "update": {
-                "sessionUpdate": "tool_call",
-                "toolCallId": "task-1",
-                "title": "Launching one read-only scout",
-                "rawInput": {
-                    "tasks": [{"agent": "scout", "task": "Inspect the target"}]
-                }
-            }
-        });
-        assert_eq!(
-            normalize_update(&initial, HarnessId::Omp),
-            Some(AgentEvent::ToolCall {
-                id: "task-1".into(),
-                call: ToolCall::Agent {
-                    agents: vec![AgentActivity {
-                        id: "Agent 1".into(),
-                        role: "scout".into(),
-                        status: AgentActivityStatus::Pending,
-                        model: None,
-                    }],
-                },
-            })
-        );
-
-        let running = json!({
-            "update": {
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "task-1",
-                "status": "in_progress",
-                "rawOutput": {
-                    "details": {
-                        "progress": [{
-                            "id": "PleasantBeetle",
-                            "agent": "scout",
-                            "status": "running",
-                            "resolvedModel": "anthropic/claude-opus-5:xhigh"
-                        }]
-                    }
-                }
-            }
-        });
-        assert_eq!(
-            normalize_update(&running, HarnessId::Omp),
-            Some(AgentEvent::ToolCall {
-                id: "task-1".into(),
-                call: ToolCall::Agent {
-                    agents: vec![AgentActivity {
-                        id: "PleasantBeetle".into(),
-                        role: "scout".into(),
-                        status: AgentActivityStatus::Running,
-                        model: Some("anthropic/claude-opus-5:xhigh".into()),
-                    }],
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn prime_ipython_cells_render_as_their_code() {
-        let update = json!({
-            "update": {
-                "sessionUpdate": "tool_call",
-                "toolCallId": "python-1",
-                "title": "IPython cell",
-                "kind": "execute",
-                "rawInput": {"code": "print(\"PRIME_RENDER_MARKER\")"}
-            }
-        });
-
-        assert_eq!(
-            normalize_update(&update, HarnessId::PrimeAgent),
-            Some(AgentEvent::ToolCall {
-                id: "python-1".into(),
-                call: ToolCall::Exec {
-                    command: "print(\"PRIME_RENDER_MARKER\")".into(),
-                },
-            })
-        );
-        assert_eq!(
-            normalize_update(&update, HarnessId::Omp),
-            Some(AgentEvent::ToolCall {
-                id: "python-1".into(),
-                call: ToolCall::Unknown {
-                    name: "IPython cell".into(),
-                    input: Some(json!({"code": "print(\"PRIME_RENDER_MARKER\")"})),
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn catalog_rejects_unsupported_opus_5_5_efforts() {
-        let models = models_from_catalog(br#"{"models":[
-            {"selector":"anthropic/claude-opus-5-5","name":"Opus 5.5","thinking":["off","minimal","low","xhigh","max","ultracode"]},
-            {"selector":"custom/other","name":"Other","thinking":["minimal","high"]},
-            {"selector":"openai-codex/gpt-6.1-sol","name":"GPT-6.1 Sol","thinking":["minimal","low","medium","high","xhigh","max","ultra"]}
-        ]}"#).unwrap();
-        assert_eq!(
-            models[0].reasoning_levels,
-            vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max
-            ]
-        );
-        assert_eq!(
-            models[1].reasoning_levels,
-            vec![ReasoningLevel::Minimal, ReasoningLevel::High]
-        );
-        assert_eq!(
-            models[2].reasoning_levels,
-            vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max
-            ]
-        );
-    }
-
-    #[test]
-    fn desktop_catalog_has_scaffold_defaults_without_local_credentials() {
-        let models = desktop_models(models_from_catalog(br#"{"models":[]}"#).unwrap());
-        assert_eq!(models[0].id, "openai-codex/gpt-6-astra");
-        let opus = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-opus-5-5")
-            .expect("released Opus 5.5 is available without local credentials");
-        assert_eq!(
-            opus.reasoning_levels,
-            vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ]
-        );
-        for id in [
-            "openai-codex/gpt-6-sol",
-            "openai-codex/gpt-6.1-sol",
-            "openai-codex/gpt-6-luna",
-        ] {
-            let released = models
-                .iter()
-                .find(|model| model.id == id)
-                .expect("released model");
-            assert_eq!(released.reasoning_levels, opus.reasoning_levels);
-            assert!(released.options.is_empty());
-        }
-        assert!(opus.options.is_empty());
-        assert!(
-            models
-                .iter()
-                .any(|model| model.id == "anthropic/claude-fable-5-1")
-        );
-    }
-
-    #[test]
-    fn desktop_catalog_preserves_local_overrides_and_custom_models() {
-        let local = models_from_catalog(
-            br#"{"models":[
-            {"selector":"openai-codex/gpt-6-astra","name":"Local Astra","thinking":["xhigh"]},
-            {"selector":"custom/private","name":"Private model","thinking":[]}
-        ]}"#,
-        )
-        .unwrap();
-        let models = desktop_models(local.clone());
-        assert_eq!(&models[..2], local.as_slice());
-        assert_eq!(
-            models
-                .iter()
-                .filter(|model| model.id == local[0].id)
-                .count(),
-            1
-        );
-        assert!(
-            models
-                .iter()
-                .any(|model| model.id == "anthropic/claude-fable-5-1")
-        );
-    }
-
-    #[test]
-    fn catalog_keeps_every_model_selector() {
-        let models = models_from_catalog(
-            br#"{"models":[
-                {"selector":"openai-codex/gpt-5.6-luna","name":"GPT-5.6 Luna","contextWindow":1000,"maxTokens":100,"thinking":[]},
-                {"selector":"openai/gpt-5.4","name":"GPT-5.4","contextWindow":1000,"maxTokens":100,"thinking":["low","high"]},
-                {"selector":"openrouter/deepseek/deepseek-v4-pro","name":"DeepSeek V4 Pro","contextWindow":1000,"maxTokens":100,"thinking":["high"]},
-                {"selector":"openrouter/tngtech/deepseek-r1t2-chimera","name":"DeepSeek R1T2 Chimera","contextWindow":1000,"maxTokens":100,"thinking":["high"]},
-                {"selector":"anthropic/claude-fable-5","name":"Fable 5","contextWindow":1000,"maxTokens":100,"thinking":[]}
-            ]}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            models
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "openai-codex/gpt-5.6-luna",
-                "openai/gpt-5.4",
-                "openrouter/deepseek/deepseek-v4-pro",
-                "openrouter/tngtech/deepseek-r1t2-chimera",
-                "anthropic/claude-fable-5",
-            ]
-        );
-    }
-    #[test]
-    fn catalog_keeps_models_with_incomplete_size_metadata() {
-        let models = models_from_catalog(
-            br#"{"models":[
-                {"selector":"openrouter/meta/muse-glimmer-30b","name":"Muse Glimmer","contextWindow":131072,"maxTokens":null,"thinking":[]},
-                {"selector":"openrouter/deepseek/incomplete","name":"Incomplete DeepSeek","contextWindow":null,"maxTokens":100,"thinking":[]},
-                {"selector":"openrouter/unknown","name":"Unknown","contextWindow":null,"maxTokens":null,"thinking":[]}
-            ]}"#,
-        )
-        .unwrap();
-
-        assert_eq!(models.len(), 3);
-        assert!(
-            models[0]
-                .description
-                .as_deref()
-                .unwrap()
-                .starts_with("131072 context")
-        );
-        assert!(
-            models[1]
-                .description
-                .as_deref()
-                .unwrap()
-                .starts_with("100 max output")
-        );
-        assert!(
-            models[2]
-                .description
-                .as_deref()
-                .unwrap()
-                .starts_with("Listed in OMP")
-        );
-    }
-
-    #[test]
-    fn session_matcher_resolves_journals_in_large_stores() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("sessions");
-        let cwd_dir = root.join("workspace");
-        std::fs::create_dir_all(&cwd_dir).unwrap();
-        for index in 0..10_001 {
-            std::fs::create_dir(root.join(format!("artifact-{index}"))).unwrap();
-        }
-        let session_id = "019fc051-d259-7000-992c-40d61e37b213";
-        let expected = cwd_dir.join(format!("timestamp_{session_id}.jsonl"));
-        std::fs::write(
-            &expected,
-            format!(r#"{{"type":"session","id":"{session_id}"}}"#),
-        )
-        .unwrap();
-
-        let (matches, exhaustive) = matching_session_files(std::slice::from_ref(&root), session_id);
-
-        assert!(exhaustive);
-        assert_eq!(matches, vec![expected]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "subprocess helper"]
-    fn recovery_engine_helper() {
-        use std::os::unix::process::CommandExt as _;
-        if std::env::var_os("CREW_TEST_JOURNAL").is_none() {
-            return;
-        }
-        let supervisor = ProcessCommand::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "omp::tests::recovery_supervisor_helper",
-            ])
-            .env("CREW_TEST_PARENT", std::process::id().to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        std::fs::write(
-            std::env::var_os("CREW_TEST_SUPERVISOR").unwrap(),
-            supervisor.id().to_string(),
-        )
-        .unwrap();
-        loop {
-            std::thread::sleep(Duration::from_secs(60));
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn recovery_supervisor_cleans_detached_tools_after_engine_death() {
-        let temp = tempfile::tempdir().unwrap();
-        let journal = temp.path().join("session.jsonl");
-        let ready = temp.path().join("ready");
-        let supervisor_file = temp.path().join("supervisor");
-        std::fs::write(
-            &journal,
-            "{\"type\":\"session\",\"id\":\"restart-session\"}\n",
-        )
-        .unwrap();
-        let mut engine = ProcessCommand::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "omp::tests::recovery_engine_helper"])
-            .env("CREW_TEST_JOURNAL", &journal)
-            .env("CREW_TEST_READY", &ready)
-            .env("CREW_TEST_SUPERVISOR", &supervisor_file)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ready.exists() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(ready.exists(), "writer tool starts before engine restart");
-        let tool = std::fs::read_to_string(&ready)
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        let supervisor = std::fs::read_to_string(&supervisor_file)
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        let tool_birth = process_birth(tool).unwrap();
-        let supervisor_birth = process_birth(supervisor).unwrap();
-        // Give the guardian one scan to observe the detached descendant.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        engine.kill().unwrap();
-        engine.wait().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while (process_birth(tool).is_some() || process_birth(supervisor).is_some())
-            && Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let tool_stopped = process_birth(tool).as_ref() != Some(&tool_birth);
-        let supervisor_stopped = process_birth(supervisor).as_ref() != Some(&supervisor_birth);
-        signal_owned_process(tool, &tool_birth, libc::SIGKILL);
-        signal_owned_process(supervisor, &supervisor_birth, libc::SIGKILL);
-        assert!(
-            tool_stopped && supervisor_stopped,
-            "guardian and detached tool must exit after engine death"
-        );
-        assert_eq!(session_writer_state(&journal), SessionWriterState::Inactive);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "subprocess helper"]
-    fn recovery_supervisor_helper() {
-        let Ok(parent) = std::env::var("CREW_TEST_PARENT") else {
-            return;
-        };
-        run_omp_supervisor(
-            [
-                OsString::from(parent),
-                std::env::current_exe().unwrap().into_os_string(),
-                "--ignored".into(),
-                "--exact".into(),
-                "omp::tests::recovery_writer_helper".into(),
-            ]
-            .into_iter(),
-        )
-        .unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "subprocess helper"]
-    fn recovery_writer_helper() {
-        use std::os::unix::process::CommandExt as _;
-        let Ok(path) = std::env::var("CREW_TEST_JOURNAL") else {
-            return;
-        };
-        let _journal = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        if std::env::var_os("CREW_TEST_TOOL").is_none() {
-            unsafe {
-                libc::signal(
-                    libc::SIGTERM,
-                    supervisor_stop as *const () as libc::sighandler_t,
-                );
-            }
-            ProcessCommand::new(std::env::current_exe().unwrap())
-                .args(["--ignored", "--exact", "omp::tests::recovery_writer_helper"])
-                .env("CREW_TEST_TOOL", "1")
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            while !SUPERVISOR_STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            return;
-        }
-        unsafe {
-            libc::signal(libc::SIGTERM, libc::SIG_IGN);
-        }
-        std::fs::write(
-            std::env::var_os("CREW_TEST_READY").unwrap(),
-            std::process::id().to_string(),
-        )
-        .unwrap();
-        loop {
-            std::thread::sleep(Duration::from_secs(60));
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn recovery_waits_for_supervisor_and_reaps_detached_writer_twice() {
-        use std::os::unix::process::CommandExt as _;
-        let temp = tempfile::tempdir().unwrap();
-        let journal = temp.path().join("session.jsonl");
-        std::fs::write(
-            &journal,
-            "{\"type\":\"session\",\"id\":\"recovery-session\"}\n",
-        )
-        .unwrap();
-        let executable = std::env::current_exe().unwrap();
-        let harness = OmpHarness::new()
-            .with_executable(&executable)
-            .with_supervisor_executable(&executable);
-        for attempt in 0..2 {
-            let ready = temp.path().join(format!("ready-{attempt}"));
-            let mut supervisor = ProcessCommand::new(&executable)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "omp::tests::recovery_supervisor_helper",
-                ])
-                .arg("--skip")
-                .arg(OMP_SUPERVISOR_MARKER)
-                .env("CREW_TEST_PARENT", std::process::id().to_string())
-                .env("CREW_TEST_JOURNAL", &journal)
-                .env("CREW_TEST_READY", &ready)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !ready.exists() && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            assert!(ready.exists(), "detached tool must start");
-            let tool = std::fs::read_to_string(&ready)
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
-            let tool_birth = process_birth(tool).unwrap();
-            let group = supervisor.id() as i32;
-            // A live owner must remain busy, not be waited out or stopped.
-            assert!(matches!(
-                harness
-                    .ensure_resume_has_no_writer(Some("recovery-session"), Some(&journal),)
-                    .await,
-                Err(HarnessError::SessionBusy { .. })
-            ));
-            unsafe {
-                libc::kill(group, libc::SIGTERM);
-            }
-            let result = harness
-                .ensure_resume_has_no_writer(Some("recovery-session"), Some(&journal))
-                .await;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while supervisor.try_wait().unwrap().is_none() && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            let exited = supervisor.try_wait().unwrap().is_some();
-            let tool_stopped = process_birth(tool).as_ref() != Some(&tool_birth);
-            signal_owned_process(tool, &tool_birth, libc::SIGKILL);
-            if !exited {
-                let _ = supervisor.kill();
-            }
-            assert!(exited, "supervisor must exit after cleanup");
-            assert!(
-                result.is_ok(),
-                "verified teardown should permit resume: {result:?}"
-            );
-            assert_eq!(session_writer_state(&journal), SessionWriterState::Inactive);
-            assert!(
-                tool_stopped,
-                "detached writer must exit before takeover completes"
-            );
-        }
-    }
-
-    #[test]
-    fn timeout_messages_name_the_blocking_stage() {
-        assert_eq!(
-            stage_timeout_message("OMP ACP", "initialize", Duration::from_secs(7)),
-            "OMP ACP initialize timed out after 7s"
-        );
     }
 }

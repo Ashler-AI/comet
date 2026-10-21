@@ -1,6 +1,6 @@
 //! Collaboration invariants that sit above the raw Loro containers.
 
-use comet_proto::{
+use zeron_proto::{
     AnchorTargetKind, AnnotationState, AttachmentMetadata, FileTargetReference, PublicationRecord,
     PublicationValue, SemanticAnchor, SemanticAnnotation, Utf8ByteRange,
 };
@@ -283,7 +283,7 @@ pub fn reanchor_annotation(
     if let Some(range) = &annotation.anchor.byte_range {
         let start = range.start as usize;
         let end = range.end as usize;
-        if end <= text.len()
+        if start <= end && end <= text.len()
             && text.is_char_boundary(start)
             && text.is_char_boundary(end)
             && quote.is_none_or(|expected| &text[start..end] == expected)
@@ -322,7 +322,7 @@ pub fn reanchor_annotation(
 /// publication audit metadata. The resolver is keyed by the complete typed anchor rather than a
 /// selected row or display target, so duplicate anchors cannot redirect a projection.
 pub fn reanchor_projected_file_annotations(
-    snapshot: &mut comet_proto::CollaborationSnapshot,
+    snapshot: &mut zeron_proto::CollaborationSnapshot,
     mut target_text: impl FnMut(&SemanticAnchor) -> Option<String>,
 ) {
     for publication in &mut snapshot.publications {

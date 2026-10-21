@@ -26,20 +26,52 @@ function identifier(value) {
 }
 function digest(value) { return createHash('sha256').update(value).digest('hex'); }
 
+export function browserEntry(entry) {
+  const parts = [];
+  let size = 0;
+  for (let index = entry.parts.length - 1; index >= 0; index--) {
+    let part = entry.parts[index];
+    if (part.kind === 'reasoning') part = { id: part.id, kind: 'thinking', started: true, completed: entry.status !== 'streaming' };
+    if (part.kind === 'text') {
+      const bytes = Buffer.from(part.text);
+      if (bytes.length > 32768) {
+        let start = bytes.length - 32768;
+        while ((bytes[start] & 0xc0) === 0x80) start++;
+        part = { ...part, kind: 'textWindow', text: bytes.subarray(start).toString('utf8'), omitted_prefix_bytes: start };
+      }
+    }
+    let bytes = Buffer.byteLength(JSON.stringify(part));
+    if (bytes > 128 * 1024) {
+      part = { id: part.id, kind: 'error', message: 'This part exceeds the browser display limit. Open native Crew to inspect it.' };
+      bytes = Buffer.byteLength(JSON.stringify(part));
+    }
+    if (size + bytes > 256 * 1024 || parts.length >= 100) {
+      parts.unshift({ id: `${entry.id}:omitted`, kind: 'error', message: 'Earlier parts omitted from this browser window. Open native Crew for the full entry.' });
+      break;
+    }
+    parts.unshift(part);
+    size += bytes;
+  }
+  return { id: entry.id, role: entry.role, status: entry.status, createdAt: entry.createdAt, continuationOf: entry.continuationOf, durationMs: entry.durationMs, parts };
+}
+
 export function loadConfig(env = process.env) {
-  const profile = env.SCAFFOLD_COMET_RUNTIME_PROFILE_JSON ? JSON.parse(env.SCAFFOLD_COMET_RUNTIME_PROFILE_JSON) : {};
-  const sessionId = env.CREW_WEB_SESSION_ID || profile.sessionId;
-  requireValue(typeof sessionId === 'string' && sessionId.length > 0, 'Trusted session binding required');
-  requireValue(!profile.sessionId || profile.sessionId === sessionId, 'Conflicting session binding');
+  requireValue(env.SCAFFOLD_CREW_SYNC_GENERATION === 'chat2', 'Trusted chat2 runtime required');
+  const profile = JSON.parse(env.SCAFFOLD_COMET_RUNTIME_PROFILE_JSON || '{}');
+  const sessionId = identifier(profile.sessionId);
+  requireValue(!env.CREW_WEB_SESSION_ID || env.CREW_WEB_SESSION_ID === sessionId, 'Conflicting session binding');
+  for (const value of [profile.projectId, profile.deploymentId, profile.sandboxId, profile.targetDeviceId]) identifier(value);
+  requireValue(typeof profile.actor?.sub === 'string' && profile.actor.sub.length > 0, 'Trusted owner binding required');
+  requireValue(Number.isSafeInteger(profile.lifecycleEpoch) && profile.lifecycleEpoch > 0, 'Trusted lifecycle epoch required');
   const port = Number(env.CREW_WEB_PORT || 4096);
   const ipcPort = Number(env.COMET_IPC_PORT);
   requireValue(Number.isInteger(port) && port > 0 && port <= 65535, 'Invalid HTTP port');
-  requireValue(Number.isInteger(ipcPort) && ipcPort > 0 && ipcPort <= 65535, 'COMET_IPC_PORT required');
+  requireValue(ipcPort === 27954, 'Canary COMET_IPC_PORT must be 27954');
   requireValue(typeof env.CREW_WEB_AUTH_TOKEN === 'string' && env.CREW_WEB_AUTH_TOKEN.length >= 32, 'Trusted proxy token required');
-  requireValue(env.COMET_DATA_DIR && env.SCAFFOLD_RUNTIME_DIR, 'COMET_DATA_DIR and SCAFFOLD_RUNTIME_DIR required');
-  const sandboxId = profile.sandboxId || env.CREW_WEB_SANDBOX_ID;
-  requireValue(typeof sandboxId === 'string' && /^[a-zA-Z0-9:_-]{1,256}$/.test(sandboxId), 'Trusted sandbox binding required');
-  return { sessionId, sandboxId, host: env.CREW_WEB_HOST || '127.0.0.1', port, ipcPort,
+  requireValue(env.COMET_DATA_DIR?.startsWith('/') && env.COMET_DATA_DIR.endsWith('/.scaffold/crew-upstream-canary/data') && env.SCAFFOLD_RUNTIME_DIR?.startsWith('/'), 'Canonical canary data and runtime directories required');
+  return { sessionId, sandboxId: profile.sandboxId, projectId: profile.projectId, deploymentId: profile.deploymentId,
+    deviceId: profile.targetDeviceId, ownerSubject: profile.actor.sub, lifecycleEpoch: profile.lifecycleEpoch,
+    host: env.CREW_WEB_HOST || '127.0.0.1', port, ipcPort,
     token: env.CREW_WEB_AUTH_TOKEN, storage: join(env.COMET_DATA_DIR, 'crew-web', digest(sessionId)), runtimeDir: env.SCAFFOLD_RUNTIME_DIR };
 }
 
@@ -110,36 +142,34 @@ export class Viewport {
       await this.rpc.connect();
       const authority = await this.readAuthority();
       if (generation !== this.generation || this.stopped) return;
-      this.binding = { chatId: this.config.sessionId, roomProjection: authority.scope };
-      await this.readContext();
-      if (generation !== this.generation || this.stopped) return;
+      this.binding = { chatId: this.config.sessionId };
+      this.rpc.watch('WatchChats', {}, rows => {
+        if (generation !== this.generation) return;
+        try {
+          this.context = rows.find(row => row.id === this.config.sessionId);
+          this.acceptContext();
+        } catch (error) {
+          this.clearProtected();
+          this.rpc.close();
+          throw error;
+        }
+        this.snapshots.add('context');
+        this.emit();
+      });
       this.rpc.watch('WatchSessions', {}, rows => {
         if (generation !== this.generation) return;
         this.snapshots.add('sessions');
-        this.snapshots.delete('selection');
-        this.live = rows.find(row => row.chatId === `${this.config.sessionId}::session::${this.config.sessionId}` && row.deviceId === authority.deviceId)
-          || rows.find(row => row.chatId === this.config.sessionId && row.deviceId === authority.deviceId);
-        this.rpc.call('ReadSessionSelection', { chatId: this.config.sessionId }).then(({ selection }) => {
-          if (generation !== this.generation) return;
-          this.snapshots.add('selection');
-          this.selection = selection;
-          this.emit();
-        }).catch(() => { if (generation === this.generation) this.rpc.close(); });
+        this.live = rows.find(row => row.chatId === this.config.sessionId && row.deviceId === authority.deviceId);
         this.emit();
       });
       this.rpc.watch('WatchDocMessages', this.binding, frame => {
         if (generation !== this.generation) return;
         if (!this.snapshots.has('messages') && !Array.isArray(frame.reset)) throw new Error('Transcript reset required');
-        this.snapshots.add('messages');
         this.messages = applyTranscriptFrame(this.messages, frame);
-        this.before = frame.before ?? null;
+        // ponytail: mirror the native stream; a native paged RPC is needed above 64 MiB.
+        requireValue(Buffer.byteLength(JSON.stringify(this.messages)) <= 64 * 1024 * 1024, 'Transcript mirror limit exceeded', 503);
+        this.snapshots.add('messages');
         this.connection = 'connected';
-        this.emit();
-      });
-      this.rpc.watch('WatchCollaboration', this.binding, snapshot => {
-        if (generation !== this.generation) return;
-        this.snapshots.add('collaboration');
-        this.collaboration = snapshot;
         this.emit();
       });
       let refreshing = false;
@@ -150,7 +180,7 @@ export class Viewport {
         catch { if (generation === this.generation) this.rpc.close(); }
         finally { refreshing = false; }
       }, 15000);
-      const models = await this.rpc.call('ListSessionModels', { chatId: this.config.sessionId }).catch(() => []);
+      const models = await this.rpc.call('ListModels', { harness: 'omp' });
       if (generation !== this.generation) return;
       this.models = models;
       this.emit();
@@ -164,13 +194,17 @@ export class Viewport {
   }
   async authority(capability) {
     const generation = this.generation;
-    const authority = await this.rpc.call('ReadSessionAuthority', { chatId: this.config.sessionId });
+    const authority = await this.rpc.call('ScaffoldHostAuthority', {});
     requireValue(generation === this.generation, 'Crew connection changed', 503);
     return this.acceptAuthority(authority, capability);
   }
   acceptAuthority(authority, capability) {
-    requireValue(authority.scope?.sessionId === this.config.sessionId && (!this.config.sandboxId || authority.sandboxId === this.config.sandboxId), 'Crew session authority mismatch', 503);
-    requireValue(authority.expiresAt > Date.now(), 'Crew authority expired', 503);
+    requireValue(authority.scope?.sessionId === this.config.sessionId && authority.sandboxId === this.config.sandboxId
+      && authority.scope.projectId === this.config.projectId && authority.scope.deploymentId === this.config.deploymentId
+      && authority.deviceId === this.config.deviceId && authority.principalSubject === this.config.ownerSubject
+      && authority.lifecycleEpoch === this.config.lifecycleEpoch && typeof authority.grantId === 'string' && authority.grantId.length > 0,
+    'Crew session authority mismatch', 503);
+    requireValue(Number.isSafeInteger(authority.expiresAt) && authority.expiresAt > Date.now(), 'Crew authority expired', 503);
     if (this.currentAuthority) {
       requireValue(authority.deviceId === this.currentAuthority.deviceId
         && authority.principalSubject === this.currentAuthority.principalSubject
@@ -183,27 +217,25 @@ export class Viewport {
     this.currentAuthority = authority;
     return authority;
   }
-  async readContext() {
-    const generation = this.generation;
-    try {
-      const context = await this.rpc.call('ReadSessionContext', { chatId: this.config.sessionId });
-      requireValue(generation === this.generation, 'Crew connection changed', 503);
-      this.acceptAuthority(context.authority, 'session.read');
-      requireValue(typeof context.cwd === 'string' && context.cwd.startsWith('/') && context.config?.harness === 'omp', 'Invalid Crew session context', 503);
-      this.context = context;
-      this.snapshots.add('context');
-      return context;
-    } catch (error) {
-      if (generation === this.generation) {
-        this.clearProtected();
-        this.rpc.close();
-      }
-      throw error;
+  acceptContext() {
+    const context = this.context;
+    requireValue(context?.id === this.config.sessionId && context.deviceId === this.config.deviceId
+      && typeof context.cwd === 'string' && context.cwd.startsWith('/') && context.config?.harness === 'omp'
+      && context.roomGen === 2, 'Invalid Crew session context', 503);
+    if (context.crew) {
+      requireValue(context.crew.sessionId === this.config.sessionId
+        && context.crew.scope?.projectId === this.config.projectId && context.crew.scope?.deploymentId === this.config.deploymentId
+        && context.crew.scope?.sessionId === this.config.sessionId, 'Crew chat identity mismatch', 503);
     }
+    return context;
+  }
+  async readContext() {
+    await this.readAuthority();
+    return this.acceptContext();
   }
   ready() {
     return this.connection === 'connected' && !!this.context
-      && ['context', 'sessions', 'selection', 'messages', 'collaboration'].every(key => this.snapshots.has(key));
+      && ['context', 'sessions', 'messages'].every(key => this.snapshots.has(key));
   }
   canRead() {
     return !!this.currentAuthority && this.currentAuthority.expiresAt > Date.now()
@@ -214,11 +246,8 @@ export class Viewport {
     this.currentAuthority = null;
     this.context = null;
     this.live = null;
-    this.selection = null;
-    this.collaboration = null;
     this.messages = [];
     this.models = [];
-    this.before = null;
     this.connection = 'disconnected';
     const frame = `event: state\ndata: ${JSON.stringify(this.state())}\n\n`;
     for (const client of this.clients) client.end(frame);
@@ -244,24 +273,34 @@ export class Viewport {
       connection: 'disconnected', capabilities: { message: false, input: false, interrupt: false },
     };
     const context = this.context;
-    const record = this.collaboration?.sessions?.find(row => row.sessionId === this.config.sessionId);
-    const status = this.live?.status || record?.status || 'idle';
-    const updatedAt = this.live ? Date.parse(this.live.updatedAt) : record?.updatedAt ?? record?.createdAt;
-    const modelRetry = status === 'working' && Date.now() - updatedAt <= 45_000
-      ? (this.live ? this.live.modelRetry : record?.modelRetry) : null;
+    const status = this.live?.status || 'idle';
+    const page = this.messagePage();
     const active = this.ready() && this.currentAuthority?.expiresAt > Date.now();
     const caps = this.currentAuthority?.capabilities || [];
     return {
       sandboxId: this.config.sandboxId,
       session: { id: this.config.sessionId, title: context?.title || 'Crew', cwd: context?.cwd || '', branch: context?.branch || '', status,
-        turnId: this.live?.startedAt ? JSON.stringify([this.live.chatId, this.live.deviceId, this.live.startedAt]) : null,
-        modelRetry,
-        model: this.selection?.model || record?.model || context?.config?.model,
-        reasoning: this.selection ? this.selection.reasoning : context?.config?.reasoning },
-      messages: this.messages, models: this.models, history: { hasOlder: this.before != null, before: this.before ?? null },
+        turnId: ['working', 'awaitingInput'].includes(status) ? this.messages.at(-1)?.id ?? null : null,
+        model: context?.config?.model, reasoning: context?.config?.reasoning },
+      messages: page.entries, models: this.models, history: { hasOlder: page.before != null, before: page.before },
       connection: this.connection,
       capabilities: { message: active && caps.includes(CAP_CHAT), input: active && caps.includes(CAP_CHAT), interrupt: active && caps.includes(CAP_CONTROL) },
     };
+  }
+  messagePage(before = this.messages.length) {
+    requireValue(Number.isSafeInteger(before) && before >= 0 && before <= this.messages.length, 'Invalid history cursor', 409);
+    const entries = [];
+    let size = 0;
+    let cursor = before;
+    while (cursor > 0 && entries.length < 100) {
+      const entry = browserEntry(this.messages[cursor - 1]);
+      const bytes = Buffer.byteLength(JSON.stringify(entry));
+      if (entries.length && size + bytes > 512 * 1024) break;
+      entries.unshift(entry);
+      size += bytes;
+      cursor--;
+    }
+    return { entries, before: cursor || null };
   }
   sendState(client, frame) {
     if (client.writableLength + Buffer.byteLength(frame) > 2 * 1024 * 1024) {
@@ -317,6 +356,8 @@ export class Viewport {
     const allowed = kind === 'message' ? ['requestId', 'text', 'model', 'reasoning', 'attachments'] : kind === 'input' ? ['requestId', 'inputRequestId', 'answers'] : ['requestId', 'turnId'];
     object(input, allowed);
     const requestId = identifier(input.requestId);
+    await this.readContext();
+    await this.authority(kind === 'interrupt' ? CAP_CONTROL : CAP_CHAT);
     const requestHash = digest(JSON.stringify({ kind, input }));
     const recordPath = join(this.config.storage, `command-${digest(requestId)}.json`);
     let record;
@@ -328,10 +369,8 @@ export class Viewport {
     }
     requireValue(this.ready(), 'Assigned Crew session unavailable', 503);
     const generation = this.generation;
-    await this.readContext();
-    const authority = await this.readAuthority();
-    requireValue(authority.capabilities.includes(kind === 'interrupt' ? CAP_CONTROL : CAP_CHAT), 'Session capability unavailable', 403);
-    let action;
+    let command;
+    const commandId = `crew-web:${this.config.lifecycleEpoch}:${requestId}`;
     if (kind === 'message') {
       requireValue(typeof input.text === 'string' && input.text.length <= 128 * 1024, 'Invalid message text');
       requireValue(Array.isArray(input.attachments) && input.attachments.length <= 16, 'Invalid attachments');
@@ -358,10 +397,10 @@ export class Viewport {
       const currentState = this.state().session;
       if (['working', 'awaitingInput'].includes(currentState.status)) {
         requireValue(model === currentState.model && reasoning === (currentState.reasoning ?? null), 'Stop the current turn before changing model or reasoning', 409);
-        action = { action: 'steer', prompt, message_id: `crew-web:${requestId}` };
+        command = { kind: 'steer', prompt, messageId: commandId };
       } else {
-        action = { action: 'start', message_id: `crew-web:${requestId}`, request: {
-          prompt, model, reasoning, modelOptions: this.context.config?.modelOptions || {}, cwd: this.context.cwd,
+        command = { kind: 'run', messageId: commandId, request: {
+          prompt, harness: 'omp', model, reasoning, modelOptions: this.context.config?.modelOptions || {}, cwd: this.context.cwd,
           sandbox: this.context.config?.sandbox || 'workspace-write', autoApprove: false,
           resume: null,
           attachments: images,
@@ -370,7 +409,7 @@ export class Viewport {
     } else if (kind === 'interrupt') {
       requireValue(typeof input.turnId === 'string' && input.turnId.length > 0 && input.turnId.length <= 2048, 'Expected turn required');
       requireValue(input.turnId === this.state().session.turnId && ['working', 'awaitingInput'].includes(this.state().session.status), 'Stop target is no longer active', 409);
-      action = { action: 'stop', expected_turn_id: input.turnId };
+      command = { kind: 'interrupt' };
     } else {
       requireValue(typeof input.inputRequestId === 'string' && input.inputRequestId.length > 0 && input.inputRequestId.length <= 512, 'Invalid input request');
       const pending = this.messages.flatMap(entry => entry.parts).find(part => part.kind === 'input' && !part.resolved && part.requestId === input.inputRequestId);
@@ -385,17 +424,20 @@ export class Viewport {
         requireValue(Array.isArray(answer.labels) && answer.labels.length > 0 && answer.labels.length <= 32 && answer.labels.every(label => typeof label === 'string' && label.length <= 8192), 'Invalid input answer');
         requireValue(question.multiSelect || answer.labels.length === 1, 'Question requires a single answer');
       }
-      action = { action: 'respondInput', request_id: input.inputRequestId, answers: input.answers };
+      command = { kind: 'respondInput', requestId: input.inputRequestId, answers: input.answers };
     }
-    const command = { kind: 'control', sessionId: this.config.sessionId, ownerDeviceId: authority.deviceId,
-      actorDeviceId: `crew-web:${this.config.sessionId}`, actorSubject: authority.principalSubject,
-      grantId: authority.grantId, source: 'scaffold', action };
-    record = { requestHash, commandId: `crew-web:${requestId}`, command };
+    record = { requestHash, commandId, command, lifecycleEpoch: this.config.lifecycleEpoch,
+      expectedTurnId: kind === 'interrupt' ? input.turnId : undefined };
     await atomicJson(recordPath, record);
     return this.queueRecord(recordPath, record);
   }
   async queueRecord(path, record) {
-    const receipt = await this.rpc.call('QueueCommand', { chatId: this.config.sessionId, commandId: record.commandId, command: record.command });
+    await this.readContext();
+    await this.authority(record.command.kind === 'interrupt' ? CAP_CONTROL : CAP_CHAT);
+    requireValue(record.lifecycleEpoch === this.config.lifecycleEpoch, 'Command belongs to an earlier lifecycle; use a new request identifier', 409);
+    if (record.command.kind === 'run') await this.approvedModel(record.command.request.model);
+    const receipt = await this.rpc.call('QueueCommand', { chatId: this.config.sessionId, commandId: record.commandId,
+      command: record.command, ...(record.expectedTurnId ? { expectedTurnId: record.expectedTurnId } : {}) });
     await atomicJson(path, { ...record, receipt });
     return receipt;
   }
@@ -406,16 +448,31 @@ export class Viewport {
       if (error.code === 'ENOENT') throw new HttpError(404, 'Unknown viewport request');
       throw error;
     });
-    const { command } = await this.rpc.call('ReadSessionCommand', { chatId: this.config.sessionId, commandId: record.commandId });
+    const { command } = await this.rpc.call('ReadCommand', { chatId: this.config.sessionId, commandId: record.commandId });
     await this.readAuthority();
-    return command || { commandId: record.commandId, status: 'pending', resolution: null };
+    return { commandId: record.commandId, status: command?.status || 'pending', resolution: command?.resolution ?? null };
+  }
+  async toolDetail(toolId) {
+    const part = this.messages.flatMap(entry => entry.parts).find(part => part.kind === 'tool' && part.id === toolId);
+    requireValue(part, 'Unknown tool in assigned session', 404);
+    let output = part.output ?? '';
+    for (const [ref, suffix] of [[part.outputRef, ''], [part.diffRef, '.diff']]) {
+      if (!ref) continue;
+      requireValue(ref === `${this.config.sessionId}/${toolId}${suffix}`, 'Tool blob session mismatch', 503);
+      const { text } = await this.rpc.call('FetchToolBlob', { blobRef: ref });
+      requireValue(typeof text === 'string' && Buffer.byteLength(text) <= 512 * 1024, 'Tool detail exceeds browser limit', 413);
+      output = suffix ? `${output}\n\nDiff:\n${text}` : text;
+    }
+    const detail = { found: true, resolved: part.resolved, isError: part.isError, input: JSON.stringify(part.call, null, 2), output };
+    requireValue(Buffer.byteLength(JSON.stringify(detail)) <= 1024 * 1024, 'Tool detail exceeds browser limit', 413);
+    return detail;
   }
   async upload(req) {
     requireValue(this.ready(), 'Assigned Crew session unavailable', 503);
     const generation = this.generation;
     await this.readContext();
     const authority = await this.readAuthority();
-    requireValue(authority.capabilities.includes(CAP_CHAT), 'Session capability unavailable', 403);
+    requireValue(authority.capabilities.includes(CAP_CHAT) && authority.capabilities.includes('session.files'), 'Session capability unavailable', 403);
     let name;
     try { name = decodeURIComponent(req.headers['x-filename'] || ''); } catch { throw new HttpError(400, 'Invalid file name'); }
     requireValue(name.length > 0 && name.length <= 200 && !/[\x00-\x1f/\\]/.test(name) && name !== '.' && name !== '..', 'Invalid file name');
@@ -426,11 +483,11 @@ export class Viewport {
     for (let offset = 0, seq = 0; offset < bytes.length; offset += chunkSize, seq++) {
       await this.authority(CAP_CHAT);
       requireValue(generation === this.generation && this.ready(), 'Crew session state changed; retry', 503);
-      await this.rpc.call('UploadChunk', { uploadId: id, seq, data: bytes.subarray(offset, offset + chunkSize).toString('base64') });
+      await this.rpc.call('UploadChunk', { chatId: this.config.sessionId, uploadId: id, seq, data: bytes.subarray(offset, offset + chunkSize).toString('base64') });
     }
     await this.authority(CAP_CHAT);
     requireValue(generation === this.generation && this.ready(), 'Crew session state changed; retry', 503);
-    const { path } = await this.rpc.call('UploadCommit', { uploadId: id, fileName: name });
+    const { path } = await this.rpc.call('UploadCommit', { chatId: this.config.sessionId, uploadId: id, fileName: name });
     const type = /^image\/(png|jpeg|gif|webp)$/.test(req.headers['content-type'] || '') ? req.headers['content-type'] : 'application/octet-stream';
     const metadata = { id, name, size: bytes.length, type };
     await atomicJson(join(this.config.storage, `upload-${digest(id)}.json`), { ...metadata, path });
@@ -464,7 +521,11 @@ export async function createServer(config, viewport = new Viewport(config)) {
       const url = new URL(req.url, 'http://crew.invalid');
       const path = url.pathname;
       if (req.method === 'GET' && (['/api/session', '/api/events', '/api/messages'].includes(path) || path.startsWith('/api/tool/'))) await viewport.readAuthority();
-      if (req.method === 'GET' && path === '/health') return respond(res, 200, { service: 'crew-web', sessionId: config.sessionId, sandboxId: config.sandboxId });
+      if (req.method === 'GET' && path === '/health') {
+        await viewport.readContext();
+        requireValue(viewport.ready(), 'Assigned Crew session unavailable', 503);
+        return respond(res, 200, { service: 'crew-web', crewSyncGeneration: 'chat2', sessionId: config.sessionId, sandboxId: config.sandboxId });
+      }
       if (req.method === 'GET' && path === '/api/session') return respond(res, 200, viewport.state());
       if (req.method === 'GET' && path === '/api/native-open') {
         const authority = await viewport.readAuthority();
@@ -473,14 +534,11 @@ export async function createServer(config, viewport = new Viewport(config)) {
         requireValue(segments.every(value => typeof value === 'string' && /^[A-Za-z0-9._-]{1,256}$/.test(value))
           && scope.sessionId === config.sessionId && authority.sandboxId === config.sandboxId,
         'Crew native session binding unavailable', 503);
-        const scheme = scope.deploymentId === 'ashler-staging' ? 'comet-staging'
-          : scope.deploymentId === 'ashler-production' ? 'comet' : null;
-        requireValue(scheme && scope.projectId === scope.deploymentId, 'Crew deployment is not installed', 503);
-        return respond(res, 200, { url: `${scheme}://scaffold/${segments.join('/')}` });
+        return respond(res, 200, { url: `crew-upstream-canary://scaffold/${segments.join('/')}` });
       }
       if (req.method === 'GET' && path === '/api/models') {
         await viewport.readAuthority();
-        if (!viewport.models.length) viewport.models = await viewport.rpc.call('ListSessionModels', { chatId: config.sessionId });
+        if (!viewport.models.length) viewport.models = await viewport.rpc.call('ListModels', { harness: 'omp' });
         await viewport.readAuthority();
         return respond(res, 200, { models: viewport.models });
       }
@@ -496,15 +554,14 @@ export async function createServer(config, viewport = new Viewport(config)) {
       if (req.method === 'GET' && path === '/api/messages') {
         const before = Number(url.searchParams.get('before'));
         requireValue(url.searchParams.has('before') && Number.isSafeInteger(before) && before >= 0, 'Invalid history cursor');
-        const page = await viewport.rpc.call('ReadDocMessages', { ...viewport.binding, before });
+        const page = viewport.messagePage(before);
         await viewport.readAuthority();
         return respond(res, 200, page);
       }
       if (req.method === 'GET' && path.startsWith('/api/tool/')) {
         const toolId = decodeURIComponent(path.slice('/api/tool/'.length));
         requireValue(toolId.length > 0 && toolId.length <= 512, 'Invalid tool identifier');
-        let detail = await viewport.rpc.call('ToolCallDetail', { chatId: `${config.sessionId}::session::${config.sessionId}`, toolId });
-        if (!detail.found) detail = await viewport.rpc.call('ToolCallDetail', { chatId: config.sessionId, toolId });
+        const detail = await viewport.toolDetail(toolId);
         await viewport.readAuthority();
         return respond(res, 200, detail);
       }

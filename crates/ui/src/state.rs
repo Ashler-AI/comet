@@ -4,7 +4,7 @@
 //! ## EngineHandle
 //! The UI talks the same typed RPC whether the engine is in-process or a separate
 //! daemon (ARCHITECTURE §1). [`EngineHandle::bootstrap`] probes the localhost IPC
-//! port, mirroring comet: if an engine is listening it connects over WebSocket
+//! port, mirroring zeron: if an engine is listening it connects over WebSocket
 //! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
 //! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
 //!
@@ -18,398 +18,71 @@
 //! unit tests; rendering reads them.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity};
+use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use comet_doc::{
-    MessagePart, MessageRole, SessionEntryWindow, SessionMessageEntry,
-    TranscriptDesync, TranscriptFrame,
+use crate::comments::ReviewComment;
+use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
+use zeron_proto::{
+    AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
+    EngineInfo, HarnessId, Session, SidebarPreferencesState, Space, WorkspaceScope,
 };
-use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use comet_proto::{
-    AgentRoute, AuthState, Chat, ChatIndicator, CollaborationScope, CollaborationSnapshot, Device,
-    HarnessId, LocalSessionAttachResult, LocalSessionCandidate, MessageProvenance,
-    ParticipantPresence, RuntimeProfile, ScaffoldDatabaseEnvironment, ScaffoldEnvironmentControl,
-    ScaffoldEnvironmentControlResult, ScaffoldEnvironmentSnapshot, ScaffoldLifecycle, Session,
-    SessionEnvironment, SessionEnvironmentSource, SessionRef, SessionRoomProjection, Space,
+use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+
+use crate::change_requests::{
+    ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
 };
-use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RetainedSend {
-    pub prompt: String,
-    pub message_id: String,
-    pub params: serde_json::Value,
-    pub accepted: bool,
-    #[serde(default)]
-    pub applied: bool,
-    #[serde(default)]
-    pub terminal: bool,
-    #[serde(default)]
-    pub failure: Option<String>,
-    #[serde(default)]
-    pub cancelled: bool,
-    /// Explicit admission failure: readback alone cannot replace a successful same-ID retry.
-    #[serde(default)]
-    pub admission_error: Option<String>,
+// Recently viewed transcripts stay renderable while a fresh watch opens. Move
+// ownership on navigation; never clone whale payloads or retain live watches.
+const TRANSCRIPT_CACHE_CAP: usize = 12;
+const TRANSCRIPT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+struct CachedTranscript {
+    prepared: Option<Arc<crate::transcript::PreparedTranscript>>,
+    chat_id: String,
+    entries: Vec<SessionMessageEntry>,
+    context_usage: Option<zeron_proto::ContextUsage>,
+    bytes: usize,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct RetainedSendRecoveryScope {
-    data_dir: PathBuf,
-    project_scope: String,
-    user_id: String,
-    local_device_id: Option<String>,
-    scaffold_scope: Option<(String, String)>,
+// A cancelled GPUI watch may own a whale's mirror between updates. Its
+// destructor must not free that entire object graph on the UI thread either.
+struct WatchPreparation {
+    worker: Option<crate::transcript::TranscriptPreparation>,
+    executor: gpui::BackgroundExecutor,
 }
-
-pub(crate) struct RetainedBootstrap {
-    chat: Chat,
-    space: Space,
-    projection: Option<SessionRoomProjection>,
-}
-
-impl AppState {
-    pub(crate) fn retained_send_recovery_scope(&self) -> Option<RetainedSendRecoveryScope> {
-        let AuthState::SignedIn { user, project_scope } = self.auth.as_ref()? else { return None };
-        Some(RetainedSendRecoveryScope {
-            data_dir: self.data_dir.clone()?, project_scope: project_scope.clone(), user_id: user.id.clone(),
-            local_device_id: self.local_device_id.clone(), scaffold_scope: self.scaffold_scope.clone(),
-        })
-    }
-
-    pub(crate) fn retained_send_recovery_scope_matches(&self, scope: &RetainedSendRecoveryScope) -> bool {
-        matches!(self.auth.as_ref(), Some(AuthState::SignedIn { user, project_scope })
-            if user.id == scope.user_id && project_scope == &scope.project_scope)
-            && self.data_dir.as_ref() == Some(&scope.data_dir)
-            && self.local_device_id == scope.local_device_id && self.scaffold_scope == scope.scaffold_scope
-    }
-
-    pub(crate) fn restore_retained_bootstraps(&mut self, bootstraps: Vec<RetainedBootstrap>) {
-        let space_count = self.spaces.len();
-        for bootstrap in bootstraps {
-            if self.chats.iter().find(|chat| chat.id == bootstrap.chat.id).is_some_and(|chat|
-                chat.device_id != bootstrap.chat.device_id || chat.space_id != bootstrap.chat.space_id)
-                || self.room_projections.get(&bootstrap.chat.id).is_some_and(|current| Some(current) != bootstrap.projection.as_ref()) { continue }
-            if !self.spaces.iter().any(|space| space.id == bootstrap.space.id) { self.spaces.push(bootstrap.space); }
-            if let Some(projection) = bootstrap.projection {
-                self.room_projections.insert(bootstrap.chat.id.clone(), projection);
-            }
-            self.stage_pending_chat(bootstrap.chat);
+impl WatchPreparation {
+    fn new(executor: gpui::BackgroundExecutor) -> Self {
+        Self {
+            worker: Some(Default::default()),
+            executor,
         }
-        if self.spaces.len() != space_count { sort_spaces(&mut self.spaces); }
     }
-
-    pub(crate) fn send_journal_path(&self, chat_id: &str) -> Result<Option<PathBuf>, String> {
-        use base64::Engine as _;
-        let Some(data_dir) = &self.data_dir else { return Ok(None) };
-        let user = self.auth_user().ok_or("Sign in before recovering Crew sends")?;
-        let Some(AuthState::SignedIn { project_scope, .. }) = self.auth.as_ref() else { return Err("Crew project scope unavailable".into()) };
-        let projection = self.transcript_room_projection(chat_id);
-        let scope = serde_json::to_vec(&(project_scope, &user.id, &self.local_device_id, &self.scaffold_scope, projection, chat_id)).map_err(|error| error.to_string())?;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(scope);
-        let mut path = data_dir.join("composer-sends");
-        for chunk in encoded.as_bytes().chunks(120) { path.push(std::str::from_utf8(chunk).expect("base64 is ASCII")); }
-        Ok(Some(path.join("sends.json")))
-    }
-
-    pub(crate) fn retained_send_owner_matches(&self, chat_id: &str, send: &RetainedSend) -> bool {
-        let Some(original) = send.params["targetDeviceId"].as_str() else { return true };
-        let current = if send.params["command"]["kind"] == "control" {
-            let session_id = send.params["command"]["sessionId"].as_str();
-            self.collaboration.as_ref().and_then(|snapshot| snapshot.sessions.iter()
-                .find(|session| Some(session.session_id.as_str()) == session_id && session.chat_id == chat_id))
-                .map(|session| session.owner_device_id.as_str())
-        } else {
-            self.chats.iter().find(|chat| chat.id == chat_id).map(|chat| chat.device_id.as_str())
-        };
-        // Missing browse metadata cannot refresh authority; the original RPC
-        // still validates its exact host/grant before any new admission.
-        current.is_none_or(|device| device == original)
-    }
-
-}
-
-// ponytail: serialize small composer journals; shard by path if write contention matters.
-static SEND_JOURNAL_WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-impl RetainedSend {
-    /// Recover presentation only; original command/grant validation still belongs to admission.
-    pub(crate) fn recover_bootstraps(scope: RetainedSendRecoveryScope) -> Result<Vec<RetainedBootstrap>, String> {
-        use base64::Engine as _;
-        // Prune other authenticated owners before entering their journal directories.
-        let mut prefix = serde_json::to_vec(&(&scope.project_scope, &scope.user_id, &scope.local_device_id, &scope.scaffold_scope)).map_err(|error| error.to_string())?;
-        prefix.pop();
-        prefix.push(b',');
-        prefix.truncate(prefix.len() / 3 * 3);
-        let prefix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(prefix);
-        let mut directories = vec![(scope.data_dir.join("composer-sends"), String::new())];
-        let mut recovered = Vec::new();
-        while let Some((directory, encoded)) = directories.pop() {
-            let entries = match std::fs::read_dir(&directory) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("Crew retained sends could not be discovered: {error}")),
-            };
-            for entry in entries {
-                let entry = entry.map_err(|error| error.to_string())?;
-                let kind = entry.file_type().map_err(|error| error.to_string())?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if kind.is_dir() && !name.is_empty() && name.len() <= 120
-                    && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-                    && encoded.len() + name.len() <= 16_384 {
-                    let next = format!("{encoded}{name}");
-                    if prefix.starts_with(&next) || next.starts_with(&prefix) { directories.push((entry.path(), next)); }
-                    continue;
-                }
-                if !kind.is_file() || name != "sends.json" { continue }
-                let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&encoded) else { continue };
-                let Ok((project, user, device, scaffold, projection, chat_id)) = serde_json::from_slice::<(
-                    String, String, Option<String>, Option<(String, String)>, Option<SessionRoomProjection>, String,
-                )>(&bytes) else { continue };
-                if project != scope.project_scope || user != scope.user_id || device != scope.local_device_id || scaffold != scope.scaffold_scope { continue }
-                if let Some(projection) = &projection {
-                    if projection.session_id != chat_id || scope.scaffold_scope.as_ref().is_none_or(|(project, deployment)|
-                        &projection.project_id != project || &projection.deployment_id != deployment) { continue }
-                }
-                let sends = match Self::load(Some(entry.path()), &chat_id) {
-                    Ok(sends) => sends,
-                    Err(error) => { tracing::warn!(%chat_id, %error, "retained Crew bootstrap journal is unreadable"); continue }
-                };
-                let projection_value = serde_json::to_value(&projection).map_err(|error| error.to_string())?;
-                for send in sends {
-                    if send.terminal || send.applied || send.cancelled || !send.is_message()
-                        || send.params["roomProjection"] != projection_value { continue }
-                    let Ok(chat) = serde_json::from_value::<Chat>(send.params["bootstrap"]["chat"].clone()) else { continue };
-                    let Ok(space) = serde_json::from_value::<Space>(send.params["bootstrap"]["space"].clone()) else { continue };
-                    if chat.id != chat_id || chat.space_id.as_deref() != Some(space.id.as_str()) || chat.device_id != space.device_id { continue }
-                    if send.params["command"]["kind"] == "control" {
-                        if send.params["command"]["source"] != "scaffold" || projection.is_none()
-                            || send.params["command"]["sessionId"] != chat_id
-                            || send.params["command"]["ownerDeviceId"] != send.params["targetDeviceId"] { continue }
-                    } else if send.params["targetDeviceId"].as_str().is_some_and(|target| target != chat.device_id)
-                        || (send.params["targetDeviceId"].is_null() && scope.local_device_id.as_deref() != Some(chat.device_id.as_str())) { continue }
-                    if !recovered.iter().any(|bootstrap: &RetainedBootstrap| bootstrap.chat.id == chat.id) {
-                        recovered.push(RetainedBootstrap { chat, space, projection: projection.clone() });
-                    }
-                }
-            }
-        }
-        Ok(recovered)
-    }
-
-    pub(crate) fn is_message(&self) -> bool {
-        matches!(self.params["command"]["kind"].as_str(), Some("run" | "steer" | "queue"))
-            || matches!(self.params["command"]["action"]["action"].as_str(), Some("start" | "steer" | "queue"))
-    }
-
-    pub(crate) fn matches_control(&self, params: &serde_json::Value) -> bool {
-        let original = &self.params;
-        let command = &original["command"];
-        let candidate = &params["command"];
-        if original["chatId"] != params["chatId"] || original["roomProjection"] != params["roomProjection"]
-            || command["kind"] != candidate["kind"] || command["sessionId"] != candidate["sessionId"]
-            || command["source"] != candidate["source"] { return false }
-        if command["kind"] == "control" {
-            let action = &command["action"];
-            let requested = &candidate["action"];
-            if action["action"] == "respondInput" {
-                action["action"] == requested["action"] && action["request_id"] == requested["request_id"]
-            } else { action == requested }
-        } else if command["kind"] == "respondInput" {
-            command["requestId"] == candidate["requestId"]
-        } else { command == candidate }
-    }
-
-    pub(crate) fn load_input_outcome(path: Option<PathBuf>, prompt: &str, params: &serde_json::Value) -> Result<Option<Self>, String> {
-        let Some(path) = path else { return Ok(None) };
-        let Some(key) = input_outcome_key(params) else { return Ok(None) };
-        let Some(mut index) = input_outcome_path(&path, &key) else { return Ok(None) };
-        // Recover accepted inputs written before indexes included the session.
-        let scoped = index.exists();
-        if !scoped { if let Some(legacy) = input_outcome_path(&path, prompt) { index = legacy; } }
-        if std::fs::metadata(&index).map(|metadata| metadata.len() > 36).unwrap_or(false) { return Err("Crew input outcome index exceeds its byte limit".into()); }
-        let id = match std::fs::read_to_string(index) {
-            Ok(id) => id,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.to_string()),
-        };
-        if uuid::Uuid::parse_str(&id).is_err() { return Err("Crew input outcome identity conflicts; original retained".into()); }
-        let outcome = path.with_file_name(format!("{id}.outcome"));
-        if std::fs::metadata(&outcome).map_err(|error| error.to_string())?.len() > 8 * 1024 * 1024 { return Err("Crew input outcome exceeds its byte limit".into()); }
-        let send: Self = serde_json::from_slice(&std::fs::read(outcome).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-        if send.message_id != id || !send.accepted { return Err("Crew input outcome payload conflicts; original retained".into()); }
-        if !send.matches_control(params) {
-            return if scoped { Err("Crew input outcome target conflicts; original retained".into()) } else { Ok(None) };
-        }
-        Ok(Some(send))
-    }
-    pub(crate) fn load(path: Option<PathBuf>, chat_id: &str) -> Result<Vec<Self>, String> {
-        let Some(path) = path else { return Ok(Vec::new()) };
-        if std::fs::metadata(&path).map(|metadata| metadata.len() > 8 * 1024 * 1024).unwrap_or(false) {
-            return Err("Crew send journal exceeds its safe byte limit; original retained".into());
-        }
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(format!("Crew send journal is retained but unreadable: {error}")),
-        };
-        let mut sends: Vec<RetainedSend> = serde_json::from_slice(&bytes).map_err(|error| format!("Crew send journal is retained but invalid: {error}"))?;
-        if sends.len() > 16 || sends.iter().any(|send| send.params["chatId"].as_str() != Some(chat_id)
-            || uuid::Uuid::parse_str(&send.message_id).is_err()
-            || send.params["commandId"].as_str().is_none_or(|id| uuid::Uuid::parse_str(id).is_err())) {
-            return Err("Crew retained send journal has conflicting identity or exceeds its record limit".into());
-        }
-        for send in &mut sends {
-            let outcome = path.with_file_name(format!("{}.outcome", send.message_id));
-            if outcome.exists() {
-                if std::fs::metadata(&outcome).map_err(|error| error.to_string())?.len() > 8 * 1024 * 1024 {
-                    return Err("Crew retained outcome exceeds its byte limit".into());
-                }
-                let completed: RetainedSend = serde_json::from_slice(&std::fs::read(outcome).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-                if completed.params != send.params || completed.message_id != send.message_id || !(completed.accepted || completed.cancelled) { return Err("Crew retained admission outcome conflicts; original retained".into()); }
-                send.accepted = completed.accepted;
-                send.applied = completed.applied;
-                send.terminal = completed.terminal || completed.applied;
-                send.failure = completed.failure;
-                send.cancelled = completed.cancelled;
-                send.admission_error = completed.admission_error;
-            }
-        }
-        sends.retain(|send| !send.cancelled);
-        Ok(sends)
-    }
-
-    pub(crate) fn save(path: Option<PathBuf>, chat_id: &str, mut send: Self) -> Result<(), String> {
-        let Some(path) = path else { return Ok(()) };
-        let _write = SEND_JOURNAL_WRITE.lock();
-        send.terminal |= send.applied;
-        let mut sends = Self::load(Some(path.clone()), chat_id)?;
-        if let Some(existing) = sends.iter_mut().find(|record| record.message_id == send.message_id) {
-            if existing.params != send.params || existing.prompt != send.prompt { return Err("Crew send identity conflict; original retained".into()); }
-            existing.accepted |= send.accepted;
-            existing.applied |= send.applied;
-            send.accepted = existing.accepted;
-            send.applied = existing.applied;
-            existing.terminal |= send.terminal;
-            send.terminal = existing.terminal;
-            if existing.failure.is_some() { send.failure = existing.failure.clone(); }
-            existing.cancelled |= send.cancelled;
-            existing.admission_error = send.admission_error.clone();
-        } else if !send.terminal && !send.cancelled {
-            if sends.iter().filter(|record| !record.terminal).count() >= 16 { return Err("Crew retains 16 unresolved sends; resolve them before sending another".into()); }
-        }
-        if send.accepted || send.cancelled {
-            let outcome = path.with_file_name(format!("{}.outcome", send.message_id));
-            if outcome.exists() {
-                if std::fs::metadata(&outcome).map_err(|error| error.to_string())?.len() > 8 * 1024 * 1024 { return Err("Crew retained outcome exceeds its byte limit".into()); }
-                let existing: Self = serde_json::from_slice(&std::fs::read(&outcome).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-                if existing.params != send.params || existing.prompt != send.prompt { return Err("Crew retained outcome identity conflicts; original retained".into()); }
-                if existing.accepted && send.cancelled { return Err("Crew cannot cancel an already admitted instruction".into()); }
-                send.applied |= existing.applied;
-                send.accepted |= existing.accepted;
-                send.terminal |= existing.terminal || existing.applied;
-                if existing.failure.is_some() { send.failure = existing.failure; }
-            }
-            write_send_journal(&outcome, &serde_json::to_vec(&send).map_err(|error| error.to_string())?)?;
-            if send.accepted { if let Some(key) = input_outcome_key(&send.params) && let Some(index) = input_outcome_path(&path, &key) { write_send_journal(&index, send.message_id.as_bytes())?; } }
-        }
-        if !send.terminal && !send.cancelled && !sends.iter().any(|existing| existing.message_id == send.message_id) {
-            sends.push(send);
-        }
-        sends.retain(|send| !send.terminal && !send.cancelled);
-        let bytes = serde_json::to_vec(&sends).map_err(|error| error.to_string())?;
-        write_send_journal(&path, &bytes)
+    fn prepare(
+        &mut self,
+        update: &zeron_doc::TranscriptUpdate,
+    ) -> Result<Arc<crate::transcript::PreparedTranscript>, TranscriptDesync> {
+        self.worker.as_mut().unwrap().prepare(update)
     }
 }
-fn input_outcome_key(params: &serde_json::Value) -> Option<String> {
-    let command = &params["command"];
-    let request = if command["kind"] == "respondInput" { &command["requestId"] }
-        else if command["kind"] == "control" && command["action"]["action"] == "respondInput" { &command["action"]["request_id"] }
-        else { return None };
-    Some(format!("Respond to Crew input {}", serde_json::json!([
-        params["chatId"], params["roomProjection"], command["sessionId"], command["source"], request
-    ])))
-}
-
-
-fn input_outcome_path(path: &std::path::Path, prompt: &str) -> Option<PathBuf> {
-    use base64::Engine as _;
-    if !prompt.starts_with("Respond to Crew input ") { return None }
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(prompt);
-    let mut index = path.parent()?.join("inputs");
-    for chunk in encoded.as_bytes().chunks(120) { index.push(std::str::from_utf8(chunk).expect("base64 is ASCII")); }
-    Some(index.join("command-id"))
-}
-
-fn write_send_journal(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() > 8 * 1024 * 1024 { return Err("Crew send journal exceeds its safe byte limit; original retained".into()); }
-    std::fs::create_dir_all(path.parent().expect("journal parent")).map_err(|error| error.to_string())?;
-    let tmp = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp).map_err(|error| error.to_string())?;
-    use std::io::Write as _;
-    file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|error| error.to_string())?;
-    std::fs::rename(tmp, path).map_err(|error| error.to_string())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActiveHarnessGoal {
-    pub objective: String,
-    pub status: String,
-}
-
-/// The newest normalized OMP goal-state carrier wins, including a null goal
-/// emitted by `/goal drop`. The transcript persists this hidden part, so every
-/// editor surface can project the active goal after navigation or restart.
-pub(crate) fn latest_active_omp_goal(entries: &[SessionMessageEntry]) -> Option<ActiveHarnessGoal> {
-    for part in entries
-        .iter()
-        .rev()
-        .flat_map(|entry| entry.parts.iter().rev())
-    {
-        let MessagePart::Tool {
-            id,
-            call:
-                comet_proto::ToolCall::Unknown {
-                    name,
-                    input: Some(input),
-                },
-            ..
-        } = part
-        else {
-            continue;
-        };
-        if id != comet_proto::OMP_GOAL_STATE_CALL_ID
-            || name != comet_proto::OMP_GOAL_STATE_CALL_NAME
-        {
-            continue;
-        }
-        let goal = input.get("goal")?;
-        let objective = goal
-            .get("objective")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|objective| !objective.is_empty())?
-            .to_string();
-        let status = goal
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("active")
-            .to_string();
-        return Some(ActiveHarnessGoal { objective, status });
+impl Drop for WatchPreparation {
+    fn drop(&mut self) {
+        let worker = self.worker.take();
+        self.executor
+            .spawn(async move {
+                drop(worker);
+            })
+            .detach();
     }
-    None
 }
-/// Hidden compatibility artifact from the removed virtual Scaffold space.
-/// The synced data remains untouched; the headed app no longer presents it.
-const LEGACY_SCAFFOLD_SPACE_ID_PREFIX: &str = "comet-scaffold-space-";
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -418,7 +91,7 @@ const LEGACY_SCAFFOLD_SPACE_ID_PREFIX: &str = "comet-scaffold-space-";
 /// Everything needed to reach (or start) an engine.
 #[derive(Debug, Clone)]
 pub struct EngineBootConfig {
-    /// Data directory for the embedded engine (`~/.comet-native`).
+    /// Data directory for the embedded engine (`~/.zeron`).
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
@@ -426,16 +99,15 @@ pub struct EngineBootConfig {
     pub edge_url: String,
     /// Bearer for edge room joins; `None` runs offline.
     pub edge_token: Option<String>,
-    /// Operator-configured Scaffold project/deployment boundary.
-    pub project_scope: String,
-    /// Trusted deployment namespace for a Scaffold-host SessionRoom.
-    pub deployment_id: Option<String>,
-    /// Scaffold control-plane origin; `None` keeps explicit local mode.
-    pub scaffold_url: Option<String>,
+    /// Workspace org override for explicit dev-mode runs.
+    pub org_id: Option<String>,
+    /// WorkOS client id for production authentication.
+    pub workos_client_id: Option<String>,
+    pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
+    pub managed_inference: bool,
+    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
-    /// Server-enforced capabilities for the engine process.
-    pub runtime_profile: RuntimeProfile,
 }
 
 /// How this UI reached its engine.
@@ -454,12 +126,16 @@ pub enum EngineMode {
 trait EngineBackend: Send + Sync {
     fn client(&self) -> &RpcClient;
     fn mode(&self) -> EngineMode;
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        Err(RpcError::Failed("voice media unavailable".into()))
+    }
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
 }
 
 /// Embedded engine: owns the [`EngineCore`] and an in-memory RPC loop.
 struct InProcessEngine {
+    service: Arc<dyn RpcService>,
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
     boot_task: tokio::task::JoinHandle<()>,
     refresh_task: tokio::task::JoinHandle<()>,
@@ -471,6 +147,9 @@ struct InProcessEngine {
 
 #[async_trait]
 impl EngineBackend for InProcessEngine {
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        Ok(memory_client(self.service.clone()))
+    }
     fn client(&self) -> &RpcClient {
         &self.client
     }
@@ -481,12 +160,13 @@ impl EngineBackend for InProcessEngine {
         self.boot_task.abort();
         // Stop accepting first: a viewport must not connect midway through the
         // drain and queue work against stores that are closing.
-        let mut ipc_task = self.ipc_task.lock().await;
-        if let Some(ipc) = ipc_task.take() {
+        let ipc_task = self.ipc_task.lock().await.take();
+        if let Some(ipc) = ipc_task {
             ipc.abort();
+            // `abort` only requests cancellation. Observe task completion so the
+            // listener is closed before bootstrap reports an assembly failure.
             let _ = ipc.await;
         }
-        drop(ipc_task);
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
         }
@@ -497,21 +177,33 @@ impl EngineBackend for InProcessEngine {
 #[derive(Clone)]
 enum DeferredEngineState {
     Waiting,
-    Ready(Arc<dyn RpcService>),
+    Ready,
     Failed(String),
 }
 
-/// Serves AuthRpc immediately, then holds all data RPC calls until the signed-in
-/// user's identity-scoped engine is assembled. Existing UI subscriptions remain
-/// pending and attach to the real service without reconnecting.
+/// Serves engine identity and AuthRpc immediately, then holds data calls only
+/// while a captured synced profile still needs organization onboarding.
+/// Existing subscriptions attach to the assembled service without reconnecting.
 struct DeferredEngineRpc {
     auth: AuthRpc,
+    engine_info: EngineInfo,
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
+    service: Arc<tokio::sync::OnceCell<Arc<dyn RpcService>>>,
 }
 
 #[async_trait]
 impl RpcService for DeferredEngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if method == methods::ENGINE_INFO {
+            return RpcReply::value(&self.engine_info);
+        }
+        if method == methods::ENGINE_READY {
+            let mut state = self.state.clone();
+            return match wait_for_deferred_engine(&mut state).await {
+                Ok(()) => RpcReply::value(&serde_json::json!({ "ready": true })),
+                Err(message) => Err(RpcError::Failed(message)),
+            };
+        }
         if AuthRpc::handles(method) {
             return self.auth.handle(method, params).await;
         }
@@ -521,7 +213,12 @@ impl RpcService for DeferredEngineRpc {
             let current = { state.borrow().clone() };
             match current {
                 DeferredEngineState::Waiting => {}
-                DeferredEngineState::Ready(service) => {
+                DeferredEngineState::Ready => {
+                    let service = self.service.get().ok_or_else(|| {
+                        RpcError::Failed(
+                            "embedded engine became ready without an RPC service".into(),
+                        )
+                    })?;
                     return service.handle(method, params).await;
                 }
                 DeferredEngineState::Failed(message) => return Err(RpcError::Failed(message)),
@@ -531,14 +228,35 @@ impl RpcService for DeferredEngineRpc {
     }
 }
 
+async fn wait_for_deferred_engine(
+    state: &mut tokio::sync::watch::Receiver<DeferredEngineState>,
+) -> Result<(), String> {
+    loop {
+        let current = { state.borrow().clone() };
+        match current {
+            DeferredEngineState::Waiting => {}
+            DeferredEngineState::Ready => return Ok(()),
+            DeferredEngineState::Failed(message) => return Err(message),
+        }
+        state
+            .changed()
+            .await
+            .map_err(|_| "embedded engine assembly ended without a result".to_string())?;
+    }
+}
+
 /// External daemon over `ws://127.0.0.1:{port}`.
 struct RemoteEngine {
-    client: RpcClient,
+    client: Arc<RpcClient>,
     url: String,
+    lifecycle_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[async_trait]
 impl EngineBackend for RemoteEngine {
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        connect_ws(&self.url).await
+    }
     fn client(&self) -> &RpcClient {
         &self.client
     }
@@ -548,7 +266,10 @@ impl EngineBackend for RemoteEngine {
         }
     }
     async fn shutdown(&self) {
-        // The daemon outlives this viewport; nothing to tear down.
+        // The daemon outlives this viewport; only stop our readiness probe.
+        if let Some(task) = self.lifecycle_task.lock().await.take() {
+            task.abort();
+        }
     }
 }
 
@@ -556,32 +277,28 @@ impl EngineBackend for RemoteEngine {
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
+    engine_info: EngineInfo,
+    deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
 }
 
 impl EngineHandle {
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
     pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
-        let url = format!("ws://127.0.0.1:{}", config.ipc_port);
-        let probe = tokio::time::timeout(
-            std::time::Duration::from_millis(750),
-            tokio::net::TcpStream::connect(("127.0.0.1", config.ipc_port)),
-        )
-        .await;
-        if matches!(probe, Ok(Ok(_))) {
-            tracing::info!(%url, "engine daemon detected; connecting");
-            match connect_ws(&url).await {
-                Ok(client) => {
-                    return Ok(EngineHandle {
-                        inner: Arc::new(RemoteEngine { client, url }),
-                    });
-                }
-                // Something is on the port but it is not an engine (or it is
-                // wedged). Fall through and embed: a stranger holding 27654
-                // should cost other viewports, not this window.
-                Err(err) => tracing::warn!(%url, error = %err, "not an engine; embedding instead"),
-            }
+        // Invariant: at most one bootstrap in this process runs probe+embed at
+        // a time. The winner binds the deferred IPC listener before releasing
+        // the gate, so a concurrent viewport's probe finds it and attaches as
+        // Remote instead of racing it for the data dir.
+        static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _gate = BOOTSTRAP_GATE.lock().await;
+
+        if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
+            return Ok(handle);
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -591,37 +308,63 @@ impl EngineHandle {
             edge_token: config.edge_token,
             ipc_port: config.ipc_port,
             default_harness: config.default_harness,
-            runtime_profile: config.runtime_profile,
-            project_scope: config.project_scope,
-            deployment_id: config.deployment_id,
-            scaffold_url: config.scaffold_url,
-            harness_supervisor_executable: std::env::current_exe().ok().filter(|path| {
-                path.file_stem()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.eq_ignore_ascii_case("comet")
-                            || name.eq_ignore_ascii_case("crew-staging")
-                    })
-            }),
+            org_id: config.org_id,
+            workos_client_id: config.workos_client_id,
+            scaffold: config.scaffold,
+            device: None,
+            device_bootstrap_file: None,
+            managed_inference: config.managed_inference,
+            scaffold_runtime_artifact: config.scaffold_runtime_artifact,
         };
+
+        // Own the data dir before opening anything under it or binding IPC —
+        // the lock, not the port bind, is the ownership decision. A failed
+        // acquire means an out-of-process engine holds the dir but was not
+        // serving IPC at probe time (a daemon mid-start): wait for its
+        // listener, re-trying the lock in case it dies instead.
+        std::fs::create_dir_all(&engine_config.data_dir)?;
+        let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lock = loop {
+            match InstanceLock::acquire(&engine_config.data_dir) {
+                Ok(lock) => break lock,
+                Err(err) => {
+                    if std::time::Instant::now() >= lock_deadline {
+                        return Err(err.into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Some(handle) = Self::attach_to_daemon(engine_config.ipc_port).await {
+                        return Ok(handle);
+                    }
+                }
+            }
+        };
+
         let auth = Engine::build_auth(&engine_config).await;
+        let workspace_scope = Engine::initial_workspace_scope(&auth);
+        let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
+        let profile_is_resolved = initial_profile.is_some();
+        let engine_info = Engine::engine_info(&engine_config, workspace_scope)?;
         let refresh_task = auth.spawn_refresh_loop();
-        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let assembled_service = Arc::new(tokio::sync::OnceCell::new());
         let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
             auth: AuthRpc::new(auth.clone()),
-            state: state_rx,
+            engine_info: engine_info.clone(),
+            state: state_rx.clone(),
+            service: assembled_service.clone(),
         });
         let client = memory_client(service.clone());
 
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
         // *deferred* service, not the assembled one: a viewport that connects
-        // before sign-in gets AuthRpc (so it can show its own gate) and its
-        // data subscriptions wait exactly as this window's do.
+        // during cloud onboarding gets EngineInfo and AuthRpc immediately, and
+        // its data subscriptions wait exactly as this window's do.
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match comet_engine::serve_ipc(engine_config.ipc_port, service).await {
+        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service.clone()).await
+        {
             Ok(task) => Some(task),
             Err(err) => {
                 tracing::warn!(
@@ -634,22 +377,56 @@ impl EngineHandle {
         };
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
+        let service_for_boot = assembled_service.clone();
+        // Agents only learn a port THIS window serves: a lost bind race must
+        // not point their injected MCP server at some other engine.
+        let served_ipc_port = ipc_task.as_ref().map(|_| engine_config.ipc_port);
+        // The instance lock rides into the boot task and is consumed by
+        // assembly — held through sign-in onboarding too, because this process
+        // owns the data dir from the moment it decided to embed.
         let boot_task = tokio::spawn(async move {
-            let mut auth_state = auth.watch_state();
-            while !auth_state.borrow().is_signed_in() {
-                if auth_state.changed().await.is_err() {
-                    state_tx.send_replace(DeferredEngineState::Failed(
-                        "authentication state closed before sign-in".into(),
-                    ));
-                    return;
+            let profile = match initial_profile {
+                Some(profile) => profile,
+                None => {
+                    let mut auth_state = auth.watch_state();
+                    while !auth_state.borrow().is_signed_in() {
+                        if auth_state.changed().await.is_err() {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "authentication state closed before workspace onboarding".into(),
+                            ));
+                            return;
+                        }
+                    }
+                    match Engine::resolve_profile(&engine_config, &auth, workspace_scope) {
+                        Ok(Some(profile)) => profile,
+                        Ok(None) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "workspace onboarding completed without an organization".into(),
+                            ));
+                            return;
+                        }
+                        Err(err) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(err.to_string()));
+                            return;
+                        }
+                    }
                 }
-            }
+            };
 
-            match Engine::assemble_runtime(&engine_config, auth).await {
+            match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
+                    if let Some(port) = served_ipc_port {
+                        engine_runtime.core().sessions.set_ipc_port(port);
+                    }
                     *runtime_for_boot.lock().await = Some(engine_runtime);
-                    state_tx.send_replace(DeferredEngineState::Ready(service));
+                    if service_for_boot.set(service).is_err() {
+                        state_tx.send_replace(DeferredEngineState::Failed(
+                            "embedded engine RPC service was assembled more than once".into(),
+                        ));
+                        return;
+                    }
+                    state_tx.send_replace(DeferredEngineState::Ready);
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "embedded engine assembly failed");
@@ -657,24 +434,111 @@ impl EngineHandle {
                 }
             }
         });
-        Ok(EngineHandle {
+        let handle = EngineHandle {
             inner: Arc::new(InProcessEngine {
+                service,
                 runtime,
                 boot_task,
                 refresh_task,
                 ipc_task: tokio::sync::Mutex::new(ipc_task),
                 client,
             }),
-        })
+            engine_info,
+            deferred_state: Some(state_rx.clone()),
+        };
+        // Local, development, and already-resolved synced profiles need no
+        // authentication UI while assembling. Keep the viewport Connecting
+        // until their stores and journals are actually open, and surface a
+        // boot failure through the existing bootstrap error path.
+        if profile_is_resolved && let Err(message) = wait_for_deferred_engine(&mut state_rx).await {
+            handle.shutdown().await;
+            return Err(anyhow::anyhow!(message));
+        }
+        Ok(handle)
+    }
+
+    /// Probe the IPC port and, if a live engine answers, attach as a remote
+    /// viewport. `None` means embed: nothing listening, a non-engine listener,
+    /// or a listener without an identity.
+    async fn attach_to_daemon(ipc_port: u16) -> Option<EngineHandle> {
+        let url = format!("ws://127.0.0.1:{ipc_port}");
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+        )
+        .await;
+        if !matches!(probe, Ok(Ok(_))) {
+            return None;
+        }
+        tracing::info!(%url, "engine daemon detected; connecting");
+        match connect_ws(&url).await {
+            Ok(client) => match query_engine_info(&client).await {
+                Ok(engine_info) => {
+                    let client = Arc::new(client);
+                    let (state_tx, state_rx) =
+                        tokio::sync::watch::channel(DeferredEngineState::Waiting);
+                    let lifecycle_client = client.clone();
+                    let lifecycle_task = tokio::spawn(async move {
+                        let state = match lifecycle_client
+                            .call(methods::ENGINE_READY, serde_json::json!({}))
+                            .await
+                        {
+                            Ok(_) => DeferredEngineState::Ready,
+                            // EngineReady was added after EngineInfo. An older daemon
+                            // that does not expose the barrier is already assembled.
+                            Err(RpcError::UnknownMethod(method))
+                                if method == methods::ENGINE_READY =>
+                            {
+                                DeferredEngineState::Ready
+                            }
+                            Err(err) => DeferredEngineState::Failed(err.to_string()),
+                        };
+                        state_tx.send_replace(state);
+                    });
+                    Some(EngineHandle {
+                        inner: Arc::new(RemoteEngine {
+                            client,
+                            url,
+                            lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
+                        }),
+                        engine_info,
+                        deferred_state: Some(state_rx),
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %url,
+                        error = %err,
+                        "listener did not provide engine identity; embedding instead"
+                    );
+                    None
+                }
+            },
+            // Something is on the port but it is not an engine (or it is
+            // wedged). Fall through and embed: a stranger holding 27654
+            // should cost other viewports, not this window.
+            Err(err) => {
+                tracing::warn!(%url, error = %err, "not an engine; embedding instead");
+                None
+            }
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(service: Arc<dyn RpcService>) -> Self {
+    pub(crate) fn from_test_client(client: RpcClient) -> Self {
         Self {
             inner: Arc::new(RemoteEngine {
-                client: memory_client(service),
+                client: Arc::new(client),
                 url: "memory://test".into(),
+                lifecycle_task: tokio::sync::Mutex::new(None),
             }),
+            engine_info: EngineInfo {
+                device_id: "local".into(),
+                workspace_scope: WorkspaceScope::Local,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+            },
+            deferred_state: None,
         }
     }
 
@@ -686,8 +550,48 @@ impl EngineHandle {
         self.inner.mode()
     }
 
+    pub async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        self.inner.media_client().await
+    }
+
+    pub fn engine_info(&self) -> &EngineInfo {
+        &self.engine_info
+    }
+
+    fn deferred_state(&self) -> Option<tokio::sync::watch::Receiver<DeferredEngineState>> {
+        self.deferred_state.clone()
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
+    }
+}
+
+/// Query the current protocol first, with a conservative fallback for daemons
+/// from before `EngineInfo` existed. Old daemons are always treated as synced.
+async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
+    match client
+        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+    {
+        Ok(info) => Ok(info),
+        Err(RpcError::UnknownMethod(method)) if method == methods::ENGINE_INFO => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LocalDevice {
+                device_id: String,
+            }
+            let legacy: LocalDevice = client
+                .call_as(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await?;
+            Ok(EngineInfo {
+                device_id: legacy.device_id,
+                workspace_scope: WorkspaceScope::Synced,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+            })
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -696,770 +600,157 @@ impl EngineHandle {
 // ---------------------------------------------------------------------------
 
 // The frontend-agnostic derivations (sort orders, staleness gating, sidebar
-// grouping, the boot gate, relative times) live in `comet_proto::view`, pure
+// grouping, the boot gate, relative times) live in `zeron_proto::view`, pure
 // and with their own test suite. Re-exported here because every call site in
 // this crate reads them as `state::…`.
-pub use comet_proto::view::{
+pub use zeron_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
-    chat_location, display_status, effective_agent_indicator, effective_indicator, format_time_ago,
-    gate_phase, group_chats, parse_auth_state, project_label, sort_active, sort_chats, sort_spaces,
-    sort_tabs,
+    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
+    parse_auth_state, project_label, running_subagents, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatStartupPhase {
-    PreparingCheckout,
-    UploadingAttachments,
-    Admitting,
-}
-
-/// A compact transcript-derived label for an imported session. Peer turns are
-/// never eligible; blank/tool-only ordinary turns keep the
-/// exact-id fallback.
-fn shared_session_preview(entries: &[SessionMessageEntry]) -> Option<(String, String)> {
-    let entry = entries
-        .iter()
-        .find(|entry| entry.role == MessageRole::User && !entry.is_peer_message())?;
-    let text = entry
-        .parts
-        .iter()
-        .filter_map(|part| match part {
-            MessagePart::Text { text, .. } | MessagePart::TextWindow { text, .. } => {
-                Some(text.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.is_empty() {
-        return None;
-    }
-    let mut chars = one_line.chars();
-    let preview: String = chars.by_ref().take(48).collect();
-    let preview = if chars.next().is_some() {
-        format!("{preview}\u{2026}")
-    } else {
-        preview
-    };
-    Some((entry.id.clone(), preview))
-}
-
-
-pub(crate) fn session_ref_fallback(chat_id: &str) -> String {
-    format!("Session {}", chat_id.chars().take(8).collect::<String>())
+/// What a session row shows that ticks with the clock rather than with its
+/// content: the staleness-checked indicator and running-subagent count. A
+/// change in either must repaint even when the row itself is untouched.
+fn session_presence(session: &Session, now: DateTime<Utc>) -> (Indicator, u32) {
+    (
+        effective_indicator(Some(session), now),
+        running_subagents(Some(session), now),
+    )
 }
 
 // ---------------------------------------------------------------------------
+// Org gate (pure)
+// ---------------------------------------------------------------------------
 
+/// One org membership row (tolerant local mirror of the engine's ListOrgs
+/// reply — `{orgs: [{id, organizationId, name}]}`).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgRow {
+    pub organization_id: String,
+    pub name: String,
+}
+
+/// Parse a ListOrgs reply tolerantly (accepts a bare array too).
+pub fn parse_orgs(value: &serde_json::Value) -> Vec<OrgRow> {
+    let list = value.get("orgs").unwrap_or(value);
+    serde_json::from_value(list.clone()).unwrap_or_default()
+}
+
+/// Workspace names must be non-empty (trimmed) and reasonably short.
+pub fn org_name_valid(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty() && trimmed.chars().count() <= 64
+}
+
+/// Memberships sorted by name (case-insensitive), deduped by organization id.
+pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
+    orgs.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    orgs.dedup_by(|a, b| a.organization_id == b.organization_id);
+    orgs
+}
+
+// ---------------------------------------------------------------------------
 // AppState entity
 // ---------------------------------------------------------------------------
 
-/// Durable OMP identity copied into Scaffold before the first remote run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScaffoldOmpHandoffDraft {
-    pub native_session_id: String,
-    pub cwd: String,
+/// A composer send whose doc command is queued but not yet executed by the
+/// chat's host device — cleared when the host writes the user message back
+/// into the transcript (same client-minted id as the [`AppState::echoes`]
+/// dedup); past [`UNDELIVERED_GRACE_MS`] it surfaces as the explicit
+/// failed/retry state instead.
+#[derive(Debug, Clone)]
+struct PendingSend {
+    message_id: String,
+    started: DateTime<Utc>,
 }
 
-/// A local Comet session selected for Scaffold. The sandbox does not exist
-/// until this session's first prompt is submitted.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScaffoldSessionDraft {
-    pub project_id: String,
-    pub deployment_id: String,
-    pub space_id: String,
-    pub chat_id: String,
-    pub database_environment: ScaffoldDatabaseEnvironment,
-    /// Explicit Git ref, or the published source when unset. Remote sessions
-    /// never inherit the local worktree picker.
-    pub source_ref: Option<String>,
-    /// Existing local OMP session to materialize in Scaffold. `None` creates a
-    /// blank session.
-    pub omp_handoff: Option<ScaffoldOmpHandoffDraft>,
-}
-impl ScaffoldSessionDraft {
-    pub fn collaboration_scope(&self) -> CollaborationScope {
-        CollaborationScope {
-            project_id: self.project_id.clone(),
-            deployment_id: Some(self.deployment_id.clone()),
-            session_id: Some(self.chat_id.clone()),
-            unknown: Default::default(),
-        }
-    }
-}
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScaffoldControlTarget {
-    pub sandbox_id: String,
-    pub scope: CollaborationScope,
+/// How long an unadopted send reads as Working/Sending (or Queued when the
+/// path is degraded) before flipping to the EXPLICIT failed state with a
+/// retry affordance. The old 30s overlay silently expired back to Idle with
+/// no visible trace of the send at all — the exact hole the 2026-08-19
+/// incident fell into.
+pub const UNDELIVERED_GRACE_MS: i64 = 120_000;
+
+/// The one-shot timer behind [`AppState::watch_clock_transitions`].
+#[derive(Default)]
+struct ClockTransitions {
+    /// Re-arms the timer after every notify.
+    observation: Option<gpui::Subscription>,
+    /// The last time observers saw current state (a notify or a wake).
+    checked_at: Option<DateTime<Utc>>,
+    wake_at: Option<DateTime<Utc>>,
+    task: Option<Task<()>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScaffoldSessionAttachment {
-    pub environment: SessionEnvironment,
-    pub projection: SessionRoomProjection,
-    pub grant_id: String,
-    pub owner_device_id: String,
-    pub actor_subject: String,
-    pub source_ref: Option<String>,
-    pub control_target: ScaffoldControlTarget,
-}
-
-/// Read the sandbox lifecycle without opening a session-room projection or
-/// starting its remote Comet process.
-pub(crate) async fn inspect_scaffold_session(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: &CollaborationScope,
-) -> Result<ScaffoldLifecycle, RpcError> {
-    let inspect = ScaffoldEnvironmentControl::Inspect {
-        sandbox_id: sandbox_id.to_string(),
-        scope: scope.clone(),
-    };
-    let value = handle
-        .client()
-        .call(
-            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-            serde_json::to_value(inspect).unwrap_or_default(),
-        )
-        .await?;
-    let inspected: ScaffoldEnvironmentControlResult =
-        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
-    let SessionEnvironmentSource::Scaffold {
-        sandbox_id: inspected_id,
-        lifecycle,
-        ..
-    } = inspected.environment.source
-    else {
-        return Err(RpcError::Failed(
-            "Scaffold inspect returned a local environment".into(),
-        ));
-    };
-    if inspected_id != sandbox_id
-        || inspected.environment.scope.project_id != scope.project_id
-        || inspected.environment.scope.deployment_id != scope.deployment_id
-        || inspected.environment.scope.session_id != scope.session_id
-    {
-        return Err(RpcError::Failed(
-            "Scaffold inspect returned a different sandbox scope".into(),
-        ));
-    }
-    Ok(lifecycle)
-}
-
-/// Attach once the sandbox reports a runnable lifecycle. Every successful
-/// result is fully validated before its route is installed into UI state.
-pub(crate) async fn attach_scaffold_session(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: CollaborationScope,
-) -> Result<ScaffoldSessionAttachment, RpcError> {
-    let attach = ScaffoldEnvironmentControl::Attach {
-        sandbox_id: sandbox_id.to_string(),
-        scope: scope.clone(),
-    };
-    let value = handle
-        .client()
-        .call(
-            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-            serde_json::to_value(attach).unwrap_or_default(),
-        )
-        .await?;
-    let attached: ScaffoldEnvironmentControlResult =
-        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
-    scaffold_session_attachment(attached, sandbox_id, scope)
-}
-
-fn scaffold_session_attachment(
-    attached: ScaffoldEnvironmentControlResult,
-    sandbox_id: &str,
-    scope: CollaborationScope,
-) -> Result<ScaffoldSessionAttachment, RpcError> {
-    let environment = attached.environment.clone();
-    let source_ref = attached.environment.source_ref.clone();
-    let SessionEnvironmentSource::Scaffold {
-        sandbox_id: attached_sandbox_id,
-        lifecycle_epoch,
-        ..
-    } = &attached.environment.source
-    else {
-        return Err(RpcError::Failed(
-            "Scaffold attach returned a local environment".into(),
-        ));
-    };
-    if attached_sandbox_id != sandbox_id {
-        return Err(RpcError::Failed(
-            "Scaffold attach returned a different sandbox".into(),
-        ));
-    }
-    let projection = attached
-        .room_projection
-        .ok_or_else(|| RpcError::Failed("Scaffold attach returned no session room".into()))?;
-    if projection.project_id != scope.project_id
-        || Some(projection.deployment_id.as_str()) != scope.deployment_id.as_deref()
-        || Some(projection.session_id.as_str()) != scope.session_id.as_deref()
-    {
-        return Err(RpcError::Failed(
-            "Scaffold attach returned a different session room".into(),
-        ));
-    }
-    let grant = attached
-        .control_grant
-        .ok_or_else(|| RpcError::Failed("Scaffold attach returned no control grant".into()))?;
-    if !grant
-        .capabilities
-        .iter()
-        .any(|capability| capability == comet_proto::CAPABILITY_SESSION_CHAT)
-    {
-        return Err(RpcError::Failed(
-            "Scaffold attach returned no chat authority".into(),
-        ));
-    }
-    let expected_lifecycle_epoch = lifecycle_epoch
-        .ok_or_else(|| RpcError::Failed("Scaffold attach returned no lifecycle epoch".into()))?;
-    let owner_device_id = attached
-        .attached_device_id
-        .filter(|device_id| {
-            comet_proto::parse_scaffold_device_id(device_id).is_some_and(
-                |(device_sandbox_id, lifecycle_epoch)| {
-                    device_sandbox_id == sandbox_id && lifecycle_epoch == expected_lifecycle_epoch
-                },
-            )
-        })
-        .ok_or_else(|| RpcError::Failed("Scaffold attach returned a different device".into()))?;
-    if attached.environment.owner_principal.is_empty() {
-        return Err(RpcError::Failed(
-            "Scaffold attach returned no owner identity".into(),
-        ));
-    }
-    Ok(ScaffoldSessionAttachment {
-        environment,
-        projection,
-        grant_id: grant.id,
-        owner_device_id,
-        actor_subject: attached.environment.owner_principal,
-        source_ref,
-        control_target: ScaffoldControlTarget {
-            sandbox_id: sandbox_id.to_string(),
-            scope,
-        },
-    })
-}
-
-#[derive(Debug)]
-pub(crate) enum ScaffoldReconnectError {
-    Terminal(ScaffoldLifecycle),
-    InvalidAttachment(RpcError),
-    ProviderUnavailable(RpcError),
-}
-
-impl std::fmt::Display for ScaffoldReconnectError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Terminal(lifecycle) => {
-                write!(formatter, "Scaffold sandbox is terminal ({lifecycle:?})")
-            }
-            Self::InvalidAttachment(error) | Self::ProviderUnavailable(error) => {
-                error.fmt(formatter)
-            }
-        }
-    }
-}
-
-fn scaffold_reconnect_control_error(error: RpcError) -> ScaffoldReconnectError {
-    // ponytail: RpcError has no stable provider/validation code. Crew's own
-    // "returned" checks are invariants; add wire error codes if more cases appear.
-    if matches!(
-        &error,
-        RpcError::Failed(message)
-            if message.starts_with("Scaffold ") && message.contains(" returned ")
-    ) {
-        ScaffoldReconnectError::InvalidAttachment(error)
-    } else {
-        ScaffoldReconnectError::ProviderUnavailable(error)
-    }
-}
-
-// Existing-session reconnects retry transient control failures for up to ten minutes.
-const SCAFFOLD_CONTROL_MAX_ATTEMPTS: usize = 1_200;
-#[cfg(not(test))]
-const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(test)]
-const SCAFFOLD_CONTROL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+thread_local! {
+    static TEST_CLOCK: std::cell::Cell<Option<DateTime<Utc>>> = const { std::cell::Cell::new(None) };
+}
 
-async fn retry_scaffold_control_operation<T, Operation, OperationFuture, Wait, WaitFuture>(
-    mut operation: Operation,
-    wait: &Wait,
-) -> Result<T, RpcError>
-where
-    Operation: FnMut() -> OperationFuture,
-    OperationFuture: Future<Output = Result<T, RpcError>>,
-    Wait: Fn(std::time::Duration) -> WaitFuture,
-    WaitFuture: Future<Output = ()>,
-{
-    let mut attempt = 1;
-    loop {
-        match operation().await {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if attempt < SCAFFOLD_CONTROL_MAX_ATTEMPTS
-                    && comet_engine::scaffold::is_retryable_scaffold_control_error(&error) =>
-            {
-                attempt += 1;
-                wait(SCAFFOLD_CONTROL_RETRY_DELAY).await;
-            }
-            Err(error) => return Err(error),
-        }
+/// Wall-clock time for clock-driven state derivations. Tests pin it to the
+/// simulated executor's timeline with [`TestClock`].
+pub(crate) fn clock_now() -> DateTime<Utc> {
+    #[cfg(test)]
+    if let Some(now) = TEST_CLOCK.with(std::cell::Cell::get) {
+        return now;
+    }
+    Utc::now()
+}
+
+/// Pins [`clock_now`] on this test thread until dropped.
+#[cfg(test)]
+pub(crate) struct TestClock;
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn start(now: DateTime<Utc>) -> Self {
+        let clock = Self;
+        clock.set(now);
+        clock
+    }
+
+    pub(crate) fn set(&self, now: DateTime<Utc>) {
+        TEST_CLOCK.with(|clock| clock.set(Some(now)));
     }
 }
 
-/// Reconnect an existing Scaffold room once. Paused sandboxes resume before a
-/// fresh, lifecycle-bound device grant is installed; active sandboxes only
-/// reattach.
-async fn ensure_scaffold_session_attached_once(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: &CollaborationScope,
-) -> Result<ScaffoldSessionAttachment, ScaffoldReconnectError> {
-    match inspect_scaffold_session(handle, sandbox_id, scope)
-        .await
-        .map_err(scaffold_reconnect_control_error)?
-    {
-        ScaffoldLifecycle::Paused => {
-            let value = handle
-                .client()
-                .call(
-                    methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-                    serde_json::to_value(ScaffoldEnvironmentControl::Resume {
-                        sandbox_id: sandbox_id.to_string(),
-                        scope: scope.clone(),
-                    })
-                    .unwrap_or_default(),
-                )
-                .await
-                .map_err(scaffold_reconnect_control_error)?;
-            let resumed: ScaffoldEnvironmentControlResult =
-                serde_json::from_value(value).map_err(|err| {
-                    scaffold_reconnect_control_error(RpcError::Failed(err.to_string()))
-                })?;
-            if resumed.environment.scope != *scope {
-                return Err(scaffold_reconnect_control_error(RpcError::Failed(
-                    "Scaffold resume returned a different sandbox scope".into(),
-                )));
-            }
-            let SessionEnvironmentSource::Scaffold {
-                sandbox_id: resumed_id,
-                lifecycle,
-                ..
-            } = resumed.environment.source
-            else {
-                return Err(scaffold_reconnect_control_error(RpcError::Failed(
-                    "Scaffold resume returned a local environment".into(),
-                )));
-            };
-            if resumed_id != sandbox_id {
-                return Err(scaffold_reconnect_control_error(RpcError::Failed(
-                    "Scaffold resume returned a different sandbox scope".into(),
-                )));
-            }
-            if matches!(
-                lifecycle,
-                ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed
-            ) {
-                return Err(ScaffoldReconnectError::Terminal(lifecycle));
-            }
-        }
-        lifecycle @ (ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed) => {
-            return Err(ScaffoldReconnectError::Terminal(lifecycle));
-        }
-        ScaffoldLifecycle::Creating
-        | ScaffoldLifecycle::RestoringSnapshot
-        | ScaffoldLifecycle::Starting
-        | ScaffoldLifecycle::Ready
-        | ScaffoldLifecycle::AgentRunning
-        | ScaffoldLifecycle::Resuming => {}
-    }
-    attach_scaffold_session(handle, sandbox_id, scope.clone())
-        .await
-        .map_err(scaffold_reconnect_control_error)
-}
-
-/// Reconnect an existing Scaffold room with bounded automatic recovery for
-/// transient provider rollout, lifecycle, and room-readiness races.
-pub(crate) async fn ensure_scaffold_session_attached<Wait, WaitFuture>(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: &CollaborationScope,
-    wait: &Wait,
-) -> Result<ScaffoldSessionAttachment, ScaffoldReconnectError>
-where
-    Wait: Fn(std::time::Duration) -> WaitFuture,
-    WaitFuture: Future<Output = ()>,
-{
-    let mut attempt = 1;
-    loop {
-        match ensure_scaffold_session_attached_once(handle, sandbox_id, scope).await {
-            Ok(attachment) => return Ok(attachment),
-            Err(ScaffoldReconnectError::ProviderUnavailable(error))
-                if attempt < SCAFFOLD_CONTROL_MAX_ATTEMPTS
-                    && comet_engine::scaffold::is_retryable_scaffold_control_error(&error) =>
-            {
-                attempt += 1;
-                wait(SCAFFOLD_CONTROL_RETRY_DELAY).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-async fn update_scaffold_session_agent_route_once(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: &CollaborationScope,
-    agent_route: &comet_proto::AgentRoute,
-) -> Result<(), RpcError> {
-    let value = handle
-        .client()
-        .call(
-            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-            serde_json::to_value(ScaffoldEnvironmentControl::UpdateAgentRoute {
-                sandbox_id: sandbox_id.to_string(),
-                scope: scope.clone(),
-                agent_route: agent_route.clone(),
-            })
-            .unwrap_or_default(),
-        )
-        .await?;
-    let updated: ScaffoldEnvironmentControlResult =
-        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
-    if updated.environment.scope != *scope {
-        return Err(RpcError::Failed(
-            "Scaffold agent route update returned a different sandbox scope".into(),
-        ));
-    }
-    let SessionEnvironmentSource::Scaffold {
-        sandbox_id: updated_id,
-        lifecycle,
-        ..
-    } = updated.environment.source
-    else {
-        return Err(RpcError::Failed(
-            "Scaffold agent route update returned a local environment".into(),
-        ));
-    };
-    if updated_id != sandbox_id {
-        return Err(RpcError::Failed(
-            "Scaffold agent route update returned a different sandbox".into(),
-        ));
-    }
-    if !matches!(
-        lifecycle,
-        ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning
-    ) {
-        return Err(RpcError::Failed(format!(
-            "Scaffold agent route update returned unavailable lifecycle {lifecycle:?}"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) async fn update_scaffold_session_agent_route<Wait, WaitFuture>(
-    handle: &EngineHandle,
-    sandbox_id: &str,
-    scope: &CollaborationScope,
-    agent_route: &comet_proto::AgentRoute,
-    wait: &Wait,
-) -> Result<(), RpcError>
-where
-    Wait: Fn(std::time::Duration) -> WaitFuture,
-    WaitFuture: Future<Output = ()>,
-{
-    retry_scaffold_control_operation(
-        || update_scaffold_session_agent_route_once(handle, sandbox_id, scope, agent_route),
-        wait,
-    )
-    .await
-}
-
-/// Reports abandoned client-side startup without changing provider readiness.
-/// Ownership moves with the admission future, not with the composer entity.
-pub(crate) struct ScaffoldPreparationGuard {
-    engine: EngineHandle,
-    chat_id: String,
-    generation: String,
-    admitted: bool,
-}
-
-impl ScaffoldPreparationGuard {
-    pub(crate) fn generation(&self) -> &str {
-        &self.generation
-    }
-
-    pub(crate) fn disarm(&mut self) {
-        self.admitted = true;
-    }
-}
-
-impl Drop for ScaffoldPreparationGuard {
+#[cfg(test)]
+impl Drop for TestClock {
     fn drop(&mut self) {
-        if !self.admitted
-            && let Err(error) = self.engine.client().notify(
-                methods::REPORT_SCAFFOLD_PREPARATION_FAILURE,
-                serde_json::json!({
-                    "chatId": self.chat_id,
-                    "generation": self.generation,
-                }),
-            )
-        {
-            tracing::warn!(%error, "could not report abandoned Scaffold preparation");
-        }
+        TEST_CLOCK.with(|clock| clock.set(None));
     }
 }
 
-/// The engine owns creation, bootstrap/readiness, and native history transfer.
-pub(crate) async fn prepare_scaffold_session(
-    handle: &EngineHandle,
-    scope: &CollaborationScope,
-    name: Option<&str>,
-    source_ref: Option<&str>,
-    database_environment: ScaffoldDatabaseEnvironment,
-    agent_route: &AgentRoute,
-    omp_handoff: Option<&ScaffoldOmpHandoffDraft>,
-) -> Result<
-    (
-        ScaffoldSessionAttachment,
-        Option<String>,
-        Option<String>,
-        ScaffoldPreparationGuard,
-    ),
-    RpcError,
-> {
-    let value = handle
-        .client()
-        .call_cancellable(
-            methods::PREPARE_SCAFFOLD_SESSION,
-            serde_json::json!({
-                "scope": scope,
-                "name": name,
-                "sourceRef": source_ref,
-                "databaseEnvironment": database_environment,
-                "agentRoute": agent_route,
-                "ompHandoff": omp_handoff.map(|handoff| serde_json::json!({
-                    "nativeSessionId": handoff.native_session_id,
-                    "cwd": handoff.cwd,
-                })),
-            }),
-        )
-        .await?;
-    // Capture the receipt before decoding/validating the remaining response:
-    // malformed attachment or handoff metadata still abandons this generation.
-    let generation = value
-        .get("preparationGeneration")
-        .and_then(serde_json::Value::as_str)
-        .filter(|generation| !generation.is_empty())
-        .ok_or_else(|| RpcError::Failed("Scaffold preparation returned no generation".into()))?;
-    let preparation = ScaffoldPreparationGuard {
-        engine: handle.clone(),
-        chat_id: scope.session_id.clone().ok_or_else(|| {
-            RpcError::Failed("Scaffold preparation has no session identity".into())
-        })?,
-        generation: generation.to_string(),
-        admitted: false,
-    };
-    let result: ScaffoldEnvironmentControlResult =
-        serde_json::from_value(value).map_err(|error| RpcError::Failed(error.to_string()))?;
-    let native_session_id = result.handoff_native_session_id.clone();
-    let cwd = result.handoff_cwd.clone();
-    if omp_handoff.is_some()
-        && (native_session_id
-            .as_deref()
-            .is_none_or(|id| id.trim().is_empty())
-            || cwd.as_deref().is_none_or(|cwd| cwd.trim().is_empty()))
-    {
-        return Err(RpcError::Failed(
-            "Scaffold preparation returned no native session resume identity".into(),
-        ));
-    }
-    let SessionEnvironmentSource::Scaffold { sandbox_id, .. } = &result.environment.source else {
-        return Err(RpcError::Failed(
-            "Scaffold returned a local environment".into(),
-        ));
-    };
-    let sandbox_id = sandbox_id.clone();
-    Ok((
-        scaffold_session_attachment(result, &sandbox_id, scope.clone())?,
-        native_session_id,
-        cwd,
-        preparation,
-    ))
-}
-/// Pause exactly the sandbox attached to a chat. The response must preserve
-/// both physical sandbox identity and logical session scope.
-pub(crate) async fn pause_scaffold_session(
-    handle: &EngineHandle,
-    target: &ScaffoldControlTarget,
-) -> Result<(), RpcError> {
-    let value = handle
-        .client()
-        .call(
-            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-            serde_json::to_value(ScaffoldEnvironmentControl::Pause {
-                sandbox_id: target.sandbox_id.clone(),
-                scope: target.scope.clone(),
-            })
-            .unwrap_or_default(),
-        )
-        .await?;
-    let paused: ScaffoldEnvironmentControlResult =
-        serde_json::from_value(value).map_err(|err| RpcError::Failed(err.to_string()))?;
-    if paused.environment.scope != target.scope {
-        return Err(RpcError::Failed(
-            "Scaffold pause returned a different sandbox scope".into(),
-        ));
-    }
-    let SessionEnvironmentSource::Scaffold {
-        sandbox_id,
-        lifecycle,
-        ..
-    } = paused.environment.source
-    else {
-        return Err(RpcError::Failed(
-            "Scaffold pause returned a local environment".into(),
-        ));
-    };
-    if sandbox_id != target.sandbox_id || lifecycle != ScaffoldLifecycle::Paused {
-        return Err(RpcError::Failed(
-            "Scaffold pause did not pause the attached sandbox".into(),
-        ));
-    }
-    Ok(())
-}
-pub(crate) async fn archive_and_pause_scaffold_session(
-    handle: &EngineHandle,
-    chat_id: &str,
-    target: &ScaffoldControlTarget,
-) -> Result<(), RpcError> {
-    handle
-        .client()
-        .call(
-            methods::MUTATE,
-            serde_json::json!({
-                "op": "setChatArchived",
-                "chatId": chat_id,
-                "archived": true,
-            }),
-        )
-        .await?;
-    pause_scaffold_session(handle, target).await
+/// A send's attachment-upload leg in flight. `done` is bumped by the upload
+/// task per completed chunk (binary bytes); the working label reads it every
+/// paint (the spinner already animates each frame), so no notify plumbing is
+/// needed. A slow upload renders as "Uploading… N%" instead of a
+/// hang-indistinguishable "Sending…" (2026-08-18 user report).
+pub struct UploadProgress {
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: u64,
 }
 
-const TRANSCRIPT_CACHE_CHAT_LIMIT: usize = 8;
-const TRANSCRIPT_CACHE_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+pub(crate) const CANVAS_PANEL_PREFIX: &str = "space-canvas:";
 
-struct CachedTranscriptWindow {
-    entries: Vec<SessionMessageEntry>,
-    tail_start: usize,
-    tail_before: Option<usize>,
-    history_before: Option<usize>,
+/// Per-space key for new-session-canvas chrome (terminal tabs, panel flags).
+pub fn canvas_panel_key(space_id: Option<&str>) -> String {
+    format!("{CANVAS_PANEL_PREFIX}{}", space_id.unwrap_or(""))
 }
 
-impl CachedTranscriptWindow {
-    fn byte_len(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|entry| {
-                entry.id.len()
-                    + entry.device_id.len()
-                    + entry.parts.iter().map(MessagePart::byte_len).sum::<usize>()
-            })
-            .sum()
-    }
-}
-/// Entry-level work represented by one selected-transcript notification.
-///
-/// `Splice` names indices before and after the reducer mutation. Delta frames
-/// conservatively use a suffix; history paging uses a true head insertion so
-/// the transcript view can preserve every existing row and its list anchor.
+/// The new-session canvas's project/device pick, see [`AppState::canvas_target`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TranscriptEntriesChange {
-    None,
-    Reset,
-    Splice {
-        old: Range<usize>,
-        new: Range<usize>,
-    },
-}
-
-/// Metadata for the most recent selected-transcript revision. Consumers must
-/// fall back to a full reconciliation if they miss a revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranscriptChange {
-    pub revision: u64,
-    pub entries: TranscriptEntriesChange,
-    pub echoes_changed: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum OmpRecoveryPhase {
-    Idle,
-    Waiting,
-    Stopping,
-    Resuming,
-    Failed,
-    Completed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub(crate) struct OmpRecoveryState {
-    pub phase: OmpRecoveryPhase,
-    pub error: Option<String>,
-    #[serde(skip)]
-    pub watch_error: Option<String>,
-    #[serde(skip)]
-    request_generation: u64,
-}
-
-impl OmpRecoveryState {
-    pub fn busy(&self) -> bool {
-        self.watch_error.is_none()
-            && matches!(
-                self.phase,
-                OmpRecoveryPhase::Waiting | OmpRecoveryPhase::Stopping | OmpRecoveryPhase::Resuming
-            )
-    }
-
-    pub fn can_take_over(&self) -> bool {
-        !self.busy() && self.watch_error.is_none() && self.phase == OmpRecoveryPhase::Failed
-    }
-
-    fn disconnected(&mut self, error: String) {
-        self.watch_error = Some(error);
-        self.request_generation = self.request_generation.wrapping_add(1);
-    }
-
-    fn finish_request(&mut self, generation: u64, result: Result<(), String>) {
-        if self.request_generation != generation
-            || self.watch_error.is_some()
-            || matches!(
-                self.phase,
-                OmpRecoveryPhase::Completed | OmpRecoveryPhase::Failed
-            )
-        {
-            return;
-        }
-        match result {
-            Ok(()) => {
-                self.phase = OmpRecoveryPhase::Completed;
-                self.error = None;
-            }
-            Err(error) => {
-                self.phase = OmpRecoveryPhase::Failed;
-                self.error = Some(format!(
-                    "Crew could not resume this session: {error}. Resolve the issue, then retry recovery."
-                ));
-            }
-        }
-    }
+pub(crate) struct CanvasTarget {
+    space: Option<String>,
+    no_project: bool,
+    device: Option<String>,
 }
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
@@ -1467,136 +758,181 @@ impl OmpRecoveryState {
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
 pub struct AppState {
     pub connection: ConnectionStatus,
+    /// Fixed data boundary of the attached engine. Authentication may change
+    /// in place, but changing this scope requires assembling a new runtime.
+    pub workspace_scope: Option<WorkspaceScope>,
+    pub managed_inference: bool,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
+    // Last published device presentation. Heartbeats refresh the underlying
+    // timestamps without invalidating every view when no displayed value changed.
+    device_presentation: Option<Vec<(Device, bool, String)>>,
+    // Presence ticks also retire stale remote session indicators. Remember
+    // their last published appearance even when the device rows stay online.
+    session_presence_presentation: Vec<(Indicator, u32)>,
+    /// Live edge posture (WatchConnectivity): drives the connection pill,
+    /// composer honesty ("will queue"), and the Queued send badges.
+    pub connectivity: zeron_proto::Connectivity,
+    /// Whether this runtime's connectivity watch has delivered its first
+    /// frame. The default `Disabled` value is only a placeholder and must not
+    /// seed notification decisions before the watch is authoritative.
+    pub(crate) connectivity_observed: bool,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
-    /// Harness-native session metadata discovered on this device. Transcripts
-    /// remain engine-private until the user attaches one candidate explicitly.
-    pub local_session_candidates: Vec<LocalSessionCandidate>,
-    /// Current engine authority, never inferred from historical transcript errors.
-    omp_recovery: HashMap<String, OmpRecoveryState>,
-    omp_recovery_request_generation: u64,
-    pub local_sessions_loading: bool,
-    pub local_sessions_error: Option<String>,
-    pub local_session_attaching: HashSet<String>,
-    pub local_session_attach_errors: HashMap<String, String>,
-    local_sessions_refreshed_at: Option<std::time::Instant>,
-    /// Session attachment and first-send creation can resolve before the chats
-    /// watch publishes their row. Keep the selected id alive until it arrives.
-    pending_local_chat_ids: HashSet<String>,
-    /// Local first-send progress remains explicit after the workspace watch
-    /// replaces the optimistic row and clears `pending_local_chat_ids`.
-    chat_startup_phases: HashMap<String, ChatStartupPhase>,
+    /// Fork RPC may arrive ahead of its registry row on a remote device.
+    pending_side_chat: Option<Chat>,
+    /// `pending_side_chat` was started by hand and nothing has minted it:
+    /// no registry row, no doc, until its first send.
+    unsaved_side_chat: bool,
     pub sessions: Vec<Session>,
-    /// Factual watch publications, independent of UI/heartbeat notifications.
-    pub sessions_revision: u64,
-    /// First frame of each subscription establishes a silent attention baseline.
-    pub sessions_epoch: u64,
-    /// Imported session memberships from the workspace `sessionRefs` map.
-    pub session_refs: Vec<SessionRef>,
-    /// Source entry id and label learned after an imported room has opened.
-    shared_session_previews: HashMap<String, (String, String)>,
-    /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
-    /// when the row vanishes; selecting a chat implies its space.
+    /// Synced user/org sidebar pin state. Local workspaces deliberately ignore
+    /// this and continue reading their device-local settings entry.
+    pub sidebar_preferences: SidebarPreferencesState,
+    session_presentation: Option<Vec<Session>>,
+    /// The project the new-session canvas mints into. Healed by
+    /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
+    /// its project.
     pub selected_space: Option<String>,
-    /// Presentation-only members of the selected logical sidebar source.
-    /// Persisted spaces and chat ownership remain unchanged.
-    selected_space_members: Vec<String>,
+    /// Deliberate "Don't work in a project" pick: while set, the canvas mints
+    /// project-less sessions (cwd `~` on the picked device) and
+    /// [`Self::selected_space_row`] reads as `None` — healing must NOT
+    /// re-select a project underneath it.
+    pub no_project: bool,
+    /// The composer's device pick — where project-less sessions run, and the
+    /// device whose projects the project picker lists. `None` falls back to
+    /// the local device.
+    pub selected_device: Option<String>,
+    /// The new-session canvas's own target, set aside while a chat is open
+    /// (a chat implies ITS project/device) and put back on return, so the
+    /// canvas always reopens where the user left it.
+    pub(crate) canvas_target: Option<CanvasTarget>,
     pub selected_chat: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
+    /// First chats / spaces watch frame has landed — device-local state that
+    /// prunes against the doc (open tabs, the sidebar space filter) must not
+    /// judge by the empty pre-sync lists.
+    pub chats_synced: bool,
+    pub spaces_synced: bool,
+    pending_deep_link: Option<crate::links::ConversationDeepLink>,
+    pending_crew_link: Option<crate::settings::PendingCrewLink>,
+    deep_link_notice: Option<String>,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
-    /// Changes only when selected transcript rows or optimistic echoes change.
-    transcript_revision: u64,
-    /// Exact entry/echo work represented by `transcript_revision`.
-    transcript_change: TranscriptChange,
-    /// First entry owned by the live bounded tail. Earlier entries were loaded
-    /// explicitly by upward paging and are not part of delta `count` checks.
-    transcript_tail_start: usize,
-    /// Cursor immediately before the live tail; refreshed by watch frames.
-    transcript_tail_before: Option<usize>,
-    /// Cursor immediately before the oldest explicitly loaded entry.
-    transcript_history_before: Option<usize>,
-    transcript_history_loading: bool,
-    transcript_history_task: Option<Task<()>>,
-    transcript_restored_from_cache: bool,
-    transcript_cache: HashMap<String, CachedTranscriptWindow>,
-    transcript_cache_lru: Vec<String>,
-    /// Multiplayer projection for the selected shared thread. The last good
-    /// snapshot remains visible while its watch reconnects or a model hands off.
-    pub collaboration: Option<CollaborationSnapshot>,
-    /// Independently-owned agent session targeted by pause/resume/steer/stop.
-    /// It is UI selection only; authority still comes from the verified grant.
-    pub selected_agent_session: Option<String>,
-    /// Installed-app invitation awaiting the exact session/grant projection.
-    pending_invitation: Option<comet_proto::CometInvitation>,
-    pending_scaffold_link: Option<comet_proto::ScaffoldSessionLink>,
-    pending_directory_link: Option<comet_proto::CrewSessionLink>,
-    /// Grant named by the accepted deep link. It remains a routing identity;
-    /// command authority is still checked against the verified projection.
-    pub selected_invitation_grant: Option<String>,
-    /// Verified invite membership awaiting its `AddSessionRef` pin — set once
-    /// the deep link's grant checks out against the room projection and the
-    /// session has no workspace chat row. Drained wherever a `Context` and the
-    /// engine handle are both in reach.
-    pending_session_pin: Option<String>,
-    /// Trusted per-chat room scopes returned by Scaffold Attach. Absence is
-    /// intentional: ordinary local sessions continue to use legacy s3 rooms.
-    room_projections: HashMap<String, SessionRoomProjection>,
-    /// Exact non-secret grant id returned by the attach that selected each
-    /// Scaffold room. It is a route selector only; authority remains host-local.
-    scaffold_control_grants: HashMap<String, String>,
-    /// Non-secret physical targets for attached Scaffold chats. Retained after
-    /// settlement so archive can pause the exact sandbox idempotently.
-    scaffold_control_targets: HashMap<String, ScaffoldControlTarget>,
-    /// Exact remote host device for attached Scaffold chats. The workspace chat
-    /// stays owned by the local folder device for grouping; filesystem RPCs
-    /// must route to this physical sandbox device instead.
-    scaffold_host_devices: HashMap<String, String>,
-    /// Latest control-plane metadata keyed by the Crew chat/session id.
-    scaffold_environments: HashMap<String, SessionEnvironment>,
-    /// Exact local Comet session awaiting its first-prompt Scaffold attach.
-    pending_scaffold_session: Option<ScaffoldSessionDraft>,
-    /// A Comet chat row is being persisted for a user-selected Scaffold session.
-    scaffold_session_creating: bool,
-    pub scaffold_session_error: Option<String>,
-    /// Configured local-controller boundary for creating Scaffold demo sandboxes.
-    scaffold_scope: Option<(String, String)>,
-    /// First turns intentionally wait here after the staging sandbox is accepted.
-    scaffold_starting_chats: HashSet<String>,
-    /// Chats the user explicitly marked unread. Suppresses the shell's
-    /// "looking at it ⇒ seen" auto-stamp until the user actively re-selects
-    /// the chat, and pins the row unseen against in-flight watch frames that
-    /// still carry the pre-mutate seen stamp.
-    unread_marks: HashSet<String>,
+    /// The selected chat's pending-message queue — what was typed while the
+    /// agent was busy, in the order it will be sent. Device-agnostic: the
+    /// chat's doc holds them (every device sees the same queue).
+    pub queue: Vec<zeron_doc::QueuedMessage>,
+    pub context_usage: Option<zeron_proto::ContextUsage>,
+    /// The selected chat has a transcript from a `WatchDocMessages` reset
+    /// (including a retained reset from an earlier visit). An
+    /// empty transcript is otherwise indistinguishable from the pre-replay
+    /// gap after selection, where optimistic echoes may already be visible.
+    pub transcript_replayed: bool,
+    transcript_baselines: HashMap<String, Arc<zeron_doc::TranscriptBaseline>>,
+    transcript_cache: std::collections::VecDeque<CachedTranscript>,
+    pub(crate) prepared_transcripts: HashMap<String, Arc<crate::transcript::PreparedTranscript>>,
+    /// Changes only when transcript/optimistic content changes. Presence,
+    /// catalogs and other app-state notifications need no row derivation.
+    pub(crate) transcript_revision: u64,
+    /// Changes whenever an input of [`Self::file_link_roots`] does — chat
+    /// rows, projects, this device's id — so views can memoize the roots.
+    pub(crate) link_roots_revision: u64,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    /// Send-in-flight overlay per chat id: a queued doc command the host
+    /// hasn't executed yet (see [`Self::begin_pending_send`]).
+    pending_sends: HashMap<String, PendingSend>,
+    /// The in-flight send's attachment upload, when it has one.
+    upload_progress: Option<UploadProgress>,
+    /// Engine-side queued-attachment transfers by uploadId (`WatchTransfers`
+    /// snapshots): real relay-leg progress for the sending thumbnail's
+    /// percent ring, present exactly while bytes are moving.
+    transfers: HashMap<String, (u64, u64)>,
+    /// Written by the changes pane, read by the composer.
+    review_comments: HashMap<String, Vec<ReviewComment>>,
+    /// File surfaces whose editor-backed comments currently cite a buffer
+    /// revision that has not reached disk yet. A chat remains blocked until
+    /// every surface waiting on a workspace write has finished or cancelled.
+    review_comment_flushes: HashMap<String, HashSet<u64>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<comet_update::UpdateStatus>,
+    /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
+    /// standing stream may be backed by subprocess and network probes.
+    pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
-    runtime_profile: RuntimeProfile,
+    /// Notifies at clock-driven transitions (see [`Self::watch_clock_transitions`]).
+    clock: ClockTransitions,
     engine: Option<EngineHandle>,
-    /// Boot config retained so a closed RPC transport can re-run the
-    /// probe-or-embed bootstrap (`on_engine_closed`).
-    boot_config: Option<EngineBootConfig>,
-    /// Quit in progress: the drained in-process engine's closing streams must
-    /// not trigger the reconnect supervisor mid-shutdown.
-    shutting_down: bool,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
-    collaboration_task: Option<Task<()>>,
-    omp_recovery_task: Option<Task<()>>,
+    change_requests: ChangeRequestClientState,
+    change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
+    queue_task: Option<Task<()>>,
+    change_requests_visible: bool,
+    /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
+    /// subagent tabs read these). Independent of `selected_chat`: a tab's
+    /// feed must survive chat switches — the tab itself is what scopes it.
+    sub_transcripts: HashMap<String, Vec<SessionMessageEntry>>,
+    /// One watch task per live subagent doc (single-flight per key).
+    /// Dropping a task cancels the engine-side watch and unpins the doc from
+    /// the engine LRU — closing a tab MUST go through
+    /// [`Self::unwatch_subagent_doc`].
+    sub_watch_tasks: HashMap<String, Task<()>>,
+}
+
+/// Text/reasoning growth changes the transcript without changing session
+/// status, tools, navigation, or composer state. Keep those frames local to
+/// the affected transcript instead of rebuilding every app-state observer.
+pub(crate) struct TranscriptTextChanged {
+    pub doc_id: String,
+}
+
+impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
+
+/// An explicit conversation link passed workspace/owner resolution. Background
+/// selection changes do not request a shell route change.
+pub(crate) struct ConversationLinkOpened {
+    pub chat_id: String,
+}
+
+impl gpui::EventEmitter<ConversationLinkOpened> for AppState {}
+
+fn is_text_append(frame: &TranscriptFrame) -> bool {
+    matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
+        if upsert.is_empty() && remove.is_empty() && !append.is_empty())
+}
+
+/// Each session's presence at `now` (the lease-dependent part of a frame).
+fn session_presence_at(sessions: &[Session], now: DateTime<Utc>) -> Vec<(Indicator, u32)> {
+    sessions
+        .iter()
+        .map(|session| session_presence(session, now))
+        .collect()
+}
+
+/// Device rows as rendered at `now`: the heartbeat timestamp only through its
+/// online state and last-seen label.
+fn device_presentation_at(devices: &[Device], now: DateTime<Utc>) -> Vec<(Device, bool, String)> {
+    devices
+        .iter()
+        .map(|device| {
+            let mut metadata = device.clone();
+            metadata.last_seen_at = None;
+            (
+                metadata,
+                crate::settings::devices::device_online(device.last_seen_at, now),
+                crate::settings::devices::format_last_seen(device.last_seen_at, now),
+            )
+        })
+        .collect()
 }
 
 impl Default for AppState {
@@ -1604,696 +940,794 @@ impl Default for AppState {
         Self::new()
     }
 }
-fn configured_scaffold_scope(config: &EngineBootConfig) -> Option<(String, String)> {
-    config.scaffold_url.as_ref().map(|_| {
-        let deployment_id = config
-            .deployment_id
-            .clone()
-            .unwrap_or_else(|| config.project_scope.clone());
-        (config.project_scope.clone(), deployment_id)
-    })
-}
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             connection: ConnectionStatus::Connecting,
+            workspace_scope: None,
+            managed_inference: false,
             auth: None,
             devices: Vec::new(),
+            device_presentation: None,
+            session_presence_presentation: Vec::new(),
+            connectivity: zeron_proto::Connectivity::default(),
+            connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
-            omp_recovery: HashMap::new(),
-            omp_recovery_request_generation: 0,
-            local_session_candidates: Vec::new(),
-            local_sessions_loading: false,
-            local_sessions_error: None,
-            local_session_attaching: HashSet::new(),
-            local_session_attach_errors: HashMap::new(),
-            local_sessions_refreshed_at: None,
-            pending_local_chat_ids: HashSet::new(),
-            chat_startup_phases: HashMap::new(),
+            pending_side_chat: None,
+            unsaved_side_chat: false,
             sessions: Vec::new(),
-            sessions_revision: 0,
-            sessions_epoch: 0,
-            session_refs: Vec::new(),
-            shared_session_previews: HashMap::new(),
+            sidebar_preferences: SidebarPreferencesState::default(),
+            session_presentation: None,
             selected_space: None,
-            selected_space_members: Vec::new(),
+            no_project: false,
+            selected_device: None,
+            canvas_target: None,
             selected_chat: None,
             transcript: Vec::new(),
+            queue: Vec::new(),
+            context_usage: None,
+            transcript_replayed: false,
+            transcript_baselines: HashMap::new(),
+            transcript_cache: Default::default(),
+            prepared_transcripts: HashMap::new(),
             transcript_revision: 0,
-            transcript_change: TranscriptChange {
-                revision: 0,
-                entries: TranscriptEntriesChange::Reset,
-                echoes_changed: true,
-            },
-            transcript_tail_start: 0,
-            transcript_tail_before: None,
-            transcript_history_before: None,
-            transcript_history_loading: false,
-            transcript_history_task: None,
-            transcript_restored_from_cache: false,
-            transcript_cache: HashMap::new(),
-            transcript_cache_lru: Vec::new(),
-            collaboration: None,
-            selected_agent_session: None,
-            pending_invitation: None,
-            pending_scaffold_link: None,
-            pending_directory_link: None,
-            selected_invitation_grant: None,
-            pending_session_pin: None,
-            room_projections: HashMap::new(),
-            scaffold_control_grants: HashMap::new(),
-            scaffold_control_targets: HashMap::new(),
-            scaffold_host_devices: HashMap::new(),
-            scaffold_environments: HashMap::new(),
-            pending_scaffold_session: None,
-            scaffold_session_creating: false,
-            scaffold_session_error: None,
-            scaffold_scope: None,
-            scaffold_starting_chats: HashSet::new(),
-            unread_marks: HashSet::new(),
+            link_roots_revision: 0,
             echoes: HashMap::new(),
+            pending_sends: HashMap::new(),
+            upload_progress: None,
+            transfers: HashMap::new(),
+            review_comments: HashMap::new(),
+            review_comment_flushes: HashMap::new(),
             local_device_id: None,
-            update: None,
+            harness_updates: Vec::new(),
             data_dir: None,
-            runtime_profile: RuntimeProfile::LocalController,
+            clock: ClockTransitions::default(),
             engine: None,
-            boot_config: None,
-            shutting_down: false,
             watch_tasks: Vec::new(),
             transcript_task: None,
-            collaboration_task: None,
-            omp_recovery_task: None,
+            change_requests: ChangeRequestClientState::default(),
+            change_request_tasks: HashMap::new(),
+            queue_task: None,
+            change_requests_visible: true,
+            sub_transcripts: HashMap::new(),
+            sub_watch_tasks: HashMap::new(),
             auto_selected: false,
+            chats_synced: false,
+            spaces_synced: false,
+            pending_deep_link: None,
+            pending_crew_link: None,
+            deep_link_notice: None,
         }
+    }
+
+    /// The selected chat, or `""` on the new-chat canvas. Identical to the
+    /// composer's own attachment/draft key, so a comment written before the
+    /// first send survives the chat being minted.
+    pub fn composer_key(&self) -> String {
+        self.selected_chat.clone().unwrap_or_default()
+    }
+
+    /// Per-session chrome key (terminal tabs, panel open flags). Real chats
+    /// use the chat id; the new-session canvas is per-space so two projects
+    /// don't share one drawer.
+    pub fn panel_session_key(&self) -> String {
+        match self.selected_chat.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => canvas_panel_key(self.selected_space.as_deref()),
+        }
+    }
+
+    /// Optional `OpenTerminal` cwd. Existing chats leave this unset so the
+    /// engine reads the chat row. The canvas has no row yet — pass the
+    /// selected project's folder. When the project id is known but the
+    /// WatchSpaces row has not landed, leave cwd unset: `chatId` is
+    /// `space-canvas:{spaceId}` and the engine resolves the folder. Only
+    /// a deliberate project-less canvas sends `~`.
+    pub fn terminal_open_cwd(&self) -> Option<String> {
+        self.terminal_open_cwd_for(&self.panel_session_key())
+    }
+
+    /// [`Self::terminal_open_cwd`] for a specific panel key (the tab being
+    /// opened, which matches the selected session).
+    pub fn terminal_open_cwd_for(&self, session_key: &str) -> Option<String> {
+        let Some(space_id) = session_key.strip_prefix(CANVAS_PANEL_PREFIX) else {
+            return None;
+        };
+        if space_id.is_empty() || self.no_project {
+            return Some("~".to_string());
+        }
+        self.spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .map(|space| space.path.clone())
+            .filter(|path| !path.trim().is_empty())
+    }
+
+    /// Device to address terminal RPCs at, when it isn't this engine.
+    /// Canvas keys (`space-canvas:{space}`) resolve through the space row
+    /// (or the project-less device pick).
+    pub fn terminal_target_device(&self, session_key: &str) -> Option<String> {
+        let device = if let Some(space_id) = session_key.strip_prefix(CANVAS_PANEL_PREFIX) {
+            if space_id.is_empty() {
+                self.selected_device
+                    .clone()
+                    .or_else(|| self.local_device_id.clone())?
+            } else {
+                self.spaces
+                    .iter()
+                    .find(|space| space.id == space_id)?
+                    .device_id
+                    .clone()
+            }
+        } else {
+            self.chats
+                .iter()
+                .find(|chat| chat.id == session_key)?
+                .device_id
+                .clone()
+        };
+        (self.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
+    }
+
+    pub fn review_comments(&self, key: &str) -> &[ReviewComment] {
+        self.review_comments
+            .get(key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn add_review_comment(&mut self, key: &str, comment: ReviewComment) {
+        self.review_comments
+            .entry(key.to_string())
+            .or_default()
+            .push(comment);
+    }
+
+    pub fn remove_review_comment(&mut self, key: &str, id: &str) {
+        if let Some(list) = self.review_comments.get_mut(key) {
+            list.retain(|c| c.id != id);
+            if list.is_empty() {
+                self.review_comments.remove(key);
+                self.review_comment_flushes.remove(key);
+            }
+        }
+    }
+
+    /// Update only a staged comment's body. A stale editor must never recreate
+    /// a comment that has already been removed or sent to the agent.
+    pub fn update_review_comment_body(&mut self, key: &str, id: &str, body: String) {
+        if let Some(comment) = self
+            .review_comments
+            .get_mut(key)
+            .and_then(|comments| comments.iter_mut().find(|comment| comment.id == id))
+        {
+            comment.body = body;
+        }
+    }
+
+    pub fn update_review_comment_line(&mut self, key: &str, id: &str, line: u32) {
+        if let Some(comment) = self
+            .review_comments
+            .get_mut(key)
+            .and_then(|comments| comments.iter_mut().find(|comment| comment.id == id))
+        {
+            comment.line = line;
+        }
+    }
+
+    pub fn rename_review_comment_path(&mut self, key: &str, old_path: &str, new_path: &str) {
+        if let Some(comments) = self.review_comments.get_mut(key) {
+            for comment in comments
+                .iter_mut()
+                .filter(|comment| comment.is_file() && comment.path == old_path)
+            {
+                comment.path = new_path.to_string();
+            }
+        }
+    }
+
+    pub fn take_review_comments(&mut self, key: &str) -> Vec<ReviewComment> {
+        self.review_comment_flushes.remove(key);
+        self.review_comments.remove(key).unwrap_or_default()
+    }
+
+    pub fn purge_review_comments(&mut self, key: &str) {
+        self.review_comment_flushes.remove(key);
+        self.review_comments.remove(key);
+    }
+
+    pub fn begin_review_comment_flush(&mut self, key: &str, source: u64) {
+        self.review_comment_flushes
+            .entry(key.to_string())
+            .or_default()
+            .insert(source);
+    }
+
+    pub fn finish_review_comment_flush(&mut self, key: &str, source: u64) {
+        let remove_key = self
+            .review_comment_flushes
+            .get_mut(key)
+            .is_some_and(|sources| {
+                sources.remove(&source);
+                sources.is_empty()
+            });
+        if remove_key {
+            self.review_comment_flushes.remove(key);
+        }
+    }
+
+    pub fn review_comment_flush_pending(&self, key: &str) -> bool {
+        self.review_comment_flushes.contains_key(key)
     }
 
     // ---- reducers (pure) ----
 
-    pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
-        // First-send setup may spend seconds materializing a large worktree.
-        // Preserve its optimistic row across unrelated watch frames so tabs and
-        // the sidebar acknowledge the session immediately. The authoritative
-        // row replaces it as soon as the watch publishes the same id.
-        self.pending_local_chat_ids
-            .retain(|chat_id| !chats.iter().any(|chat| chat.id == *chat_id));
-        for pending in self
-            .chats
-            .iter()
-            .filter(|chat| self.pending_local_chat_ids.contains(&chat.id))
-        {
-            if !chats.iter().any(|chat| chat.id == pending.id) {
+    pub(crate) fn apply_sidebar_preferences(&mut self, value: SidebarPreferencesState) -> bool {
+        if value.revision < self.sidebar_preferences.revision || value == self.sidebar_preferences {
+            return false;
+        }
+        self.sidebar_preferences = value;
+        true
+    }
+
+    /// Returns whether anything observable changed. The engine re-publishes
+    /// identical lists (presence and sync churn elsewhere in the doc), and
+    /// each notify re-renders the whole shell.
+    pub fn apply_chats(&mut self, mut chats: Vec<Chat>) -> bool {
+        let mut changed = false;
+        if let Some(pending) = &self.pending_side_chat {
+            if chats.iter().any(|chat| chat.id == pending.id) {
+                self.pending_side_chat = None;
+                changed = true;
+            } else {
                 chats.push(pending.clone());
             }
         }
         sort_chats(&mut chats);
-        // An explicit "mark unread" must survive watch frames that raced the
-        // mutate (they still carry the pre-clear seen stamp). Once the synced
-        // row itself reads unseen, the pin has served its display purpose —
-        // it stays set only to keep suppressing the shell's auto-seen stamp.
-        if !self.unread_marks.is_empty() {
-            self.unread_marks
-                .retain(|id| chats.iter().any(|chat| chat.id == *id));
-            for chat in &mut chats {
-                if self.unread_marks.contains(&chat.id) {
-                    chat.last_seen_at = None;
-                }
-            }
+        if !self.chats_synced || self.chats != chats {
+            changed = true;
+            self.chats = chats;
+            self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
+            self.chats_synced = true;
+            self.transcript_cache
+                .retain(|cached| self.chats.iter().any(|c| c.id == cached.chat_id));
         }
-        self.chats = chats;
-        let chats = &self.chats;
-        self.local_session_candidates
-            .retain(|candidate| !chats.iter().any(|chat| chat.id == candidate.chat_id));
-        let candidates = &self.local_session_candidates;
-        self.local_session_attach_errors.retain(|candidate_id, _| {
-            candidates
-                .iter()
-                .any(|candidate| candidate.id == *candidate_id)
-        });
-        self.scaffold_starting_chats.retain(|chat_id| {
-            chats.iter().any(|chat| chat.id == *chat_id)
-                || self.pending_local_chat_ids.contains(chat_id)
-        });
-        self.chat_startup_phases.retain(|chat_id, _| {
-            chats.iter().any(|chat| chat.id == *chat_id)
-                || self.pending_local_chat_ids.contains(chat_id)
-        });
-        self.heal_selected_session();
-    }
-
-    pub fn apply_local_session_candidates(&mut self, mut candidates: Vec<LocalSessionCandidate>) {
-        candidates.retain(|candidate| {
-            !self.chats.iter().any(|chat| chat.id == candidate.chat_id)
-                && !self.pending_local_chat_ids.contains(&candidate.chat_id)
-        });
-        self.local_session_attach_errors.retain(|candidate_id, _| {
-            candidates
-                .iter()
-                .any(|candidate| candidate.id == *candidate_id)
-        });
-        self.local_session_candidates = candidates;
-    }
-
-    pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
-        self.sessions = sessions;
-        self.sessions_revision = self.sessions_revision.wrapping_add(1);
-    }
-
-    pub fn apply_scaffold_environments(&mut self, snapshot: ScaffoldEnvironmentSnapshot) {
-        for environment in &snapshot.environments {
-            self.remember_scaffold_route(environment);
+        if let Some(selected) = &self.selected_chat
+            && !self.chats.iter().any(|c| &c.id == selected)
+        {
+            changed = true;
+            // Selected chat vanished (deleted elsewhere): drop selection + transcript.
+            self.transcript_baselines.remove(selected);
+            self.prepared_transcripts.remove(selected);
+            self.selected_chat = None;
+            self.restore_canvas_target();
+            self.transcript.clear();
+            self.context_usage = None;
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            self.transcript_replayed = false;
+            self.transcript_task = None;
+            self.queue.clear();
+            self.queue_task = None;
         }
-        self.scaffold_environments = snapshot
-            .environments
-            .into_iter()
-            .filter_map(|environment| {
-                let chat_id = environment.scope.session_id.clone()?;
-                Some((chat_id, environment))
+        changed
+    }
+
+    pub fn apply_sessions(&mut self, sessions: Vec<Session>) -> bool {
+        self.apply_sessions_at(sessions, Utc::now())
+    }
+
+    fn apply_sessions_at(&mut self, sessions: Vec<Session>, now: DateTime<Utc>) -> bool {
+        let presence = session_presence_at(&sessions, now);
+        let presentation: Vec<_> = sessions
+            .iter()
+            .map(|session| {
+                let mut metadata = session.clone();
+                // The timestamp is a liveness lease, not visible text. Keep its
+                // effective indicator in the key and retain the actual value below.
+                metadata.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+                metadata
             })
             .collect();
+        let changed = self.session_presentation.as_ref() != Some(&presentation)
+            || self.session_presence_presentation != presence;
+        self.session_presentation = Some(presentation);
+        self.session_presence_presentation = presence;
+        self.sessions = sessions;
+        changed
     }
 
-    pub fn apply_session_refs(&mut self, mut refs: Vec<SessionRef>) {
-        // Persisted refs seed missing routes. Live snapshots and attachments
-        // refresh them; a later ref notification must not roll back that state.
-        for session_ref in &refs {
-            if let Some(environment) = &session_ref.environment
-                && environment.scope.session_id.as_deref() == Some(session_ref.chat_id.as_str())
-                && !self
-                    .scaffold_control_targets
-                    .contains_key(&session_ref.chat_id)
-            {
-                self.remember_scaffold_route(environment);
-            }
-        }
-        refs.sort_by(|a, b| {
-            b.added_at
-                .cmp(&a.added_at)
-                .then_with(|| a.chat_id.cmp(&b.chat_id))
-        });
-        self.session_refs = refs;
-        self.heal_selected_session();
-    }
-
-    /// Environment snapshots and persisted refs are route hints, not grants.
-    /// The engine still verifies exact room/device authority on every attach.
-    fn remember_scaffold_route(&mut self, environment: &SessionEnvironment) {
-        let Some((project, deployment)) = self.scaffold_scope.as_ref() else {
-            return;
-        };
-        let scope = &environment.scope;
-        let Some(chat_id) = scope.session_id.as_ref() else {
-            return;
-        };
-        if &scope.project_id != project || scope.deployment_id.as_ref() != Some(deployment) {
-            return;
-        }
-        let SessionEnvironmentSource::Scaffold {
-            sandbox_id,
-            lifecycle_epoch,
-            ..
-        } = &environment.source
-        else {
-            return;
-        };
-        self.room_projections.insert(
-            chat_id.clone(),
-            SessionRoomProjection {
-                project_id: project.clone(),
-                deployment_id: deployment.clone(),
-                session_id: chat_id.clone(),
-            },
-        );
-        self.scaffold_control_targets.insert(
-            chat_id.clone(),
-            ScaffoldControlTarget {
-                sandbox_id: sandbox_id.clone(),
-                scope: scope.clone(),
-            },
-        );
-        if let Some(epoch) = lifecycle_epoch {
-            self.scaffold_host_devices.insert(
-                chat_id.clone(),
-                format!("comet-scaffold-{sandbox_id}-e{epoch}"),
-            );
-        }
-        self.scaffold_environments
-            .insert(chat_id.clone(), environment.clone());
-    }
-
-    fn heal_selected_session(&mut self) {
-        let Some(selected) = self.selected_chat.as_deref() else {
-            return;
-        };
-        let available = self.chats.iter().any(|chat| chat.id == selected)
-            || self
-                .session_refs
-                .iter()
-                .any(|session_ref| session_ref.chat_id == selected)
-            || self.pending_local_chat_ids.contains(selected)
-            || self
-                .pending_invitation
-                .as_ref()
-                .is_some_and(|invitation| invitation.chat_id == selected);
-        if available {
-            return;
-        }
-        self.cache_selected_transcript();
-        self.selected_chat = None;
-        self.restore_transcript(None);
-        self.transcript_task = None;
-        self.omp_recovery_task = None;
-        self.transcript_history_task = None;
-        self.transcript_history_loading = false;
-        self.collaboration = None;
-        self.collaboration_task = None;
-    }
-
-    pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
-        spaces.retain(|space| !space.id.starts_with(LEGACY_SCAFFOLD_SPACE_ID_PREFIX));
-        // A retained first send owns presentation until its bootstrap projects;
-        // an unrelated/stale spaces frame must not hide its folder or selection.
-        for space in &self.spaces {
-            if !spaces.iter().any(|incoming| incoming.id == space.id)
-                && self.chats.iter().any(|chat| chat.space_id.as_deref() == Some(space.id.as_str()) && self.chat_is_pending(&chat.id)) {
-                spaces.push(space.clone());
-            }
-        }
+    /// Returns whether the list or the healed selection changed.
+    pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) -> bool {
         sort_spaces(&mut spaces);
-        self.spaces = spaces;
-        // Heal a vanished selection (space deleted elsewhere): fall back to the
-        // first space; its chats died with it, so a matching chat selection is
-        // healed by the accompanying chats frame (`apply_chats`).
+        let previous_selection = self.selected_space.clone();
+        let mut changed = false;
+        if !self.spaces_synced || self.spaces != spaces {
+            changed = true;
+            self.spaces = spaces;
+            self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
+            self.spaces_synced = true;
+        }
+        self.heal_space_selection();
+        changed || self.selected_space != previous_selection
+    }
+
+    fn heal_space_selection(&mut self) {
+        if self.no_project {
+            self.selected_space = None;
+            return;
+        }
+        // Heal a vanished selection (project deleted elsewhere): fall back to
+        // the first project; its chats died with it, so a matching chat
+        // selection is healed by the accompanying chats frame (`apply_chats`).
+        // The picker lists projects per-device, so healing prefers one on the
+        // picked device — a global fallback would silently re-aim the canvas
+        // at another machine.
         if let Some(selected) = &self.selected_space
-            && !self.spaces.iter().any(|space| &space.id == selected)
+            && !self.spaces.iter().any(|s| &s.id == selected)
         {
-            self.selected_space = self.spaces.first().map(|space| space.id.clone());
-            self.selected_space_members.clear();
+            self.selected_space = self.first_space_on_picked_device();
         }
-        // First frame with no selection yet: pick the first space so the shell
-        // never renders an empty main area while spaces exist.
-        if self.selected_space.is_none() {
-            self.selected_space = self.spaces.first().map(|space| space.id.clone());
+        // First frame with no selection yet: pick the first project so the
+        // canvas never boots project-less by accident — unless the user
+        // deliberately opted out.
+        if self.selected_space.is_none() && !self.no_project {
+            self.selected_space = self.first_space_on_picked_device();
         }
-        self.selected_space_members
-            .retain(|id| self.spaces.iter().any(|space| space.id == *id));
-        if let Some(selected) = self.selected_space.clone()
-            && !self.selected_space_members.contains(&selected)
+    }
+
+    /// The ordered checkouts a file link from `chat_id` may resolve against:
+    /// the chat's own checkout, its parent chat's, then every project root on
+    /// the linking chat's device — an agent's paths name its own disk, so a
+    /// root on another device never owns them. Project roots have no owning
+    /// chat — a link that matches one opens by absolute path through the
+    /// linking chat. `local` marks roots whose files sit on this disk; a
+    /// remote chat's worktree still resolves links (reads go through its own
+    /// device) but cannot offer local file actions.
+    pub(crate) fn file_link_roots(
+        &self,
+        chat_id: &str,
+    ) -> Vec<crate::workspace_links::FileLinkRoot> {
+        use crate::workspace_links::FileLinkRoot;
+        // An unprobed device id means the chats on screen are the local
+        // engine's — everything shown counts as local until sync says else.
+        let on_this_device = |device: &str| {
+            self.local_device_id
+                .as_deref()
+                .is_none_or(|local| device == local)
+        };
+        let mut roots: Vec<FileLinkRoot> = Vec::new();
+        let mut push = |chat: Option<&Chat>, device: &str, root: Option<&str>| {
+            let Some(root) = root.filter(|root| !root.is_empty()) else {
+                return;
+            };
+            if roots.iter().any(|existing| existing.root == root) {
+                return;
+            }
+            roots.push(FileLinkRoot {
+                chat: chat.map(|chat| chat.id.clone()),
+                local: on_this_device(device),
+                root: root.to_owned(),
+            });
+        };
+        let chat_row = |id: &str| self.chats.iter().find(|chat| chat.id == id);
+        let linking = chat_row(chat_id);
+        // Roots on the linking chat's device; an unknown chat row falls back
+        // to this device's.
+        let on_link_device = |device: &str| match linking {
+            Some(chat) => chat.device_id == device,
+            None => on_this_device(device),
+        };
+        if let Some(chat) = linking {
+            push(Some(chat), &chat.device_id, chat.cwd.as_deref());
+        }
+        if let Some(parent) = linking
+            .and_then(|chat| chat.parent_chat_id.as_deref())
+            .and_then(chat_row)
+            .filter(|parent| on_link_device(&parent.device_id))
         {
-            self.selected_space_members.push(selected);
+            push(Some(parent), &parent.device_id, parent.cwd.as_deref());
         }
-        self.selected_space_members.sort();
-        self.selected_space_members.dedup();
+        for space in self
+            .spaces
+            .iter()
+            .filter(|space| on_link_device(&space.device_id))
+        {
+            push(None, &space.device_id, Some(space.path.as_str()));
+        }
+        roots
+    }
+
+    /// Whether `chat_id` lives on this device — an outside file link from it
+    /// resolves to this disk, so its menu may offer local file actions. An
+    /// unprobed device id (or an unknown chat row) counts as local, matching
+    /// `file_link_roots`.
+    pub(crate) fn chat_is_local(&self, chat_id: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_none_or(|chat| {
+                self.local_device_id
+                    .as_deref()
+                    .is_none_or(|local| chat.device_id == local)
+            })
     }
 
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.
-    pub fn apply_chat_config(&mut self, chat_id: &str, config: comet_proto::ChatConfig) {
+    pub fn apply_chat_config(&mut self, chat_id: &str, config: zeron_proto::ChatConfig) {
+        // The pending side chat's copy is what `apply_chats` re-inserts and
+        // what an unsaved one is minted from.
+        if let Some(chat) = self
+            .pending_side_chat
+            .as_mut()
+            .filter(|chat| chat.id == chat_id)
+        {
+            chat.config = Some(config.clone());
+        }
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             chat.config = Some(config);
         }
     }
 
-    pub fn apply_devices(&mut self, devices: Vec<Device>) {
+    /// Returns whether the posture changed. The first frame after attach always
+    /// counts: it ends the bootstrap gap the shell's alert baseline waits on.
+    pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) -> bool {
+        let changed = !self.connectivity_observed || self.connectivity != connectivity;
+        self.connectivity = connectivity;
+        self.connectivity_observed = true;
+        changed
+    }
+
+    /// Is this chat's delivery path degraded — will a send QUEUE rather than
+    /// reach its executor promptly? Locally-hosted chats are never degraded
+    /// (a queued command executes on this device even fully offline). Remote
+    /// chats degrade when the OS is offline, when registry recovery is needed
+    /// to restore their delivery path, when an active room stays down, or when
+    /// the host device has gone presence-dark. A Local sync state is normal
+    /// dormancy while the global connection and remote host are healthy.
+    pub fn chat_delivery_degraded(&self, chat_id: &str) -> bool {
+        use zeron_proto::ConnectivityState as S;
+        if self.connectivity.state == S::Disabled {
+            return false;
+        }
+        let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
+            // Unknown chat (a just-minted canvas send): only the global
+            // state can speak.
+            return self.connectivity.state != S::Connected;
+        };
+        if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
+            return false;
+        }
+        if self.connectivity.state == S::Offline
+            || !self.device_online(&chat.device_id, Utc::now())
+        {
+            return true;
+        }
+        let net = self
+            .connectivity
+            .chats
+            .iter()
+            .find(|c| c.chat_id == chat_id);
+        if self.connectivity.state == S::Reconnecting {
+            // The registry can be down while this chat's room or HTTP fallback
+            // still delivers. A dormant or unknown chat has no such proof.
+            return !net.is_some_and(|net| net.delivery_live);
+        }
+        match net {
+            Some(net) if net.sync_state == zeron_proto::ChatSyncState::Local => false,
+            Some(net) => !net.connected,
+            None => false,
+        }
+    }
+
+    /// A send is queued: in flight AND its delivery path is degraded — the
+    /// honest badge is "Queued", not a Working spinner.
+    pub fn send_queued(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
+    }
+
+    pub fn apply_devices(&mut self, devices: Vec<Device>) -> bool {
+        self.apply_devices_at(devices, Utc::now())
+    }
+
+    fn apply_devices_at(&mut self, mut devices: Vec<Device>, now: DateTime<Utc>) -> bool {
+        // A local-only workspace has no remote device identity to distinguish.
+        // Keep the engine's legacy sentinel out of the UI while preserving real
+        // hostnames and user-assigned device names.
+        if self.workspace_scope == Some(WorkspaceScope::Local)
+            && let Some(local_id) = self.local_device_id.as_deref()
+            && let Some(device) = devices.iter_mut().find(|device| device.id == local_id)
+            && device.name == "unknown-device"
+        {
+            device.name = "Local".to_string();
+        }
+        for device in &devices {
+            self.change_requests
+                .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
+        }
+        let presentation = device_presentation_at(&devices, now);
+        let session_presence = session_presence_at(&self.sessions, now);
+        let changed = self.device_presentation.as_ref() != Some(&presentation)
+            || self.session_presence_presentation != session_presence;
+        self.device_presentation = Some(presentation);
+        self.session_presence_presentation = session_presence;
+        // Freshness must advance even when the heartbeat does not redraw:
+        // delivery gating and later renders still need the newest timestamp.
         self.devices = devices;
+        changed
     }
 
-    pub fn apply_update(&mut self, status: comet_update::UpdateStatus) {
-        self.update = Some(status);
+    /// True when `device_id`'s engine (per its registry device row) is at
+    /// least `min`. Unknown devices and unstamped versions are conservatively
+    /// false — feature gates fall back to the legacy path rather than speak a
+    /// protocol the peer may not understand.
+    pub fn device_version_at_least(&self, device_id: &str, min: (u64, u64, u64)) -> bool {
+        self.devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.version.as_deref())
+            .and_then(version_triple)
+            .is_some_and(|v| v >= min)
     }
 
-    pub fn apply_auth(&mut self, auth: AuthState) {
+    /// Capability checks use the live EngineInfo for this device (including a
+    /// localhost daemon that may not match the UI binary) and synced device
+    /// rows for peers. Missing declarations are conservatively unsupported.
+    pub fn device_supports(&self, device_id: &str, capability: &str) -> bool {
+        if let Some(engine) = self.engine.as_ref()
+            && engine.engine_info().device_id == device_id
+        {
+            return engine.engine_info().supports(capability);
+        }
+        self.devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .is_some_and(|device| device.supports(capability))
+    }
+
+    pub fn chat_host_supports(&self, chat_id: &str, capability: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_some_and(|chat| self.device_supports(&chat.device_id, capability))
+    }
+
+    /// First project on the composer's picked device (falling back through
+    /// the local device, then any project at all — better a cross-device
+    /// project than a surprise project-less canvas). Display order.
+    fn first_space_on_picked_device(&self) -> Option<String> {
+        let device = self
+            .selected_device
+            .as_deref()
+            .or(self.local_device_id.as_deref());
+        let sorted = self.spaces_sorted();
+        device
+            .and_then(|d| sorted.iter().find(|s| s.device_id == d).copied())
+            .or_else(|| sorted.first().copied())
+            .map(|s| s.id.clone())
+    }
+
+    pub fn apply_harness_updates(
+        &mut self,
+        statuses: Vec<zeron_proto::HarnessUpdateStatus>,
+    ) -> bool {
+        if self.harness_updates == statuses {
+            return false;
+        }
+        self.harness_updates = statuses;
+        true
+    }
+
+    pub fn apply_auth(&mut self, auth: AuthState) -> bool {
+        if self.auth.as_ref() == Some(&auth) {
+            return false;
+        }
         self.auth = Some(auth);
+        true
     }
 
     /// Tolerant AuthStatus frame reducer (see [`parse_auth_state`]).
-    pub fn apply_auth_value(&mut self, value: serde_json::Value) {
+    pub fn apply_auth_value(&mut self, value: serde_json::Value) -> bool {
         match parse_auth_state(&value) {
             Some(auth) => self.apply_auth(auth),
-            None => tracing::warn!("dropping unrecognized AuthStatus frame"),
+            None => {
+                tracing::warn!("dropping unrecognized AuthStatus frame");
+                false
+            }
         }
     }
 
     /// The signed-in user, if the engine reports one.
-    pub fn auth_user(&self) -> Option<&comet_proto::UserProfile> {
+    pub fn auth_user(&self) -> Option<&zeron_proto::UserProfile> {
         match self.auth.as_ref()? {
-            AuthState::SignedIn { user, .. } => Some(user),
+            AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
             AuthState::SignedOut => None,
         }
     }
 
-    pub(crate) fn transcript_revision(&self) -> u64 {
-        self.transcript_revision
-    }
-
-    pub(crate) fn transcript_change(&self) -> &TranscriptChange {
-        &self.transcript_change
-    }
-
-    fn record_transcript_change(&mut self, entries: TranscriptEntriesChange, echoes_changed: bool) {
-        self.transcript_revision = self.transcript_revision.wrapping_add(1);
-        self.transcript_change = TranscriptChange {
-            revision: self.transcript_revision,
-            entries,
-            echoes_changed,
-        };
-    }
-
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
+        if let Some(id) = &self.selected_chat {
+            self.prepared_transcripts.remove(id);
+        }
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         // Doc frames supersede optimistic echoes carrying the same id.
-        let echoes_changed = if let Some(chat_id) = self.selected_chat.as_deref()
+        if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
-            let old_len = echoes.len();
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
-            echoes.len() != old_len
-        } else {
-            false
-        };
+        }
         self.transcript = entries;
-        self.transcript_tail_start = 0;
-        self.transcript_tail_before = None;
-        self.transcript_history_before = None;
-        self.record_transcript_change(TranscriptEntriesChange::Reset, echoes_changed);
-        self.update_selected_shared_preview();
+        self.transcript_replayed = true;
+        self.ack_pending_send_from_transcript();
     }
 
-    fn cache_selected_transcript(&mut self) {
-        let Some(chat_id) = self.selected_chat.clone() else {
-            return;
-        };
-        if self.transcript.is_empty() {
-            return;
-        }
-        let entries = std::mem::take(&mut self.transcript);
-        self.transcript_cache.insert(
-            chat_id.clone(),
-            CachedTranscriptWindow {
-                entries,
-                tail_start: self.transcript_tail_start,
-                tail_before: self.transcript_tail_before,
-                history_before: self.transcript_history_before,
-            },
-        );
-        self.transcript_cache_lru.retain(|id| id != &chat_id);
-        self.transcript_cache_lru.push(chat_id);
-        while self.transcript_cache.len() > TRANSCRIPT_CACHE_CHAT_LIMIT
-            || self
-                .transcript_cache
-                .values()
-                .map(CachedTranscriptWindow::byte_len)
-                .sum::<usize>()
-                > TRANSCRIPT_CACHE_BYTE_LIMIT
-        {
-            let Some(oldest) = self.transcript_cache_lru.first().cloned() else {
-                break;
-            };
-            self.transcript_cache_lru.remove(0);
-            self.transcript_cache.remove(&oldest);
-        }
-    }
-
-    fn restore_transcript(&mut self, chat_id: Option<&str>) {
-        self.transcript.clear();
-        self.transcript_tail_start = 0;
-        self.transcript_tail_before = None;
-        self.transcript_history_before = None;
-        self.transcript_restored_from_cache = false;
-        let Some(chat_id) = chat_id else {
-            self.record_transcript_change(TranscriptEntriesChange::Reset, true);
-            return;
-        };
-        let Some(cached) = self.transcript_cache.remove(chat_id) else {
-            self.record_transcript_change(TranscriptEntriesChange::Reset, true);
-            return;
-        };
-        self.transcript_cache_lru.retain(|id| id != chat_id);
-        self.transcript = cached.entries;
-        self.transcript_tail_start = cached.tail_start.min(self.transcript.len());
-        self.transcript_tail_before = cached.tail_before;
-        self.transcript_history_before = cached.history_before;
-        self.transcript_restored_from_cache = true;
-        self.record_transcript_change(TranscriptEntriesChange::Reset, true);
-    }
-
-    fn apply_transcript_page(&mut self, page: SessionEntryWindow) {
-        let first_loaded = self.transcript.first().map(|entry| entry.id.as_str());
-        let mut entries: Vec<_> = page
-            .entries
-            .into_iter()
-            .filter(|entry| Some(entry.id.as_str()) != first_loaded)
-            .filter(|entry| !self.transcript.iter().any(|known| known.id == entry.id))
-            .collect();
-        let added = entries.len();
-        if added > 0 {
-            entries.append(&mut self.transcript);
-            self.transcript = entries;
-            self.transcript_tail_start += added;
-            self.record_transcript_change(
-                TranscriptEntriesChange::Splice {
-                    old: 0..0,
-                    new: 0..added,
-                },
-                false,
-            );
-        }
-        self.transcript_history_before = page.before;
-    }
-
-    pub fn apply_collaboration(&mut self, snapshot: CollaborationSnapshot) {
-        for session in &snapshot.sessions {
-            if session.source == comet_proto::AgentSessionSource::Scaffold
-                || session.environment.as_ref().is_some_and(|environment| {
-                    matches!(
-                        environment.source,
-                        SessionEnvironmentSource::Scaffold { .. }
-                    )
-                })
-            {
-                self.scaffold_host_devices
-                    .insert(session.chat_id.clone(), session.owner_device_id.clone());
-            }
-            if let Some(environment) = &session.environment {
-                self.scaffold_environments
-                    .insert(session.chat_id.clone(), environment.clone());
-            }
-        }
-        if self.apply_pending_invitation(&snapshot) {
-            self.collaboration = Some(snapshot);
-            return;
-        }
-        let selected_still_exists = self.selected_agent_session.as_deref().is_some_and(|id| {
-            snapshot
-                .sessions
-                .iter()
-                .any(|session| session.session_id == id)
-        });
-        if !selected_still_exists {
-            let principal = snapshot
-                .principal
-                .as_ref()
-                .map(|principal| principal.subject.as_str());
-            self.selected_agent_session = snapshot
-                .sessions
-                .iter()
-                .find(|session| {
-                    principal == Some(session.owner_subject.as_str())
-                        && self.local_device_id.as_deref() == Some(session.owner_device_id.as_str())
-                })
-                .or_else(|| snapshot.sessions.first())
-                .map(|session| session.session_id.clone());
-        }
-        self.collaboration = Some(snapshot);
-    }
-
-    fn apply_pending_invitation(&mut self, snapshot: &CollaborationSnapshot) -> bool {
-        let Some(invitation) = self.pending_invitation.as_ref() else {
-            return false;
-        };
-        if self.selected_chat.as_deref() != Some(invitation.chat_id.as_str()) {
-            return false;
-        }
-        let Some(session) = snapshot.sessions.iter().find(|session| {
-            session.chat_id == invitation.chat_id && session.session_id == invitation.session_id
-        }) else {
-            return true;
-        };
-        // Navigation may select the named session immediately; this is display
-        // state only. The grant remains unavailable until the authenticated
-        // projection below proves the exact id and scope.
-        self.selected_agent_session = Some(session.session_id.clone());
-        let now = Utc::now().timestamp_millis();
-        let Some(principal) = snapshot.principal.as_ref() else {
-            return true;
-        };
-        let exact_grant = snapshot.grants.iter().find(|grant| {
-            grant.id == invitation.grant_id
-                && grant.principal_subject == principal.subject
-                && grant.scope.project_id == principal.project_id
-                && grant.scope.session_id.as_deref() == Some(session.session_id.as_str())
-                && grant.device_id.as_deref() == Some(session.owner_device_id.as_str())
-                && grant.granted_at <= now
-                && grant.expires_at.is_some_and(|expires| now < expires)
-                && grant.revoked_at.is_none()
-        });
-        let Some(grant) = exact_grant else {
-            return true;
-        };
-        self.selected_invitation_grant = Some(grant.id.clone());
-        // The one-click link is the whole membership flow: once the grant
-        // verifies and the session has no workspace chat row, pin the imported
-        // room so it survives restarts (`drain_session_pin` issues the RPC).
-        if !self.has_chat_row(&invitation.chat_id)
-            && !self
-                .session_refs
-                .iter()
-                .any(|session_ref| session_ref.chat_id == invitation.chat_id)
-        {
-            self.pending_session_pin = Some(invitation.chat_id.clone());
-        }
-        self.pending_invitation = None;
-        true
-    }
-
-    /// Earliest selected-transcript entry a delta may disturb. Delta rows are
-    /// reconciled as a suffix from here; reset frames deliberately use the
-    /// conservative full-rebuild path.
-    fn transcript_delta_start(&self, frame: &TranscriptFrame) -> Option<usize> {
-        let TranscriptFrame::Delta {
-            upsert,
-            append,
-            remove,
-            ..
-        } = frame
-        else {
-            return None;
-        };
-        if upsert.is_empty() && append.is_empty() && remove.is_empty() {
-            return None;
-        }
-        let tail_start = self.transcript_tail_start.min(self.transcript.len());
-        let tail = &self.transcript[tail_start..];
-        let mut earliest = tail.len();
-        for id in remove {
-            if let Some(index) = tail.iter().rposition(|entry| entry.id == *id) {
-                earliest = earliest.min(index);
-            }
-        }
-        for text_append in append {
-            if let Some(index) = tail.iter().rposition(|entry| entry.id == text_append.entry) {
-                earliest = earliest.min(index);
-            }
-        }
-        for operation in upsert {
-            if let Some(index) = tail
-                .iter()
-                .rposition(|entry| entry.id == operation.entry.id)
-            {
-                earliest = earliest.min(index);
-            }
-            match operation.after.as_deref() {
-                None => earliest = 0,
-                Some(anchor) => {
-                    if let Some(index) = tail.iter().rposition(|entry| entry.id == anchor) {
-                        earliest = earliest.min(index + 1);
-                    }
-                }
-            }
-        }
-        Some(tail_start + earliest)
-    }
-
-    /// Apply a `WatchDocMessages` delta to the live bounded tail. Explicitly
-    /// paged history remains a stable prefix and does not enter frame counts.
+    /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
+    /// diverged; the watch task resubscribes for a fresh reset.
     pub fn apply_transcript_frame(
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
-        let before = frame.before();
-        let reset = frame.reset_entries().is_some();
-        let old_len = self.transcript.len();
-        let changed_start = self.transcript_delta_start(&frame);
-        if let Some(reset) = frame.reset_entries()
-            && self.transcript_restored_from_cache
-        {
-            let cached_before = self.transcript_tail_before;
-            let cached_tail_start = self.transcript_tail_start.min(self.transcript.len());
-            if self.transcript[cached_tail_start..] == *reset {
-                self.transcript_tail_before = before.or(cached_before);
-                self.transcript_restored_from_cache = false;
-                return Ok(());
-            }
-            let retired = self.transcript[cached_tail_start..]
-                .iter()
-                .take_while(|entry| !reset.iter().any(|next| next.id == entry.id))
-                .count();
-            self.transcript_tail_start = cached_tail_start + retired;
-            self.transcript.truncate(self.transcript_tail_start);
-            self.transcript.extend_from_slice(reset);
-        } else {
-            let tail_start = self.transcript_tail_start.min(self.transcript.len());
-            let retired = if tail_start > 0 {
-                if let Some(reset) = frame.reset_entries() {
-                    self.transcript[tail_start..]
-                        .iter()
-                        .take_while(|entry| !reset.iter().any(|next| next.id == entry.id))
-                        .count()
-                } else {
-                    let remove = frame.removed_entry_ids();
-                    self.transcript[tail_start..]
-                        .iter()
-                        .take_while(|entry| remove.iter().any(|id| id == &entry.id))
-                        .count()
-                }
-            } else {
-                0
-            };
-            if retired > 0 {
-                self.transcript_tail_start += retired;
-            }
-            if self.transcript_tail_start == 0 {
-                comet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
-            } else {
-                // Isolate the bounded live tail only when paged history exists;
-                // the ordinary no-history hot path must not move every entry
-                // through a temporary vector on every streaming commit.
-                let mut tail = self.transcript.split_off(self.transcript_tail_start);
-                comet_doc::apply_transcript_frame(&mut tail, frame)?;
-                self.transcript.append(&mut tail);
-            }
+        if let Some(id) = &self.selected_chat {
+            self.prepared_transcripts.remove(id);
         }
-        self.transcript_tail_before = before;
-        if self.transcript_tail_start == 0 {
-            self.transcript_history_before = before;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
+        zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        if is_reset {
+            self.transcript_replayed = true;
         }
-        self.transcript_restored_from_cache = false;
-        let echoes_changed = if let Some(chat_id) = self.selected_chat.as_deref()
+        if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
-            let old_len = echoes.len();
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
-            echoes.len() != old_len
-        } else {
-            false
-        };
-        let entries = if reset {
-            TranscriptEntriesChange::Reset
-        } else if let Some(start) = changed_start {
-            TranscriptEntriesChange::Splice {
-                old: start.min(old_len)..old_len,
-                new: start.min(self.transcript.len())..self.transcript.len(),
-            }
-        } else {
-            TranscriptEntriesChange::None
-        };
-        if entries != TranscriptEntriesChange::None || echoes_changed {
-            self.record_transcript_change(entries, echoes_changed);
         }
-        self.update_selected_shared_preview();
+        self.ack_pending_send_from_transcript();
         Ok(())
+    }
+
+    /// Apply an incoming frame and invalidate only its affected presentation.
+    pub fn receive_transcript_frame(
+        &mut self,
+        frame: TranscriptFrame,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        let text_doc = self
+            .selected_chat
+            .as_ref()
+            .filter(|id| {
+                is_text_append(&frame)
+                    && !self.pending_sends.contains_key(*id)
+                    && self.pending_echoes().is_empty()
+            })
+            .cloned();
+        let result = self.apply_transcript_frame(frame);
+        if let Some(doc_id) = text_doc.filter(|_| result.is_ok()) {
+            cx.emit(TranscriptTextChanged { doc_id });
+        } else {
+            cx.notify();
+        }
+        result
+    }
+
+    pub(crate) fn transcript_baseline(
+        &self,
+        doc_id: &str,
+    ) -> Option<&Arc<zeron_doc::TranscriptBaseline>> {
+        self.transcript_baselines.get(doc_id)
+    }
+
+    pub fn receive_transcript_update(
+        &mut self,
+        update: zeron_doc::TranscriptUpdate,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        self.receive_transcript_frame(update.frame, cx)?;
+        if let (Some(doc_id), Some(baseline)) = (&self.selected_chat, update.replay_baseline) {
+            self.transcript_baselines
+                .insert(doc_id.clone(), Arc::new(baseline));
+        }
+        if self.context_usage != update.context_usage {
+            self.context_usage = update.context_usage;
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    /// The opt-in opening tail is provisional. Never replace a complete view
+    /// with it, and don't treat it as a full reset for caching/scroll anchors.
+    pub(crate) fn receive_opening_transcript_update(
+        &mut self,
+        update: zeron_doc::TranscriptUpdate,
+        history_pending: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        if history_pending && self.transcript_replayed {
+            return Ok(());
+        }
+        let old_prepared = self
+            .selected_chat
+            .as_ref()
+            .and_then(|id| self.prepared_transcripts.remove(id));
+        let old_entries = if matches!(&update.frame, TranscriptFrame::Reset { .. }) {
+            std::mem::take(&mut self.transcript)
+        } else {
+            Vec::new()
+        };
+        cx.background_executor()
+            .spawn(async move {
+                drop((old_prepared, old_entries));
+            })
+            .detach();
+        self.receive_transcript_update(update, cx)?;
+        if history_pending {
+            self.transcript_replayed = false;
+        }
+        Ok(())
+    }
+
+    /// A subagent doc's current transcript copy (empty until its watch's
+    /// replay frame lands, or its frozen snapshot is set).
+    pub fn sub_transcript(&self, doc_id: &str) -> &[SessionMessageEntry] {
+        self.sub_transcripts
+            .get(doc_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Watch a SUBAGENT doc (`WatchDocMessages` works for any doc id).
+    /// Single-flight per key; a frozen snapshot already in place wins — the
+    /// watch would race the (complete) blob with a possibly-purged live doc.
+    pub fn watch_subagent_doc(&mut self, doc_id: String, cx: &mut Context<Self>) {
+        if self.sub_watch_tasks.contains_key(&doc_id) {
+            return;
+        }
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.sub_transcripts.entry(doc_id.clone()).or_default();
+        let task = spawn_subagent_watch(cx, handle, doc_id.clone());
+        self.sub_watch_tasks.insert(doc_id, task);
+    }
+
+    /// Tab closed: drop the watch task (cancels the engine-side watch and
+    /// unpins the doc from the engine LRU) and the rows.
+    pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.sub_watch_tasks.remove(doc_id);
+        self.sub_transcripts.remove(doc_id);
+        self.prepared_transcripts.remove(doc_id);
+        self.transcript_baselines.remove(doc_id);
+    }
+
+    /// Frozen-blob path: the finished subagent's uploaded transcript, no
+    /// watch needed (and any in-flight watch is superseded).
+    pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
+        self.prepared_transcripts.remove(&doc_id);
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.sub_watch_tasks.remove(&doc_id);
+        self.transcript_baselines.insert(
+            doc_id.clone(),
+            Arc::new(zeron_doc::TranscriptBaseline::capture(&entries)),
+        );
+        self.sub_transcripts.insert(doc_id, entries);
+    }
+
+    pub(crate) fn set_prepared_subagent_snapshot(
+        &mut self,
+        doc_id: String,
+        entries: Vec<SessionMessageEntry>,
+        prepared: Arc<crate::transcript::PreparedTranscript>,
+    ) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.sub_watch_tasks.remove(&doc_id);
+        self.transcript_baselines
+            .insert(doc_id.clone(), prepared.navigation_baseline.clone());
+        self.prepared_transcripts.insert(doc_id.clone(), prepared);
+        self.sub_transcripts.insert(doc_id, entries);
     }
 
     /// Add an optimistic user echo (composer send path).
@@ -2301,88 +1735,184 @@ impl AppState {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
             echoes.push(entry);
-            if self.selected_chat.as_deref() == Some(chat_id) {
-                self.record_transcript_change(TranscriptEntriesChange::None, true);
-            }
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
         }
-    }
-
-    /// Hold a newly minted chat selection until its admitted bootstrap projects.
-    pub fn mark_chat_pending(&mut self, chat_id: &str) {
-        if !self.chats.iter().any(|chat| chat.id == chat_id) {
-            self.pending_local_chat_ids.insert(chat_id.to_string());
-        }
-    }
-
-    /// Stage prepared first-send presentation without replacing a catalog-owned row.
-    pub fn stage_pending_chat(&mut self, chat: Chat) {
-        let pending = self.chat_is_pending(&chat.id);
-        if let Some(existing) = self.chats.iter_mut().find(|existing| existing.id == chat.id) {
-            if pending { *existing = chat; sort_chats(&mut self.chats); }
-            return;
-        }
-        self.pending_local_chat_ids.insert(chat.id.clone());
-        self.chats.push(chat);
-        sort_chats(&mut self.chats);
-    }
-
-    pub(crate) fn chat_is_pending(&self, chat_id: &str) -> bool {
-        self.pending_local_chat_ids.contains(chat_id)
-            || self.scaffold_session_draft_for_chat(chat_id).is_some()
-    }
-
-    pub fn set_chat_startup_phase(&mut self, chat_id: &str, phase: ChatStartupPhase) {
-        self.chat_startup_phases.insert(chat_id.to_string(), phase);
-    }
-
-    pub fn clear_chat_startup_phase(&mut self, chat_id: &str) {
-        self.chat_startup_phases.remove(chat_id);
-    }
-
-    pub fn chat_startup_phase(&self, chat_id: &str) -> Option<ChatStartupPhase> {
-        self.chat_startup_phases.get(chat_id).copied()
-    }
-
-    /// Release a failed first-send reservation after its durable chat and any
-    /// managed checkout have been rolled back.
-    pub fn cancel_pending_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        if self
-            .pending_scaffold_session
-            .as_ref()
-            .is_some_and(|draft| draft.chat_id == chat_id)
-        {
-            self.pending_scaffold_session = None;
-            self.scaffold_session_error = None;
-            self.scaffold_starting_chats.remove(chat_id);
-        }
-        self.pending_local_chat_ids.remove(chat_id);
-        self.chat_startup_phases.remove(chat_id);
-        self.chats.retain(|chat| chat.id != chat_id);
-        if self.selected_chat.as_deref() == Some(chat_id) {
-            self.select_chat(None, cx);
-        }
-    }
-
-    pub(crate) fn cancel_unaccepted_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        if self.scaffold_control_targets.contains_key(chat_id)
-            || (self.scaffold_session_error.is_some()
-                && self.scaffold_session_draft_for_chat(chat_id).is_some())
-        {
-            return;
-        }
-        self.cancel_pending_chat(chat_id, cx);
     }
 
     /// Drop an echo (send failed — the prompt returns to the draft).
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
-        let removed = self.echoes.get_mut(chat_id).is_some_and(|echoes| {
-            let before = echoes.len();
+        if let Some(echoes) = self.echoes.get_mut(chat_id) {
+            let previous_len = echoes.len();
             echoes.retain(|e| e.id != message_id);
-            echoes.len() != before
-        });
-        if removed && self.selected_chat.as_deref() == Some(chat_id) {
-            self.record_transcript_change(TranscriptEntriesChange::None, true);
+            if echoes.len() != previous_len {
+                self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            }
         }
+    }
+
+    /// Composer send fired: overlay the chat as Working until the host writes
+    /// the user message back into the transcript (or the TTL lapses). A remote
+    /// send has no live session row until the host drains the queued command —
+    /// that gap read as "no live run" and flashed the Completed dot, and any
+    /// phantom Working→Idle edge in it rang the done-chime on send (user
+    /// report 2026-08-05).
+    pub fn begin_pending_send(&mut self, chat_id: &str, message_id: &str, now: DateTime<Utc>) {
+        self.pending_sends.insert(
+            chat_id.to_string(),
+            PendingSend {
+                message_id: message_id.to_string(),
+                started: now,
+            },
+        );
+    }
+
+    /// Send failed — drop the overlay so the dot tells the truth again. Only
+    /// removes the overlay this message started: a quick resend must not lose
+    /// its own overlay to the first send's failure cleanup.
+    pub fn end_pending_send(&mut self, chat_id: &str, message_id: &str) {
+        if self
+            .pending_sends
+            .get(chat_id)
+            .is_some_and(|p| p.message_id == message_id)
+        {
+            self.pending_sends.remove(chat_id);
+        }
+    }
+
+    /// Attachment upload starting: expose its progress to the working label.
+    pub fn begin_upload_progress(
+        &mut self,
+        total: u64,
+        done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.upload_progress = Some(UploadProgress { done, total });
+    }
+
+    /// Upload leg over (success or failure) — the label goes back to plain
+    /// send/working wording.
+    pub fn end_upload_progress(&mut self) {
+        self.upload_progress = None;
+    }
+
+    /// Percent of the in-flight attachment upload, clamped to 99 — the last
+    /// point belongs to the commit + queue, so "100% but still spinning"
+    /// never shows. `None` when no upload is in flight (or it's empty).
+    pub fn upload_progress_percent(&self) -> Option<u8> {
+        let progress = self.upload_progress.as_ref()?;
+        if progress.total == 0 {
+            return None;
+        }
+        let done = progress
+            .done
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(progress.total);
+        Some(((done * 100) / progress.total).min(99) as u8)
+    }
+
+    /// A `WatchTransfers` snapshot: the engine-side relay leg's in-flight
+    /// queued-attachment transfers, replacing the whole set each frame.
+    pub fn apply_transfers(&mut self, transfers: Vec<zeron_proto::TransferProgress>) -> bool {
+        let transfers: HashMap<_, _> = transfers
+            .into_iter()
+            .map(|t| (t.upload_id, (t.done, t.total)))
+            .collect();
+        if self.transfers == transfers {
+            return false;
+        }
+        self.transfers = transfers;
+        true
+    }
+
+    /// Percent of one queued attachment's relay transfer, by the uploadId
+    /// its `pending://{uploadId}/…` ref names. Same 99-clamp as
+    /// [`Self::upload_progress_percent`]: the last point belongs to the
+    /// commit, so "100% but still spinning" never shows. `None` when no
+    /// bytes are moving for that upload (staged-but-waiting, retry backoff,
+    /// or done) — the thumbnail falls back to its indeterminate spinner.
+    pub fn transfer_percent(&self, upload_id: &str) -> Option<u8> {
+        let (done, total) = self.transfers.get(upload_id)?;
+        if *total == 0 {
+            return None;
+        }
+        Some(((done.min(total) * 100) / total).min(99) as u8)
+    }
+
+    /// Is a send still in flight for this chat (unacked)? Inside the grace
+    /// window normally; while the chat's delivery path is degraded the
+    /// overlay holds indefinitely — the truth IS "Queued", and silently
+    /// expiring back to Idle left a queued send with no visible trace at
+    /// all (the 30s→silence hole, 2026-08-19).
+    pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                || self.chat_delivery_degraded(chat_id)
+        })
+    }
+
+    /// The send has sat unadopted past the grace window: surface the
+    /// EXPLICIT failed state ("Not delivered — retry") instead of either
+    /// faking progress or silently forgetting the send ever happened.
+    pub fn send_undelivered(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
+        })
+    }
+
+    /// Retry pressed: restart the grace clock so the overlay returns to its
+    /// Sending/Queued phase while the re-kicked delivery runs.
+    pub fn retry_pending_send(&mut self, chat_id: &str, now: DateTime<Utc>) {
+        if let Some(p) = self.pending_sends.get_mut(chat_id) {
+            p.started = now;
+        }
+    }
+
+    /// When the in-flight send (if any, inside the TTL) was fired — the
+    /// elapsed-timer base while the overlay reads as Working. The session
+    /// row's `started_at` still belongs to the PREVIOUS turn during this
+    /// window, and showing it made a fresh send open at the old turn's
+    /// half-hour mark.
+    pub fn pending_send_started(&self, chat_id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.pending_sends
+            .get(chat_id)
+            .filter(|p| {
+                now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                    || self.chat_delivery_degraded(chat_id)
+            })
+            .map(|p| p.started)
+    }
+
+    /// The host executed the queued command iff the sent message's id showed
+    /// up in the transcript (it writes the message before — causally with —
+    /// the Working status; sessions.rs dispatch paths).
+    fn ack_pending_send_from_transcript(&mut self) {
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(pending) = self.pending_sends.get(chat_id)
+            && self.transcript.iter().any(|e| e.id == pending.message_id)
+        {
+            self.pending_sends.remove(chat_id);
+        }
+    }
+
+    /// A send the host held for the next turn shows as its queue row, not
+    /// as an echo: drop echoes (and the pending-send overlay) for queued ids.
+    pub fn apply_queue(&mut self, items: Vec<zeron_doc::QueuedMessage>) {
+        if let Some(chat_id) = self.selected_chat.as_deref() {
+            if let Some(echoes) = self.echoes.get_mut(chat_id) {
+                let before = echoes.len();
+                echoes.retain(|echo| !items.iter().any(|q| q.id == echo.id));
+                if echoes.len() != before {
+                    self.transcript_revision = self.transcript_revision.wrapping_add(1);
+                }
+            }
+            if self
+                .pending_sends
+                .get(chat_id)
+                .is_some_and(|p| items.iter().any(|q| q.id == p.message_id))
+            {
+                self.pending_sends.remove(chat_id);
+            }
+        }
+        self.queue = items;
     }
 
     /// Unconfirmed echoes for the selected chat, in send order.
@@ -2394,372 +1924,155 @@ impl AppState {
             .unwrap_or(&[])
     }
 
-    fn update_selected_shared_preview(&mut self) {
-        let Some(chat_id) = self.selected_chat.as_deref() else {
-            return;
-        };
-        if self.chats.iter().any(|chat| chat.id == chat_id) || self.transcript.is_empty() {
-            return;
-        }
-        if let Some((entry_id, _)) = self.shared_session_previews.get(chat_id) {
-            // A bounded replay may not include the original title's source.
-            // Keep that stable label, but never retain it when its source is
-            // now known to be a peer entry.
-            let Some(entry) = self.transcript.iter().find(|entry| &entry.id == entry_id) else {
-                return;
-            };
-            if !entry.is_peer_message() {
-                return;
-            }
-        }
-        if let Some(preview) = shared_session_preview(&self.transcript) {
-            self.shared_session_previews
-                .insert(chat_id.to_string(), preview);
-        } else {
-            self.shared_session_previews.remove(chat_id);
-        }
-    }
-
-    pub fn collaboration_sessions(
-        &self,
-        chat_id: &str,
-    ) -> impl Iterator<Item = &comet_proto::AgentSessionRecord> {
-        self.collaboration
-            .iter()
-            .flat_map(|snapshot| snapshot.sessions.iter())
-            .filter(move |session| session.chat_id == chat_id)
-    }
-
-    pub fn message_provenance(&self, message_id: &str) -> Option<&MessageProvenance> {
-        self.collaboration
-            .as_ref()?
-            .message_provenance
-            .iter()
-            .find(|provenance| provenance.message_id == message_id)
-    }
-
-    pub fn participants(&self) -> &[ParticipantPresence] {
-        self.collaboration
-            .as_ref()
-            .map(|snapshot| snapshot.participants.as_slice())
-            .unwrap_or_default()
-    }
-
-    pub fn participant_name<'a>(&'a self, subject: &'a str) -> &'a str {
-        self.participants()
-            .iter()
-            .find(|participant| participant.principal_subject == subject)
-            .and_then(|participant| participant.display_name.as_deref())
-            .unwrap_or(subject)
-    }
-
-    pub fn principal_subject(&self) -> Option<&str> {
-        self.collaboration
-            .as_ref()?
-            .principal
-            .as_ref()
-            .map(|principal| principal.subject.as_str())
-    }
-
-    pub fn has_collaboration_capability(&self, capability: &str) -> bool {
-        self.collaboration
-            .as_ref()
-            .and_then(|snapshot| snapshot.principal.as_ref())
-            .is_some_and(|principal| principal.has_capability(capability))
-    }
-
-    pub fn selected_agent_session(&self) -> Option<&comet_proto::AgentSessionRecord> {
-        let selected = self.selected_agent_session.as_deref()?;
-        self.collaboration
-            .as_ref()?
-            .sessions
-            .iter()
-            .find(|session| session.session_id == selected)
-    }
-
-    pub fn agent_indicator_for(&self, session_id: &str, now: DateTime<Utc>) -> Indicator {
-        let selected_chat = self.selected_chat.as_deref();
-        effective_agent_indicator(
-            self.collaboration
-                .as_ref()
-                .and_then(|snapshot| {
-                    snapshot
-                        .sessions
-                        .iter()
-                        .find(|session| session.session_id == session_id)
-                })
-                .filter(|session| Some(session.chat_id.as_str()) == selected_chat),
-            now,
-        )
-    }
-
-    pub fn selected_agent_indicator(&self, now: DateTime<Utc>) -> Indicator {
-        self.selected_agent_session
-            .as_deref()
-            .map_or(Indicator::None, |session_id| {
-                self.agent_indicator_for(session_id, now)
-            })
-    }
-
-    pub fn select_agent_session(&mut self, session_id: Option<String>) {
-        self.selected_agent_session = session_id.filter(|id| {
-            self.collaboration.as_ref().is_some_and(|snapshot| {
-                snapshot
-                    .sessions
-                    .iter()
-                    .any(|session| &session.session_id == id)
-            })
-        });
-    }
-
-    pub fn open_url(&mut self, url: &str, cx: &mut Context<Self>) {
-        let scheme = if option_env!("COMET_PACKAGE_ENVIRONMENT") == Some("staging") {
-            "comet-staging"
-        } else {
-            "comet"
-        };
-        if let Some(link) = comet_proto::CrewSessionLink::parse_deep_link(url, scheme) {
-            self.pending_directory_link = Some(link);
-            self.drain_directory_link(cx);
-            return;
-        }
-        if let Some(link) = comet_proto::ScaffoldSessionLink::parse_deep_link(url, scheme) {
-            self.pending_scaffold_link = Some(link);
-            self.drain_scaffold_link(cx);
-        } else if let Some(invitation) = comet_proto::CometInvitation::parse_deep_link(url) {
-            self.open_invitation(invitation, cx);
-        }
-    }
-
-    fn drain_directory_link(&mut self, cx: &mut Context<Self>) {
-        let Some(AuthState::SignedIn { project_scope, .. }) = self.auth.as_ref() else {
-            return;
-        };
-        let Some(link) = self.pending_directory_link.take() else {
-            return;
-        };
-        if project_scope != &link.project_id {
-            self.scaffold_session_error = Some("Open this session in Crew for its project".into());
-            cx.notify();
-            return;
-        }
-        if self.engine().is_none() {
-            self.pending_directory_link = Some(link);
-            return;
-        }
-        if let Some(deployment_id) = link.deployment_id {
-            let projection = SessionRoomProjection {
-                project_id: link.project_id,
-                deployment_id,
-                session_id: link.session_id.clone(),
-            };
-            if self.room_projections.get(&link.session_id) != Some(&projection) {
-                if self.selected_chat.as_deref() == Some(link.session_id.as_str()) {
-                    self.select_chat(None, cx);
-                }
-                self.room_projections
-                    .insert(link.session_id.clone(), projection);
-            }
-        }
-        // A directory link grants no access. Membership and selection use the
-        // same authenticated room path as an explicit session-id import.
-        self.pending_invitation = None;
-        self.selected_invitation_grant = None;
-        self.pending_session_pin = Some(link.session_id.clone());
-        self.drain_session_pin(cx);
-        self.select_chat(Some(link.session_id), cx);
-    }
-
-    fn drain_scaffold_link(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.auth.as_ref(), Some(AuthState::SignedIn { .. })) {
-            return;
-        }
-        let Some(handle) = self.engine().cloned() else {
-            return;
-        };
-        let Some(link) = self.pending_scaffold_link.take() else {
-            return;
-        };
-        if !self
-            .scaffold_scope
-            .as_ref()
-            .is_some_and(|(project, deployment)| {
-                project == &link.scope.project_id
-                    && Some(deployment.as_str()) == link.scope.deployment_id.as_deref()
-            })
-        {
-            self.scaffold_session_error =
-                Some("Open this session in Crew for its project and deployment".into());
-            cx.notify();
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let result = attach_scaffold_session(&handle, &link.sandbox_id, link.scope).await;
-            let _ = this.update(cx, |state, cx| {
-                match result {
-                    Ok(attachment) => state.install_scaffold_session(&attachment, cx),
-                    Err(error) => {
-                        state.scaffold_session_error =
-                            Some(format!("Could not open Crew session: {error}"))
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    pub fn open_invitation(
-        &mut self,
-        invitation: comet_proto::CometInvitation,
-        cx: &mut Context<Self>,
-    ) {
-        let chat_id = invitation.chat_id.clone();
-        self.pending_invitation = Some(invitation);
-        self.selected_invitation_grant = None;
-        if self.selected_chat.as_deref() == Some(chat_id.as_str()) {
-            if let Some(snapshot) = self.collaboration.clone() {
-                self.apply_pending_invitation(&snapshot);
-                self.drain_session_pin(cx);
-            }
-            cx.notify();
-        } else {
-            self.select_chat(Some(chat_id), cx);
-        }
-    }
-
-    /// Keep admitted threads observable while the host's browse index catches up.
-    pub(crate) fn ensure_session_ref(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        if self.session_refs.iter().any(|reference| reference.chat_id == chat_id) { return }
-        self.pending_session_pin = Some(chat_id.to_owned());
-        self.drain_session_pin(cx);
-    }
-
-    /// Issue a non-owning pin for an authenticated invitation or accepted send. The
-    /// merged result lands immediately (the `WatchSessionRefs` frame carrying
-    /// it is the durable source); a lost engine keeps the pin armed for the
-    /// next snapshot.
-    fn drain_session_pin(&mut self, cx: &mut Context<Self>) {
-        let Some(chat_id) = self.pending_session_pin.clone() else {
-            return;
-        };
-        let Some(handle) = self.engine().cloned() else {
-            return;
-        };
-        self.pending_session_pin = None;
-        cx.spawn(async move |this, cx| {
-            let result = handle
-                .client()
-                .call(
-                    methods::ADD_SESSION_REF,
-                    serde_json::json!({ "chatId": chat_id.clone() }),
-                )
-                .await;
-            match result.map(serde_json::from_value::<SessionRef>) {
-                Ok(Ok(session_ref)) => {
-                    this.update(cx, |state, cx| {
-                        let mut refs = state.session_refs.clone();
-                        refs.retain(|item| item.chat_id != session_ref.chat_id);
-                        refs.push(session_ref);
-                        state.apply_session_refs(refs);
-                        cx.notify();
-                    })
-                    .ok();
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "membership pin returned invalid data");
-                }
-                Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "membership pin failed");
-                }
-            }
-        })
-        .detach();
-    }
-
     // ---- queries ----
 
-    /// Non-archived chats in sidebar order. A chat row always renders in its
-    /// space, even when an exact-id membership pin names the same session —
-    /// the row carries the context (status, harness, branch) a bare ref lacks.
+    /// Non-archived, top-level chats in sidebar order. Chats spawned by
+    /// another chat (`parent_chat_id`, the Zeron MCP's orchestration link)
+    /// are the parent's workers, not sessions the user started: they stay
+    /// reachable by id/deep link but never take a sidebar row or jump slot.
+    /// Voice orchestrator chats are hidden the same way.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
-        self.chats.iter().filter(|chat| !chat.archived)
-    }
-    /// Imported memberships with no workspace chat row — sessions genuinely
-    /// foreign to this workspace. Row-backed pins are served by the normal
-    /// space list instead.
-    pub fn shared_session_refs(&self) -> impl Iterator<Item = &SessionRef> {
-        self.session_refs
+        self.chats
             .iter()
-            .filter(|session_ref| !self.has_chat_row(&session_ref.chat_id))
+            .filter(|c| !c.archived && c.is_top_level())
     }
 
-    /// An imported session room without a local chat row: transcript comes
-    /// from the room, sends go over steer, attachments are unavailable.
-    pub fn is_shared_session(&self, chat_id: &str) -> bool {
-        !self.has_chat_row(chat_id)
+    pub(crate) fn restore_composer_target(
+        &mut self,
+        defaults: &crate::settings::composer::ComposerDefaults,
+    ) {
+        if self.selected_chat.is_some() || self.no_project {
+            return;
+        }
+        if self.selected_device.is_none() {
+            self.selected_device = defaults.device.clone();
+        }
+        if self.selected_space.is_none() {
+            self.no_project = defaults.no_project;
+            self.selected_space = if defaults.no_project {
+                None
+            } else {
+                defaults.project.clone()
+            };
+        }
+    }
+
+    fn current_canvas_target(&self) -> CanvasTarget {
+        CanvasTarget {
+            space: self.selected_space.clone(),
+            no_project: self.no_project,
+            device: self.selected_device.clone(),
+        }
+    }
+
+    /// Put back the canvas target set aside when a chat opened. A project
+    /// deleted meanwhile heals the way [`Self::apply_spaces`] would.
+    fn restore_canvas_target(&mut self) {
+        let Some(target) = self.canvas_target.take() else {
+            return;
+        };
+        self.selected_device = target.device;
+        self.no_project = target.no_project;
+        self.selected_space = target.space;
+        if self.spaces_synced
+            && !self.no_project
             && self
-                .session_refs
-                .iter()
-                .any(|session_ref| session_ref.chat_id == chat_id)
-    }
-
-    fn has_chat_row(&self, chat_id: &str) -> bool {
-        self.chats.iter().any(|chat| chat.id == chat_id)
-    }
-
-    /// Existing sidebar name precedence, without loading session content.
-    pub(crate) fn chat_display_name<'a>(&'a self, chat: &'a Chat) -> Option<&'a str> {
-        self.scaffold_session_name(&chat.id).or_else(|| {
-            chat.title
-                .as_deref()
-                .map(str::trim)
-                .filter(|title| !title.is_empty())
-        })
-    }
-
-    fn scaffold_session_name(&self, chat_id: &str) -> Option<&str> {
-        self.scaffold_environment(chat_id)
-            .and_then(|environment| environment.name.as_deref())
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .or_else(|| {
-                self.session_refs
-                    .iter()
-                    .find(|session_ref| session_ref.chat_id == chat_id)
-                    .and_then(|session_ref| session_ref.environment.as_ref())
-                    .and_then(|environment| environment.name.as_deref())
-            })
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-    }
-
-    /// Canonical imported environment name, then a learned transcript preview.
-    pub(crate) fn shared_session_preview(&self, chat_id: &str) -> Option<&str> {
-        self.scaffold_session_name(chat_id).or_else(|| {
-            self.shared_session_previews
-                .get(chat_id)
-                .map(|(_, preview)| preview.as_str())
-        })
-    }
-
-    pub fn shared_session_title(&self, chat_id: &str) -> String {
-        self.shared_session_preview(chat_id)
-            .map(str::to_owned)
-            .unwrap_or_else(|| session_ref_fallback(chat_id))
+                .selected_space
+                .as_ref()
+                .is_none_or(|id| !self.spaces.iter().any(|s| &s.id == id))
+        {
+            self.selected_space = self.first_space_on_picked_device();
+        }
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
+        if self.no_project {
+            return None;
+        }
         let id = self.selected_space.as_deref()?;
         self.spaces.iter().find(|s| s.id == id)
+    }
+
+    /// The device the new-session canvas targets: the picked project's host
+    /// when one is selected, else the explicit device pick, else this device.
+    pub fn effective_device_id(&self) -> Option<String> {
+        if let Some(space) = self.selected_space_row() {
+            return Some(space.device_id.clone());
+        }
+        self.selected_device
+            .clone()
+            .or_else(|| self.local_device_id.clone())
+    }
+
+    /// Pick the composer's target device. Keeps the project pick consistent:
+    /// it moves to the project's checkout on the new device, else the first
+    /// project there, else "no project".
+    pub fn select_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let moving = self
+            .selected_space_row()
+            .filter(|s| s.device_id != device_id);
+        if let Some(space) = moving {
+            let first = self
+                .project_members(space)
+                .into_iter()
+                .find(|s| s.device_id == device_id)
+                .or_else(|| {
+                    self.spaces_sorted()
+                        .into_iter()
+                        .find(|s| s.device_id == device_id)
+                })
+                .map(|s| s.id.clone());
+            self.no_project = first.is_none();
+            self.selected_space = first;
+        }
+        self.selected_device = Some(device_id);
+        cx.notify();
     }
 
     pub fn space_row(&self, space_id: &str) -> Option<&Space> {
         self.spaces.iter().find(|s| s.id == space_id)
     }
 
+    /// Spaces in display order — case-insensitive alphabetical, the order
+    /// both space selectors (sidebar filter, composer picker) list rows in.
+    /// Ties break on id so the order is stable across renders.
+    pub fn spaces_sorted(&self) -> Vec<&Space> {
+        let mut spaces: Vec<&Space> = self.spaces.iter().collect();
+        spaces.sort_by_key(|s| (s.display_name().to_lowercase(), s.id.clone()));
+        spaces
+    }
+
     pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
         self.space_row(chat.space_id.as_deref()?)
+    }
+
+    /// The space whose name and color stand for `space`'s whole project
+    /// ([`zeron_proto::view::representative_space`]).
+    pub fn representative_space<'a>(&'a self, space: &'a Space) -> &'a Space {
+        zeron_proto::view::representative_space(&self.spaces, space)
+    }
+
+    /// Every space of `space`'s project ([`zeron_proto::view::project_key`]):
+    /// this device's first, then by device name and path.
+    pub fn project_members(&self, space: &Space) -> Vec<&Space> {
+        let key = zeron_proto::view::project_key(space);
+        let local = self.local_device_id.as_deref();
+        let mut members: Vec<&Space> = self
+            .spaces
+            .iter()
+            .filter(|s| zeron_proto::view::project_key(s) == key)
+            .collect();
+        members.sort_by_key(|s| {
+            (
+                local != Some(s.device_id.as_str()),
+                self.device_name(&s.device_id)
+                    .unwrap_or_default()
+                    .to_lowercase(),
+                s.path.clone(),
+                s.id.clone(),
+            )
+        });
+        members
     }
 
     /// Non-archived chats of a space in tab (creation) order. Chats with a
@@ -2773,33 +2086,11 @@ impl AppState {
         chats
     }
 
-    /// Non-archived chats belonging to every persisted member of the currently
-    /// selected logical sidebar source.
-    pub fn chats_in_selected_source(&self) -> Vec<&Chat> {
-        let mut chats: Vec<&Chat> = self
-            .visible_chats()
-            .filter(|chat| {
-                chat.space_id
-                    .as_ref()
-                    .is_some_and(|id| self.selected_space_members.contains(id))
-            })
-            .collect();
-        sort_tabs(&mut chats);
-        chats
-    }
-
     pub fn device_name(&self, device_id: &str) -> Option<&str> {
         self.devices
             .iter()
             .find(|d| d.id == device_id)
             .map(|d| d.name.as_str())
-    }
-
-    pub fn device_environment(&self, device_id: &str) -> Option<comet_proto::DeviceEnvironment> {
-        self.devices
-            .iter()
-            .find(|d| d.id == device_id)
-            .and_then(|d| d.devbox_provider)
     }
 
     /// Host-presence check: is this device's 15s presence heartbeat fresh?
@@ -2816,74 +2107,267 @@ impl AppState {
         }
     }
 
+    /// The "@ device" tag for a space — shared by the space pickers' rows,
+    /// the sidebar filter trigger, and the composer's space chip. Returns
+    /// `(tag, offline)`; staleness renders as a disconnected GLYPH at the
+    /// call sites (user request), never words in the tag.
+    pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
+        let offline = !self.device_online(&space.device_id, now);
+        let device = self
+            .device_name(&space.device_id)
+            .unwrap_or("Unknown device");
+        (format!("@ {device}"), offline)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {
         self.selected_space_row().is_some_and(|s| s.git_detected)
     }
 
-    /// Full display status for a chat (tab dots, Active list).
+    /// Full display status for a chat (tab dots, Active list). A send in
+    /// flight ([`Self::begin_pending_send`]) reads as Working — the queued
+    /// command is as good as running.
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
-        if self.pending_local_chat_ids.contains(&chat.id)
-            || self.chat_startup_phases.contains_key(&chat.id)
-        {
-            ChatIndicator::Working
-        } else {
-            comet_proto::view::display_indicator(chat, self.indicator_for(&chat.id, now))
+        if self.send_pending(&chat.id, now) {
+            return ChatIndicator::Working;
         }
+        display_status(chat, self.session_for(&chat.id), now)
     }
 
-    /// Every non-archived member session, including detached/missing-space
-    /// rows, in pure recency order. Space membership supplies context, never
-    /// visibility; the engine has already applied the principal's memberships.
+    /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
+    /// on any device — idle included — in pure recency order (status drives
+    /// the dot, never the position; see [`sort_active`]).
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
+            .filter(|c| match c.space_id.as_deref() {
+                // Project-less sessions are first-class rows.
+                None => true,
+                Some(id) => self.space_row(id).is_some(),
+            })
             .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
     }
 
-    /// Archived member sessions, newest first, including detached rows.
-    /// Archiving changes the section, never the session's reachability.
-    pub fn settled_chats(&self) -> Vec<&Chat> {
-        let mut rows: Vec<(ChatIndicator, &Chat)> = self
-            .chats
+    /// The sidebar's active list exactly as it is drawn: [`Self::overview_chats`]
+    /// narrowed to the current project filter. The jump shortcuts and their
+    /// hints both count positions here, so neither can drift from the rows on
+    /// screen.
+    pub fn sidebar_chats(
+        &self,
+        now: DateTime<Utc>,
+        space_filter: Option<&str>,
+    ) -> Vec<(ChatIndicator, &Chat)> {
+        let in_filter = self.project_filter(space_filter);
+        self.overview_chats(now)
+            .into_iter()
+            .filter(|(_, chat)| in_filter(chat))
+            .collect()
+    }
+
+    /// The sidebar's project filter matches by repository: it stores one
+    /// checkout's space id, and a chat in ANY checkout of that repository
+    /// (clones and worktrees on every device, [`zeron_proto::view::project_key`])
+    /// matches. A filter naming a space not synced here matches its own id.
+    pub fn project_filter<'a>(&'a self, filter: Option<&str>) -> impl Fn(&Chat) -> bool + 'a {
+        let filter = filter.map(|id| {
+            (
+                id.to_owned(),
+                self.space_row(id).map(zeron_proto::view::project_key),
+            )
+        });
+        move |chat| {
+            let Some((id, key)) = &filter else {
+                return true;
+            };
+            match chat.space_id.as_deref() {
+                Some(space_id) if space_id == id => true,
+                Some(space_id) => key.as_ref().is_some_and(|key| {
+                    self.space_row(space_id)
+                        .is_some_and(|space| zeron_proto::view::project_key(space) == *key)
+                }),
+                None => false,
+            }
+        }
+    }
+
+    /// Every project — one per repository across devices — as its checkouts
+    /// in [`Self::project_members`] order (this device's first), ordered by
+    /// the project's name.
+    pub fn projects(&self) -> Vec<Vec<&Space>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut projects: Vec<Vec<&Space>> = self
+            .spaces
             .iter()
-            .filter(|chat| chat.archived)
-            .map(|chat| (ChatIndicator::Idle, chat))
+            .filter(|space| seen.insert(zeron_proto::view::project_key(space)))
+            .map(|space| self.project_members(space))
             .collect();
-        sort_active(&mut rows);
-        rows.into_iter().map(|(_, chat)| chat).collect()
+        projects.sort_by_key(|members| {
+            let representative = self.representative_space(members[0]);
+            (
+                representative.display_name().to_lowercase(),
+                representative.id.clone(),
+            )
+        });
+        projects
+    }
+
+    /// A project's host tag: its one device as in [`Self::space_device_tag`],
+    /// else the devices holding a checkout. Offline only when every one is.
+    pub fn project_device_tag(&self, members: &[&Space], now: DateTime<Utc>) -> (String, bool) {
+        let mut devices: Vec<&str> = Vec::new();
+        for member in members {
+            if !devices.contains(&member.device_id.as_str()) {
+                devices.push(member.device_id.as_str());
+            }
+        }
+        match devices.as_slice() {
+            [] => (String::new(), false),
+            [_] => self.space_device_tag(members[0], now),
+            _ => {
+                let offline = devices.iter().all(|d| !self.device_online(d, now));
+                let tag = if devices.len() == 2 {
+                    devices
+                        .iter()
+                        .map(|d| self.device_name(d).unwrap_or("Unknown device"))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                } else {
+                    format!("{} devices", devices.len())
+                };
+                (format!("@ {tag}"), offline)
+            }
+        }
     }
 
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
 
-    fn owner_activity_for(&self, chat_id: &str, now: DateTime<Utc>) -> Option<&comet_proto::AgentSessionRecord> {
-        if self.selected_chat.as_deref() != Some(chat_id) { return None; }
-        let records = &self.collaboration.as_ref()?.sessions;
-        let canonical = records.iter().find(|record| record.session_id == chat_id && record.chat_id == chat_id)?;
-        let owner = comet_proto::view::owner_thread_activity(records, canonical, now.timestamp_millis())?;
-        if let Some(index) = self.session_for(chat_id) {
-            // A slower workspace/watch cannot mask this owner's newer room
-            // state. Neither another device nor an old active row may revive it.
-            if owner.owner_device_id != index.device_id
-                || owner.updated_at.unwrap_or(owner.created_at) <= index.updated_at.timestamp_millis() {
-                return None;
-            }
-        }
-        Some(owner)
+    /// Subagents running under `chat_id` right now (the engine's count on its
+    /// session row; 0 once that row goes stale). Every device can ask, opened
+    /// chat or not.
+    pub fn running_subagents_for(&self, chat_id: &str, now: DateTime<Utc>) -> u32 {
+        running_subagents(self.session_for(chat_id), now)
     }
 
-    /// Staleness-checked status dot for a chat row.
+    /// Staleness-checked status dot for a chat row. A send in flight reads as
+    /// Working (see [`Self::display_status_for`]).
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
-        match self.owner_activity_for(chat_id, now) {
-            Some(owner) => effective_agent_indicator(Some(owner), now),
-            None => effective_indicator(self.session_for(chat_id), now),
+        if self.send_pending(chat_id, now) {
+            return Indicator::Working;
         }
+        effective_indicator(self.session_for(chat_id), now)
+    }
+
+    /// The earliest moment after `now` at which a clock-derived value flips
+    /// with no frame to announce it: a Working/AwaitingInput session going
+    /// stale ([`SESSION_STALE_MS`]), a remote device leaving its online window
+    /// (offline glyphs, degraded delivery, Queued badges), or a pending send's
+    /// grace expiring into "Not delivered". Each deadline is the first instant
+    /// the predicate reads differently. Relative-time labels are excluded:
+    /// they advance on the views' minute heartbeat. Pure.
+    pub fn next_clock_transition(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.clock_deadlines()
+            .filter(|deadline| *deadline > now)
+            .min()
+    }
+
+    /// Whether any clock-driven transition fell in `(from, to]`. Heartbeats
+    /// that move a deadline later without notifying (session and device
+    /// liveness leases) leave an armed timer early; this tells a real
+    /// transition from such an obsolete wake. Pure.
+    fn clock_transition_between(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
+        self.clock_deadlines()
+            .any(|deadline| from < deadline && deadline <= to)
+    }
+
+    fn clock_deadlines(&self) -> impl Iterator<Item = DateTime<Utc>> + '_ {
+        let stale = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                matches!(
+                    session.status,
+                    zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
+                )
+            })
+            // `age_ms > SESSION_STALE_MS` first holds one millisecond past it.
+            .map(|session| {
+                session.updated_at + chrono::TimeDelta::milliseconds(SESSION_STALE_MS + 1)
+            });
+        let offline = self
+            .devices
+            .iter()
+            .filter(|device| self.local_device_id.as_deref() != Some(device.id.as_str()))
+            .filter_map(|device| device.last_seen_at)
+            // Whole seconds `<= DEVICE_ONLINE_WINDOW_SECS` stay online.
+            .map(|at| {
+                at + chrono::TimeDelta::seconds(
+                    crate::settings::devices::DEVICE_ONLINE_WINDOW_SECS + 1,
+                )
+            });
+        let grace = self.pending_sends.values().map(|pending| {
+            pending.started + chrono::TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1)
+        });
+        stale.chain(offline).chain(grace)
+    }
+
+    /// Notify this entity at every clock-driven transition, so each state
+    /// observer (composer interrupts, session sounds, views) sees a session
+    /// go stale, a device go dark or a send's grace expire on time — no state
+    /// frame announces those. Idempotent; every notify re-arms a single
+    /// one-shot timer for the next deadline, so idle state never polls.
+    pub fn watch_clock_transitions(&mut self, cx: &mut Context<Self>) {
+        if self.clock.observation.is_none() {
+            self.clock.observation =
+                Some(cx.observe_self(|state, cx| state.arm_clock_transition(cx)));
+        }
+        self.arm_clock_transition(cx);
+    }
+
+    /// Re-evaluate the clock-dependent parts of the change-detection caches.
+    fn refresh_clock_presentations(&mut self, now: DateTime<Utc>) {
+        self.session_presence_presentation = session_presence_at(&self.sessions, now);
+        if self.device_presentation.is_some() {
+            self.device_presentation = Some(device_presentation_at(&self.devices, now));
+        }
+    }
+
+    fn arm_clock_transition(&mut self, cx: &mut Context<Self>) {
+        let now = clock_now();
+        self.clock.checked_at = Some(now);
+        let wake = self.next_clock_transition(now);
+        if wake == self.clock.wake_at && self.clock.task.is_some() {
+            return;
+        }
+        self.clock.wake_at = wake;
+        self.clock.task = wake.map(|wake| {
+            let delay = (wake - now).to_std().unwrap_or_default();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                this.update(cx, |state, cx| {
+                    state.clock.wake_at = None;
+                    state.clock.task = None;
+                    let now = clock_now();
+                    let from = state.clock.checked_at.unwrap_or(now);
+                    if state.clock_transition_between(from, now) {
+                        // Record what this transition changed, so the frame
+                        // that later reverts it (a heartbeat reviving the
+                        // session or device) compares unequal and notifies.
+                        state.refresh_clock_presentations(now);
+                        // The self-observer re-arms for the next deadline.
+                        cx.notify();
+                    } else {
+                        state.arm_clock_transition(cx);
+                    }
+                })
+                .ok();
+            })
+        });
     }
 
     pub fn selected_chat_row(&self) -> Option<&Chat> {
@@ -2891,8 +2375,23 @@ impl AppState {
         self.chats.iter().find(|c| c.id == id)
     }
 
+    /// The chat the Archive session shortcut acts on: the selected one, unless
+    /// it is already archived. The shortcut archives and never unarchives, so
+    /// an archived chat is left alone. Pure.
+    pub fn archivable_selected_chat(&self) -> Option<&str> {
+        self.selected_chat_row()
+            .filter(|chat| !chat.archived)
+            .map(|chat| chat.id.as_str())
+    }
+
+    /// Latest valid PR for a chat, rechecked against device, checkout, cwd and branch.
+    pub fn change_request_for_chat(&self, chat: &Chat) -> Option<&ChangeRequestSummary> {
+        self.change_requests
+            .change_request_for_chat(chat, &self.spaces)
+    }
+
     pub fn gate(&self) -> GatePhase {
-        gate_phase(&self.connection, self.auth.as_ref())
+        gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {
@@ -2900,13 +2399,153 @@ impl AppState {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_engine_for_test(&mut self, handle: EngineHandle) {
+    pub(crate) fn set_test_engine(&mut self, handle: EngineHandle) {
         self.engine = Some(handle);
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_scaffold_scope_for_test(&mut self, project: &str, deployment: &str) {
-        self.scaffold_scope = Some((project.into(), deployment.into()));
+    /// Drop every account-scoped view and subscription after its runtime has
+    /// stopped. The next bootstrap must never render rows from the previous
+    /// account while the local profile is opening.
+    pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
+        self.engine = None;
+        self.watch_tasks.clear();
+        self.transcript_task = None;
+        self.change_request_tasks.clear();
+        self.change_requests = ChangeRequestClientState::default();
+        self.connection = ConnectionStatus::Connecting;
+        self.workspace_scope = None;
+        self.auth = None;
+        self.devices.clear();
+        self.device_presentation = None;
+        self.session_presence_presentation.clear();
+        self.spaces.clear();
+        self.chats.clear();
+        self.pending_side_chat = None;
+        self.unsaved_side_chat = false;
+        self.sessions.clear();
+        self.sidebar_preferences = SidebarPreferencesState::default();
+        self.session_presentation = None;
+        self.selected_space = None;
+        self.no_project = false;
+        self.selected_device = None;
+        self.canvas_target = None;
+        self.selected_chat = None;
+        self.auto_selected = false;
+        self.chats_synced = false;
+        self.spaces_synced = false;
+        self.transcript.clear();
+        self.transcript_baselines.clear();
+        self.transcript_cache.clear();
+        self.prepared_transcripts.clear();
+        self.context_usage = None;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_replayed = false;
+        self.echoes.clear();
+        self.pending_sends.clear();
+        self.upload_progress = None;
+        self.transfers.clear();
+        self.local_device_id = None;
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// Independent selection and transcript subscriptions over the same engine.
+    /// An `unsaved` chat is a hand-started side chat nothing has written yet:
+    /// it opens no doc until its first send mints it (see
+    /// [`Self::unsaved_side_chat_create`]).
+    pub(crate) fn side_chat_state(
+        parent: &Entity<Self>,
+        chat: Chat,
+        unsaved: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let source = parent.read(cx);
+        let engine = source.engine.clone();
+        let mut state = Self::new();
+        state.chats = source.chats.clone();
+        if !state.chats.iter().any(|c| c.id == chat.id) {
+            state.chats.push(chat.clone());
+        }
+        state.spaces = source.spaces.clone();
+        state.devices = source.devices.clone();
+        state.data_dir = source.data_dir.clone();
+        state.managed_inference = source.managed_inference;
+        state.auto_selected = true;
+        state.pending_side_chat = Some(chat.clone());
+        state.unsaved_side_chat = unsaved;
+        if let Some(engine) = engine {
+            state.attach_engine(engine, cx);
+        }
+        state.select_chat(Some(chat.id), cx);
+        state.watch_clock_transitions(cx);
+        state
+    }
+
+    /// This is a side chat's state whose chat its first send has yet to mint.
+    pub(crate) fn side_chat_unsaved(&self) -> bool {
+        self.unsaved_side_chat
+    }
+
+    /// The harness can change until the first send snapshots it.
+    /// Keep the harness fixed while createChat is in flight, including uploads.
+    pub(crate) fn side_chat_harness_editable(&self) -> bool {
+        self.unsaved_side_chat
+            && self
+                .selected_chat
+                .as_ref()
+                .is_some_and(|id| !self.pending_sends.contains_key(id))
+    }
+
+    fn is_unsaved_side_chat(&self, chat_id: &str) -> bool {
+        self.unsaved_side_chat
+            && self
+                .pending_side_chat
+                .as_ref()
+                .is_some_and(|chat| chat.id == chat_id)
+    }
+
+    /// The `Mutate createChat` params that mint the unsaved side chat
+    /// `chat_id` on its first send; `None` once it exists.
+    pub(crate) fn unsaved_side_chat_create(&self, chat_id: &str) -> Option<serde_json::Value> {
+        if !self.is_unsaved_side_chat(chat_id) {
+            return None;
+        }
+        let chat = self.pending_side_chat.as_ref()?;
+        Some(serde_json::json!({
+            "op": "createChat",
+            "chatId": chat.id,
+            "deviceId": chat.device_id,
+            "spaceId": chat.space_id,
+            "config": chat.config,
+            "branch": chat.branch,
+            "cwd": chat.cwd,
+            "parentChatId": chat.parent_chat_id,
+        }))
+    }
+
+    /// The unsaved side chat now exists: attach the doc watches it deferred.
+    pub(crate) fn side_chat_saved(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if !self.is_unsaved_side_chat(chat_id) {
+            return;
+        }
+        self.unsaved_side_chat = false;
+        if self.selected_chat.as_deref() == Some(chat_id) {
+            self.focus_chat_sync(chat_id, cx);
+            self.start_chat_watches(chat_id.to_owned(), cx);
+        }
+    }
+
+    fn start_chat_watches(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.transcript_task = Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+        if handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+        {
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        }
     }
 
     // ---- gpui glue ----
@@ -2915,15 +2554,15 @@ impl AppState {
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
-        let runtime_profile = config.runtime_profile;
-        let scaffold_scope = configured_scaffold_scope(&config);
-        let boot_config = config.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
+            s.workspace_scope = None;
+            s.auth = None;
             s.data_dir = Some(data_dir);
-            s.runtime_profile = runtime_profile;
-            s.scaffold_scope = scaffold_scope;
-            s.boot_config = Some(boot_config);
+            s.managed_inference = config.managed_inference;
+            if s.pending_crew_link.is_none() {
+                s.pending_crew_link = crate::settings::current(cx).pending_crew_link;
+            }
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -2952,24 +2591,38 @@ impl AppState {
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
-        self.connection = ConnectionStatus::Ready;
+        // The attachment notification precedes the first connectivity frame.
+        // Make that bootstrap gap explicit so the shell resets its alert
+        // baseline instead of comparing the new runtime with the old one.
+        self.connectivity_observed = false;
+        let engine_info = handle.engine_info();
+        let supports_harness_updates =
+            engine_info.supports(zeron_proto::capabilities::HARNESS_UPDATES_V1);
+        self.workspace_scope = Some(engine_info.workspace_scope);
+        self.local_device_id = Some(engine_info.device_id.clone());
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
+        if !supports_harness_updates {
+            self.harness_updates.clear();
+        }
         self.engine = Some(handle.clone());
-        self.drain_scaffold_link(cx);
-        self.drain_directory_link(cx);
-        self.watch_tasks = vec![
+        let mut watch_tasks = Vec::with_capacity(10);
+        if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
+            watch_tasks.push(task);
+        }
+        watch_tasks.extend([
             spawn_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_SESSIONS,
                 AppState::apply_sessions,
             ),
+            spawn_chats_watch(cx, handle.clone()),
             spawn_watch(
                 cx,
                 handle.clone(),
-                methods::WATCH_SESSION_REFS,
-                AppState::apply_session_refs,
+                methods::WATCH_SIDEBAR_PREFERENCES,
+                AppState::apply_sidebar_preferences,
             ),
-            spawn_chats_watch(cx, handle.clone()),
             spawn_watch(
                 cx,
                 handle.clone(),
@@ -2979,16 +2632,21 @@ impl AppState {
             spawn_watch(
                 cx,
                 handle.clone(),
-                methods::WATCH_SPACES,
-                AppState::apply_spaces,
+                methods::WATCH_CONNECTIVITY,
+                AppState::apply_connectivity,
             ),
             spawn_watch(
                 cx,
                 handle.clone(),
-                methods::WATCH_SCAFFOLD_ENVIRONMENTS,
-                AppState::apply_scaffold_environments,
+                methods::WATCH_TRANSFERS,
+                AppState::apply_transfers,
             ),
-            spawn_scaffold_environment_refresh(cx, handle.clone(), self.scaffold_scope.clone()),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_SPACES,
+                AppState::apply_spaces,
+            ),
             // Auth frames parse tolerantly — engine and proto tags differ today.
             spawn_watch(
                 cx,
@@ -2996,707 +2654,191 @@ impl AppState {
                 methods::AUTH_STATUS,
                 AppState::apply_auth_value,
             ),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                AppState::apply_update,
-            ),
             spawn_local_device_probe(cx, handle.clone()),
-        ];
-        // Re-subscribe selected-room projections after an engine reconnect.
-        // Both retain their last good content until replacement frames arrive.
+        ]);
+        if supports_harness_updates {
+            watch_tasks.push(spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_HARNESS_UPDATES,
+                AppState::apply_harness_updates,
+            ));
+        }
+        self.watch_tasks = watch_tasks;
+        self.reconcile_change_request_watches(cx);
+        // EngineInfo is part of the attachment boundary: views must know which
+        // data profile they reached before they are allowed to render Ready.
+        self.connection = ConnectionStatus::Ready;
+        // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
-            let projection = self.room_projections.get(&chat_id).cloned();
-            self.watch_omp_recovery(&chat_id, cx);
-            self.transcript_task = Some(spawn_transcript_watch(
-                cx,
-                handle.clone(),
-                chat_id.clone(),
-                projection.clone(),
-            ));
-            self.collaboration_task =
-                Some(spawn_collaboration_watch(cx, handle, chat_id, projection));
-        }
-        cx.notify();
-    }
-
-    /// A watch task saw the RPC transport die ([`RpcError::Closed`]). First
-    /// caller wins: flip back to Connecting and re-run the probe-or-embed
-    /// bootstrap — a restarted daemon is reattached, a vanished one is
-    /// replaced by an embedded engine. Without this the app is a zombie:
-    /// standing watches end silently and the transcript watch retries a dead
-    /// socket every 2s forever.
-    fn on_engine_closed(&mut self, cx: &mut Context<Self>) {
-        for recovery in self.omp_recovery.values_mut() {
-            recovery
-                .disconnected("Crew disconnected. Reconnect the engine, then retry status.".into());
-        }
-        cx.notify();
-        let Some(config) = self.reconnect_config() else {
-            return;
-        };
-        let old_engine = self.engine.take();
-        let entity = cx.entity();
-        cx.defer(move |cx| {
-            if let Some(old) = old_engine {
-                // Graceful for an in-process engine (releases the IPC port
-                // ahead of the re-probe); a no-op for a remote daemon.
-                Tokio::spawn(cx, async move { old.shutdown().await }).detach();
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            if handle
+                .engine_info()
+                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+            {
+                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
             }
-            AppState::bootstrap(entity, config, cx);
-        });
-        cx.notify();
-    }
-
-    /// Guard half of the reconnect supervisor: only an attached, non-quitting
-    /// app with a retained boot config reconnects. The winner flips the status
-    /// to Connecting, collapsing concurrent detectors into one bootstrap.
-    fn reconnect_config(&mut self) -> Option<EngineBootConfig> {
-        if self.shutting_down || !matches!(self.connection, ConnectionStatus::Ready) {
-            return None; // already reconnecting, failed, or quitting
-        }
-        let config = self.boot_config.clone()?;
-        tracing::warn!("engine RPC connection closed; re-probing");
-        self.connection = ConnectionStatus::Connecting;
-        Some(config)
-    }
-
-    /// Async-context entry for watch tasks reporting a closed connection.
-    fn engine_connection_lost(this: &WeakEntity<AppState>, cx: &mut AsyncApp) {
-        this.update(cx, |state, cx| state.on_engine_closed(cx)).ok();
-    }
-
-    /// Mark the quit in progress and hand back the engine for teardown, so
-    /// its closing streams can't restart a fresh engine mid-shutdown.
-    pub fn begin_shutdown(&mut self) -> Option<EngineHandle> {
-        self.shutting_down = true;
-        self.engine.clone()
-    }
-
-    pub fn selected_scaffold_control_grant_id(&self) -> Option<&str> {
-        self.selected_chat
-            .as_deref()
-            .and_then(|chat_id| self.scaffold_control_grants.get(chat_id))
-            .map(String::as_str)
-    }
-    pub(crate) fn scaffold_control_target(&self, chat_id: &str) -> Option<&ScaffoldControlTarget> {
-        self.scaffold_control_targets.get(chat_id)
-    }
-    pub(crate) fn scaffold_environment(&self, chat_id: &str) -> Option<&SessionEnvironment> {
-        self.scaffold_environments.get(chat_id)
-    }
-    pub(crate) fn chat_host_device_id(&self, chat_id: &str) -> Option<&str> {
-        self.scaffold_host_devices
-            .get(chat_id)
-            .map(String::as_str)
-            .or_else(|| {
-                self.chats
-                    .iter()
-                    .find(|chat| chat.id == chat_id)
-                    .map(|chat| chat.device_id.as_str())
-            })
-    }
-
-    pub fn selected_chat_is_scaffold_room(&self) -> bool {
-        self.selected_chat
-            .as_ref()
-            .is_some_and(|chat_id| self.chat_is_scaffold(chat_id))
-    }
-    pub fn chat_is_scaffold(&self, chat_id: &str) -> bool {
-        self.pending_scaffold_session
-            .as_ref()
-            .is_some_and(|draft| draft.chat_id == chat_id)
-            || self.room_projections.contains_key(chat_id)
-            || self.scaffold_environments.contains_key(chat_id)
-    }
-
-    pub fn can_start_scaffold_session(&self) -> bool {
-        !self.scaffold_session_creating
-            && self.pending_scaffold_session.is_none()
-            && self.scaffold_scope.is_some()
-            && self.selected_space.is_some()
-            && self.runtime_profile.allows_session_import()
-    }
-
-    pub fn scaffold_session_creating(&self) -> bool {
-        self.scaffold_session_creating
-    }
-    fn select_pending_scaffold_chat(
-        &mut self,
-        draft: ScaffoldSessionDraft,
-        cx: &mut Context<Self>,
-    ) {
-        let chat_id = draft.chat_id.clone();
-        self.pending_scaffold_session = Some(draft);
-        self.mark_chat_pending(&chat_id);
-        // `select_chat` keeps pending Scaffold drafts unopened until Attach
-        // returns their exact room projection.
-        self.select_chat(Some(chat_id), cx);
-    }
-
-    /// Create one remote Crew session under the selected folder. No Scaffold
-    /// environment RPC is made until this exact session sends its first prompt.
-    /// Handoff is a separate session-menu action.
-    pub fn start_scaffold_session(
-        &mut self,
-        database_environment: ScaffoldDatabaseEnvironment,
-        cx: &mut Context<Self>,
-    ) {
-        self.stage_scaffold_session(database_environment, false, cx);
-    }
-
-    pub fn handoff_session_to_scaffold(
-        &mut self,
-        chat_id: String,
-        database_environment: ScaffoldDatabaseEnvironment,
-        cx: &mut Context<Self>,
-    ) {
-        if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
-            self.select_chat(Some(chat_id), cx);
-        }
-        self.stage_scaffold_session(database_environment, true, cx);
-    }
-
-    pub fn chat_can_handoff_to_scaffold(&self, chat_id: &str) -> bool {
-        self.local_device_id
-            .as_deref()
-            .is_some_and(|local_device_id| {
-                self.chats.iter().any(|chat| {
-                    chat.id == chat_id
-                        && chat.device_id == local_device_id
-                        && chat
-                            .config
-                            .as_ref()
-                            .is_some_and(|config| config.harness == HarnessId::Omp)
-                        && chat
-                            .harness_session_id
-                            .as_deref()
-                            .is_some_and(|id| !id.is_empty())
-                        && chat
-                            .harness_session_cwd
-                            .as_deref()
-                            .is_some_and(|cwd| !cwd.is_empty())
-                        && !self.room_projections.contains_key(chat_id)
-                })
-            })
-    }
-
-    fn stage_scaffold_session(
-        &mut self,
-        database_environment: ScaffoldDatabaseEnvironment,
-        require_handoff: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if self.scaffold_session_creating || self.pending_scaffold_session.is_some() {
-            return;
-        }
-        let Some((project_id, deployment_id)) = self.scaffold_scope.clone() else {
-            self.scaffold_session_error = Some("Scaffold is not configured".into());
-            cx.notify();
-            return;
-        };
-        let handoff_source = require_handoff
-            .then(|| {
-                self.selected_chat.as_deref().and_then(|selected| {
-                    self.chats
-                        .iter()
-                        .find(|chat| chat.id == selected)
-                        .filter(|_| self.chat_can_handoff_to_scaffold(selected))
-                        .and_then(|chat| {
-                            let native_session_id = chat.harness_session_id.as_deref()?;
-                            let cwd = chat.harness_session_cwd.as_deref()?;
-                            Some((
-                                ScaffoldOmpHandoffDraft {
-                                    native_session_id: native_session_id.to_string(),
-                                    cwd: cwd.to_string(),
-                                },
-                                chat.config.clone(),
-                                chat.space_id.clone(),
-                                chat.title.clone(),
-                            ))
-                        })
-                })
-            })
-            .flatten();
-        if require_handoff && handoff_source.is_none() {
-            self.scaffold_session_error =
-                Some("Only local OMP sessions can be handed off to Scaffold".into());
-            cx.notify();
-            return;
-        }
-        let source_space_id = handoff_source
-            .as_ref()
-            .and_then(|(_, _, space_id, _)| space_id.clone());
-        let Some(space_id) = source_space_id.or_else(|| self.selected_space.clone()) else {
-            self.scaffold_session_error = Some("Select a folder first".into());
-            cx.notify();
-            return;
-        };
-        let Some(space) = self.space_row(&space_id).cloned() else {
-            self.scaffold_session_error = Some("Selected folder is unavailable".into());
-            cx.notify();
-            return;
-        };
-        let chat_id = uuid::Uuid::new_v4().to_string();
-        let source_ref = None;
-        let handoff = handoff_source
-            .as_ref()
-            .map(|(handoff, _, _, _)| handoff.clone());
-        let config = handoff_source
-            .as_ref()
-            .and_then(|(_, config, _, _)| config.clone());
-        let title = handoff_source.and_then(|(_, _, _, title)| title);
-        self.scaffold_session_error = None;
-        self.stage_pending_chat(Chat {
-            id: chat_id.clone(),
-            device_id: space.device_id,
-            title,
-            archived: false,
-            cwd: Some(space.path),
-            branch: source_ref.clone(),
-            checkout_id: space.checkout_id,
-            config,
-            last_message_preview: None,
-            last_message_at: None,
-            created_at: chrono::Utc::now(),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            fork_from: None,
-            space_id: Some(space_id.clone()),
-            last_seen_at: None,
-        });
-        self.select_pending_scaffold_chat(
-            ScaffoldSessionDraft {
-                project_id,
-                deployment_id,
-                space_id,
-                chat_id,
-                database_environment,
-                source_ref,
-                omp_handoff: handoff,
-            },
-            cx,
-        );
-    }
-
-    pub(crate) fn set_scaffold_database_environment(
-        &mut self,
-        database_environment: ScaffoldDatabaseEnvironment,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(draft) = self.pending_scaffold_session.as_mut() {
-            draft.database_environment = database_environment;
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn set_scaffold_source_ref(&mut self, source_ref: Option<String>, cx: &mut Context<Self>) {
-        if source_ref.as_ref().is_some_and(|reference| reference.trim().is_empty()) {
-            return;
-        }
-        if let Some(draft) = self.pending_scaffold_session.as_mut() {
-            draft.source_ref = source_ref.clone();
-            if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == draft.chat_id) {
-                chat.branch = source_ref;
-            }
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn scaffold_session_draft(&self) -> Option<&ScaffoldSessionDraft> {
-        self.selected_chat
-            .as_deref()
-            .and_then(|chat_id| self.scaffold_session_draft_for_chat(chat_id))
-    }
-
-    pub(crate) fn scaffold_session_draft_for_chat(
-        &self,
-        chat_id: &str,
-    ) -> Option<&ScaffoldSessionDraft> {
-        self.pending_scaffold_session
-            .as_ref()
-            .filter(|draft| draft.chat_id == chat_id)
-    }
-
-    pub(crate) fn complete_scaffold_session_startup(&mut self, chat_id: &str) {
-        if self.scaffold_session_draft_for_chat(chat_id).is_some() {
-            self.pending_scaffold_session = None;
-            self.scaffold_session_error = None;
-        }
-    }
-
-    pub(crate) fn install_scaffold_session(
-        &mut self,
-        attachment: &ScaffoldSessionAttachment,
-        cx: &mut Context<Self>,
-    ) {
-        let chat_id = attachment.projection.session_id.clone();
-        self.room_projections
-            .insert(chat_id.clone(), attachment.projection.clone());
-        self.scaffold_control_grants
-            .insert(chat_id.clone(), attachment.grant_id.clone());
-        self.scaffold_control_targets
-            .insert(chat_id.clone(), attachment.control_target.clone());
-        self.scaffold_environments
-            .insert(chat_id.clone(), attachment.environment.clone());
-        self.scaffold_host_devices
-            .insert(chat_id.clone(), attachment.owner_device_id.clone());
-        // Attachment is not command admission. Keep the original draft so a
-        // checkout/upload/admission failure can prepare the same target again.
-        self.scaffold_session_error = None;
-        if self.selected_chat.as_deref() != Some(chat_id.as_str()) {
-            self.select_chat(Some(chat_id), cx);
-            return;
-        }
-        self.restore_transcript(None);
-        self.transcript_task = None;
-        self.omp_recovery_task = None;
-        self.transcript_history_task = None;
-        self.transcript_history_loading = false;
-        self.collaboration = None;
-        self.collaboration_task = None;
-        self.selected_agent_session = None;
-        self.selected_invitation_grant = None;
-        if let Some(handle) = self.engine.clone() {
-            let projection = Some(attachment.projection.clone());
-            self.watch_omp_recovery(&chat_id, cx);
-            self.transcript_task = Some(spawn_transcript_watch(
-                cx,
-                handle.clone(),
-                chat_id.clone(),
-                projection.clone(),
-            ));
-            self.collaboration_task =
-                Some(spawn_collaboration_watch(cx, handle, chat_id, projection));
         }
         cx.notify();
     }
 
-    pub fn mark_scaffold_chat_starting(&mut self, chat_id: &str) {
-        self.scaffold_starting_chats.insert(chat_id.to_string());
-    }
-
-    pub fn clear_scaffold_chat_starting(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        if !self.scaffold_starting_chats.remove(chat_id)
-            || self.selected_chat.as_deref() != Some(chat_id)
-            || self.transcript_task.is_some()
-            || self.collaboration_task.is_some()
-            || self
-                .pending_scaffold_session
-                .as_ref()
-                .is_some_and(|draft| draft.chat_id == chat_id)
-        {
-            return;
-        }
+    fn reconcile_change_request_watches(&mut self, cx: &mut Context<Self>) {
         let Some(handle) = self.engine.clone() else {
+            self.change_request_tasks.clear();
             return;
         };
-        let projection = self.room_projections.get(chat_id).cloned();
-        self.watch_omp_recovery(chat_id, cx);
-        self.transcript_task = Some(spawn_transcript_watch(
-            cx,
-            handle.clone(),
-            chat_id.to_string(),
-            projection.clone(),
-        ));
-        self.collaboration_task = Some(spawn_collaboration_watch(
-            cx,
-            handle,
-            chat_id.to_string(),
-            projection,
-        ));
-        cx.notify();
-    }
-
-    pub fn scaffold_chat_starting(&self, chat_id: &str) -> bool {
-        self.scaffold_starting_chats.contains(chat_id)
-    }
-
-    pub fn load_local_sessions(&mut self, force: bool, cx: &mut Context<Self>) {
-        if !self.runtime_profile.allows_session_import() {
-            return;
-        }
-        if self.local_sessions_loading
-            || (!force
-                && self
-                    .local_sessions_refreshed_at
-                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30)))
-        {
-            return;
-        }
-        let Some(handle) = self.engine.clone() else {
-            return;
-        };
-        self.local_sessions_loading = true;
-        self.local_sessions_refreshed_at = Some(std::time::Instant::now());
-        self.local_sessions_error = None;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = handle
-                .client()
-                .call(methods::LIST_LOCAL_SESSIONS, serde_json::json!({}))
-                .await
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<LocalSessionCandidate>>(value)
-                        .map_err(|err| RpcError::Failed(err.to_string()))
-                });
-            let _ = this.update(cx, |state, cx| {
-                state.local_sessions_loading = false;
-                match result {
-                    Ok(candidates) => state.apply_local_session_candidates(candidates),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "local session discovery failed");
-                        state.local_sessions_error =
-                            Some(format!("Could not find local sessions: {err}"));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    pub fn attach_local_session(&mut self, candidate_id: String, cx: &mut Context<Self>) {
-        if self.local_session_attaching.contains(&candidate_id)
-            || !self
-                .local_session_candidates
-                .iter()
-                .any(|candidate| candidate.id == candidate_id)
-        {
-            return;
-        }
-        let failure_verb = self
-            .local_session_candidates
-            .iter()
-            .find(|candidate| candidate.id == candidate_id)
-            .map(|candidate| {
-                if candidate.history_only {
-                    "import"
-                } else {
-                    "open"
-                }
+        let targets = if self.change_requests_visible {
+            desired_watch_targets(&self.chats, &self.spaces, |device| {
+                !self.change_requests.is_supported(device)
             })
-            .unwrap_or("open");
-        let Some(handle) = self.engine.clone() else {
-            return;
-        };
-        self.local_session_attaching.insert(candidate_id.clone());
-        self.local_session_attach_errors.remove(&candidate_id);
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = handle
-                .client()
-                .call(
-                    methods::ATTACH_LOCAL_SESSION,
-                    serde_json::json!({ "candidateId": candidate_id.clone() }),
-                )
-                .await
-                .and_then(|value| {
-                    serde_json::from_value::<LocalSessionAttachResult>(value)
-                        .map_err(|err| RpcError::Failed(err.to_string()))
-                });
-            let _ = this.update(cx, |state, cx| {
-                state.local_session_attaching.remove(&candidate_id);
-                match result {
-                    Ok(attached) => {
-                        state
-                            .local_session_candidates
-                            .retain(|candidate| candidate.id != candidate_id);
-                        state.local_session_attach_errors.remove(&candidate_id);
-                        let chat_id = attached.chat_id;
-                        if !state.chats.iter().any(|chat| chat.id == chat_id) {
-                            state.pending_local_chat_ids.insert(chat_id.clone());
-                        }
-                        state.selected_space = Some(attached.space_id);
-                        state.select_chat(Some(chat_id), cx);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            %candidate_id,
-                            error = %err,
-                            "local session attach failed"
-                        );
-                        state.local_session_attach_errors.insert(
-                            candidate_id.clone(),
-                            format!("Could not {failure_verb}: {err}"),
-                        );
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-    pub(crate) fn omp_recovery(&self, chat_id: &str) -> Option<&OmpRecoveryState> {
-        self.omp_recovery.get(chat_id)
-    }
-
-    fn apply_omp_recovery(&mut self, chat_id: &str, mut snapshot: OmpRecoveryState) {
-        if let Some(previous) = self.omp_recovery.get(chat_id) {
-            snapshot.request_generation = previous.request_generation;
-        }
-        self.omp_recovery.insert(chat_id.to_string(), snapshot);
-    }
-
-    fn omp_recovery_disconnected(&mut self, chat_id: &str, error: String) {
-        self.omp_recovery
-            .entry(chat_id.to_string())
-            .or_insert(OmpRecoveryState {
-                phase: OmpRecoveryPhase::Idle,
-                error: None,
-                watch_error: None,
-                request_generation: 0,
-            })
-            .disconnected(error);
-    }
-
-    fn omp_recovery_target(&self, chat_id: &str) -> Option<&str> {
-        self.chat_host_device_id(chat_id).or_else(|| {
-            self.sessions
-                .iter()
-                .find(|session| session.chat_id == chat_id)
-                .map(|session| session.device_id.as_str())
-        })
-    }
-
-    pub(crate) fn watch_omp_recovery(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        self.omp_recovery_task = None;
-        // Cached phases are not authoritative after navigation/reconnection.
-        self.omp_recovery.remove(chat_id);
-        if let Some(handle) = self.engine.clone() {
-            let target_device_id = self.omp_recovery_target(chat_id).map(str::to_string);
-            let projection = self.room_projections.get(chat_id).cloned();
-            self.omp_recovery_task = Some(spawn_omp_recovery_watch(
-                cx,
-                handle,
-                chat_id.to_string(),
-                target_device_id,
-                projection,
-            ));
         } else {
-            self.omp_recovery_disconnected(
-                chat_id,
-                "Crew is disconnected. Reconnect the engine, then retry status.".into(),
-            );
-        }
-        cx.notify();
-    }
+            HashSet::new()
+        };
 
-    pub(crate) fn take_over_omp_session(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        if !self
-            .omp_recovery
-            .get(&chat_id)
-            .is_some_and(OmpRecoveryState::can_take_over)
-        {
-            return;
-        }
-        let Some(engine) = self.engine.clone() else {
-            self.omp_recovery_disconnected(
-                &chat_id,
-                "Crew is disconnected. Reconnect the engine, then retry status.".into(),
-            );
-            cx.notify();
-            return;
-        };
-        let target_device_id = self.omp_recovery_target(&chat_id).map(str::to_string);
-        let Some(target_device_id) = target_device_id else {
-            self.omp_recovery_disconnected(
-                &chat_id,
-                "The device running this session is unavailable. Reconnect it, then retry status."
-                    .into(),
-            );
-            cx.notify();
-            return;
-        };
-        self.omp_recovery_request_generation = self.omp_recovery_request_generation.wrapping_add(1);
-        let recovery = self.omp_recovery.get_mut(&chat_id).unwrap();
-        recovery.phase = OmpRecoveryPhase::Waiting;
-        recovery.error = None;
-        recovery.request_generation = self.omp_recovery_request_generation;
-        let generation = recovery.request_generation;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::TAKE_OVER_OMP_SESSION,
-                    serde_json::json!({
-                        "chatId": chat_id,
-                        "targetDeviceId": target_device_id,
-                    }),
-                )
-                .await;
-            let closed = matches!(&result, Err(RpcError::Closed));
-            let _ = this.update(cx, |state, cx| {
-                if let Some(recovery) = state.omp_recovery.get_mut(&chat_id) {
-                    recovery.finish_request(
-                        generation,
-                        result.map(|_| ()).map_err(|error| error.to_string()),
-                    );
-                    cx.notify();
-                }
-            });
-            if closed {
-                AppState::engine_connection_lost(&this, cx);
+        self.change_request_tasks
+            .retain(|target, _| targets.contains(target));
+        self.change_requests.retain_targets(&targets);
+
+        let local_device_id = self.local_device_id.clone();
+        for target in targets {
+            if self.change_request_tasks.contains_key(&target) {
+                continue;
             }
-        })
-        .detach();
+            let task = spawn_change_request_watch(
+                cx,
+                handle.clone(),
+                target.clone(),
+                local_device_id.clone(),
+            );
+            self.change_request_tasks.insert(target, task);
+        }
     }
 
-    pub(crate) fn transcript_room_projection(
-        &self,
-        chat_id: &str,
-    ) -> Option<SessionRoomProjection> {
-        self.room_projections.get(chat_id).cloned()
+    pub fn set_change_requests_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.change_requests_visible != visible {
+            self.change_requests_visible = visible;
+            self.reconcile_change_request_watches(cx);
+        }
     }
 
-    pub fn load_older_transcript(&mut self, cx: &mut Context<Self>) {
-        if self.transcript_history_loading {
+    pub fn open_deep_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        if crate::links::crew_link_scope(url).is_some()
+            || (self.managed_inference && crate::links::parse_zeron_conversation_link(url).is_ok()) {
+            let pending = crate::settings::PendingCrewLink {
+                url: url.to_owned(),
+                owner: self.auth_user().map(|user| user.id.clone()),
+                expires_at: chrono::Utc::now().timestamp() + 1800,
+            };
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                settings.pending_crew_link = Some(pending.clone());
+            });
+            self.pending_crew_link = Some(pending);
+            if !matches!(self.auth, Some(AuthState::SignedIn { .. })) {
+                self.deep_link_notice = Some("Sign in to Crew to open this session. The link will continue after login; it will not start execution.".into());
+            }
+            self.apply_pending_deep_link(cx);
+            cx.notify();
             return;
         }
-        let (Some(chat_id), Some(before), Some(handle)) = (
-            self.selected_chat.clone(),
-            self.transcript_history_before,
-            self.engine.clone(),
-        ) else {
-            return;
+        match crate::links::parse_zeron_conversation_link(url) {
+            Ok(link) => {
+                self.pending_deep_link = Some(link);
+                self.apply_pending_deep_link(cx);
+            }
+            Err(error) => self.deep_link_notice = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// Returns whether a pending link was resolved (selected or rejected).
+    fn apply_pending_deep_link(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pending_crew_link.is_some() {
+            return self.apply_pending_crew_link(cx);
+        }
+        let Some(link) = self.pending_deep_link.clone() else {
+            return false;
         };
-        let projection = self.room_projections.get(&chat_id).cloned();
-        self.transcript_history_loading = true;
-        self.transcript_history_task = Some(cx.spawn(async move |this, cx| {
-            let result = handle
-                .client()
-                .call(
-                    methods::READ_DOC_MESSAGES,
-                    serde_json::json!({
-                        "chatId": chat_id,
-                        "before": before,
-                        "roomProjection": projection,
-                    }),
-                )
-                .await
-                .and_then(|value| {
-                    serde_json::from_value::<SessionEntryWindow>(value)
-                        .map_err(|error| RpcError::Failed(error.to_string()))
-                });
+        let Some(locator) = crate::links::workspace_locator(
+            self.workspace_scope,
+            self.auth.as_ref(),
+            self.local_device_id.as_deref(),
+        ) else {
+            return false;
+        };
+        if locator != link.workspace {
+            self.pending_deep_link = None;
+            self.deep_link_notice =
+                Some("This conversation link belongs to another workspace".into());
+            return true;
+        }
+        if self.chats.iter().any(|chat| chat.id == link.chat_id) {
+            self.pending_deep_link = None;
+            self.select_linked_chat(link.chat_id, cx);
+            true
+        } else if self.chats_synced {
+            self.pending_deep_link = None;
+            self.deep_link_notice = Some("The linked conversation was not found".into());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_pending_crew_link(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.pending_crew_link.clone() else { return false; };
+        if pending.expires_at <= chrono::Utc::now().timestamp() {
+            self.pending_crew_link = None;
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| settings.pending_crew_link = None);
+            self.deep_link_notice = Some("Session link expired while waiting for login. Open the original link again.".into());
+            return true;
+        }
+        let Some(AuthState::SignedIn { user, org_id }) = &self.auth else { return false; };
+        if self.workspace_scope != Some(WorkspaceScope::Synced) { return false; }
+        let owner = user.id.clone();
+        let conversation = crate::links::parse_zeron_conversation_link(&pending.url).ok();
+        let same_scope = if let Some(link) = &conversation {
+            if !self.chats_synced { return false; }
+            crate::links::workspace_locator(self.workspace_scope, self.auth.as_ref(), self.local_device_id.as_deref()).as_deref() == Some(link.workspace.as_str())
+        } else {
+            crate::links::crew_link_scope(&pending.url).is_some_and(|scope| org_id.as_deref() == Some(scope.project_id.as_str()))
+        };
+        let valid = pending.owner.as_ref().is_none_or(|expected| expected == &owner) && same_scope;
+        let Some(engine) = self.engine().cloned() else { return false; };
+        self.pending_crew_link = None;
+        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| settings.pending_crew_link = None);
+        if !valid {
+            self.deep_link_notice = Some("This session link belongs to a different account or project. Switch to its profile and reopen the link.".into());
+            return true;
+        }
+        if let Some(link) = conversation {
+            self.pending_deep_link = Some(link);
+            return self.apply_pending_deep_link(cx);
+        }
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call("ResolveCrewSessionLink", serde_json::json!({"url": pending.url})).await;
             this.update(cx, |state, cx| {
-                if state.selected_chat.as_deref() == Some(chat_id.as_str())
-                    && state.transcript_history_before == Some(before)
-                {
-                    match result {
-                        Ok(page) => state.apply_transcript_page(page),
-                        Err(error) => {
-                            tracing::warn!(%chat_id, %error, "transcript history page failed")
-                        }
-                    }
+                if state.auth_user().map(|user| user.id.as_str()) != Some(owner.as_str()) { return; }
+                match result {
+                    Ok(value) => match value.get("chatId").and_then(serde_json::Value::as_str) {
+                        Some(id) if !id.is_empty() => state.select_linked_chat(id.to_owned(), cx),
+                        _ => state.deep_link_notice = Some("The session resolver returned no authorized session. Reopen the link after refreshing.".into()),
+                    },
+                    Err(error) => state.deep_link_notice = Some(format!("Could not open Crew session: {error}. Reopen the original link to retry.")),
                 }
-                state.transcript_history_loading = false;
-                state.transcript_history_task = None;
                 cx.notify();
-            })
-            .ok();
-        }));
+            }).ok();
+        }).detach();
+        true
+    }
+
+    fn select_linked_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.select_chat(Some(chat_id.clone()), cx);
+        cx.emit(ConversationLinkOpened { chat_id });
+    }
+
+    pub fn take_deep_link_notice(&mut self) -> Option<String> {
+        self.deep_link_notice.take()
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -3704,133 +2846,188 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
-        if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
-            !self.scaffold_control_targets.contains_key(&draft.chat_id)
-                && self.scaffold_session_error.is_none()
-                && !self.scaffold_starting_chats.contains(&draft.chat_id)
-                && Some(draft.chat_id.as_str()) != chat_id.as_deref()
-        }) {
-            self.pending_scaffold_session = None;
+        if let Some(id) = &chat_id
+            && !self.is_unsaved_side_chat(id)
+        {
+            self.focus_chat_sync(id, cx);
         }
         if self.selected_chat == chat_id {
-            // An explicit click on an already-open new-session canvas must
-            // still suppress the boot watch's automatic prior-chat selection.
-            self.auto_selected = true;
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
             }
             return;
         }
-        self.cache_selected_transcript();
+        match (&self.selected_chat, &chat_id) {
+            (None, Some(_)) => self.canvas_target = Some(self.current_canvas_target()),
+            (Some(_), None) => self.restore_canvas_target(),
+            _ => {}
+        }
+        // Take the destination before trimming: switching to the oldest warm
+        // transcript must not evict the very entry we are about to display.
+        let cached = self
+            .transcript_cache
+            .iter()
+            .position(|cached| Some(&cached.chat_id) == chat_id.as_ref())
+            .and_then(|index| self.transcript_cache.remove(index));
+        if let Some(previous) = &self.selected_chat {
+            let old_baseline = self.transcript_baselines.remove(previous);
+            cx.background_executor()
+                .spawn(async move {
+                    drop(old_baseline);
+                })
+                .detach();
+            let prepared = self.prepared_transcripts.remove(previous);
+            if self.transcript_replayed {
+                let entries = std::mem::take(&mut self.transcript);
+                let bytes = prepared.as_ref().map_or_else(
+                    || {
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                std::mem::size_of::<SessionMessageEntry>()
+                                    + entry.id.len()
+                                    + entry
+                                        .parts
+                                        .iter()
+                                        .map(|part| {
+                                            std::mem::size_of::<zeron_doc::MessagePart>()
+                                                + part.byte_len()
+                                        })
+                                        .sum::<usize>()
+                            })
+                            .sum()
+                    },
+                    |p| p.bytes,
+                );
+                self.transcript_cache.push_back(CachedTranscript {
+                    prepared,
+                    chat_id: previous.clone(),
+                    entries,
+                    context_usage: self.context_usage,
+                    bytes,
+                });
+                while self.transcript_cache.len() > TRANSCRIPT_CACHE_CAP
+                    || self
+                        .transcript_cache
+                        .iter()
+                        .map(|cached| cached.bytes)
+                        .sum::<usize>()
+                        > TRANSCRIPT_CACHE_BYTES
+                {
+                    let evicted = self.transcript_cache.pop_front();
+                    cx.background_executor()
+                        .spawn(async move {
+                            drop(evicted);
+                        })
+                        .detach();
+                }
+            }
+        }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
-        self.restore_transcript(chat_id.as_deref());
-        self.transcript_task = None;
-        self.omp_recovery_task = None;
-        self.transcript_history_task = None;
-        self.transcript_history_loading = false;
-        self.collaboration = None;
-        self.collaboration_task = None;
-        self.selected_agent_session = None;
-        self.selected_invitation_grant = None;
-        if self
-            .pending_invitation
-            .as_ref()
-            .is_some_and(|invitation| Some(invitation.chat_id.as_str()) != chat_id.as_deref())
-        {
-            self.pending_invitation = None;
+        self.transcript.clear();
+        self.context_usage = None;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_replayed = false;
+        if let Some(cached) = cached {
+            self.transcript_baselines.insert(
+                cached.chat_id.clone(),
+                cached
+                    .prepared
+                    .as_ref()
+                    .map(|p| p.navigation_baseline.clone())
+                    .unwrap_or_else(|| {
+                        Arc::new(zeron_doc::TranscriptBaseline::capture(&cached.entries))
+                    }),
+            );
+            if let Some(prepared) = cached.prepared {
+                self.prepared_transcripts.insert(cached.chat_id, prepared);
+            }
+            self.transcript = cached.entries;
+            self.context_usage = cached.context_usage;
+            self.transcript_replayed = true;
         }
+        self.transcript_task = None;
+        self.queue.clear();
+        self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
-            // A chat implies its space; `select_chat(None)` (the new-session
-            // canvas) stays within the current space.
-            if let Some(space_id) = self
-                .chats
-                .iter()
-                .find(|c| c.id == id)
-                .and_then(|c| c.space_id.clone())
-            {
-                if !self.selected_space_members.contains(&space_id) {
-                    self.selected_space_members = vec![space_id.clone()];
+            // A chat implies its project (or the lack of one); `select_chat(None)`
+            // (the new-session canvas) restores the pick set aside above.
+            if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
+                match chat.space_id.clone() {
+                    Some(space_id) => {
+                        self.selected_space = Some(space_id);
+                        self.no_project = false;
+                    }
+                    None => {
+                        self.selected_space = None;
+                        self.no_project = true;
+                        self.selected_device = Some(chat.device_id.clone());
+                    }
                 }
-                self.selected_space = Some(space_id);
             }
             self.mark_chat_seen(id, cx);
         }
-        if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone())
-            && !self.scaffold_starting_chats.contains(&chat_id)
-            && !self
-                .pending_scaffold_session
-                .as_ref()
-                .is_some_and(|draft| draft.chat_id == chat_id)
-        {
-            let projection = self.room_projections.get(&chat_id).cloned();
-            self.watch_omp_recovery(&chat_id, cx);
-            self.transcript_task = Some(spawn_transcript_watch(
-                cx,
-                handle.clone(),
-                chat_id.clone(),
-                projection.clone(),
-            ));
-            self.collaboration_task =
-                Some(spawn_collaboration_watch(cx, handle, chat_id, projection));
-        }
-        cx.notify();
-    }
-
-    /// Select one persisted space; the caller decides which chat to land on.
-    pub fn select_space(&mut self, space_id: Option<String>, cx: &mut Context<Self>) {
-        match space_id {
-            Some(space_id) => self.select_space_source(space_id.clone(), vec![space_id], cx),
-            None => {
-                if self.selected_space.is_none() && self.selected_space_members.is_empty() {
-                    return;
-                }
-                self.selected_space = None;
-                self.selected_space_members.clear();
-                if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
-                    !self.scaffold_control_targets.contains_key(&draft.chat_id)
-                        && self.scaffold_session_error.is_none()
-                        && !self.scaffold_starting_chats.contains(&draft.chat_id)
-                }) {
-                    self.pending_scaffold_session = None;
-                }
-                cx.notify();
+        if let Some(chat_id) = chat_id {
+            if self.is_unsaved_side_chat(&chat_id) {
+                // Nothing to watch yet, and opening its doc would start one.
+                self.transcript_replayed = true;
+            } else {
+                self.start_chat_watches(chat_id, cx);
             }
         }
-    }
-
-    /// Select a presentation-only logical source while retaining every
-    /// persisted member id for tab/chat projection.
-    pub fn select_space_source(
-        &mut self,
-        space_id: String,
-        mut member_ids: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        if !member_ids.contains(&space_id) {
-            member_ids.push(space_id.clone());
-        }
-        member_ids.sort();
-        member_ids.dedup();
-        if self.selected_space.as_deref() == Some(space_id.as_str())
-            && self.selected_space_members == member_ids
-        {
-            return;
-        }
-        if self.pending_scaffold_session.as_ref().is_some_and(|draft| {
-            !self.scaffold_control_targets.contains_key(&draft.chat_id)
-                && self.scaffold_session_error.is_none()
-                && !self.scaffold_starting_chats.contains(&draft.chat_id)
-        }) {
-            self.pending_scaffold_session = None;
-        }
-        self.selected_space = Some(space_id);
-        self.selected_space_members = member_ids;
         cx.notify();
     }
 
-    /// Window-focus liveness sweep for every open room.
+    /// Replace the selected chat's queue subscription without clearing its
+    /// current projection. This is used after an optimistic mutation fails:
+    /// the authoritative opening frame repairs the local list even though the
+    /// document itself did not change and therefore emitted no new frame.
+    pub(crate) fn refresh_selected_queue(&mut self, cx: &mut Context<Self>) {
+        self.queue_task = None;
+        let (Some(chat_id), Some(handle)) = (self.selected_chat.clone(), self.engine.clone())
+        else {
+            return;
+        };
+        if handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+        {
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        }
+    }
+
+    /// Select a project; the caller (shell) decides which chat to land on.
+    /// `Some` clears a "Don't work in a project" opt-out and re-aims the
+    /// device pick at the project's host; `None` IS that opt-out.
+    pub fn select_space(&mut self, space_id: Option<String>, cx: &mut Context<Self>) {
+        match &space_id {
+            Some(id) => {
+                self.no_project = false;
+                if let Some(device) = self.space_row(id).map(|s| s.device_id.clone()) {
+                    self.selected_device = Some(device);
+                }
+            }
+            None => {
+                self.selected_device = self.effective_device_id();
+                self.no_project = true;
+            }
+        }
+        if self.selected_space == space_id && space_id.is_some() {
+            cx.notify();
+            return;
+        }
+        self.selected_space = space_id;
+        cx.notify();
+    }
+
+    /// Synced seen marker: only fires when the chat is currently unseen
+    /// (idempotence — no mutate spam), stamps the local row optimistically so
+    /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
+    /// Window-focus liveness sweep: ask the engine to probe every open room
+    /// (workspace + chat docs). Fire-and-forget; each room ignores the hint
+    /// unless it has been broadcast-quiet ≥30s, so spamming is harmless.
     pub fn probe_sync(&mut self, cx: &mut Context<Self>) {
         let Some(handle) = self.engine.clone() else {
             return;
@@ -3844,12 +3041,7 @@ impl AppState {
         .detach();
     }
 
-    /// Synced seen marker: only fires when the chat is currently unseen
-    /// (idempotence — no mutate spam), stamps the local row optimistically so
-    /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
     pub fn mark_chat_seen(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        // An explicit read releases the "marked unread" pin either way.
-        self.unread_marks.remove(chat_id);
         let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
             return;
         };
@@ -3871,109 +3063,207 @@ impl AppState {
         .detach();
     }
 
-    /// Explicit "mark as unread": clears the synced seen marker (optimistically
-    /// locally, LWW mutate to every device) and pins the chat against the
-    /// shell's window-active auto-seen stamp until the user re-selects it.
-    pub fn mark_chat_unread(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
-            return;
-        };
-        chat.last_seen_at = None;
-        self.unread_marks.insert(chat_id.to_string());
-        cx.notify();
+    /// Navigation signal is separate from watch lifetime: resubscribing,
+    /// receiving agent output and MCP reads cannot refresh focus priority.
+    pub(crate) fn focus_chat_sync(&self, chat_id: &str, cx: &mut Context<Self>) {
         let Some(handle) = self.engine.clone() else {
             return;
         };
-        let chat_id = chat_id.to_string();
+        let chat_id = chat_id.to_owned();
         cx.spawn(async move |_, _| {
-            let params = serde_json::json!({ "op": "markChatUnread", "chatId": chat_id });
-            if let Err(err) = handle.client().call(methods::MUTATE, params).await {
-                tracing::warn!(chat = %chat_id, error = %err, "markChatUnread failed");
+            if let Err(error) = handle
+                .client()
+                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .await
+            {
+                tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
             }
         })
         .detach();
     }
 
-    /// True while an explicit "mark unread" is pinned (the shell's
-    /// looking-at-it auto-seen stamp must not clear it).
-    pub fn chat_marked_unread(&self, chat_id: &str) -> bool {
-        self.unread_marks.contains(chat_id)
+    pub(crate) fn focus_subagent_sync(&self, doc_id: &str, cx: &mut Context<Self>) {
+        // Frozen transcripts are static blobs: navigation must not open their
+        // old room just to report focus.
+        if self.sub_watch_tasks.contains_key(doc_id) {
+            self.focus_chat_sync(doc_id, cx);
+        }
     }
 }
 
-/// Subscribe to a watch method and pump each frame through `apply`. Runs on the
-/// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: comet's `/` route redirected to the
-/// last-used chat; we approximate by selecting the most recent unarchived chat
-/// on the first frame when nothing is selected yet (manual selection wins).
+/// Observe assembly after an early attach (cloud onboarding or another viewport
+/// reaching the embedded engine over IPC). Data subscriptions wait on the same
+/// result, but their individual errors are not authoritative: older engines may
+/// legitimately omit a watch method. Only the assembly result may fail the
+/// whole connection.
+fn spawn_deferred_engine_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+) -> Option<Task<()>> {
+    let mut deferred = handle.deferred_state()?;
+    Some(cx.spawn(async move |this, cx| {
+        let Err(failure) = wait_for_deferred_engine(&mut deferred).await else {
+            return;
+        };
+        tracing::error!(error = %failure, "engine assembly failed after attachment");
+        // Embedded handles release their IPC listener before exposing Retry;
+        // remote handles stop their completed readiness probe.
+        handle.shutdown().await;
+        this.update(cx, |state, cx| {
+            state.connection = ConnectionStatus::Failed(failure);
+            cx.notify();
+        })
+        .ok();
+    }))
+}
+
+/// Chats watch. Boot selection is the shell's job (it lands on the first
+/// restored open tab, device-local state this entity can't see); this task
+/// only pumps frames.
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        'resubscribe: loop {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(RpcError::Closed) => {
-                AppState::engine_connection_lost(&this, cx);
-                return;
-            }
-            Err(err) => {
-                tracing::debug!(error = %err, "chats watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let value = match value {
-                Ok(value) => value,
-                Err(RpcError::StreamOverflow) => continue 'resubscribe,
-                Err(error) => {
-                    tracing::debug!(%error, "chats stream interrupted");
-                    break;
-                }
-            };
-            let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop (same contract as the transcript watch): a daemon
+        // restart or RPC drop ends the stream, and a bare return here froze
+        // the sidebar until app restart — new chats, renames and archives
+        // from every device silently stopped arriving.
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(error = %err, "dropping malformed chats frame");
+                    tracing::debug!(error = %err, "chats watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                state.apply_chats(parsed);
-                if state.selected_chat.is_none() && !state.auto_selected {
-                    let most_recent = state
-                        .chats
-                        .iter()
-                        .find(|c| !c.archived)
-                        .map(|c| c.id.clone());
-                    if let Some(chat_id) = most_recent {
-                        state.auto_selected = true;
-                        state.select_chat(Some(chat_id), cx);
+            while let Some(value) = rx.recv().await {
+                let parsed: Vec<Chat> = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed chats frame");
+                        continue;
                     }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    // Identical re-published lists skip the re-sort fan-out:
+                    // watch reconciliation and a whole-shell re-render.
+                    let changed = state.apply_chats(parsed);
+                    let linked = state.apply_pending_deep_link(cx);
+                    if changed {
+                        state.reconcile_change_request_watches(cx);
+                    }
+                    if changed || linked {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
                 }
-                cx.notify();
-            });
-            if alive.is_err() {
+            }
+            tracing::debug!("chats stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
                 return;
             }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
-        // Stream ended with the entity alive: dead transport, or a
-        // server-side end (an engine that doesn't serve the method replies
-        // with an err frame that just closes the stream). Only a dead
-        // transport reconnects — any unary reply, even "unknown method",
-        // proves the connection is still alive.
-        if matches!(
-            handle
+    })
+}
+
+pub use zeron_proto::version_triple;
+
+fn spawn_change_request_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    target: ChangeRequestWatchKey,
+    local_device_id: Option<String>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let params = watch_params(&target, local_device_id.as_deref());
+
+            let mut subscription = match handle
                 .client()
-                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
-                .await,
-            Err(RpcError::Closed)
-        ) {
-            AppState::engine_connection_lost(&this, cx);
-        }
-        return;
+                .subscribe_checked(methods::WATCH_CHECKOUT_CHANGE_REQUEST, params)
+                .await
+            {
+                Ok(subscription) => subscription,
+                Err(RpcError::UnknownMethod(_)) => {
+                    tracing::debug!(
+                        device = %target.device_id,
+                        "checkout change requests unsupported on device"
+                    );
+                    this.update(cx, |state, cx| {
+                        let engine_version = state
+                            .devices
+                            .iter()
+                            .find(|device| device.id == target.device_id)
+                            .and_then(|device| device.version.clone());
+                        state
+                            .change_requests
+                            .mark_unsupported(target.device_id.clone(), engine_version);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        device = %target.device_id,
+                        cwd = %target.cwd,
+                        error = %err,
+                        "checkout change request watch unavailable; retrying"
+                    );
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            while let Some(value) = subscription.recv().await {
+                let snapshot: CheckoutChangeRequestStatus = match serde_json::from_value(value) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        tracing::warn!(
+                            device = %target.device_id,
+                            cwd = %target.cwd,
+                            error = %err,
+                            "dropping malformed checkout change request frame"
+                        );
+                        continue;
+                    }
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        if state.change_requests.store(target.clone(), snapshot) {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            // Preserve the latest successful snapshot during a transport gap.
+            tracing::debug!(
+                device = %target.device_id,
+                cwd = %target.cwd,
+                "checkout change request stream ended; resubscribing"
+            );
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -3982,69 +3272,58 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     method: &'static str,
-    apply: fn(&mut AppState, T),
+    apply: fn(&mut AppState, T) -> bool,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        'resubscribe: loop {
-        let mut rx = match handle
-            .client()
-            .subscribe(method, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(RpcError::Closed) => {
-                AppState::engine_connection_lost(&this, cx);
-                return;
-            }
-            Err(err) => {
-                tracing::debug!(method, error = %err, "watch unavailable");
-                return;
-            }
-        };
-        let mut first_frame = true;
-        while let Some(value) = rx.recv().await {
-            let value = match value {
-                Ok(value) => value,
-                Err(RpcError::StreamOverflow) => continue 'resubscribe,
-                Err(error) => {
-                    tracing::debug!(method, %error, "watch interrupted");
-                    break;
-                }
-            };
-            let parsed: T = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop: these are the standing Sessions/Devices/Spaces
+        // watches — a daemon restart ended the stream and a bare return froze
+        // them for the rest of the app's life (remote Working dots staled out
+        // to nothing after 45s, and Idle/Completed transitions from other
+        // devices never arrived again — "the session never completes").
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(method, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                    tracing::debug!(method, error = %err, "watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                if first_frame && method == methods::WATCH_SESSIONS {
-                    state.sessions_epoch = state.sessions_epoch.wrapping_add(1);
+            while let Some(value) = rx.recv().await {
+                let parsed: T = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    let changed = apply(state, parsed);
+                    let linked = state.apply_pending_deep_link(cx);
+                    if changed && matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
+                        state.reconcile_change_request_watches(cx);
+                    }
+                    if changed || linked {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
                 }
-                first_frame = false;
-                apply(state, parsed);
-                if method == methods::AUTH_STATUS {
-                    state.drain_scaffold_link(cx);
-                    state.drain_directory_link(cx);
-                }
-                cx.notify();
-            });
-            if alive.is_err() {
+            }
+            tracing::debug!(method, "watch stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
                 return;
             }
-        }
-        // See spawn_chats_watch: reconnect only on a provably dead transport.
-        if matches!(
-            handle
-                .client()
-                .call(methods::LOCAL_DEVICE, serde_json::json!({}))
-                .await,
-            Err(RpcError::Closed)
-        ) {
-            AppState::engine_connection_lost(&this, cx);
-        }
-        return;
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -4069,91 +3348,15 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
         if let Some(id) = id {
             this.update(cx, |state, cx| {
                 state.local_device_id = Some(id);
+                state.link_roots_revision = state.link_roots_revision.wrapping_add(1);
+                state.apply_pending_deep_link(cx);
+                // Watches opened before this probe conservatively route through
+                // targetDeviceId. Recreate them now that local routing is known.
+                state.change_request_tasks.clear();
+                state.reconcile_change_request_watches(cx);
                 cx.notify();
             })
             .ok();
-        }
-    })
-}
-
-/// Load existing control-plane metadata once after engine attach. The watch
-/// above carries all later lifecycle changes; this call is not a poll loop.
-fn spawn_scaffold_environment_refresh(
-    cx: &mut Context<AppState>,
-    handle: EngineHandle,
-    scope: Option<(String, String)>,
-) -> Task<()> {
-    cx.spawn(async move |_, _| {
-        let Some((project_id, deployment_id)) = scope else {
-            return;
-        };
-        if let Err(error) = handle
-            .client()
-            .call(
-                methods::REFRESH_SCAFFOLD_ENVIRONMENTS,
-                serde_json::json!({
-                    "scope": {
-                        "projectId": project_id,
-                        "deploymentId": deployment_id,
-                    }
-                }),
-            )
-            .await
-        {
-            tracing::debug!(%error, "Scaffold environment refresh unavailable");
-        }
-    })
-}
-
-fn spawn_omp_recovery_watch(
-    cx: &mut Context<AppState>,
-    handle: EngineHandle,
-    chat_id: String,
-    target_device_id: Option<String>,
-    room_projection: Option<SessionRoomProjection>,
-) -> Task<()> {
-    cx.spawn(async move |this, cx| {
-        'resubscribe: loop {
-        let result = handle.client().subscribe(methods::WATCH_OMP_RECOVERY, serde_json::json!({
-            "chatId": chat_id,
-            "targetDeviceId": target_device_id,
-            "roomProjection": room_projection,
-        })).await;
-        let error = match result {
-            Ok(mut rx) => loop {
-                match rx.recv().await {
-                    Some(Err(RpcError::StreamOverflow)) => continue 'resubscribe,
-                    Some(Err(error)) => break format!("Recovery updates interrupted: {error}. Retry status."),
-                    Some(Ok(value)) => match serde_json::from_value::<OmpRecoveryState>(value) {
-                        Ok(snapshot) => {
-                            if this.update(cx, |state, cx| {
-                                if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                                    state.apply_omp_recovery(&chat_id, snapshot);
-                                    cx.notify();
-                                }
-                            }).is_err() {
-                                return;
-                            }
-                        }
-                        Err(error) => break format!("Invalid recovery status: {error}. Update Crew, then retry status."),
-                    },
-                    None => break "Recovery updates disconnected. Reconnect the session device, then retry status.".into(),
-                }
-            },
-            Err(error) => format!("Recovery status unavailable: {error}. Reconnect or update Crew, then retry status."),
-        };
-        let _ = this.update(cx, |state, cx| {
-            if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                state.omp_recovery_disconnected(&chat_id, error);
-                cx.notify();
-            }
-        });
-        // A remote room ending need not mean the local engine died. Probe once,
-        // handing transport recovery to the existing supervisor, never polling.
-        if matches!(handle.client().call(methods::LOCAL_DEVICE, serde_json::json!({})).await, Err(RpcError::Closed)) {
-            AppState::engine_connection_lost(&this, cx);
-        }
-        return;
         }
     })
 }
@@ -4162,36 +3365,27 @@ fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     chat_id: String,
-    room_projection: Option<SessionRoomProjection>,
 ) -> Task<()> {
+    // The scoped subscription cancels even a silent server stream on drop;
+    // otherwise a deselected chat would retain its protected sync slot.
     cx.spawn(async move |this, cx| {
         // Outer loop: a delta desync (missed frame) resubscribes immediately
         // and the fresh stream's opening reset heals the copy; a subscribe
         // failure, malformed frame, or stream end retries on a delay. Every
-        // path re-enters the loop except a dead transport, which hands off to
-        // the reconnect supervisor (attach_engine re-spawns this watch for the
-        // selected chat once the engine is back). The task itself is dropped
-        // by select_chat/apply_chats when the chat is deselected or deleted,
-        // so retrying can't outlive relevance.
+        // path re-enters the loop — a return here freezes the transcript
+        // with no banner and no heal short of an app restart (this watch and
+        // its engine-side room are the ONLY transcript delivery path). The
+        // task itself is dropped by select_chat/apply_chats when the chat is
+        // deselected or deleted, so retrying can't outlive relevance.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
-            let params = serde_json::json!({
-                "chatId": chat_id,
-                "roomProjection": room_projection,
-            });
+            let params = serde_json::json!({ "chatId": chat_id, "openingTail": true });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .subscribe_checked(methods::WATCH_DOC_MESSAGES, params)
                 .await
             {
                 Ok(rx) => rx,
-                Err(RpcError::Closed) => {
-                    // No resubscribe can heal a dead transport; without the
-                    // handoff this arm retried every 2s for hours (~8k warns
-                    // per zombie session in the field).
-                    AppState::engine_connection_lost(&this, cx);
-                    return;
-                }
                 Err(err) => {
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
                     if this.update(cx, |_, _| {}).is_err() {
@@ -4201,27 +3395,22 @@ fn spawn_transcript_watch(
                     continue 'resubscribe;
                 }
             };
+            let mut preparation = WatchPreparation::new(cx.background_executor().clone());
             while let Some(value) = rx.recv().await {
-                let value = match value {
-                    Ok(value) => value,
-                    Err(RpcError::StreamOverflow) => continue 'resubscribe,
-                    Err(RpcError::Closed) => {
-                        AppState::engine_connection_lost(&this, cx);
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%chat_id, %error, "transcript stream failed; resubscribing");
-                        break;
-                    }
-                };
-                // The opening bounded tail can still contain large text parts.
-                // Decode off the UI executor, preserving stream order and the
-                // selection guard below when the result returns.
+                let history_pending = value
+                    .get("historyPending")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let decoded = cx
                     .background_executor()
-                    .spawn(async move { serde_json::from_value::<TranscriptFrame>(value) })
+                    .spawn(async move {
+                        let update: zeron_doc::TranscriptUpdate =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        let prepared = preparation.prepare(&update).map_err(|e| e.to_string())?;
+                        Ok::<_, String>((update, prepared, preparation))
+                    })
                     .await;
-                let frame = match decoded {
+                let (update, prepared, next_preparation) = match decoded {
                     Ok(frame) => frame,
                     Err(err) => {
                         // Schema skew (a newer peer's entry shape arriving
@@ -4233,15 +3422,22 @@ fn spawn_transcript_watch(
                         continue 'resubscribe;
                     }
                 };
+                preparation = next_preparation;
                 let mut desync = false;
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        if let Err(err) = state.apply_transcript_frame(frame) {
+                        if history_pending && state.transcript_replayed {
+                            return;
+                        }
+                        if let Err(err) =
+                            state.receive_opening_transcript_update(update, history_pending, cx)
+                        {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
                             desync = true;
+                        } else {
+                            state.prepared_transcripts.insert(chat_id.clone(), prepared);
                         }
-                        cx.notify();
                     }
                 });
                 if alive.is_err() {
@@ -4261,69 +3457,150 @@ fn spawn_transcript_watch(
         }
     })
 }
-fn spawn_collaboration_watch(
+
+/// The selected chat's pending-message queue, straight off its doc. Whole-list
+/// frames (the queue is a handful of rows at most), retried like the transcript
+/// watch — a queue that silently stopped updating would show messages the host
+/// has already sent.
+fn spawn_queue_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     chat_id: String,
-    room_projection: Option<SessionRoomProjection>,
 ) -> Task<()> {
+    #[derive(serde::Deserialize)]
+    struct QueueFrame {
+        #[serde(default)]
+        items: Vec<zeron_doc::QueuedMessage>,
+    }
     cx.spawn(async move |this, cx| {
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-        loop {
-            let params = serde_json::json!({
-                "chatId": chat_id,
-                "roomProjection": room_projection,
-            });
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": chat_id });
             let mut rx = match handle
                 .client()
-                .subscribe("WatchCollaboration", params)
+                .subscribe_checked(methods::WATCH_QUEUE, params)
                 .await
             {
                 Ok(rx) => rx,
-                Err(RpcError::Closed) => {
-                    // Dead transport — hand off to the reconnect supervisor;
-                    // attach_engine re-spawns this watch after reconnect.
-                    AppState::engine_connection_lost(&this, cx);
-                    return;
-                }
                 Err(err) => {
-                    tracing::warn!(%chat_id, error = %err, "collaboration watch failed; retrying");
+                    tracing::debug!(%chat_id, error = %err, "queue watch failed; retrying");
                     if this.update(cx, |_, _| {}).is_err() {
                         return;
                     }
                     cx.background_executor().timer(RETRY_DELAY).await;
-                    continue;
+                    continue 'resubscribe;
                 }
             };
             while let Some(value) = rx.recv().await {
-                let value = match value {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::debug!(%chat_id, %error, "collaboration stream interrupted");
-                        break;
-                    }
-                };
-                let snapshot: CollaborationSnapshot = match serde_json::from_value(value) {
-                    Ok(snapshot) => snapshot,
+                let frame: QueueFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
                     Err(err) => {
-                        tracing::warn!(%chat_id, error = %err, "malformed collaboration snapshot");
+                        tracing::warn!(error = %err, "dropping malformed queue frame");
                         continue;
                     }
                 };
-                if this
-                    .update(cx, |state, cx| {
-                        if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                            state.apply_collaboration(snapshot);
-                            state.drain_session_pin(cx);
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
+                let alive = this.update(cx, |state, cx| {
+                    // Guard against a stale pump racing a newer selection.
+                    if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                        state.apply_queue(frame.items);
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
                     return;
                 }
             }
-            // Keep the last good snapshot on screen while the room reconnects.
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+/// [`spawn_transcript_watch`]'s shape, writing into `sub_transcripts[doc_id]`
+/// instead of the selected chat's transcript. The apply guard is per key so a
+/// subagent tab can outlive chat switches.
+fn spawn_subagent_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    doc_id: String,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": doc_id });
+            let mut rx = match handle
+                .client()
+                .subscribe_checked(methods::WATCH_DOC_MESSAGES, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(%doc_id, error = %err, "subagent watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            let mut preparation = WatchPreparation::new(cx.background_executor().clone());
+            while let Some(value) = rx.recv().await {
+                let decoded = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let update: zeron_doc::TranscriptUpdate =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        let prepared = preparation.prepare(&update).map_err(|e| e.to_string())?;
+                        Ok::<_, String>((update, prepared, preparation))
+                    })
+                    .await;
+                let (update, prepared, next_preparation) = match decoded {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "malformed subagent frame; resubscribing");
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        continue 'resubscribe;
+                    }
+                };
+                preparation = next_preparation;
+                let mut desync = false;
+                let alive = this.update(cx, |state, cx| {
+                    // A stale pump racing a snapshot/unwatch finds no key.
+                    if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                        let frame = update.frame;
+                        let text_only = is_text_append(&frame);
+                        state.transcript_revision = state.transcript_revision.wrapping_add(1);
+                        if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
+                            tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
+                            desync = true;
+                        }
+                        if !desync {
+                            state.prepared_transcripts.insert(doc_id.clone(), prepared);
+                        }
+                        if !desync && let Some(baseline) = update.replay_baseline {
+                            state
+                                .transcript_baselines
+                                .insert(doc_id.clone(), Arc::new(baseline));
+                        }
+                        if text_only && !desync {
+                            cx.emit(TranscriptTextChanged {
+                                doc_id: doc_id.clone(),
+                            });
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+                if desync {
+                    continue 'resubscribe;
+                }
+            }
+            tracing::debug!(%doc_id, "subagent stream ended; resubscribing");
             if this.update(cx, |_, _| {}).is_err() {
                 return;
             }
@@ -4335,766 +3612,136 @@ fn spawn_collaboration_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scoped_bootstrap_recovery_preserves_namespace_without_restoring_grants() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = AppState::new();
-        state.data_dir = Some(dir.path().into()); state.local_device_id = Some("local".into());
-        state.auth = Some(AuthState::SignedIn { user:comet_proto::UserProfile { id:"user".into(), email:"user@example.com".into(), name:None }, project_scope:"auth-project".into() });
-        state.set_scaffold_scope_for_test("room-project", "staging");
-        let projection = SessionRoomProjection { project_id:"room-project".into(), deployment_id:"staging".into(), session_id:"chat".into() };
-        state.room_projections.insert("chat".into(), projection.clone());
-        let id = uuid::Uuid::new_v4().to_string();
-        let params = serde_json::json!({"chatId":"chat", "commandId":uuid::Uuid::new_v4().to_string(), "issuedAt":100, "expiresAt":1000,
-            "targetDeviceId":"comet-scaffold-sandbox-e1", "roomProjection":projection, "preparationGeneration":"prepared",
-            "command":{"kind":"control", "source":"scaffold", "sessionId":"chat", "ownerDeviceId":"comet-scaffold-sandbox-e1",
-                "actorDeviceId":"local", "actorSubject":"user", "grantId":"original-grant", "action":{"action":"start", "message_id":id,
-                    "request":{"prompt":"original", "cwd":"/remote", "sandbox":"workspaceWrite", "autoApprove":true, "attachments":[]}}},
-            "bootstrap":{
-                "chat":{"id":"chat", "deviceId":"local", "spaceId":"folder", "cwd":"/remote", "archived":false, "createdAt":Utc::now()},
-                "space":{"id":"folder", "deviceId":"local", "path":"/original", "gitDetected":true, "createdAt":Utc::now()}
-            }});
-        let send = RetainedSend { prompt:"original".into(), message_id:id, params:params.clone(), accepted:false, applied:false,
-            terminal:false, failure:None, cancelled:false, admission_error:Some("command_authority_pending".into()) };
-        let path = state.send_journal_path("chat").unwrap();
-        RetainedSend::save(path.clone(), "chat", send).unwrap();
-        let scope = state.retained_send_recovery_scope().unwrap();
-        let mut wrong_user = scope.clone(); wrong_user.user_id = "other-user".into();
-        let mut wrong_project = scope.clone(); wrong_project.project_scope = "other-project".into();
-        let mut wrong_device = scope.clone(); wrong_device.local_device_id = Some("other-device".into());
-        let mut wrong_deployment = scope.clone(); wrong_deployment.scaffold_scope = Some(("room-project".into(), "production".into()));
-        for other in [wrong_user, wrong_project, wrong_device, wrong_deployment] {
-            assert!(RetainedSend::recover_bootstraps(other).unwrap().is_empty());
-        }
-        let recovered = RetainedSend::recover_bootstraps(scope).unwrap();
-        assert_eq!(recovered.len(), 1);
-        state.room_projections.clear();
-        state.restore_retained_bootstraps(recovered);
-        assert!(state.chat_is_pending("chat"));
-        assert_eq!(state.transcript_room_projection("chat"), Some(projection));
-        assert_eq!(state.send_journal_path("chat").unwrap(), path);
-        assert!(state.scaffold_control_grants.is_empty(), "retained presentation must not mint or refresh authority");
-        assert_eq!(RetainedSend::load(path, "chat").unwrap()[0].params, params);
-    }
-
-    #[test]
-    fn input_outcome_index_migration_preserves_original_session_and_rejects_conflicts() {
-        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("sends.json");
-        let prompt = "Respond to Crew input request";
-        let mut send = RetainedSend {
-            prompt:prompt.into(), message_id:uuid::Uuid::new_v4().to_string(), accepted:true, applied:true, terminal:true, failure:None, cancelled:false,
-            admission_error: None,
-            params:serde_json::json!({"chatId":"chat", "commandId":uuid::Uuid::new_v4().to_string(), "command":{
-                "kind":"control", "sessionId":"agent-a", "source":"local", "action":{"action":"respondInput", "request_id":"request", "answers":[]}
-            }}),
-        };
-        RetainedSend::save(Some(path.clone()), "chat", send.clone()).unwrap();
-        let scoped_index = input_outcome_path(&path, &input_outcome_key(&send.params).unwrap()).unwrap();
-        std::fs::remove_file(&scoped_index).unwrap();
-        // A real pre-cutover index only knew the human prompt.
-        write_send_journal(&input_outcome_path(&path, prompt).unwrap(), send.message_id.as_bytes()).unwrap();
-        assert_eq!(RetainedSend::load_input_outcome(Some(path.clone()), prompt, &send.params).unwrap().unwrap().params, send.params);
-        let mut other = send.params.clone(); other["command"]["sessionId"] = "agent-b".into();
-        assert!(RetainedSend::load_input_outcome(Some(path.clone()), prompt, &other).unwrap().is_none());
-        RetainedSend::save(Some(path.clone()), "chat", send.clone()).unwrap();
-        // Scoped indexes must fail closed, not silently mint a replacement ID.
-        send.params = other; send.message_id = uuid::Uuid::new_v4().to_string(); send.params["commandId"] = uuid::Uuid::new_v4().to_string().into();
-        RetainedSend::save(Some(path.clone()), "chat", send.clone()).unwrap();
-        write_send_journal(&scoped_index, send.message_id.as_bytes()).unwrap();
-        let mut original = send.params; original["command"]["sessionId"] = "agent-a".into();
-        assert!(RetainedSend::load_input_outcome(Some(path), prompt, &original).err().unwrap().contains("target conflicts"));
-    }
-
-    #[test]
-    fn omp_recovery_transitions_clear_busy_and_do_not_reactivate_resolved_errors() {
-        let mut state = AppState::new();
-        let snapshot = |phase, error| {
-            serde_json::from_value(serde_json::json!({
-                "phase": phase, "error": error,
-            }))
-            .unwrap()
-        };
-        for phase in ["waiting", "stopping", "resuming"] {
-            state.apply_omp_recovery("chat-a", snapshot(phase, None::<&str>));
-            let recovery = state.omp_recovery("chat-a").unwrap();
-            assert!(recovery.busy());
-            assert!(!recovery.can_take_over());
-        }
-        state.apply_omp_recovery(
-            "chat-a",
-            snapshot("failed", Some("Writer could not be stopped")),
-        );
-        let recovery = state.omp_recovery("chat-a").unwrap();
-        assert!(!recovery.busy());
-        assert!(recovery.can_take_over());
-        assert_eq!(
-            recovery.error.as_deref(),
-            Some("Writer could not be stopped")
-        );
-        state.apply_omp_recovery("chat-a", snapshot("completed", None));
-        let recovery = state.omp_recovery.get_mut("chat-a").unwrap();
-        // A delayed request failure cannot resurrect an already resolved action.
-        recovery.finish_request(0, Err("late transport error".into()));
-        assert_eq!(recovery.phase, OmpRecoveryPhase::Completed);
-        assert!(!recovery.busy());
-        assert!(!recovery.can_take_over());
-        state.apply_omp_recovery("chat-a", snapshot("idle", None));
-        assert!(!state.omp_recovery("chat-a").unwrap().can_take_over());
-    }
-
-    #[test]
-    fn omp_recovery_disconnect_clears_busy_until_authoritative_reconnect() {
-        let mut state = AppState::new();
-        let snapshot = |phase| {
-            serde_json::from_value(serde_json::json!({
-                "phase": phase, "error": null,
-            }))
-            .unwrap()
-        };
-        state.apply_omp_recovery("chat-a", snapshot("stopping"));
-        state.omp_recovery_disconnected("chat-a", "Connection closed".into());
-        let recovery = state.omp_recovery.get_mut("chat-a").unwrap();
-        recovery.finish_request(0, Ok(()));
-        assert!(!recovery.busy());
-        assert!(!recovery.can_take_over());
-        assert_eq!(recovery.watch_error.as_deref(), Some("Connection closed"));
-        state.apply_omp_recovery("chat-a", snapshot("failed"));
-        let recovery = state.omp_recovery("chat-a").unwrap();
-        assert!(recovery.watch_error.is_none());
-        assert!(recovery.can_take_over());
-        assert!(!recovery.busy());
-    }
-
-    #[test]
-    fn omp_recovery_request_success_and_failure_both_release_busy() {
-        let mut recovery: OmpRecoveryState = serde_json::from_value(serde_json::json!({
-            "phase": "waiting", "error": null,
-        }))
-        .unwrap();
-        recovery.finish_request(0, Err("permission denied".into()));
-        assert!(!recovery.busy());
-        assert!(recovery.can_take_over());
-        assert!(
-            recovery
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("permission denied")
-        );
-        recovery.phase = OmpRecoveryPhase::Resuming;
-        recovery.finish_request(0, Ok(()));
-        assert!(!recovery.busy());
-        assert!(!recovery.can_take_over());
-        assert!(recovery.error.is_none());
-    }
     use chrono::TimeDelta;
-    use comet_engine::{EngineCore, default_registry};
     use gpui::AppContext;
-    // Session records are only needed to build fixtures below; production
-    // state derives indicators through `comet_proto::view`.
-    use comet_proto::{AgentSessionRecord, AgentSessionSource, SessionStatus, UserProfile};
-    use std::collections::BTreeMap;
-    use std::sync::{
-        Mutex as StdMutex,
-        atomic::{AtomicU16, Ordering},
-    };
+    use zeron_engine::{EngineCore, default_registry};
+    // `SessionStatus` is only needed to build the fixtures below — the module
+    // itself derives everything through `zeron_proto::view`.
+    use zeron_proto::{SessionStatus, UserProfile};
 
-    struct ReadyScaffoldRpc {
-        operations: Arc<StdMutex<Vec<String>>>,
-        attach_failures_remaining: AtomicU16,
-        update_route_failures_remaining: AtomicU16,
-        inspect_lifecycle: &'static str,
-        archive_fails: bool,
+    /// A localhost port that was just free (bind :0, read, drop).
+    async fn free_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
     }
 
-    #[async_trait::async_trait]
-    impl RpcService for ReadyScaffoldRpc {
+    struct LegacyIdentityRpc;
+
+    #[async_trait]
+    impl RpcService for LegacyIdentityRpc {
         async fn handle(
             &self,
             method: &str,
-            params: serde_json::Value,
-        ) -> Result<RpcReply, RpcError> {
-            if method == methods::MUTATE {
-                assert_eq!(
-                    params,
-                    serde_json::json!({
-                        "op": "setChatArchived",
-                        "chatId": "session-ready",
-                        "archived": true,
-                    })
-                );
-                self.operations
-                    .lock()
-                    .expect("Scaffold operation log")
-                    .push("archive".into());
-                if self.archive_fails {
-                    return Err(RpcError::Failed("archive failed".into()));
-                }
-                return RpcReply::value(&serde_json::json!({ "ok": true }));
-            }
-            assert_eq!(method, methods::CONTROL_SCAFFOLD_ENVIRONMENT);
-            let operation = params
-                .get("operation")
-                .and_then(serde_json::Value::as_str)
-                .expect("typed Scaffold operation");
-            self.operations
-                .lock()
-                .expect("Scaffold operation log")
-                .push(operation.to_string());
-            if operation == "attach"
-                && self
-                    .attach_failures_remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-            {
-                return Err(RpcError::Failed(
-                    "scaffold_api_error:502:scaffold_request_rejected".into(),
-                ));
-            }
-            if operation == "updateAgentRoute"
-                && self
-                    .update_route_failures_remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-            {
-                return Err(RpcError::Failed(
-                    "scaffold_api_error:500:scaffold_request_rejected".into(),
-                ));
-            }
-            let scope = params.get("scope").expect("Scaffold scope");
-            let session_id = scope
-                .get("sessionId")
-                .and_then(serde_json::Value::as_str)
-                .expect("session id");
-            let lifecycle = match operation {
-                "inspect" => self.inspect_lifecycle,
-                "pause" => "paused",
-                "updateAgentRoute" => "ready",
-                _ => "starting",
-            };
-            let environment = serde_json::json!({
-                "source": {
-                    "kind": "scaffold",
-                    "sandbox_id": "sandbox-ready",
-                    "region": "default",
-                    "lifecycle": lifecycle,
-                    "lifecycle_epoch": 1,
-                    "links": {
-                        "session": "https://scaffold.example/?q=sandbox-ready",
-                        "web": "https://scaffold.example/sessions/sandbox-ready/web"
-                    }
-                },
-                "name": "Investigate staging resume delivery",
-                "ownerPrincipal": "accounts.google.com:ready@example.com",
-                "sourceRef": "387d6652abd642f0b85e8bd14f9131a9f23b7e70",
-                "scope": {
-                    "projectId": "ashler-staging",
-                    "deploymentId": "ashler-staging",
-                    "sessionId": session_id
-                },
-                "lastActivityAt": 1,
-            });
-            let result = if operation == "attach" {
-                serde_json::json!({
-                    "environment": environment,
-                    "attachedDeviceId": "comet-scaffold-sandbox-ready-e1",
-                    "runId": "run-ready",
-                    "roomProjection": {
-                        "projectId": "ashler-staging",
-                        "deploymentId": "ashler-staging",
-                        "sessionId": session_id
-                    },
-                    "controlGrant": {
-                        "id": "grant-ready",
-                        "expiresAt": 9_999_999_999_999_i64,
-                        "capabilities": [comet_proto::CAPABILITY_SESSION_CHAT]
-                    }
-                })
-            } else {
-                assert!(matches!(
-                    operation,
-                    "inspect" | "pause" | "resume" | "updateAgentRoute"
-                ));
-                serde_json::json!({ "environment": environment })
-            };
-            RpcReply::value(&result)
-        }
-    }
-
-    struct PreparedScaffoldRpc {
-        ready: ReadyScaffoldRpc,
-        generation: AtomicU16,
-        malformed_attachment: bool,
-        reports: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
-    }
-
-    #[async_trait::async_trait]
-    impl RpcService for PreparedScaffoldRpc {
-        async fn handle(
-            &self,
-            method: &str,
-            params: serde_json::Value,
+            _params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
             match method {
-                methods::PREPARE_SCAFFOLD_SESSION => {
-                    let RpcReply::Value(mut result) = self
-                        .ready
-                        .handle(
-                            methods::CONTROL_SCAFFOLD_ENVIRONMENT,
-                            serde_json::json!({ "operation": "attach", "scope": params["scope"] }),
-                        )
-                        .await?
-                    else {
-                        panic!("unary attachment")
-                    };
-                    let generation = self.generation.fetch_add(1, Ordering::SeqCst);
-                    result["preparationGeneration"] = format!("generation-{generation}").into();
-                    if self.malformed_attachment {
-                        result["environment"] = serde_json::Value::Null;
-                    }
-                    Ok(RpcReply::Value(result))
+                methods::LOCAL_DEVICE => {
+                    RpcReply::value(&serde_json::json!({ "deviceId": "legacy-device" }))
                 }
-                methods::REPORT_SCAFFOLD_PREPARATION_FAILURE => {
-                    self.reports.send(params).unwrap();
-                    RpcReply::value(&serde_json::json!({ "reported": true }))
-                }
-                _ => Err(RpcError::UnknownMethod(method.to_string())),
+                other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
     }
 
-    fn preparation_client(
-        malformed_attachment: bool,
-    ) -> (
-        EngineHandle,
-        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-    ) {
-        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
-        let handle = EngineHandle::for_test(Arc::new(PreparedScaffoldRpc {
-            ready: ReadyScaffoldRpc {
-                operations: Arc::new(StdMutex::new(Vec::new())),
-                attach_failures_remaining: AtomicU16::new(0),
-                update_route_failures_remaining: AtomicU16::new(0),
-                inspect_lifecycle: "ready",
-                archive_fails: false,
-            },
-            generation: AtomicU16::new(1),
-            malformed_attachment,
-            reports,
-        }));
-        (handle, received)
+    struct DeferredIdentityRpc {
+        engine_info: EngineInfo,
+        state: tokio::sync::watch::Receiver<DeferredEngineState>,
     }
 
-    async fn prepare_test_session(
-        handle: &EngineHandle,
-    ) -> Result<
-        (
-            ScaffoldSessionAttachment,
-            Option<String>,
-            Option<String>,
-            ScaffoldPreparationGuard,
-        ),
-        RpcError,
-    > {
-        let scope = CollaborationScope {
-            project_id: "ashler-staging".into(),
-            deployment_id: Some("ashler-staging".into()),
-            session_id: Some("session-ready".into()),
-            unknown: Default::default(),
-        };
-        let route =
-            comet_proto::AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-6-astra");
-        prepare_scaffold_session(
-            handle,
-            &scope,
-            None,
-            None,
-            ScaffoldDatabaseEnvironment::Local,
-            &route,
-            None,
+    #[async_trait]
+    impl RpcService for DeferredIdentityRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+                methods::ENGINE_READY => {
+                    let mut state = self.state.clone();
+                    wait_for_deferred_engine(&mut state)
+                        .await
+                        .map_err(RpcError::Failed)?;
+                    RpcReply::value(&serde_json::json!({ "ready": true }))
+                }
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_identity_falls_back_to_synced_scope() {
+        let client = memory_client(Arc::new(LegacyIdentityRpc));
+
+        let info = query_engine_info(&client).await.unwrap();
+
+        assert_eq!(info.device_id, "legacy-device");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(info.workspace_scope),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::SignIn
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_viewport_treats_legacy_daemon_as_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(zeron_rpc::serve_ws_listener(
+            listener,
+            Arc::new(LegacyIdentityRpc),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
+        .await
+        .expect("legacy daemon remains attachable");
+
+        let mut deferred = handle
+            .deferred_state()
+            .expect("remote viewport tracks readiness");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_deferred_engine(&mut deferred),
         )
         .await
-    }
+        .expect("legacy readiness fallback completes")
+        .expect("unknown EngineReady means the old daemon is assembled");
 
-    #[tokio::test]
-    async fn malformed_prepare_attachment_reports_the_returned_generation() {
-        let (handle, mut reports) = preparation_client(true);
-        assert!(prepare_test_session(&handle).await.is_err());
-        let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            report,
-            serde_json::json!({
-                "chatId": "session-ready", "generation": "generation-1",
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn abandoned_preparation_reports_origin_not_newer_attempt_and_admission_disarms() {
-        let (handle, mut reports) = preparation_client(false);
-        let (_, _, _, first) = prepare_test_session(&handle).await.unwrap();
-        let (_, _, _, mut second) = prepare_test_session(&handle).await.unwrap();
-        // Dropping the owning future after preparation (for example during an
-        // upload) must report the old receipt, even after a newer Prepare.
-        drop(first);
-        let report = tokio::time::timeout(std::time::Duration::from_secs(3), reports.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            report,
-            serde_json::json!({
-                "chatId": "session-ready", "generation": "generation-1",
-            })
-        );
-        second.disarm();
-        drop(second);
-        assert!(matches!(
-            reports.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    /// A localhost port that was just free — picked OUTSIDE the OS ephemeral
-    /// range (macOS: 49152+), which `:0` allocations and outbound sockets in
-    /// parallel test processes draw from. Binding `:0` and re-using the port
-    /// after drop raced those allocations in the free→bootstrap window.
-    static NEXT_TEST_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
-    async fn free_port() -> u16 {
-        let start = 20000 + (std::process::id() % 10000) as u16;
-        for _ in 0..2000 {
-            let offset = NEXT_TEST_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
-            let port = start + (offset % 2000);
-            if tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                return port;
-            }
-        }
-        panic!("no free port in 20000-32000");
-    }
-
-    #[test]
-    fn local_scaffold_scope_defaults_deployment_to_project() {
-        let mut config = EngineBootConfig {
-            data_dir: PathBuf::new(),
-            ipc_port: 0,
-            edge_url: "https://edge.example".into(),
-            edge_token: None,
-            project_scope: "ashler-staging".into(),
-            deployment_id: None,
-            scaffold_url: Some("https://scaffold.example".into()),
-            default_harness: HarnessId::Omp,
-            runtime_profile: RuntimeProfile::LocalController,
-        };
-        assert_eq!(
-            configured_scaffold_scope(&config),
-            Some(("ashler-staging".into(), "ashler-staging".into()))
-        );
-        config.deployment_id = Some("deployment-a".into());
-        assert_eq!(
-            configured_scaffold_scope(&config),
-            Some(("ashler-staging".into(), "deployment-a".into()))
-        );
-        config.scaffold_url = None;
-        assert_eq!(configured_scaffold_scope(&config), None);
-    }
-
-    #[tokio::test]
-    async fn archiving_scaffold_pauses_the_attached_sandbox_after_persistence() {
-        let operations = Arc::new(StdMutex::new(Vec::new()));
-        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
-            operations: Arc::clone(&operations),
-            attach_failures_remaining: AtomicU16::new(0),
-            inspect_lifecycle: "ready",
-            archive_fails: false,
-            update_route_failures_remaining: AtomicU16::new(0),
-        });
-        let handle = EngineHandle {
-            inner: Arc::new(RemoteEngine {
-                client: memory_client(service),
-                url: "memory://ready-scaffold".into(),
-            }),
-        };
-        let scope = CollaborationScope {
-            project_id: "ashler-staging".into(),
-            deployment_id: Some("ashler-staging".into()),
-            session_id: Some("session-ready".into()),
-            unknown: Default::default(),
-        };
-        let attachment = attach_scaffold_session(&handle, "sandbox-ready", scope)
-            .await
-            .unwrap();
-        archive_and_pause_scaffold_session(&handle, "session-ready", &attachment.control_target)
-            .await
-            .unwrap();
-        assert_eq!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .as_slice(),
-            ["attach", "archive", "pause"]
-        );
-    }
-
-    #[test]
-    fn scaffold_control_retries_transient_provider_and_readiness_failures() {
-        use comet_engine::scaffold::is_retryable_scaffold_control_error;
-        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_api_error:500:scaffold_request_rejected".into()
-        )));
-        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_api_error:502:scaffold_request_rejected".into()
-        )));
-        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_api_error:404:not_found:Sandbox agent route projection failed".into()
-        )));
-        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_api_error:404:sandbox_provider_error:E2B sandbox control channel is unavailable"
-                .into()
-        )));
-        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_response_invalid: sandbox rcs_1 is not ready".into()
-        )));
-        assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_session_owner_room_unavailable".into()
-        )));
-        assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_api_error:404:scaffold_request_rejected".into()
-        )));
-        assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(
-            "scaffold_response_invalid: sandbox failed".into()
-        )));
-
-        let runtime = tokio::runtime::Runtime::new().expect("Tokio RPC server runtime");
-        let (handle, operations) = {
-            let _runtime_guard = runtime.enter();
-            let operations = Arc::new(StdMutex::new(Vec::new()));
-            let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
-                operations: Arc::clone(&operations),
-                attach_failures_remaining: AtomicU16::new(2),
-                inspect_lifecycle: "ready",
-                archive_fails: false,
-                update_route_failures_remaining: AtomicU16::new(0),
-            });
-            let handle = EngineHandle {
-                inner: Arc::new(RemoteEngine {
-                    client: memory_client(service),
-                    url: "memory://transient-scaffold".into(),
-                }),
-            };
-            (handle, operations)
-        };
-
-        futures::executor::block_on(async {
-            let scope = CollaborationScope {
-                project_id: "ashler-staging".into(),
-                deployment_id: Some("ashler-staging".into()),
-                session_id: Some("session-transient".into()),
-                unknown: Default::default(),
-            };
-            let no_wait = |_| futures::future::ready(());
-            let attachment =
-                ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
-                    .await
-                    .unwrap();
-
-            assert_eq!(attachment.projection.session_id, "session-transient");
-            assert_eq!(
-                operations
-                    .lock()
-                    .expect("Scaffold operation log")
-                    .as_slice(),
-                [
-                    "inspect", "attach", "inspect", "attach", "inspect", "attach"
-                ]
-            );
-        });
-    }
-
-    #[tokio::test]
-    async fn scaffold_reconnect_preserves_terminal_lifecycle() {
-        let operations = Arc::new(StdMutex::new(Vec::new()));
-        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
-            operations: Arc::clone(&operations),
-            attach_failures_remaining: AtomicU16::new(0),
-            inspect_lifecycle: "stopped",
-            archive_fails: false,
-            update_route_failures_remaining: AtomicU16::new(0),
-        });
-        let handle = EngineHandle {
-            inner: Arc::new(RemoteEngine {
-                client: memory_client(service),
-                url: "memory://terminal-scaffold".into(),
-            }),
-        };
-        let scope = CollaborationScope {
-            project_id: "ashler-staging".into(),
-            deployment_id: Some("ashler-staging".into()),
-            session_id: Some("session-terminal".into()),
-            unknown: Default::default(),
-        };
-        let no_wait = |_| futures::future::ready(());
-
-        let error = ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ScaffoldReconnectError::Terminal(ScaffoldLifecycle::Stopped)
-        ));
-        assert_eq!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .as_slice(),
-            ["inspect"]
-        );
-    }
-
-    #[tokio::test]
-    async fn scaffold_send_route_update_retries_transient_provider_rejection() {
-        let operations = Arc::new(StdMutex::new(Vec::new()));
-        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
-            operations: Arc::clone(&operations),
-            attach_failures_remaining: AtomicU16::new(0),
-            update_route_failures_remaining: AtomicU16::new(1),
-            inspect_lifecycle: "ready",
-            archive_fails: false,
-        });
-        let handle = EngineHandle {
-            inner: Arc::new(RemoteEngine {
-                client: memory_client(service),
-                url: "memory://transient-route-update".into(),
-            }),
-        };
-        let scope = CollaborationScope {
-            project_id: "ashler-staging".into(),
-            deployment_id: Some("ashler-staging".into()),
-            session_id: Some("session-transient-route".into()),
-            unknown: Default::default(),
-        };
-        let route = AgentRoute::automatic(comet_proto::AgentProvider::OpenAi, "gpt-5.6-sol");
-        let no_wait = |_| futures::future::ready(());
-
-        update_scaffold_session_agent_route(&handle, "sandbox-ready", &scope, &route, &no_wait)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .as_slice(),
-            ["updateAgentRoute", "updateAgentRoute"]
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_archive_does_not_pause_scaffold() {
-        let operations = Arc::new(StdMutex::new(Vec::new()));
-        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
-            operations: Arc::clone(&operations),
-            attach_failures_remaining: AtomicU16::new(0),
-            inspect_lifecycle: "ready",
-            archive_fails: true,
-            update_route_failures_remaining: AtomicU16::new(0),
-        });
-        let handle = EngineHandle {
-            inner: Arc::new(RemoteEngine {
-                client: memory_client(service),
-                url: "memory://failed-archive".into(),
-            }),
-        };
-        let target = ScaffoldControlTarget {
-            sandbox_id: "sandbox-ready".into(),
-            scope: CollaborationScope {
-                project_id: "ashler-staging".into(),
-                deployment_id: Some("ashler-staging".into()),
-                session_id: Some("session-ready".into()),
-                unknown: Default::default(),
-            },
-        };
-
-        assert!(
-            archive_and_pause_scaffold_session(&handle, "session-ready", &target)
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .as_slice(),
-            ["archive"]
-        );
-    }
-
-    #[tokio::test]
-    async fn paused_scaffold_resumes_before_reattaching() {
-        let operations = Arc::new(StdMutex::new(Vec::new()));
-        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
-            operations: Arc::clone(&operations),
-            attach_failures_remaining: AtomicU16::new(0),
-            inspect_lifecycle: "paused",
-            archive_fails: false,
-            update_route_failures_remaining: AtomicU16::new(0),
-        });
-        let handle = EngineHandle {
-            inner: Arc::new(RemoteEngine {
-                client: memory_client(service),
-                url: "memory://paused-scaffold".into(),
-            }),
-        };
-        let scope = CollaborationScope {
-            project_id: "ashler-staging".into(),
-            deployment_id: Some("ashler-staging".into()),
-            session_id: Some("session-paused".into()),
-            unknown: Default::default(),
-        };
-        let no_wait = |_| futures::future::ready(());
-
-        let attachment =
-            ensure_scaffold_session_attached(&handle, "sandbox-ready", &scope, &no_wait)
-                .await
-                .unwrap();
-
-        assert_eq!(attachment.projection.session_id, "session-paused");
-        assert_eq!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .as_slice(),
-            ["inspect", "resume", "attach"]
-        );
+        handle.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]
     async fn bootstrap_embeds_engine_when_port_is_free() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            project_scope: "test".into(),
-            deployment_id: None,
-            scaffold_url: None,
-            default_harness: HarnessId::Mock,
-            runtime_profile: RuntimeProfile::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: free_port().await,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None, // offline
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
+        assert!(matches!(
+            handle
+                .deferred_state()
+                .expect("embedded lifecycle")
+                .borrow()
+                .clone(),
+            DeferredEngineState::Ready
+        ));
         // Same protocol over the in-memory transport: a real engine answers.
         let harnesses = handle
             .client()
@@ -5106,23 +3753,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_reports_local_assembly_failure_before_returning_a_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        zeron_engine::EngineProfile::local(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("profiles")).unwrap();
+        std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
+        let port = free_port().await;
+
+        let error = match EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+        default_harness: HarnessId::Mock, })
+        .await
+        {
+            Ok(handle) => {
+                handle.shutdown().await;
+                panic!("a corrupt local store must fail bootstrap")
+            }
+            Err(error) => error,
+        };
+
+        assert!(!format!("{error:#}").is_empty());
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "failed bootstrap must release the IPC listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_engine_failure_remains_observable_after_early_attach() {
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        state_tx.send_replace(DeferredEngineState::Failed("store failed".into()));
+
+        assert_eq!(
+            wait_for_deferred_engine(&mut state_rx).await,
+            Err("store failed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_viewport_observes_deferred_engine_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let server = tokio::spawn(zeron_rpc::serve_ws_listener(
+            listener,
+            Arc::new(DeferredIdentityRpc {
+                engine_info: EngineInfo {
+                    device_id: "owner-device".into(),
+                    workspace_scope: WorkspaceScope::Local,
+                    cursor_sdk_version: None,
+                    capabilities: zeron_proto::capabilities::current(),
+                },
+                state: state_rx,
+            }),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
+        .await
+        .expect("second viewport attaches over IPC");
+        assert!(matches!(handle.mode(), EngineMode::Remote { .. }));
+
+        let mut deferred = handle
+            .deferred_state()
+            .expect("remote viewport tracks engine readiness");
+        state_tx.send_replace(DeferredEngineState::Failed("store failed".into()));
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_for_deferred_engine(&mut deferred),
+            )
+            .await
+            .expect("remote readiness probe completes"),
+            Err("store failed".into())
+        );
+
+        handle.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn an_embedded_engine_serves_the_ipc_port_for_other_viewports() {
         // The whole point of embedding-and-serving: a second viewport (the
         // terminal app) can attach to this window's engine with no setup, no
         // separate daemon, and no launch ordering.
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            project_scope: "test".into(),
-            deployment_id: None,
-            scaffold_url: None,
-            default_harness: HarnessId::Mock,
-            runtime_profile: RuntimeProfile::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None, // offline
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
@@ -5149,6 +3884,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_bootstraps_elect_one_embedded_engine() {
+        // Two viewports of one app booting at once (the Local-switch restart
+        // path): both used to probe a closed port, both embedded, and one lost
+        // the data-dir lock. The bootstrap gate must elect exactly one owner
+        // and turn the other into a plain remote attach.
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().await;
+        let config = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None, // offline
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, };
+        let (a, b) = tokio::join!(
+            EngineHandle::bootstrap(config.clone()),
+            EngineHandle::bootstrap(config.clone()),
+        );
+        let a = a.expect("first viewport boots");
+        let b = b.expect("second viewport boots");
+
+        let modes = [a.mode(), b.mode()];
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| **mode == EngineMode::InProcess)
+                .count(),
+            1,
+            "exactly one viewport embeds: {modes:?}"
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| matches!(mode, EngineMode::Remote { .. }))
+                .count(),
+            1,
+            "the other attaches over IPC: {modes:?}"
+        );
+
+        for handle in [&a, &b] {
+            let mut deferred = handle.deferred_state().expect("lifecycle tracked");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                wait_for_deferred_engine(&mut deferred),
+            )
+            .await
+            .expect("readiness resolves")
+            .expect("both viewports reach Ready");
+        }
+
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
         // The port probe only proves *something* is listening. A process that
         // accepts TCP and never speaks WebSocket used to hang the dial forever;
@@ -5159,17 +3949,13 @@ mod tests {
             .unwrap();
         let port = squatter.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            project_scope: "test".into(),
-            deployment_id: None,
-            scaffold_url: None,
-            default_harness: HarnessId::Mock,
-            runtime_profile: RuntimeProfile::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .expect("a taken port must not fail the boot");
         assert_eq!(handle.mode(), EngineMode::InProcess);
@@ -5186,34 +3972,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_bootstrap_opens_local_data_without_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: free_port().await,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+        default_harness: HarnessId::Mock, })
+        .await
+        .unwrap();
+
+        assert_eq!(handle.engine_info().workspace_scope, WorkspaceScope::Local);
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(info, *handle.engine_info());
+
+        let mut auth = handle
+            .client()
+            .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_auth_state(&auth.recv().await.unwrap()),
+            Some(AuthState::SignedOut)
+        );
+        let harnesses = handle
+            .client()
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await
+            .expect("local data RPC is immediately available");
+        assert!(harnesses.as_array().is_some_and(|items| !items.is_empty()));
+        assert!(
+            !dir.path().join("orgs/dev-org/dev-user").exists(),
+            "production boot must not create dev-user data"
+        );
+        assert!(dir.path().join("profiles/local").is_dir());
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn engine_info_is_available_while_cloud_onboarding_is_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
+        )
+        .unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
+        ipc_port: free_port().await,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: Some("client_test".into()),
+        default_harness: HarnessId::Mock, })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            handle
+                .deferred_state()
+                .expect("embedded lifecycle")
+                .borrow()
+                .clone(),
+            DeferredEngineState::Waiting
+        ));
+
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .expect("EngineInfo bypasses deferred cloud stores");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                handle
+                    .client()
+                    .call(methods::LIST_HARNESSES, serde_json::json!({})),
+            )
+            .await
+            .is_err(),
+            "cloud data waits for organization onboarding"
+        );
+        assert!(!dir.path().join("orgs").exists());
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn bootstrap_connects_when_daemon_is_listening() {
-        // Stand in for `comet headless`: an engine served over the WS IPC port.
+        // Stand in for `zeron headless`: an engine served over the WS IPC port.
         let daemon_dir = tempfile::tempdir().unwrap();
         let core = EngineCore::assemble(
             daemon_dir.path(),
-            Arc::new(default_registry(
-                comet_proto::RuntimeProfile::LocalController,
-            )),
+            Arc::new(default_registry()),
             HarnessId::Mock,
             None,
         )
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(comet_rpc::serve_ws_listener(listener, core.rpc_service()));
+        tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
 
         let ui_dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: ui_dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            project_scope: "test".into(),
-            deployment_id: None,
-            scaffold_url: None,
-            default_harness: HarnessId::Mock,
-            runtime_profile: RuntimeProfile::Mock,
-        })
+        let handle = EngineHandle::bootstrap(EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: ui_dir.path().to_path_buf(),
+        ipc_port: port,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock, })
         .await
         .unwrap();
         assert_eq!(
@@ -5222,541 +4094,47 @@ mod tests {
                 url: format!("ws://127.0.0.1:{port}")
             }
         );
+        assert_eq!(
+            handle.engine_info().workspace_scope,
+            WorkspaceScope::Development
+        );
         let harnesses = handle
             .client()
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
             .await
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        assert!(matches!(
+            handle
+                .client()
+                .call(methods::STOP_ENGINE, serde_json::json!({}))
+                .await,
+            Err(RpcError::UnknownMethod(method)) if method == methods::STOP_ENGINE
+        ));
     }
 
     fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {
         let base = DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
             .unwrap()
             .to_utc();
-        Chat {
-            id: id.into(),
-            device_id: "dev".into(),
-            title: None,
-            archived: false,
-            cwd: None,
-            branch: None,
-            checkout_id: None,
-            config: None,
-            last_message_preview: None,
-            last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),
-            created_at: base + TimeDelta::minutes(created_min),
-            harness_session_id: None,
-            harness_session_cwd: None,
-            fork_from: None,
-            space_id: None,
-            last_seen_at: None,
-        }
-    }
-
-    #[test]
-    fn scaffold_draft_preserves_exact_first_prompt_scope() {
-        let draft = ScaffoldSessionDraft {
-            project_id: "project-a".into(),
-            deployment_id: "deployment-a".into(),
-            space_id: "space-a".into(),
-            chat_id: "chat-a".into(),
-            database_environment: ScaffoldDatabaseEnvironment::StagingSnapshot,
-            source_ref: Some("master".into()),
-            omp_handoff: Some(ScaffoldOmpHandoffDraft {
-                native_session_id: "omp-native-a".into(),
-                cwd: "/repo".into(),
-            }),
-        };
-
-        let scope = draft.collaboration_scope();
-
-        assert_eq!(scope.project_id, "project-a");
-        assert_eq!(scope.deployment_id.as_deref(), Some("deployment-a"));
-        assert_eq!(scope.session_id.as_deref(), Some("chat-a"));
-        assert_eq!(
-            draft.omp_handoff,
-            Some(ScaffoldOmpHandoffDraft {
-                native_session_id: "omp-native-a".into(),
-                cwd: "/repo".into(),
-            })
-        );
-    }
-    #[test]
-    fn scaffold_physical_host_overrides_local_folder_device() {
-        let mut state = AppState::new();
-        state.chats = vec![chat("chat-a", 0, None)];
-        assert_eq!(state.chat_host_device_id("chat-a"), Some("dev"));
-
-        state
-            .scaffold_host_devices
-            .insert("chat-a".into(), "comet-scaffold-sandbox-a-e1".into());
-
-        assert_eq!(
-            state.chat_host_device_id("chat-a"),
-            Some("comet-scaffold-sandbox-a-e1")
-        );
-    }
-
-    #[gpui::test]
-    fn scaffold_draft_updates_branch_database_and_staged_chat(cx: &mut gpui::TestAppContext) {
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            state.spaces = vec![space("space-a", "device-a", "/repo", 0)];
-            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
-            state.selected_space = Some("space-a".into());
-            state.start_scaffold_session(ScaffoldDatabaseEnvironment::Local, cx);
-            assert_eq!(state.scaffold_session_draft().unwrap().source_ref, None);
-            assert_eq!(state.selected_chat_row().unwrap().branch, None);
-
-            let chat_id = state
-                .scaffold_session_draft()
-                .expect("Scaffold draft")
-                .chat_id
-                .clone();
-            state.set_scaffold_source_ref(Some("feature/crew".into()), cx);
-            state.set_scaffold_database_environment(
-                ScaffoldDatabaseEnvironment::StagingSnapshot,
-                cx,
-            );
-
-            let draft = state.scaffold_session_draft().expect("updated draft");
-            assert_eq!(draft.source_ref.as_deref(), Some("feature/crew"));
-            assert_eq!(
-                draft.database_environment,
-                ScaffoldDatabaseEnvironment::StagingSnapshot
-            );
-            assert_eq!(
-                state
-                    .chats
-                    .iter()
-                    .find(|chat| chat.id == chat_id)
-                    .and_then(|chat| chat.branch.as_deref()),
-                Some("feature/crew")
-            );
-            for reference in ["master", "a123456789abcdef"] {
-                state.set_scaffold_source_ref(Some(reference.into()), cx);
-                assert_eq!(
-                    state.scaffold_session_draft().unwrap().source_ref.as_deref(),
-                    Some(reference)
-                );
-                assert_eq!(state.selected_chat_row().unwrap().branch.as_deref(), Some(reference));
-            }
-            state.set_scaffold_source_ref(None, cx);
-            let draft = state.scaffold_session_draft().unwrap();
-            assert_eq!(draft.source_ref, None);
-            assert_eq!(draft.chat_id, chat_id);
-            assert_eq!(draft.database_environment, ScaffoldDatabaseEnvironment::StagingSnapshot);
-            assert_eq!(state.selected_chat_row().unwrap().branch, None);
-        });
-    }
-
-    #[gpui::test]
-    fn scaffold_launch_does_not_implicitly_handoff_selected_omp_session(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            let mut local = chat("local-omp", 0, Some(1));
-            local.device_id = "device-a".into();
-            local.space_id = Some("space-a".into());
-            local.harness_session_id = Some("omp-session-a".into());
-            local.harness_session_cwd = Some("/repo".into());
-            local.config = Some(comet_proto::ChatConfig {
-                harness: HarnessId::Omp,
-                model: Some("gpt-5.6-sol".into()),
-                reasoning: None,
-                agent_account_id: None,
-                model_options: Default::default(),
-                sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-            });
-            state.local_device_id = Some("device-a".into());
-            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
-            state.selected_space = Some("space-a".into());
-            state.selected_chat = Some(local.id.clone());
-            state.chats = vec![local];
-            state.spaces = vec![space("space-a", "device-a", "/repo", 0)];
-
-            state.start_scaffold_session(ScaffoldDatabaseEnvironment::Local, cx);
-
-            assert!(
-                state
-                    .scaffold_session_draft()
-                    .is_some_and(|draft| draft.omp_handoff.is_none())
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn explicit_local_omp_handoff_creates_a_separate_scaffold_draft(cx: &mut gpui::TestAppContext) {
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            let mut local = chat("a6c3c748-7fb2-4fa0-bf5c-ccb26b471599", 0, Some(1));
-            local.device_id = "device-a".into();
-            local.space_id = Some("space-a".into());
-            local.harness_session_id = Some("omp-session-a".into());
-            local.harness_session_cwd = Some("/repo".into());
-            local.config = Some(comet_proto::ChatConfig {
-                harness: HarnessId::Omp,
-                model: Some("gpt-5.6-sol".into()),
-                reasoning: None,
-                agent_account_id: None,
-                model_options: Default::default(),
-                sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
-            });
-            state.local_device_id = Some("device-a".into());
-            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
-            state.selected_space = Some("space-a".into());
-            state.selected_chat = Some(local.id.clone());
-            state.chats = vec![local];
-            state.spaces = vec![space("space-a", "device-a", "/repo", 0)];
-
-            state.handoff_session_to_scaffold(
-                "a6c3c748-7fb2-4fa0-bf5c-ccb26b471599".into(),
-                ScaffoldDatabaseEnvironment::Local,
-                cx,
-            );
-
-            let draft = state.scaffold_session_draft().expect("OMP handoff draft");
-            assert_ne!(draft.chat_id, "a6c3c748-7fb2-4fa0-bf5c-ccb26b471599");
-            assert_eq!(draft.source_ref, None);
-            assert_eq!(
-                draft.omp_handoff,
-                Some(ScaffoldOmpHandoffDraft {
-                    native_session_id: "omp-session-a".into(),
-                    cwd: "/repo".into(),
-                })
-            );
-            let remote = state
-                .chats
-                .iter()
-                .find(|chat| chat.id == draft.chat_id)
-                .expect("separate remote session");
-            assert_eq!(
-                remote
-                    .config
-                    .as_ref()
-                    .and_then(|config| config.model.as_deref()),
-                Some("gpt-5.6-sol")
-            );
-            assert!(
-                state
-                    .chats
-                    .iter()
-                    .any(|chat| chat.id == "a6c3c748-7fb2-4fa0-bf5c-ccb26b471599")
-            );
-            assert!(!state.scaffold_session_creating());
-        });
-    }
-
-    #[gpui::test]
-    fn scaffold_draft_is_bound_to_its_selected_comet_session(cx: &mut gpui::TestAppContext) {
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            state.pending_scaffold_session = Some(ScaffoldSessionDraft {
-                project_id: "project-a".into(),
-                deployment_id: "deployment-a".into(),
-                space_id: "space-a".into(),
-                chat_id: "chat-a".into(),
-                database_environment: ScaffoldDatabaseEnvironment::Local,
-                source_ref: Some("master".into()),
-                omp_handoff: None,
-            });
-
-            state.select_chat(Some("chat-a".into()), cx);
-            assert!(state.chat_is_scaffold("chat-a"));
-
-            state.select_chat(None, cx);
-            assert!(state.pending_scaffold_session.is_none());
-        });
-    }
-
-    #[gpui::test]
-    fn attached_scaffold_draft_survives_failure_and_navigation_until_admission(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            let draft = ScaffoldSessionDraft {
-                project_id: "project-a".into(),
-                deployment_id: "deployment-a".into(),
-                space_id: "space-a".into(),
-                chat_id: "chat-a".into(),
-                database_environment: ScaffoldDatabaseEnvironment::Local,
-                source_ref: Some("master".into()),
-                omp_handoff: None,
-            };
-            let scope = draft.collaboration_scope();
-            state.select_pending_scaffold_chat(draft, cx);
-            state.mark_scaffold_chat_starting("chat-a");
-            let attachment = ScaffoldSessionAttachment {
-                environment: serde_json::from_value(serde_json::json!({
-                    "source": {
-                        "kind": "scaffold", "sandbox_id": "sandbox-a",
-                        "lifecycle": "ready", "lifecycle_epoch": 1, "links": {}
-                    },
-                    "ownerPrincipal": "owner@example.com",
-                    "scope": scope,
-                }))
-                .unwrap(),
-                projection: SessionRoomProjection {
-                    project_id: "project-a".into(),
-                    deployment_id: "deployment-a".into(),
-                    session_id: "chat-a".into(),
-                },
-                grant_id: "grant-a".into(),
-                owner_device_id: "comet-scaffold-sandbox-a-e1".into(),
-                actor_subject: "owner@example.com".into(),
-                source_ref: Some("master".into()),
-                control_target: ScaffoldControlTarget {
-                    sandbox_id: "sandbox-a".into(),
-                    scope: scope.clone(),
-                },
-            };
-            state.install_scaffold_session(&attachment, cx);
-            assert_eq!(
-                state
-                    .scaffold_session_draft()
-                    .unwrap()
-                    .collaboration_scope(),
-                scope
-            );
-
-            state.clear_scaffold_chat_starting("chat-a", cx);
-            state.select_chat(None, cx);
-            state.select_space_source("other-space".into(), Vec::new(), cx);
-            state.select_space(None, cx);
-            state.select_chat(Some("chat-a".into()), cx);
-            assert_eq!(
-                state
-                    .scaffold_session_draft()
-                    .unwrap()
-                    .collaboration_scope(),
-                scope
-            );
-            assert_eq!(
-                state.scaffold_control_target("chat-a"),
-                Some(&attachment.control_target)
-            );
-
-            // An upload can fail after Attach has installed the room and grant.
-            state.scaffold_session_error = Some("upload failed".into());
-            state.select_chat(None, cx);
-            state.select_chat(Some("chat-a".into()), cx);
-            assert_eq!(
-                state
-                    .scaffold_session_draft()
-                    .unwrap()
-                    .collaboration_scope(),
-                scope
-            );
-
-            state.complete_scaffold_session_startup("another-chat");
-            assert!(state.scaffold_session_draft().is_some());
-            state.complete_scaffold_session_startup("chat-a");
-            assert!(state.scaffold_session_draft().is_none());
-            assert!(state.scaffold_session_error.is_none());
-            assert_eq!(
-                state.scaffold_control_target("chat-a"),
-                Some(&attachment.control_target)
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn pending_scaffold_chat_does_not_open_the_unscoped_room(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Runtime::new().expect("Tokio test runtime");
-        let _runtime_guard = runtime.enter();
-        let operations = Arc::new(StdMutex::new(Vec::new()));
-        let service: Arc<dyn RpcService> = Arc::new(ReadyScaffoldRpc {
-            operations: Arc::clone(&operations),
-            attach_failures_remaining: AtomicU16::new(0),
-            inspect_lifecycle: "ready",
-            archive_fails: false,
-            update_route_failures_remaining: AtomicU16::new(0),
-        });
-        let handle = EngineHandle {
-            inner: Arc::new(RemoteEngine {
-                client: memory_client(service),
-                url: "memory://pending-scaffold".into(),
-            }),
-        };
-        let state = cx.new(|_| AppState::new());
-
-        state.update(cx, |state, cx| {
-            state.engine = Some(handle);
-            state.select_pending_scaffold_chat(
-                ScaffoldSessionDraft {
-                    project_id: "project-a".into(),
-                    deployment_id: "deployment-a".into(),
-                    space_id: "space-a".into(),
-                    chat_id: "chat-a".into(),
-                    database_environment: ScaffoldDatabaseEnvironment::ProductionSnapshot,
-                    source_ref: Some("master".into()),
-                    omp_handoff: None,
-                },
-                cx,
-            );
-            let unaccepted = state.scaffold_session_draft().unwrap().clone();
-            state.cancel_unaccepted_chat("chat-a", cx);
-            assert!(state.pending_scaffold_session.is_none());
-            assert!(!state.pending_local_chat_ids.contains("chat-a"));
-            assert!(state.selected_chat.is_none());
-            state.select_pending_scaffold_chat(unaccepted, cx);
-
-            assert_eq!(state.selected_chat.as_deref(), Some("chat-a"));
-            assert!(!state.scaffold_chat_starting("chat-a"));
-            assert!(state.transcript_task.is_none());
-            assert!(state.collaboration_task.is_none());
-            let target = ScaffoldControlTarget {
-                sandbox_id: "sandbox-pending".into(),
-                scope: state
-                    .scaffold_session_draft()
-                    .unwrap()
-                    .collaboration_scope(),
-            };
-            state.mark_scaffold_chat_starting("chat-a");
-            // An error may arrive before the engine's accepted-ref watch frame.
-            state.scaffold_session_error = Some("attachment interrupted".into());
-            state.clear_scaffold_chat_starting("chat-a", cx);
-            state.select_chat(None, cx);
-            state.cancel_unaccepted_chat("chat-a", cx);
-            state.select_space_source("other-space".into(), Vec::new(), cx);
-            state.select_space(None, cx);
-            state.select_chat(Some("chat-a".into()), cx);
-            assert!(state.scaffold_session_draft().is_some());
-            assert!(state.transcript_task.is_none());
-            assert!(state.collaboration_task.is_none());
-            state.scaffold_session_error = None;
-            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
-            let accepted: SessionEnvironment = serde_json::from_value(serde_json::json!({
-                "source": { "kind": "scaffold", "sandbox_id": "sandbox-pending", "lifecycle": "starting", "links": {} },
-                "ownerPrincipal": "owner@example.com",
-                "scope": target.scope,
-            })).unwrap();
-            state.apply_session_refs(vec![SessionRef {
-                chat_id: "chat-a".into(),
-                added_at: Utc::now(),
-                environment: Some(accepted),
-                startup: None,
-            }]);
-            state.clear_scaffold_chat_starting("chat-a", cx);
-            assert!(state.transcript_task.is_none());
-            assert!(state.collaboration_task.is_none());
-            state.select_chat(None, cx);
-            state.cancel_unaccepted_chat("chat-a", cx);
-            assert!(state.scaffold_session_draft_for_chat("chat-a").is_some());
-            assert_eq!(state.scaffold_control_target("chat-a"), Some(&target));
-            state.select_space(None, cx);
-            state.select_chat(Some("chat-a".into()), cx);
-            assert!(state.scaffold_session_draft().is_some());
-            assert_eq!(state.scaffold_control_target("chat-a"), Some(&target));
-            assert!(state.chat_is_scaffold("chat-a"));
-            assert!(state.transcript_task.is_none());
-            assert!(state.collaboration_task.is_none());
-            state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
-            state.selected_space = Some("space-a".into());
-            assert!(!state.can_start_scaffold_session());
-            state.cancel_pending_chat("chat-a", cx);
-            assert!(state.can_start_scaffold_session());
-            assert!(state.chat_is_scaffold("chat-a"));
-        });
-        assert!(
-            operations
-                .lock()
-                .expect("Scaffold operation log")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn reconnect_supervisor_gates_flips_and_dedupes() {
-        let config = EngineBootConfig {
-            data_dir: PathBuf::from("/tmp/comet-reconnect-test"),
-            ipc_port: 0,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None, // offline
-            project_scope: "test".into(),
-            deployment_id: None,
-            scaffold_url: None,
-            default_harness: HarnessId::Mock,
-            runtime_profile: RuntimeProfile::Mock,
-        };
-        let mut state = AppState::new();
-
-        // Closure before the first attach (still Connecting) never reconnects.
-        state.boot_config = Some(config);
-        assert!(state.reconnect_config().is_none());
-
-        // An attached app reconnects: the first detector wins and flips the
-        // status back to Connecting…
-        state.connection = ConnectionStatus::Ready;
-        assert!(state.reconnect_config().is_some());
-        assert!(
-            matches!(state.connection, ConnectionStatus::Connecting),
-            "a closed transport must flip the app back to Connecting"
-        );
-        // …so the other watch tasks noticing the same dead transport collapse
-        // into that one bootstrap instead of racing their own.
-        assert!(state.reconnect_config().is_none());
-
-        // Quit guard: after begin_shutdown the drained engine's closing
-        // streams must not restart a fresh engine mid-teardown.
-        state.connection = ConnectionStatus::Ready;
-        assert!(state.begin_shutdown().is_none()); // no engine attached here
-        assert!(state.reconnect_config().is_none());
-        assert!(matches!(state.connection, ConnectionStatus::Ready));
-
-        // A state that never bootstrapped has no config to reboot with.
-        let mut blank = AppState::new();
-        blank.connection = ConnectionStatus::Ready;
-        assert!(blank.reconnect_config().is_none());
-    }
-
-    #[test]
-    fn scaffold_starting_state_survives_materialization_and_clears_on_delete() {
-        let mut state = AppState::new();
-        state.scaffold_scope = Some(("ashler-staging".into(), "ashler-staging".into()));
-        state.mark_chat_pending("scaffold-chat");
-        state.mark_scaffold_chat_starting("scaffold-chat");
-
-        state.apply_chats(Vec::new());
-        assert!(state.scaffold_chat_starting("scaffold-chat"));
-
-        state.apply_chats(vec![chat("scaffold-chat", 0, None)]);
-        assert!(state.scaffold_chat_starting("scaffold-chat"));
-
-        state.apply_chats(Vec::new());
-        assert!(!state.scaffold_chat_starting("scaffold-chat"));
-    }
-
-    fn local_candidate(
-        id: &str,
-        chat_id: &str,
-        resumable: bool,
-        history_only: bool,
-    ) -> LocalSessionCandidate {
-        LocalSessionCandidate {
-            id: id.into(),
-            chat_id: chat_id.into(),
-            harness: if resumable {
-                HarnessId::PrimeAgent
-            } else {
-                HarnessId::Codex
-            },
-            session_id: format!("native-{id}"),
-            cwd: "/workspace/comet".into(),
-            title: format!("Session {id}"),
-            preview: None,
-            model: None,
-            reasoning: None,
-            created_at: 1,
-            updated_at: 2,
-            live_attachable: false,
-            resumable,
-            history_only,
-            busy_elsewhere: None,
-        }
+        Chat { crew: None, id: id.into(),
+        device_id: "dev".into(),
+        title: None,
+        archived: false,
+        cwd: None,
+        branch: None,
+        checkout_id: None,
+        source_context: None,
+        config: None,
+        last_message_preview: None,
+        last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),
+        created_at: base + TimeDelta::minutes(created_min),
+        harness_session_id: None,
+        harness_session_cwd: None,
+        parent_chat_id: None,
+        space_id: None,
+        last_seen_at: None,
+        room_gen: None, }
     }
 
     fn space(id: &str, device_id: &str, path: &str, created_min: i64) -> Space {
@@ -5771,6 +4149,7 @@ mod tests {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            repository_id: None,
             created_at: base + TimeDelta::minutes(created_min),
         }
     }
@@ -5782,38 +4161,473 @@ mod tests {
         now: DateTime<Utc>,
     ) -> Session {
         Session {
+            last_completed_turn: None,
+            running_subagents: 0,
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
-            model_retry: None,
             started_at: None,
             updated_at: now - TimeDelta::seconds(updated_secs_ago),
         }
     }
 
-    fn agent_session(
-        chat_id: &str,
-        status: SessionStatus,
-        updated_secs_ago: i64,
-        now: DateTime<Utc>,
-    ) -> AgentSessionRecord {
-        AgentSessionRecord {
-            session_id: "remote-session".into(),
-            chat_id: chat_id.into(),
-            owner_subject: "owner".into(),
-            owner_device_id: "remote-device".into(),
-            source: AgentSessionSource::Scaffold,
-            environment: None,
-            harness: Some(HarnessId::Omp),
-            model: Some("openai-codex/gpt-5.6-sol".into()),
-            harness_session_id: None,
-            status: Some(status),
-            model_retry: None,
-            started_at: None,
-            updated_at: Some((now - TimeDelta::seconds(updated_secs_ago)).timestamp_millis()),
-            created_at: (now - TimeDelta::minutes(1)).timestamp_millis(),
-            unknown: BTreeMap::new(),
+    fn user_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: zeron_doc::MessageRole::User,
+            parts: Vec::new(),
+            created_at: 0,
+            device_id: "dev".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
         }
+    }
+
+    #[gpui::test]
+    fn opening_tail_is_visible_but_never_replaces_or_caches_complete_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            let update = |id: &str| zeron_doc::TranscriptUpdate {
+                frame: TranscriptFrame::reset(&[user_entry(id)]),
+                context_usage: None,
+                replay_baseline: None,
+            };
+            state.select_chat(Some("whale".into()), cx);
+            state
+                .receive_opening_transcript_update(update("tail"), true, cx)
+                .unwrap();
+            assert_eq!(state.transcript[0].id, "tail");
+            assert!(
+                !state.transcript_replayed,
+                "scroll-anchor fallback must await full history"
+            );
+            state.select_chat(None, cx);
+            assert!(
+                state.transcript_cache.is_empty(),
+                "a preview is not a complete cached copy"
+            );
+            state.select_chat(Some("whale".into()), cx);
+            state
+                .receive_opening_transcript_update(update("full"), false, cx)
+                .unwrap();
+            state
+                .receive_opening_transcript_update(update("tail"), true, cx)
+                .unwrap();
+            assert_eq!(
+                state.transcript[0].id, "full",
+                "reconnect must preserve the full view"
+            );
+            state.select_chat(None, cx);
+            state.select_chat(Some("whale".into()), cx);
+            state
+                .receive_opening_transcript_update(update("tail"), true, cx)
+                .unwrap();
+            assert_eq!(
+                state.transcript[0].id, "full",
+                "revisit must preserve the cache"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn whale_transcript_revisit_is_synchronous_and_fresh_reset_wins(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("whale".into()), cx);
+            let entries: Vec<_> = (0..2000)
+                .map(|i| {
+                    let mut entry = user_entry(&format!("message-{i}"));
+                    entry.parts.push(zeron_doc::MessagePart::Text {
+                        id: "text".into(),
+                        text: "x".repeat(2048),
+                    });
+                    entry
+                })
+                .collect();
+            state.apply_transcript(entries);
+            let allocation = state.transcript.as_ptr();
+            for _ in 0..10 {
+                state.select_chat(Some("other".into()), cx);
+                assert!(
+                    state.transcript.is_empty(),
+                    "never show another chat's rows"
+                );
+                state.select_chat(Some("whale".into()), cx);
+                assert_eq!(
+                    state.transcript.len(),
+                    2000,
+                    "revisit must render before any RPC frame"
+                );
+                assert_eq!(
+                    state.transcript.as_ptr(),
+                    allocation,
+                    "move whale payloads, don't copy them"
+                );
+                assert!(state.transcript_replayed);
+                assert!(
+                    state
+                        .transcript_baseline("whale")
+                        .unwrap()
+                        .covers(&state.transcript[0])
+                );
+            }
+            state
+                .apply_transcript_frame(TranscriptFrame::reset(&[user_entry(
+                    "new-authoritative-row",
+                )]))
+                .unwrap();
+            assert_eq!(state.transcript.len(), 1);
+            assert_eq!(state.transcript[0].id, "new-authoritative-row");
+            state.select_chat(None, cx);
+            state.select_chat(Some("whale".into()), cx);
+            assert_eq!(state.transcript[0].id, "new-authoritative-row");
+            // An authoritative empty reset must still be honored.
+            state
+                .apply_transcript_frame(TranscriptFrame::reset(&[]))
+                .unwrap();
+            assert!(state.transcript.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn transcript_revisit_cache_is_bounded_and_account_scoped(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            for i in 0..20 {
+                state.select_chat(Some(format!("chat-{i}")), cx);
+                state.apply_transcript(vec![user_entry("row")]);
+            }
+            state.select_chat(None, cx);
+            assert_eq!(state.transcript_cache.len(), TRANSCRIPT_CACHE_CAP);
+            state.select_chat(Some("chat-0".into()), cx);
+            assert!(state.transcript.is_empty(), "oldest entry was evicted");
+            state.apply_chats(vec![chat("chat-19", 0, None)]);
+            assert_eq!(
+                state.transcript_cache.len(),
+                1,
+                "deleted chats leave no cached rows"
+            );
+            state.prepare_runtime_replacement(cx);
+            state.select_chat(Some("chat-19".into()), cx);
+            assert!(
+                state.transcript.is_empty(),
+                "account replacement must clear cached content"
+            );
+            assert!(state.transcript_cache.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn transcript_cache_rejects_oversize_and_unloaded_entries(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("loading".into()), cx);
+            state.select_chat(Some("oversize".into()), cx);
+            assert!(state.transcript_cache.is_empty());
+            let mut entry = user_entry("large");
+            entry.parts.push(zeron_doc::MessagePart::Text {
+                id: "text".into(),
+                text: "x".repeat(TRANSCRIPT_CACHE_BYTES + 1),
+            });
+            state.apply_transcript(vec![entry]);
+            state.select_chat(None, cx);
+            assert!(
+                state.transcript_cache.is_empty(),
+                "byte budget applies even to one whale"
+            );
+        });
+    }
+
+    #[test]
+    fn transcript_revision_tracks_replay_echoes_and_subagent_content() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        let initial = state.transcript_revision;
+        state.apply_transfers(Vec::new());
+        state.apply_auth(AuthState::SignedOut);
+        assert_eq!(
+            state.transcript_revision, initial,
+            "unrelated notifications are inert"
+        );
+
+        state.push_echo("c", user_entry("m1"));
+        let echo = state.transcript_revision;
+        assert_ne!(echo, initial);
+        state.push_echo("c", user_entry("m1"));
+        state.remove_echo("c", "absent");
+        assert_eq!(
+            state.transcript_revision, echo,
+            "unchanged echoes do not invalidate"
+        );
+        state.apply_transcript(vec![user_entry("m1")]);
+        assert!(state.pending_echoes().is_empty());
+        assert_ne!(
+            state.transcript_revision, echo,
+            "echo-to-replay handoff invalidates"
+        );
+
+        let before_reset = state.transcript_revision;
+        state
+            .apply_transcript_frame(TranscriptFrame::Reset { reset: Vec::new() })
+            .unwrap();
+        assert!(state.transcript_replayed);
+        assert_ne!(
+            state.transcript_revision, before_reset,
+            "empty replay is authoritative"
+        );
+
+        let before_subagent = state.transcript_revision;
+        state.set_subagent_snapshot("sub".into(), vec![user_entry("nested")]);
+        assert_ne!(state.transcript_revision, before_subagent);
+        let before_close = state.transcript_revision;
+        state.unwatch_subagent_doc("sub");
+        assert!(state.sub_transcript("sub").is_empty());
+        assert_ne!(state.transcript_revision, before_close);
+    }
+
+    fn device(id: &str, name: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_heartbeats_preserve_freshness_without_redrawing_unchanged_status() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        let mut row = Session {
+            last_completed_turn: None,
+            running_subagents: 0,
+            chat_id: "chat".into(),
+            device_id: "host".into(),
+            status: SessionStatus::Working,
+            started_at: Some(now),
+            updated_at: now,
+        };
+        assert!(state.apply_sessions_at(vec![row.clone()], now));
+        row.updated_at = now + TimeDelta::seconds(30);
+        assert!(!state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(30)));
+        assert_eq!(state.sessions[0].updated_at, row.updated_at);
+        assert_eq!(
+            state.indicator_for("chat", now + TimeDelta::seconds(60)),
+            Indicator::Working
+        );
+        assert!(state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(76)));
+        row.updated_at = now + TimeDelta::seconds(80);
+        assert!(state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(80)));
+        row.status = SessionStatus::AwaitingInput;
+        assert!(state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(80)));
+        row.status = SessionStatus::Idle;
+        row.started_at = None;
+        assert!(state.apply_sessions_at(vec![row], now + TimeDelta::seconds(80)));
+        assert!(state.apply_sessions_at(vec![], now + TimeDelta::seconds(80)));
+    }
+
+    #[test]
+    fn unchanged_device_heartbeat_still_retires_stale_session_indicators() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        state.sessions = vec![Session {
+            last_completed_turn: None,
+            running_subagents: 0,
+            chat_id: "chat".into(),
+            device_id: "host".into(),
+            status: SessionStatus::Working,
+            started_at: Some(now),
+            updated_at: now,
+        }];
+        let mut row = device("host", "Host");
+        row.last_seen_at = Some(now);
+        assert!(state.apply_devices_at(vec![row.clone()], now));
+        row.last_seen_at = Some(now + TimeDelta::seconds(30));
+        assert!(!state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(30)));
+        row.last_seen_at = Some(now + TimeDelta::seconds(46));
+        assert!(state.apply_devices_at(vec![row], now + TimeDelta::seconds(46)));
+        assert_eq!(
+            state.indicator_for("chat", now + TimeDelta::seconds(46)),
+            Indicator::None
+        );
+        let mut recovered = state.sessions.clone();
+        recovered[0].updated_at = now + TimeDelta::seconds(47);
+        assert!(
+            state.apply_sessions_at(recovered, now + TimeDelta::seconds(47)),
+            "a heartbeat must immediately restore an indicator retired by a device tick"
+        );
+    }
+
+    #[test]
+    fn device_heartbeats_keep_freshness_without_repainting_unchanged_presentation() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        let mut row = device("host", "Host");
+        row.last_seen_at = Some(now);
+        assert!(state.apply_devices_at(vec![row.clone()], now));
+        row.last_seen_at = Some(now + TimeDelta::seconds(15));
+        assert!(!state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(15)));
+        assert_eq!(state.devices[0].last_seen_at, row.last_seen_at);
+        // The settings label still advances even before the presence dot expires.
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(75)));
+        // An identical frame must redraw when presence crosses the expiry boundary.
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(86)));
+        assert!(!state.device_online("host", now + TimeDelta::seconds(86)));
+        row.last_seen_at = Some(now + TimeDelta::seconds(90));
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(90)));
+        assert!(state.device_online("host", now + TimeDelta::seconds(90)));
+        row.name = "Renamed".into();
+        assert!(state.apply_devices_at(vec![row.clone()], now + TimeDelta::seconds(90)));
+        row.version = Some("9.0.0".into());
+        assert!(state.apply_devices_at(vec![row], now + TimeDelta::seconds(90)));
+        assert!(state.apply_devices_at(vec![], now + TimeDelta::seconds(90)));
+        assert!(!state.apply_devices_at(vec![], now + TimeDelta::seconds(90)));
+    }
+
+    #[test]
+    fn local_workspace_hides_the_unknown_device_sentinel() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.local_device_id = Some("local".into());
+
+        state.apply_devices(vec![
+            device("local", "unknown-device"),
+            device("remote", "unknown-device"),
+        ]);
+
+        assert_eq!(state.device_name("local"), Some("Local"));
+        assert_eq!(state.device_name("remote"), Some("unknown-device"));
+
+        state.apply_devices(vec![device("local", "José's MacBook Pro")]);
+        assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
+    }
+
+    #[test]
+    fn device_version_change_reenables_change_request_capability() {
+        let mut state = AppState::new();
+        state
+            .change_requests
+            .mark_unsupported("remote".into(), Some("0.2.2".into()));
+        let mut old = device("remote", "Remote");
+        old.version = Some("0.2.2".into());
+        state.apply_devices(vec![old]);
+        assert!(!state.change_requests.is_supported("remote"));
+
+        let mut upgraded = device("remote", "Remote");
+        upgraded.version = Some("0.2.3".into());
+        state.apply_devices(vec![upgraded]);
+        assert!(state.change_requests.is_supported("remote"));
+    }
+
+    #[test]
+    fn transfer_percent_tracks_snapshots_by_upload_id() {
+        let mut s = AppState::new();
+        assert_eq!(s.transfer_percent("u1"), None);
+
+        let frame = |id: &str, done, total| zeron_proto::TransferProgress {
+            upload_id: id.into(),
+            file_name: "a.png".into(),
+            done,
+            total,
+        };
+        s.apply_transfers(vec![frame("u1", 430, 1_000), frame("u2", 0, 400)]);
+        assert_eq!(s.transfer_percent("u1"), Some(43));
+        assert_eq!(s.transfer_percent("u2"), Some(0));
+        assert_eq!(s.transfer_percent("other"), None);
+
+        // The last point belongs to the commit — never a stuck 100%; b64
+        // padding overshoot stays clamped too.
+        s.apply_transfers(vec![frame("u1", 1_000, 1_000), frame("u3", 12, 0)]);
+        assert_eq!(s.transfer_percent("u1"), Some(99));
+        // Zero-total renders indeterminate, not a division blowup.
+        assert_eq!(s.transfer_percent("u3"), None);
+        // Snapshots REPLACE: u2's transfer retired with its entry.
+        assert_eq!(s.transfer_percent("u2"), None);
+
+        s.apply_transfers(Vec::new());
+        assert_eq!(s.transfer_percent("u1"), None);
+    }
+
+    #[test]
+    fn upload_progress_percent_clamps_and_clears() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut s = AppState::new();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        let done = Arc::new(AtomicU64::new(0));
+        s.begin_upload_progress(1_000, done.clone());
+        assert_eq!(s.upload_progress_percent(), Some(0));
+        done.store(430, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(43));
+        // The last point belongs to commit+queue — never show a stuck 100%.
+        done.store(1_000, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+        // Overshoot (b64 padding rounding) stays clamped.
+        done.store(1_002, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+
+        s.end_upload_progress();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        // A zero-byte total renders as plain "Sending…", not a percent.
+        s.begin_upload_progress(0, Arc::new(AtomicU64::new(0)));
+        assert_eq!(s.upload_progress_percent(), None);
+    }
+
+    #[test]
+    fn send_pending_overlays_working_until_the_grace_window() {
+        let now = Utc::now();
+        let s_chat = chat("c", 0, Some(10)); // unseen, no session row
+        let mut s = AppState::new();
+        assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Completed);
+        assert_eq!(s.indicator_for("c", now), Indicator::None);
+        s.begin_pending_send("c", "m1", now);
+        assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Working);
+        assert_eq!(s.indicator_for("c", now), Indicator::Working);
+        // Time-bounded: an offline host must not leave an eternal spinner —
+        // past the grace the overlay yields (and `send_undelivered` takes
+        // over with the explicit failed state).
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        assert_eq!(
+            s.display_status_for(&s_chat, later),
+            ChatIndicator::Completed
+        );
+        assert_eq!(s.indicator_for("c", later), Indicator::None);
+        assert!(s.send_undelivered("c", later));
+    }
+
+    #[test]
+    fn send_pending_acked_when_the_host_writes_the_message_back() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        s.selected_chat = Some("c".into());
+        s.begin_pending_send("c", "m1", now);
+        // A frame without the message keeps the overlay.
+        s.apply_transcript(vec![user_entry("other")]);
+        assert!(s.send_pending("c", now));
+        // The host executed the command: our id comes back in the doc.
+        s.apply_transcript(vec![user_entry("other"), user_entry("m1")]);
+        assert!(!s.send_pending("c", now));
+    }
+
+    #[test]
+    fn send_failure_cleanup_only_ends_its_own_overlay() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        s.begin_pending_send("c", "m1", now);
+        s.begin_pending_send("c", "m2", now); // quick resend superseded m1
+        s.end_pending_send("c", "m1"); // m1's failure cleanup arrives late
+        assert!(s.send_pending("c", now), "m2's overlay must survive");
+        s.end_pending_send("c", "m2");
+        assert!(!s.send_pending("c", now));
     }
 
     #[test]
@@ -5842,73 +4656,15 @@ mod tests {
         // Fresh working session shows.
         let fresh = session("c", SessionStatus::Working, 10, now);
         assert_eq!(effective_indicator(Some(&fresh), now), Indicator::Working);
-        // Expired active owners are unreachable, never successful completions.
+        // Stale working session is suppressed — crashed backend, not eternal spinner.
         let stale = session("c", SessionStatus::Working, 46, now);
-        assert_eq!(effective_indicator(Some(&stale), now), Indicator::Unreachable);
+        assert_eq!(effective_indicator(Some(&stale), now), Indicator::None);
         // Exactly at the boundary still shows (strictly-older-than semantics).
         let edge = session("c", SessionStatus::Working, 45, now);
         assert_eq!(effective_indicator(Some(&edge), now), Indicator::Working);
         // Future timestamps (clock skew) count as fresh.
         let skewed = session("c", SessionStatus::Working, -30, now);
         assert_eq!(effective_indicator(Some(&skewed), now), Indicator::Working);
-    }
-
-    #[test]
-    fn scaffold_agent_indicator_matches_local_session_status() {
-        let now = Utc::now();
-        let fresh = agent_session("c", SessionStatus::Working, 10, now);
-        assert_eq!(
-            effective_agent_indicator(Some(&fresh), now),
-            Indicator::Working
-        );
-        let stale = agent_session("c", SessionStatus::Working, 46, now);
-        assert_eq!(
-            effective_agent_indicator(Some(&stale), now),
-            Indicator::Unreachable
-        );
-        let awaiting = agent_session("c", SessionStatus::AwaitingInput, 5, now);
-        assert_eq!(
-            effective_agent_indicator(Some(&awaiting), now),
-            Indicator::AwaitingInput
-        );
-    }
-
-    #[test]
-    fn owner_room_activity_outweighs_an_older_workspace_status() {
-        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
-        let mut state = AppState::default();
-        state.selected_chat = Some("c".into());
-        state.apply_sessions(vec![session("c", SessionStatus::Working, 60, now)]);
-        let mut owner = agent_session("c", SessionStatus::Working, 5, now);
-        owner.session_id = "c".into();
-        owner.owner_device_id = "dev".into();
-        owner.source = AgentSessionSource::Local;
-        let publish = |state: &mut AppState, owner: &AgentSessionRecord| {
-            state.apply_collaboration(serde_json::from_value(serde_json::json!({
-                "schemaVersion": 2, "sessions": [owner],
-            })).unwrap());
-        };
-        publish(&mut state, &owner);
-        assert_eq!(state.indicator_for("c", now), Indicator::Working);
-        assert_eq!(state.display_status_for(&chat("c", 0, None), now), ChatIndicator::Working);
-
-        // A newer terminal outcome wins over an older active room snapshot.
-        state.apply_sessions(vec![session("c", SessionStatus::Idle, 1, now)]);
-        assert_eq!(state.indicator_for("c", now), Indicator::None);
-        owner.status = Some(SessionStatus::AwaitingInput);
-        owner.updated_at = Some(now.timestamp_millis());
-        publish(&mut state, &owner);
-        assert_eq!(state.indicator_for("c", now), Indicator::AwaitingInput);
-
-        // Another device's publication cannot refresh this owner's clock.
-        owner.owner_device_id = "other".into();
-        publish(&mut state, &owner);
-        assert_eq!(state.indicator_for("c", now), Indicator::None);
-        owner.owner_device_id = "dev".into();
-        owner.updated_at = Some((now - TimeDelta::seconds(46)).timestamp_millis());
-        state.apply_sessions(vec![session("c", SessionStatus::Working, 60, now)]);
-        publish(&mut state, &owner);
-        assert_eq!(state.indicator_for("c", now), Indicator::Unreachable);
     }
 
     #[test]
@@ -5928,13 +4684,13 @@ mod tests {
         let awaiting_stale = session("c", SessionStatus::AwaitingInput, 300, now);
         assert_eq!(
             effective_indicator(Some(&awaiting_stale), now),
-            Indicator::Unreachable
+            Indicator::None
         );
     }
 
     #[test]
     fn display_status_derivation() {
-        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let now = Utc::now();
         let mut c = chat("c", 0, Some(10));
         // Live states win regardless of seen.
         let working = session("c", SessionStatus::Working, 5, now);
@@ -5955,18 +4711,15 @@ mod tests {
             display_status(&c, Some(&idle), now),
             ChatIndicator::Completed
         );
-        // Stale activity is unreachable, regardless of unseen/seen state.
+        // Stale working session falls back to the seen check.
         let stale = session("c", SessionStatus::Working, 300, now);
         assert_eq!(
             display_status(&c, Some(&stale), now),
-            ChatIndicator::Unreachable
+            ChatIndicator::Completed
         );
         // Seen after the last message = Idle.
         c.last_seen_at = c.last_message_at.map(|t| t + TimeDelta::minutes(1));
         assert_eq!(display_status(&c, Some(&idle), now), ChatIndicator::Idle);
-        assert_eq!(display_status(&c, Some(&stale), now), ChatIndicator::Unreachable);
-        let stale_input = session("c", SessionStatus::AwaitingInput, 300, now);
-        assert_eq!(display_status(&c, Some(&stale_input), now), ChatIndicator::Unreachable);
         // Errored + unseen = Errored; seen clears it to Idle.
         let errored = session("c", SessionStatus::Errored, 600, now);
         assert_eq!(display_status(&c, Some(&errored), now), ChatIndicator::Idle);
@@ -6025,7 +4778,6 @@ mod tests {
         state.apply_spaces(vec![
             space("s2", "dev", "/b", 2),
             space("s1", "dev", "/a", 1),
-            space("comet-scaffold-space-dev", "dev", "/legacy-scaffold", 3),
         ]);
         let ids: Vec<&str> = state.spaces.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["s1", "s2"]);
@@ -6038,6 +4790,236 @@ mod tests {
         // No spaces at all: selection clears.
         state.apply_spaces(vec![]);
         assert_eq!(state.selected_space, None);
+    }
+
+    #[test]
+    fn file_link_roots_order_chat_parent_then_projects() {
+        use crate::workspace_links::FileLinkRoot;
+        let mut state = AppState::new();
+        state.local_device_id = Some("dev".into());
+        let mut parent = chat("parent", 0, None);
+        parent.cwd = Some("/repo".into());
+        let mut fork = chat("fork", 1, None);
+        fork.cwd = Some("/fork/fork".into());
+        fork.parent_chat_id = Some("parent".into());
+        // A chat hosted on another device still contributes its checkout —
+        // reads go through it — but is flagged remote so system-level file
+        // actions stay hidden.
+        let mut remote = chat("remote", 2, None);
+        remote.device_id = "other".into();
+        remote.cwd = Some("/far/worktree".into());
+        remote.parent_chat_id = Some("fork".into());
+        state.apply_chats(vec![parent, fork, remote]);
+        state.apply_spaces(vec![
+            space("local", "dev", "/projects/zeron", 0),
+            space("remote", "other", "/remote/only", 1),
+        ]);
+        let root = |chat: Option<&str>, root: &str, local: bool| FileLinkRoot {
+            chat: chat.map(str::to_owned),
+            root: root.into(),
+            local,
+        };
+
+        let roots = state.file_link_roots("fork");
+        assert_eq!(
+            roots,
+            vec![
+                root(Some("fork"), "/fork/fork", true),
+                root(Some("parent"), "/repo", true),
+                root(None, "/projects/zeron", true),
+            ],
+            "own checkout, parent, then this device's projects"
+        );
+        assert!(state.chat_is_local("fork"));
+        assert!(!state.chat_is_local("remote"));
+        // A remote chat's paths name its own device: this device's projects
+        // and a parent hosted here never own them.
+        assert_eq!(
+            state.file_link_roots("remote"),
+            vec![
+                root(Some("remote"), "/far/worktree", false),
+                root(None, "/remote/only", false),
+            ]
+        );
+
+        // An absolute path outside every known root is still a file: it
+        // resolves as an outside link owned by the linking chat.
+        let root_refs: Vec<&str> = roots.iter().map(|root| root.root.as_str()).collect();
+        assert!(matches!(
+            crate::workspace_links::first_root_owning("/elsewhere/x.md", root_refs.clone()),
+            Some(crate::workspace_links::FileLinkResolution::Outside(link))
+                if link.path == "/elsewhere/x.md" && link.outside
+        ));
+        // A path under the parent's checkout resolves to that root.
+        assert_eq!(
+            match crate::workspace_links::first_root_owning("/repo/src/lib.rs", root_refs) {
+                Some(crate::workspace_links::FileLinkResolution::Owned { root, link }) =>
+                    Some((roots[root].chat.clone(), link.path)),
+                _ => None,
+            },
+            Some((Some("parent".into()), "src/lib.rs".into()))
+        );
+    }
+
+    #[test]
+    fn canvas_terminal_uses_the_selected_project_folder() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        state.apply_spaces(vec![
+            space("s1", "local", "/Users/me/proj", 1),
+            space("remote-space", "remote", "/remote/proj", 2),
+        ]);
+        state.selected_chat = None;
+        state.no_project = false;
+        state.selected_space = Some("s1".into());
+
+        assert_eq!(state.panel_session_key(), "space-canvas:s1");
+        assert_eq!(state.terminal_open_cwd().as_deref(), Some("/Users/me/proj"));
+        assert_eq!(
+            state.terminal_open_cwd_for("space-canvas:s1").as_deref(),
+            Some("/Users/me/proj")
+        );
+        // Project id is known, row not in the list yet — do not send `~`.
+        state.spaces.clear();
+        assert_eq!(state.terminal_open_cwd(), None);
+        state.apply_spaces(vec![
+            space("s1", "local", "/Users/me/proj", 1),
+            space("remote-space", "remote", "/remote/proj", 2),
+        ]);
+        assert_eq!(state.terminal_open_cwd().as_deref(), Some("/Users/me/proj"));
+        assert_eq!(
+            state.terminal_target_device(&state.panel_session_key()),
+            None,
+            "local project stays on this engine"
+        );
+
+        state.selected_space = Some("remote-space".into());
+        assert_eq!(
+            state
+                .terminal_target_device("space-canvas:remote-space")
+                .as_deref(),
+            Some("remote")
+        );
+
+        state.no_project = true;
+        state.selected_space = None;
+        state.selected_device = Some("remote".into());
+        assert_eq!(state.panel_session_key(), "space-canvas:");
+        assert_eq!(state.terminal_open_cwd().as_deref(), Some("~"));
+        assert_eq!(
+            state.terminal_target_device("space-canvas:").as_deref(),
+            Some("remote")
+        );
+
+        let mut row = chat("chat-1", 0, None);
+        row.device_id = "remote".into();
+        state.chats = vec![row];
+        state.selected_chat = Some("chat-1".into());
+        assert_eq!(state.panel_session_key(), "chat-1");
+        assert_eq!(state.terminal_open_cwd(), None);
+        assert_eq!(
+            state.terminal_target_device("chat-1").as_deref(),
+            Some("remote")
+        );
+    }
+
+    #[test]
+    fn projectless_preference_survives_restart_and_space_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let defaults = crate::settings::composer::ComposerDefaults {
+            device: Some("remote".into()),
+            // Older versions kept a stale project alongside the opt-out.
+            project: Some("old-project".into()),
+            no_project: true,
+            ..Default::default()
+        };
+        defaults.save(dir.path()).unwrap();
+        let mut state = AppState::new();
+        state.restore_composer_target(&crate::settings::composer::ComposerDefaults::load(
+            dir.path(),
+        ));
+        for spaces in [
+            vec![],
+            vec![space("s1", "remote", "/a", 1)],
+            vec![],
+            vec![space("s2", "other", "/b", 2)],
+        ] {
+            state.apply_spaces(spaces);
+            assert!(state.no_project);
+            assert!(state.selected_space.is_none());
+            assert!(state.selected_space_row().is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+        }
+    }
+
+    #[gpui::test]
+    fn projectless_selection_clears_project_and_survives_device_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.apply_spaces(vec![
+                space("s1", "dev", "/a", 1),
+                space("s2", "remote", "/b", 2),
+            ]);
+            state.select_space(Some("s1".into()), cx);
+            state.select_space(None, cx);
+            assert!(state.selected_space.is_none());
+            state.select_device("remote".into(), cx);
+            assert!(state.no_project);
+            assert!(state.selected_space.is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+            state.select_space(Some("s2".into()), cx);
+            assert!(!state.no_project);
+            assert_eq!(state.selected_space_row().unwrap().id, "s2");
+            state.selected_device = Some("dev".into());
+            state.select_space(None, cx);
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+            state.select_space(Some("s2".into()), cx);
+            state.select_device("empty-device".into(), cx);
+            assert!(state.selected_space.is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("empty-device"));
+        });
+    }
+
+    #[gpui::test]
+    fn canvas_reopens_on_its_own_target_after_visiting_chats(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.apply_spaces(vec![
+                space("s1", "dev", "/a", 1),
+                space("s2", "remote", "/b", 2),
+            ]);
+            let mut remote = chat("remote-chat", 1, None);
+            remote.device_id = "remote".into();
+            remote.space_id = Some("s2".into());
+            let mut loose = chat("loose-chat", 2, None);
+            loose.device_id = "remote".into();
+            state.apply_chats(vec![remote, loose.clone()]);
+            state.select_space(Some("s1".into()), cx);
+
+            // Chats imply their own target while open…
+            state.select_chat(Some("remote-chat".into()), cx);
+            assert_eq!(state.selected_space.as_deref(), Some("s2"));
+            state.select_chat(Some("loose-chat".into()), cx);
+            assert!(state.no_project);
+            // …and the canvas returns to where it was left.
+            state.select_chat(None, cx);
+            assert!(!state.no_project);
+            assert_eq!(state.selected_space.as_deref(), Some("s1"));
+            assert_eq!(state.effective_device_id().as_deref(), Some("dev"));
+
+            // A projectless canvas survives a project chat, and a chat deleted
+            // elsewhere lands back on it too.
+            state.select_space(None, cx);
+            state.select_device("remote".into(), cx);
+            state.select_chat(Some("remote-chat".into()), cx);
+            state.apply_chats(vec![loose]);
+            assert!(state.selected_chat.is_none());
+            assert!(state.no_project);
+            assert!(state.selected_space.is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+        });
     }
 
     #[test]
@@ -6054,59 +5036,82 @@ mod tests {
         archived.space_id = Some("s1".into());
         archived.archived = true;
         let dangling = chat("dangling", 3, None); // no space id
-        let mut legacy_scaffold = chat("legacy-scaffold", 6, Some(60));
-        legacy_scaffold.space_id = Some("comet-scaffold-space-dev".into());
-        state.apply_chats(vec![
-            in_space_new,
-            in_space_old,
-            other,
-            archived,
-            dangling,
-            legacy_scaffold,
-        ]);
+        state.apply_chats(vec![in_space_new, in_space_old, other, archived, dangling]);
         let ids: Vec<&str> = state
             .chats_in_space("s1")
             .iter()
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["old", "new"]);
-        assert!(state.chats.iter().any(|chat| chat.id == "legacy-scaffold"));
-        // Missing space context must not hide a member session. Status never
-        // reorders the list: activity/creation recency determines position.
+        // The overview shows every live-space chat (idle included) PLUS
+        // project-less chats (first-class since the project selectors);
+        // chats of unknown spaces stay hidden. Completed ("old") outranks
+        // idle ("new"/"dangling").
         let now = Utc::now();
         let overview: Vec<&str> = state
             .overview_chats(now)
             .iter()
             .map(|(_, c)| c.id.as_str())
             .collect();
-        assert_eq!(
-            overview,
-            ["legacy-scaffold", "old", "new", "dangling", "other"]
-        );
+        assert_eq!(overview, ["old", "new", "dangling"]);
     }
 
     #[test]
-    fn selected_logical_source_includes_chats_from_every_member_space() {
+    fn project_filter_and_projects_span_a_repository_across_devices() {
         let mut state = AppState::new();
-        state.apply_spaces(vec![
-            space("main", "dev", "/repo", 1),
-            space("worktree", "dev", "/worktree", 2),
+        state.local_device_id = Some("laptop".into());
+        let mut remote = space("remote", "metal", "/w/anara", 1);
+        remote.repository_id = Some("commit:abc".into());
+        let mut local = space("local", "laptop", "/h/anara", 2);
+        local.repository_id = Some("commit:abc".into());
+        let other = space("other", "laptop", "/h/notes", 3);
+        state.apply_spaces(vec![remote, local, other]);
+        let in_space = |id: &str, space: &str| {
+            let mut chat = chat(id, 0, None);
+            chat.space_id = Some(space.into());
+            chat
+        };
+        state.apply_chats(vec![
+            in_space("on-remote", "remote"),
+            in_space("on-local", "local"),
+            in_space("on-other", "other"),
         ]);
-        let mut main_chat = chat("main-chat", 1, None);
-        main_chat.space_id = Some("main".into());
-        let mut worktree_chat = chat("worktree-chat", 2, None);
-        worktree_chat.space_id = Some("worktree".into());
-        state.apply_chats(vec![main_chat, worktree_chat]);
-        state.selected_space = Some("main".into());
-        state.selected_space_members = vec!["main".into(), "worktree".into()];
 
-        let ids: Vec<&str> = state
-            .chats_in_selected_source()
+        // One project per repository, its checkouts local-first.
+        let projects: Vec<Vec<&str>> = state
+            .projects()
             .iter()
-            .map(|chat| chat.id.as_str())
+            .map(|members| members.iter().map(|s| s.id.as_str()).collect())
             .collect();
+        assert_eq!(projects, vec![vec!["local", "remote"], vec!["other"]]);
 
-        assert_eq!(ids, ["main-chat", "worktree-chat"]);
+        // Filtering on either checkout shows the whole repository's chats.
+        for filter in ["remote", "local"] {
+            let mut ids: Vec<&str> = state
+                .sidebar_chats(Utc::now(), Some(filter))
+                .iter()
+                .map(|(_, c)| c.id.as_str())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["on-local", "on-remote"], "filter {filter}");
+        }
+        let other_only: Vec<&str> = state
+            .sidebar_chats(Utc::now(), Some("other"))
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(other_only, ["on-other"]);
+
+        // A two-device project tags both hosts; a one-device one keeps the
+        // plain host tag.
+        let anara = state.projects().into_iter().next().unwrap();
+        let (tag, _) = state.project_device_tag(&anara, Utc::now());
+        assert!(tag.starts_with("@ ") && tag.contains(" · "), "{tag}");
+        let notes = state.projects().into_iter().nth(1).unwrap();
+        assert_eq!(
+            state.project_device_tag(&notes, Utc::now()).0,
+            state.space_device_tag(notes[0], Utc::now()).0
+        );
     }
 
     #[test]
@@ -6123,131 +5128,311 @@ mod tests {
         assert_eq!(state.selected_chat.as_deref(), Some("b"));
     }
 
-    #[test]
-    fn local_candidates_disappear_once_their_comet_chat_exists() {
-        let mut state = AppState::new();
-        state.apply_chats(vec![chat("local-chat-existing", 0, None)]);
-        state.apply_local_session_candidates(vec![
-            local_candidate("existing", "local-chat-existing", false, true),
-            local_candidate("fresh", "local-chat-fresh", true, false),
-        ]);
-        assert_eq!(
+    fn clock_epoch() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
+            .unwrap()
+            .to_utc()
+    }
+
+    /// Builds a clock-watching state at the pinned `now` and counts its
+    /// notifications.
+    fn clock_state(
+        cx: &mut gpui::TestAppContext,
+        setup: impl FnOnce(&mut AppState),
+    ) -> (
+        Entity<AppState>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        gpui::Subscription,
+    ) {
+        let state = cx.new(|cx| {
+            let mut state = AppState::new();
+            setup(&mut state);
+            state.watch_clock_transitions(cx);
             state
-                .local_session_candidates
-                .iter()
-                .map(|candidate| candidate.id.as_str())
-                .collect::<Vec<_>>(),
-            ["fresh"]
-        );
+        });
+        let notifies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = notifies.clone();
+        let subscription =
+            cx.update(|cx| cx.observe(&state, move |_, _| counter.set(counter.get() + 1)));
+        (state, notifies, subscription)
+    }
 
-        state.apply_chats(vec![
-            chat("local-chat-existing", 0, None),
-            chat("local-chat-fresh", 1, None),
-        ]);
-        assert!(state.local_session_candidates.is_empty());
+    /// Steps the simulated executor and the pinned wall clock together.
+    fn advance_to(
+        cx: &mut gpui::TestAppContext,
+        clock: &TestClock,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) {
+        clock.set(to);
+        cx.executor().advance_clock((to - from).to_std().unwrap());
+    }
+
+    /// Proves the state notifies exactly once, exactly at `deadline`.
+    fn assert_state_notifies_at(
+        cx: &mut gpui::TestAppContext,
+        now: DateTime<Utc>,
+        deadline: DateTime<Utc>,
+        setup: impl FnOnce(&mut AppState),
+    ) {
+        let clock = TestClock::start(now);
+        let (_state, notifies, _subscription) = clock_state(cx, setup);
+        let before = deadline - TimeDelta::milliseconds(1);
+        advance_to(cx, &clock, now, before);
+        assert_eq!(notifies.get(), 0, "no notify before the deadline");
+        advance_to(cx, &clock, before, deadline);
+        assert_eq!(notifies.get(), 1, "one notify at the deadline");
+        // Nothing else is due: the next minute passes silently.
+        advance_to(cx, &clock, deadline, deadline + TimeDelta::minutes(1));
+        assert_eq!(notifies.get(), 1);
+    }
+
+    #[gpui::test]
+    fn stale_session_notifies_state_at_its_cutoff(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let row = session("row", SessionStatus::Working, 10, now);
+        let cutoff = row.updated_at + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        let mut probe = AppState::new();
+        probe.sessions = vec![row.clone()];
+        assert_eq!(
+            probe.indicator_for("row", cutoff - TimeDelta::milliseconds(1)),
+            Indicator::Working
+        );
+        assert_eq!(probe.indicator_for("row", cutoff), Indicator::None);
+        assert_state_notifies_at(cx, now, cutoff, |state| state.sessions = vec![row]);
+    }
+
+    #[gpui::test]
+    fn remote_device_notifies_state_when_it_goes_offline(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let seen = now - TimeDelta::seconds(40);
+        let mut remote = device("remote", "Remote");
+        remote.last_seen_at = Some(seen);
+        // The local device is always online; its stale heartbeat is no deadline.
+        let mut local = device("local", "Local");
+        local.last_seen_at = Some(now - TimeDelta::seconds(65));
+        let offline =
+            seen + TimeDelta::seconds(crate::settings::devices::DEVICE_ONLINE_WINDOW_SECS + 1);
+        let mut probe = AppState::new();
+        probe.devices = vec![remote.clone()];
+        assert!(probe.device_online("remote", offline - TimeDelta::milliseconds(1)));
+        assert!(!probe.device_online("remote", offline));
+        assert_state_notifies_at(cx, now, offline, |state| {
+            state.local_device_id = Some("local".into());
+            state.devices = vec![local, remote];
+        });
+    }
+
+    #[gpui::test]
+    fn pending_send_notifies_state_when_its_grace_expires(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let started = now - TimeDelta::seconds(100);
+        let expiry = started + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        let mut probe = AppState::new();
+        probe.begin_pending_send("chat", "message", started);
+        assert!(!probe.send_undelivered("chat", expiry - TimeDelta::milliseconds(1)));
+        assert!(probe.send_undelivered("chat", expiry));
+        assert_state_notifies_at(cx, now, expiry, |state| {
+            state.begin_pending_send("chat", "message", started)
+        });
+    }
+
+    #[gpui::test]
+    fn settled_state_arms_no_clock(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let clock = TestClock::start(now);
+        let (state, notifies, _subscription) = clock_state(cx, |state| {
+            state.sessions = vec![
+                session("failed", SessionStatus::Errored, 0, now),
+                session("idle", SessionStatus::Idle, 0, now),
+            ];
+        });
+        assert!(state.read_with(cx, |state, _| state.clock.task.is_none()));
+        advance_to(cx, &clock, now, now + TimeDelta::hours(1));
+        assert_eq!(notifies.get(), 0);
+    }
+
+    #[gpui::test]
+    fn silent_heartbeat_defers_the_stale_notify(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let clock = TestClock::start(now);
+        let row = session("row", SessionStatus::Working, 10, now);
+        let first_cutoff = row.updated_at + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        let (state, notifies, _subscription) = clock_state(cx, |state| {
+            state.apply_sessions_at(vec![row], now);
+        });
+        // A heartbeat only refreshes the lease: the reducer stores it without
+        // notifying, so the armed timer is now early.
+        let heartbeat = now + TimeDelta::seconds(20);
+        advance_to(cx, &clock, now, heartbeat);
+        state.update(cx, |state, _| {
+            let changed = state.apply_sessions_at(
+                vec![session("row", SessionStatus::Working, 0, heartbeat)],
+                heartbeat,
+            );
+            assert!(!changed);
+        });
+        advance_to(cx, &clock, heartbeat, first_cutoff);
+        assert_eq!(notifies.get(), 0, "an obsolete deadline re-arms silently");
+        let cutoff = heartbeat + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        advance_to(
+            cx,
+            &clock,
+            first_cutoff,
+            cutoff - TimeDelta::milliseconds(1),
+        );
+        assert_eq!(notifies.get(), 0);
+        advance_to(cx, &clock, cutoff - TimeDelta::milliseconds(1), cutoff);
+        assert_eq!(notifies.get(), 1);
+    }
+
+    #[gpui::test]
+    fn revival_after_a_clock_transition_notifies_and_rearms(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let clock = TestClock::start(now);
+        let row = session("row", SessionStatus::Working, 0, now);
+        let stale_at = now + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        let (state, notifies, _subscription) = clock_state(cx, |state| {
+            state.apply_sessions_at(vec![row], now);
+        });
+        advance_to(cx, &clock, now, stale_at);
+        assert_eq!(notifies.get(), 1, "went stale by clock alone");
+        // A heartbeat revives it: that is a visible change again, and the
+        // revived lease arms its own cutoff.
+        let revived = stale_at + TimeDelta::seconds(1);
+        advance_to(cx, &clock, stale_at, revived);
+        state.update(cx, |state, cx| {
+            let changed = state.apply_sessions_at(
+                vec![session("row", SessionStatus::Working, 0, revived)],
+                revived,
+            );
+            assert!(changed, "revival is a change");
+            cx.notify();
+        });
+        assert_eq!(notifies.get(), 2);
+        let next_cutoff = revived + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        advance_to(cx, &clock, revived, next_cutoff);
+        assert_eq!(notifies.get(), 3, "the revived lease's cutoff fires");
     }
 
     #[test]
-    fn pending_chat_selection_survives_until_the_chats_watch_catches_up() {
+    fn identical_chats_frames_report_no_change() {
         let mut state = AppState::new();
-        state.selected_chat = Some("local-chat-fresh".into());
-        state.mark_chat_pending("local-chat-fresh");
-
-        state.apply_chats(Vec::new());
-        assert_eq!(state.selected_chat.as_deref(), Some("local-chat-fresh"));
-
-        state.apply_chats(vec![chat("local-chat-fresh", 0, None)]);
-        assert_eq!(state.selected_chat.as_deref(), Some("local-chat-fresh"));
-        assert!(state.pending_local_chat_ids.is_empty());
+        // The first frame flips `chats_synced` even when empty.
+        assert!(state.apply_chats(vec![]));
+        assert!(!state.apply_chats(vec![]));
+        assert!(state.apply_chats(vec![chat("b", 1, None), chat("a", 0, None)]));
+        let revision = state.link_roots_revision;
+        // Same rows in a different wire order sort to the same list.
+        assert!(!state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]));
+        assert_eq!(state.link_roots_revision, revision);
+        let mut renamed = chat("a", 0, None);
+        renamed.title = Some("Renamed".into());
+        assert!(state.apply_chats(vec![renamed.clone(), chat("b", 1, None)]));
+        assert_ne!(state.link_roots_revision, revision);
+        // A selection pointing at no row still heals on an unchanged frame.
+        state.selected_chat = Some("gone".into());
+        assert!(state.apply_chats(vec![renamed, chat("b", 1, None)]));
+        assert_eq!(state.selected_chat, None);
     }
 
     #[test]
-    fn pending_chat_renders_while_worktree_setup_waits_for_the_workspace_watch() {
+    fn identical_spaces_frames_report_no_change() {
         let mut state = AppState::new();
-        state.apply_spaces(vec![space("space", "dev", "/repo", 0)]);
-        let mut pending = chat("pending", 2, None);
-        pending.space_id = Some("space".into());
-        pending.cwd = Some("/repo".into());
-        state.stage_pending_chat(pending);
-
-        let now = Utc::now();
-        assert_eq!(state.overview_chats(now)[0].0, ChatIndicator::Working);
-        assert_eq!(state.chats_in_space("space")[0].id, "pending");
-
-        let mut unrelated = chat("unrelated", 1, None);
-        unrelated.space_id = Some("space".into());
-        state.apply_chats(vec![unrelated.clone()]);
-        assert!(state.chats.iter().any(|chat| chat.id == "pending"));
-
-        let mut materialized = chat("pending", 2, None);
-        materialized.space_id = Some("space".into());
-        materialized.cwd = Some("/worktrees/repo/fresh".into());
-        materialized.branch = Some("comet/fresh".into());
-        state.apply_chats(vec![unrelated, materialized]);
-
-        let row = state
-            .chats
-            .iter()
-            .find(|chat| chat.id == "pending")
-            .unwrap();
-        assert_eq!(row.cwd.as_deref(), Some("/worktrees/repo/fresh"));
-        assert_eq!(row.branch.as_deref(), Some("comet/fresh"));
-        assert!(!state.pending_local_chat_ids.contains("pending"));
-        assert_eq!(state.display_status_for(row, now), ChatIndicator::Idle);
+        assert!(state.apply_spaces(vec![]));
+        assert!(!state.apply_spaces(vec![]));
+        let frame = vec![space("s2", "dev", "/b", 2), space("s1", "dev", "/a", 1)];
+        assert!(state.apply_spaces(frame.clone()));
+        assert_eq!(state.selected_space.as_deref(), Some("s1"));
+        assert!(!state.apply_spaces(frame.clone()));
+        // A vanished selection still heals (and reports it) on an unchanged list.
+        state.selected_space = Some("gone".into());
+        assert!(state.apply_spaces(frame));
+        assert_eq!(state.selected_space.as_deref(), Some("s1"));
     }
 
     #[test]
-    fn explicit_startup_phase_survives_durable_chat_materialization() {
+    fn identical_connectivity_frames_report_no_change() {
+        use zeron_proto::{Connectivity, ConnectivityState};
         let mut state = AppState::new();
-        state.apply_spaces(vec![space("space", "dev", "/repo", 0)]);
-        let mut pending = chat("pending", 2, None);
-        pending.space_id = Some("space".into());
-        state.stage_pending_chat(pending);
-        state.set_chat_startup_phase("pending", ChatStartupPhase::PreparingCheckout);
+        // The first frame ends the bootstrap gap even when it equals the default.
+        assert!(state.apply_connectivity(Connectivity::default()));
+        assert!(state.connectivity_observed);
+        assert!(!state.apply_connectivity(Connectivity::default()));
+        let reconnecting = Connectivity {
+            state: ConnectivityState::Reconnecting,
+            retry_at_ms: 5_000,
+            ..Default::default()
+        };
+        assert!(state.apply_connectivity(reconnecting.clone()));
+        assert!(!state.apply_connectivity(reconnecting.clone()));
+        assert!(state.apply_connectivity(Connectivity {
+            retry_at_ms: 9_000,
+            ..reconnecting
+        }));
+        // Re-attach reopens the gap: the next frame counts again.
+        state.connectivity_observed = false;
+        assert!(state.apply_connectivity(state.connectivity.clone()));
+    }
 
-        let mut materialized = chat("pending", 2, None);
-        materialized.space_id = Some("space".into());
-        materialized.cwd = Some("/worktrees/repo/fresh".into());
-        state.apply_chats(vec![materialized]);
+    #[test]
+    fn identical_transfer_auth_and_harness_frames_report_no_change() {
+        use zeron_proto::{HarnessUpdatePhase, HarnessUpdateStatus, TransferProgress};
+        let mut state = AppState::new();
+        assert!(!state.apply_transfers(vec![]));
+        let progress = |done| TransferProgress {
+            upload_id: "u1".into(),
+            file_name: "a.png".into(),
+            done,
+            total: 100,
+        };
+        assert!(state.apply_transfers(vec![progress(10)]));
+        assert!(!state.apply_transfers(vec![progress(10)]));
+        assert!(state.apply_transfers(vec![progress(20)]));
+        assert_eq!(state.transfer_percent("u1"), Some(20));
+        assert!(state.apply_transfers(vec![]));
 
-        let row = state
-            .chats
-            .iter()
-            .find(|chat| chat.id == "pending")
-            .unwrap();
-        assert!(state.pending_local_chat_ids.is_empty());
-        assert_eq!(
-            state.chat_startup_phase("pending"),
-            Some(ChatStartupPhase::PreparingCheckout)
-        );
-        assert_eq!(
-            state.display_status_for(row, Utc::now()),
-            ChatIndicator::Working
-        );
+        assert!(state.apply_auth(AuthState::SignedOut));
+        assert!(!state.apply_auth_value(serde_json::json!({ "state": "signedOut" })));
+        let user = UserProfile {
+            id: "u".into(),
+            email: "w@example.com".into(),
+            name: None,
+        };
+        assert!(state.apply_auth(AuthState::NeedsOrganization { user: user.clone() }));
+        assert!(!state.apply_auth(AuthState::NeedsOrganization { user }));
+        assert!(!state.apply_auth_value(serde_json::json!({ "bogus": true })));
 
-        state.clear_chat_startup_phase("pending");
-        let row = state
-            .chats
-            .iter()
-            .find(|chat| chat.id == "pending")
-            .unwrap();
-        assert_eq!(
-            state.display_status_for(row, Utc::now()),
-            ChatIndicator::Idle
-        );
+        let status = |phase| HarnessUpdateStatus {
+            harness: HarnessId::Codex,
+            installed_version: Some("1.0".into()),
+            latest_version: Some("2.0".into()),
+            channel: None,
+            source: Default::default(),
+            policy: Default::default(),
+            phase,
+            progress: None,
+            checked_at: None,
+            error: None,
+            can_apply: true,
+            manual_command: None,
+        };
+        assert!(!state.apply_harness_updates(vec![]));
+        assert!(state.apply_harness_updates(vec![status(HarnessUpdatePhase::Available)]));
+        assert!(!state.apply_harness_updates(vec![status(HarnessUpdatePhase::Available)]));
+        assert!(state.apply_harness_updates(vec![status(HarnessUpdatePhase::Current)]));
     }
 
     #[test]
     fn apply_chat_config_stamps_the_row() {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
-        let config = comet_proto::ChatConfig {
+        let config = zeron_proto::ChatConfig {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
-            reasoning: Some(comet_proto::ReasoningLevel::XHigh),
-            agent_account_id: Some("opaque-account-id".into()),
+            reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
-            sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -6266,13 +5451,12 @@ mod tests {
         // Unknown chat: no-op, no panic.
         state.apply_chat_config(
             "missing",
-            comet_proto::ChatConfig {
+            zeron_proto::ChatConfig {
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,
-                agent_account_id: None,
                 model_options: serde_json::Map::new(),
-                sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             },
         );
     }
@@ -6288,28 +5472,148 @@ mod tests {
     }
 
     #[test]
-    fn settled_chats_keep_detached_members_in_recency_order() {
+    fn visible_chats_hide_spawned_children() {
+        let now = Utc::now();
         let mut state = AppState::new();
-        state.apply_spaces(vec![space("space", "dev", "/workspace", 0)]);
-        let mut older = chat("older", 0, Some(2));
-        older.archived = true;
-        older.space_id = Some("space".into());
-        let mut newer = chat("newer", 0, Some(5));
-        newer.archived = true;
-        newer.space_id = Some("space".into());
-        let mut dangling = chat("dangling", 0, Some(9));
-        dangling.archived = true;
-        dangling.space_id = Some("missing".into());
-        let mut active = chat("active", 0, Some(10));
-        active.space_id = Some("space".into());
-        state.apply_chats(vec![older, newer, dangling, active]);
-
-        let settled: Vec<&str> = state
-            .settled_chats()
+        let mut child = chat("child", 0, Some(1));
+        child.parent_chat_id = Some("parent".into());
+        state.apply_chats(vec![child, chat("parent", 1, Some(2))]);
+        let visible: Vec<&str> = state.visible_chats().map(|c| c.id.as_str()).collect();
+        assert_eq!(visible, ["parent"]);
+        // The sidebar list and jump slots follow the same rule.
+        let rows: Vec<&str> = state
+            .sidebar_chats(now, None)
             .into_iter()
-            .map(|chat| chat.id.as_str())
+            .map(|(_, c)| c.id.as_str())
             .collect();
-        assert_eq!(settled, ["dangling", "newer", "older"]);
+        assert_eq!(rows, ["parent"]);
+        // The child row itself is still addressable (deep links, tabs).
+        assert!(state.chats.iter().any(|c| c.id == "child"));
+    }
+
+    #[test]
+    fn side_chats_remain_addressable_but_do_not_appear_in_sidebar() {
+        let mut state = AppState::new();
+        let main = chat("main", 0, None);
+        let mut side = chat("side", 1, Some(2));
+        side.parent_chat_id = Some(main.id.clone());
+        state.apply_chats(vec![main, side]);
+        assert_eq!(
+            state
+                .visible_chats()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["main"]
+        );
+        state.selected_chat = Some("side".into());
+        assert_eq!(
+            state.selected_chat_row().unwrap().parent_chat_id.as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn remote_fork_waits_for_registry_then_observes_deletion() {
+        let mut state = AppState::new();
+        let mut side = chat("side", 1, None);
+        side.parent_chat_id = Some("main".into());
+        state.selected_chat = Some(side.id.clone());
+        state.pending_side_chat = Some(side.clone());
+        state.apply_chats(vec![]);
+        assert_eq!(state.selected_chat.as_deref(), Some("side"));
+        state.apply_chats(vec![side]);
+        assert!(state.pending_side_chat.is_none());
+        state.apply_chats(vec![]);
+        assert_eq!(state.selected_chat, None);
+    }
+
+    #[test]
+    fn jump_slots_count_the_rows_the_sidebar_draws() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        let mut in_space = chat("a", 0, Some(3));
+        in_space.space_id = Some("s1".into());
+        let mut other_space = chat("b", 1, Some(2));
+        other_space.space_id = Some("s2".into());
+        let mut archived = chat("gone", 2, Some(1));
+        archived.space_id = Some("s1".into());
+        archived.archived = true;
+        state.apply_spaces(vec![
+            space("s1", "d1", "/tmp/s1", 0),
+            space("s2", "d1", "/tmp/s2", 1),
+        ]);
+        state.apply_chats(vec![in_space, other_space, archived]);
+
+        // The archived row is not in the active list, so no slot reaches it.
+        let order: Vec<&str> = state
+            .sidebar_chats(now, None)
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(order.len(), 2);
+        assert!(!order.contains(&"gone"));
+
+        // A project filter renumbers: the visible rows only.
+        let filtered: Vec<&str> = state
+            .sidebar_chats(now, Some("s2"))
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(filtered, ["b"]);
+    }
+
+    #[test]
+    fn archive_shortcut_only_targets_an_open_active_chat() {
+        let mut state = AppState::new();
+        let mut archived = chat("a", 0, None);
+        archived.archived = true;
+        state.apply_chats(vec![archived, chat("b", 1, None)]);
+        // No chat open: nothing to archive.
+        assert_eq!(state.archivable_selected_chat(), None);
+        // The open active chat is the target.
+        state.selected_chat = Some("b".into());
+        assert_eq!(state.archivable_selected_chat(), Some("b"));
+        // An already archived chat stays put — the shortcut never unarchives.
+        state.selected_chat = Some("a".into());
+        assert_eq!(state.archivable_selected_chat(), None);
+    }
+
+    #[test]
+    fn a_send_held_in_the_queue_drops_its_echo_and_pending_overlay() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        let echo = |id: &str| SessionMessageEntry {
+            id: id.into(),
+            role: zeron_doc::MessageRole::User,
+            parts: vec![],
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let row = |id: &str| zeron_doc::QueuedMessage {
+            id: id.into(),
+            text: "held".into(),
+            attachments: vec![],
+            hold_for_turn_end: false,
+            issued_by: "local".into(),
+            issued_at: 0,
+            edited_at: None,
+            delivery_gate: None,
+        };
+        state.push_echo("c1", echo("held"));
+        state.push_echo("c1", echo("sent"));
+        state.begin_pending_send("c1", "held", Utc::now());
+        state.apply_queue(vec![row("held")]);
+        let ids: Vec<_> = state
+            .pending_echoes()
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["sent"]);
+        assert!(!state.pending_sends.contains_key("c1"));
+        assert_eq!(state.queue.len(), 1);
     }
 
     #[test]
@@ -6318,13 +5622,13 @@ mod tests {
         state.selected_chat = Some("c1".into());
         let echo = SessionMessageEntry {
             id: "m1".into(),
-            role: comet_doc::MessageRole::User,
+            role: zeron_doc::MessageRole::User,
             parts: vec![],
             created_at: 0,
             device_id: "local".into(),
             status: None,
             continuation_of: None,
-            peer_message: None,
+            duration_ms: None,
         };
         state.push_echo("c1", echo.clone());
         // Duplicate pushes dedupe.
@@ -6360,223 +5664,25 @@ mod tests {
         assert!(state.pending_echoes().is_empty());
     }
 
-    fn transcript_entry(id: &str) -> SessionMessageEntry {
-        SessionMessageEntry {
-            id: id.into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: id.into(),
-            }],
-            created_at: 0,
-            device_id: "device".into(),
-            status: None,
-            continuation_of: None,
-            peer_message: None,
-        }
-    }
-
-    #[gpui::test]
-    async fn transcript_overflow_resubscribes_and_replaces_the_stale_prefix(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use futures::StreamExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct OverflowTranscript(AtomicUsize);
-        #[async_trait::async_trait]
-        impl RpcService for OverflowTranscript {
-            async fn handle(&self, method: &str, _: serde_json::Value) -> Result<RpcReply, RpcError> {
-                assert_eq!(method, methods::WATCH_DOC_MESSAGES);
-                let attempt = self.0.fetch_add(1, Ordering::SeqCst);
-                let reset = serde_json::to_value(TranscriptFrame::reset(
-                    &[transcript_entry(if attempt == 0 { "stale" } else { "healed" })],
-                    None,
-                )).unwrap();
-                if attempt == 0 {
-                    Ok(RpcReply::FallibleStream(futures::stream::iter([
-                        Ok(reset), Err(RpcError::StreamOverflow),
-                    ]).boxed()))
-                } else {
-                    Ok(RpcReply::Stream(futures::stream::once(async move { reset })
-                        .chain(futures::stream::pending()).boxed()))
-                }
-            }
-        }
-
-        cx.executor().allow_parking();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let _guard = runtime.enter();
-        let service = Arc::new(OverflowTranscript(AtomicUsize::new(0)));
-        let handle = EngineHandle {
-            inner: Arc::new(RemoteEngine {
-                client: memory_client(service.clone()),
-                url: "memory://transcript-overflow".into(),
-            }),
-        };
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            state.selected_chat = Some("chat".into());
-            state.transcript_task = Some(spawn_transcript_watch(cx, handle, "chat".into(), None));
-        });
-        cx.condition(&state, |state, _| {
-            state.transcript.len() == 1 && state.transcript[0].id == "healed"
-        }).await;
-        assert_eq!(service.0.load(Ordering::SeqCst), 2);
-    }
-
     #[test]
-    fn transcript_change_metadata_tracks_tail_updates_and_history_inserts() {
+    fn transcript_replay_barrier_requires_the_opening_reset() {
         let mut state = AppState::new();
-        state.selected_chat = Some("chat".into());
-        let initial = vec![transcript_entry("m0"), transcript_entry("m1")];
-        state
-            .apply_transcript_frame(TranscriptFrame::reset(&initial, None))
-            .unwrap();
-
-        let mut changed_tail = transcript_entry("m1");
-        changed_tail.parts = vec![MessagePart::Text {
-            id: "t0".into(),
-            text: "changed".into(),
-        }];
-        let next = vec![transcript_entry("m0"), changed_tail];
-        let frame = comet_doc::diff_transcript(&initial, &next, None);
-        state.apply_transcript_frame(frame).unwrap();
-        assert_eq!(
-            state.transcript_change().entries,
-            TranscriptEntriesChange::Splice {
-                old: 1..2,
-                new: 1..2,
-            }
-        );
-
-        state.apply_transcript_page(SessionEntryWindow {
-            entries: vec![transcript_entry("history")],
-            before: None,
-        });
-        assert_eq!(
-            state.transcript_change().entries,
-            TranscriptEntriesChange::Splice {
-                old: 0..0,
-                new: 0..1,
-            }
-        );
-    }
-
-    #[test]
-    fn older_pages_remain_a_prefix_of_live_tail_deltas() {
-        let mut state = AppState::new();
-        state.selected_chat = Some("chat".into());
-        state
-            .apply_transcript_frame(TranscriptFrame::reset(
-                &[transcript_entry("m2"), transcript_entry("m3")],
-                Some(2),
-            ))
-            .unwrap();
-        state.apply_transcript_page(SessionEntryWindow {
-            entries: vec![transcript_entry("m0"), transcript_entry("m1")],
-            before: None,
-        });
-
-        let frame = comet_doc::diff_transcript(
-            &[transcript_entry("m2"), transcript_entry("m3")],
-            &[transcript_entry("m3"), transcript_entry("m4")],
-            Some(3),
-        );
-        state.apply_transcript_frame(frame).unwrap();
-
-        assert_eq!(
-            state
-                .transcript
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            ["m0", "m1", "m2", "m3", "m4"]
-        );
-        assert_eq!(state.transcript_tail_start, 3);
-        assert_eq!(state.transcript_tail_before, Some(3));
-        assert_eq!(state.transcript_history_before, None);
-    }
-
-    #[test]
-    fn recent_transcript_window_moves_into_and_out_of_cache() {
-        let mut state = AppState::new();
-        state.selected_chat = Some("chat".into());
-        state.transcript = vec![transcript_entry("m1")];
-        state.transcript_tail_before = Some(4);
-        state.transcript_history_before = Some(2);
-        state.cache_selected_transcript();
-        assert!(state.transcript.is_empty());
-
-        state.restore_transcript(Some("chat"));
-        assert_eq!(state.transcript[0].id, "m1");
-        assert_eq!(state.transcript_tail_before, Some(4));
-        assert_eq!(state.transcript_history_before, Some(2));
-        assert!(state.transcript_restored_from_cache);
-    }
-
-    #[test]
-    fn cached_reset_preserves_rows_retired_from_the_live_tail() {
-        let mut state = AppState::new();
-        state.selected_chat = Some("chat".into());
-        state.transcript = vec![
-            transcript_entry("m0"),
-            transcript_entry("m1"),
-            transcript_entry("m2"),
-            transcript_entry("m3"),
-        ];
-        state.transcript_tail_start = 2;
-        state.transcript_tail_before = Some(2);
-        state.transcript_history_before = None;
-        state.transcript_restored_from_cache = true;
+        assert!(!state.transcript_replayed);
 
         state
-            .apply_transcript_frame(TranscriptFrame::reset(
-                &[transcript_entry("m3"), transcript_entry("m4")],
-                Some(3),
-            ))
-            .unwrap();
+            .apply_transcript_frame(TranscriptFrame::Delta {
+                upsert: Vec::new(),
+                append: Vec::new(),
+                remove: Vec::new(),
+                count: 0,
+            })
+            .expect("empty delta");
+        assert!(!state.transcript_replayed);
 
-        assert_eq!(
-            state
-                .transcript
-                .iter()
-                .map(|entry| entry.id.as_str())
-                .collect::<Vec<_>>(),
-            ["m0", "m1", "m2", "m3", "m4"]
-        );
-        assert_eq!(state.transcript_tail_start, 3);
-        assert_eq!(state.transcript_tail_before, Some(3));
-        assert!(!state.transcript_restored_from_cache);
-    }
-
-    #[gpui::test]
-    fn directory_link_waits_for_sign_in_and_rejects_foreign_project(cx: &mut gpui::TestAppContext) {
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            state.selected_chat = Some("existing-chat".into());
-            state.pending_directory_link = Some(comet_proto::CrewSessionLink {
-                project_id: "other-project".into(),
-                session_id: "011664b5-3660-4fe6-83a2-3647fa6a2f65".into(),
-                deployment_id: Some("deployment".into()),
-            });
-            state.auth = Some(AuthState::SignedOut);
-            state.drain_directory_link(cx);
-            assert!(state.pending_directory_link.is_some());
-            state.auth = Some(AuthState::SignedIn {
-                user: UserProfile {
-                    id: "u".into(),
-                    email: "u@example.com".into(),
-                    name: None,
-                },
-                project_scope: "my-project".into(),
-            });
-            state.drain_directory_link(cx);
-            assert!(state.pending_directory_link.is_none());
-            assert!(state.pending_session_pin.is_none());
-            assert!(state.room_projections.is_empty());
-            assert_eq!(state.selected_chat.as_deref(), Some("existing-chat"));
-        });
+        state
+            .apply_transcript_frame(TranscriptFrame::Reset { reset: Vec::new() })
+            .expect("empty reset");
+        assert!(state.transcript_replayed);
     }
 
     #[test]
@@ -6587,50 +5693,104 @@ mod tests {
             name: None,
         };
         assert_eq!(
-            gate_phase(&ConnectionStatus::Connecting, None),
+            gate_phase(&ConnectionStatus::Connecting, None, None),
             GatePhase::Loading
         );
         assert_eq!(
-            gate_phase(&ConnectionStatus::Failed("boom".into()), None),
+            gate_phase(&ConnectionStatus::Failed("boom".into()), None, None),
             GatePhase::Failed("boom".into())
         );
-        // Unknown auth (pre-M4) gates nothing.
-        assert_eq!(gate_phase(&ConnectionStatus::Ready, None), GatePhase::Ready);
         assert_eq!(
-            gate_phase(&ConnectionStatus::Ready, Some(&AuthState::SignedOut)),
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Local),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::Ready
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
             GatePhase::SignIn
         );
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
                 Some(&AuthState::SignedIn {
-                    user,
-                    project_scope: "project-test".into(),
+                    user: user.clone(),
+                    org_id: None
                 })
             ),
             GatePhase::Ready
         );
+        // No org yet → org gate.
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::NeedsOrganization { user })
+            ),
+            GatePhase::OrgGate
+        );
     }
 
     #[test]
-    fn auth_frames_parse_current_wire_shape() {
+    fn auth_changes_do_not_change_a_local_runtime_scope_or_watches() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.watch_tasks.push(Task::ready(()));
+
+        state.apply_auth(AuthState::NeedsOrganization {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
+
+        state.apply_auth(AuthState::SignedIn {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
+    }
+
+    #[test]
+    fn auth_frames_parse_both_wire_shapes() {
+        // Proto shape.
         let proto = serde_json::json!({ "state": "signedOut" });
         assert_eq!(parse_auth_state(&proto), Some(AuthState::SignedOut));
+        // Engine shape (`_tag`, PascalCase, orgId).
         let engine = serde_json::json!({
             "_tag": "SignedIn",
             "user": { "id": "u1", "email": "w@example.com" },
-            "projectScope": "project-test",
+            "orgId": "org-1",
         });
-        let Some(AuthState::SignedIn {
-            user,
-            project_scope,
-        }) = parse_auth_state(&engine)
-        else {
+        let Some(AuthState::SignedIn { user, org_id }) = parse_auth_state(&engine) else {
             panic!("expected SignedIn");
         };
         assert_eq!(user.email, "w@example.com");
-        assert_eq!(project_scope, "project-test");
-        // Garbage is dropped rather than crashing the auth stream.
+        assert_eq!(org_id.as_deref(), Some("org-1"));
+        let needs = serde_json::json!({
+            "_tag": "NeedsOrganization",
+            "user": { "id": "u1", "email": "w@example.com", "name": "W" },
+        });
+        assert!(matches!(
+            parse_auth_state(&needs),
+            Some(AuthState::NeedsOrganization { .. })
+        ));
+        // Garbage → None (frame dropped, not a crash).
         assert_eq!(
             parse_auth_state(&serde_json::json!({ "_tag": "Wat" })),
             None
@@ -6646,9 +5806,15 @@ mod tests {
 
     #[test]
     fn project_labels_from_cwd() {
-        assert_eq!(project_label(Some("/home/w/dev/comet")), "comet");
-        assert_eq!(project_label(Some("/home/w/dev/comet/")), "comet");
+        assert_eq!(project_label(Some("/home/w/dev/zeron")), "zeron");
+        assert_eq!(project_label(Some("/home/w/dev/zeron/")), "zeron");
         assert_eq!(project_label(None), "No project");
+        assert_eq!(project_label(Some("~")), "No project");
+        assert_eq!(project_label(Some("~/")), "No project");
+        assert_eq!(
+            project_label(Some("~/.zeron/scratch/2026-10-11-3e4f5a6b")),
+            "No project"
+        );
         assert_eq!(project_label(Some("   ")), "No project");
         assert_eq!(project_label(Some("/")), "/");
     }
@@ -6657,22 +5823,22 @@ mod tests {
     fn grouped_sidebar_preserves_recency_order() {
         // Input is sidebar-sorted (most recent first).
         let chats = [
-            chat_with_cwd("a", 9, Some("/dev/comet")),
+            chat_with_cwd("a", 9, Some("/dev/zeron")),
             chat_with_cwd("b", 8, Some("/dev/zed")),
-            chat_with_cwd("c", 7, Some("/dev/comet")),
+            chat_with_cwd("c", 7, Some("/dev/zeron")),
             chat_with_cwd("d", 6, None),
         ];
         let groups = group_chats(chats.iter());
         let labels: Vec<&str> = groups.iter().map(|g| g.label.as_str()).collect();
         // Groups ordered by their most recent chat; rows keep order.
-        assert_eq!(labels, ["comet", "zed", "No project"]);
-        let comet_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(comet_ids, ["a", "c"]);
+        assert_eq!(labels, ["zeron", "zed", "No project"]);
+        let zeron_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(zeron_ids, ["a", "c"]);
         assert!(group_chats(std::iter::empty()).is_empty());
     }
 
     #[test]
-    fn relative_times_match_comet_format() {
+    fn relative_times_match_zeron_format() {
         let now = Utc::now();
         let ago = |secs: i64| now - chrono::Duration::seconds(secs);
         assert_eq!(format_time_ago(ago(0), now), "now");
@@ -6697,10 +5863,10 @@ mod tests {
     #[test]
     fn chat_location_joins_project_and_branch() {
         let mut c = chat_with_cwd("x", 1, Some("/home/w/dev/soccertcg"));
-        c.branch = Some("comet/rebalance".into());
+        c.branch = Some("zeron/rebalance".into());
         assert_eq!(
             chat_location(&c).as_deref(),
-            Some("soccertcg · comet/rebalance")
+            Some("soccertcg · zeron/rebalance")
         );
         c.branch = None;
         assert_eq!(chat_location(&c).as_deref(), Some("soccertcg"));
@@ -6711,338 +5877,287 @@ mod tests {
         assert_eq!(chat_location(&c), None);
         c.branch = None;
         assert_eq!(chat_location(&c), None);
-    }
-
-    #[test]
-    fn invitation_routes_to_exact_session_and_verified_grant() {
-        let now = Utc::now().timestamp_millis();
-        let snapshot: CollaborationSnapshot = serde_json::from_value(serde_json::json!({
-            "schemaVersion": 2,
-            "sessions": [
-                {
-                    "sessionId": "session-other",
-                    "chatId": "chat-a",
-                    "ownerSubject": "iap:other@example.com",
-                    "ownerDeviceId": "device-other",
-                    "source": "local",
-                    "createdAt": now
-                },
-                {
-                    "sessionId": "session-invited",
-                    "chatId": "chat-a",
-                    "ownerSubject": "iap:owner@example.com",
-                    "ownerDeviceId": "device-owner",
-                    "source": "local",
-                    "environment": {
-                        "source": {
-                            "kind": "scaffold",
-                            "sandbox_id": "sandbox-invited",
-                            "lifecycle": "ready",
-                            "links": {
-                                "web": "https://scaffold.example/sessions/sandbox-invited/web"
-                            }
-                        },
-                        "name": "Investigate staging resume delivery",
-                        "ownerPrincipal": "iap:owner@example.com",
-                        "scope": {
-                            "projectId": "project-a",
-                            "deploymentId": "deployment-a",
-                            "sessionId": "chat-a"
-                        }
-                    },
-                    "createdAt": now
-                }
-            ],
-            "principal": {
-                "subject": "iap:invitee@example.com",
-                "projectId": "project-a",
-                "deploymentId": "deployment-a",
-                "sessionId": "session-invited",
-                "capabilities": ["session.read"]
-            },
-            "grants": [{
-                "id": "grant-invited",
-                "principalSubject": "iap:invitee@example.com",
-                "scope": {
-                    "projectId": "project-a",
-                    "deploymentId": "deployment-a",
-                    "sessionId": "session-invited"
-                },
-                "capabilities": ["session.read"],
-                "deviceId": "device-owner",
-                "grantedBy": "iap:owner@example.com",
-                "grantedAt": now - 1,
-                "expiresAt": now + 60_000
-            }]
-        }))
-        .unwrap();
-        let mut state = AppState::new();
-        state.selected_chat = Some("chat-a".into());
-        state.pending_invitation =
-            comet_proto::CometInvitation::new("chat-a", "session-invited", "grant-invited");
-
-        state.apply_collaboration(snapshot);
-
-        assert_eq!(
-            state.selected_agent_session.as_deref(),
-            Some("session-invited")
-        );
-        assert_eq!(
-            state.selected_invitation_grant.as_deref(),
-            Some("grant-invited")
-        );
-        assert!(state.pending_invitation.is_none());
-        // No chat row for the invited session: verified membership arms the
-        // sidebar pin that replaces the manual exact-id import dialog.
-        assert_eq!(state.pending_session_pin.as_deref(), Some("chat-a"));
-        assert_eq!(
-            state
-                .scaffold_environment("chat-a")
-                .and_then(|environment| environment.name.as_deref()),
-            Some("Investigate staging resume delivery")
-        );
-        assert!(state.chat_is_scaffold("chat-a"));
-        assert_eq!(state.chat_host_device_id("chat-a"), Some("device-owner"));
-    }
-    #[test]
-    fn native_handoff_reference_restores_remote_routing_without_ui_creation() {
-        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let mut state = AppState::new();
-        state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
-        let environment: SessionEnvironment = serde_json::from_value(serde_json::json!({
-            "source": { "kind": "scaffold", "sandbox_id": "sandbox-cli", "lifecycle": "ready", "lifecycle_epoch": 2, "links": {} },
-            "ownerPrincipal": "owner@example.com",
-            "scope": { "projectId": "project-a", "deploymentId": "deployment-a", "sessionId": chat_id },
-        })).unwrap();
-        state.apply_session_refs(vec![SessionRef {
-            chat_id: chat_id.into(),
-            added_at: Utc::now(),
-            environment: Some(environment.clone()),
-            startup: None,
-        }]);
-        assert!(state.chat_is_scaffold(chat_id));
-        assert_eq!(
-            state.chat_host_device_id(chat_id),
-            Some("comet-scaffold-sandbox-cli-e2")
-        );
-        assert_eq!(
-            state.scaffold_control_target(chat_id).unwrap().sandbox_id,
-            "sandbox-cli"
-        );
-        assert!(
-            !state.scaffold_control_grants.contains_key(chat_id),
-            "discovery must not manufacture authority"
-        );
-
-        let mut other_deployment = AppState::new();
-        other_deployment.scaffold_scope = Some(("project-a".into(), "deployment-b".into()));
-        other_deployment.apply_session_refs(vec![SessionRef {
-            chat_id: chat_id.into(),
-            added_at: Utc::now(),
-            environment: Some(environment),
-            startup: None,
-        }]);
-        assert!(!other_deployment.chat_is_scaffold(chat_id));
-    }
-
-    #[test]
-    fn native_handoff_reference_does_not_roll_back_live_environment() {
-        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let mut state = AppState::new();
-        state.scaffold_scope = Some(("project-a".into(), "deployment-a".into()));
-        let persisted: SessionEnvironment = serde_json::from_value(serde_json::json!({
-            "source": { "kind": "scaffold", "sandbox_id": "sandbox-cli", "lifecycle": "ready", "lifecycle_epoch": 1, "links": {} },
-            "ownerPrincipal": "owner@example.com",
-            "scope": { "projectId": "project-a", "deploymentId": "deployment-a", "sessionId": chat_id },
-        })).unwrap();
-        let session_ref = SessionRef {
-            chat_id: chat_id.into(),
-            added_at: Utc::now(),
-            environment: Some(persisted.clone()),
-            startup: None,
-        };
-        state.apply_session_refs(vec![session_ref.clone()]);
-        let mut live = persisted;
-        if let SessionEnvironmentSource::Scaffold {
-            lifecycle,
-            lifecycle_epoch,
-            ..
-        } = &mut live.source
-        {
-            *lifecycle = ScaffoldLifecycle::Paused;
-            *lifecycle_epoch = Some(2);
+        // Projectless: no project name, no folder.
+        for cwd in ["~", "~/.zeron/scratch/2026-10-11-3e4f5a6b"] {
+            c.cwd = Some(cwd.into());
+            assert_eq!(chat_location(&c), None);
         }
-        state.apply_scaffold_environments(ScaffoldEnvironmentSnapshot {
-            environments: vec![live.clone()],
-            refreshed_at: 2,
-        });
-        state.apply_session_refs(vec![
-            session_ref,
-            SessionRef {
-                chat_id: "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
-                added_at: Utc::now(),
-                environment: None,
-                startup: None,
+    }
+
+    #[test]
+    fn org_gate_reducers() {
+        assert!(org_name_valid("Acme"));
+        assert!(org_name_valid("  padded  "));
+        assert!(!org_name_valid(""));
+        assert!(!org_name_valid("   "));
+        assert!(!org_name_valid(&"x".repeat(65)));
+
+        let rows = parse_orgs(&serde_json::json!({ "orgs": [
+            { "id": "m2", "organizationId": "o2", "name": "beta" },
+            { "id": "m1", "organizationId": "o1", "name": "Alpha" },
+            { "id": "m3", "organizationId": "o1", "name": "Alpha" },
+        ]}));
+        assert_eq!(rows.len(), 3);
+        let sorted = sort_memberships(rows);
+        let names: Vec<&str> = sorted.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Alpha", "beta"],
+            "case-insensitive sort + dedupe by org id"
+        );
+        // Bare-array replies parse too; garbage yields empty.
+        assert_eq!(
+            parse_orgs(&serde_json::json!([{ "id": "m", "organizationId": "o", "name": "n" }]))
+                .len(),
+            1
+        );
+        assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn review_comment_body_updates_are_scoped_and_keep_current_metadata() {
+        let mut state = AppState::new();
+        let original = ReviewComment::file("a.rs", 2, "Original");
+        state.add_review_comment("chat-1", original.clone());
+        state.add_review_comment("chat-2", original.clone());
+        state.begin_review_comment_flush("chat-1", 1);
+        state.update_review_comment_line("chat-1", &original.id, 9);
+        state.rename_review_comment_path("chat-1", "a.rs", "renamed.rs");
+        state.update_review_comment_body("chat-1", &original.id, "Revised".into());
+        let mut expected = original.clone();
+        expected.path = "renamed.rs".into();
+        expected.line = 9;
+        expected.body = "Revised".into();
+        assert_eq!(state.review_comments("chat-1"), &[expected]);
+        assert_eq!(state.review_comments("chat-2"), &[original.clone()]);
+        assert!(state.review_comment_flush_pending("chat-1"));
+        state.remove_review_comment("chat-1", &original.id);
+        state.update_review_comment_body("chat-1", &original.id, "Stale".into());
+        state.update_review_comment_body("missing-chat", &original.id, "Stale".into());
+        assert!(state.review_comments("chat-1").is_empty());
+        assert!(state.review_comments("missing-chat").is_empty());
+    }
+
+    #[test]
+    fn review_comment_flush_waits_for_every_file_surface() {
+        let mut state = AppState::new();
+
+        state.begin_review_comment_flush("chat-1", 1);
+        state.begin_review_comment_flush("chat-1", 2);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 1);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 2);
+        assert!(!state.review_comment_flush_pending("chat-1"));
+    }
+
+    #[test]
+    fn version_triple_parses_and_gates_device_features() {
+        assert_eq!(version_triple("0.2.12"), Some((0, 2, 12)));
+        assert_eq!(version_triple("0.2.12-beta.1"), Some((0, 2, 12)));
+        assert_eq!(version_triple("1.0.0+build7"), Some((1, 0, 0)));
+        assert_eq!(version_triple("0.2"), None);
+        assert_eq!(version_triple("garbage"), None);
+
+        let mut s = AppState::default();
+        assert!(
+            !s.device_version_at_least("d1", (0, 2, 12)),
+            "unknown device conservatively fails the gate"
+        );
+        s.devices = vec![Device {
+            id: "d1".into(),
+            name: "laptop".into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: Some("0.2.12".into()),
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
+        }];
+        assert!(s.device_version_at_least("d1", (0, 2, 12)));
+        assert!(!s.device_version_at_least("d1", (0, 2, 13)));
+        s.devices[0].version = None;
+        assert!(
+            !s.device_version_at_least("d1", (0, 2, 12)),
+            "unstamped version conservatively fails the gate"
+        );
+    }
+
+    #[test]
+    fn explicit_capabilities_distinguish_same_version_builds() {
+        let mut state = AppState::default();
+        state.devices = vec![
+            Device {
+                id: "personal".into(),
+                name: "personal".into(),
+                platform: "macos".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: Some("0.2.31".into()),
+                cursor_sdk_version: None,
+                capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
             },
-        ]);
-        assert_eq!(
-            state.chat_host_device_id(chat_id),
-            Some("comet-scaffold-sandbox-cli-e2")
-        );
-        assert_eq!(state.scaffold_environment(chat_id), Some(&live));
+            Device {
+                id: "upstream".into(),
+                name: "upstream".into(),
+                platform: "macos".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: Some("0.2.31".into()),
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+            },
+        ];
+
+        assert!(state.device_supports("personal", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
+        assert!(!state.device_supports("upstream", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
     }
 
     #[test]
-    fn imported_membership_keeps_selection_without_a_chat_row() {
-        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let mut state = AppState::new();
-        state.selected_chat = Some(chat_id.into());
-        state.apply_session_refs(vec![SessionRef {
-            chat_id: chat_id.into(),
-            added_at: Utc::now(),
-            environment: None,
-            startup: None,
-        }]);
-
-        state.apply_chats(Vec::new());
-        assert_eq!(state.selected_chat.as_deref(), Some(chat_id));
-        assert!(state.selected_chat_row().is_none());
-        assert!(state.is_shared_session(chat_id));
-
-        state.apply_session_refs(Vec::new());
-        assert!(state.selected_chat.is_none());
-    }
-
-    #[test]
-    fn chat_display_name_prefers_canonical_environment_then_local_rename() {
-        let mut state = AppState::new();
-        let mut chat = chat("chat", 0, None);
-        chat.title = Some("  Local rename  ".into());
-        let mut environment: SessionEnvironment = serde_json::from_value(serde_json::json!({
-            "source": { "kind": "scaffold", "sandbox_id": "sandbox", "lifecycle": "ready", "links": {} },
-            "name": "  Imported name  ",
-            "ownerPrincipal": "owner",
-            "scope": { "projectId": "project", "deploymentId": "deployment", "sessionId": "chat" }
-        }))
-        .unwrap();
-        state.session_refs.push(SessionRef {
-            chat_id: chat.id.clone(),
-            added_at: Utc::now(),
-            environment: Some(environment.clone()),
-            startup: None,
-        });
-        environment.name = Some("  Canonical name  ".into());
-        state
-            .scaffold_environments
-            .insert(chat.id.clone(), environment);
-        assert_eq!(state.chat_display_name(&chat), Some("Canonical name"));
-        state.scaffold_environments.clear();
-        assert_eq!(state.chat_display_name(&chat), Some("Imported name"));
-        state.session_refs[0].environment.as_mut().unwrap().name = Some("\n \t".into());
-        assert_eq!(state.chat_display_name(&chat), Some("Local rename"));
-        chat.title = Some("\n \t".into());
-        assert_eq!(state.chat_display_name(&chat), None);
-    }
-
-    #[test]
-    fn imported_session_title_promotes_from_id_to_transcript_preview() {
-        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let mut state = AppState::new();
-        state.selected_chat = Some(chat_id.into());
-        state.apply_session_refs(vec![SessionRef {
-            chat_id: chat_id.into(),
-            added_at: Utc::now(),
-            environment: None,
-            startup: None,
-        }]);
-        assert_eq!(state.shared_session_title(chat_id), "Session aaaaaaaa");
-
-        state.apply_transcript(vec![SessionMessageEntry {
-            id: "message".into(),
-            role: MessageRole::User,
-            parts: vec![MessagePart::Text {
-                id: "text".into(),
-                text: "  Explain   the shared transcript  ".into(),
-            }],
-            created_at: 1,
-            device_id: "remote".into(),
-            status: None,
-            continuation_of: None,
-            peer_message: None,
-        }]);
-        assert_eq!(
-            state.shared_session_title(chat_id),
-            "Explain the shared transcript"
-        );
-    }
-
-    #[test]
-    fn imported_session_preview_skips_peer_turns_and_evicts_stale_body() {
-        let chat_id = "shared-peer";
-        let mut state = AppState::new();
-        state.selected_chat = Some(chat_id.into());
-        let mut peer = transcript_entry("peer");
-        peer.role = MessageRole::User;
-        peer.parts = vec![MessagePart::Text {
-            id: "text".into(),
-            text: "private peer payload".into(),
+    fn delivery_degradation_and_queued_sends_tell_the_truth() {
+        use zeron_proto::{ChatConnectivity, ConnectivityState};
+        let now = Utc::now();
+        let mut s = AppState::default();
+        s.local_device_id = Some("local".into());
+        let mut remote = chat("c-remote", 0, None);
+        remote.device_id = "remote".into();
+        let mut local = chat("c-local", 0, None);
+        local.device_id = "local".into();
+        s.chats = vec![remote, local];
+        s.devices = vec![Device {
+            id: "remote".into(),
+            name: "vps".into(),
+            platform: "linux".into(),
+            last_seen_at: Some(now),
+            created_at: None,
+            version: None,
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
         }];
-        state.apply_transcript(vec![peer.clone()]);
-        assert_eq!(
-            state.shared_session_preview(chat_id),
-            Some("private peer payload")
-        );
-        peer.peer_message = Some(comet_proto::PeerMessageProvenance {
-            command_id: peer.id.clone(),
-            source_chat_id: "source".into(),
-            thread_id: "thread".into(),
-            reply_to: None,
-        });
-        state.apply_transcript(vec![peer.clone()]);
-        assert!(state.shared_session_preview(chat_id).is_none());
-        let mut ordinary = transcript_entry("ordinary");
-        ordinary.role = MessageRole::User;
-        ordinary.parts = vec![MessagePart::Text {
-            id: "text".into(),
-            text: "[Peer message] ordinary prompt".into(),
+        s.connectivity.state = ConnectivityState::Connected;
+        s.connectivity.chats = vec![ChatConnectivity {
+            sync_state: zeron_proto::ChatSyncState::Unknown,
+            chat_id: "c-remote".into(),
+            connected: true,
+            delivery_live: false,
+            pending_pushes: 0,
         }];
-        state.apply_transcript(vec![peer.clone(), ordinary]);
-        assert_eq!(
-            state.shared_session_preview(chat_id),
-            Some("[Peer message] ordinary prompt")
-        );
-        peer.peer_message.as_mut().unwrap().command_id = "mismatch".into();
-        assert_eq!(
-            shared_session_preview(&[peer]),
-            Some(("peer".into(), "private peer payload".into()))
-        );
-        state.apply_transcript(vec![transcript_entry("later-window")]);
-        assert_eq!(
-            state.shared_session_preview(chat_id),
-            Some("[Peer message] ordinary prompt")
-        );
+
+        // Healthy: nothing degraded.
+        assert!(!s.chat_delivery_degraded("c-remote"));
+        assert!(!s.chat_delivery_degraded("c-local"));
+
+        // Idle chats can remain without a socket for longer than the engine's
+        // grace. A stale down sample during focus must not flash a warning.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Local;
+        s.connectivity.chats[0].connected = false;
+        assert!(!s.chat_delivery_degraded("c-remote"));
+
+        // A requested reconnect stays quiet inside its fresh grace window.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        s.connectivity.chats[0].connected = true;
+        assert!(!s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
+        assert!(!s.chat_delivery_degraded("c-remote"));
+
+        // A requested or active room down past grace degrades even while
+        // globally Connected.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        s.connectivity.chats[0].connected = false;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].connected = true;
+
+        // Global registry failure and host presence loss still warn for a
+        // dormant chat.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Local;
+        s.connectivity.state = ConnectivityState::Reconnecting;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Waiting;
+        assert!(s.chat_delivery_degraded("c-remote"));
+
+        // A live chat room can deliver while the registry reconnects. The
+        // graced `connected` bit alone is not proof, but delivery_live is.
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Synced;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].delivery_live = true;
+        assert!(!s.chat_delivery_degraded("c-remote"));
+        s.begin_pending_send("c-remote", "m-live", now);
+        assert!(!s.send_queued("c-remote", now));
+        s.connectivity.chats[0].sync_state = zeron_proto::ChatSyncState::Connecting;
+        s.connectivity.chats[0].connected = false; // HTTP delivery can outlive the socket.
+        assert!(!s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].delivery_live = false;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        assert!(s.send_queued("c-remote", now));
+        s.connectivity.chats[0].connected = true;
+        s.connectivity.state = ConnectivityState::Connected;
+
+        // Host gone presence-dark → degraded (a send would queue at best).
+        s.connectivity.chats[0].delivery_live = true;
+        s.devices[0].last_seen_at = Some(now - TimeDelta::minutes(10));
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.devices[0].last_seen_at = Some(now);
+
+        // OS offline: remote degrades; a locally-hosted chat NEVER does (the
+        // queued command executes on this device even fully offline).
+        s.connectivity.state = ConnectivityState::Offline;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        assert!(!s.chat_delivery_degraded("c-local"));
+        s.connectivity.chats[0].delivery_live = false;
+
+        // Local profile (Disabled): nothing degrades.
+        s.connectivity.state = ConnectivityState::Disabled;
+        assert!(!s.chat_delivery_degraded("c-remote"));
+
+        // Queued = pending send + degraded path — and degradation HOLDS the
+        // overlay past the grace window instead of silently expiring (the
+        // no-trace hole).
+        s.connectivity.state = ConnectivityState::Offline;
+        s.begin_pending_send("c-remote", "m1", now - TimeDelta::seconds(200));
+        assert!(s.send_pending("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        // Past the grace: the explicit failed state surfaces alongside.
+        assert!(s.send_undelivered("c-remote", now));
+        // Retry restarts the clock: back to Queued, no longer failed.
+        s.retry_pending_send("c-remote", now);
+        assert!(!s.send_undelivered("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        // Path healed with a stale unacked send: the overlay expires after
+        // the grace rather than holding forever.
+        s.retry_pending_send("c-remote", now - TimeDelta::seconds(200));
+        s.connectivity.state = ConnectivityState::Connected;
+        assert!(!s.send_pending("c-remote", now));
+        assert!(!s.send_queued("c-remote", now));
+        // …but the explicit undelivered flag still tells the truth.
+        assert!(s.send_undelivered("c-remote", now));
     }
+}
 
-    #[test]
-    fn chat_row_wins_over_imported_membership() {
-        let chat_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let mut state = AppState::new();
-        state.apply_session_refs(vec![SessionRef {
-            chat_id: chat_id.into(),
-            added_at: Utc::now(),
-            environment: None,
-            startup: None,
-        }]);
-        state.apply_chats(vec![chat(chat_id, 1, None)]);
+#[cfg(any(feature = "appshots-fixture", feature = "pull-request-fixture"))]
+impl AppState {
+    /// Keep fixture documents deterministic while using the real attachment RPC.
+    pub fn fixture_attachment_engine(&mut self, engine: EngineHandle) {
+        self.engine = Some(engine);
+    }
+}
 
-        // The row carries space/status/harness context — it renders in the
-        // normal sidebar; the membership pin stays out of the Shared list.
-        assert_eq!(state.shared_session_refs().count(), 0);
-        assert_eq!(state.visible_chats().count(), 1);
-        assert!(!state.is_shared_session(chat_id));
-
-        state.apply_chats(Vec::new());
-        assert_eq!(state.shared_session_refs().count(), 1);
-        assert!(state.is_shared_session(chat_id));
+#[cfg(feature = "project-palette-fixture")]
+impl AppState {
+    /// Seed provider metadata for the isolated native sidebar review fixture.
+    pub fn fixture_sidebar_change_request(
+        &mut self,
+        snapshot: zeron_proto::CheckoutChangeRequestStatus,
+    ) {
+        let key = crate::change_requests::ChangeRequestWatchKey {
+            device_id: snapshot.device_id.clone(),
+            cwd: snapshot.cwd.clone(),
+            branch: snapshot.branch.clone(),
+            checkout_id: Some(snapshot.checkout_id.clone()),
+        };
+        self.change_requests.store(key, snapshot);
     }
 }

@@ -36,6 +36,8 @@ function probe(overrides, certificateTeam) {
       overrides = { ...overrides, CODESIGN_IDENTITY: hash };
     }
     const env = { ...process.env };
+    // The preflight owns no real user's global Cargo gate or profile.
+    env.HOME = bin;
     for (const key of [
       "CI", "CODESIGN_IDENTITY", "CODESIGN_KEYCHAIN", "NOTARYTOOL_KEYCHAIN_PROFILE",
       "COMET_MACOS_SIGNING", "COMET_PACKAGE_ENVIRONMENT", "COMET_DEFAULT_ENVIRONMENT",
@@ -93,6 +95,16 @@ test("ad-hoc packaging is forbidden in CI but accepts an explicitly local CI=fal
   assert.equal(local.status, 86, local.stderr + local.stdout);
   assert.match(local.stdout, /BUILD_BOUNDARY staging staging/);
 });
+
+test("unselected local packaging retains Canary and explicit production stays production", { skip: !nativeHost }, () => {
+  for (const [environment, expected] of [[undefined, "canary"], ["production", "production"]]) {
+    const result = probe({ CI: "false", COMET_MACOS_SIGNING: "adhoc", ...(environment ? { COMET_PACKAGE_ENVIRONMENT: environment } : {}) });
+    assert.ifError(result.error);
+    assert.equal(result.status, 86, result.stderr + result.stdout);
+    assert.ok(result.stdout.includes(`BUILD_BOUNDARY ${expected} ${expected}`));
+  }
+});
+
 
 test("distribution verification rejects wrong bundle metadata and unsigned executables", { skip: !nativeHost }, () => {
   const directory = mkdtempSync(path.join(tmpdir(), "crew-verify-app-"));

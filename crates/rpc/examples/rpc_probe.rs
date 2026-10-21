@@ -1,10 +1,10 @@
 //! Ad-hoc RPC probe: call or subscribe against a running engine's IPC socket.
 //!
 //! Usage:
-//!   cargo run -p comet-rpc --example rpc_probe -- ws://127.0.0.1:27801 LocalDevice '{}'
-//!   cargo run -p comet-rpc --example rpc_probe -- ws://127.0.0.1:27801 WatchSessions '{}' --stream 3
+//!   cargo run -p zeron-rpc --example rpc_probe -- ws://127.0.0.1:27801 LocalDevice '{}'
+//!   cargo run -p zeron-rpc --example rpc_probe -- ws://127.0.0.1:27801 WatchSessions '{}' --stream 3
 
-use comet_rpc::connect_ws;
+use zeron_rpc::connect_ws;
 
 #[tokio::main]
 async fn main() {
@@ -20,11 +20,7 @@ async fn main() {
         let mut rx = client.subscribe(method, params).await.expect("subscribe");
         for _ in 0..count {
             match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
-                Ok(Some(Ok(item))) => println!("{item}"),
-                Ok(Some(Err(error))) => {
-                    eprintln!("stream failed: {error}");
-                    std::process::exit(1);
-                }
+                Ok(Some(item)) => println!("{item}"),
                 Ok(None) => {
                     eprintln!("stream ended");
                     break;
