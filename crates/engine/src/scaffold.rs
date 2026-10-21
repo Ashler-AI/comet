@@ -6245,6 +6245,7 @@ mod tests {
             .unwrap();
         assert!(prepare_omp_handoff_archive(artifact, &CancellationToken::new()).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn materializer_process_is_exact_idempotent_and_rejects_mismatch() {
         use std::os::unix::fs::PermissionsExt as _;

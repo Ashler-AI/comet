@@ -2050,6 +2050,7 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
                 .call("list_harnesses", json!({"device":"device-b"}))
                 .await
                 .is_ok()
+            && a.workspace.peer_liveness("device-b") == zeron_rpc::PeerLiveness::Live
         {
             break;
         }
@@ -2116,6 +2117,10 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
                 && m["text"] == "remote reply"
                 && m["deviceId"] == "device-b")
     );
+    let summary = tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], read["total"]);
+    assert_eq!(summary["lastMessage"]["text"], "remote reply");
+    assert_eq!(summary["lastMessage"]["deviceId"], "device-b");
     let sent = tools
         .call(
             "send_message",
@@ -2155,6 +2160,65 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // Retain the real host's completed transcript, as session-doc sync does.
+    let retained = tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    let snapshot = b.doc_host.open(chat_id).unwrap().doc().export_snapshot().unwrap();
+    let offline = assemble(&dirs.path().join("offline"), "device-offline");
+    offline.workspace.import_chat_row(&chat).unwrap();
+    offline.doc_host.open(chat_id).unwrap().doc().doc().import(&snapshot).unwrap();
+    let mut offline_links = LinkCacheConfig::new(
+        "http://127.0.0.1:1",
+        Arc::new(StaticToken("test-user".into())),
+    );
+    offline_links.liveness = Some(Arc::new(|_| zeron_rpc::PeerLiveness::Dark));
+    offline.set_links(LinkCache::new(offline_links));
+    let offline_client = zeron_rpc::memory_client(offline.rpc_service());
+    let offline_tools = Tools::new(Arc::new(Zeron::with_client(
+        offline_client.clone(), Origin::default(),
+    )));
+    assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
+    let unknown = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(unknown["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+
+    // A stale heartbeat is positive Dark evidence, not a read failure to hide.
+    let dark_registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
+    let (mut presence, _) = tokio_tungstenite::connect_async(dark_registry.url()).await.unwrap();
+    presence.send(WsMessage::Text(json!({"t":"hello","device":"device-b"}).to_string())).await.unwrap();
+    presence.next().await.unwrap().unwrap();
+    presence.send(WsMessage::Text(json!({
+        "t":"presence", "at":chrono::Utc::now().timestamp_millis() - 10 * 60_000,
+    }).to_string())).await.unwrap();
+    presence.next().await.unwrap().unwrap();
+    let mut remote_device = b.workspace.watch_devices().borrow().iter()
+        .find(|device| device.id == "device-b").unwrap().clone();
+    remote_device.last_seen_at = None;
+    offline.workspace.upsert_device_row(&remote_device);
+    let mut devices = offline.workspace.watch_devices();
+    offline.workspace.connect_registry_url(&dark_registry.url());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while offline.workspace.peer_liveness("device-b") != zeron_rpc::PeerLiveness::Dark {
+            devices.changed().await.unwrap();
+        }
+    }).await.expect("stale host presence converges");
+    let dark = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(dark["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+    assert!(offline_client.subscribe_checked(methods::WATCH_DOC_MESSAGES,
+        json!({"chatId":chat_id,"targetDeviceId":"device-b"})).await.is_err(),
+        "an explicit offline host must not fall back to retained history");
+    offline.workspace.disconnect_edge();
+    assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
+    let disconnected = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(disconnected["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+    offline.shutdown().await;
     a.shutdown().await;
     b.shutdown().await;
     drop(host);

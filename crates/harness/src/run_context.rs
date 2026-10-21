@@ -91,12 +91,12 @@ mod tests {
         let mut cmd = Command::new("claude");
         cmd.env("ANTHROPIC_API_KEY", "must-not-survive");
         apply_run_context(&mut cmd, Some(&context));
-        let env: std::collections::BTreeMap<_, _> = cmd.as_std().get_envs().collect();
+        let env: std::collections::BTreeMap<_, _> = cmd.as_std_mut().get_envs().collect();
         assert_eq!(env.get(std::ffi::OsStr::new("ANTHROPIC_API_KEY")), Some(&None));
         assert_eq!(env.get(std::ffi::OsStr::new("ANTHROPIC_AUTH_TOKEN")),
             Some(&Some(std::ffi::OsStr::new("opaque-local-token"))));
         assert!(!format!("{context:?}").contains("opaque-local-token"));
         apply_run_context(&mut cmd, None);
-        assert!(cmd.as_std().get_envs().any(|(key, value)| key == "COMET_SESSION_ID" && value.is_none()));
+        assert!(cmd.as_std_mut().get_envs().any(|(key, value)| key == "COMET_SESSION_ID" && value.is_none()));
     }
 }
