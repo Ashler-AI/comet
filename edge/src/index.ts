@@ -163,6 +163,7 @@ export default {
     ) {
       const key = safeDecode(parts[0] === "api" ? parts[2] : url.pathname.slice("/releases/".length));
       if (!key || key.includes("..")) return json({ error: "bad request" }, 400);
+      if (!env.RELEASES) return json({ error: "not_found" }, 404);
       const object = await env.RELEASES.get(key);
       if (!object) return json({ error: "not_found" }, 404);
       // latest.txt / manifest.json flip on release; artifacts are immutable by name.

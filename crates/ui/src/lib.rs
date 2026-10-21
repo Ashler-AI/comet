@@ -111,7 +111,6 @@ pub struct UiConfig {
     /// Explicit resource-bound Crew OAuth configuration; never a WorkOS fallback.
     pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
     pub managed_inference: bool,
-    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
     /// Conversation URL passed by the OS on a cold launch.
@@ -120,7 +119,7 @@ pub struct UiConfig {
 
 impl UiConfig {
     fn boot(&self) -> EngineBootConfig {
-        EngineBootConfig { scaffold_runtime_artifact: self.scaffold_runtime_artifact.clone(), managed_inference: self.managed_inference, scaffold: self.scaffold.clone(), data_dir: self.data_dir.clone(),
+        EngineBootConfig { managed_inference: self.managed_inference, scaffold: self.scaffold.clone(), data_dir: self.data_dir.clone(),
         ipc_port: self.ipc_port,
         edge_url: self.edge_url.clone(),
         edge_token: self.edge_token.clone(),

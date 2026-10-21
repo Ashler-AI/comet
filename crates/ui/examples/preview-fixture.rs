@@ -139,7 +139,7 @@ fn main() -> anyhow::Result<()> {
     let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, core.rpc_service()))?;
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
-    let boot = EngineBootConfig { scaffold_runtime_artifact: None, managed_inference: false, scaffold: None, data_dir: data.clone(),
+    let boot = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: data.clone(),
     ipc_port,
     edge_url: String::new(),
     edge_token: None,

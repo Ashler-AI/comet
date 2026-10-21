@@ -1760,6 +1760,8 @@ struct ExecResponse {
     #[serde(default)]
     run_id: Option<String>,
     #[serde(default)]
+    supervised: bool,
+    #[serde(default)]
     exit_code: Option<i32>,
     #[serde(default)]
     stdout: Option<String>,
@@ -2635,91 +2637,11 @@ impl DeviceJoinGrantProvider for UnavailableDeviceJoinGrantProvider {
     }
 }
 
-struct RuntimeArtifact {
-    archive: NamedTempFile,
-    archive_bytes: u64,
-    sha256: String,
-}
-
-impl RuntimeArtifact {
-    fn capture(path: &std::path::Path, expected_sha256: &str) -> Result<Self, ScaffoldError> {
-        use sha2::{Digest, Sha256};
-        if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(ScaffoldError::InvalidScope("Runtime artifact SHA256 is required".into()));
-        }
-        let capture = || -> Result<Self, crate::EngineError> {
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-            }
-            let mut source = options.open(path)?;
-            let metadata = source.metadata()?;
-            if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_HANDOFF_ARCHIVE_BYTES - 2048 {
-                return Err(crate::EngineError::Other("Invalid runtime artifact size or type".into()));
-            }
-            let mut archive = NamedTempFile::new()?;
-            crate::worktree_handoff::append_tar_header(archive.as_file_mut(), "comet", metadata.len(), 0o600)?;
-            let mut hash = Sha256::new();
-            let mut remaining = metadata.len();
-            let mut buffer = [0u8; 64 * 1024];
-            while remaining > 0 {
-                let limit = remaining.min(buffer.len() as u64) as usize;
-                let count = source.read(&mut buffer[..limit])?;
-                if count == 0 { return Err(crate::EngineError::Other("Runtime artifact changed during capture".into())); }
-                hash.update(&buffer[..count]);
-                archive.write_all(&buffer[..count])?;
-                remaining -= count as u64;
-            }
-            let sha256 = format!("{:x}", hash.finalize());
-            if source.read(&mut buffer[..1])? != 0 || sha256 != expected_sha256.to_ascii_lowercase() {
-                return Err(crate::EngineError::Other("Runtime artifact SHA256 mismatch".into()));
-            }
-            let padding = (512 - metadata.len() % 512) % 512;
-            archive.write_all(&[0; 1536][..padding as usize + 1024])?;
-            archive.as_file().sync_all()?;
-            let archive_bytes = archive.as_file().metadata()?.len();
-            Ok(Self { archive, archive_bytes, sha256 })
-        };
-        capture().map_err(|_| ScaffoldError::InvalidResponse("Runtime artifact capture or SHA256 verification failed".into()))
-    }
-}
-
-// Executed only in the explicitly selected sandbox. Never follows a directory
-// symlink or overwrites a pre-existing different runtime.
-const PREPARE_RUNTIME_DIRECTORY: &str = r#"import os,pathlib,stat,sys
-p=pathlib.PurePosixPath(sys.argv[1])
-parts=p.parts
-if len(parts)!=4 or parts[0]!='.scaffold' or not parts[1].startswith('crew-') or parts[2:]!=('bin','comet'):
-    raise SystemExit(40)
-current=os.getcwd()
-if not stat.S_ISDIR(os.lstat(current).st_mode): raise SystemExit(41)
-for part in parts[:-1]:
-    current=os.path.join(current,part)
-    try: os.mkdir(current,0o700)
-    except FileExistsError: pass
-    if not stat.S_ISDIR(os.lstat(current).st_mode): raise SystemExit(41)
-data=os.path.join(os.path.dirname(current),'data')
-try: os.mkdir(data,0o700)
-except FileExistsError: pass
-if not stat.S_ISDIR(os.lstat(data).st_mode): raise SystemExit(41)
-try:
-    st=os.lstat(str(p))
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1: raise SystemExit(42)
-    print('present')
-except FileNotFoundError: print('absent')
-"#;
 
 #[derive(Clone)]
 pub struct ScaffoldRuntime {
     inner: Arc<ScaffoldRuntimeInner>,
     deployment_id: Arc<str>,
-    remote_executable: Arc<str>,
-    remote_data_dir: Option<Arc<str>>,
-    remote_ipc_port: Option<u16>,
-    runtime_artifact: Option<Arc<RuntimeArtifact>>,
 }
 
 struct ScaffoldRuntimeInner {
@@ -2744,10 +2666,6 @@ impl ScaffoldRuntime {
         let (watch_tx, _) = watch::channel(snapshot);
         Self {
             deployment_id: client.project_scope.as_str().into(),
-            remote_executable: "comet".into(),
-            remote_data_dir: None,
-            remote_ipc_port: None,
-            runtime_artifact: None,
             inner: Arc::new(ScaffoldRuntimeInner {
                 client,
                 edge_origin: edge_origin.into(),
@@ -2764,97 +2682,11 @@ impl ScaffoldRuntime {
         self
     }
 
-    pub fn with_remote_executable(mut self, executable: String) -> Self {
-        self.remote_executable = executable.into();
-        self
-    }
 
-    pub fn with_remote_data_dir(mut self, data_dir: String) -> Self {
-        self.remote_data_dir = Some(data_dir.into());
-        self
-    }
-
-    pub fn with_remote_ipc_port(mut self, port: u16) -> Self {
-        self.remote_ipc_port = Some(port);
-        self
-    }
-
-    /// Captures immutable bytes now; the source path is never re-opened at upload.
-    pub fn with_runtime_artifact(mut self, path: std::path::PathBuf, sha256: String) -> Result<Self, ScaffoldError> {
-        self.runtime_artifact = Some(Arc::new(RuntimeArtifact::capture(&path, &sha256)?));
-        Ok(self)
-    }
-
-    async fn ensure_remote_runtime(&self, sandbox_id: &str, environment: &SessionEnvironment, cancellation: &CancellationToken) -> Result<(), ScaffoldError> {
-        let artifact = self.runtime_artifact.as_ref().ok_or_else(|| {
-            ScaffoldError::InvalidScope("A verified runtime artifact is required for native attachment".into())
-        })?;
-        let expected_data_dir = self.remote_executable.strip_suffix("/bin/comet")
-            .map(|root| format!("{root}/data"));
-        if expected_data_dir.as_deref() != self.remote_data_dir.as_deref()
-            || self.remote_data_dir.is_none()
-            || self.remote_ipc_port.is_none_or(|port| matches!(port, 0 | 27654 | 27655)) {
-            return Err(ScaffoldError::InvalidScope("Isolated runtime data directory and IPC port are required".into()));
-        }
-        let argv = vec!["python3".into(), "-c".into(), PREPARE_RUNTIME_DIRECTORY.into(), self.remote_executable.to_string()];
-        let prepared = self.probe_attach_authority(sandbox_id, &environment.scope, environment, &argv, cancellation).await?;
-        if !prepared.ok || prepared.exit_code != Some(0) {
-            return Err(ScaffoldError::InvalidScope("Runtime destination is not an isolated regular path".into()));
-        }
-        let present = match prepared.stdout.as_deref().map(str::trim) {
-            Some("present") => true,
-            Some("absent") => false,
-            _ => return Err(ScaffoldError::InvalidResponse("Runtime destination probe failed".into())),
-        };
-        if !present {
-            let relative = self.remote_executable.strip_suffix("/comet")
-                .ok_or_else(|| ScaffoldError::InvalidScope("Unsafe runtime artifact destination".into()))?;
-            let grant: UploadGrantEnvelope = self.inner.client.request(Method::POST,
-                self.inner.client.sandbox_url(sandbox_id, Some("uploads"))?,
-                Some(&UploadGrantRequest { destination_path: relative }), cancellation, None).await?;
-            if !grant.ok || grant.upload.destination_path != relative {
-                return Err(ScaffoldError::InvalidResponse("Runtime upload destination mismatch".into()));
-            }
-            validate_upload_grant(&grant.upload)?;
-            self.inner.client.upload_granted_file(&grant.upload,
-                artifact.archive.reopen().map_err(|_| ScaffoldError::InvalidResponse("Runtime artifact unavailable".into()))?,
-                artifact.archive_bytes, cancellation).await?;
-        }
-        let argv = vec!["sha256sum".into(), "--".into(), self.remote_executable.to_string()];
-        let verified = self.inner.client.exec(sandbox_id, &ExecBody {
-            argv: &argv, mode: "inline", timeout_ms: 60_000,
-        }, cancellation).await?;
-        if !verified.ok || verified.exit_code != Some(0)
-            || verified.stdout.as_deref().and_then(|value| value.split_whitespace().next()) != Some(artifact.sha256.as_str()) {
-            return Err(ScaffoldError::InvalidResponse("Remote runtime SHA256 mismatch; existing binary was not replaced".into()));
-        }
-        let argv = vec!["chmod".into(), "0700".into(), "--".into(), self.remote_executable.to_string()];
-        let secured = self.inner.client.exec(sandbox_id, &ExecBody {
-            argv: &argv, mode: "inline", timeout_ms: 10_000,
-        }, cancellation).await?;
-        if !secured.ok || secured.exit_code != Some(0) {
-            return Err(ScaffoldError::InvalidResponse("Could not secure verified runtime artifact".into()));
-        }
-        let argv = self.remote_argv("scaffold-install-web");
-        let installed = self.inner.client.exec(sandbox_id, &ExecBody {
-            argv: &argv, mode: "inline", timeout_ms: 30_000,
-        }, cancellation).await?;
-        if !installed.ok || installed.exit_code != Some(0) {
-            return Err(ScaffoldError::InvalidResponse("Verified runtime browser installation failed".into()));
-        }
-        Ok(())
-    }
 
     fn remote_argv(&self, command: &str) -> Vec<String> {
-        let mut argv = vec![self.remote_executable.to_string()];
-        if let Some(path) = &self.remote_data_dir {
-            argv.extend(["--data-dir".into(), path.to_string()]);
-        }
-        if let Some(port) = self.remote_ipc_port {
-            argv.extend(["--ipc-port".into(), port.to_string()]);
-        }
-        argv.push(command.into());
-        argv
+        vec![".scaffold/crew/bin/comet".into(), "--data-dir".into(),
+            ".scaffold/crew-data".into(), "--ipc-port".into(), "39400".into(), command.into()]
     }
 
     pub(crate) fn deployment_id(&self) -> &str {
@@ -3182,8 +3014,8 @@ impl ScaffoldRuntime {
         }))
     }
 
-    // Only retry authority reads or idempotent directory preparation, never
-    // credential minting or process launch. Bootstrap itself makes the app ready.
+    // Only retry read-only authority probes, never credential minting
+    // or process launch. Bootstrap itself makes the app ready.
     async fn probe_attach_authority(
         &self,
         sandbox_id: &str,
@@ -3288,12 +3120,11 @@ impl ScaffoldRuntime {
         let lifecycle_epoch = lifecycle_epoch.ok_or_else(|| {
             ScaffoldError::InvalidResponse("sandbox lifecycle epoch is required to attach".into())
         })?;
-        self.ensure_remote_runtime(sandbox_id, environment, cancellation).await?;
 
 
-        // Reuse a live deployment-bound host before minting another grant. This
-        // keeps repeated attach idempotent while preserving a fail-closed fallback
-        // when the prior process is missing, stale, or bound to another room.
+        // The server owns installation and pinned archive readiness admission.
+        // Reuse only an exactly bound live host; otherwise the single background
+        // exec below enters the native runner's verified admission path.
         let authority_argv = self.remote_argv("scaffold-authority");
         let authority = self
             .probe_attach_authority(
@@ -3316,25 +3147,6 @@ impl ScaffoldRuntime {
             ));
         }
 
-        // Probe after reuse so an older binary without the authority command
-        // still fails deterministically without minting a credential.
-        let probe_argv = vec![self.remote_executable.to_string(), "--version".into()];
-        let probe = self
-            .inner
-            .client
-            .exec(
-                sandbox_id,
-                &ExecBody {
-                    argv: &probe_argv,
-                    mode: "inline",
-                    timeout_ms: 10_000,
-                },
-                cancellation,
-            )
-            .await?;
-        if !probe.ok || probe.exit_code != Some(0) {
-            return Err(ScaffoldError::CometNotInstalled);
-        }
 
         let device_id = device_id_for(sandbox_id, lifecycle_epoch);
         let request = DeviceJoinGrantRequest {
@@ -3361,19 +3173,17 @@ impl ScaffoldRuntime {
             "sandboxId": sandbox_id
         })
         .to_string();
-        self.inner
-            .client
-            .put_file(sandbox_id, &bootstrap_path, &bootstrap, cancellation)
-            .await?;
-        let chmod_argv = vec![
-            "chmod".to_string(),
-            "600".to_string(),
-            bootstrap_path.clone(),
-        ];
-        let chmod = match self
-            .inner
-            .client
-            .exec(
+        let result = async {
+            self.inner
+                .client
+                .put_file(sandbox_id, &bootstrap_path, &bootstrap, cancellation)
+                .await?;
+            let chmod_argv = vec![
+                "chmod".to_string(),
+                "600".to_string(),
+                bootstrap_path.clone(),
+            ];
+            let chmod = self.inner.client.exec(
                 sandbox_id,
                 &ExecBody {
                     argv: &chmod_argv,
@@ -3381,45 +3191,26 @@ impl ScaffoldRuntime {
                     timeout_ms: 10_000,
                 },
                 cancellation,
-            )
-            .await
-        {
-            Ok(response) if response.ok && response.exit_code == Some(0) => response,
-            Ok(_) => {
-                self.inner
-                    .client
-                    .remove_file(sandbox_id, &bootstrap_path, cancellation)
-                    .await;
+            ).await?;
+            if !chmod.ok || chmod.exit_code != Some(0) {
                 return Err(ScaffoldError::InvalidResponse(
                     "could not secure the device bootstrap file".into(),
                 ));
             }
-            Err(error) => {
-                self.inner
-                    .client
-                    .remove_file(sandbox_id, &bootstrap_path, cancellation)
-                    .await;
-                return Err(error);
-            }
-        };
-        let _ = chmod;
-        let mut argv = self.remote_argv("headless");
-        argv.extend([
-            "--device-bootstrap-file".to_string(),
-            bootstrap_path.clone(),
-            "--edge-url".to_string(),
-            self.inner.edge_origin.clone(),
-            "--scaffold-url".to_string(),
-            self.inner.client.origin.as_str().to_owned(),
-            "--project-scope".to_string(),
-            scope.project_id.clone(),
-            "--deployment-id".to_string(),
-            deployment_id.to_owned(),
-        ]);
-        let started = match self
-            .inner
-            .client
-            .exec(
+            let mut argv = self.remote_argv("headless");
+            argv.extend([
+                "--device-bootstrap-file".to_string(),
+                bootstrap_path.clone(),
+                "--edge-url".to_string(),
+                self.inner.edge_origin.clone(),
+                "--scaffold-url".to_string(),
+                self.inner.client.origin.as_str().to_owned(),
+                "--project-scope".to_string(),
+                scope.project_id.clone(),
+                "--deployment-id".to_string(),
+                deployment_id.to_owned(),
+            ]);
+            let started = self.inner.client.exec(
                 sandbox_id,
                 &ExecBody {
                     argv: &argv,
@@ -3427,81 +3218,74 @@ impl ScaffoldRuntime {
                     timeout_ms: 0,
                 },
                 cancellation,
-            )
-            .await
-        {
-            Ok(started) => started,
-            Err(error) => {
-                self.inner
-                    .client
-                    .remove_file(sandbox_id, &bootstrap_path, cancellation)
-                    .await;
-                return Err(error);
-            }
-        };
-        if !started.ok {
-            self.inner
-                .client
-                .remove_file(sandbox_id, &bootstrap_path, cancellation)
-                .await;
-            if started.error.as_deref() == Some("exec_spawn_failed") {
-                return Err(ScaffoldError::CometNotInstalled);
-            }
-            return Err(ScaffoldError::InvalidResponse(
-                started
-                    .error
-                    .unwrap_or_else(|| "sandbox exec rejected".into()),
-            ));
-        }
-        let run_id = started.run_id.ok_or_else(|| {
-            ScaffoldError::InvalidResponse("sandbox exec returned no runId".into())
-        })?;
-        // Bootstrap can reuse an existing supervised host. Its newly minted
-        // grant is not evidence that the serving host adopted it.
-        let wait_for_authority = async {
-            loop {
-                let authority = self
-                    .probe_attach_authority(
-                        sandbox_id,
-                        scope,
-                        environment,
-                        &authority_argv,
-                        cancellation,
-                    )
-                    .await?;
-                if let Some(confirmed) = confirmed_host_authority(&authority, environment) {
-                    return Ok(confirmed);
+            ).await?;
+            if !started.ok {
+                if started.error.as_deref() == Some("exec_spawn_failed") {
+                    return Err(ScaffoldError::CometNotInstalled);
                 }
-                // A completed authority response is authoritative: never wait
-                // through an expired grant or a different owner/scope/epoch.
-                if authority.ok && authority.exit_code == Some(0) {
-                    return Err(ScaffoldError::InvalidResponse(
-                        "Scaffold host returned invalid attachment authority".into(),
-                    ));
+                return Err(ScaffoldError::InvalidResponse(
+                    started.error.unwrap_or_else(|| "sandbox exec rejected".into()),
+                ));
+            }
+            let Some(run_id) = started.run_id.filter(|id| started.supervised && !id.trim().is_empty()) else {
+                return Err(ScaffoldError::InvalidResponse("sandbox exec returned no supervised native runId".into()));
+            };
+            // Bootstrap can reuse an existing supervised host. Its newly minted
+            // grant is not evidence that the serving host adopted it.
+            let wait_for_authority = async {
+                loop {
+                    let authority = self
+                        .probe_attach_authority(
+                            sandbox_id,
+                            scope,
+                            environment,
+                            &authority_argv,
+                            cancellation,
+                        )
+                        .await?;
+                    if let Some(confirmed) = confirmed_host_authority(&authority, environment) {
+                        return Ok(confirmed);
+                    }
+                    // A completed authority response is authoritative: never wait
+                    // through an expired grant or a different owner/scope/epoch.
+                    if authority.ok && authority.exit_code == Some(0) {
+                        return Err(ScaffoldError::InvalidResponse(
+                            "Scaffold host returned invalid attachment authority".into(),
+                        ));
+                    }
+                    // Background process creation precedes IPC readiness. Only this
+                    // fresh-bootstrap window permits retrying an unavailable host.
+                    tokio::time::sleep(RUNTIME_START_POLL).await;
                 }
-                // Background process creation precedes IPC readiness. Only this
-                // fresh-bootstrap window permits retrying an unavailable host.
-                tokio::time::sleep(RUNTIME_START_POLL).await;
-            }
-        };
-        let confirmed = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-            result = tokio::time::timeout(REQUEST_TIMEOUT, wait_for_authority) => {
-                result.map_err(|_| ScaffoldError::InvalidResponse(
-                    "Scaffold host did not confirm attachment authority within 30 seconds".into(),
-                ))??
-            }
-        };
-        Ok((
-            device_id,
-            Some(run_id),
-            ScaffoldControlGrant {
-                id: confirmed.grant_id,
-                expires_at: confirmed.expires_at,
-                capabilities: confirmed.capabilities,
-            },
-        ))
+            };
+            let confirmed = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+                result = tokio::time::timeout(REQUEST_TIMEOUT, wait_for_authority) => {
+                    result.map_err(|_| ScaffoldError::InvalidResponse(
+                        "Scaffold host did not confirm attachment authority within 30 seconds".into(),
+                    ))??
+                }
+            };
+            Ok((
+                device_id,
+                Some(run_id),
+                ScaffoldControlGrant {
+                    id: confirmed.grant_id,
+                    expires_at: confirmed.expires_at,
+                    capabilities: confirmed.capabilities,
+                },
+            ))
+        }.await;
+        // A failed upload response may still mean the file was committed. Always
+        // remove our unique path, even after cancellation or supervised host reuse.
+        // Cleanup is independent and bounded; it must never replace the outcome.
+        let cleanup = CancellationToken::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.inner.client.remove_file(sandbox_id, &bootstrap_path, &cleanup),
+        ).await;
+        result
     }
 
     fn publish(&self) -> ScaffoldEnvironmentSnapshot {
@@ -3701,7 +3485,7 @@ mod tests {
 
     fn sandbox(status: &str) -> String {
         format!(
-            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","cometRuntimeProfile":{{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}},"region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
+            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","cometRuntimeProfile":{{"version":"scaffold.comet-runtime.v2","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}},"region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
         )
     }
 
@@ -3756,6 +3540,7 @@ mod tests {
         Http { status: u16, body: String },
         Close,
         HeadersThenClose,
+        CancelThenClose(CancellationToken),
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -3781,62 +3566,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_artifact_is_hash_bound_and_captured_immutably() {
-        let mut source = NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut source, b"verified-runtime").unwrap();
-        let digest = format!("{:x}", sha2::Sha256::digest(b"verified-runtime"));
-        let artifact = RuntimeArtifact::capture(source.path(), &digest).unwrap();
-        std::fs::write(source.path(), b"replacement").unwrap();
-        let mut archive = artifact.archive.reopen().unwrap();
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut archive, &mut bytes).unwrap();
-        assert_eq!(&bytes[512..528], b"verified-runtime");
-        assert_eq!(artifact.sha256, digest);
-        assert!(RuntimeArtifact::capture(source.path(), &digest).is_err());
-    }
-
-    #[test]
-    fn runtime_archive_and_exec_share_the_api_workspace() {
-        let workspace = tempfile::tempdir().unwrap();
-        let executable = ".scaffold/crew-test/bin/comet";
-        let prepare = |path: &str| std::process::Command::new("python3")
-            .args(["-c", PREPARE_RUNTIME_DIRECTORY, path])
-            .current_dir(workspace.path()).output().unwrap();
-        let first = prepare(executable);
-        assert!(first.status.success(), "{:?}", first);
-        assert!(!workspace.path().join(executable).exists());
-        assert!(workspace.path().join(executable).parent().unwrap().is_dir());
-        let mut source = NamedTempFile::new().unwrap();
-        source.write_all(TEST_RUNTIME_BYTES).unwrap();
-        let digest = format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES));
-        let artifact = RuntimeArtifact::capture(source.path(), &digest).unwrap();
-        let destination = workspace.path().join(executable).parent().unwrap().to_owned();
-        assert!(std::process::Command::new("tar").arg("-xf").arg(artifact.archive.path())
-            .arg("-C").arg(destination).status().unwrap().success());
-        let present = prepare(executable);
-        assert!(present.status.success(), "{:?}", present);
-        assert_eq!(format!("{:x}", sha2::Sha256::digest(std::fs::read(workspace.path().join(executable)).unwrap())), digest);
-        for path in ["/workspace/.scaffold/crew-test/bin/comet", "../crew-test/bin/comet", ".scaffold/other/bin/comet"] {
-            assert!(!prepare(path).status.success(), "accepted {path}");
-        }
-        #[cfg(unix)]
-        {
-            let outside = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(outside.path(), workspace.path().join(".scaffold/crew-link")).unwrap();
-            assert!(!prepare(".scaffold/crew-link/bin/comet").status.success());
-            assert!(!outside.path().join("bin").exists());
-        }
-    }
-
-    #[tokio::test]
-    async fn native_attachment_requires_an_explicit_runtime_artifact() {
-        let runtime = ScaffoldRuntime::new(
-            ScaffoldClient::new("http://127.0.0.1:1", "project-a", Arc::new(StaticToken("token".into()))).unwrap(),
-            "https://edge.example", Arc::new(UnavailableDeviceJoinGrantProvider),
-        );
-        let envelope: SandboxEnvelope = serde_json::from_str(&comet_sandbox("starting")).unwrap();
-        let environment = envelope.sandbox.into_environment(scope()).unwrap();
-        assert!(runtime.ensure_remote_runtime("box", &environment, &CancellationToken::new()).await.is_err());
+    fn native_attachment_rejects_legacy_runtime_profiles() {
+        let legacy = comet_sandbox("ready").replace("scaffold.comet-runtime.v2", "scaffold.comet-runtime.v1");
+        let envelope: SandboxEnvelope = serde_json::from_str(&legacy).unwrap();
+        assert!(envelope.sandbox.into_environment(scope()).is_err());
     }
 
     #[tokio::test]
@@ -3876,17 +3609,8 @@ mod tests {
         }
     }
 
-    const TEST_RUNTIME_BYTES: &[u8] = b"immutable crew runtime fixture";
-
     fn test_runtime(client: ScaffoldClient, edge: &str, grants: Arc<dyn DeviceJoinGrantProvider>) -> ScaffoldRuntime {
-        let mut file = NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut file, TEST_RUNTIME_BYTES).unwrap();
         ScaffoldRuntime::new(client, edge, grants)
-            .with_remote_executable(".scaffold/crew-test/bin/comet".into())
-            .with_remote_data_dir(".scaffold/crew-test/data".into())
-            .with_remote_ipc_port(27954)
-            .with_runtime_artifact(file.path().to_owned(), format!("{:x}", sha2::Sha256::digest(TEST_RUNTIME_BYTES)))
-            .unwrap()
     }
 
     async fn mock_server_steps(
@@ -3924,32 +3648,14 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8(bytes).unwrap();
-                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-                let argv = value.get("argv").and_then(Value::as_array);
-                // Lifecycle tests model an already installed immutable fixture.
-                // Installer behavior has separate hash/path/capture regression cases.
-                let installation = argv.and_then(|argv| {
-                    if argv.get(2).and_then(Value::as_str) == Some(PREPARE_RUNTIME_DIRECTORY) {
-                        Some("present".to_string())
-                    } else if argv.first().and_then(Value::as_str) == Some("sha256sum") {
-                        Some(format!("{:x}  .scaffold/crew-test/bin/comet", sha2::Sha256::digest(TEST_RUNTIME_BYTES)))
-                    } else if (argv.first().and_then(Value::as_str) == Some("chmod")
-                        && argv.get(1).and_then(Value::as_str) == Some("0700"))
-                        || argv.last().and_then(Value::as_str) == Some("scaffold-install-web") {
-                        Some(String::new())
-                    } else { None }
-                });
-                if let Some(stdout) = installation {
-                    let body = serde_json::json!({"ok":true,"exitCode":0,"stdout":stdout}).to_string();
-                    let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body);
-                    stream.write_all(response.as_bytes()).await.unwrap();
-                    continue;
-                }
                 requests.push(request);
                 let response = responses.pop_front().unwrap();
                 match response {
                     MockResponse::Close => continue,
+                    MockResponse::CancelThenClose(cancellation) => {
+                        cancellation.cancel();
+                        continue;
+                    }
                     MockResponse::HeadersThenClose => {
                         stream
                             .write_all(
@@ -4479,7 +4185,7 @@ mod tests {
         assert!(requests[5].contains(
             r#""agentRoute":{"provider":"openai","model":"gpt-5.5","fallback":"disabled","routingMode":"automatic"}"#
         ));
-        assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v1""#));
+        assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v2""#));
         assert!(requests[2].contains(r#""projectId":"project-a""#));
         assert!(requests[2].contains(r#""deploymentId":"deployment-a""#));
         assert!(requests[2].contains(r#""sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65""#));
@@ -4499,7 +4205,7 @@ mod tests {
             database_environment: ScaffoldDatabaseEnvironment::Local,
             agent_route: &route,
             comet_runtime_profile: CreateCometRuntimeProfile {
-                version: "scaffold.comet-runtime.v1",
+                version: SCAFFOLD_COMET_RUNTIME_VERSION,
                 project_id: "project-a",
                 deployment_id: "deployment-a",
                 session_id: "session-a",
@@ -4568,12 +4274,12 @@ mod tests {
             comet_sandbox("paused"), // Native attachment validates the resume transition.
             current("resuming"),
             unavailable.clone(),
-            r#"{"ok":true,"exitCode":0}"#.into(),
             format!(r#"{{"grant":"cg1.{grant_id}.secret","expiresAt":{expires_at}}}"#),
             r#"{"ok":true}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
-            r#"{"ok":true,"runId":"resumed-host"}"#.into(),
+            r#"{"ok":true,"runId":"resumed-host","supervised":true}"#.into(),
             authority.clone(),
+            r#"{"ok":true,"exitCode":0}"#.into(), // Cleanup after confirmed attachment.
             current("ready"),
             unavailable.clone(), // Provider readiness alone must not confirm Resume.
             current("ready"),
@@ -4844,14 +4550,14 @@ mod tests {
         let responses = vec![
             sandbox("starting"),
             r#"{"ok":false,"exitCode":1}"#.into(),
-            r#"{"ok":true,"exitCode":0}"#.into(),
             format!(
                 r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#
             ),
             r#"{"ok":true}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
-            r#"{"ok":true,"runId":"run-a"}"#.into(),
+            r#"{"ok":true,"runId":"run-a","supervised":true}"#.into(),
             host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", access_expires_at),
+            r#"{"ok":true,"exitCode":0}"#.into(), // Cleanup after confirmed attachment.
         ];
         let (origin, captured) = mock_server(responses).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("sc_rc_broad_secret".into()));
@@ -4905,11 +4611,17 @@ mod tests {
                 .all(|body| !body.contains("sc_rc_broad_secret") && !body.contains("cg1."))
         );
         assert!(exec_bodies[0].contains(r#""scaffold-authority""#));
-        assert!(exec_bodies[2].contains(r#""chmod","600""#));
-        assert!(exec_bodies[3].contains(r#""--device-bootstrap-file""#));
-        assert!(!exec_bodies[3].contains("--device-join-grant"));
-        assert!(exec_bodies[3].contains(r#""mode":"background""#));
-        assert!(exec_bodies[3].contains(r#""timeoutMs":0"#));
+        assert!(exec_bodies[1].contains(r#""chmod","600""#));
+        let launch: Value = serde_json::from_str(exec_bodies[2]).unwrap();
+        let bootstrap_path = launch["argv"][7].as_str().unwrap();
+        assert!(bootstrap_path.starts_with(".comet-device-bootstrap-") && bootstrap_path.ends_with(".json"));
+        assert!(!bootstrap_path.contains('/') && !bootstrap_path.contains('\\'));
+        assert_eq!(launch, serde_json::json!({
+            "argv": [".scaffold/crew/bin/comet", "--data-dir", ".scaffold/crew-data", "--ipc-port", "39400",
+                "headless", "--device-bootstrap-file", bootstrap_path, "--edge-url", "https://comet-edge.example",
+                "--scaffold-url", format!("{origin}/"), "--project-scope", "project-a", "--deployment-id", "deployment-a"],
+            "mode": "background", "timeoutMs": 0
+        }));
         let bootstrap_request = requests
             .iter()
             .find(|request| request.starts_with("PUT /api/code-sandboxes/sandbox-a/files?"))
@@ -4924,10 +4636,201 @@ mod tests {
         );
         assert_eq!(bootstrap["deploymentId"], "deployment-a");
         assert_eq!(bootstrap["lifecycleEpoch"], 1);
-        let grant_body = requests[3].split_once("\r\n\r\n").unwrap().1;
+        let grant_body = requests[2].split_once("\r\n\r\n").unwrap().1;
         assert!(grant_body.contains(r#""sandboxId":"sandbox-a""#));
         assert!(grant_body.contains(r#""deploymentId":"deployment-a""#));
         assert!(grant_body.contains(r#""lifecycleEpoch":1"#));
+    }
+
+    async fn assert_bootstrap_cleanup_after_attempt(stage: &str) {
+        let cancellation = CancellationToken::new();
+        let expires_at = now_ms() + 60_000;
+        let reply = |body: String| MockResponse::Http { status: 200, body };
+        let mut responses = vec![
+            reply(sandbox("ready")),
+            reply(r#"{"ok":false,"exitCode":1}"#.into()),
+            reply(format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{expires_at}}}"#)),
+        ];
+        match stage {
+            "uncertain-upload" => responses.push(MockResponse::HeadersThenClose),
+            "cancelled-upload" => responses.push(MockResponse::CancelThenClose(cancellation.clone())),
+            _ => {
+                responses.extend([
+                    reply(r#"{"ok":true}"#.into()),
+                    reply(r#"{"ok":true,"exitCode":0}"#.into()),
+                    reply(r#"{"ok":true,"runId":"existing-supervised-run","supervised":true}"#.into()),
+                ]);
+                responses.push(match stage {
+                    "cancelled-authority" => MockResponse::CancelThenClose(cancellation.clone()),
+                    "invalid-authority" => reply(host_authority("existing-grant", now_ms() - 1)),
+                    "reused-host" => reply(host_authority("existing-grant", expires_at)),
+                    _ => panic!("unknown bootstrap cleanup scenario"),
+                });
+            }
+        }
+        // Cleanup failure must not replace the original outcome or trigger launch replay.
+        responses.push(MockResponse::Http { status: 503, body: r#"{"error":"cleanup_unavailable"}"#.into() });
+        let (origin, mut captured) = mock_server_steps(responses).await;
+        let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
+        let runtime = test_runtime(
+            ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+            "https://comet-edge.example", Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(12), runtime.control(
+            ScaffoldEnvironmentControl::Attach { sandbox_id: "sandbox-a".into(), scope: scope() }, &cancellation,
+        )).await;
+        if result.is_err() {
+            captured.abort();
+            panic!("{stage}: cleanup did not preserve a bounded completion");
+        }
+        let result = result.unwrap();
+        match stage {
+            "uncertain-upload" => assert!(matches!(result, Err(ScaffoldError::Transport { .. }))),
+            "cancelled-upload" | "cancelled-authority" => assert!(matches!(result, Err(ScaffoldError::Cancelled))),
+            "invalid-authority" => assert!(matches!(result, Err(ScaffoldError::InvalidResponse(_)))),
+            "reused-host" => {
+                let result = result.unwrap();
+                assert_eq!(result.run_id.as_deref(), Some("existing-supervised-run"));
+                assert_eq!(result.control_grant.unwrap().id, "existing-grant");
+            }
+            _ => unreachable!(),
+        }
+        let requests = match tokio::time::timeout(Duration::from_secs(1), &mut captured).await {
+            Ok(requests) => requests.unwrap(),
+            Err(_) => {
+                captured.abort();
+                panic!("{stage}: no independent cleanup attempt after bootstrap upload attempt");
+            }
+        };
+        let upload = requests.iter().find(|request| request.starts_with("PUT ")).unwrap();
+        let target = upload.split_whitespace().nth(1).unwrap();
+        let path = Url::parse(&format!("http://fixture{target}")).unwrap()
+            .query_pairs().find(|(key, _)| key == "path").unwrap().1.into_owned();
+        let execs: Vec<Value> = requests.iter()
+            .filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "))
+            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        let removals: Vec<_> = execs.iter().filter(|body| body["argv"][0] == "rm").collect();
+        assert_eq!(removals.len(), 1, "{stage}: cleanup must target the attempted upload once");
+        assert_eq!(removals[0]["argv"], serde_json::json!(["rm", "-f", "--", path]));
+        assert_eq!(removals[0]["mode"], "inline");
+        assert!((1..=10_000).contains(&removals[0]["timeoutMs"].as_u64().unwrap()));
+        let expected_launches = usize::from(!stage.ends_with("upload"));
+        assert_eq!(execs.iter().filter(|body| body["mode"] == "background").count(), expected_launches);
+        assert_eq!(requests.iter().filter(|request| request.contains("/auth/device-grants ")).count(), 1);
+        assert!(execs.iter().all(|body| !body.to_string().contains("cg1.")));
+        assert!(!execs.iter().any(|body| matches!(body["argv"][0].as_str(), Some("kill" | "pkill" | "killall"))));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cleanup_uncertain_upload() {
+        assert_bootstrap_cleanup_after_attempt("uncertain-upload").await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cleanup_cancelled_upload() {
+        assert_bootstrap_cleanup_after_attempt("cancelled-upload").await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cleanup_cancelled_authority() {
+        assert_bootstrap_cleanup_after_attempt("cancelled-authority").await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cleanup_invalid_authority() {
+        assert_bootstrap_cleanup_after_attempt("invalid-authority").await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cleanup_reused_host() {
+        assert_bootstrap_cleanup_after_attempt("reused-host").await;
+    }
+
+    #[tokio::test]
+    async fn rejected_native_admission_cleans_bootstrap_without_launch_replay() {
+        for (status, rejection) in [
+            (200, serde_json::json!({"ok": false, "error": "exec_spawn_failed"})),
+            (409, serde_json::json!({"error": "crew_runtime_invalid"})),
+        ] {
+            let expires_at = now_ms() + 60_000;
+            let (origin, captured) = mock_server_with_status(vec![
+                (200, sandbox("ready")),
+                (200, r#"{"ok":false,"exitCode":1}"#.into()),
+                (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{expires_at}}}"#)),
+                (200, r#"{"ok":true}"#.into()),
+                (200, r#"{"ok":true,"exitCode":0}"#.into()),
+                (status, rejection.to_string()),
+                (200, r#"{"ok":true,"exitCode":0}"#.into()),
+            ]).await;
+            let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
+            let runtime = test_runtime(
+                ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+                "https://comet-edge.example", Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+            );
+            let error = runtime.control(ScaffoldEnvironmentControl::Attach {
+                sandbox_id: "sandbox-a".into(), scope: scope(),
+            }, &CancellationToken::new()).await.unwrap_err();
+            if status == 200 {
+                assert!(matches!(error, ScaffoldError::CometNotInstalled));
+            } else {
+                let api = error.api_error().unwrap();
+                assert_eq!((api.status, api.code.as_str()), (409, "crew_runtime_invalid"));
+            }
+            assert!(!error.to_string().contains("narrow_secret"));
+            let requests = captured.await.unwrap();
+            let execs: Vec<Value> = requests.iter()
+                .filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "))
+                .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+                .collect();
+            assert_eq!(execs.len(), 4); // Authority, private chmod, one admission, cleanup.
+            assert_eq!(execs.iter().filter(|body| body["mode"] == "background").count(), 1);
+            assert_eq!(execs[3]["argv"], serde_json::json!(["rm", "-f", "--", execs[2]["argv"][7]]));
+            assert!(execs.iter().all(|body| !body.to_string().contains("cg1.")));
+            assert_eq!(requests.iter().filter(|request| request.contains("/auth/device-grants ")).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_unsupervised_or_unidentified_launch_without_replay() {
+        for receipt in [
+            serde_json::json!({"ok": true, "runId": "generic-exec"}),
+            serde_json::json!({"ok": true, "runId": "generic-exec", "supervised": false}),
+            serde_json::json!({"ok": true, "supervised": true}),
+            serde_json::json!({"ok": true, "runId": "", "supervised": true}),
+            serde_json::json!({"ok": true, "runId": "  ", "supervised": true}),
+        ] {
+            let expires_at = now_ms() + 60_000;
+            let (origin, captured) = mock_server(vec![
+                sandbox("ready"),
+                r#"{"ok":false,"exitCode":1}"#.into(),
+                format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{expires_at}}}"#),
+                r#"{"ok":true}"#.into(),
+                r#"{"ok":true,"exitCode":0}"#.into(),
+                receipt.to_string(),
+                r#"{"ok":true,"exitCode":0}"#.into(), // Remove any unconsumed bootstrap.
+            ]).await;
+            let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
+            let runtime = test_runtime(
+                ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
+                "https://comet-edge.example", Arc::new(EdgeDeviceJoinGrantClient::new(&origin, bearer).unwrap()),
+            );
+            let result = runtime.control(ScaffoldEnvironmentControl::Attach {
+                sandbox_id: "sandbox-a".into(), scope: scope(),
+            }, &CancellationToken::new()).await;
+            assert!(matches!(result, Err(ScaffoldError::InvalidResponse(_))));
+            let requests = captured.await.unwrap();
+            assert_eq!(requests.iter().filter(|request| request.contains(r#""mode":"background""#)).count(), 1);
+            assert_eq!(requests.iter().filter(|request| request.contains("/auth/device-grants ")).count(), 1);
+            assert!(!requests.iter().any(|request| request.contains("/uploads")));
+            let execs: Vec<Value> = requests.iter()
+                .filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "))
+                .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+                .collect();
+            assert_eq!(execs.len(), 4);
+            assert_eq!(execs[3]["argv"], serde_json::json!(["rm", "-f", "--", execs[2]["argv"][7]]));
+            assert!(execs.iter().all(|body| !body.to_string().contains("cg1.")));
+        }
     }
 
     #[tokio::test]
@@ -4943,12 +4846,12 @@ mod tests {
             let (origin, captured) = mock_server(vec![
                 sandbox("ready"),
                 r#"{"ok":false,"exitCode":1}"#.into(),
-                r#"{"ok":true,"exitCode":0}"#.into(),
                 format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{expires_at}}}"#),
                 r#"{"ok":true}"#.into(),
                 r#"{"ok":true,"exitCode":0}"#.into(),
-                r#"{"ok":true,"runId":"run-a"}"#.into(),
+                r#"{"ok":true,"runId":"run-a","supervised":true}"#.into(),
                 confirmation,
+                r#"{"ok":true,"exitCode":0}"#.into(), // Cleanup preserves confirmation outcome.
             ]).await;
             let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
             let runtime = test_runtime(
@@ -4982,11 +4885,10 @@ mod tests {
         let (origin, captured) = mock_server(vec![
             sandbox("ready"),
             r#"{"ok":false,"exitCode":1}"#.into(),
-            r#"{"ok":true,"exitCode":0}"#.into(),
             format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{expires_at}}}"#),
             r#"{"ok":true}"#.into(),
             r#"{"ok":true,"exitCode":0}"#.into(),
-            r#"{"ok":true,"runId":"run-a"}"#.into(),
+            r#"{"ok":true,"runId":"run-a","supervised":true}"#.into(),
             r#"{"ok":false,"exitCode":1}"#.into(),
         ]).await;
         let token: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
@@ -5025,14 +4927,14 @@ mod tests {
             (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into()),
             (200, comet_sandbox("starting")),
             (200, r#"{"ok":false,"exitCode":1}"#.into()),
-            (200, r#"{"ok":true,"exitCode":0}"#.into()),
             (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#)),
             (200, r#"{"ok":true}"#.into()),
             (200, r#"{"ok":true,"exitCode":0}"#.into()),
-            (200, r#"{"ok":true,"runId":"run-a"}"#.into()),
+            (200, r#"{"ok":true,"runId":"run-a","supervised":true}"#.into()),
             (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
             (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
             (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at)),
+            (200, r#"{"ok":true,"exitCode":0}"#.into()), // Cleanup after confirmed attachment.
         ]).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(

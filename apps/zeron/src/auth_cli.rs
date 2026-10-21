@@ -233,7 +233,6 @@ mod tests {
             device: None,
             managed_inference: false,
             device_bootstrap_file: None,
-            scaffold_runtime_artifact: None,
         }
     }
 

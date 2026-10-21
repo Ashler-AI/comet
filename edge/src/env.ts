@@ -1,10 +1,14 @@
 export interface Env {
   AUTH_GRANTS: DurableObjectNamespace;
+  /** Native-only internal view: epoch coordinators reuse NATIVE_AUTH_GRANTS. */
+  NATIVE_GRANT_EPOCHS?: DurableObjectNamespace;
   ENVIRONMENT: string;
   SCAFFOLD_CONTROL_PLANE_URL: string;
   SCAFFOLD_PROJECT_SCOPE: string;
   SCAFFOLD_DEPLOYMENT_ID: string;
   SCAFFOLD_REQUIRED_CAPABILITIES: string;
+  /** Canonical native staging overrides the independent canary's v1 admission. */
+  SCAFFOLD_COMET_RUNTIME_VERSION?: "scaffold.comet-runtime.v1" | "scaffold.comet-runtime.v2";
   SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
   PREVIEW_ROOMS: DurableObjectNamespace;
@@ -14,9 +18,9 @@ export interface Env {
   /** chat2 session rooms (`chat2/{chatId}`) — dumb authenticated log relays
    * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
   CHAT_ROOMS: DurableObjectNamespace;
-  BLOBS: R2Bucket;
-  /** Isolated authenticated release artifacts; never an upstream or shared Crew bucket. */
-  RELEASES: R2Bucket;
+  BLOBS: Pick<R2Bucket, "get" | "head" | "put">;
+  /** Canary-only release storage. Canonical staging retains its legacy GCS reader. */
+  RELEASES?: R2Bucket;
   /** Scaffold resource-bound tokens, or local-only development credentials. */
   AUTH_MODE: string;
   /** APNs auth key (contents of AuthKey_XXXX.p8, wrangler secret) and its
