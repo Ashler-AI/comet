@@ -338,6 +338,44 @@ Independent native-provider review found no blocking correctness/security issues
 the specialized review provider was unavailable with HTTP 402. Local typechecks
 and unrelated lint were not run.
 
+Auth-only source `0e481e40e82050af1b6d0253b8abdbd2df493720` passed the private
+[artifact workflow](https://github.com/Ashler-AI/comet/actions/runs/39516859297)
+on macOS ARM64 and Linux x64/ARM64, including remote Edge and browser checks.
+All archive and Linux executable checksums and the strict macOS signature passed.
+The macOS executable SHA-256 is
+`53cadd856d06f017faaf610d9557b7b1e4ee221de192b20e21109baa5fca5078`.
+This auth-only candidate is installed and activated at `/Applications/Crew Canary.app`.
+Both controllers retained all 48 baseline chat IDs and their device/native-history
+identities. The sole locally working session at activation resumed on the same
+native history and produced new tool calls; its original user entry stayed singular.
+No user prompt was manually resent and no durable work was discarded.
+
+From `2026-10-21T01:15:12Z` through `01:17:12Z`, both controllers stayed
+connected/synced with zero additional workspace disconnects or verification
+429/503 entries. The host's existing durable backlog decreased from 5,852 to
+5,593 batches; Dev retained its parked jobs. Generic backend chat/registry HTTP
+503s recurred after `01:17:55Z`, outside that observation window. This fix removes
+redundant verification; it does not hide or claim to repair backend outages.
+The separate Unicode selection correction is not included in this installed candidate.
+
+The October 20 `23:50:10Z` installed-app crash was a separate markdown-selection
+panic: byte 33 split an em dash at bytes 31–34, then the non-unwinding native
+callback aborted the app. Relaunch automatically resumed all three interrupted
+native sessions; the reported `b818292b` conversation retained its native history,
+model and worktree and subsequently completed its deployment-monitoring report.
+Selection offsets retained across frames were only length-clamped when paired
+with newer text. Span producers now snap both endpoints to UTF-8 boundaries
+using the existing left-affinity policy; fully selected virtualized overlaps
+retain whole-element coverage after text changes. Copy still slices strictly.
+
+An isolated check against the prior source reproduced the exact byte-33 panic;
+all 12 updated selection regressions and the application build passed. The
+headed native fixture copied ` café — 中文 🙂 after` exactly, then copied
+`Doc command — the composer queues a durable run entry` across styled spans.
+Fresh screenshots showed selection highlighting without a crash; focus and the
+original clipboard were restored. Private artifact CI now runs this stdlib-only
+selection module on macOS and Linux, without adding a UI test framework.
+
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
 `30fff0f0f0d`, which passed [remote Worker/provider/vault CI](https://github.com/Ashler-AI/ashler-platform/actions/runs/38973661026),

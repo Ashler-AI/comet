@@ -73,6 +73,8 @@ jobs:
         run: scripts/package-linux.sh
       - name: Verify sandbox storage and native resume
         run: |
+          rustc --edition=2024 --test crates/ui/src/markdown/selection.rs -o "$RUNNER_TEMP/crew-selection-tests"
+          "$RUNNER_TEMP/crew-selection-tests"
           cargo test --locked --release -p zeron-sync --lib scaffold_auth::tests
           cargo test --locked --release -p zeron-client --lib auth::tests
           cargo test --locked --release -p zeron-engine --test scaffold_auth
@@ -114,6 +116,8 @@ jobs:
         run: scripts/package-macos.sh
       - name: Verify native recovery, routing and sandbox lifecycle
         run: |
+          rustc --edition=2024 --test crates/ui/src/markdown/selection.rs -o "$RUNNER_TEMP/crew-selection-tests"
+          "$RUNNER_TEMP/crew-selection-tests"
           cargo test --locked --release -p zeron-sync --lib scaffold_auth::tests
           cargo test --locked --release -p zeron-client --lib auth::tests
           cargo test --locked --release -p zeron-harness --test omp
