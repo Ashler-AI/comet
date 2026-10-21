@@ -344,7 +344,7 @@ on macOS ARM64 and Linux x64/ARM64, including remote Edge and browser checks.
 All archive and Linux executable checksums and the strict macOS signature passed.
 The macOS executable SHA-256 is
 `53cadd856d06f017faaf610d9557b7b1e4ee221de192b20e21109baa5fca5078`.
-This auth-only candidate is installed and activated at `/Applications/Crew Canary.app`.
+This auth-only candidate was installed and activated at `/Applications/Crew Canary.app`.
 Both controllers retained all 48 baseline chat IDs and their device/native-history
 identities. The sole locally working session at activation resumed on the same
 native history and produced new tool calls; its original user entry stayed singular.
@@ -356,7 +356,7 @@ connected/synced with zero additional workspace disconnects or verification
 5,593 batches; Dev retained its parked jobs. Generic backend chat/registry HTTP
 503s recurred after `01:17:55Z`, outside that observation window. This fix removes
 redundant verification; it does not hide or claim to repair backend outages.
-The separate Unicode selection correction is not included in this installed candidate.
+That candidate did not include the separate Unicode selection correction below.
 
 The October 20 `23:50:10Z` installed-app crash was a separate markdown-selection
 panic: byte 33 split an em dash at bytes 31–34, then the non-unwinding native
@@ -375,6 +375,41 @@ headed native fixture copied ` café — 中文 🙂 after` exactly, then copied
 Fresh screenshots showed selection highlighting without a crash; focus and the
 original clipboard were restored. Private artifact CI now runs this stdlib-only
 selection module on macOS and Linux, without adding a UI test framework.
+
+Unicode correction `adb989e8a2ab7d6fd752f9287f73b1892535f646` passed private
+[artifact CI](https://github.com/Ashler-AI/comet/actions/runs/39528473449) on macOS
+ARM64 and Linux x64/ARM64, including the 12 selection regressions and remote
+Edge/browser checks. All archive/Linux executable checksums and the strict macOS
+signature verified. The corrected app is installed at `/Applications/Crew Canary.app`,
+with executable SHA-256
+`8fc47da3aa2a8bbaf14805e3fedc4cbbae4b579918fb609e95e13f6b24019b92`.
+Canary Dev runs the signed local build of the same source. Both profiles retained
+all 51 baseline chat IDs, device/native-history identities, model/config and working
+directories; fresh native screenshots showed populated chat surfaces after activation.
+Shared release channels, Crew Staging, existing sandboxes and their runtime pins
+were unchanged. No durable queues were manually cleared.
+
+The installed-app restart cleanly interrupted the sole working local run
+`fc016733`: its four original entries and native identity remain, but the last
+assistant entry became aborted without automatic continuation. The native journal
+recorded `Interrupted by user` and `session_exit: sigterm`; Crew's journal ended
+in `Done(interrupted)`, which intentionally excludes it from crash recovery.
+Transport and control verification HTTP 429s plus backend 503s are separate from
+that recovery decision. The live `02:24:32Z`–`02:26:33Z` continuity observation
+failed its connected-state assertion; synchronized metadata at startup is not
+evidence of a stable connection. No clean post-activation sync window is claimed.
+
+Recovery used the existing composer `QueueCommand` path with one explicit
+continuation limited to already-authorized work, not a replay of the original
+request. Its first admission failed before native launch on Agent Auth HTTP 429.
+One retry five minutes later used a fresh command ID and the same message ID,
+preserving the single continuation entry and the visible first-attempt error.
+At `02:35:01Z`, the same native session `01a15b69-07ec-754c-b4d3-d9a345be5f2b`
+was producing fresh output; its original four entries, model/config and worktree
+were intact. Both profiles still held all 51 chat IDs. Dev had also reconciled one
+other sandbox chat's host from epoch 6 to epoch 8; no host assignment was edited.
+Both controllers were connected/synced at the final snapshot, but the failed
+observation window and remaining backlog still prevent a stable-sync claim.
 
 Native chat2 supervision is deployed only to the isolated canary. The missing
 native `session.sync.write` bootstrap capability is fixed in Platform
