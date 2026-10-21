@@ -124,7 +124,7 @@ beforeAll(async () => {
 beforeEach(() => {
   outbound = [];
   authorityEpoch = 1;
-  authorityVersion = "scaffold.comet-runtime.v2";
+  authorityVersion = "scaffold.comet-runtime.v1";
   delayedAuthority = undefined;
   mf = new Miniflare(options());
 });
@@ -311,20 +311,20 @@ it("serves only the exact retained GET/HEAD GCS release route without a new R2 f
   expect(outbound).toHaveLength(calls);
 });
 
-it("admits only a v2 authority profile for native grant issuance", async () => {
+it("admits the published v1 authority profile for archive-v2 native grant issuance and rejects unsupported versions", async () => {
   const scaffold = options();
   scaffold.bindings = { ...scaffold.bindings, AUTH_MODE: "scaffold" };
   await mf.setOptions(scaffold);
-  const request = { deploymentId: nativeScope, sandboxId: "sandbox", targetDeviceId: "sandbox-device", sessionId: randomUUID(), lifecycleEpoch: 1, capabilities: ["session.read", "session.sync.write"] };
+  const request = { deploymentId: nativeScope, sandboxId: "sandbox", targetDeviceId: "sandbox-device", sessionId: randomUUID(), lifecycleEpoch: 1, capabilities: nativeCapabilities };
   const auth = { authorization: "Bearer sc_rc_synthetic" };
-  for (const version of ["scaffold.comet-runtime.v1", "unsupported-runtime"]) {
+  for (const version of ["scaffold.comet-runtime.v2", "unsupported-runtime"]) {
     authorityVersion = version;
     const rejected = await http("/auth/device-grants", { ...post(request), headers: auth });
     expect(rejected.status).toBe(403);
     expect(await rejected.json()).toEqual({ error: "grant_target_forbidden" });
     expect(await mf.listDurableObjectIds("NativeAuthGrant")).toEqual([]);
   }
-  authorityVersion = "scaffold.comet-runtime.v2";
+  authorityVersion = "scaffold.comet-runtime.v1";
   const accepted = await http("/auth/device-grants", { ...post(request), headers: auth });
   expect(accepted.status).toBe(200);
   const { grant } = await accepted.json() as { grant: string };
@@ -338,7 +338,6 @@ it("retires epoch N native grants after authoritative epoch N+1 admission withou
   const scaffold = options();
   scaffold.bindings = { ...scaffold.bindings, AUTH_MODE: "scaffold" };
   await mf.setOptions(scaffold);
-  authorityVersion = "scaffold.comet-runtime.v2";
   authorityEpoch = 10;
   const sessionId = randomUUID();
   const target = { deploymentId: nativeScope, sandboxId: "sandbox", sessionId, capabilities: nativeCapabilities };

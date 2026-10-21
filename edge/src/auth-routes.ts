@@ -5,7 +5,7 @@ import { handleNativeGrantEpoch, nativeGrantEpoch, NATIVE_GRANT_ISSUER_HEADER, t
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const GRANT_TTL_MS = 15 * 60 * 1000;
 const ACCESS_TTL_MS = 12 * 60 * 60 * 1000;
-const SCAFFOLD_COMET_RUNTIME_VERSION = "scaffold.comet-runtime.v1";
+const SCAFFOLD_AUTHORITY_PROFILE_VERSION = "scaffold.comet-runtime.v1";
 
 interface GrantRecord extends NativeGrantEpoch {
   grantId: string;
@@ -69,7 +69,7 @@ export class AuthGrant implements DurableObject {
   private async handle(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const epochs = this.env.NATIVE_GRANT_EPOCHS;
-    if (this.env.SCAFFOLD_COMET_RUNTIME_VERSION === "scaffold.comet-runtime.v2" && !epochs) {
+    if ("NATIVE_GRANT_EPOCHS" in this.env && !epochs) {
       return json({ error: "epoch_authority_unavailable" }, 503);
     }
     if (epochs) {
@@ -378,11 +378,9 @@ const verifiedSandboxTarget = async (
   const profile = payload?.profile;
   const actorSubject =
     typeof profile?.actor?.sub === "string" ? profile.actor.sub.trim().toLowerCase() : "";
-  const runtimeVersion = env.SCAFFOLD_COMET_RUNTIME_VERSION ?? SCAFFOLD_COMET_RUNTIME_VERSION;
   if (
     payload?.ok !== true ||
-    (runtimeVersion !== "scaffold.comet-runtime.v1" && runtimeVersion !== "scaffold.comet-runtime.v2") ||
-    profile?.version !== runtimeVersion ||
+    profile?.version !== SCAFFOLD_AUTHORITY_PROFILE_VERSION ||
     actorSubject !== identity.userId ||
     typeof profile.projectId !== "string" ||
     profile.projectId !== requested.projectId ||

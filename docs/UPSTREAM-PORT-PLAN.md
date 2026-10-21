@@ -775,10 +775,12 @@ No production cutover is authorized.
 
 ### Canonical staging native runtime (0.2.115)
 
-`scaffold.comet-runtime.v2` packages the native binary with `crew-web` and the
+Archive compatibility `scaffold.comet-runtime.v2` packages the native binary with `crew-web` and the
 `crew.native.web.v1` contract. Platform installs and verifies the immutable archive;
 the controller no longer uploads or reinstalls a caller-selected runtime. Native
 DATA is `.scaffold/crew-data`, web assets are `.scaffold/crew/web`, and IPC is 39400.
+This archive version is not the authority wire schema: create, inspect and target
+proof retain Platform's independently versioned `scaffold.comet-runtime.v1` envelope.
 Attachment reuses matching live authority or makes one supervised launch, then
 confirms owner, scope, sandbox, device, epoch and capabilities. Every outcome after
 bootstrap upload is attempted gets one independent, bounded cleanup attempt;

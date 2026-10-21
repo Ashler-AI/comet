@@ -70,13 +70,21 @@
     "channelMutation": false,
     "releasesR2Binding": false
   },
+  "authorityProfile": {
+    "wireVersion": "scaffold.comet-runtime.v1",
+    "implementation": "src/auth-routes.ts fixed SCAFFOLD_AUTHORITY_PROFILE_VERSION; no environment override or accept-both admission",
+    "publishedPlatformCommit": "d9843237f17f1312559a4d7c654138d72fab8b2c",
+    "publishedPlatformSources": ["control-plane/worker/src/index.ts:10103", "control-plane/worker/src/index.ts:10161-10186", "control-plane/worker/src/index.ts:10205-10223", "control-plane/worker/src/index.ts:10314-10347", "native-crew-runner.mjs:51"],
+    "archiveCompatibility": "scaffold.comet-runtime.v2 is the independent archive/install/status marker, not the authority HTTP profile version",
+    "consumerCoverage": "test/staging/retention.test.ts uses published v1 profiles for native issuance and epoch retirement, rejecting v2 and unsupported profile versions; checks not run for this source correction"
+  },
   "nativeEpochFence": {
     "implementation": "src/native-grant-epoch.ts plus shared AuthGrant transitions in src/auth-routes.ts",
-    "namespace": "Existing NATIVE_AUTH_GRANTS only, exposed internally as activeNativeEnv.NATIVE_GRANT_EPOCHS; no new binding, class, resource or migration",
+    "namespace": "Existing NATIVE_AUTH_GRANTS only, exposed internally as activeNativeEnv.NATIVE_GRANT_EPOCHS; property presence requires the fence and an unavailable binding fails closed. No new binding, class, resource, migration or external configuration knob",
     "objectName": "native-epoch/<JSON tuple of verified ownerUserId, projectId, deploymentId, sessionId, logical sandboxId>",
     "storageKey": "native-epoch",
     "value": "Complete scope tuple plus monotonic lifecycleEpoch and exact targetDeviceId for that epoch; no bearer/access secret stored in coordinator",
-    "advanceAuthority": "Only server-verified profile issuance sets the internal issuer header after verifiedSandboxTarget and ownership checks. No public header is forwarded; direct dev issuance cannot pass verifiedSandboxTarget. Coordinator calls additionally require their deterministic scope object ID, never an ordinary 32-hex grant object ID.",
+    "advanceAuthority": "Only server-verified v1 profile issuance sets the internal issuer header after verifiedSandboxTarget and ownership checks. No public header is forwarded; direct dev issuance cannot pass verifiedSandboxTarget. Coordinator calls additionally require their deterministic scope object ID, never an ordinary 32-hex grant object ID.",
     "ordering": "AuthGrant blockConcurrencyWhile serializes coordinator compare/write operations. Higher verified epochs advance durably; lower epochs and equal-epoch conflicting devices fail closed. Per-grant issue rechecks after local storage so a concurrent newer issue cannot publish an older usable grant. Failed stores never roll the fence back.",
     "consumers": "Shared exchange/authenticate/refresh check the current fence before transitions and again after hash/storage awaits. Existing HTTP authentication and socket receive/silent-delivery revalidation inherit this rejection without per-endpoint guards. Missing/corrupt state or authority failures fail closed; checks never create authority.",
     "legacyPreservation": "Exact recovered legacy classes/raw env and independent canary do not enable this internal native-only view; their grant records, namespaces and alarms remain unchanged.",

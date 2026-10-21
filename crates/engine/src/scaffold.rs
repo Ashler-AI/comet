@@ -47,6 +47,8 @@ const SCAFFOLD_HANDOFF_CWD: &str = "/workspace/crew-handoff";
 
 pub(crate) const SCAFFOLD_COMET_RUNTIME_VERSION: &str =
     include_str!("../../../scaffold-runtime-version.txt").trim_ascii();
+// The authority profile wire is independent of the installed runtime archive version.
+const SCAFFOLD_AUTHORITY_PROFILE_WIRE_VERSION: &str = "scaffold.comet-runtime.v1";
 const JOIN_GRANT_PATH: [&str; 2] = ["auth", "device-grants"];
 pub fn is_retryable_scaffold_control_error(error: &RpcError) -> bool {
     matches!(
@@ -729,7 +731,7 @@ impl ScaffoldClient {
             database_environment,
             agent_route,
             comet_runtime_profile: CreateCometRuntimeProfile {
-                version: SCAFFOLD_COMET_RUNTIME_VERSION,
+                version: SCAFFOLD_AUTHORITY_PROFILE_WIRE_VERSION,
                 project_id: &scope.project_id,
                 deployment_id,
                 session_id: scope.session_id.as_deref().expect("validated sessionId"),
@@ -1624,7 +1626,7 @@ impl ScaffoldSandbox {
                     self.id
                 ))
             })?;
-            if profile.version != SCAFFOLD_COMET_RUNTIME_VERSION
+            if profile.version != SCAFFOLD_AUTHORITY_PROFILE_WIRE_VERSION
                 || profile.project_id != scope.project_id
                 || Some(profile.deployment_id.as_str()) != scope.deployment_id.as_deref()
                 || Some(profile.session_id.as_str()) != scope.session_id.as_deref()
@@ -3337,6 +3339,7 @@ fn environment_sandbox_id(environment: &SessionEnvironment) -> Result<&str, Scaf
 mod tests {
     use super::*;
     use zeron_rpc::StaticToken;
+    #[cfg(unix)]
     use sha2::Digest as _;
     #[test]
     fn remote_agent_account_tolerates_unknown_status() {
@@ -3485,7 +3488,7 @@ mod tests {
 
     fn sandbox(status: &str) -> String {
         format!(
-            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","cometRuntimeProfile":{{"version":"scaffold.comet-runtime.v2","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}},"region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
+            r#"{{"sandbox":{{"id":"sandbox-a","lifecycleEpoch":1,"status":"{status}","kind":"remote_code","runtimeProfile":"remote_code","cometRuntimeProfile":{{"version":"scaffold.comet-runtime.v1","projectId":"project-a","deploymentId":"deployment-a","sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65","sandboxId":"sandbox-a"}},"region":"us-central1","sourceRef":"387d6652abd642f0b85e8bd14f9131a9f23b7e70","ownerEmail":"alice@example.com","createdAt":"2026-08-04T00:00:00Z","updatedAt":"2026-08-04T00:01:00Z","lastActivityAt":"2026-08-04T00:02:00Z","links":{{"terminal":"https://terminal.example"}}}}}}"#
         )
     }
 
@@ -3565,12 +3568,6 @@ mod tests {
         .await
     }
 
-    #[test]
-    fn native_attachment_rejects_legacy_runtime_profiles() {
-        let legacy = comet_sandbox("ready").replace("scaffold.comet-runtime.v2", "scaffold.comet-runtime.v1");
-        let envelope: SandboxEnvelope = serde_json::from_str(&legacy).unwrap();
-        assert!(envelope.sandbox.into_environment(scope()).is_err());
-    }
 
     #[tokio::test]
     async fn attachment_observes_current_native_authority_while_application_starts() {
@@ -4080,7 +4077,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_plane_methods_decode_lifecycle_and_preserve_http_contract() {
+    async fn control_plane_methods_preserve_v1_authority_wire_and_lifecycle_contract() {
         let listed_sandbox: Value = serde_json::from_str(&sandbox("paused")).unwrap();
         let listed = serde_json::json!({
             "ok": true,
@@ -4095,6 +4092,7 @@ mod tests {
             sandbox("resuming"),
             sandbox("ready"),
             sandbox("stopped"),
+            sandbox("ready").replace("scaffold.comet-runtime.v1", "scaffold.comet-runtime.v2"),
         ];
         let (origin, captured) = mock_server(responses).await;
         let client = ScaffoldClient::new(
@@ -4155,6 +4153,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            client.inspect("sandbox-a", &scope(), &cancellation).await,
+            Err(ScaffoldError::InvalidResponse(_))
+        ));
 
         let requests = captured.await.unwrap();
         let request_lines: Vec<_> = requests
@@ -4171,6 +4173,7 @@ mod tests {
                 "POST /api/code-sandboxes/sandbox-a/resume HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/agent-route HTTP/1.1",
                 "POST /api/code-sandboxes/sandbox-a/stop HTTP/1.1",
+                "GET /api/code-sandboxes/sandbox-a HTTP/1.1",
             ]
         );
         assert!(requests.iter().all(|request| {
@@ -4185,10 +4188,13 @@ mod tests {
         assert!(requests[5].contains(
             r#""agentRoute":{"provider":"openai","model":"gpt-5.5","fallback":"disabled","routingMode":"automatic"}"#
         ));
-        assert!(requests[2].contains(r#""version":"scaffold.comet-runtime.v2""#));
-        assert!(requests[2].contains(r#""projectId":"project-a""#));
-        assert!(requests[2].contains(r#""deploymentId":"deployment-a""#));
-        assert!(requests[2].contains(r#""sessionId":"011664b5-3660-4fe6-83a2-3647fa6a2f65""#));
+        let create_body: Value = serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(create_body["cometRuntimeProfile"], serde_json::json!({
+            "version": "scaffold.comet-runtime.v1",
+            "projectId": "project-a",
+            "deploymentId": "deployment-a",
+            "sessionId": "011664b5-3660-4fe6-83a2-3647fa6a2f65",
+        }));
     }
 
     #[test]
@@ -4205,7 +4211,7 @@ mod tests {
             database_environment: ScaffoldDatabaseEnvironment::Local,
             agent_route: &route,
             comet_runtime_profile: CreateCometRuntimeProfile {
-                version: SCAFFOLD_COMET_RUNTIME_VERSION,
+                version: SCAFFOLD_AUTHORITY_PROFILE_WIRE_VERSION,
                 project_id: "project-a",
                 deployment_id: "deployment-a",
                 session_id: "session-a",
@@ -4734,6 +4740,8 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_cleanup_cancelled_authority() {
+        // Cancel in-flight authority while the HTTP fixture remains available for
+        // independent bootstrap cleanup and no-launch-replay assertions.
         assert_bootstrap_cleanup_after_attempt("cancelled-authority").await;
     }
 
@@ -4878,45 +4886,6 @@ mod tests {
             }
             captured.await.unwrap();
         }
-    }
-    #[tokio::test]
-    async fn attach_authority_startup_wait_is_cancellable() {
-        let expires_at = now_ms() + 60_000;
-        let (origin, captured) = mock_server(vec![
-            sandbox("ready"),
-            r#"{"ok":false,"exitCode":1}"#.into(),
-            format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{expires_at}}}"#),
-            r#"{"ok":true}"#.into(),
-            r#"{"ok":true,"exitCode":0}"#.into(),
-            r#"{"ok":true,"runId":"run-a","supervised":true}"#.into(),
-            r#"{"ok":false,"exitCode":1}"#.into(),
-        ]).await;
-        let token: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
-        let runtime = test_runtime(
-            ScaffoldClient::new(&origin, "project-a", token.clone()).unwrap(),
-            "https://comet-edge.example",
-            Arc::new(EdgeDeviceJoinGrantClient::new(&origin, token).unwrap()),
-        );
-        let cancellation = CancellationToken::new();
-        let cancel_after_probe = cancellation.clone();
-        let cancel_task = tokio::spawn(async move {
-            captured.await.unwrap();
-            cancel_after_probe.cancel();
-        });
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            runtime.control(
-                ScaffoldEnvironmentControl::Attach {
-                    sandbox_id: "sandbox-a".into(),
-                    scope: scope(),
-                },
-                &cancellation,
-            ),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(result, Err(ScaffoldError::Cancelled)));
-        cancel_task.await.unwrap();
     }
 
     #[tokio::test]

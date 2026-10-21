@@ -132,6 +132,15 @@ describe("scoped transport authority", () => {
 });
 
 describe("device grant lifecycle", () => {
+  it("fails closed when the native internal view has no epoch binding", async () => {
+    const ctx = { blockConcurrencyWhile: (fn: () => Promise<Response>) => fn() } as unknown as DurableObjectState;
+    const grant = new AuthGrant(ctx, { NATIVE_GRANT_EPOCHS: undefined } as unknown as Env);
+    for (const path of ["issue", "exchange", "refresh", "authenticate", "native-epoch/advance", "native-epoch/check"]) {
+      const response = await grant.fetch(new Request(`https://grant.internal/${path}`, { method: "POST" }));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ error: "epoch_authority_unavailable" });
+    }
+  });
   function setup() {
     const grants = new Map<string, AuthGrant>();
     const ns = { idFromName: (id: string) => id, get: (id: string) => {

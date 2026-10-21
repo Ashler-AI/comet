@@ -1,14 +1,12 @@
 export interface Env {
   AUTH_GRANTS: DurableObjectNamespace;
-  /** Native-only internal view: epoch coordinators reuse NATIVE_AUTH_GRANTS. */
+  /** Native-only internal view: presence requires the NATIVE_AUTH_GRANTS epoch fence. */
   NATIVE_GRANT_EPOCHS?: DurableObjectNamespace;
   ENVIRONMENT: string;
   SCAFFOLD_CONTROL_PLANE_URL: string;
   SCAFFOLD_PROJECT_SCOPE: string;
   SCAFFOLD_DEPLOYMENT_ID: string;
   SCAFFOLD_REQUIRED_CAPABILITIES: string;
-  /** Canonical native staging overrides the independent canary's v1 admission. */
-  SCAFFOLD_COMET_RUNTIME_VERSION?: "scaffold.comet-runtime.v1" | "scaffold.comet-runtime.v2";
   SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
   PREVIEW_ROOMS: DurableObjectNamespace;

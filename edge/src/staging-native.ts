@@ -41,7 +41,6 @@ export const activeNativeEnv = (raw: StagingEnv): Env => ({
   BLOBS: nativeBlobStore(raw.BLOBS),
   SCAFFOLD_PROJECT_SCOPE: "ashler-staging",
   SCAFFOLD_DEPLOYMENT_ID: "ashler-staging",
-  SCAFFOLD_COMET_RUNTIME_VERSION: "scaffold.comet-runtime.v2",
   SCAFFOLD_REQUIRED_CAPABILITIES: "session.read session.sync.write session.chat session.control session.annotate session.files session.environment",
   APNS_KEY_P8: raw.APNS_PRIVATE_KEY
 });
