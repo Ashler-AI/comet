@@ -1614,93 +1614,108 @@ delivery remains blocked on production Worker credentials; see
 [iOS release evidence](apps/ios/README.md#crew-0172--production-ios-10-5) and
 [notification setup](apps/ios/README.md#session-attention-notifications).
 
-## GitHub deployment setup
+## One-time staging retirement deployment
 
-The checked-in `edge/wrangler.jsonc` is the deployment contract. It defines isolated `staging` and `production` Worker, Durable Object, and R2 resources. It contains no Cloudflare account ID. Scaffold access uses verified Google Cloud IAP principals and environment-specific Scaffold project scope, independent of Ashler's customer-facing application stack.
+This disposable migration branch replaces only the existing
+`ashler-comet-edge-staging` Worker with a read-only retirement/export adapter.
+Its deployment contract is `edge/wrangler.migration-staging.jsonc`, **without
+`--env`**. It retains the existing custom domain
+`comet-staging.internal.ashler.com`, `SessionRoom`/`DeviceRoom`/`AuthGrant`
+namespaces, migration history, and private `ashler-comet-staging-blobs` bucket.
+There are no deleted classes or production deployment jobs. The separate native
+Worker and eventual domain transfer are not part of this publication.
 
-The staging contract uses `SCAFFOLD_CONTROL_PLANE_URL=https://scaffold-staging.internal.ashler.com` with `SCAFFOLD_PROJECT_SCOPE=ashler-staging`. Production uses `SCAFFOLD_CONTROL_PLANE_URL=https://scaffold.internal.ashler.com` with `SCAFFOLD_PROJECT_SCOPE=ashler-production`. These values live in the two checked-in Wrangler environments, not GitHub secrets or command-line overrides.
+The source baseline is `ae2e4a94d909a3036ec5608e349140d7fc3d5168`:
+[deployment run 38926146529](https://github.com/Ashler-AI/comet/actions/runs/38926146529)
+records Worker version `be220cb6-052c-4646-b92b-1401c8a29a50`, matching the observed
+legacy staging deployment. Publish the reviewed retirement changes on their own
+branch; do not merge this temporary adapter or its deployment workflow into the
+final native source tree.
 
-Create these GitHub environments:
+### Existing credential environments
 
-- `comet-staging`
-- `comet-release-staging`
-- `comet-release-production`, with required reviewers and deployment-branch protection for release tags
+The workflow reuses `comet-staging` for deployment and `comet-release-staging`
+for the private release reader. Both were inspected on 2026-10-21 with
+`protection_rules: []` and `deployment_branch_policy: null`: these are credential
+boundaries, **not enforced reviewer approval or branch restrictions**. Review
+and authorization of the exact SHA must precede dispatch; the input equality
+check does not itself prove that a human reviewed the code.
 
-Required reviewers and deployment-branch protection are recommended setup, not
-properties supplied by this workflow. As inspected on 2026-09-07,
-`comet-release-production` has `protection_rules: []` and
-`deployment_branch_policy: null`. It currently provides **no required-reviewer
-approval or branch restriction**. An authorized production dispatch can proceed
-without a review after its prerequisite jobs succeed.
+`comet-staging` retains its existing `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, and
+`GCP_SERVICE_ACCOUNT`, plus `GCP_PROJECT_ID`/`GCP_IAP_AUDIENCE` variables for the
+existing IAP credential check. The observed staging Cloudflare account is
+`dd15bb23eb5c14365fe2621acc049e01`; deployment must use that account.
 
-Add these environment-scoped deployment secrets to `comet-staging`:
+`comet-release-staging` supplies the existing Cloudflare token/account and
+`COMET_RELEASES_GCS_BUCKET`, `GCP_RELEASE_SERVICE_ACCOUNT_EMAIL`, and
+`GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY`. The staging-only secret helper uses
+the same retirement configuration without `--env`; missing or malformed reader
+credentials fail closed. Credentials are never embedded in artifacts or sent to
+installed clients. Do not provision replacement credentials or touch production
+secrets for this operation.
 
-- `CLOUDFLARE_API_TOKEN`: token limited to the Crew staging and production Worker, Durable Object, and R2 resources
-- `CLOUDFLARE_ACCOUNT_ID`: Cloudflare account selected at runtime, never checked in
-- `GCP_WORKLOAD_IDENTITY_PROVIDER`: GitHub Actions Workload Identity Provider
-- `GCP_SERVICE_ACCOUNT`: deploy service account email allowed to mint an IAP identity token
+### Reviewed manual dispatch
 
-Add `GCP_PROJECT_ID` and `GCP_IAP_AUDIENCE` as variables. The staging job
-uses this environment directly. The current production deploy reuses the same
-platform-scoped credentials only after the staged candidate digest and GCP
-project/provider assertions pass. Release-feed synchronization does not reuse
-that boundary: it enters the matching `comet-release-*` environment
-before either edge deployment.
+The branch-local `deploy.yml` has only `workflow_dispatch`; pushes and tags do
+not deploy. `target` accepts only `staging`. `reviewed_sha` must be a full lowercase
+40-character SHA equal to the dispatched workflow's `GITHUB_SHA` and checked-out
+HEAD. The tested candidate is sealed once and its digest/source/run provenance
+is checked before publishing those same bytes with the retirement configuration.
 
-The candidate job requires its TypeScript check on both push and manual triggers;
-there is no supported input to skip it. Builds, tests, staging verification and
-candidate-digest checks are also required.
-The notification release was integrated directly into main and deployed by
-[34141398021](https://github.com/Ashler-AI/comet/actions/runs/34141398021), with
-the existing desktop candidate promoted from main by
-[34141507706](https://github.com/Ashler-AI/comet/actions/runs/34141507706).
-
-Add these environment-scoped secrets to `comet-release-staging` and `comet-release-production`:
-
-- `GCP_WORKLOAD_IDENTITY_PROVIDER`
-- `GCP_SERVICE_ACCOUNT`
-- `COMET_RELEASES_GCS_BUCKET`
-
-Add `GCP_PROJECT_ID` as an environment-scoped variable to both. Use separate private buckets and identities. The publisher's bucket IAM must grant exactly the operations it preflights: `storage.buckets.get`, `storage.buckets.getIamPolicy`, `storage.objects.get`, `storage.objects.create`, and `storage.objects.delete`; scope object access to that environment's `releases/` prefix. Deployment and publication are disabled unless the repository owner is `Ashler-AI`. Production promotes the candidate accepted by staging and never creates a public GitHub Release or object.
-
-The deployed Crew edge release feed is synchronized by the **Deploy** workflow
-from the matching `comet-release-staging` or `comet-release-production`
-environment. Add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
-`GCP_RELEASE_SERVICE_ACCOUNT_EMAIL`, and
-`GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY` there alongside
-`COMET_RELEASES_GCS_BUCKET`. The reader service account is read-only on that
-environment's release bucket. When both reader credentials are absent, the
-workflow preserves the existing Worker secrets; a partial or malformed reader
-configuration fails before Wrangler runs. A complete configuration is applied
-with one bulk secret update. Do not provision release-feed credentials with a
-local `wrangler secret put`. Installed CLI and desktop clients send their
-renewable Crew login to the edge; GCS credentials never reach the device.
-
-## Deploy
-
-Pushes to `main` that change `edge/` deploy staging only. Run either path from GitHub's **Deploy** workflow, or with GitHub CLI:
-
-```bash
-gh workflow run deploy.yml -f target=staging
-gh workflow run deploy.yml -f target=production
+```sh
+gh workflow run deploy.yml --ref "$REVIEWED_RETIREMENT_BRANCH" \
+  -f target=staging -f reviewed_sha="$REVIEWED_RETIREMENT_SHA"
 ```
 
-The production command deploys staging first, then waits for the
-`comet-release-production` synchronization job and verifies the same candidate
-digest. A manual review is required **only when** the GitHub environment has
-required reviewers configured. With the current empty protection rules, this is
-job ordering and credential scoping, not an approval gate. Synchronization remains
-a prerequisite even when the reader credential pair is absent and it is a no-op.
-Do not deploy production locally; use `workflow_dispatch target=production`.
-For an authenticated local **staging** deployment:
+The branch must already contain the reviewed adapter, configuration, tests,
+smoke fixture/driver, workflow, and secret-helper changes. A branch advancing
+after review causes the SHA equality gate to fail; do not substitute a new SHA
+without review. No PR into old `main` is technically required by the observed
+environment branch policy. A dispatch of the unmodified legacy workflow would
+still select `wrangler.jsonc` and is **not** a retirement deployment.
 
-```bash
-cd edge
+For local candidate verification only, from `edge/`:
+
+```sh
 npm ci
-CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx wrangler deploy --env staging
+npm test -- src/migration-retirement.test.ts
+npx wrangler deploy --config wrangler.migration-staging.jsonc \
+  --dry-run --outdir "$RETIREMENT_CANDIDATE_DIR"
 ```
 
-Never reuse production credentials for the staging command.
+The real workerd/SQLite smoke uses synthetic data and a fresh local directory:
+
+```sh
+npx wrangler dev --local --config wrangler.migration-smoke.jsonc \
+  --ip 127.0.0.1 --port 28765 \
+  --persist-to "$(mktemp -d /tmp/crew-migration-smoke.XXXXXX)"
+# In a second terminal, from edge/:
+node scripts/migration-retirement-smoke.mjs http://127.0.0.1:28765
+```
+
+Stop the owned local Worker and remove only its synthetic persistence afterward.
+The smoke streams a source export larger than 128 MiB without buffering the full
+envelope and checks exact identity encoding, Content-Length, digest, unchanged
+original SQL tables, scope denial, and immutable retries.
+
+### Activation and retained source authority
+
+Activate a single 100% retirement version, never a gradual old/new split.
+[Cloudflare's storage-access uniqueness guarantee](https://developers.cloudflare.com/durable-objects/platform/known-issues/)
+fences replaced instances when they access storage. Rollout is eventually
+consistent: only a completed, durably persisted per-room export receipt counts
+as a freeze, not a deployment timestamp, health response, or repeated read.
+Do not roll back to writer code while frozen captures remain authoritative.
+
+The adapter preserves original tables and stores its freeze/export separately.
+Existing owner-authenticated s4 and explicitly unscoped s3 UUID exports remain
+distinct; ws4 exports attest shared project authority, not personal ownership.
+Coordinate migration IDs for desktop/cloud captures of the same s4 room before
+the first freeze. Retain verified raw exports, receipts, and referenced attachment
+bytes before the separately approved native domain transfer. Retain the old
+Worker's storage offline afterward; never delete old classes/data as part of the
+native cutover.
 
 ## Release
 
