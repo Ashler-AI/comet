@@ -858,6 +858,11 @@ fixture checks passed locally. Shallow history still yields no inert-bootstrap
 proof; complete authenticated backup/import and current-source remote CI remain
 separate cutover gates.
 
+The vendored memory benchmark parser uses comma-delimited number groups rather
+than ambiguous nested repetition. Its two CodeQL backtracking findings are fixed;
+the actual Deno parser rejected both 100,000-digit malformed log cases in under
+2 ms, with valid numeric results unchanged (benchmark subprocess stubbed).
+
 The earlier 0.2.114 integration source is merged; these follow-on repairs require
 current-source CI. Canonical staging activation follows the gate below.
 No production cutover is authorized.

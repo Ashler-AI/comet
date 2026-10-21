@@ -31,10 +31,10 @@ export async function run(task: string): Promise<Result> {
   try {
     // extract "2,555,555" from `dhat: At t-gmax: 2,555,555 bytes`
     const maxBytes = parseInt(
-      output.match(/dhat: At t-gmax:\s+((\d+,?)+) bytes/)![1].replace(/,/g, ""),
+      output.match(/dhat: At t-gmax:\s+(\d+(?:,\d+)*,?) bytes/)![1].replace(/,/g, ""),
     );
     const endBytes = parseInt(
-      output.match(/dhat: At t-end:\s+((\d+,?)+) bytes/)![1].replace(/,/g, ""),
+      output.match(/dhat: At t-end:\s+(\d+(?:,\d+)*,?) bytes/)![1].replace(/,/g, ""),
     );
     return {
       task,
