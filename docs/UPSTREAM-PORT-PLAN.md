@@ -38,6 +38,19 @@ The SQLite contention check covers deferred reclamation, retained data and resto
 write timeouts, not an aggregate open/reclaim wall-clock deadline. The macOS CI
 deadline failure did not establish a production busy-timeout defect.
 
+Follow-on fixtures await completed file indexing and distinguish terminated Linux
+catalog descendants from unreaped zombies, while still rejecting live children.
+Native watch reconciliation keeps its notification assertions; its completion
+bound allows measured 12–14 s FSEvents RPC work under parallel test load. The
+macOS job allows a cold build beyond the observed 45-minute cutoff without
+extending headed-fixture timeouts. Handoff bootstrap retirement now reports its
+blocked state on failure; the earlier timeout has no established runtime fix.
+The workerd suite bounds concurrent Miniflare/SQLite instances to two. Its
+300-wake test retains the 64-inflight acknowledgment boundary and durable
+retirement assertions; passive timing observed completion at 6.444 s, beyond
+the old five-second fixture deadline. All 41 workerd checks passed afterward
+without diagnostics, skipped cases or reduced in-test concurrency.
+
 Prior authenticated Apple metadata identified staging app `6808397041` with
 1.0 (36) Testing. Build 1.0 (37) is an unallocated candidate, not a freshly verified
 next upload: the 2026-10-21 metadata attempt redirected to login with

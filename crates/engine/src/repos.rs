@@ -3172,7 +3172,12 @@ tmpfs /run tmpfs rw 0 0
         query: &str,
         featured_paths: &[String],
     ) -> Result<Vec<FileSearchMatch>, EngineError> {
-        super::search_files_blocking(&WorkspaceSearch::new(), root, query, featured_paths)
+        let root = canonical_search_root(root)?;
+        let search = WorkspaceSearch::new();
+        search.warm(&root).unwrap();
+        // Assert search contents only after the scan, not its interactive wait budget.
+        assert!(search.wait_until_indexed(&root, Duration::from_secs(20)));
+        super::search_files_blocking(&search, &root, query, featured_paths)
     }
 
     #[test]

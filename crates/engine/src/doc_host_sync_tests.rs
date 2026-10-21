@@ -1004,7 +1004,29 @@ async fn interactive_handoff_prefers_an_unprotected_slot_over_a_view() {
         host.enqueue_wakeup(&format!("phase-{n}")).unwrap();
     }
     until(|| relay.joins.load(Ordering::SeqCst) == 3).await;
-    until(|| host.sync_resources()["retainedBy"]["connections"] == 0).await;
+    until_with_diagnostics(
+        || host.sync_resources()["retainedBy"]["connections"] == 0,
+        || {
+            let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
+            let phases: Vec<_> = handles.iter().map(|h| (
+                h.chat_id.clone(),
+                h.sync_started.load(Ordering::Acquire),
+                h.sync_background.load(Ordering::Acquire),
+                h.sync_protected(),
+                lock(&h.chat2).as_ref().map(|c| c.caught_up()),
+                store.has_pending_chat_updates(&h.chat_id),
+                store.sync_job_version(&h.chat_id, "wake"),
+            )).collect();
+            format!(
+                "resources={}\nclients={:?}\nphases (id, started, background, protected, caught_up, pending_updates, wake)={phases:?}\nrelay joins={} by_chat={:?} rows_requests={}",
+                host.sync_resources(),
+                host.sync_statuses(),
+                relay.joins.load(Ordering::SeqCst),
+                lock(&relay.joins_by_chat),
+                relay.rows_requests.load(Ordering::SeqCst),
+            )
+        },
+    ).await;
     let mut handles = Vec::new();
     let mut views = Vec::new();
     for n in 0..ACTIVE_SYNC_CAP {

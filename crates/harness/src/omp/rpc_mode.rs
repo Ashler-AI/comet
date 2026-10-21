@@ -1434,12 +1434,34 @@ exit "$1""#.into(),
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "catalog child was not reaped");
             assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
             let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+            // The shell exits without waiting for its startup child. Linux reparents
+            // that child to init, which may leave it as a zombie after cleanup.
+            // Require no live workload, not reaping by an unrelated process.
+            let descendant_is_live = || {
+                #[cfg(target_os = "linux")]
+                {
+                    match std::fs::read_to_string(format!("/proc/{descendant}/stat")) {
+                        Ok(stat) => stat.rsplit_once(')').expect("process stat comm").1
+                            .split_whitespace().next().expect("process stat state") != "Z",
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => panic!("cannot inspect startup child {descendant}: {error}"),
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // SAFETY: signal 0 only inspects this fixture process.
+                    if unsafe { libc::kill(descendant, 0) } == 0 {
+                        return true;
+                    }
+                    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                    false
+                }
+            };
             let deadline = Instant::now() + Duration::from_secs(2);
-            while unsafe { libc::kill(descendant, 0) } == 0 && Instant::now() < deadline {
+            while descendant_is_live() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            assert_eq!(unsafe { libc::kill(descendant, 0) }, -1, "startup child survived catalog exit");
-            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            assert!(!descendant_is_live(), "startup child {descendant} survived catalog exit");
         }
     }
 

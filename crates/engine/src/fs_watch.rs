@@ -621,9 +621,11 @@ mod tests {
         // Readiness is the applied watch set, not the batch worker's lifetime.
         // Like the synchronous tests, drive the real reconciliation directly;
         // keep blocking OS watcher calls off the async runtime.
+        // Native FSEvents RPCs contend in the parallel suite; this bounds
+        // fixture completion, not notification latency.
         let hub = hub.clone();
         tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(20),
             tokio::task::spawn_blocking(move || hub.apply()),
         )
         .await
