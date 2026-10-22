@@ -17,6 +17,28 @@ and [`dist/README.md`](../dist/README.md)'s import sequence do not authorize imp
 under this fresh-only scope. Candidate preparation is not live activation;
 Platform finalization is not successor compatibility or runtime acceptance.
 
+The immutable **0.2.116** candidate is published from
+`e291d9223c7290ea031ba4e221219ac28af348ba` by
+[release 39727427013, attempt 2](https://github.com/Ashler-AI/comet/actions/runs/39727427013)
+under `gs://ashler-comet-releases-staging/releases/0.2.116/`. Archive/raw Linux
+hashes and published metadata match the sealed candidate; both macOS distribution
+identities passed local signature/notarization and DMG/updater verification. The
+actual staging executable rejected inherited runtime routing and noninteractive
+login. All four staging latest-pointer generations remain unchanged.
+
+[Edge preparation 39727427275](https://github.com/Ashler-AI/comet/actions/runs/39727427275)
+sealed and verified the native/forward-retained pair from that same source; no
+Worker, channel, client or legacy store was activated or migrated. The first
+release attempt failed on an Apple CloudKit transport loss during ticket validation;
+the same-run failed-job retry succeeded without weakening signing gates.
+
+The post-merge Windows remote-wake check exposed a fixture race: its synthetic
+row could be admitted by background sync before manual ACK, creating unrelated
+chat2 publication work. The corrected fixture keeps enqueue/nudge/ACK synchronous
+before workers poll; retry, durable wake and restart assertions remain. Its focused
+local check passed. This qualification-only correction does not replace published
+0.2.116 runtime bytes or authorize activation.
+
 The earlier [0.2.115 candidate](https://github.com/Ashler-AI/comet/actions/runs/39643038860)
 was published immutably from `2aa451d1` without moving channels. These follow-on
 repairs use 0.2.116; they must not replace the already-published 0.2.115 objects.

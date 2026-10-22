@@ -216,7 +216,11 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Keep enqueue/nudge/ACK synchronous on one runtime thread: the row is
+    // already delivered before either background worker first polls. Otherwise
+    // the sync scheduler can discover the temporary row and bootstrap a chat2
+    // outbox, which this wake-only endpoint deliberately does not serve.
+    #[tokio::test(flavor = "current_thread")]
     async fn failed_remote_wake_survives_row_ack_and_host_restart() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let edge = format!("http://{}", listener.local_addr().unwrap());
@@ -242,8 +246,11 @@ mod tests {
                             break;
                         }
                     }
+                    let request = String::from_utf8_lossy(&request);
                     assert!(
-                        String::from_utf8_lossy(&request).starts_with("POST /device/remote/nudge ")
+                        request.starts_with("POST /device/remote/nudge "),
+                        "unexpected request: {}",
+                        request.lines().next().unwrap_or("<empty>")
                     );
                     count.fetch_add(1, Ordering::SeqCst);
                     let response = format!(
@@ -303,6 +310,10 @@ mod tests {
             !store.has_pending_chat_updates("outgoing").unwrap(),
             "row delivery and wake delivery are independent"
         );
+        assert!(
+            lock(&host.inner.handles).is_empty(),
+            "wake delivery must not open the acknowledged chat's room"
+        );
         host.shutdown_workers().await;
         workspace.flush();
         let attempts_before = attempts.load(Ordering::SeqCst);
@@ -335,6 +346,10 @@ mod tests {
         .await
         .expect("wake was not recovered after restart");
         assert!(attempts.load(Ordering::SeqCst) > attempts_before);
+        assert!(
+            lock(&restarted.inner.handles).is_empty(),
+            "wake recovery must not reopen the acknowledged chat's room"
+        );
         restarted.shutdown_workers().await;
         server.abort();
     }
