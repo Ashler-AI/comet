@@ -3,12 +3,12 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { validateReleaseCandidateReuse } from "./validate-release-candidate-reuse.mjs";
-import { releaseFeedSecrets, syncReleaseFeedSecrets } from "./sync-edge-release-feed-secrets.mjs";
+import { validateRetainedReleaseReaderBindings } from "./verify-staging-release-feed-secrets.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (relative) => readFile(path.join(root, relative), "utf8");
@@ -481,7 +481,7 @@ describe("release channel publication", () => {
 });
 
 describe("Crew edge deployment", () => {
-  it("rejects production dispatch before candidate or secret jobs can start", async (t) => {
+  it("rejects production dispatch before candidate or deployment jobs can start", async (t) => {
     const script = shellStep(await read(".github/workflows/deploy.yml"), "staging-scope", "target");
     const dir = scratch(t);
     for (const target of ["candidate", "staging", "production", "", "canary"]) {
@@ -504,77 +504,27 @@ describe("Crew edge deployment", () => {
     }
   });
 
-  const complete = {
-    CLOUDFLARE_API_TOKEN: "cloudflare-token",
-    CLOUDFLARE_ACCOUNT_ID: "cloudflare-account",
-    COMET_RELEASES_GCS_BUCKET: "private-releases",
-    GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: "reader@example.iam.gserviceaccount.com",
-    GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY:
-      "-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----",
-  };
-
-
-  it("rejects missing, partial or malformed configuration before upload", async () => {
-    for (const env of [
-      {},
-      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: "", GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: "" },
-      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: "" },
-      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: "" },
-      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: "invalid" },
-      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: "not-a-key" },
-      { ...complete, CLOUDFLARE_API_TOKEN: "" },
-      { ...complete, CLOUDFLARE_ACCOUNT_ID: "" },
-      { ...complete, COMET_RELEASES_GCS_BUCKET: "" },
-    ]) {
-      assert.throws(() => releaseFeedSecrets("staging", env));
-      let uploaded = false;
-      await assert.rejects(syncReleaseFeedSecrets("staging", env, {
-        upload: async () => { uploaded = true; },
-      }));
-      assert.equal(uploaded, false);
+  it("requires the three retained release-reader secret_text bindings", () => {
+    const bindings = [
+      "COMET_RELEASES_GCS_BUCKET",
+      "GCP_RELEASE_SERVICE_ACCOUNT_EMAIL",
+      "GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY",
+    ].map((name) => ({ name, type: "secret_text" }));
+    assert.doesNotThrow(() => validateRetainedReleaseReaderBindings([
+      ...bindings, { name: "UNRELATED_NOTIFICATION_SECRET", type: "secret_text" },
+    ]));
+    for (const binding of bindings) {
+      const others = bindings.filter((entry) => entry !== binding);
+      for (const invalid of [
+        others,
+        [...others, { name: binding.name, type: "plain_text" }],
+        [...bindings, binding],
+      ]) {
+        assert.throws(() => validateRetainedReleaseReaderBindings(invalid), /retained secret_text binding/);
+      }
     }
-  });
-
-  it("rejects production and unspecified targets before upload", async () => {
-    for (const target of ["production", undefined, ""]) {
-      assert.throws(() => releaseFeedSecrets(target, complete));
-      let uploaded = false;
-      await assert.rejects(syncReleaseFeedSecrets(target, complete, {
-        upload: async () => { uploaded = true; },
-      }));
-      assert.equal(uploaded, false);
-    }
-  });
-
-  it("uploads one complete atomic secret payload and cleans up on success or failure", async () => {
-    for (const fail of [false, true]) {
-      let uploaded;
-      let temporaryFile;
-      let count = 0;
-      const uploadError = new Error("upload unavailable");
-      const result = syncReleaseFeedSecrets("staging", complete, {
-        upload: async (_edgeDir, target, secretsFile) => {
-          count += 1;
-          temporaryFile = secretsFile;
-          assert.equal((await stat(secretsFile)).mode & 0o777, 0o600);
-          uploaded = { target, payload: JSON.parse(await readFile(secretsFile, "utf8")) };
-          if (fail) throw uploadError;
-        },
-      });
-      if (fail) await assert.rejects(result, error => error === uploadError);
-      else assert.equal(await result, true);
-      assert.equal(count, 1);
-      assert.deepEqual(uploaded, {
-        target: "staging",
-        payload: {
-          COMET_RELEASES_GCS_BUCKET: complete.COMET_RELEASES_GCS_BUCKET,
-          GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: complete.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL,
-          GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: complete.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY,
-        },
-      });
-      assert.equal(existsSync(temporaryFile), false);
-      assert.equal(existsSync(path.dirname(temporaryFile)), false);
-    }
+    assert.throws(() => validateRetainedReleaseReaderBindings({ result: bindings }),
+      /invalid staging secret-list metadata/);
   });
 });
 

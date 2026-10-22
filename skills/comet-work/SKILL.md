@@ -57,9 +57,9 @@ gh workflow run deploy.yml --repo Ashler-AI/comet --ref "${reviewed_ref:?Set the
   -f source_sha="${reviewed_sha:?Set the matching full commit SHA}" -f target=candidate
 ```
 
-Use `target=staging` only with explicit staging deployment authorization; this builds and verifies an immutable candidate before secret synchronization and deployment. Environment protection settings must be checked separately, not assumed to require reviewers. The workflow generates `edge/worker-configuration.d.ts` with `npm run types`, requires zero declaration diff, then runs typecheck and unit/workerd checks; native application bindings also live in `edge/src/env.ts`.
+Use `target=staging` only with explicit staging deployment authorization; this builds and verifies an immutable candidate, checks the existing canonical Worker's release-reader bindings, then deploys. Environment protection settings must be checked separately, not assumed to require reviewers. The workflow generates `edge/worker-configuration.d.ts` with `npm run types`, requires zero declaration diff, then runs typecheck and unit/workerd checks; native application bindings also live in `edge/src/env.ts`.
 
-The `comet-release-staging` environment must also bind `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `GCP_RELEASE_SERVICE_ACCOUNT_EMAIL` and `GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY` for Edge release-feed synchronization. The release reader is distinct from the OIDC publisher identity. Missing bindings fail before Worker deployment; successful candidate build/typecheck does not establish reader access.
+Edge deployment reuses `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` from the existing `comet-staging` environment. `scripts/verify-staging-release-feed-secrets.mjs` checks secret-list metadata and rejects missing, wrong-type or duplicate required bindings before deployment. `COMET_RELEASES_GCS_BUCKET`, `GCP_RELEASE_SERVICE_ACCOUNT_EMAIL` and `GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY` stay on the existing Worker; no reader values are copied into GitHub or synchronized again. Metadata presence is not proof of GCS access: use the existing client's `update --check` before and after cutover to exercise the retained authenticated release route. The reader remains distinct from the OIDC publisher identity.
 
 ## 4. Manual-verification stop
 
