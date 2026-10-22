@@ -107,6 +107,10 @@ private Actions artifacts with archive `SHA256SUMS`, raw Linux executable
 `COMET_SHA256SUMS`, and `provenance.json`, and has only `contents: read`.
 `COMET_SHA256SUMS` names the extracted archive-root `comet` file; its digest
 is the value for `COMET_SCAFFOLD_RUNTIME_SHA256`, not the archive digest.
+The isolated auth maintenance branch `crew/canary-agent-auth-fix-20261022` is
+also accepted by the same exact-SHA gate. Dispatch it with that explicit `--ref`;
+never move `crew/upstream-canary` backwards or include unrelated staging changes.
+
 It does not deploy, publish GitHub Releases, use shared release credentials, or
 change signed stable/staging channels. Dispatch the registered workflow after review:
 
@@ -140,3 +144,20 @@ checks and applicable updates through existing idle/update locks. Explicit
 per-agent Off and `COMET_UPDATE_HARNESSES=0|false|no` remain respected. OMP uses
 its native `omp update` and `can1357/oh-my-pi` release metadata, never Pi's npm
 installer. Local typechecks are intentionally not part of this workflow.
+
+## Managed authority verification
+
+The private runtime reuses the shared desktop/mobile `ScaffoldAuth` verifier:
+one credential-bound verification per 60-second freshness window, aged by both
+monotonic and wall clocks. Cold starts still verify; sign-out, profile changes
+and explicit rejection invalidate authority. Expired success is not an outage
+fallback. Concurrent transient failures share a 1–5-second cooldown; valid
+`Retry-After` dates or seconds set an uncapped minimum delay.
+
+Canary Edge still validates every protected request. It does not immediately
+retry HTTP 429 or responses carrying `Retry-After`; unavailable HTTP responses
+retain that header on the existing 503 contract. No quota or broker change is
+part of this fix. Existing profiles and independently pinned runtimes stay in
+place; verify each executable and runtime-artifact digest separately. A newer
+Mac build already carrying this verifier must not be downgraded to update an
+older Linux runtime pin.

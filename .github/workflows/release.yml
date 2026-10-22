@@ -25,7 +25,10 @@ jobs:
           REVIEWED_SHA: ${{ inputs.reviewed_sha }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = refs/heads/crew/upstream-canary
+          case "$GITHUB_REF" in
+            refs/heads/crew/upstream-canary|refs/heads/crew/canary-agent-auth-fix-20261022) ;;
+            *) exit 1 ;;
+          esac
           test "$REVIEWED_SHA" = "$GITHUB_SHA"
   edge-contracts:
     needs: approve-source
@@ -108,6 +111,12 @@ jobs:
         run: |
           cargo test --locked --release -p zeron-harness --test omp
           cargo test --locked --release -p zeron --test noop_browser
+      - name: Verify managed authority renewal and retry boundaries
+        run: |
+          cargo test --locked --release -p zeron-engine --test scaffold_auth --test auth
+          cargo test --locked --release -p zeron-engine --lib auth::tests
+          cargo test --locked --release -p zeron-sync --lib scaffold_auth::tests
+          cargo test --locked --release -p zeron-client --lib auth::tests
       - name: Record private artifact provenance
         run: |
           cd target/package

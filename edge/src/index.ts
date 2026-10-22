@@ -117,8 +117,10 @@ export default {
     }
     const result = await authenticateResult(env, request);
     if (result.status !== "authenticated") {
-      return json({ error: result.status === "invalid" ? "unauthenticated" : "authority_unavailable" },
+      const response = json({ error: result.status === "invalid" ? "unauthenticated" : "authority_unavailable" },
         result.status === "invalid" ? 401 : 503);
+      if (result.status === "unavailable" && result.retryAfter !== undefined) response.headers.set("retry-after", result.retryAfter);
+      return response;
     }
     const auth = result.identity;
     if (url.pathname === "/auth/session" && request.method === "GET") return json(auth);

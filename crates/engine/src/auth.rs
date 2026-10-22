@@ -256,8 +256,8 @@ struct AuthInner {
     /// Pending OAuth states plus the cancellation generation that fences code
     /// exchanges already in flight when sign-out occurs.
     sign_in: Mutex<SignInLifecycle>,
-    /// Single-flight refresh: WorkOS refresh tokens are single-use (rotated per
-    /// exchange); two concurrent refreshes would race and could revoke the session.
+    /// Single-flight refresh/verification. Rotating credentials must finish even
+    /// if an individual HTTP/WS consumer cancels its wait.
     refresh_gate: tokio::sync::Mutex<()>,
     refresh_flight: Mutex<Option<RefreshFlight>>,
     /// Failed refreshes are shared across every HTTP/WS token consumer, not
@@ -454,25 +454,30 @@ impl Auth {
         if changed { self.inner.token_tx.send_modify(|epoch| *epoch = epoch.wrapping_add(1)); }
     }
 
-    async fn scaffold_access_token(&self) -> Result<String, TokenError> {
-        let _gate = self.inner.refresh_gate.lock().await;
-        let helper = self.inner.scaffold.as_ref().ok_or_else(|| TokenError::TemporarilyUnavailable("Scaffold auth is not configured correctly".into()))?;
-        let generation = lock(&self.inner.sign_in).generation;
-        let current = lock(&self.inner.scaffold_session).clone();
+    /// Called only under refresh_gate; commit is fenced against sign-out and
+    /// credential/profile replacement by the same lifecycle as OAuth callbacks.
+    async fn scaffold_refresh_locked(&self) -> Result<Option<String>, ScaffoldError> {
+        let helper = self.inner.scaffold.as_ref().ok_or_else(|| ScaffoldError::Unavailable {
+            message: "Scaffold auth is not configured correctly".into(), retry_after: None,
+        })?;
+        let (generation, current) = {
+            let lifecycle = lock(&self.inner.sign_in);
+            (lifecycle.generation, lock(&self.inner.scaffold_session).clone())
+        };
         let result = match (&self.inner.config.device, current.as_ref()) {
             (Some(device), None) if generation == 0 && !device.join_grant.is_empty() => helper.exchange_device(device).await,
             (Some(device), Some(session)) => {
                 // Rotate early, including after suspend; never treat cs1 as a permanent user token.
                 if self.state().is_signed_in() && session.device.as_ref().is_some_and(|grant| grant.expires_at - chrono::Utc::now().timestamp_millis() > 6 * 60 * 60 * 1000) {
-                    return Ok(session.access_token.clone());
+                    return Ok(Some(session.access_token.clone()));
                 }
                 helper.refresh_device(session, device).await
             }
             (None, Some(session)) if !self.device_mode() => helper.verify(session).await,
-            _ => return Err(TokenError::SignedOut),
+            _ => return Ok(None),
         };
         let mut lifecycle = lock(&self.inner.sign_in);
-        if lifecycle.generation != generation { return Err(TokenError::SignedOut); }
+        if lifecycle.generation != generation { return Ok(None); }
         match result {
             Ok(session) => {
                 let token = session.access_token.clone();
@@ -483,16 +488,16 @@ impl Auth {
                     // Retain the rotated token in memory, but never complete bootstrap
                     // until its restart credential is durable.
                     *lock(&self.inner.scaffold_session) = Some(session);
-                    return Err(TokenError::TemporarilyUnavailable(error.to_string()));
+                    return Err(error);
                 }
                 self.install_scaffold_session(session);
-                Ok(token)
+                Ok(Some(token))
             }
             Err(ScaffoldError::Rejected) => {
                 self.clear_session(&mut lifecycle);
-                Err(TokenError::SignedOut)
+                Ok(None)
             }
-            Err(ScaffoldError::Unavailable(message)) => Err(TokenError::TemporarilyUnavailable(message)),
+            Err(error) => Err(error),
         }
     }
 
@@ -528,7 +533,22 @@ impl Auth {
     /// Dev mode: the configured user id. WorkOS: cached access token, refreshed when
     /// it has under 30s left.
     pub async fn access_token(&self) -> Result<String, TokenError> {
-        if self.scaffold_enabled() { return self.scaffold_access_token().await; }
+        if self.scaffold_enabled() {
+            let generation = lock(&self.inner.sign_in).generation;
+            let result = self.refresh(None).await;
+            let lifecycle = lock(&self.inner.sign_in);
+            // The helper owns verification freshness. Never hand a late flight's
+            // bearer/error to the replacement profile, even for the same token.
+            if lifecycle.generation != generation {
+                return if lock(&self.inner.scaffold_session).is_none() {
+                    Err(TokenError::SignedOut)
+                } else {
+                    Err(TokenError::TemporarilyUnavailable("session changed during verification; retry".into()))
+                };
+            }
+            return result.map_err(|error| TokenError::TemporarilyUnavailable(error.to_string()))?
+                .ok_or(TokenError::SignedOut);
+        }
         if self.inner.workos.is_none() {
             return if self.dev_enabled() && self.state().is_signed_in() { Ok(self.inner.config.dev_user_id.clone()) } else { Err(TokenError::SignedOut) };
         }
@@ -558,7 +578,7 @@ impl Auth {
     }
 
     /// Allow one fresh attempt after a connectivity hint or an explicit Retry.
-    /// Consumers still serialize on the refresh gate and share its outcome.
+    /// Managed verification uses the helper's independent, shared cooldown.
     pub fn retry_refresh(&self) {
         let mut retry = lock(&self.inner.refresh_retry);
         retry.generation = retry.generation.wrapping_add(1);
@@ -679,9 +699,10 @@ impl Auth {
             let generation = lock(&self.inner.sign_in).generation;
             let helper = self.inner.scaffold.as_ref().ok_or_else(|| EngineError::Other("Scaffold auth is not configured correctly".into()))?;
             let session = helper.complete_sign_in(pasted).await.map_err(|error| EngineError::Other(error.to_string()))?;
-            let lifecycle = lock(&self.inner.sign_in);
+            let mut lifecycle = lock(&self.inner.sign_in);
             if lifecycle.generation != generation { return Err(EngineError::Other("sign-in was canceled".into())); }
             zeron_sync::scaffold_auth::save_session(&self.inner.config.data_dir.join("scaffold-session.json"), &session).map_err(|error| EngineError::Other(error.to_string()))?;
+            lifecycle.generation = lifecycle.generation.wrapping_add(1);
             self.install_scaffold_session(session);
             return Ok(());
         }
@@ -969,6 +990,9 @@ impl Auth {
         organization_id: Option<&str>,
     ) -> Result<Option<String>, EngineError> {
         let _gate = self.inner.refresh_gate.lock().await;
+        if self.scaffold_enabled() {
+            return self.scaffold_refresh_locked().await.map_err(|error| EngineError::Other(error.to_string()));
+        }
         // Re-check under the gate: the refresh we queued behind may have done the work.
         if organization_id.is_none()
             && let Some(entry) = &*lock(&self.inner.access)
@@ -1491,6 +1515,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[tokio::test]
     async fn concurrent_dns_failure_is_shared_with_http_and_room_consumers() {

@@ -110,6 +110,48 @@ describe("scoped transport authority", () => {
     expect(result.status === "authenticated" && result.identity.userId).toBe(identity.userId);
     expect(fetcher.mock.calls[0][1].redirect).toBe("manual");
   });
+  it.each([
+    [429, undefined, "unavailable"],
+    [429, "120", "unavailable"],
+    [408, "120", "unavailable"],
+    [503, "Wed, 21 Oct 2037 07:28:00 GMT", "unavailable"],
+    [401, "120", "invalid"],
+    [403, "120", "invalid"]
+  ] as const)("does not retry upstream %s with Retry-After %s", async (status, retryAfter, expected) => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response("", { status, headers: retryAfter === undefined ? {} : { "retry-after": retryAfter } }))
+      .mockResolvedValueOnce(Response.json({ ok: true, actor: { sub: identity.userId, auth: "iap" }, resource: config.SCAFFOLD_CONTROL_PLANE_URL, scopes: ["remote_code:read"] }));
+    vi.stubGlobal("fetch", fetcher);
+    const result = await authenticateResult(config as Env, new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } }));
+    expect(result).toEqual(expected === "unavailable" && retryAfter !== undefined ? { status: expected, retryAfter } : { status: expected });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it.each([408, 500, 503, "network"] as const)("recovers once from %s and revalidates scope and resource on later requests", async (failure) => {
+    const session = { ok: true, actor: { sub: identity.userId, auth: "iap" }, resource: config.SCAFFOLD_CONTROL_PLANE_URL, scopes: ["remote_code:read"] };
+    const fetcher = vi.fn();
+    if (failure === "network") fetcher.mockRejectedValueOnce(new Error("network unavailable"));
+    else fetcher.mockResolvedValueOnce(new Response("", { status: failure }));
+    fetcher.mockResolvedValueOnce(Response.json(session))
+      .mockResolvedValueOnce(Response.json({ ...session, scopes: [] }))
+      .mockResolvedValueOnce(Response.json({ ...session, resource: "https://other.example" }));
+    vi.stubGlobal("fetch", fetcher);
+    const request = new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } });
+    const result = await authenticateResult(config as Env, request);
+    expect(result.status === "authenticated" && result.identity.userId).toBe(identity.userId);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await authenticateResult(config as Env, request)).toEqual({ status: "unavailable" });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(await authenticateResult(config as Env, request)).toEqual({ status: "unavailable" });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+  it.each([408, 503, "network"] as const)("bounds persistent %s recovery to two attempts", async (failure) => {
+    const fetcher = vi.fn();
+    if (failure === "network") fetcher.mockRejectedValue(new Error("network unavailable"));
+    else fetcher.mockResolvedValue(new Response("", { status: failure }));
+    vi.stubGlobal("fetch", fetcher);
+    expect(await authenticateResult(config as Env, new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } }))).toEqual({ status: "unavailable" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
   it("preserves backfill order with one check per batch and blocks later delivery after revocation", async () => {
     const fetcher = vi.fn().mockImplementation(async () => Response.json({ ok: true, actor: { sub: identity.userId, auth: "iap" }, resource: config.SCAFFOLD_CONTROL_PLANE_URL, scopes: ["remote_code:read"] }));
     vi.stubGlobal("fetch", fetcher);

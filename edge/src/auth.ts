@@ -40,7 +40,7 @@ export interface Verified {
 export type ScaffoldAuthenticationResult =
   | { status: "authenticated"; identity: Verified }
   | { status: "invalid" }
-  | { status: "unavailable" };
+  | { status: "unavailable"; retryAfter?: string };
 
 interface ScaffoldSession {
   readonly ok?: unknown;
@@ -133,7 +133,8 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): P
         redirect: "manual",
         signal: AbortSignal.timeout(SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS)
       });
-      if (response.status !== 408 && response.status !== 429 && response.status < 500) break;
+      // Never amplify throttling or retry before the authority's requested delay.
+      if (response.headers.has("retry-after") || (response.status !== 408 && response.status < 500)) break;
     } catch {
       response = undefined;
     }
@@ -142,7 +143,10 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): P
   // Only an explicit credential rejection is authoritative. Network errors,
   // other HTTP failures and malformed authority responses must not revoke state.
   if (response.status === 401 || response.status === 403) return { status: "invalid" };
-  if (!response.ok) return { status: "unavailable" };
+  if (!response.ok) {
+    const retryAfter = response.headers.get("retry-after");
+    return retryAfter === null ? { status: "unavailable" } : { status: "unavailable", retryAfter };
+  }
 
   let session: ScaffoldSession;
   try {

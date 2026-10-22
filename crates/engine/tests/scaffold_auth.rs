@@ -1,9 +1,18 @@
 //! Managed auth regression: cold launch, transient outages, revocation, and scope denial.
-use std::sync::{Arc, atomic::{AtomicU16, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering}};
+use parking_lot::Mutex;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeron_engine::{Auth, AuthConfig, AuthState};
 use zeron_rpc::TokenError;
 use zeron_sync::scaffold_auth::{save_session, ScaffoldConfig, ScaffoldIdentity, ScaffoldSession, DEFAULT_OAUTH_SCOPES};
+
+// Advance only between requests: paused Tokio auto-advance must not race real TCP.
+async fn elapse(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
 
 #[tokio::test]
 async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
@@ -47,6 +56,7 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     let bound = auth.for_profile_tokens();
     assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_test");
     status.store(503, Ordering::SeqCst);
+    elapse(Duration::from_secs(60)).await;
     assert!(matches!(auth.access_token().await, Err(TokenError::TemporarilyUnavailable(_))));
     let client = zeron_engine::scaffold::ScaffoldClient::new(&origin, "canary", bound).unwrap();
     let scope = zeron_proto::CollaborationScope {
@@ -63,6 +73,7 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     assert!(path.exists());
     assert_eq!(auth.verified_profile_key().as_deref(), Some(key.as_str()));
     status.store(401, Ordering::SeqCst);
+    elapse(Duration::from_secs(6)).await;
     assert_eq!(auth.access_token().await, Err(TokenError::SignedOut));
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert!(!path.exists());
@@ -158,4 +169,315 @@ async fn device_resume_enrolls_new_grant_and_restarts_preserve_its_authority() {
     assert_eq!(restarted.state(), AuthState::SignedOut);
     assert!(!std::fs::read_to_string(&path).unwrap().contains("cs1."));
     server.await.unwrap();
+}
+
+struct Authority {
+    control_status: AtomicU16,
+    edge_status: AtomicU16,
+    control_calls: AtomicUsize,
+    edge_calls: AtomicUsize,
+    retry_after: Mutex<String>,
+    replacement_user: Mutex<&'static str>,
+    hold: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+struct ManagedServer {
+    origin: String,
+    state: Arc<Authority>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ManagedServer {
+    fn drop(&mut self) { self.task.abort(); }
+}
+
+impl ManagedServer {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Authority {
+            control_status: AtomicU16::new(200), edge_status: AtomicU16::new(200),
+            control_calls: AtomicUsize::new(0), edge_calls: AtomicUsize::new(0),
+            retry_after: Mutex::new(String::new()), replacement_user: Mutex::new("replacement"),
+            hold: AtomicBool::new(false), entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(),
+        });
+        let server_state = state.clone();
+        let resource = origin.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let state = server_state.clone();
+                let resource = resource.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut chunk = [0; 8192];
+                        let size = stream.read(&mut chunk).await.unwrap();
+                        assert!(size > 0);
+                        request.extend_from_slice(&chunk[..size]);
+                        if request.windows(4).any(|part| part == b"\r\n\r\n") { break; }
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let user = if request.contains("Bearer sc_rc_new") {
+                        *state.replacement_user.lock()
+                    } else { "original" };
+                    let scopes: Vec<_> = DEFAULT_OAUTH_SCOPES.split_whitespace().collect();
+                    let mut code = 200;
+                    let body = match path {
+                        "/api/code-sandboxes/auth/session" => {
+                            assert!(request.contains("Bearer sc_rc_"));
+                            state.control_calls.fetch_add(1, Ordering::SeqCst);
+                            code = state.control_status.load(Ordering::SeqCst);
+                            if state.hold.swap(false, Ordering::SeqCst) {
+                                state.entered.notify_one();
+                                state.release.notified().await;
+                            }
+                            serde_json::json!({"ok":true,"resource":resource,"actor":{"sub":user,"auth":"iap"},"scopes":scopes})
+                        }
+                        "/auth/session" => {
+                            state.edge_calls.fetch_add(1, Ordering::SeqCst);
+                            code = state.edge_status.load(Ordering::SeqCst);
+                            serde_json::json!({"userId":user,"email":format!("{user}@example.com"),"projectScope":"canary","credential":"scaffold","capabilities":["session.read"]})
+                        }
+                        "/.well-known/oauth-protected-resource" => serde_json::json!({"resource":resource,"authorization_servers":[resource],"scopes_supported":scopes}),
+                        "/.well-known/oauth-authorization-server" => serde_json::json!({"issuer":resource,"authorization_endpoint":format!("{resource}/authorize"),"token_endpoint":format!("{resource}/token"),"registration_endpoint":format!("{resource}/register"),"code_challenge_methods_supported":["S256"]}),
+                        "/register" => serde_json::json!({"client_id":"test-client"}),
+                        "/token" => serde_json::json!({"access_token":"sc_rc_new","token_type":"Bearer","scope":DEFAULT_OAUTH_SCOPES,"resource":resource}),
+                        _ => panic!("unexpected auth path: {path}"),
+                    }.to_string();
+                    let retry = state.retry_after.lock().clone();
+                    let header = if retry.is_empty() { String::new() } else { format!("Retry-After: {retry}\r\n") };
+                    stream.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{header}Connection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+            }
+        });
+        Self { origin, state, task }
+    }
+
+    fn auth(&self, dir: &std::path::Path) -> Auth {
+        save_session(&dir.join("scaffold-session.json"), &ScaffoldSession {
+            access_token: "sc_rc_old".into(), resource: self.origin.clone(), edge_origin: self.origin.clone(), device: None,
+            identity: ScaffoldIdentity { user_id: "original".into(), email: "original@example.com".into(), name: None, project_scope: "canary".into(), capabilities: vec!["session.read".into()], deployment_id: None },
+        }).unwrap();
+        let mut config = AuthConfig::new(&self.origin, dir);
+        config.scaffold = Some(ScaffoldConfig::new(&self.origin, &self.origin, "canary"));
+        Auth::new(config)
+    }
+
+    fn calls(&self) -> (usize, usize) {
+        (self.state.control_calls.load(Ordering::SeqCst), self.state.edge_calls.load(Ordering::SeqCst))
+    }
+}
+
+async fn consumers(auth: &Auth) -> Vec<Result<String, TokenError>> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(20));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let auth = auth.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move { barrier.wait().await; zeron_rpc::TokenSource::token(&auth).await });
+    }
+    let mut results = Vec::new();
+    while let Some(result) = tasks.join_next().await { results.push(result.unwrap()); }
+    results
+}
+
+async fn replace_credential(auth: &Auth) {
+    let authorize = reqwest::Url::parse(&auth.start_sign_in().await.unwrap()).unwrap();
+    let state = authorize.query_pairs().find(|(key, _)| key == "state").unwrap().1.into_owned();
+    auth.complete_sign_in(&format!("{state}.test-code")).await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_concurrent_and_sequential_consumers_share_bounded_verification() {
+    let server = ManagedServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.auth(dir.path());
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(auth.verified_profile_key().is_none());
+    assert!(consumers(&auth).await.iter().all(|result| result.as_deref() == Ok("sc_rc_old")));
+    let bound = auth.for_profile_tokens();
+    for _ in 0..20 { assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_old"); }
+    assert_eq!(server.calls(), (1, 1));
+    elapse(Duration::from_secs(50)).await;
+    assert_eq!(auth.access_token().await.unwrap(), "sc_rc_old");
+    assert_eq!(server.calls(), (1, 1));
+    elapse(Duration::from_secs(10)).await;
+    assert!(consumers(&auth).await.iter().all(Result::is_ok));
+    assert_eq!(server.calls(), (2, 2));
+}
+
+#[tokio::test]
+async fn managed_429_and_503_share_retry_after_and_resume_after_cooldown() {
+    for edge_failure in [false, true] {
+        let server = ManagedServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = server.auth(dir.path());
+        // One case starts unverified; the other proves expired success is not grace.
+        if edge_failure {
+            auth.access_token().await.unwrap();
+            elapse(Duration::from_secs(60)).await;
+            server.state.edge_status.store(503, Ordering::SeqCst);
+            *server.state.retry_after.lock() = (chrono::Utc::now() + chrono::TimeDelta::seconds(30)).to_rfc2822();
+        } else {
+            server.state.control_status.store(429, Ordering::SeqCst);
+            *server.state.retry_after.lock() = "30".into();
+        }
+        let results = consumers(&auth).await;
+        assert!(matches!(&results[0], Err(TokenError::TemporarilyUnavailable(_))));
+        assert!(results.iter().all(|result| result == &results[0]));
+        let calls = if edge_failure { (2, 2) } else { (1, 0) };
+        assert_eq!(server.calls(), calls);
+        assert!(dir.path().join("scaffold-session.json").exists());
+        assert_eq!(auth.state().is_signed_in(), edge_failure);
+        server.state.control_status.store(200, Ordering::SeqCst);
+        server.state.edge_status.store(200, Ordering::SeqCst);
+        auth.retry_refresh(); // connectivity hints must not defeat Retry-After
+        elapse(Duration::from_secs(20)).await;
+        assert_eq!(auth.access_token().await, results[0]);
+        assert_eq!(server.calls(), calls);
+        elapse(Duration::from_secs(11)).await;
+        assert!(consumers(&auth).await.iter().all(Result::is_ok));
+        assert_eq!(server.calls(), (calls.0 + 1, calls.1 + 1));
+        assert!(auth.state().is_signed_in());
+    }
+}
+
+#[tokio::test]
+async fn managed_signout_fences_inflight_success_and_failure() {
+    for status in [200, 429, 503] {
+        let server = ManagedServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = server.auth(dir.path());
+        auth.access_token().await.unwrap();
+        elapse(Duration::from_secs(60)).await;
+        server.state.control_status.store(status, Ordering::SeqCst);
+        server.state.hold.store(true, Ordering::SeqCst);
+        let pending = tokio::spawn({ let auth = auth.clone(); async move { auth.access_token().await } });
+        server.state.entered.notified().await;
+        auth.sign_out();
+        server.state.release.notify_one();
+        assert_eq!(pending.await.unwrap(), Err(TokenError::SignedOut));
+        assert_eq!(auth.access_token().await, Err(TokenError::SignedOut));
+        assert_eq!(auth.state(), AuthState::SignedOut);
+        assert!(auth.verified_profile_key().is_none());
+        assert!(!dir.path().join("scaffold-session.json").exists());
+        server.state.control_status.store(200, Ordering::SeqCst);
+        replace_credential(&auth).await;
+        assert_eq!(auth.access_token().await.unwrap(), "sc_rc_new");
+    }
+}
+
+#[tokio::test]
+async fn managed_replacement_fences_old_success_rejection_and_cooldown() {
+    for status in [200, 401, 503] {
+        for user in ["original", "replacement"] {
+            let server = ManagedServer::start().await;
+            *server.state.replacement_user.lock() = user;
+            let dir = tempfile::tempdir().unwrap();
+            let auth = server.auth(dir.path());
+            auth.access_token().await.unwrap();
+            let bound = auth.for_profile_tokens();
+            elapse(Duration::from_secs(60)).await;
+            server.state.control_status.store(status, Ordering::SeqCst);
+            server.state.hold.store(true, Ordering::SeqCst);
+            let pending = auth.access_token();
+            tokio::pin!(pending);
+            tokio::select! {
+                _ = server.state.entered.notified() => {},
+                result = &mut pending => panic!("verification escaped held response: {result:?}"),
+            }
+            server.state.release.notify_one();
+            // Let the detached flight finish, but leave this consumer unpolled
+            // until OAuth replaces its credential/profile. Its old result must
+            // not be returned as authority or revoke the replacement.
+            let _ = auth.access_token().await;
+            server.state.control_status.store(200, Ordering::SeqCst);
+            replace_credential(&auth).await;
+            assert!(matches!(pending.await, Err(TokenError::TemporarilyUnavailable(_))));
+            assert_eq!(auth.user_id().as_deref(), Some(user));
+            let result = zeron_rpc::TokenSource::token(bound.as_ref()).await;
+            if user == "original" { assert_eq!(result.unwrap(), "sc_rc_new"); }
+            else { assert_eq!(result, Err(TokenError::SignedOut)); }
+            elapse(Duration::from_secs(60)).await;
+            assert_eq!(auth.access_token().await.unwrap(), "sc_rc_new");
+            assert!(dir.path().join("scaffold-session.json").exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_cancelled_consumer_does_not_cancel_shared_verification() {
+    let server = ManagedServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.auth(dir.path());
+    server.state.hold.store(true, Ordering::SeqCst);
+    let pending = tokio::spawn({ let auth = auth.clone(); async move { auth.access_token().await } });
+    server.state.entered.notified().await;
+    pending.abort();
+    server.state.release.notify_one();
+    assert_eq!(auth.access_token().await.unwrap(), "sc_rc_old");
+    assert_eq!(server.calls(), (1, 1));
+}
+
+#[tokio::test]
+async fn managed_explicit_rejection_clears_cached_authority() {
+    for edge_failure in [false, true] {
+        let server = ManagedServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = server.auth(dir.path());
+        auth.access_token().await.unwrap();
+        let bound = auth.for_profile_tokens();
+        elapse(Duration::from_secs(60)).await;
+        if edge_failure { server.state.edge_status.store(403, Ordering::SeqCst); }
+        else { server.state.control_status.store(401, Ordering::SeqCst); }
+        assert!(consumers(&auth).await.iter().all(|result| *result == Err(TokenError::SignedOut)));
+        let calls = server.calls();
+        server.state.control_status.store(200, Ordering::SeqCst);
+        server.state.edge_status.store(200, Ordering::SeqCst);
+        assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await, Err(TokenError::SignedOut));
+        assert_eq!(server.calls(), calls);
+        assert_eq!(auth.state(), AuthState::SignedOut);
+        assert!(auth.verified_scope().is_none());
+        assert!(!dir.path().join("scaffold-session.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn managed_headerless_failures_share_local_backoff() {
+    for status in [429, 503] {
+        let server = ManagedServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = server.auth(dir.path());
+        server.state.control_status.store(status, Ordering::SeqCst);
+        let failures = consumers(&auth).await;
+        assert!(matches!(&failures[0], Err(TokenError::TemporarilyUnavailable(_))));
+        assert!(failures.iter().all(|failure| failure == &failures[0]));
+        assert_eq!(auth.access_token().await, failures[0]);
+        assert_eq!(server.calls(), (1, 0));
+        server.state.control_status.store(200, Ordering::SeqCst);
+        elapse(Duration::from_secs(6)).await;
+        assert!(consumers(&auth).await.iter().all(Result::is_ok));
+        assert_eq!(server.calls(), (2, 1));
+    }
+}
+
+#[tokio::test]
+async fn managed_replacement_clears_previous_retry_window() {
+    let server = ManagedServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.auth(dir.path());
+    server.state.control_status.store(429, Ordering::SeqCst);
+    *server.state.retry_after.lock() = "600".into();
+    assert!(matches!(auth.access_token().await, Err(TokenError::TemporarilyUnavailable(_))));
+    server.state.control_status.store(200, Ordering::SeqCst);
+    replace_credential(&auth).await;
+    assert_eq!(auth.user_id().as_deref(), Some("replacement"));
+    assert_eq!(server.calls(), (2, 1));
+    elapse(Duration::from_secs(60)).await;
+    assert_eq!(auth.access_token().await.unwrap(), "sc_rc_new");
+    assert_eq!(server.calls(), (3, 2));
 }

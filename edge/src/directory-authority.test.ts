@@ -48,3 +48,19 @@ it("reads existing chat2 ownership, strips forged claims, and fails closed", asy
     headers: { authorization: "Bearer sc_rc_test" },
   }), config)).status).toBe(410);
 });
+
+it.each([429, 503, 401, 403])("preserves the auth HTTP contract for upstream %s without immediate retry", async (status) => {
+  for (const retryAfter of ["120", "Wed, 21 Oct 2037 07:28:00 GMT"]) {
+    const fetcher = vi.fn().mockResolvedValue(new Response("", { status, headers: { "retry-after": retryAfter } }));
+    vi.stubGlobal("fetch", fetcher);
+    const response = await worker.fetch(new Request("https://edge.example/auth/session", {
+      headers: { authorization: "Bearer sc_rc_test" },
+    }), env);
+    const rejected = status === 401 || status === 403;
+    expect(response.status).toBe(rejected ? 401 : 503);
+    expect(await response.json()).toEqual({ error: rejected ? "unauthenticated" : "authority_unavailable" });
+    expect(response.headers.get("retry-after")).toBe(rejected ? null : retryAfter);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  }
+});
