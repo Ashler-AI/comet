@@ -76,8 +76,11 @@ def main():
         if len(extensions) != 1:
             raise ValueError("Expected exactly the upstream LiveActivity extension")
         receipt["extension"] = verify(extensions[0], BUNDLE + ".LiveActivity", build)
+        digest = hashlib.sha256()
         with ipa.open("rb") as source:
-            receipt["sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        receipt["sha256"] = digest.hexdigest()
         print(json.dumps(receipt, indent=2))
 
 

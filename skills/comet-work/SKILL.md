@@ -31,9 +31,9 @@ gh workflow run release.yml --repo Ashler-AI/comet --ref main \
 
 Wait for that run to succeed and record its run ID as `candidate_run_id`. This phase publishes only `releases/0.2.116/*` in the private staging bucket; it does not move channel/installer aliases, latest pointers or Scaffold pins. Signature, checksum, provenance and bucket-privacy gates still apply. `unchanged` here is not a claim that the new runtime is deployed: candidate-only publication stops before the deployment acknowledgement guard.
 
-Use the verified immutable versioned manifest and Linux archive tuple to deploy compatible staging Platform support and complete its required migration. Verify the resulting runtime/admission/browser contracts before advancing Crew channels. Preserve existing snapshots and profile/wire v1; do not redirect them blindly to the new runtime.
+Use the verified immutable versioned manifest and Linux archive tuple to deploy compatible staging Platform support. For a fresh-only rollout, activate only a new empty controller root after ordinary successor compatibility and the full rollback baseline are verified; retain existing stores and do not import profiles or claim a legacy-writer barrier. Migration is a separate, explicitly authorized operation. Verify the resulting runtime/admission/browser contracts before advancing Crew channels. Preserve existing snapshots and profile/wire v1; do not redirect them blindly to the new runtime.
 
-Only after those Platform deployment/migration checks succeed, promote the exact successful candidate without rebuilding or re-signing:
+Only after those Platform deployment and scope-specific activation checks succeed, promote the exact successful candidate without rebuilding or re-signing:
 
 ```sh
 gh workflow run release.yml --repo Ashler-AI/comet --ref main \

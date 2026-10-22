@@ -2,16 +2,20 @@
 
 ## Current delivery: staging native cutover 0.2.116
 
-The staging cutover replaces the maintained legacy implementation with this
-upstream-based source. Production deployment, release channels and profiles remain
-unchanged. The earlier Canary-only constraints below describe historical testing,
-not the current staging authorization.
+The authorized cutover is **fresh-only, no migration**, limited to shared Scaffold
+staging and matched Crew staging. Preserve existing stores, sessions and identities;
+production, permission changes and provider-safety bypass remain unauthorized.
+The migration procedures below describe a separately authorized retained-history
+cutover, not prerequisites to creating an isolated fresh controller/session and
+not permission to import, stop old writers or retire their records.
 
-Publish an immutable `staging-candidate` first; deploy compatible staging services,
-establish authoritative old-writer fences and verify retained-history migration,
-then activate the native runtime and promote the exact candidate. Follow
-[`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md); candidate publication
-alone is not activation or a successful migration.
+Publish an immutable `staging-candidate` first, obtain ordinary successor Platform
+compatibility and its full baseline, then coordinate native Edge/client activation
+and exact-candidate promotion. Follow the release/signature/auth gates in
+[`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md); its migration sequence
+and [`dist/README.md`](../dist/README.md)'s import sequence do not authorize imports
+under this fresh-only scope. Candidate preparation is not live activation;
+Platform finalization is not successor compatibility or runtime acceptance.
 
 The earlier [0.2.115 candidate](https://github.com/Ashler-AI/comet/actions/runs/39643038860)
 was published immutably from `2aa451d1` without moving channels. These follow-on
@@ -76,15 +80,25 @@ completed at 22:26:36, followed by identity-resolution 503s. Read-only checks
 confirmed matching canonical/Canary identities and retained native history.
 The platform deployment guard now rejects that active dependency before mutation;
 five checks and the live metadata rejection passed. It does not restore the
-retired route or establish live inference recovery: authenticated canonical
-profile/history cutover remains required.
+retired route or establish live inference recovery. Fresh canonical authentication
+and runtime proof remain required; retained-history import is not authorized.
 
-Prior authenticated Apple metadata identified staging app `6808397041` with
-1.0 (36) Testing. Build 1.0 (37) is an unallocated candidate, not a freshly verified
-next upload: the 2026-10-21 metadata attempt redirected to login with
-`authResult=FAILED`. Revalidate current build/upload metadata before allocation.
-No new staging build was uploaded; the staging LiveActivity distribution-profile
-requirement also remains unresolved.
+The authenticated 2026-10-22 Apple read confirms staging app `6808397041` remains
+1.0 (36) Testing, with no newer entry under Build Uploads / All Statuses.
+The 1.0 (37) ad-hoc archive from source `4bc3c37f1ca022e8840498fbf8beb72e5d510e47`
+passed [run 39717554382](https://github.com/Ashler-AI/comet/actions/runs/39717554382)
+and local checksum, signature and bundle/build checks. It has not been uploaded.
+After the user's scoped confirmation, the staging LiveActivity identifier and
+distribution profile were created using the existing cloud-managed certificate.
+The exported 1.0 (37) IPA passed signature, entitlement, team/bundle and checksum
+verification; its SHA-256 is
+`692ef8e6d201ff70a3bc414f429d7a3ff006095a176e38339ee50ef67fa27536`.
+No certificate was created or rotated; the main app profile was preserved.
+Apple signing is cleared, but the recovery owner still holds native/Edge
+activation after successful finalization attempt 2. Do not distribute the
+same-bundle upgrade against the incompatible canonical Edge. Tern implementation
+is deferred, not a waiver of provider safeguards or release gates. Recheck the
+build number before an authorized upload.
 
 The integration owner's arm64, ad-hoc-signed iOS Debug `build-for-testing` passed,
 including Rust core compilation, UniFFI regeneration and Swift linking. The
@@ -99,21 +113,76 @@ imported. This is offline mobile build/runtime proof, not authenticated same-bun
 migration, physical-device acceptance, TestFlight delivery or a global native-suite
 pass. The reproducible isolated commands are in [`apps/ios/README.md`](../apps/ios/README.md).
 
-Activation remains gated on complete migration and actual runtime verification.
-The running legacy engine kills its supervised OMP processes during shutdown;
-durable-history recovery must not be described as uninterrupted live-job transfer.
-Do not activate an incompletely reconciled profile or claim a live copy is frozen.
+### Fresh-only activation and rollback contract
 
-The canonical native staging profile is `~/.crew-staging`; its owner controller
-must be independently authenticated for `scaffold-staging.internal.ashler.com`,
-`comet-staging.internal.ashler.com`, and project/deployment `ashler-staging`.
-No such local controller record is currently present. Retirement source `320a9ef2`
-globally fences legacy connections; it is not a harmless `/auth/session` preflight
-deployment. Prepare the candidate and compatible services first, then establish a
-real cross-store writer barrier, capture the legacy originals, and activate native
-Edge at the canonical origin. Only then use login-only to authenticate the native
-controller and verify the offline import before starting its session engine.
-Do not manufacture identity fields or mark live writers stopped.
+1. **Prepare, do not activate:** publish the reviewed merged-main 0.2.116
+   `release.yml` `desktop-and-scaffold` / `staging-candidate` tuple with deployment
+   `unchanged`. Retain immutable source/run provenance, archive and raw-executable
+   hashes; do not replace 0.2.115 or move channels. `deploy.yml target=candidate`
+   separately seals native Edge and forward-retained rollback bytes/configuration.
+2. **Platform gate:** obtain the owner's exact ordinary successor deployment and
+   complete compatibility/baseline evidence for that tuple, fresh-image readiness,
+   runtime/admission/browser contracts and retained records. Finalization attempt 2
+   and its closed admission receipt do not satisfy this gate. Keep stored authority
+   schema `scaffold.comet-runtime.v1` distinct from archive compatibility v2.
+3. **Matched activation:** only after those gates and the verified rollback pair,
+   coordinate `deploy.yml target=staging` for canonical Worker
+   `ashler-comet-edge-staging` at `https://comet-staging.internal.ashler.com`,
+   fresh controller authentication/start, and exact-candidate staging promotion
+   using `staging-deployed` and the original `candidate_run_id`. The workflow does
+   not itself establish Platform compatibility. Verify actual runtime behavior;
+   preparation, signing and a restart alone are not acceptance.
+
+The supported controller controls are `RuntimeArgs` in
+`apps/zeron/src/crew_cli.rs`, not a new “fresh-only” flag. Use a genuinely new,
+private DATA root and an unused explicit IPC port, never inherited parent routing.
+Canonical packaged staging uses `~/.crew-staging` and **27957**; headed startup
+pins these compiled coordinates and ignores overrides. If either is occupied by
+retained work, do not clear or repurpose it: a separate root/free port is supported
+by `login` and `headless`, not by the packaged headed app. An occupied canonical
+profile therefore blocks a fresh-only headed rollout at those coordinates.
+
+After compatible canonical services are ready, run the existing login-only
+**command** in an interactive terminal (there is no `--login-only` flag):
+
+```sh
+comet --data-dir "$FRESH_DATA" --ipc-port "$FRESH_PORT" \
+  --edge-url https://comet-staging.internal.ashler.com \
+  --scaffold-url https://scaffold-staging.internal.ashler.com \
+  --project-scope ashler-staging --deployment-id ashler-staging login
+```
+
+`FRESH_DATA` must be the absolute fresh root, `FRESH_PORT` its unused port; use
+the verified candidate executable. Do not use mock/dev bearer/local-inference
+overrides. `auth_cli::login` locks that root, authenticates and exits without
+starting the engine. The human completes ordinary Scaffold OAuth/IAP sign-in for
+the exact owner/origins/scope; any required provider consent remains interactive.
+No copied session, Keychain, provider credential or manufactured identity is a
+substitute. Auth stores `scaffold-session.json`; native stores resolve beneath
+`profiles/scaffold/<verified-key>`. After verified sign-in, use the same arguments
+with `headless`, or the pinned staging app only for its fresh canonical root.
+Scaffold hosts instead use Platform's verified bootstrap and
+`/workspace/.scaffold/crew-data`, IPC **39400**; never transplant controller auth.
+
+Retain legacy/Canary DATA, credentials/identities, journals, attachments, worktrees,
+pending commands/outcomes, snapshots, server records, Edge v1/v2 classes and blob
+bytes; retain new native DATA and `native-v2/` blobs after any new writes too.
+Do not import, replay unknown work, rewrite authority profiles or claim existing
+writers stopped. Canonical native HTTP routing is not a cross-store writer fence;
+retaining legacy classes does not prove old-client service continuity. Migration
+and its authoritative barriers remain mandatory **if migration is later authorized**.
+Legacy shutdown kills supervised OMP processes, not a live-job transfer.
+
+Rollback uses the sealed **forward** `staging-rollback` deployment with the full
+`native-v2` migration/binding set and exact retained ae2 code, never a Cloudflare
+version rollback or stale-store restore. It restores legacy HTTP routing while
+retaining native classes/data; it does not merge native writes into legacy or
+prove native clients/connected writers quiescent. Coordinate affected runtimes
+and Platform's rollback gates before switching; preserve both generations and
+report unavailable surfaces rather than deleting state or inventing a barrier.
+
+Same-bundle iOS sign-in auto-imports retained `CometDocs`; it is not authorized
+here. See the [iOS fresh-only restriction](../apps/ios/README.md#legacy-ios-native-migration).
 
 ## Historical verification: isolated upstream canary
 
@@ -884,10 +953,10 @@ Build-only reviewed source cannot publish; GCS candidates require merged-main
 ancestry. Shared Edge deployment is manual-only, and immutable candidate
 publication does not move channels or activate a controller. Fresh staging uses
 its own `~/.crew-staging` profile and IPC 27957, independently authenticated.
-Legacy mixed/unscoped deployments, pending work, unsupported consumer access and
-unqualified real-profile import memory remain cutover blockers, not permission
-to relabel profiles or retire other owners' records. Production remains gated
-on the captain's installed-app restart and manual acceptance.
+Legacy mixed/unscoped deployments, pending work and unqualified real-profile import
+memory remain migration blockers, not permission to relabel profiles or retire
+other owners' records. Fresh-only activation follows the contract above and must
+report unsupported consumer access. Production remains unauthorized.
 
 Copied-database inspection now completes without dataset-wide history retention.
 The actual public API inspected 3,037 snapshots (715,402,552 encoded bytes) in
@@ -896,8 +965,8 @@ The same shallow workspace that exceeded 1 GiB now completes at 41.61 MiB;
 full-corpus timing used a 120 s watchdog, not the earlier 15 s diagnostic window.
 Six native codec, 23 migration-library, 32 backup/import and one portable runtime
 fixture checks passed locally. Shallow history still yields no inert-bootstrap
-proof; complete authenticated backup/import and current-source remote CI remain
-separate cutover gates.
+proof; complete authenticated backup/import remains a separately authorized
+migration gate. Current-source remote CI remains required for fresh-only delivery.
 
 The vendored memory benchmark parser uses comma-delimited number groups rather
 than ambiguous nested repetition. Its two CodeQL backtracking findings are fixed;
@@ -931,10 +1000,11 @@ Candidate and forward-retained rollback artifacts bind the complete staging conf
 and exact legacy bytes. Rollback is a forward deployment retaining both generations,
 not a Cloudflare version rollback across new Durable Object classes. Publish only a
 merged-main `release.yml` `desktop-and-scaffold` / `staging-candidate` tuple first;
-this does not move release channels. A fresh independently signed-in controller uses
-its own DATA and IPC 27957. Hold the single `deploy.yml` staging switch for matched
-Platform fresh-image readiness and the verified rollback pair. No profile import,
-old-data migration, production deployment or independent channel movement is allowed.
+this does not move release channels. The fresh-controller and rollback contract
+above governs DATA/IPC selection and ordinary successor Platform compatibility.
+Hold `deploy.yml` staging activation for that evidence and the verified rollback
+pair. No profile import, old-data migration, production deployment or independent
+channel movement is allowed.
 
 ## Decision
 
@@ -1109,6 +1179,11 @@ Keep upstream ancestry intact. The eventual reviewed cutover merge must retain b
 Phases 2 and the control-plane portion of 3 can proceed independently after phase 1 contracts are fixed. Finish the working login → managed inference → remote lifecycle path before polishing optional UI.
 
 ## 6. Data and protocol migration
+
+This section is a separate migration design/operator contract, **not authorized
+by the current fresh-only staging rollout**. Do not execute its capture/import,
+claim/commit or writer-retirement steps under that scope. Its data/auth/barrier
+gates remain intact for any later explicitly authorized migration.
 
 This is not an in-place binary upgrade over the old store. Current Crew's project workspace/session schema and upstream's per-user registry/chat2 topology differ.
 

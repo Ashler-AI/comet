@@ -16,13 +16,15 @@ Requires Xcode 26+, an iOS 26+ simulator/device, and Rust with the
 module, and Rust library names remain upstream `Zeron`/`zeron_*`.
 
 The shared scheme is **Crew Staging**, bundle ID **ai.ashler.crew.staging**,
-signing team **825LYXGJR6**, version **1.0**. This replaces the existing staging
-app while retaining its sandbox and default team/bundle Keychain access group.
-Legacy has no explicit app-group entitlement; none is invented. The upstream
-LiveActivity extension uses `ai.ashler.crew.staging.LiveActivity` and needs an
-authorizing team distribution profile, which may be an existing matching wildcard
-profile because the extension requests no app-specific capabilities. Production
-`ai.ashler.crew` is not built or uploaded.
+signing team **825LYXGJR6**, version **1.0**. A same-bundle upgrade retains its
+sandbox and default team/bundle Keychain access group, but is **not authorized
+for a legacy installation under the current fresh-only/no-migration rollout**:
+sign-in automatically imports retained `CometDocs` (see below). Legacy has no
+explicit app-group entitlement; none is invented. The upstream LiveActivity
+extension uses `ai.ashler.crew.staging.LiveActivity` and needs an authorizing team
+distribution profile, which may be an existing matching wildcard profile because
+the extension requests no app-specific capabilities. Production `ai.ashler.crew`
+is not built or uploaded.
 
 Checked-in staging settings (substituted into Info.plist):
 
@@ -68,7 +70,8 @@ changes to `CrewLogin`, `CrewAccount`, or `crewPrepareLegacyBackup`.
 
 ### Explicit simulator session import
 
-For an approved local test only, a **Debug simulator** build accepts
+This credential-import hook is **outside the current fresh-only authorization**.
+For a separately approved local test only, a **Debug simulator** build accepts
 `-import-staging-session`. Put the staging desktop's `scaffold-session.json`
 at `<simulator app data container>/tmp/crew-scaffold-session.json` with mode `0600`,
 then launch only `ai.ashler.crew.staging` with that flag. Discover the container
@@ -139,6 +142,19 @@ results are not release evidence for this build.
   credentials. Upstream dev/demo voice code remains intact.
 
 ## Legacy iOS native migration
+
+The implementation below is retained, not activated by fresh-only authorization.
+`Zeron/App/AppModel.swift`'s `signIn(account:)` checks for `CometDocs` and calls
+`crewPrepareLegacyBackup` before starting the client, including restored sign-in.
+There is no supported skip-import switch. A legacy same-bundle installation
+therefore cannot satisfy no-migration without a reviewed code change or separate
+migration authorization; deleting/renaming its store or clearing Keychain is not
+a workaround. Keep its sandbox, identities, pending work and cache untouched.
+Only an actually fresh app container with no legacy source can use this path
+without import, with independent human sign-in after matched canonical services
+are ready. A new simulator can provide isolated evidence; it does not prove an
+existing physical-device or TestFlight upgrade safe. Credential import, `-signedout`
+and demo/dev authentication are not fresh authenticated staging acceptance.
 
 Same-bundle upgrades retain `Application Support/CometDocs`. After online
 Scaffold identity verification, before constructing `CoreClient` or starting any
@@ -363,17 +379,38 @@ testers, permissions, or public App Store submissions.
 
 ## Staging archive, export, upload and readback
 
-The candidate staging release is **1.0 (37)**, not an allocated build number.
-The prior authenticated App Store Connect read for app **6808397041**, Crew
-Staging by Ashler, showed **1.0 (36) Testing** in **Ashler Internal** (35 and 34
-also Testing), and Build Uploads with **All Statuses** showed 36 Complete,
-Oct 15 02:55, with no higher upload. The integration owner's fresh read attempt
-on 2026-10-21 redirected to login with `authResult=FAILED`; the current browser
-session did not authenticate. Build 36/next 37 therefore remains unvalidated
-against current metadata. Obtain a fresh authenticated read before allocating
-a number or uploading; do not import credentials or bypass authentication.
-Existing Xcode account/team signing access was observed;
-the LiveActivity profile inventory remains a separate release prerequisite.
+The staging **1.0 (37)** ad-hoc archive was built from exact source
+`4bc3c37f1ca022e8840498fbf8beb72e5d510e47` by
+[run 39717554382](https://github.com/Ashler-AI/comet/actions/runs/39717554382).
+Its downloaded SHA-256 is
+`d790e7c45dc7e05d4af7ae6ededf891db63c54bb1bcf87b2d45a989f092c3d18`;
+local signature, main/extension bundle IDs and build-number checks passed.
+The subsequent distribution export succeeded. Its IPA SHA-256 is
+`692ef8e6d201ff70a3bc414f429d7a3ff006095a176e38339ee50ef67fa27536`;
+the real IPA verifier and independent `shasum` agree. It has not been uploaded.
+
+The authenticated 2026-10-22 read of app **6808397041**, Crew Staging by Ashler,
+showed **1.0 (36) Testing** in **Ashler Internal**. Build Uploads with **All
+Statuses** showed 36 Complete and no newer upload. Recheck availability before
+uploading 37; an archive does not reserve its number in App Store Connect.
+After explicit user confirmation, the exact staging LiveActivity App ID was
+registered with no optional capabilities. Apple marks In-App Purchase as an
+immutable default on new App IDs; no existing App ID capability was changed.
+Xcode created extension profile `9c345fde-6575-433e-b3ef-cb16b8f6e87b` and
+retained main profile `a9f3f9ce-32c7-4e9f-a678-bc967e5a44aa`. Both signatures use
+the existing cloud-managed certificate SHA-1
+`0734B8714AB48F3776D89080AF61A1803E44008E`; no certificate was created or rotated.
+Main-app production APNs, exact team/bundle identities and disabled development
+entitlements passed verification. Tern implementation remains deferred.
+
+Apple signing is no longer the blocker. The recovery owner's finalization
+attempt 2 completed, but native/Edge activation remains held pending the exact
+ordinary successor compatibility/full baseline and matched release gates.
+Do not distribute this same-bundle upgrade to legacy installations under fresh-only
+scope, even after canonical Edge becomes compatible: sign-in auto-migration is
+still unauthorized. Apple delivery does not block independent desktop/backend
+readiness; it is not evidence that those surfaces are activated or accepted.
+
 `testflight.yml` accepts exact `reviewed_sha` and this explicit `build_number`.
 It creates an ad-hoc archive without Apple credentials, never uploads or changes
 App IDs/capabilities/groups. Production is not a selectable environment.
@@ -383,22 +420,12 @@ team `825LYXGJR6`, cloud-managed signing. API keys are not a prerequisite. Verif
 the exact archive checksum/source/build before export. Both main app and upstream
 LiveActivity extension require matching team distribution profiles; inspect actual
 account inventory rather than silently creating an App ID or granting capabilities.
-The authenticated App ID inventory contains the staging main app and `XCWildcard *`,
-but no explicit staging LiveActivity App ID. The extension has no custom signing
-entitlements, app groups, shared Keychain or APNs capability; ActivityKit uses
-`pushType: nil`. Per [Apple TN3125](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles),
-an extension's concrete signed application identifier may be authorized by a
-matching wildcard profile. The verifier allows this only for the capability-free
-extension, retaining exact main-app/APNs checks. An existing App Store distribution
-profile and successful Apple export still need verification; a wildcard App ID
-alone is not proof of distribution readiness.
-Read-only local Xcode cache inspection found four unexpired Xcode-managed Team
-Store profiles: production, staging, Canary and Canary LiveActivity. All use team
-`825LYXGJR6`, expire `2027-09-02 21:36:25`, have no device allowlist and disable
-`get-task-allow`. None authorizes staging LiveActivity or a wildcard. The portal
-Profiles page listed no manual profiles; neither observation proves that a usable
-cloud-managed wildcard profile exists. Do not invoke `-allowProvisioningUpdates`
-until the release owner confirms the precise permitted signing/profile changes.
+The web profile wizard cannot select the existing cloud-managed certificate.
+Use the approved Xcode account export path, not a newly generated certificate.
+The capability-free extension uses its dedicated profile; the verifier can also
+accept an existing authorizing wildcard profile for this extension only, retaining
+exact main-app/APNs checks. Automatic provisioning must stay within the explicitly
+approved App ID/profile scope.
 
 Commands from repository root, only after explicit staging release authorization:
 
@@ -416,12 +443,12 @@ scripts/ios/prepare-staging-archive.sh /tmp/Crew-Staging.xcarchive "$BUILD_NUMBE
 xcodebuild -exportArchive -archivePath /tmp/Crew-Staging.xcarchive \
   -exportPath /tmp/StagingInspection -exportOptionsPlist scripts/ios/ExportOptions-Staging.plist \
   -allowProvisioningUpdates
-python3 scripts/ios/verify-staging-ipa.py /tmp/StagingInspection/Zeron.ipa "$BUILD_NUMBER"
+python3 scripts/ios/verify-staging-ipa.py '/tmp/StagingInspection/Crew Staging.ipa' "$BUILD_NUMBER"
 # Upload uses the same reviewed archive and existing Xcode account; internal only.
 xcodebuild -exportArchive -archivePath /tmp/Crew-Staging.xcarchive \
   -exportPath /tmp/StagingUpload -exportOptionsPlist scripts/ios/UploadOptions-Staging.plist \
   -allowProvisioningUpdates
-python3 scripts/ios/verify-staging-ipa.py /tmp/StagingUpload/Zeron.ipa "$BUILD_NUMBER"
+python3 scripts/ios/verify-staging-ipa.py '/tmp/StagingUpload/Crew Staging.ipa' "$BUILD_NUMBER"
 ```
 
 Record the upload receipt and exact uploaded IPA hash, then read App Store Connect
@@ -436,7 +463,9 @@ create credentials or change Apple state. Offline checks:
 `python3 scripts/ios/test-staging-release.py`.
 The parent integration owner ran the metadata self-check and all three release
 contract tests successfully, including wildcard profile matching. The isolated
-simulator build and eight tests above also passed. Distribution signing and
-upload have not run; current Apple authentication, build-number availability and
-the LiveActivity distribution profile remain release gates. This mobile smoke
-does not establish that every native suite or the full staging cutover has passed.
+simulator build and eight tests above also passed. The real distribution IPA
+verification and three release contract tests passed after replacing Python
+3.11-only `hashlib.file_digest` with bounded SHA-256 streaming for the documented
+system `python3` command. Upload remains behind the canonical activation and
+reviewed-source release gates; signing does not establish same-bundle migration
+or a completed staging cutover.

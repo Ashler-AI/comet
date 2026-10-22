@@ -57,10 +57,13 @@ Building production-identity candidate bytes does not publish production.
 compatibility; always specify `staging` for standalone staging builds. A conflicting
 `COMET_DEFAULT_ENVIRONMENT` is rejected. The native staging app uses
 `~/.crew-staging` and IPC port `27957`, retaining the staging bundle and permission
-identity. Legacy `~/.comet-native-staging` / `27655` remains the migration source,
-not the new app's active store. Authenticate the fresh native root with `login`,
-then import and verify its owner-scoped `profiles/scaffold/<profile-key>` store
-before the first headed launch. Packaging never imports or launches a profile.
+identity. Legacy `~/.comet-native-staging` / `27655` stays retained, not the new
+app's active store. Fresh-only activation requires a new empty native root and
+fresh `login`; it does not import legacy profiles or establish a writer barrier.
+An occupied native root cannot be reused as fresh: use explicit `login`/`headless`
+coordinates for a separate empty root instead. Profile migration requires separate
+authorization and its offline import/readback gates. Packaging never imports or
+launches a profile.
 Packaged headed startup pins these compiled coordinates; CLI, environment and
 saved runtime overrides cannot redirect it. Explicit coordinates remain available
 to the separate `login` and `headless` operator commands.
@@ -146,7 +149,9 @@ checksum, provenance and bucket-privacy gates remain enforced.
 This cutover changes the release compatibility marker to
 `scaffold.comet-runtime.v2` in both Crew and Platform. Use the verified versioned
 manifest and Linux archive tuple to deploy compatible staging Platform support,
-complete its required migration and verify runtime/admission/browser behavior.
+verify ordinary successor compatibility and its full rollback baseline, and verify
+runtime/admission/browser behavior. Fresh-only activation leaves legacy stores and
+writers untouched; it neither requires nor authorizes migration.
 This release marker is separate from the persisted `cometRuntimeProfile.version`
 wire schema, which remains `scaffold.comet-runtime.v1` in Crew, Platform and Edge.
 Do not rewrite retained authority profiles or send the release marker as their version.
