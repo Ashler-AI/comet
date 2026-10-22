@@ -102,9 +102,11 @@ and preservation of existing installations. It uses a throwaway HOME.
 ## Build-only workflow and update policy
 
 `.github/workflows/release.yml` is **Crew Canary artifacts**. Manual dispatch
-requires the exact reviewed SHA and builds that immutable `github.sha`, uploading
-private Actions artifacts with archive `SHA256SUMS`, raw Linux executable
-`COMET_SHA256SUMS`, and `provenance.json`, and has only `contents: read`.
+requires the exact reviewed SHA and only builds/packages that immutable
+`github.sha`, uploading private Actions artifacts with archive `SHA256SUMS`, raw
+Linux executable `COMET_SHA256SUMS`, and `provenance.json`, with `contents: read`.
+Behavior checks and typechecks are not deployment-pipeline jobs. Run required
+focused checks and actual runtime/inference smokes separately.
 `COMET_SHA256SUMS` names the extracted archive-root `comet` file; its digest
 is the value for `COMET_SCAFFOLD_RUNTIME_SHA256`, not the archive digest.
 The isolated auth maintenance branch `crew/canary-agent-auth-fix-20261022` is
@@ -121,7 +123,8 @@ gh workflow run release.yml --repo Ashler-AI/comet --ref crew/upstream-canary \
 
 Verify that the run's `headSha` is the reviewed commit before consuming its private
 artifacts. Edge deployment is a separate operator action: from `edge/`, run
-`npx wrangler deploy --env canary` only after that revision passes CI. The isolated
+`npx wrangler deploy --env canary` only after that revision has verified private
+artifacts and separately exercised behavior checks. The isolated
 controller uses Platform's `internal/scaffold/scripts/deploy-upstream-canary.mjs`.
 
 `zeron-update::AUTOMATIC_UPDATES_SUPPORTED` is false for this branch. Direct

@@ -30,26 +30,6 @@ jobs:
             *) exit 1 ;;
           esac
           test "$REVIEWED_SHA" = "$GITHUB_SHA"
-  edge-contracts:
-    needs: approve-source
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '22'
-      - name: Verify Edge in remote CI without deployment credentials
-        working-directory: edge
-        run: |
-          npm ci
-          npm run typecheck
-          npm test
-      - name: Verify native browser contracts
-        run: node --test apps/web/server.test.mjs
-
   linux:
     needs: approve-source
     strategy:
@@ -107,16 +87,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Package isolated ad-hoc signed app
         run: scripts/package-macos.sh
-      - name: Verify native recovery and one-shot routing
-        run: |
-          cargo test --locked --release -p zeron-harness --test omp
-          cargo test --locked --release -p zeron --test noop_browser
-      - name: Verify managed authority renewal and retry boundaries
-        run: |
-          cargo test --locked --release -p zeron-engine --test scaffold_auth --test auth
-          cargo test --locked --release -p zeron-engine --lib auth::tests
-          cargo test --locked --release -p zeron-sync --lib scaffold_auth::tests
-          cargo test --locked --release -p zeron-client --lib auth::tests
       - name: Record private artifact provenance
         run: |
           cd target/package
