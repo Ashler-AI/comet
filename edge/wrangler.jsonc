@@ -1,8 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // Root deployment stays disabled. Canary is isolated; canonical staging below
-  // retains the captured account/domain/bucket and original v1/v2 DO lineage.
-  "name": "crew-upstream-canary-disabled",
+  // Root deployment stays disabled. Canonical staging retains the captured
+  // account/domain/bucket and original v1/v2 DO lineage; production is absent.
+  "name": "ashler-comet-edge-local-only",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
   "workers_dev": false,
@@ -11,6 +11,29 @@
   "alias": { "loro-crdt": "loro-crdt/base64" },
   "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" },
   "env": {
+    // Local simulation of the same native entry, never a second deployed product.
+    "local": {
+      "name": "ashler-comet-edge-local-only",
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [],
+      "durable_objects": {
+        "bindings": [
+          { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
+          { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+          { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
+          { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
+          { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
+          { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
+        ]
+      },
+      "migrations": [{
+        "tag": "local-v1",
+        "new_sqlite_classes": ["SessionRoom", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom", "AuthGrant"]
+      }],
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "crew-local-blobs" }],
+      "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" }
+    },
     "staging": {
       "name": "ashler-comet-edge-staging",
       "account_id": "dd15bb23eb5c14365fe2621acc049e01",
@@ -48,41 +71,6 @@
         "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
         "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
         "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
-      }
-    },
-    "canary": {
-      "name": "crew-upstream-canary",
-      "account_id": "dd15bb23eb5c14365fe2621acc049e01",
-      "workers_dev": true,
-      "preview_urls": false,
-      "routes": [],
-      "durable_objects": {
-        "bindings": [
-          { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
-          { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
-          { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
-          { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
-          { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
-          { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
-        ]
-      },
-      "migrations": [{
-        "tag": "crew-upstream-canary-v1",
-        "new_sqlite_classes": ["SessionRoom", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom", "AuthGrant"]
-      }],
-      "r2_buckets": [
-        { "binding": "BLOBS", "bucket_name": "crew-upstream-canary-blobs" },
-        { "binding": "RELEASES", "bucket_name": "crew-upstream-canary-releases" }
-      ],
-      "vars": {
-        "AUTH_MODE": "scaffold",
-        "ENVIRONMENT": "crew-upstream-canary",
-        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-upstream-canary.internal.ashler.com",
-        // Matched by the separately deployed isolated Platform authority, never shared staging.
-        "SCAFFOLD_PROJECT_SCOPE": "crew-upstream-canary",
-        "SCAFFOLD_DEPLOYMENT_ID": "crew-upstream-canary",
-        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.environment",
-        "APNS_TOPIC": "ai.ashler.crew.upstream-canary"
       }
     }
   },

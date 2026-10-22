@@ -68,6 +68,8 @@ pub mod methods {
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
+    /// IPC-only exact-run capability; retained until this subscription closes.
+    pub const RETAIN_SESSION_SUPERVISION: &str = "RetainSessionSupervision";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
     /// connection; automatic subscriptions and retries must not call it.
@@ -126,6 +128,8 @@ pub mod methods {
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// This engine runtime's fixed device and workspace identity.
     pub const ENGINE_INFO: &str = "EngineInfo";
+    /// Explicit local-controller wake of a registered immutable provider binding.
+    pub const WAKE_DEVICE: &str = "WakeDevice";
     /// Readiness barrier for the engine runtime. The call completes once stores
     /// and journals are assembled, or fails with the assembly error.
     pub const ENGINE_READY: &str = "EngineReady";
@@ -134,6 +138,9 @@ pub mod methods {
     /// engine behind its windows would leave that process unusable.
     pub const STOP_ENGINE: &str = "StopEngine";
     pub const AUTH_STATUS: &str = "AuthStatus";
+    /// Local desktop updater bearer for the engine's configured edge URL.
+    /// Never relay-forwarded or available to scoped sandbox hosts.
+    pub const UPDATE_ACCESS_TOKEN: &str = "UpdateAccessToken";
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     pub const SIGN_IN: &str = "SignIn";
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
@@ -339,6 +346,13 @@ impl RpcReply {
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainSessionSupervisionParams {
+    pub chat_id: String,
+    pub token: String,
 }
 
 /// Deserialize typed params out of the envelope's `params` value.

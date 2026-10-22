@@ -22,6 +22,24 @@ use crate::http_error::describe_http_error;
 /// thin docs are lineage epoch 2; M3 readers discard-and-adopt below it).
 pub const CHAT2_DOC_EPOCH: u32 = 2;
 
+/// Shared checkpoint transport: callers supply the exact durable snapshot bytes.
+pub(crate) async fn post_checkpoint(
+    http: &reqwest::Client, edge: &EdgeConfig, chat_id: &str,
+    seq_covered: u64, frontier: &[u8], snapshot: Vec<u8>,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let bearer = edge.bearer().await.map_err(|e| e.to_string())?;
+    let _permit = zeron_sync::budget::shared().http(zeron_sync::budget::Priority::Background)
+        .await.map_err(|e| e.to_string())?;
+    let response = http.post(format!("{}/chat2/{chat_id}/checkpoint?seqCovered={seq_covered}", edge.url.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(300))
+        .bearer_auth(bearer)
+        .header("x-chat2-frontier", base64::engine::general_purpose::STANDARD.encode(frontier))
+        .body(snapshot).send().await.map_err(describe_http_error)?;
+    if !response.status().is_success() { return Err(format!("checkpoint HTTP {}", response.status())); }
+    Ok(())
+}
+
 /// [`ChatDocSink`] over a live [`SessionDoc`] + the cursor-bearing store.
 ///
 /// Loro import of a remote row/checkpoint fires the doc's root subscription,
@@ -470,6 +488,46 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
 mod frontier_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn imported_checkpoint_posts_exact_bytes_and_rejects_advanced_floor() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let doc = loro::LoroDoc::new();
+        doc.get_map("meta").insert("epoch", 2i64).unwrap();
+        let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+        let frontier = loro::LoroDoc::decode_import_blob_meta(&snapshot, true).unwrap().partial_end_vv.encode();
+        for (status, success) in [("200 OK", true), ("409 Conflict", false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let edge = EdgeConfig::with_static_token(format!("http://{}", listener.local_addr().unwrap()), "owner-token");
+            let expected = snapshot.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let boundary = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") { break end + 4; }
+                };
+                while request.len() < boundary + expected.len() {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let headers = String::from_utf8_lossy(&request[..boundary]).to_lowercase();
+                assert!(headers.starts_with("post /chat2/history/checkpoint?seqcovered=0 "));
+                assert!(headers.contains("authorization: bearer owner-token\r\n"));
+                assert!(headers.contains("x-chat2-frontier:"));
+                assert_eq!(&request[boundary..], expected.as_slice());
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let result = post_checkpoint(&reqwest::Client::new(), &edge, "history", 0, &frontier, snapshot.clone()).await;
+            assert_eq!(result.is_ok(), success);
+            server.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn http_sync_and_exhausted_checkpoint_retries_retain_dns_cause() {

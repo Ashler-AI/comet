@@ -5,7 +5,6 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const supportedTargets = new Set(["staging", "production"]);
 
 const required = (env, name, target) => {
   const value = env[name]?.trim();
@@ -14,15 +13,15 @@ const required = (env, name, target) => {
 };
 
 export function releaseFeedSecrets(target, env) {
-  if (!supportedTargets.has(target)) throw new Error(`unsupported Crew edge environment: ${target}`);
+  if (target !== "staging") throw new Error(`unsupported Crew edge environment: ${target}`);
 
+  // The protected staging sync must never replace retained secrets with missing credentials.
   const email = env.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL?.trim() ?? "";
   const privateKey = env.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY?.trim() ?? "";
-  if (!email && !privateKey) return undefined;
   if (!email || !privateKey) {
     throw new Error(`${target} release-feed synchronization requires the reader email and private key together`);
   }
-  if (!email.endsWith(".iam.gserviceaccount.com")) {
+  if (!/^[^\s@]+@[^\s@]+\.iam\.gserviceaccount\.com$/.test(email)) {
     throw new Error(`${target} release-reader email is malformed`);
   }
   if (!/^-----BEGIN PRIVATE KEY-----[\s\S]+-----END PRIVATE KEY-----$/.test(privateKey)) {
@@ -60,11 +59,6 @@ export async function syncReleaseFeedSecrets(
   { edgeDir = path.join(root, "edge"), upload = runWrangler } = {},
 ) {
   const secrets = releaseFeedSecrets(target, env);
-  if (!secrets) {
-    console.log(`No environment-owned ${target} release-reader credentials are configured; preserving existing Worker secrets.`);
-    return false;
-  }
-
   const directory = await mkdtemp(path.join(os.tmpdir(), "crew-release-feed-secrets-"));
   const secretsFile = path.join(directory, "secrets.json");
   try {

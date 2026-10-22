@@ -41,6 +41,8 @@ fn host_rows(now: chrono::DateTime<Utc>) -> (Device, Space, Chat) {
         id: HOST.into(),
         name: "MacBook Pro".into(),
         platform: "macos".into(),
+        devbox_provider: None,
+        devbox_id: None,
         last_seen_at: Some(now),
         created_at: Some(now),
         version: Some(env!("CARGO_PKG_VERSION").into()),

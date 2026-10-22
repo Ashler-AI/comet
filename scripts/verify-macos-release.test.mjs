@@ -58,3 +58,30 @@ test(`valid release checksums cannot authorize an untrusted ${bundleId} update`,
   }
 });
 }
+
+for (const defect of ["missing-dmg", "missing-archive", "duplicate", "malformed"]) {
+  test(`release verification rejects ${defect} artifact checksum entries before extraction`, () => {
+    const temp = mkdtempSync(path.join(tmpdir(), "crew-candidate-checksums-"));
+    try {
+      const archive = "comet-1.2.3-macos-arm64-app.tar.gz";
+      const dmg = "comet-1.2.3-macos-arm64.dmg";
+      const entries = [archive, dmg].map(name => {
+        writeFileSync(path.join(temp, name), "must not be extracted or mounted");
+        return `${createHash("sha256").update(readFileSync(path.join(temp, name))).digest("hex")}  ${name}\n`;
+      });
+      if (defect === "missing-dmg") entries.pop();
+      if (defect === "missing-archive") entries.shift();
+      if (defect === "duplicate") entries.push(entries[0]);
+      if (defect === "malformed") entries[0] = `invalid  ${archive}\n`;
+      writeFileSync(path.join(temp, "desktop-SHA256SUMS"), entries.join(""));
+      const result = spawnSync("/bin/bash", [path.join(root, "scripts", "verify-macos-release.sh"), temp, "1.2.3"], {
+        env, encoding: "utf8", timeout: 10_000,
+      });
+      assert.ifError(result.error);
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /Expected one SHA-256 entry/);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+}

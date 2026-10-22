@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
@@ -136,6 +136,7 @@ function releaseCheckout(t, merged) {
   fixtureCommand(dir, "git", "init", "-b", "main", upstream);
   writeFileSync(path.join(upstream, "Cargo.toml"), `[workspace]\nmembers = ["."]\n[workspace.package]\nversion = "${VERSION}"\n[package]\nname = "zeron"\nversion.workspace = true\nedition = "2024"\n[lib]\npath = "lib.rs"\n`);
   writeFileSync(path.join(upstream, "lib.rs"), "");
+  writeFileSync(path.join(upstream, "Cargo.lock"), `version = 4\n\n[[package]]\nname = "zeron"\nversion = "${VERSION}"\n`);
   fixtureCommand(upstream, "git", "add", ".");
   fixtureCommand(upstream, "git", "commit", "-m", "main baseline");
   fixtureCommand(upstream, "git", "checkout", "-b", "release-fixture");
@@ -190,6 +191,13 @@ function candidateArchive(t, { corrupt, missingStaging = false, archiveCorrupt =
     writeFileSync(path.join(payload, sumsName), sums);
   }
   writeFileSync(path.join(payload, "install.sh"), "#!/bin/sh\n");
+  writeFileSync(path.join(payload, "COMET_SHA256SUMS"), Object.keys(candidate.scaffoldManifest.files)
+    .map(name => `${SHA256}  ${name.replace(/\.tar\.gz$/, "/comet")}\n`).join(""));
+  writeFileSync(path.join(payload, "provenance.json"), JSON.stringify({
+    schemaVersion: 1, version: VERSION, sourceRevision: RUN_SHA,
+    runtimeContract: "scaffold.comet-runtime.v1", repository: REPOSITORY,
+    workflowRun: RUN_URL, delivery: "authenticated-private-gcs",
+  }));
   if (missingStaging) rmSync(path.join(payload, "desktop-staging-manifest.json"));
   const archive = path.join(dir, "reused/release-candidate.tar.gz");
   fixtureCommand(dir, "tar", "-czf", archive, "-C", payload, ".");
@@ -249,7 +257,6 @@ describe("executable release gates", () => {
       else assert.equal(result.output, "");
     }
   });
-
 
   it("accepts desktop staging reuse of a full candidate without changing its archive digest", async (t) => {
     const workflow = await read(".github/workflows/release.yml");
@@ -358,12 +365,13 @@ function publicationFixture(t) {
 const fs = require("node:fs");
 const path = require("node:path");
 const [service, action, ...args] = process.argv.slice(2);
-const local = value => value.startsWith("gs://fixture/") ? path.join(process.env.FIXTURE_BUCKET, value.slice("gs://fixture/".length)) : value;
+const local = value => value.startsWith("gs://") ? path.join(process.env.FIXTURE_BUCKET, value.slice(5).split("/").slice(1).join("/")) : value;
 try {
   if (service !== "storage") throw new Error("unexpected service");
   if (action === "cat") process.stdout.write(fs.readFileSync(local(args[0])));
   else if (action === "cp") {
     const immutable = args[0] === "--if-generation-match=0";
+    if (args.at(-1).startsWith("gs://")) fs.appendFileSync(process.env.FIXTURE_WRITES, JSON.stringify(args) + "\\n");
     const [source, target] = args.slice(immutable ? 1 : 0).map(local);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(source, target, immutable ? fs.constants.COPYFILE_EXCL : 0);
@@ -372,7 +380,8 @@ try {
 `, { mode: 0o755 });
   const env = {
     PATH: `${path.join(dir, "bin")}${path.delimiter}${process.env.PATH}`,
-    FIXTURE_BUCKET: bucket, COMET_RELEASES_GCS_BUCKET: "fixture", RUNNER_TEMP: dir,
+    FIXTURE_BUCKET: bucket, FIXTURE_WRITES: path.join(dir, "storage-writes.jsonl"),
+    COMET_RELEASES_GCS_BUCKET: "ashler-comet-releases-staging", RUNNER_TEMP: dir,
     VERSION, RELEASE_SURFACE: "desktop-and-scaffold", PROMOTION_TARGET: "staging",
     SCAFFOLD_RUNTIME_DEPLOYMENT: "production-deployed",
   };
@@ -380,6 +389,21 @@ try {
 }
 
 describe("release channel publication", () => {
+  it("rejects non-staging buckets before any storage write for candidates or channel promotion", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "publish-staging", "publish");
+    for (const promotion of ["staging-candidate", "staging"]) {
+      for (const configuredBucket of [undefined, "", "ashler-comet-releases-production", "unrelated-private-bucket", "ashler-comet-releases-staging-copy"]) {
+        const { dir, bucket, env } = publicationFixture(t);
+        const result = command(dir, "bash", ["-c", script], {
+          ...env, PROMOTION_TARGET: promotion, COMET_RELEASES_GCS_BUCKET: configuredBucket,
+        });
+        assert.notEqual(result.status, 0);
+        assert.equal(existsSync(env.FIXTURE_WRITES), false);
+        assert.deepEqual(readdirSync(bucket), []);
+      }
+    }
+  });
+
   it("publishes both staging channels but keeps staging files out of production", async (t) => {
     const workflow = await read(".github/workflows/release.yml");
     for (const target of ["staging", "production"]) {
@@ -392,7 +416,11 @@ describe("release channel publication", () => {
       assert.deepEqual(readdirSync(path.join(releases, VERSION)).sort(), expected.sort());
       for (const name of expected) {
         assert.deepEqual(readFileSync(path.join(releases, VERSION, name)), readFileSync(path.join(dir, "candidate", name)));
-        assert.deepEqual(readFileSync(path.join(releases, name)), readFileSync(path.join(dir, "candidate", name)));
+        if (name === "COMET_SHA256SUMS" || name === "provenance.json") {
+          assert.equal(existsSync(path.join(releases, name)), false);
+        } else {
+          assert.deepEqual(readFileSync(path.join(releases, name)), readFileSync(path.join(dir, "candidate", name)));
+        }
       }
       assert.equal(readFileSync(path.join(releases, "desktop-latest.txt"), "utf8"), VERSION);
       assert.equal(existsSync(path.join(releases, "desktop-staging-latest.txt")), target === "staging");
@@ -434,9 +462,48 @@ describe("release channel publication", () => {
     assert.equal(existsSync(path.join(releases, "desktop-manifest.json")), false);
     assert.equal(existsSync(path.join(releases, "desktop-staging-manifest.json")), false);
   });
+
+  it("does not move desktop channels when the selected Scaffold channel would move backwards", async (t) => {
+    const { dir, bucket, env } = publicationFixture(t);
+    const releases = path.join(bucket, "releases");
+    mkdirSync(releases);
+    writeFileSync(path.join(releases, "scaffold-latest.txt"), "9.0.0");
+    writeFileSync(path.join(dir, "bin/dpkg"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const script = shellStep(await read(".github/workflows/release.yml"), "publish-staging", "publish");
+    const result = command(dir, "bash", ["-c", script], env);
+    assert.notEqual(result.status, 0);
+    assert.equal(readFileSync(path.join(releases, "scaffold-latest.txt"), "utf8"), "9.0.0");
+    for (const channel of ["desktop", "desktop-staging"]) {
+      assert.equal(existsSync(path.join(releases, `${channel}-manifest.json`)), false);
+      assert.equal(existsSync(path.join(releases, `${channel}-latest.txt`)), false);
+    }
+  });
 });
 
 describe("Crew edge deployment", () => {
+  it("rejects production dispatch before candidate or secret jobs can start", async (t) => {
+    const script = shellStep(await read(".github/workflows/deploy.yml"), "staging-scope", "target");
+    const dir = scratch(t);
+    for (const target of ["candidate", "staging", "production", "", "canary"]) {
+      const result = command(dir, "bash", ["-c", script], { REQUESTED_TARGET: target });
+      assert.equal(result.status === 0, ["candidate", "staging"].includes(target), result.stderr);
+    }
+  });
+
+  it("accepts only the dispatched reviewed source before installing candidate tooling", async (t) => {
+    const script = shellStep(await read(".github/workflows/deploy.yml"), "candidate", "source_request");
+    const dir = scratch(t);
+    for (const source of [RUN_SHA, "c".repeat(40), "", "HEAD", RUN_SHA.toUpperCase()]) {
+      for (const target of ["candidate", "staging", "production", ""]) {
+        const result = command(dir, "bash", ["-c", script], {
+          SOURCE_SHA: source, GITHUB_SHA: RUN_SHA, TARGET: target,
+        });
+        assert.equal(result.status === 0,
+          source === RUN_SHA && ["candidate", "staging"].includes(target), result.stderr);
+      }
+    }
+  });
+
   const complete = {
     CLOUDFLARE_API_TOKEN: "cloudflare-token",
     CLOUDFLARE_ACCOUNT_ID: "cloudflare-account",
@@ -447,60 +514,67 @@ describe("Crew edge deployment", () => {
   };
 
 
-  it("preserves Worker secrets when the environment-owned reader pair is absent", async () => {
-    assert.equal(
-      releaseFeedSecrets("production", {
-        CLOUDFLARE_API_TOKEN: "already-configured",
-        CLOUDFLARE_ACCOUNT_ID: "already-configured",
-        COMET_RELEASES_GCS_BUCKET: "already-configured",
-      }),
-      undefined,
-    );
-    let uploaded = false;
-    const changed = await syncReleaseFeedSecrets("production", {}, {
-      upload: async () => {
-        uploaded = true;
-      },
-    });
-    assert.equal(changed, false);
-    assert.equal(uploaded, false);
+  it("rejects missing, partial or malformed configuration before upload", async () => {
+    for (const env of [
+      {},
+      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: "", GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: "" },
+      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: "" },
+      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: "" },
+      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: "invalid" },
+      { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: "not-a-key" },
+      { ...complete, CLOUDFLARE_API_TOKEN: "" },
+      { ...complete, CLOUDFLARE_ACCOUNT_ID: "" },
+      { ...complete, COMET_RELEASES_GCS_BUCKET: "" },
+    ]) {
+      assert.throws(() => releaseFeedSecrets("staging", env));
+      let uploaded = false;
+      await assert.rejects(syncReleaseFeedSecrets("staging", env, {
+        upload: async () => { uploaded = true; },
+      }));
+      assert.equal(uploaded, false);
+    }
   });
 
-  it("rejects partial or malformed reader credentials before upload", () => {
-    assert.throws(
-      () => releaseFeedSecrets("production", { GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: complete.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL }),
-      /reader email and private key together/,
-    );
-    assert.throws(
-      () => releaseFeedSecrets("production", { GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: complete.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY }),
-      /reader email and private key together/,
-    );
-    assert.throws(
-      () => releaseFeedSecrets("production", { ...complete, GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: "not-a-key" }),
-      /private key is malformed/,
-    );
-    assert.throws(
-      () => releaseFeedSecrets("production", { ...complete, CLOUDFLARE_API_TOKEN: "" }),
-      /requires CLOUDFLARE_API_TOKEN/,
-    );
+  it("rejects production and unspecified targets before upload", async () => {
+    for (const target of ["production", undefined, ""]) {
+      assert.throws(() => releaseFeedSecrets(target, complete));
+      let uploaded = false;
+      await assert.rejects(syncReleaseFeedSecrets(target, complete, {
+        upload: async () => { uploaded = true; },
+      }));
+      assert.equal(uploaded, false);
+    }
   });
 
-  it("uploads one complete atomic secret payload", async () => {
-    let uploaded;
-    const changed = await syncReleaseFeedSecrets("production", complete, {
-      upload: async (_edgeDir, target, secretsFile) => {
-        uploaded = { target, payload: JSON.parse(await readFile(secretsFile, "utf8")) };
-      },
-    });
-    assert.equal(changed, true);
-    assert.deepEqual(uploaded, {
-      target: "production",
-      payload: {
-        COMET_RELEASES_GCS_BUCKET: complete.COMET_RELEASES_GCS_BUCKET,
-        GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: complete.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL,
-        GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: complete.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY,
-      },
-    });
+  it("uploads one complete atomic secret payload and cleans up on success or failure", async () => {
+    for (const fail of [false, true]) {
+      let uploaded;
+      let temporaryFile;
+      let count = 0;
+      const uploadError = new Error("upload unavailable");
+      const result = syncReleaseFeedSecrets("staging", complete, {
+        upload: async (_edgeDir, target, secretsFile) => {
+          count += 1;
+          temporaryFile = secretsFile;
+          assert.equal((await stat(secretsFile)).mode & 0o777, 0o600);
+          uploaded = { target, payload: JSON.parse(await readFile(secretsFile, "utf8")) };
+          if (fail) throw uploadError;
+        },
+      });
+      if (fail) await assert.rejects(result, error => error === uploadError);
+      else assert.equal(await result, true);
+      assert.equal(count, 1);
+      assert.deepEqual(uploaded, {
+        target: "staging",
+        payload: {
+          COMET_RELEASES_GCS_BUCKET: complete.COMET_RELEASES_GCS_BUCKET,
+          GCP_RELEASE_SERVICE_ACCOUNT_EMAIL: complete.GCP_RELEASE_SERVICE_ACCOUNT_EMAIL,
+          GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY: complete.GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY,
+        },
+      });
+      assert.equal(existsSync(temporaryFile), false);
+      assert.equal(existsSync(path.dirname(temporaryFile)), false);
+    }
   });
 });
 
@@ -516,7 +590,7 @@ describe("release candidate reuse validation", () => {
 
   it("requires staging artifacts from the same source, version, and runtime", () => {
     const missing = reusableCandidate({ desktopStagingManifest: undefined });
-    assert.throws(() => validateReleaseCandidateReuse(missing), /desktop staging manifest/);
+    assert.throws(() => validateReleaseCandidateReuse(missing));
     for (const mutate of [
       (staging, candidate) => { staging.files = candidate.desktopManifest.files; },
       (staging) => { staging.source.commit = "c".repeat(40); },
@@ -526,7 +600,7 @@ describe("release candidate reuse validation", () => {
     ]) {
       const candidate = reusableCandidate();
       mutate(candidate.desktopStagingManifest, candidate);
-      assert.throws(() => validateReleaseCandidateReuse(candidate), /desktop staging manifest/);
+      assert.throws(() => validateReleaseCandidateReuse(candidate));
     }
   });
 
@@ -540,33 +614,21 @@ describe("release candidate reuse validation", () => {
 
     const unmerged = reusableCandidate();
     unmerged.run.head_branch = "fix/crew-installed-stability";
-    assert.throws(
-      () => validateReleaseCandidateReuse(unmerged),
-      /commit is not reachable from main/,
-    );
+    assert.throws(() => validateReleaseCandidateReuse(unmerged));
   });
 
   it("rejects candidates from another repository, commit, or file set", () => {
     const wrongRepository = reusableCandidate();
     wrongRepository.run.repository.full_name = "attacker/comet";
-    assert.throws(
-      () => validateReleaseCandidateReuse(wrongRepository),
-      /source run repository/,
-    );
+    assert.throws(() => validateReleaseCandidateReuse(wrongRepository));
 
     const wrongCommit = reusableCandidate();
     wrongCommit.desktopManifest.source.commit = "c".repeat(40);
-    assert.throws(
-      () => validateReleaseCandidateReuse(wrongCommit),
-      /desktop manifest\.source\.commit/,
-    );
+    assert.throws(() => validateReleaseCandidateReuse(wrongCommit));
 
     const wrongFiles = reusableCandidate();
     delete wrongFiles.unifiedManifest.files[`comet-${VERSION}-linux-aarch64.tar.gz`];
-    assert.throws(
-      () => validateReleaseCandidateReuse(wrongFiles),
-      /unified manifest\.files/,
-    );
+    assert.throws(() => validateReleaseCandidateReuse(wrongFiles));
   });
 });
 

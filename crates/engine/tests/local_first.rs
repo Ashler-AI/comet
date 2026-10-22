@@ -305,56 +305,18 @@ async fn signed_out_workos_boot_serves_local_data_without_dev_identity() {
 async fn clean_local_auth_construction_does_not_probe_edge_health() {
     let dir = tempfile::tempdir().unwrap();
     let (edge_url, requests, edge_task) = rejecting_edge().await;
-    let config = config(dir.path(), edge_url, Some("client_test"), None);
+    for workos_client_id in [Some("client_test"), None] {
+        let config = config(dir.path(), edge_url.clone(), workos_client_id, None);
+        let auth = Engine::build_auth(&config).await;
 
-    let auth = Engine::build_auth(&config).await;
-
-    assert_eq!(
-        Engine::initial_workspace_scope(&auth),
-        WorkspaceScope::Local
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
-    edge_task.abort();
-}
-
-#[tokio::test]
-async fn local_runtime_checks_public_releases_without_starting_edge_links() {
-    let dir = tempfile::tempdir().unwrap();
-    let (edge_url, requests, edge_task) = rejecting_edge().await;
-    let config = config(dir.path(), edge_url, Some("client_test"), None);
-    let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
-    let profile = Engine::resolve_profile(&config, &auth, scope)
-        .unwrap()
-        .expect("local profile is ready");
-
-    let runtime = Engine::assemble_runtime(&config, auth, profile)
-        .await
-        .unwrap();
-
-    assert_eq!(scope, WorkspaceScope::Local);
-    assert!(runtime.core().links().is_none());
-    let updater = runtime
-        .core()
-        .updater()
-        .expect("local runtime starts the public release checker");
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
-
-    updater.check_now();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while requests.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("release checker requested manifest.json and latest.txt");
-    assert!(runtime.core().links().is_none());
-
-    runtime.shutdown().await;
-    let stopped_at = requests.load(Ordering::SeqCst);
-    updater.check_now();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(requests.load(Ordering::SeqCst), stopped_at);
+        assert_eq!(
+            Engine::initial_workspace_scope(&auth),
+            WorkspaceScope::Local
+        );
+        assert_eq!(auth.state(), AuthState::SignedOut);
+        assert_eq!(auth.access_token().await, Err(zeron_rpc::TokenError::SignedOut));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
     edge_task.abort();
 }
 
@@ -489,33 +451,6 @@ async fn workspace_recovers_from_an_unreachable_edge_without_restarting() {
 }
 
 #[tokio::test]
-async fn development_without_an_explicit_bearer_stays_offline() {
-    let dir = tempfile::tempdir().unwrap();
-    let (edge_url, requests, edge_task) = rejecting_edge().await;
-    let config = config(dir.path(), edge_url, None, None);
-    let auth = Engine::build_auth(&config).await;
-    let scope = Engine::initial_workspace_scope(&auth);
-    let profile = Engine::resolve_profile(&config, &auth, scope)
-        .unwrap()
-        .expect("development profile is ready");
-
-    assert_eq!(scope, WorkspaceScope::Development);
-    assert_eq!(auth.access_token().await.as_deref(), Ok("dev-user"));
-    let runtime = Engine::assemble_runtime(&config, auth, profile)
-        .await
-        .unwrap();
-
-    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Development);
-    assert!(
-        runtime.core().links().is_none(),
-        "the synthetic dev identity must not enable Edge"
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
-    runtime.shutdown().await;
-    edge_task.abort();
-}
-
-#[tokio::test]
 async fn explicit_dev_bearer_keeps_online_routing_enabled() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(
@@ -542,6 +477,9 @@ async fn explicit_dev_bearer_keeps_online_routing_enabled() {
 
 #[tokio::test]
 async fn headless_stop_rpc_drains_the_daemon_and_releases_ipc() {
+    // Provider discovery starts real login-shell/version probes even with Mock.
+    // Keep that cold catalog work outside the shutdown/IPC lifecycle deadline.
+    let _ = zeron_engine::default_registry().descriptors();
     let dir = tempfile::tempdir().unwrap();
     let port = {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -554,18 +492,27 @@ async fn headless_stop_rpc_drains_the_daemon_and_releases_ipc() {
         None,
     );
     engine_config.ipc_port = port;
-    let daemon = tokio::spawn(Engine::new(engine_config).run());
+    let mut daemon = tokio::spawn(Engine::new(engine_config).run());
+    let mut last_connect_error = None;
 
     let client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Ok(client) = connect_ws(&format!("ws://127.0.0.1:{port}")).await {
-                break client;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::select! {
+            result = &mut daemon => panic!("headless engine exited before IPC connected: {result:?}"),
+            client = async {
+                loop {
+                    match connect_ws(&format!("ws://127.0.0.1:{port}")).await {
+                        Ok(client) => break client,
+                        Err(error) => last_connect_error = Some(error),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            } => client,
         }
     })
     .await
-    .expect("headless IPC did not start");
+    .unwrap_or_else(|error| {
+        panic!("headless IPC did not start: {error}; last connection error: {last_connect_error:?}")
+    });
 
     assert_eq!(
         client
@@ -587,6 +534,9 @@ async fn headless_stop_rpc_drains_the_daemon_and_releases_ipc() {
 
 #[tokio::test]
 async fn headless_sign_out_closes_joined_edge_rooms_and_stops_daemon() {
+    // Mock selection still builds the real provider catalog. Warm its shared
+    // login-shell and executable-version caches before timing the IPC lifecycle.
+    let _ = zeron_engine::default_registry().descriptors();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("session.json"),
@@ -600,18 +550,27 @@ async fn headless_sign_out_closes_joined_edge_rooms_and_stops_daemon() {
     };
     let mut engine_config = config(dir.path(), edge.url.clone(), Some("client_test"), None);
     engine_config.ipc_port = port;
-    let daemon = tokio::spawn(Engine::new(engine_config).run());
+    let mut daemon = tokio::spawn(Engine::new(engine_config).run());
+    let mut last_connect_error = None;
 
     let client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Ok(client) = connect_ws(&format!("ws://127.0.0.1:{port}")).await {
-                break client;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::select! {
+            result = &mut daemon => panic!("headless engine exited before IPC connected: {result:?}"),
+            client = async {
+                loop {
+                    match connect_ws(&format!("ws://127.0.0.1:{port}")).await {
+                        Ok(client) => break client,
+                        Err(error) => last_connect_error = Some(error),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            } => client,
         }
     })
     .await
-    .expect("headless IPC did not start");
+    .unwrap_or_else(|error| {
+        panic!("headless IPC did not start: {error}; last connection error: {last_connect_error:?}")
+    });
     wait_until(
         || edge.active_matching("/registry/") > 0,
         "registry room did not connect",

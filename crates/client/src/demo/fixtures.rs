@@ -307,6 +307,8 @@ pub(crate) fn devices(self_id: &str, self_name: &str, now: i64) -> Vec<Device> {
             id: id.into(),
             name: name.into(),
             platform: platform.into(),
+            devbox_provider: None,
+            devbox_id: None,
             last_seen_at: Some(ms(seen)),
             created_at: Some(ms(now - 30 * DAY)),
             version: Some(version.into()),

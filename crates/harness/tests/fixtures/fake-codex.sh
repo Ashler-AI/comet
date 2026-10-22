@@ -59,11 +59,13 @@ if has "$line" '"method":"thread/resume"'; then
   elif has "$line" '"threadId":"resume-with-child-v2"'; then
     emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-resumed\",\"turns\":[{\"items\":[{\"type\":\"subAgentActivity\",\"id\":\"spawn-alpha\",\"kind\":\"started\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"},{\"type\":\"subAgentActivity\",\"id\":\"subagent-completed-old\",\"kind\":\"completed\",\"agentThreadId\":\"child-alpha\",\"agentPath\":\"/root/alpha\"}]}]}}}"
   elif has "$line" '"threadId":"resume-fail"'; then
-    # Offer a replacement only if the client wrongly falls back; the safety test must catch it.
+    # A rejected resume must end the run without creating a new identity.
     emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32600,\"message\":\"rollout not found\"}}"
-    read -r line || exit 1
-    has "$line" '"method":"thread/start"' || exit 1
-    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-fresh\"}}}"
+    if read -r line; then
+      printf '%s\n' "$line" > rejected-resume-request.json
+      emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32600,\"message\":\"unexpected request after rejected resume\"}}"
+    fi
+    exit 0
   else
     emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-resumed\"}}}"
   fi

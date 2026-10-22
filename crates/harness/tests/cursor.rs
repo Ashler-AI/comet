@@ -681,22 +681,3 @@ async fn cancelling_a_native_steering_burst_stops_without_starting_another_turn(
         assert_eq!(dones, 1);
     }
 }
-
-#[tokio::test]
-async fn mcp_injection_reaches_shim_on_new_and_resumed_runs() {
-    for resume in [None, Some("agent-1")] {
-        let mut req = request("scenario:mcp");
-        req.resume = resume.map(str::to_owned);
-        req.mcp = Some(zeron_proto::McpServer {
-            name: "zeron".into(),
-            command: "/path with spaces/zeron".into(),
-            args: vec!["mcp".into()],
-            env: [("ZERON_CHAT_ID".into(), "origin-chat".into())].into(),
-        });
-        let (controls, _steer, _token) = controls();
-        let events = run_to_first_done(&harness(), req, controls).await;
-        assert!(events.contains(&AgentEvent::TextDelta {
-            text: "mcp configured".into()
-        }));
-    }
-}

@@ -34,7 +34,7 @@ use zeron_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
     evaluate_command, join_continuation_entries,
 };
-use zeron_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
+use zeron_proto::{chat_allows_sync, ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
 use zeron_sync::DocsStore;
 
 use crate::http_error::describe_http_error;
@@ -1227,6 +1227,7 @@ impl DocHost {
                 let now = now_ms();
                 let candidate = chats.into_iter().find(|c| {
                     c.device_id == device
+                        && chat_allows_sync(&c.id)
                         && c.room_gen.unwrap_or(1) < 2
                         && !attempted
                             .get(&c.id)
@@ -1355,6 +1356,25 @@ impl DocHost {
         self.inner.store.clone()
     }
 
+    pub(crate) fn ensure_execution_allowed(&self, chat_id: &str, resume: Option<&str>) -> Result<(), EngineError> {
+        if let Some(sessions) = self.sessions() {
+            return sessions.ensure_execution_allowed(chat_id, resume);
+        }
+        if self.workspace().map(|workspace| workspace.chat(chat_id)).transpose()?.flatten()
+            .and_then(|chat| chat.crew).is_some_and(|metadata| metadata.original_epoch_history.is_some()) {
+            return Err(EngineError::Other("Original execution epoch is read-only history; verified execution authority is unavailable".into()));
+        }
+        Ok(())
+    }
+
+    fn ensure_command_execution_allowed(&self, chat_id: &str, payload: &SessionCommandPayload) -> Result<(), EngineError> {
+        match payload {
+            SessionCommandPayload::Run { request, .. } => self.ensure_execution_allowed(chat_id, request.resume.as_deref()),
+            SessionCommandPayload::Steer { .. } => self.ensure_execution_allowed(chat_id, None),
+            _ => Ok(()),
+        }
+    }
+
     pub fn device_id(&self) -> &str {
         &self.inner.config.device_id
     }
@@ -1452,7 +1472,7 @@ impl DocHost {
         };
         let deferred_adoption = room_gen >= 2
             && stored_epoch < crate::chat2_host::CHAT2_DOC_EPOCH
-            && self.inner.config.edge.is_none()
+            && (self.inner.config.edge.is_none() || !chat_allows_sync(chat_id))
             && stored.is_some();
         let mut snapshot_len = 0usize;
         let mut chat2_cursor = 0u64;
@@ -1467,13 +1487,11 @@ impl DocHost {
                         .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
                     SessionDoc::from_doc(raw)
                 }
-                Some((bytes, _cursor, epoch)) if self.inner.config.edge.is_none() => {
-                    // Offline/edge-less: adopting would blank a readable
-                    // transcript with no way to catch up (review B4). Keep
-                    // the old doc read-only-ish; the adopt runs on the next
-                    // online open.
+                Some((bytes, _cursor, epoch)) if self.inner.config.edge.is_none() || !chat_allows_sync(chat_id) => {
+                    // A local history never adopts a remote lineage. Preserve
+                    // its full transcript even when this profile has an edge.
                     tracing::info!(chat = %chat_id, old_epoch = epoch,
-                        "chat2 adopt deferred (no edge configured)");
+                        "chat2 adopt deferred (local-only or no edge configured)");
                     snapshot_len = bytes.len();
                     let raw = loro::LoroDoc::new();
                     raw.import(&bytes)
@@ -1655,7 +1673,7 @@ impl DocHost {
         // retried: the exact "transcript frozen until restart" report.
         // Retry on the workspace host's capped, jittered backoff; a system
         // wake redials immediately; eviction/purge ends the loop via `weak`.
-        if self.inner.config.edge.is_some() {
+        if self.inner.config.edge.is_some() && chat_allows_sync(chat_id) {
             if room_gen >= 2 {
                 // Subscription BEFORE the dial (review B3): every local
                 // commit lands in the client when connected, else in the
@@ -1717,6 +1735,9 @@ impl DocHost {
     /// Concurrent callers activate at most one supervisor for this handle.
     /// Called on the device control link. Acceptance never cold-opens a chat.
     pub fn enqueue_wakeup(&self, chat_id: &str) -> Result<(), EngineError> {
+        if chat_id != "*" && !chat_allows_sync(chat_id) {
+            return Ok(());
+        }
         self.inner
             .store
             .schedule_sync_job(chat_id, if chat_id == "*" { "reconcile" } else { "wake" })?;
@@ -1724,6 +1745,7 @@ impl DocHost {
     }
 
     pub fn activate_sync(&self, handle: &Arc<ChatDocHandle>) {
+        if !chat_allows_sync(&handle.chat_id) { return; }
         handle.sync_background.store(false, Ordering::Release);
         if !handle.sync_started.load(Ordering::Acquire) {
             let _ = handle.sync_wait_since.compare_exchange(
@@ -1747,6 +1769,10 @@ impl DocHost {
         handle: &ChatDocHandle,
         wake_version: Option<i64>,
     ) -> Result<Option<SyncAdmission>, EngineError> {
+        if !chat_allows_sync(&handle.chat_id) {
+            handle.sync_requested.store(false, Ordering::Release);
+            return Ok(None);
+        }
         if handle.room_gen >= 2 {
             return Ok(Some(SyncAdmission::Join));
         }
@@ -1783,6 +1809,7 @@ impl DocHost {
         chat_id: &str,
         wake_version: Option<i64>,
     ) -> Result<Option<SyncAdmission>, EngineError> {
+        if !chat_allows_sync(chat_id) { return Ok(None); }
         if self.inner.store.snapshot_epoch(chat_id)? >= crate::chat2_host::CHAT2_DOC_EPOCH {
             return Ok(Some(SyncAdmission::Join));
         }
@@ -2215,6 +2242,7 @@ impl DocHost {
     /// Install a supervised chat2 client. Construction is local-first; only
     /// caught_up() proves the checkpoint and row replay actually completed.
     fn spawn_chat2_join(&self, edge: EdgeConfig, handle: &Arc<ChatDocHandle>, cursor: u64) {
+        if !chat_allows_sync(&handle.chat_id) { return; }
         let cancel = CancellationToken::new();
         *lock(&handle.sync_cancel) = cancel.clone();
         let priority = if handle.sync_background.load(Ordering::Acquire) {
@@ -2478,6 +2506,7 @@ impl DocHost {
         chat_id: &str,
         handle: &Arc<ChatDocHandle>,
     ) {
+        if !chat_allows_sync(chat_id) { return; }
         const TICK: std::time::Duration = std::time::Duration::from_millis(500);
         const QUIET_TICKS: u32 = 4; // 2s of frontier silence
         if !lock(&self.inner.seed_waiting).insert(chat_id.to_string()) {
@@ -2524,6 +2553,7 @@ impl DocHost {
     }
 
     fn spawn_chat2_seed(&self, edge: EdgeConfig, chat_id: &str, doc: Arc<SessionDoc>) {
+        if !chat_allows_sync(chat_id) { return; }
         {
             let mut seeding = lock(&self.inner.seeding);
             if !seeding.insert(chat_id.to_string()) {
@@ -2553,7 +2583,9 @@ impl DocHost {
         chat_id: &str,
         doc: Arc<SessionDoc>,
     ) -> Result<(), String> {
-        use base64::Engine as _;
+        if !chat_allows_sync(chat_id) {
+            return Err("Local history cannot seed a cloud session".into());
+        }
         let vv_at_rebuild = doc.doc().oplog_vv().encode();
         let rebuilt = zeron_doc::rebuild::rebuild_thin_doc(&doc).map_err(|e| e.to_string())?;
         // The seed's own doc ref must be gone before the pinned re-check
@@ -2570,32 +2602,7 @@ impl DocHost {
         }
         let snapshot = rebuilt.doc.export_snapshot().map_err(|e| e.to_string())?;
         let frontier = rebuilt.doc.doc().oplog_vv().encode();
-        let bearer = edge.bearer().await.map_err(|e| e.to_string())?;
-        let url = format!(
-            "{}/chat2/{}/checkpoint?seqCovered=0",
-            edge.url.trim_end_matches('/'),
-            chat_id
-        );
-        let _permit = zeron_sync::budget::shared()
-            .http(zeron_sync::budget::Priority::Background)
-            .await
-            .map_err(|e| e.to_string())?;
-        let res = self
-            .inner
-            .http
-            .post(&url)
-            .bearer_auth(&bearer)
-            .header(
-                "x-chat2-frontier",
-                base64::engine::general_purpose::STANDARD.encode(&frontier),
-            )
-            .body(snapshot.clone())
-            .send()
-            .await
-            .map_err(|e| format!("seed checkpoint POST: {}", describe_http_error(e)))?;
-        if !res.status().is_success() {
-            return Err(format!("seed checkpoint HTTP {}", res.status()));
-        }
+        crate::chat2_host::post_checkpoint(&self.inner.http, edge, chat_id, 0, &frontier, snapshot.clone()).await?;
         // PINNED RE-CHECK before anything irreversible (review B1): if a
         // run/watcher attached during the rebuild+POST, abort — everything
         // they write would fork away from the thin lineage. The orphan
@@ -2745,7 +2752,7 @@ impl DocHost {
         if let Some((bytes, _, epoch)) = &stored {
             // A pre-chat2 snapshot may be discarded by open() during adoption;
             // its entries are a recovery SOURCE, not proof the new doc is healthy.
-            if *epoch >= crate::chat2_host::CHAT2_DOC_EPOCH || self.inner.config.edge.is_none() {
+            if *epoch >= crate::chat2_host::CHAT2_DOC_EPOCH || self.inner.config.edge.is_none() || !chat_allows_sync(chat_id) {
                 let raw = loro::LoroDoc::new();
                 raw.import(bytes).map_err(|e| e.to_string())?;
                 for (_, update) in self
@@ -2786,7 +2793,7 @@ impl DocHost {
             return Ok(());
         }
         let handle = self.open(chat_id).map_err(|e| e.to_string())?;
-        if self.inner.config.edge.is_some() {
+        if self.inner.config.edge.is_some() && chat_allows_sync(chat_id) {
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
                 loop {
                     if lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up()) {
@@ -2905,16 +2912,64 @@ impl DocHost {
         self.spawn_chat2_checkpoint(handle, "threshold");
     }
 
+    /// Owner-controller migration only. Never open/adopt the old guest's document:
+    /// doing so would join/drain it or re-export bytes different from the proof.
+    pub(crate) async fn publish_imported_terminal_history(
+        &self, report: &zeron_sync::crew_import::CrewImportReport,
+    ) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        let chat = report.selected_chat_id.as_deref().ok_or("Selected import required")?;
+        let marker = report.original_epoch_histories.get(chat).ok_or("Terminal original epoch required")?;
+        let expected = report.destination_snapshots_sha256.get(chat).ok_or("Verified snapshot digest required")?;
+        if report.device_id != self.device_id() || !chat_allows_sync(chat)
+            || self.inner.edge_disconnected.load(Ordering::Acquire) {
+            return Err("Imported history publication requires its connected owner controller".into());
+        }
+        let edge = self.inner.config.edge.as_ref().ok_or("Native Edge is not configured")?;
+        let workspace = self.workspace().ok_or("Native registry is unavailable")?;
+        let store = self.inner.store.clone();
+        let id = chat.to_owned();
+        let snapshot = tokio::task::spawn_blocking(move || store.load_snapshot(&id))
+            .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?
+            .ok_or("Imported snapshot is absent")?;
+        if format!("{:x}", Sha256::digest(&snapshot)) != *expected {
+            return Err("Imported snapshot changed after verification".into());
+        }
+        let frontier = loro::LoroDoc::decode_import_blob_meta(&snapshot, true)
+            .map_err(|e| e.to_string())?.partial_end_vv.encode();
+        // Zero never compacts remote commands; an advanced room floor rejects
+        // this import instead of replacing a newer execution epoch's history.
+        crate::chat2_host::post_checkpoint(&self.inner.http, edge, chat, 0, &frontier, snapshot).await?;
+        let mut changes = workspace.watch_registry();
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                changes.borrow_and_update();
+                if let Some(row) = workspace.acknowledged_chat(chat)
+                    && row.seq > 0 && !row.deleted
+                    && row.fields.get("deviceId").and_then(serde_json::Value::as_str) == Some(marker.source_device_id.as_str())
+                    && row.fields.get("roomGen").and_then(serde_json::Value::as_u64) == Some(2)
+                    && let Some(crew) = row.fields.get("crew")
+                    && let Ok(crew) = serde_json::from_value::<zeron_proto::CrewChatMetadata>(crew.clone())
+                    && crew.session_id == chat && crew.owner_subject == report.owner_subject
+                    && crew.scope.project_id == report.project_id && crew.scope.deployment_id == report.deployment_id
+                    && crew.original_epoch_history.as_ref() == Some(marker) {
+                    return Ok(());
+                }
+                changes.changed().await.map_err(|_| "Native registry stopped".to_owned())?;
+            }
+        }).await.map_err(|_| "Imported registry row was not acknowledged before the deadline".to_owned())?
+    }
+
     /// POST a full checkpoint for a chat2 room (one in flight per handle).
     /// Callers: the quiesce-tick threshold above, and the client recovery
     /// events (`ServerReset` — a wiped room needs a seed checkpoint or every
     /// fresh reader sees only post-reset rows; `PushRejected` — the rejected
     /// ops reach peers only through a checkpoint).
     fn spawn_chat2_checkpoint(&self, handle: &Arc<ChatDocHandle>, reason: &'static str) {
+        if !chat_allows_sync(&handle.chat_id) { return; }
         if self.inner.edge_disconnected.load(Ordering::Acquire) {
             return;
         }
-        use base64::Engine as _;
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
@@ -2956,32 +3011,9 @@ impl DocHost {
                 return;
             };
 
-            let Ok(bearer) = edge.bearer().await else {
-                return;
-            };
-            let url = format!(
-                "{}/chat2/{}/checkpoint?seqCovered={}",
-                edge.url.trim_end_matches('/'),
-                chat_id,
-                seq_covered
-            );
-            let Ok(_permit) = zeron_sync::budget::shared().http(zeron_sync::budget::Priority::Background).await else {
-                return;
-            };
             let size = snapshot.len() as u64;
-            match http
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(300))
-                .bearer_auth(&bearer)
-                .header(
-                    "x-chat2-frontier",
-                    base64::engine::general_purpose::STANDARD.encode(&frontier),
-                )
-                .body(snapshot)
-                .send()
-                .await
-            {
-                Ok(res) if res.status().is_success() => {
+            match crate::chat2_host::post_checkpoint(&http, &edge, &chat_id, seq_covered, &frontier, snapshot).await {
+                Ok(()) => {
                     tracing::info!(chat = %chat_id, seq_covered, reason, "chat2 checkpoint posted");
                     for batch_id in &covered_rejections {
                         if let Err(err) = publication_store.acknowledge_chat_update(&chat_id,batch_id) {
@@ -2995,12 +3027,7 @@ impl DocHost {
                         client.note_checkpoint(seq_covered, size);
                     }
                 }
-                Ok(res) => {
-                    tracing::warn!(chat = %chat_id, status = res.status().as_u16(),
-                        "chat2 checkpoint rejected");
-                }
                 Err(err) => {
-                    let err = describe_http_error(err);
                     tracing::warn!(chat = %chat_id, error = %err, "chat2 checkpoint POST failed");
                 }
             }
@@ -3452,6 +3479,7 @@ impl DocHost {
         command_id: Option<&str>,
         expected_turn_id: Option<&str>,
     ) -> Result<String, EngineError> {
+        self.ensure_command_execution_allowed(chat_id, &payload)?;
         let handle = self.open(chat_id)?;
         let _owner = lock(&handle.transcript_import);
         if expected_turn_id.is_some_and(|id| id.is_empty() || id.len() > 256)
@@ -3496,6 +3524,7 @@ impl DocHost {
             expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
             resolution: None,
+            accepted_at: None,
         };
         handle.doc.queue_command(&entry)?;
         if command_id.is_some() {
@@ -4404,6 +4433,7 @@ impl DocHost {
     /// The chat's host device when it is NOT this engine (mirrors
     /// `nudge_remote_host`'s ownership read).
     fn remote_host_for(&self, chat_id: &str) -> Option<String> {
+        if !chat_allows_sync(chat_id) { return None; }
         let workspace = self.workspace()?;
         let host_device = match workspace.chat(chat_id) {
             Ok(Some(chat)) => chat.device_id,
@@ -4617,6 +4647,9 @@ impl DocHost {
             chat2.redial();
         }
         self.nudge_remote_host(chat_id);
+        // Read outcomes and execution liveness together, and serialize retry
+        // reissues: retiring preparation must not look like a dead attempt.
+        let executing = lock(&self.inner.executing);
         let commands = handle.doc.read_commands()?;
         let pending: Vec<SessionCommandEntry> = commands
             .iter()
@@ -4659,7 +4692,7 @@ impl DocHost {
                 SessionCommandStatus::Rejected | SessionCommandStatus::Expired => true,
                 SessionCommandStatus::Pending => {
                     self.inner.store.is_processed(&c.id).unwrap_or(false)
-                        && !lock(&self.inner.executing).contains(&c.id)
+                        && !executing.contains(&c.id)
                 }
                 _ => false,
             };
@@ -4671,7 +4704,8 @@ impl DocHost {
             let live_attempt = commands.iter().any(|o| {
                 o.id != c.id
                     && o.status == SessionCommandStatus::Pending
-                    && !self.inner.store.is_processed(&o.id).unwrap_or(false)
+                    && (!self.inner.store.is_processed(&o.id).unwrap_or(false)
+                        || executing.contains(&o.id))
                     && match (&o.payload, &c.payload) {
                         (
                             SessionCommandPayload::Run { message_id: a, .. },
@@ -4722,6 +4756,7 @@ impl DocHost {
                 expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
                 status: SessionCommandStatus::Pending,
                 resolution: None,
+                accepted_at: None,
             };
             tracing::info!(chat = %chat_id, old = %old.id, new = %reissue.id,
                 "retry re-issues a dead send attempt");
@@ -4749,6 +4784,7 @@ impl DocHost {
         chat_id: &str,
         entry: SessionCommandEntry,
     ) -> Result<&'static str, EngineError> {
+        self.ensure_command_execution_allowed(chat_id, &entry.payload)?;
         let handle = self.open(chat_id)?;
         // The sender sequences attachment transfers BEFORE the relay; refuse
         // (retryably) rather than run without the images.
@@ -4798,15 +4834,23 @@ impl DocHost {
                 CommandDisposition::Skip => Ok("duplicate"),
                 CommandDisposition::Expired => Ok("expired"),
                 CommandDisposition::Superseded => Ok("superseded"),
-                CommandDisposition::Execute => match {
+                CommandDisposition::Execute => {
                     if _prompt_guard.is_some() {
                         self.await_earlier_controls(&handle, &entry.id).await;
                     }
-                    self.execute(&sessions, &handle, &entry).await
-                } {
-                    Ok(_) => Ok("executed"),
-                    Err(err) => Err(err),
-                },
+                    let result = self.execute(&sessions, &handle, &entry).await;
+                    if commands.iter().any(|command| command.id == entry.id)
+                        || matches!(&entry.payload, SessionCommandPayload::Run { request, .. } if request.worktree.is_some())
+                    {
+                        let error = result.as_ref().err().map(ToString::to_string);
+                        let (status, resolution) = match &result {
+                            Ok((status, resolution)) => (*status, resolution.as_deref()),
+                            Err(_) => (SessionCommandStatus::Rejected, error.as_deref()),
+                        };
+                        self.resolve_command(&handle, &entry.id, status, resolution);
+                    }
+                    result.map(|_| "executed")
+                }
             },
         };
         lock(&self.inner.executing).remove(&entry.id);
@@ -4915,6 +4959,7 @@ impl DocHost {
     /// degrades to "full output unavailable" — it must never block or fail
     /// the run. Offline/edge-less engines skip silently.
     pub fn upload_tool_sidecar(&self, chat_id: &str, payload: zeron_doc::SidecarPayload) {
+        if !chat_allows_sync(chat_id) { return; }
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
@@ -4972,11 +5017,7 @@ impl DocHost {
     pub async fn fetch_tool_blob(&self, blob_ref: &str) -> Result<String, EngineError> {
         // Same shape `apply_sidecar_refs` writes; anything else is a forged ref.
         let valid = blob_ref.split_once('/').is_some_and(|(chat, part)| {
-            !chat.is_empty()
-                && chat.len() <= 128
-                && chat
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            chat_allows_sync(chat)
                 && !part.is_empty()
                 && part.len() <= 200
                 && part
@@ -5075,37 +5116,59 @@ impl DocHost {
         // Entries this pass decided to leave alone (processed dedupe hits).
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
-            let commands = match handle.doc.read_commands() {
-                Ok(commands) => commands,
-                Err(err) => {
-                    tracing::warn!(chat = %handle.chat_id, error = %err, "command read failed");
-                    return;
-                }
-            };
             let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
-            // Dead-command sweep: Pending in the doc, consumed by the ledger,
-            // and NOT mid-execution in this process — the crash window
-            // between mark-processed and the outcome write. Left alone it is
-            // a send no drain or retry can ever reach ("Sending…" forever,
-            // 2026-08-19); terminalize it so the truth lands in the doc and
-            // a user retry can mint a fresh attempt.
-            for c in &commands {
-                if c.status == SessionCommandStatus::Pending
-                    && !skipped.contains(&c.id)
-                    && is_processed(&c.id)
-                    && !lock(&self.inner.executing).contains(&c.id)
-                {
-                    tracing::warn!(chat = %handle.chat_id, command = %c.id,
-                        "command consumed but never resolved (crash mid-execute?); rejecting");
-                    self.resolve_command(
-                        handle,
-                        &c.id,
-                        SessionCommandStatus::Rejected,
-                        Some("interrupted before completion — retry to send again"),
-                    );
-                    skipped.insert(c.id.clone());
+            let commands = {
+                // Retirement writes the outcome before removing its executing id.
+                // Read Pending and liveness together: otherwise a control drain
+                // can overwrite that outcome using a pre-retirement snapshot.
+                let executing = lock(&self.inner.executing);
+                let commands = match handle.doc.read_commands() {
+                    Ok(commands) => commands,
+                    Err(err) => {
+                        tracing::warn!(chat = %handle.chat_id, error = %err, "command read failed");
+                        return;
+                    }
+                };
+                // Dead-command sweep: Pending in the doc, consumed by the ledger,
+                // and NOT mid-execution in this process — the crash window
+                // between mark-processed and the outcome write. Left alone it is
+                // a send no drain or retry can ever reach ("Sending…" forever,
+                // 2026-08-19); terminalize it so the truth lands in the doc and
+                // a user retry can mint a fresh attempt.
+                for c in &commands {
+                    if c.status == SessionCommandStatus::Pending
+                        && !skipped.contains(&c.id)
+                        && is_processed(&c.id)
+                        && !executing.contains(&c.id)
+                    {
+                        tracing::warn!(chat = %handle.chat_id, command = %c.id,
+                            "command consumed but never resolved (crash mid-execute?); rejecting");
+                        self.resolve_command(
+                            handle,
+                            &c.id,
+                            SessionCommandStatus::Rejected,
+                            Some("interrupted before completion — retry to send again"),
+                        );
+                        skipped.insert(c.id.clone());
+                    }
                 }
-            }
+                // Relay preparation can precede the sender's command row.
+                // A receipt is observational only: reject abandoned work,
+                // never turn a receipt into an executable command.
+                if let Ok(receipts) = handle.doc.pending_command_receipt_ids() {
+                    for id in receipts {
+                        if is_processed(&id) && !executing.contains(&id) {
+                            self.resolve_command(
+                                handle,
+                                &id,
+                                SessionCommandStatus::Rejected,
+                                Some("interrupted before completion — retry to send again"),
+                            );
+                        }
+                    }
+                }
+                commands
+            };
             let Some(entry) = commands
                 .iter()
                 .find(|c| {
@@ -5364,6 +5427,7 @@ impl DocHost {
                 "command outcome write failed"
             );
         }
+        handle.publish_messages_if_watched();
     }
 
     /// `entry` is a prompt sent before the Stop that has already acted on
@@ -5394,6 +5458,7 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        self.ensure_command_execution_allowed(chat_id, &entry.payload)?;
         if let Some(message_id) = self.cancelled_by_stop(handle, entry) {
             // Still the user's message: it stays in the transcript, unrun.
             let prompt = match &entry.payload {
@@ -5433,6 +5498,10 @@ impl DocHost {
                 let worktree_spec = request.worktree.take();
                 let fresh_worktree = match &worktree_spec {
                     Some(spec) => {
+                        // Acceptance is not transcript delivery: keep failures
+                        // retryable while the host prepares the checkout.
+                        handle.doc.accept_command(entry, now_ms())?;
+                        handle.publish_messages_if_watched();
                         let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;
                         request.cwd = cwd;
                         fresh

@@ -83,8 +83,8 @@ jobs:
   # compiled once (one cargo invocation, so dependencies are built once) and then run.
   macos-native:
     runs-on: macos-latest
-    # A cold cache (first run, eviction, toolchain bump) takes about 32 minutes; warm is about 10.
-    timeout-minutes: 45
+    # Cold native builds can exceed 45 minutes; headed fixtures retain their own short timeouts.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain
@@ -278,7 +278,7 @@ jobs:
           # Reuse the core built above instead of rebuilding it in the Xcode build phase.
           ZERON_SKIP_CORE: 1
         run: |
-          xcodebuild -project Zeron.xcodeproj -scheme "Crew Canary" \
+          xcodebuild -project Zeron.xcodeproj -scheme 'Crew Staging' \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
             -only-testing:ZeronTests CODE_SIGNING_ALLOWED=NO test

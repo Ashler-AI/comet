@@ -3,11 +3,11 @@ import CryptoKit
 import UIKit
 
 enum Endpoints {
-    static let callbackScheme = "crew-upstream-canary"
+    static let callbackScheme = "comet-staging"
     static func setting(_ key: String) throws -> String {
         guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
               !value.isEmpty, !value.contains("$(") else {
-            throw CoreError.Auth(message: "Configure \(key) for the isolated Crew Canary build.")
+            throw CoreError.Auth(message: "Configure \(key) for the Crew Staging build.")
         }
         return value
     }
@@ -49,7 +49,7 @@ final class SignInViewController: UIViewController, ASWebAuthenticationPresentat
         let mark = UIImageView(image: UIImage(systemName: "sparkle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 44, weight: .light)))
         mark.tintColor = Palette.text
         let title = UILabel()
-        title.text = "Crew Canary"
+        title.text = "Crew Staging"
         title.font = Fonts.ui(.sansSemibold, 34)
         title.textColor = Palette.text
         let tagline = UILabel()
@@ -126,7 +126,7 @@ final class SignInViewController: UIViewController, ASWebAuthenticationPresentat
                             }
                             return
                         }
-                        do { try self.app.signIn(account: await login.complete(callback: callback.absoluteString)) }
+                        do { try await self.app.signIn(account: login.complete(callback: callback.absoluteString)) }
                         catch { self.status.text = error.localizedDescription }
                     }
                 }

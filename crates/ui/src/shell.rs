@@ -1933,7 +1933,6 @@ enum UpdatePromptButton {
     CheckAgain,
     Download,
     Restart,
-    OpenDownloads,
 }
 
 #[derive(Debug, Clone)]
@@ -4451,6 +4450,7 @@ impl Shell {
                     let entries: Vec<zeron_doc::SessionMessageEntry> =
                         serde_json::from_str(value.get("text")?.as_str()?).ok()?;
                     let update = zeron_doc::TranscriptUpdate {
+                        command_delivery: Default::default(),
                         replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
                         frame: zeron_doc::TranscriptFrame::Reset { reset: entries },
                         context_usage: None,
@@ -4993,6 +4993,11 @@ impl Shell {
             if let Some(page) = self.pull_requests_page.as_ref().cloned() {
                 page.update(cx, |page, _| page.on_hidden());
             }
+        }
+        if matches!(self.route, Route::Settings(SettingsSection::Devices))
+            && !matches!(route, Route::Settings(SettingsSection::Devices))
+            && let Some(page) = &self.devices_page {
+            page.update(cx, |page, _| page.on_hidden());
         }
         self.route = route;
         if !was_pull_requests && will_show_pull_requests {
@@ -8082,6 +8087,9 @@ impl Shell {
             .iter()
             .find(|chat| chat.id == id)
             .map(|chat| chat.device_id.clone());
+        let devbox = pr_device.as_deref().is_some_and(|device_id| {
+            self.state.read(cx).devices.iter().any(|device| device.id == device_id && device.devbox_binding().is_some())
+        });
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
         let remote = self
@@ -8109,12 +8117,13 @@ impl Shell {
         // FAILED (explicit, with the transcript's retry affordance); a send
         // whose delivery path is degraded is QUEUED, not Working — the
         // pending pill tells the truth instead of faking a spinner.
-        let (queued, undelivered) = {
+        let (queued, undelivered, preparing) = {
             let now = Utc::now();
             let state = self.state.read(cx);
             (
                 state.send_queued(&id, now),
                 state.send_undelivered(&id, now),
+                state.send_preparing(&id),
             )
         };
         let status_color = if undelivered {
@@ -8128,6 +8137,8 @@ impl Shell {
             Some("Failed")
         } else if queued {
             Some("Queued")
+        } else if preparing {
+            Some("Preparing workspace…")
         } else {
             match status {
                 zeron_proto::ChatIndicator::Working => Some("Working"),
@@ -8314,7 +8325,7 @@ impl Shell {
                     .text_size(crate::typography::ui_rems(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .children(subagent_pill("idle"))
-                    .child(time_ago.clone())
+                    .child(if devbox { format!("Idle · {time_ago}").into() } else { time_ago.clone() })
                     .into_any_element(),
             }
         };
@@ -9456,10 +9467,10 @@ impl Shell {
 
     /// Update strip: shown above the user menu whenever this app's release
     /// checker ([`crate::app_update`]) has found a newer version. Self-updating
-    /// installs (macOS bundles, Windows installs, Linux managed installs) show
+    /// installs (macOS bundles and Linux managed installs) show
     /// the background download and then "restart to apply"; installs that
-    /// can't replace themselves explain why; advisory installs point at
-    /// `zeron update` or the GitHub releases page and dismiss per version.
+    /// can't replace themselves explain why and direct users to the established
+    /// private release workflow without linking an unverified download page.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let update = crate::app_update::AppUpdate::global(cx)?;
         let (label, action) = update.read(cx).strip()?;
@@ -9504,8 +9515,7 @@ impl Shell {
     }
 
     /// Download → the background stage; Restart → swap + relaunch; Explain →
-    /// the update dialog; advisory installs open their destination (if any),
-    /// then dismiss for this version.
+    /// the update dialog, including instructions for unmanaged installs.
     fn on_update_strip_click(
         &mut self,
         action: crate::app_update::StripAction,
@@ -9524,12 +9534,6 @@ impl Shell {
                 }
             }
             StripAction::Explain => update.update(cx, |update, cx| update.show_result(cx)),
-            StripAction::Advise { open_releases } => {
-                if open_releases {
-                    cx.open_url(zeron_update::RELEASES_PAGE);
-                }
-                update.update(cx, |update, cx| update.dismiss_advisory(cx));
-            }
         }
     }
 
@@ -9590,10 +9594,7 @@ impl Shell {
                             (
                                 title,
                                 blocker.to_string().into(),
-                                vec![
-                                    UpdatePromptButton::Close("Later"),
-                                    UpdatePromptButton::OpenDownloads,
-                                ],
+                                vec![UpdatePromptButton::Close("OK")],
                             )
                         } else if update.install().supports_desktop_update() {
                             match update.flow() {
@@ -9635,18 +9636,15 @@ impl Shell {
                         ) {
                             (
                                 title,
-                                "Run `zeron update` in a terminal to install it.".into(),
+                                "Run `comet update` in a terminal to install it.".into(),
                                 vec![UpdatePromptButton::Close("OK")],
                             )
                         } else {
                             (
                                 title,
-                                "This copy of Crew Canary was not installed by the Crew installer, so it cannot update itself."
+                                "This is a source or unmanaged install and cannot update itself. Obtain a signed Crew package through the established private release workflow."
                                     .into(),
-                                vec![
-                                    UpdatePromptButton::Close("Later"),
-                                    UpdatePromptButton::OpenDownloads,
-                                ],
+                                vec![UpdatePromptButton::Close("OK")],
                             )
                         }
                     }
@@ -9696,16 +9694,6 @@ impl Shell {
                             this.apply_staged_update(staged, cx);
                         }
                     })),
-                UpdatePromptButton::OpenDownloads => {
-                    popover::btn_primary(&theme, "Open download page")
-                        .id("update-prompt-downloads")
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.open_url(zeron_update::LATEST_RELEASE_PAGE);
-                            if let Some(update) = crate::app_update::AppUpdate::global(cx) {
-                                update.update(cx, |update, cx| update.dismiss_prompt(cx));
-                            }
-                        }))
-                }
             });
         }
         let card = popover::dialog_card(&theme)

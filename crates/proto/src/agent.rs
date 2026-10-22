@@ -980,3 +980,20 @@ mod todo_item_tests {
         assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
     }
 }
+
+/// Split the existing attachment transport trailer without interpreting paths.
+pub fn attachment_trailer(content: &str) -> Option<(&str, &str)> {
+    let mut offset = 0;
+    let mut previous_start = 0;
+    let mut previous_blank = false;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim();
+        if offset > 0 && previous_blank && text.to_lowercase().starts_with("attached images (local files") && text.ends_with("):") {
+            return Some((&content[..previous_start], &content[offset + line.len()..]));
+        }
+        previous_start = offset;
+        previous_blank = text.is_empty();
+        offset += line.len();
+    }
+    None
+}

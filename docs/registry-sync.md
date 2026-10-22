@@ -203,6 +203,19 @@ off the UI/runtime thread. The caller supplies a freshly verified controller
 principal; a manifest is not authentication. The destination must not exist and
 must be outside the immutable backup. Never select the live old profile.
 
+For fenced cloud imports, `comet import-remote-backup` and
+`comet verify-remote-backup` require `--destination-root` (the absolute native
+`COMET_DATA_DIR`), `--resource` (control origin), `--edge-origin`, `--context-file`
+and `--backup`. Both derive the destination with
+`zeron_engine::profile::scaffold_profile_directory`, the same pure helper used
+by `EngineProfile`: `<COMET_DATA_DIR>/profiles/scaffold/<scope_key>`, never the
+data root itself. The scope key uses the existing `sandbox_storage_key` over
+control resource, Edge origin, user, project, identity deployment, device
+deployment, logical session and sandbox. Lifecycle epochs and credentials are
+not inputs; authority verification and fencing remain the provider's job.
+The CLI rejects incomplete bound context and returns the exact directory as
+`destinationProfile`; the provider must preserve that path for native readback.
+
 After stopping every legacy writer and checkpointing SQLite, inventory a copied
 profile in `crew-backup.json` using `CrewBackupManifest` version 1:
 `writerStopped`, `sourceProfileRoot` (the original absolute profile path),
@@ -212,11 +225,48 @@ mapped to its SHA-256), and `chats` (chat IDs mapped to
 credential-free Agent Auth route). The inventory excludes the manifest itself.
 Keep attachment, native-history and settings paths relative to the profile.
 For every OMP native resume, include `nativeHistories` mapping the canonical
-native ID to an inventoried `native-histories/…` journal copy. Header IDs and
-initial hashes are checked; missing OMP histories are errors. At startup load
-`imported_native_histories(profile)` into host-only launch state and replace
-OMP `RunRequest.resume` IDs with their copied absolute paths. Keep synchronized
-native IDs and cwd unchanged. The copied journal may append after import.
+native ID to an inventoried `native-histories/<root>/sessions/…` journal copy,
+with referenced native bytes in sibling `blobs/<sha256>` files. Header IDs and
+initial hashes are checked; missing OMP histories are errors. At startup
+`imported_native_histories(profile)` feeds a one-time atomic hydration into
+`native-resumes/<nativeID>.jsonl`. The inventoried raw journal stays unchanged;
+only this durable launch copy may append. Host-only selectors for both resume
+and fork use the launch copy, retaining the exact native ID and cwd. Restart
+validates and reuses it, never overwriting native followup turns with the archive.
+OMP's source-backed `SessionManager` resolves/writes blobs in `getBlobsDir()`,
+not relative to an absolute `--resume` journal. Initial hydration therefore
+inlines SHA-256-verified bytes using the existing historical-attachment contract;
+provider image-URL blobs contain the original UTF-8 data URL, not raw image bytes.
+Unavailable historical attachments receive the existing explicit markers; other
+missing/corrupt native image fields fail before publishing the launch copy.
+New native-written blob references in launch/branch journals resolve against the
+configured native runtime store, including when preparing a later fork. No
+undocumented blob-root setting or transcript reconstruction is used.
+
+The runnable release smoke is the ignored engine test
+`imported_native_blobs_resume_in_real_omp`: provide `COMET_TEST_OMP_EXECUTABLE`,
+`COMET_TEST_OMP_MODEL`, `COMET_TEST_OMP_BLOB_PNG`,
+`COMET_TEST_OMP_VISUAL_NONCE` (text visible only inside a PNG of at least 1 KiB),
+and `COMET_TEST_CREW_AUTH_ROOT` (an isolated profile authenticated through normal
+Crew browser login, containing `scaffold-session.json`). The test derives the
+configured origins/scope from that session, re-verifies it with `Auth::detect`,
+and uses `CrewServices::prepare_inference` plus the ordinary `RunContext` route
+and auth-gateway extension. Never copy provider credentials or replace managed
+inference with a direct provider key. Device/sandbox authority is rejected.
+Run `cargo test -p zeron-engine imported_native_blobs_resume_in_real_omp -- --ignored --nocapture`
+with a disposable `HOME` and documented `PI_CODING_AGENT_DIR`, a managed vision
+model, and no `OMP_PROFILE`/`PI_PROFILE` override. `COMET_TEST_*` values are test
+inputs, not claimed OMP settings. Select the actual installed release executable;
+on the inspected host, `command -v omp` resolves through
+`/Users/czhen/Library/Application Support/Tern/omp/bin/omp` to
+`/Users/czhen/Library/Application Support/Tern/omp/versions/18.12.3`.
+The check performs native resume, restart/resume with a new attachment, and fork/inference;
+requires that OMP actually externalizes a new blob reference and that the fork
+hydrates those runtime-written bytes without an unavailable-attachment marker;
+checks exact native IDs, recalls the visual nonce and both old/new textual
+tokens, and checks the raw archive remains unchanged. Byte-only hydration tests
+are not that smoke.
+
 Non-OMP native resumes fail before destination creation with the original
 chat/native IDs and cwd reported: an isolated external-native-store importer
 is a release/cutover prerequisite, not an approved retirement of those sessions.
@@ -247,13 +297,39 @@ startup/native-fork state, delayed worktree deletion, unknown tables or workspac
 containers, malformed rows, mismatched scope and unlisted/tampered files are
 explicit errors. Reconcile those in the legacy lane, then take a new backup.
 There is no automatic unsafe replay or silent record dropping.
-The known `session_startups` table is accepted only when empty; any startup row
-still requires legacy reconciliation before snapshot loading or destination
-creation. Every stored scope must match the verified importing principal as-is;
+The known `session_startups` table is accepted only when empty, without requiring
+legacy identity columns; bootstrap classification likewise skips that empty
+sidecar without modifying it. Any startup row still requires legacy reconciliation
+before snapshot loading or destination creation. Every stored scope must match
+the verified importing principal as-is;
 missing or mixed deployment bindings are not relabeled to make import succeed.
-Validation currently materializes snapshot blobs and decoded documents. Qualify
-peak memory on a representative immutable copy before authorizing a real-profile
-import; synthetic fixture success is not that qualification.
+Inspection and source-evidence classification stream SQLite snapshots through the
+same historical-reference checks, retaining snapshot identities and one decoded
+document rather than every transcript. The repository pins a native-only
+`loro-internal` 1.13.9 patch for read-only change metadata and per-operation visitors;
+`vendor/loro-internal-1.13.9/UPSTREAM.json` records archive provenance and local changes.
+Causal validation walks metadata with the native shallow-root baseline instead of
+materializing ancestor version-vector caches. Retained-operation comparison hashes
+canonical framed values without exporting the entire history. A shallow or incomplete
+source still cannot prove that a bootstrap document has no historical associations.
+Export and import reconcile one canonical chat and its private execution aliases at
+a time in a private temporary SQLite worktable. Import also spools converted snapshots
+and original evidence there, preserves the original semantic-journal order, and reads
+back expected/actual records incrementally. No source or live profile is modified;
+the destination is created only after all semantic validation succeeds.
+Memory still depends on the largest workspace, canonical alias group, individual
+document/change and compact identity/outcome indexes; there is no content-dropping
+size limit. Qualify peak memory on a representative immutable copy before authorizing
+a real-profile import. A database-only observation without native archives or verified
+source authority is not a complete backup, and fixture success is not that qualification.
+
+The public inspection API completed on an immutable 3,037-snapshot, 715,402,552-byte
+database copy in 95.83 s: 254.94 MiB lifetime peak footprint, 236.17 MiB sampled RSS,
+and identical source database SHA-256 before/after. The watchdog retained its 1 GiB
+stop threshold; the full-corpus allowance was 120 s after the 15 s diagnostic expired.
+It conservatively returned zero inert-bootstrap proofs because shallow history was
+present. This verifies bounded copied-database inspection, not authenticated source
+capture, native archive completeness, real-profile import, or cutover readiness.
 
 A successful import writes `crew-import-report.json` with preserved IDs and
 checksums. Failed writes retain `crew-import-incomplete`; `DocsStore::open`

@@ -346,6 +346,21 @@ pub fn profile_key(session: &ScaffoldSession) -> String {
     let binding = serde_json::to_vec(&(&session.resource, &session.edge_origin, &session.identity.project_scope, &session.identity.deployment_id, &session.identity.user_id, session.device.as_ref().map(|device| (&device.deployment_id, &device.session_id, &device.device_id, &device.sandbox_id)))).expect("string tuple serializes");
     format!("{:x}", Sha256::digest(binding))
 }
+
+/// Stable storage identity, not an authentication credential. Deliberately
+/// excludes device/lifecycle epochs so a fenced migration retains its store.
+#[allow(clippy::too_many_arguments)]
+pub fn sandbox_storage_key(
+    resource: &str, edge_origin: &str, user_id: &str, project_id: &str,
+    deployment_id: Option<&str>, device_deployment_id: &str, session_id: &str, sandbox_id: &str,
+) -> String {
+    let binding = serde_json::to_vec(&(
+        "scaffold-sandbox-storage-v1", resource, edge_origin, user_id, project_id,
+        deployment_id, device_deployment_id, session_id, sandbox_id,
+    )).expect("string tuple serializes");
+    format!("{:x}", Sha256::digest(binding))
+}
+
 pub fn load_session(path: &Path) -> Result<Option<ScaffoldSession>, AuthError> {
     let bytes = match std::fs::read(path) { Ok(bytes) => bytes, Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None), Err(_) => return Err(unavailable("could not read Scaffold credential")) };
     let session: ScaffoldSession = serde_json::from_slice(&bytes).map_err(|_| AuthError::Rejected)?;

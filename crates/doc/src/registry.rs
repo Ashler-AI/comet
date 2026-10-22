@@ -656,6 +656,13 @@ impl RegistryDoc {
                 .or_default()
                 .insert(row.id.clone(), row);
         }
+        // Older snapshots may have queued imported histories before this gate.
+        for mut batch in std::mem::take(&mut doc.pending) {
+            doc.fold_local_history_ops(&mut batch.ops);
+            if !batch.ops.is_empty() {
+                doc.pending.push(batch);
+            }
+        }
         // Nothing is in flight after a load, so the whole queue coalesces —
         // this shrinks snapshots bloated before coalescing existed (178k
         // batches → one op per touched row). The host persists the result.
@@ -683,6 +690,8 @@ impl RegistryDoc {
     ) -> StateOutcome {
         self.generation += 1;
         self.sequence_reset |= seq < self.server_seq;
+        // Remote frames cannot create or overwrite a profile-local history.
+        let rows = rows.into_iter().filter(|row| !zeron_proto::is_local_history_chat(&row.id));
         if !full {
             for row in rows {
                 self.put_authoritative(row);
@@ -748,7 +757,7 @@ impl RegistryDoc {
     #[must_use]
     pub fn apply_rows(&mut self, seq: u64, rows: Vec<RegistryRow>) -> bool {
         self.generation += 1;
-        for row in rows {
+        for row in rows.into_iter().filter(|row| !zeron_proto::is_local_history_chat(&row.id)) {
             self.put_authoritative(row);
         }
         if seq > self.server_seq + 1 {
@@ -820,7 +829,22 @@ impl RegistryDoc {
         self.clock.next(Self::now_ms(), &device)
     }
 
+    /// Reserved imported histories (including their status and sidebar rows)
+    /// persist in this replica, never in an outgoing registry batch.
+    fn fold_local_history_ops(&mut self, ops: &mut Vec<RowOp>) {
+        ops.retain(|op| {
+            if zeron_proto::is_local_history_chat(&op.id) {
+                self.generation += 1;
+                self.fold_op(op);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn enqueue_ops(&mut self, mut ops: Vec<RowOp>) {
+        self.fold_local_history_ops(&mut ops);
         if ops.is_empty() {
             return;
         }
@@ -1081,6 +1105,8 @@ impl RegistryDoc {
             ("id", json!(device.id)),
             ("name", json!(device.name)),
             ("platform", json!(device.platform)),
+            ("devboxProvider", json!(device.devbox_provider)),
+            ("devboxId", opt_str(device.devbox_id.as_deref())),
             ("lastSeenAt", opt_ms(device.last_seen_at)),
             ("createdAt", opt_ms(device.created_at)),
             ("version", opt_str(device.version.as_deref())),
@@ -1652,6 +1678,8 @@ impl RegistryDoc {
                     ("id", json!(device.id)),
                     ("name", json!(device.name)),
                     ("platform", json!(device.platform)),
+                    ("devboxProvider", json!(device.devbox_provider)),
+                    ("devboxId", opt_str(device.devbox_id.as_deref())),
                     ("lastSeenAt", opt_ms(device.last_seen_at)),
                     ("createdAt", opt_ms(device.created_at)),
                     ("version", opt_str(device.version.as_deref())),

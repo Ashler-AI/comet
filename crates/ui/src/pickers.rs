@@ -988,7 +988,7 @@ impl Pickers {
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
             let space = state.read(cx).selected_space.clone();
-            let device = state.read(cx).effective_device_id();
+            let device = state.read(cx).active_device_id();
             let device_changed = device != this.device_owner;
             if space != this.space_owner || device_changed {
                 this.space_owner = space;
@@ -1061,7 +1061,7 @@ impl Pickers {
         }
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
-        let device_owner = state.read(cx).effective_device_id();
+        let device_owner = state.read(cx).active_device_id();
         Self {
             state,
             managed_models_only: false,
@@ -1198,7 +1198,7 @@ impl Pickers {
             return None;
         }
         let state = self.state.read(cx);
-        let device = state.effective_device_id()?;
+        let device = state.active_device_id()?;
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
@@ -1650,6 +1650,56 @@ impl Pickers {
     }
 
     // ---- loads ----
+
+    /// Refresh only after an explicit wake. Ordinary discovery never wakes hosts.
+    pub(crate) fn refresh_after_wake(&mut self, device_id: &str, harness: Option<HarnessId>, cx: &mut Context<Self>) {
+        if self.space_target(cx).as_deref() != Some(device_id) { return; }
+        self.target_generation = self.target_generation.wrapping_add(1);
+        self.load_task = None;
+        self.refs_task = None;
+        self.harnesses = Loadable::Idle;
+        self.harnesses_stale = false;
+        self.harnesses_revalidating = false;
+        self.models.clear();
+        self.stale_models.clear();
+        self.revalidating.clear();
+        self.refs = Loadable::Idle;
+        self.refs_space = None;
+        self.ensure_harnesses(true, cx);
+        self.prefetch_models(true, cx);
+        if let Some(harness) = harness { self.ensure_models(harness, true, cx); }
+        if self.state.read(cx).selected_space_row().is_some_and(|space| space.device_id == device_id) {
+            self.ensure_refs(true, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn wake_refresh_result(&self, device_id: &str, harness: Option<HarnessId>, cx: &App) -> Option<Result<(), String>> {
+        if self.space_target(cx).as_deref() != Some(device_id) {
+            return Some(Err("The selected device changed. Your draft is preserved.".into()));
+        }
+        fn loaded<T>(slot: &Loadable<T>) -> Option<Result<(), &str>> {
+            match slot {
+                Loadable::Ready(_) => Some(Ok(())),
+                Loadable::Error(error) => Some(Err(error.as_str())),
+                _ => None,
+            }
+        }
+        let slots = [
+            loaded(&self.harnesses),
+            match harness {
+                Some(harness) => self.models.get(&harness).and_then(loaded),
+                None => Some(Ok(())),
+            },
+            if self.state.read(cx).selected_space_row().is_some_and(|space| space.git_detected && space.device_id == device_id) {
+                loaded(&self.refs)
+            } else { Some(Ok(())) },
+        ];
+        for slot in &slots {
+            if let Some(Err(error)) = slot { return Some(Err(format!("Could not refresh the connected device: {error}"))); }
+        }
+        slots.iter().all(Option::is_some).then_some(Ok(()))
+    }
 
     fn ensure_harnesses(&mut self, force: bool, cx: &mut Context<Self>) {
         // Non-forced (the render loop's eager kick) only loads from Idle: an

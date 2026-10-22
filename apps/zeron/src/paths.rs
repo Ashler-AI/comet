@@ -3,14 +3,11 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub fn data_dir() -> PathBuf {
-    resolve_data_dir(|name| std::env::var_os(name))
-}
 
-fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
-    if let Some(dir) = env("COMET_DATA_DIR")
-        .or_else(|| env("ZERON_DATA_DIR"))
+pub fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>, pinned: bool) -> PathBuf {
+    if let Some(dir) = (!pinned).then(|| env("COMET_DATA_DIR")
         .filter(|value| !value.is_empty())
+        .or_else(|| env("ZERON_DATA_DIR").filter(|value| !value.is_empty()))).flatten()
     {
         return PathBuf::from(dir);
     }
@@ -48,7 +45,7 @@ mod tests {
             vars.iter()
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.into())
-        })
+        }, false)
     }
 
     #[test]
@@ -62,8 +59,8 @@ mod tests {
     #[test]
     fn native_runtime_data_dir_takes_precedence() {
         assert_eq!(
-            resolve(&[("COMET_DATA_DIR", "canary"), ("ZERON_DATA_DIR", "upstream")]),
-            PathBuf::from("canary")
+            resolve(&[("COMET_DATA_DIR", "explicit"), ("ZERON_DATA_DIR", "upstream")]),
+            PathBuf::from("explicit")
         );
     }
 

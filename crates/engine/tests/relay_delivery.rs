@@ -184,7 +184,13 @@ fn registry() -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
+    let core = EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles");
+    // The fake room still needs an explicit token source; production auth
+    // correctly stays signed out when no credentials have been configured.
+    let mut auth = zeron_engine::AuthConfig::new("http://localhost:27640", dir);
+    auth.allow_dev_auth = true;
+    core.set_auth(zeron_engine::Auth::new(auth));
+    core
 }
 
 fn complete_assistant_count(core: &EngineCore) -> usize {
@@ -221,6 +227,8 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
         id: "device-b".into(),
         name: "b".into(),
         platform: "linux".into(),
+        devbox_provider: None,
+        devbox_id: None,
         last_seen_at: Some(chrono::Utc::now()),
         created_at: None,
         version: Some("0.2.12".into()),

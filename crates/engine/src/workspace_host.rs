@@ -221,6 +221,7 @@ impl WorkspaceHost {
     /// Load (or migrate, or init) the registry, upsert this device's row, start
     /// the change-driven task, and join the edge registry room when configured.
     pub fn open(store: Arc<DocsStore>, config: WorkspaceHostConfig) -> Result<Self, EngineError> {
+        let binding = crate::devbox::host_binding().map_err(EngineError::Other)?;
         let stored = store.load_snapshot(REGISTRY_DOC_ID)?;
         let mut doc = match stored {
             Some(bytes) => RegistryDoc::from_bytes(&bytes, &config.device_id)
@@ -286,6 +287,16 @@ impl WorkspaceHost {
             .read_devices()?
             .into_iter()
             .find(|d| d.id == config.device_id);
+        if let Some(device) = &existing {
+            if (device.devbox_provider.is_some() || device.devbox_id.is_some())
+                && (device.devbox_provider != binding.as_ref().map(|(provider, _)| *provider)
+                    || device.devbox_id.as_deref() != binding.as_ref().map(|(_, id)| id.as_str()))
+            {
+                return Err(EngineError::Other("Native host binding differs from the registered immutable provider identity".into()));
+            }
+        }
+        let (devbox_provider, devbox_id) = binding.map(|(provider, id)| (Some(provider), Some(id)))
+            .unwrap_or_default();
         doc.upsert_device(&Device {
             id: config.device_id.clone(),
             name: device_name_on_boot(
@@ -293,6 +304,8 @@ impl WorkspaceHost {
                 &config.device_name,
             ),
             platform: config.platform.clone(),
+            devbox_provider,
+            devbox_id,
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
             // (the Devices page "Added …" fragment).
@@ -1296,6 +1309,23 @@ impl WorkspaceHostInner {
         };
         match snapshot {
             Ok(mut state) => {
+                if !state.sessions.is_empty() {
+                    let owners: std::collections::HashMap<&str, &str> = state.chats.iter()
+                        .map(|chat| (chat.id.as_str(), chat.device_id.as_str())).collect();
+                    let mut seen = lock(&self.presence_seen);
+                    for session in &state.sessions {
+                        if owners.get(session.chat_id.as_str()).copied() != Some(session.device_id.as_str()) {
+                            continue;
+                        }
+                        // Replayed rows prove only their original host timestamp,
+                        // never the time this controller happens to receive them.
+                        let heartbeat = session.updated_at.timestamp_millis();
+                        match seen.get_mut(&session.device_id) {
+                            Some(previous) => *previous = (*previous).max(heartbeat),
+                            None => { seen.insert(session.device_id.clone(), heartbeat); }
+                        }
+                    }
+                }
                 self.overlay_presence(&mut state.devices);
                 // Retain the latest value even with no subscribers, but don't
                 // wake every list for unrelated registry/presence changes.
@@ -1978,6 +2008,36 @@ mod tests {
             updated_at: at,
             running_subagents: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn owner_session_heartbeat_projects_monotonic_device_presence() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(), device_name: "Host".into(),
+                platform: "test".into(), org_id: "org".into(), user_id: "owner".into(),
+                edge: None, local_only: true,
+            },
+        ).unwrap();
+        host.create_chat("chat-1", None, Some("test-device"), None, None).unwrap();
+        let original = host.read(|doc| doc.read_devices()).unwrap().remove(0);
+        let heartbeat = original.last_seen_at.unwrap() + chrono::Duration::seconds(10);
+        host.record_session(&running_session(heartbeat));
+        host.inner.publish();
+        assert_eq!(host.watch_devices().borrow()[0].last_seen_at, Some(heartbeat));
+        host.record_session(&running_session(heartbeat - chrono::Duration::seconds(5)));
+        host.inner.publish();
+        assert_eq!(host.watch_devices().borrow()[0].last_seen_at, Some(heartbeat));
+        let mut impostor = running_session(heartbeat + chrono::Duration::seconds(20));
+        impostor.device_id = "other-device".into();
+        host.record_session(&impostor);
+        host.inner.publish();
+        assert!(!lock(&host.inner.presence_seen).contains_key("other-device"));
+        assert_eq!(host.read(|doc| doc.read_devices()).unwrap(), vec![original],
+            "session presence must not rewrite durable device rows");
     }
 
     #[tokio::test]

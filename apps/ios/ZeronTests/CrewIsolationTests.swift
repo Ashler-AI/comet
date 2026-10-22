@@ -2,6 +2,27 @@ import XCTest
 @testable import Zeron
 
 final class CrewIsolationTests: XCTestCase {
+    func testStagingIdentityAndProfileIsolation() throws {
+        XCTAssertEqual(Bundle.main.bundleIdentifier, "ai.ashler.crew.staging")
+        XCTAssertEqual(Endpoints.callbackScheme, "comet-staging")
+        XCTAssertEqual(try Endpoints.setting("CrewProjectScope"), "ashler-staging")
+        XCTAssertEqual(try Endpoints.setting("CrewDeploymentId"), "ashler-staging")
+        XCTAssertTrue(AppModel.profilesDir.path.hasSuffix("profiles/scaffold"))
+    }
+
+    func testNotificationScopeNeverCrossesAccountsOrDeployment() {
+        func accepts(_ user: String, _ project: String, _ deployment: String?) -> Bool {
+            PushNotifications.matchesScope(userId: user, projectScope: project, deploymentId: deployment,
+                                           currentUser: "owner", currentProject: "ashler-staging", currentDeployment: "ashler-staging")
+        }
+        XCTAssertTrue(accepts("owner", "ashler-staging", "ashler-staging"))
+        XCTAssertTrue(accepts("owner", "ashler-staging", nil), "Existing legacy payloads bind user and project")
+        XCTAssertFalse(accepts("foreign", "ashler-staging", nil))
+        XCTAssertFalse(accepts("owner", "ashler-production", nil))
+        XCTAssertFalse(accepts("owner", "ashler-staging", "foreign-deployment"))
+        XCTAssertFalse(accepts("", "", nil))
+    }
+
     @MainActor
     func testCreatingSandboxNeverReusesSelectedSessionIdentity() throws {
         let selected = UUID().uuidString.lowercased()
@@ -10,6 +31,18 @@ final class CrewIsolationTests: XCTestCase {
         XCTAssertNotNil(UUID(uuidString: created))
         XCTAssertNotEqual(created, try CrewControlsViewController.sessionID(for: "create", selected: selected))
         XCTAssertEqual(try CrewControlsViewController.sessionID(for: "attach", selected: selected), selected)
+        XCTAssertEqual(try CrewControlsViewController.sessionID(for: "start", selected: selected), selected)
+        XCTAssertThrowsError(try CrewControlsViewController.sessionID(for: "start", selected: nil))
+        XCTAssertTrue(CrewControlsViewController.canStartNewEpoch(lifecycle: "stopped", epoch: 7))
+        XCTAssertTrue(CrewControlsViewController.canStartNewEpoch(lifecycle: "failed", epoch: 7))
+        XCTAssertFalse(CrewControlsViewController.canStartNewEpoch(lifecycle: "stopped", epoch: nil))
+        XCTAssertEqual(CrewControlsViewController.lifecycleEpoch(from: NSNumber(value: UInt64.max)), UInt64.max)
+        for value in [nil, true, -1, 1.5, "7"] as [Any?] {
+            XCTAssertNil(CrewControlsViewController.lifecycleEpoch(from: value))
+        }
+        for lifecycle in [nil, "running", "paused", "starting", "unknown"] as [String?] {
+            XCTAssertFalse(CrewControlsViewController.canStartNewEpoch(lifecycle: lifecycle, epoch: 7))
+        }
         XCTAssertThrowsError(try CrewControlsViewController.sessionID(for: "attach", selected: nil))
         XCTAssertThrowsError(try CrewControlsViewController.sessionID(for: "inspect", selected: "invalid"))
     }
@@ -65,9 +98,9 @@ final class CrewIsolationTests: XCTestCase {
         XCTAssertEqual(Drafts.load("same-session"), "unsent private work")
     }
 
-    func testExistingAndCanaryLinksUseTheSharedParser() {
+    func testExistingLinksUseTheSharedParser() {
         let id = "8b3ca06e-1fe0-4b72-bbe3-7bc7ec760baf"
-        for scheme in ["comet", "comet-staging", "crew-upstream-canary"] {
+        for scheme in ["comet", "comet-staging"] {
             XCTAssertTrue(crewIsSessionLink(url: "\(scheme)://session/project/\(id)?deploymentId=staging"))
             XCTAssertTrue(crewIsSessionLink(url: "\(scheme)://scaffold/project/staging/\(id)/sandbox"))
             XCTAssertFalse(crewIsSessionLink(url: "\(scheme)://session/project/\(id)?token=secret"))

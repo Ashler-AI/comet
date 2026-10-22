@@ -2130,7 +2130,10 @@ async fn mcp_selected_device_online() -> (
                 && m["text"] == "remote reply"
                 && m["deviceId"] == "device-b")
     );
-    let summary = tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    let summary = tools
+        .call("get_chat", json!({"chat":chat_id}))
+        .await
+        .unwrap();
     assert_eq!(summary["messageCount"], read["total"]);
     assert_eq!(summary["lastMessage"]["text"], "remote reply");
     assert_eq!(summary["lastMessage"]["deviceId"], "device-b");

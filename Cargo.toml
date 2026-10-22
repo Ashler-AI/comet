@@ -27,9 +27,10 @@ members = [
     "crates/visual-gpu",
     "apps/zeron",
 ]
+exclude = ["vendor/loro-internal-1.13.9"]
 
 [workspace.package]
-version = "0.2.115"
+version = "0.2.116"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -203,3 +204,7 @@ inherits = "release"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Pinned native metadata/operation inspection without expanding the history cache.
+[patch.crates-io]
+loro-internal = { path = "vendor/loro-internal-1.13.9" }

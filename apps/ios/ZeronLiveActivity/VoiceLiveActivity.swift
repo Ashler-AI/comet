@@ -75,7 +75,7 @@ struct VoiceLiveActivity: Widget {
 }
 
 private enum Stage {
-    static let url = URL(string: "crew-upstream-canary://voice")
+    static let url = URL(string: "comet-staging://voice")
 }
 
 // MARK: Lock Screen

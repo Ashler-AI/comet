@@ -46,6 +46,13 @@ type RelayBody = UnsyncBoxBody<Bytes, BoxError>;
 type RelayByteStream =
     Pin<Box<dyn futures::Stream<Item = Result<Bytes, BoxError>> + Send + 'static>>;
 
+
+/// A native run's provider protection gate. Metadata/catalog reads never call it.
+pub(crate) struct RunInferenceAdmission {
+    pub(crate) cancellation: zeron_harness::CancellationToken,
+    pub(crate) check: Arc<dyn Fn() -> futures::future::BoxFuture<'static,
+        Result<crate::sessions::InferenceActivity, EngineError>> + Send + Sync>,
+}
 #[derive(Clone)]
 pub(crate) struct InferenceRelay {
     inner: Arc<Inner>,
@@ -64,6 +71,7 @@ struct Route {
     owner_subject: String,
     authority: AsyncMutex<AuthorityState>,
     cancellation: zeron_harness::CancellationToken,
+    admission: Option<RunInferenceAdmission>,
 }
 
 impl Route {
@@ -91,6 +99,7 @@ struct RetiredRoute {
     owner_subject: String,
     provider: String,
     retired_at: Instant,
+    run_bound: bool,
 }
 
 impl RetiredRoute {
@@ -120,6 +129,7 @@ impl RouteState {
                 route.session_id() == session_id
                     && route.owner_subject == owner_subject
                     && route.provider == provider
+                    && !route.run_bound
             })
             .max_by_key(|(_, route)| route.retired_at)
             .map(|(token, _)| token.clone())?;
@@ -141,6 +151,7 @@ struct InstrumentedRelayStream {
     status: StatusCode,
     bytes_received: u64,
     terminated: bool,
+    activity: Option<crate::sessions::InferenceActivity>,
 }
 
 impl InstrumentedRelayStream {
@@ -157,11 +168,13 @@ impl InstrumentedRelayStream {
             status,
             bytes_received: 0,
             terminated: false,
+            activity: None,
         }
     }
 
     fn finish(&mut self, outcome: &'static str, error: Option<&(dyn Error + Send + Sync)>) {
         self.terminated = true;
+        self.activity.take();
         if let Some(error) = error {
             tracing::warn!(
                 outcome,
@@ -328,12 +341,19 @@ impl InferenceRelay {
         Ok(relay)
     }
 
-    pub(crate) async fn prepare(
+    #[cfg(test)]
+    async fn prepare(&self, session_id: &str, harness: HarnessId, model: Option<&str>,
+        requested_account_id: Option<&str>) -> Result<Option<InferenceRoute>, EngineError> {
+        self.prepare_with_admission(session_id, harness, model, requested_account_id, None).await
+    }
+
+    pub(crate) async fn prepare_with_admission(
         &self,
         session_id: &str,
         harness: HarnessId,
         model: Option<&str>,
         requested_account_id: Option<&str>,
+        admission: Option<RunInferenceAdmission>,
     ) -> Result<Option<InferenceRoute>, EngineError> {
         let agent_auth_session_id = agent_auth_logical_session_id(session_id);
         let local_session_id =
@@ -360,11 +380,15 @@ impl InferenceRelay {
         let provider = request.provider.clone();
         let model = request.model.clone();
         let owner_subject = authority.principal_id.clone();
+        let run_bound = admission.is_some();
+        let cancellation = admission.as_ref().map(|gate| gate.cancellation.child_token())
+            .unwrap_or_default();
         let route = Arc::new(Route {
             request,
             local_session_id,
             owner_subject: owner_subject.clone(),
-            cancellation: zeron_harness::CancellationToken::new(),
+            cancellation,
+            admission,
             authority: AsyncMutex::new(AuthorityState {
                 authority,
                 expires_at,
@@ -373,9 +397,9 @@ impl InferenceRelay {
         let local_token = {
             let mut state = lock(&self.inner.route_state);
             state.prune_retired();
-            let token = state
-                .take_retired_token(session_id, &owner_subject, &provider)
-                .unwrap_or_else(|| local_relay_token(&provider));
+            let token = if run_bound { None } else {
+                state.take_retired_token(session_id, &owner_subject, &provider)
+            }.unwrap_or_else(|| local_relay_token(&provider));
             state.active.insert(token.clone(), route);
             token
         };
@@ -410,6 +434,7 @@ impl InferenceRelay {
                             owner_subject: route.owner_subject.clone(),
                             provider: route.request.provider.clone(),
                             retired_at,
+                            run_bound: route.admission.is_some(),
                         },
                     );
                 }
@@ -473,6 +498,7 @@ impl InferenceRelay {
                             route.session_id().to_string(),
                             route.owner_subject.clone(),
                             route.provider.clone(),
+                            route.run_bound,
                         )
                     })
                 })
@@ -480,7 +506,7 @@ impl InferenceRelay {
                 None
             };
             let retired_route =
-                if let Some((session_id, owner_subject, provider)) = retired {
+                if let Some((session_id, owner_subject, provider, run_bound)) = retired {
                     let replacement = state
                         .active
                         .values()
@@ -488,6 +514,7 @@ impl InferenceRelay {
                             candidate.session_id() == session_id
                                 && candidate.owner_subject == owner_subject
                                 && candidate.request.provider == provider
+                                && !run_bound && candidate.admission.is_none()
                         })
                         .cloned();
                     if let (Some(local_token), Some(replacement)) = (token.as_ref(), replacement) {
@@ -593,6 +620,24 @@ impl InferenceRelay {
             }
         };
         let cancellation = route.cancellation.clone();
+        // This is the last admission boundary before any model request/body is
+        // forwarded. A bound route cannot borrow another native run's lease.
+        let activity = if let Some(admission) = &route.admission {
+            let admitted = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return json_response(StatusCode::GONE,
+                    json!({ "error": "inference_run_retired" })),
+                result = (admission.check)() => result,
+            };
+            match admitted {
+                Ok(activity) => Some(activity),
+                Err(_) => return json_response(StatusCode::SERVICE_UNAVAILABLE,
+                    json!({ "error": "provider_protection_unavailable" })),
+            }
+        } else { None };
+        if cancellation.is_cancelled() {
+            return json_response(StatusCode::GONE, json!({ "error": "inference_run_retired" }));
+        }
         let body = reqwest::Body::wrap_stream(request.into_body().into_data_stream());
         let upstream = self
             .inner
@@ -611,7 +656,7 @@ impl InferenceRelay {
             })
             .await;
         match upstream {
-            Ok(response) => stream_response(response, cancellation, stream_context),
+            Ok(response) => stream_response(response, cancellation, stream_context, activity),
             Err(error) => {
                 tracing::warn!(err = %error, "inference relay upstream failed");
                 json_response(
@@ -765,25 +810,18 @@ fn stream_response(
     upstream: reqwest::Response,
     cancellation: zeron_harness::CancellationToken,
     context: RelayStreamContext,
+    activity: Option<crate::sessions::InferenceActivity>,
 ) -> Response<RelayBody> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let upstream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
-    instrumented_streamed_response(status, headers, Box::pin(upstream), cancellation, context)
-}
-
-fn instrumented_streamed_response(
-    status: StatusCode,
-    headers: HeaderMap,
-    stream: RelayByteStream,
-    cancellation: zeron_harness::CancellationToken,
-    context: RelayStreamContext,
-) -> Response<RelayBody> {
-    let stream = InstrumentedRelayStream::new(stream, cancellation, context, status);
+    let mut stream = InstrumentedRelayStream::new(Box::pin(upstream), cancellation, context, status);
+    stream.activity = activity;
     streamed_response(status, headers, Box::pin(stream))
 }
+
 
 fn streamed_response(
     status: StatusCode,

@@ -23,8 +23,8 @@ async function fixture(t, publish = true) {
     COMET_DATA_DIR: join(root, '.scaffold/crew-data'), SCAFFOLD_RUNTIME_DIR: root,
   };
   const config = loadConfig(env);
-  await mkdir(join(root, 'omp-inference'));
-  await writeFile(join(root, 'omp-inference/profile.json'), JSON.stringify({ profile: 'scaffold-host', model: 'scaffold-openai/gpt-example' }));
+  await mkdir(join(env.SCAFFOLD_RUNTIME_DIR, 'omp-inference'), { recursive: true });
+  await writeFile(join(env.SCAFFOLD_RUNTIME_DIR, 'omp-inference/profile.json'), JSON.stringify({ profile: 'scaffold-host', model: 'scaffold-openai/gpt-example' }));
   const authority = {
     scope: { projectId: profile.projectId, deploymentId: profile.deploymentId, sessionId: profile.sessionId },
     sandboxId: profile.sandboxId, deviceId: profile.targetDeviceId, lifecycleEpoch: 1,
@@ -83,6 +83,7 @@ test('only trusted chat2 configuration enables the canonical native bridge', asy
     { SCAFFOLD_CREW_SYNC_GENERATION: '' }, { SCAFFOLD_CREW_SYNC_GENERATION: 'legacy' },
     { COMET_IPC_PORT: '27954' }, { COMET_DATA_DIR: '/tmp/shared-data' },
     { COMET_DATA_DIR: '/tmp/.scaffold/crew-upstream-canary/data' },
+    { SCAFFOLD_RUNTIME_DIR: 'relative/runtime' },
     { CREW_WEB_AUTH_TOKEN: 'short' }, { CREW_WEB_SESSION_ID: 'another-session' },
     { SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify({ ...profile, actor: {} }) },
   ]) assert.throws(() => loadConfig({ ...f.env, ...change }));

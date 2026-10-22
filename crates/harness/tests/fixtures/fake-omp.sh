@@ -40,6 +40,8 @@ fi
 SESSION_ID="omp-session-1"
 NO_SESSION=0
 CONFIG_PATH=""
+CATALOG_GUARD=0
+EXTENSION_PATH=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--resume" ]; then
@@ -47,6 +49,10 @@ for arg in "$@"; do
   elif [ "$prev" = "--config" ]; then
     [ -f "$arg" ] || exit 92
     CONFIG_PATH="$arg"
+  elif [ "$prev" = "--extension" ]; then
+    EXTENSION_PATH="$arg"
+  elif [ "$arg" = "--comet-command-catalog" ]; then
+    CATALOG_GUARD=1
   elif [ "$arg" = "--no-session" ]; then
     NO_SESSION=1
   fi
@@ -62,13 +68,15 @@ ACTIVE_GOAL="${OMP_ACTIVE_GOAL:-}"
 if [ "$NO_SESSION" != "1" ]; then
   [ -f "$CONFIG_PATH" ] || exit 92
   [ "${PI_CONFIG_FILES+x}" != x ] || exit 92
+else
+  [ "$CATALOG_GUARD" = "1" ] && [ -f "$EXTENSION_PATH" ] || exit 93
 fi
 
 printf '%s\n' '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}'
 if [ -n "$ACTIVE_GOAL" ]; then
   printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"goal","description":"Toggle goal mode","input":{"hint":"[objective]"},"subcommands":[{"name":"set","description":"Set or replace the goal","usage":"<objective>"},{"name":"drop","description":"Drop the current goal"}]},{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
 else
-  printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"}]}'
+  printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"ralplan","description":"Plan with consensus","input":{"hint":"goal"}},{"name":"security","description":"Run security review"},{"name":"advisor","description":"Toggle advisor","input":{"hint":"[on|off|status|dump [raw]|configure]"}}]}'
 fi
 
 finish_turn() {
@@ -81,6 +89,7 @@ finish_turn() {
 }
 
 turn_open=0
+state_requests=0
 while IFS= read -r line; do
   type=$(printf '%s' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -89,6 +98,14 @@ while IFS= read -r line; do
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"negotiate_protocol\",\"success\":true}"
       ;;
     get_state)
+      state_requests=$((state_requests + 1))
+      if [ "$state_requests" -gt 1 ] && [ -n "${OMP_STATE_BURST:-}" ]; then
+        i=0
+        while [ "$i" -lt 512 ]; do
+          printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"queued event\n"}}'
+          i=$((i + 1))
+        done
+      fi
       if [ -n "${OMP_SESSION_LOG:-}" ]; then
         printf 'config:%s\n' "$CONFIG_PATH" >> "$OMP_SESSION_LOG"
         printf '%s\n' "get_state" >> "$OMP_SESSION_LOG"

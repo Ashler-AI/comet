@@ -10,7 +10,7 @@
 # environment before curl starts; it is never placed in argv or written to disk.
 # The release workflow publishes scaffold-SHA256SUMS; missing or mismatched files fail.
 #
-# Installs the self-contained native binary to the fresh ~/.crew/app, puts
+# Installs immutable releases under ~/.crew/app/<version>-<sha256>, puts
 # `comet` on PATH, and — once signed in — runs it as a systemd user service.
 # After the comet install it bootstraps any missing agent CLIs (OMP, Claude
 # Code, Codex). Bootstrap failures never abort the comet install; set
@@ -133,7 +133,7 @@ release_fetch() {
   esac
   # Curl reads the private header from stdin. The bearer is neither an argument
   # nor an inherited environment variable in the curl process.
-  printf 'Authorization: %s\n' "$RELEASE_AUTHORIZATION" | curl --header @- "$@"
+  printf 'Authorization: %s\n' "$RELEASE_AUTHORIZATION" | curl --proto '=https' --proto-redir '=https' --tlsv1.2 --header @- "$@"
 }
 
 # --- platform ---------------------------------------------------------------
@@ -143,7 +143,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "comet install: on macOS, download the desktop app instead:" >&2
-    echo "  $RELEASES/latest.txt → $RELEASES/comet-<version>-macos-arm64.dmg" >&2
+    echo "  $RELEASES/desktop-latest.txt → $RELEASES/comet-<version>-macos-arm64.dmg" >&2
     exit 1
     ;;
   *)
@@ -163,30 +163,29 @@ esac
 # --- download ----------------------------------------------------------------
 ver="$(release_fetch -fsSL "$RELEASES/scaffold-latest.txt" | tr -d '[:space:]')"
 [ -n "$ver" ] || { echo "ashler comet install: could not resolve latest version" >&2; exit 1; }
+case "$ver" in
+  *[!0-9A-Za-z.+-]*|.*|-*) echo "ashler comet install: invalid release version '$ver'" >&2; exit 1 ;;
+esac
 file="comet-$ver-$plat-$arch.tar.gz"
 data_root="$HOME/.crew"
-app_root="$data_root/app"
-dest="$app_root/$ver"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 
-if [ -x "$dest/comet" ]; then
-  echo "comet $ver already downloaded — relinking."
-else
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  echo "downloading Crew $ver ($plat-$arch)…"
-  release_fetch -fSL --progress-bar "$RELEASES/$file" -o "$tmp/$file"
-  release_fetch -fsSL "$RELEASES/scaffold-SHA256SUMS" -o "$tmp/SHA256SUMS"
-  expected="$(awk -v file="$file" '$2 == file || $2 == "*" file { print $1; exit }' "$tmp/SHA256SUMS")"
-  [ -n "$expected" ] || { echo "ashler comet install: $file is missing from scaffold-SHA256SUMS" >&2; exit 1; }
-  actual="$(sha256_file "$tmp/$file")"
-  [ "$actual" = "$expected" ] || { echo "ashler comet install: checksum mismatch for $file" >&2; exit 1; }
-  mkdir -p "$dest"
-  tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
-fi
-
-ln -sfn "$dest" "$app_root/current"
-mkdir -p "$HOME/.local/bin"
-ln -sf "$app_root/current/comet" "$HOME/.local/bin/comet"
+echo "downloading Crew $ver ($plat-$arch)…"
+release_fetch -fSL --progress-bar "$RELEASES/$file" -o "$tmp/$file"
+release_fetch -fsSL "$RELEASES/scaffold-SHA256SUMS" -o "$tmp/SHA256SUMS"
+expected="$(awk -v file="$file" '$2 == file || $2 == "*" file { print $1 }' "$tmp/SHA256SUMS")"
+case "$expected" in
+  *[!0-9a-f]*|'') echo "ashler comet install: expected one SHA-256 entry for $file in scaffold-SHA256SUMS" >&2; exit 1 ;;
+esac
+[ "${#expected}" -eq 64 ] || { echo "ashler comet install: invalid SHA-256 entry for $file" >&2; exit 1; }
+actual="$(sha256_file "$tmp/$file")"
+[ "$actual" = "$expected" ] || { echo "ashler comet install: checksum mismatch for $file" >&2; exit 1; }
+mkdir "$tmp/package"
+tar -xzf "$tmp/$file" -C "$tmp/package" --strip-components=1
+# Share the tarball's immutable install and XDG desktop integration. A loader
+# failure leaves the previous current symlink intact; no service is touched.
+bash "$tmp/package/install.sh"
 
 # --- service -----------------------------------------------------------------
 # Auth is decoupled from the daemon: `comet login` persists the session and a

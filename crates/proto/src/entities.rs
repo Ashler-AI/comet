@@ -72,12 +72,37 @@ impl SidebarPreferencesState {
     }
 }
 
+/// Immutable host provider identity, independent of OS and peer routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceEnvironment {
+    Namespace,
+    Boat,
+}
+
+impl DeviceEnvironment {
+    pub fn valid_devbox_id(&self, id: &str) -> bool {
+        match self {
+            Self::Namespace => id.len() == 13
+                && id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            Self::Boat => id.strip_prefix("bx_").is_some_and(|suffix| suffix.len() == 8
+                && suffix.bytes().all(|byte| b"23456789abcdefghjkmnpqrstuvwxyz".contains(&byte))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
     pub id: String,
     pub name: String,
     pub platform: String,
+    /// Absent on ordinary hosts and older registry rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbox_provider: Option<DeviceEnvironment>,
+    /// Immutable provider ID; display names never authorize execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbox_id: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
     /// First registration time (zeron devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
@@ -97,6 +122,12 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn devbox_binding(&self) -> Option<(DeviceEnvironment, &str)> {
+        let provider = self.devbox_provider?;
+        let id = self.devbox_id.as_deref()?;
+        provider.valid_devbox_id(id).then_some((provider, id))
+    }
+
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
     }

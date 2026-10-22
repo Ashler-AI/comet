@@ -31,13 +31,16 @@ pub(crate) fn validate_inference_route(
 
 pub(crate) fn apply_run_context(cmd: &mut Command, context: Option<&RunContext>) {
     // Child identity always comes from the host, never an inherited nested run.
-    for key in ["COMET_SESSION_ID", "COMET_IPC_PORT", "COMET_INFERENCE_TOKEN",
+    for key in ["COMET_SESSION_ID", "COMET_IPC_PORT", "COMET_SUPERVISION_TOKEN", "COMET_INFERENCE_TOKEN",
         "PRIME_AGENT_AUTH_GATEWAY_URL", "OMP_AUTH_GATEWAY_URL", "OMP_AUTH_GATEWAY_TOKEN"] {
         cmd.env_remove(key);
     }
     let Some(context) = context else { return };
     cmd.env("COMET_SESSION_ID", &context.session_id)
         .env("COMET_IPC_PORT", context.ipc_port.to_string());
+    if let Some(token) = &context.supervision_token {
+        cmd.env("COMET_SUPERVISION_TOKEN", token);
+    }
     let Some(route) = &context.inference else { return };
     // The opaque loopback token is the only provider authority a managed child gets.
     // CLI config overrides below also prevent on-disk OAuth credentials taking precedence.
@@ -82,6 +85,7 @@ mod tests {
     fn managed_route_rejects_unsupported_harness_and_clears_inherited_credentials() {
         let context = RunContext {
             session_id: "session".into(), ipc_port: 1234, fork_from: None,
+            supervision_token: Some("exact-run-capability".into()),
             inference: Some(InferenceRoute { base_url: "http://127.0.0.1:9876".into(),
                 token: "opaque-local-token".into(), provider: "anthropic".into(), model: "claude".into() }),
         };
@@ -96,7 +100,11 @@ mod tests {
         assert_eq!(env.get(std::ffi::OsStr::new("ANTHROPIC_AUTH_TOKEN")),
             Some(&Some(std::ffi::OsStr::new("opaque-local-token"))));
         assert!(!format!("{context:?}").contains("opaque-local-token"));
+        assert!(!format!("{context:?}").contains("exact-run-capability"));
+        assert_eq!(env.get(std::ffi::OsStr::new("COMET_SUPERVISION_TOKEN")),
+            Some(&Some(std::ffi::OsStr::new("exact-run-capability"))));
         apply_run_context(&mut cmd, None);
         assert!(cmd.as_std_mut().get_envs().any(|(key, value)| key == "COMET_SESSION_ID" && value.is_none()));
+        assert!(cmd.as_std_mut().get_envs().any(|(key, value)| key == "COMET_SUPERVISION_TOKEN" && value.is_none()));
     }
 }

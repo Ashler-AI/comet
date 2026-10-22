@@ -18,13 +18,17 @@ DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
 
 echo "▸ building (first run takes a few minutes)…"
+# This is a source/mock launch, never a packaged application identity.
+unset COMET_PACKAGE_ENVIRONMENT COMET_DEFAULT_ENVIRONMENT
 cargo build -p zeron -q
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')"
+CREW="$TARGET_DIR/debug/zeron"
 
 echo "▸ starting engine daemon on :$IPC"
 env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
   ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_HARNESS=mock \
   ${DELAY:+ZERON_MOCK_DELAY_MS=$DELAY} RUST_LOG=warn \
-  ./target/debug/zeron --data-dir "$DAEMON_DIR" --ipc-port "$IPC" \
+  "$CREW" --data-dir "$DAEMON_DIR" --ipc-port "$IPC" \
   --edge-url http://127.0.0.1:27941 headless &
 DAEMON_PID=$!
 trap 'kill "$DAEMON_PID" 2>/dev/null || true; rm -rf "$DEMO_ROOT"' EXIT
@@ -59,7 +63,7 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
     fi
     probe Mutate "{\"op\":\"setChatActivity\",\"chatId\":\"$id\",\"lastMessageAt\":$(( ($(date +%s) - $4*3600) * 1000 ))}" >/dev/null
   }
-  seed "Native Zeron Rust Rewrite"    zeron zeron/main                 0  run
+  seed "Native Crew Rust Rewrite"     zeron zeron/main                 0  run
   seed "Rebalance Player Stats Caps"  soccertcg    zeron/rebalance-player-stat-caps  2  run
   seed "Craft Premium TCG Experience" soccertcg    zeron/craft-premium-tcg-exp       26 skip
   seed "Initial Context Exploration"  zeron        zeron/initial-context-exploration 14 skip
@@ -67,8 +71,8 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   touch "$DAEMON_DIR/.demo-seeded"
 fi
 
-echo "▸ opening zeron (composer is live — type into it; --slow shows streaming)"
+echo "▸ opening Crew (composer is live — type into it; --slow shows streaming)"
 env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
   ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_HARNESS=mock RUST_LOG=warn \
-  ./target/debug/zeron --data-dir "$UI_DIR" --ipc-port "$IPC" \
+  "$CREW" --data-dir "$UI_DIR" --ipc-port "$IPC" \
   --edge-url http://127.0.0.1:27941

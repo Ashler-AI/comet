@@ -20,8 +20,8 @@ export default {
       }
       return Response.json({ error: "not_found" }, { status: 404 });
     }
-    // /releases is canary-only R2, not an alias for the established GCS feed.
-    if (parts[0] === "releases") return Response.json({ error: "not_found" }, { status: 404 });
+    // The retained GCS feed has one established route, not a second release alias.
+    if (parts[0] === "releases" || parts[0] === "install.sh") return Response.json({ error: "not_found" }, { status: 404 });
     return native.fetch(request, activeNativeEnv(raw));
   }
 } satisfies ExportedHandler<StagingEnv>;

@@ -35,6 +35,7 @@ Typing an unselected inline `/word` does not execute a local action.
 | --- | --- |
 | Codex | Native `/compact` and `/review`; eleven total entries in an existing chat before skills |
 | Claude Code | Project-scoped commands from its initialize catalog |
+| OMP | Native RPC command metadata, including `/advisor`, extensions, skills, custom and file commands |
 | OpenCode | Project-scoped server command catalog |
 | Pi | Native `get_commands`, including extension commands and `skill:*` invocations |
 | Devin, Grok, Hermes, Antigravity | Advertised ACP commands, including session command updates |
@@ -75,6 +76,22 @@ Shared `.agents/skills` files use explicit file delivery in Claude and generic A
 catalogs: a matching built-in command name does not establish skill identity.
 Pi's `skill:` namespace and OpenCode's skill source metadata identify native skills
 explicitly and remain eligible for native delivery.
+
+Crew-managed command discovery is limited to OMP and desktop Codex's static
+metadata. Claude command discovery remains blocked because its startup hooks do
+not have a proven inference-denial boundary; existing skill discovery is unchanged.
+Live provider model probes remain disabled. OMP discovery uses a disposable
+`--no-session` RPC process in the selected checkout, retaining native user and
+project commands, extensions, and skill metadata. Its temporary final config
+overlay sets `skillful: false` and `memory.backend: off`, disabling startup skill
+description compression and memory inference jobs without disabling skill discovery.
+Inherited config files remain earlier overlays; no global settings are modified.
+Any startup inference attempt must terminate the catalog process before request
+delivery. A published snapshot does not turn a failed
+catalog exit into success. Failures propagate; startup descendants are terminated
+and the owned child is reaped before discovery completes, including
+on timeout. Normal session launch, authentication, model policy, and persisted
+history are unchanged.
 
 At delivery, Codex receives typed skill inputs. A leading skill selection with a
 native command for the current harness becomes that command, preserving its

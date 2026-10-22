@@ -2527,8 +2527,15 @@ mod tests {
         limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Vec<WorkspaceFileSearchMatch>, WorkspaceFilesError> {
+        let search = WorkspaceSearch::new();
+        if !include_ignored {
+            // Assert search results against a completed index, not the
+            // interactive first-scan budget (which permits partial results).
+            search.warm(root).unwrap();
+            assert!(search.wait_until_indexed(root, Duration::from_secs(20)));
+        }
         super::search_workspace_blocking(
-            &WorkspaceSearch::new(),
+            &search,
             root,
             query,
             include_ignored,

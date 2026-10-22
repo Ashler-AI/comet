@@ -1,0 +1,99 @@
+name: Release contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main, crew/staging-native-cutover]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-contracts-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  packaging:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Rust toolchain for metadata fixtures
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Release gates and immutable candidate promotion
+        run: node --test scripts/release-workflow.test.mjs scripts/scaffold-runtime-release-guard.test.mjs
+      - name: Linux installed desktop entry contracts
+        run: bash scripts/test-linux-desktop-entry.sh
+
+  macos-packaging:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Signed desktop packaging rejection contracts
+        run: node --test scripts/package-macos.test.mjs scripts/verify-macos-release.test.mjs
+
+  edge-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: Edge contracts without deployment credentials
+        working-directory: edge
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+      - name: Native browser server contracts
+        run: node --test apps/web/server.test.mjs
+
+  native-regressions:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/linux-ci
+        if: runner.os == 'Linux'
+        with:
+          rust-cache: core
+      - name: macOS Rust toolchain
+        if: runner.os == 'macOS'
+        run: |
+          rustup update stable --no-self-update
+          rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.os == 'macOS'
+        with:
+          shared-key: release-contracts
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Native auth, runtime, resume, directory and updater regressions
+        run: >-
+          cargo test --locked
+          -p zeron-sync -p zeron-client -p zeron-update -p zeron-engine -p zeron-harness
+          --lib --test scaffold_auth --test omp
+      - name: Read-only migration history codec regressions
+        run: >-
+          cargo test --locked --manifest-path vendor/loro-internal-1.13.9/Cargo.toml
+          --target-dir target --lib --features counter readonly_
+      - name: Native application browser suppression and inherited IPC
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p zeron --test noop_browser

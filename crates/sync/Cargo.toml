@@ -24,6 +24,7 @@ sha2.workspace = true
 base64.workspace = true
 chrono.workspace = true
 percent-encoding.workspace = true
+tempfile.workspace = true
 
 # NWPathMonitor bridge (net_path.rs) — the update handler is an ObjC block.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -37,6 +38,5 @@ mock-server = []
 [dev-dependencies]
 # chat2_live example only (live checkpoint fetch against a deployed worker).
 reqwest.workspace = true
-tempfile.workspace = true
 # `start_paused` virtual-clock tests (the 2026-07-30 sync-stall regressions).
 tokio = { workspace = true, features = ["test-util"] }

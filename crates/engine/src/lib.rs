@@ -11,12 +11,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 pub use zeron_proto::{EngineInfo, HarnessId, WorkspaceScope};
-use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
+use zeron_rpc::{RpcError, RpcReply, RpcService, TokenSource, methods};
 
 use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+mod boat_lease;
+pub mod devbox;
+mod namespace_tasks;
 pub mod crew;
 mod crew_directory;
 pub mod scaffold;
@@ -247,6 +250,7 @@ impl EngineCore {
         lock: InstanceLock,
         crew_context: Option<(Auth, scaffold::ScaffoldRuntime)>,
     ) -> Result<Self, EngineError> {
+        crate::devbox::host_binding().map_err(EngineError::Other)?;
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
@@ -291,11 +295,6 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
-        match sessions.recover_stale() {
-            Ok(0) => {}
-            Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
-            Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
-        }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
         sessions.set_scratch_root(repos.scratch_root());
@@ -370,6 +369,13 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        // Recovered commands can execute immediately: wire attachment aliases,
+        // repository/worktree services and turn hooks before admitting any.
+        match sessions.recover_stale() {
+            Ok(0) => {}
+            Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
+            Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
+        }
         Ok(Self {
             sessions,
             doc_host,
@@ -792,10 +798,15 @@ impl Engine {
         config: &EngineConfig,
         workspace_scope: WorkspaceScope,
     ) -> Result<EngineInfo, EngineError> {
+        let binding = crate::devbox::host_binding().map_err(EngineError::Other)?;
+        let (devbox_provider, devbox_id) = binding.map(|(provider, id)| (Some(provider), Some(id)))
+            .unwrap_or_default();
         std::fs::create_dir_all(&config.data_dir)?;
         Ok(EngineInfo {
             device_id: load_or_create_device_id(&config.data_dir)?,
             workspace_scope,
+            devbox_provider,
+            devbox_id,
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
             capabilities: zeron_proto::capabilities::current(),
         })
@@ -830,6 +841,7 @@ impl Engine {
         profile: EngineProfile,
         lock: Option<InstanceLock>,
     ) -> anyhow::Result<EngineRuntime> {
+        crate::devbox::host_binding().map_err(anyhow::Error::msg)?;
         if profile.scaffold_profile_key() != auth.verified_profile_key().as_deref() {
             anyhow::bail!("Crew profile authority changed during initialization");
         }
@@ -903,6 +915,41 @@ impl Engine {
             Some(lock) => lock,
             None => InstanceLock::acquire(profile.device_root())?,
         };
+        // Device bootstrap fetches the canonical original-epoch evidence before
+        // any document sync or command drain can observe historical requests.
+        if let Some(authority) = auth.device_grant_authority()
+            && let Some((_, runtime)) = &crew_context
+            && let Some(evidence) = runtime.client().original_epoch_history(
+                &authority.sandbox_id, &authority.scope, &tokio_util::sync::CancellationToken::new(),
+            ).await?
+        {
+            let root = profile.store_root().to_owned();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let chat = authority.scope.session_id.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Original epoch bootstrap requires an exact session grant"))?;
+                let principal = zeron_proto::CollaborationPrincipal {
+                    subject: authority.principal_subject.clone(), email: None,
+                    project_id: authority.scope.project_id.clone(), deployment_id: authority.scope.deployment_id.clone(),
+                    session_id: Some(chat.to_owned()), capabilities: Vec::new(), unknown: Default::default(),
+                };
+                let history = zeron_sync::crew_import::validate_original_epoch_bootstrap(
+                    evidence.proof_json.as_bytes(), &evidence.command_outcomes, &principal,
+                )?;
+                if authority.expires_at <= now_ms() || authority.grant_id.is_empty()
+                    || authority.sandbox_id != history.sandbox_id || authority.lifecycle_epoch <= history.coordinator_lifecycle_epoch
+                    || authority.device_id != scaffold::device_id_for(&authority.sandbox_id, authority.lifecycle_epoch)
+                { anyhow::bail!("Original epoch bootstrap differs from the verified new host grant"); }
+                let store = zeron_sync::DocsStore::open(&root)?;
+                let key = format!("original-epoch-bootstrap:{chat}:{}", history.lifecycle_epoch);
+                let request = serde_json::to_vec(&serde_json::json!({
+                    "proofJson":evidence.proof_json, "commandOutcomes":evidence.command_outcomes, "principal":principal,
+                }))?;
+                store.claim_crew_command(&key, &request)?;
+                for id in evidence.command_outcomes.keys() { store.mark_processed(id)?; }
+                store.finish_crew_command(&key, &serde_json::to_vec(&history)?)?;
+                Ok(())
+            }).await??;
+        }
         let core = EngineCore::assemble_with_services_locked(
             profile, registry, config.default_harness, edge.clone(), lock, crew_context,
         )?;
@@ -924,21 +971,22 @@ impl Engine {
             tokens: tokens.clone(),
         });
         core.previews.start(projects, preview_signaling).await;
-        // Isolated canaries have no shared updater channel.
-        if !auth.scaffold_enabled() {
-        // Release checker: polls {edge}/releases hourly (wall clock); headless
-        // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
-        // on quiescence so a restart never lands under a live run or open PTY.
-        // Spawned for every install: application updates must not depend on
-        // workspace sync being enabled — the feed is the public release feed
-        // (served without authentication), not an edge feature.
+        // Crew updates share this profile's live authorization. Never retain a
+        // bearer snapshot or switch to a public feed when authentication fails.
         let quiescent: zeron_update::QuiescentCheck = {
             let sessions = core.sessions.clone();
             let terminals = core.terminals.clone();
             Arc::new(move || !sessions.any_active() && !terminals.any_open())
         };
-        let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
-        if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
+        let update_tokens: zeron_update::AccessTokenProvider = {
+            let tokens = tokens.clone();
+            Arc::new(move || {
+                let tokens = tokens.clone();
+                Box::pin(async move { tokens.token().await.map_err(anyhow::Error::from) })
+            })
+        };
+        let updater = zeron_update::Updater::spawn(config.edge_url.clone(), update_tokens, Some(quiescent));
+        if let Some(mut token_changes) = tokens.subscribe() {
             let updater_for_tokens = updater.clone();
             let wake = tokio::spawn(async move {
                 while token_changes.changed().await.is_ok() {
@@ -948,7 +996,6 @@ impl Engine {
             core.set_updater_wake(wake);
         }
         core.set_updater(updater);
-        }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
         // Managed ACP adapters install in the background at boot (agents
         // whose CLI is present but whose adapter isn't yet), so a first chat

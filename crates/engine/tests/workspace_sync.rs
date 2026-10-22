@@ -193,6 +193,7 @@ fn queue_run_with(
             based_on: None::<CommandBasedOn>,
             expires_at: None,
             status: SessionCommandStatus::Pending,
+            accepted_at: None,
             resolution: None,
         })
         .expect("queue command");
@@ -680,6 +681,8 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 id: "dev-a".into(),
                 name: "old laptop".into(),
                 platform: "linux".into(),
+                devbox_provider: None,
+                devbox_id: None,
                 last_seen_at: Some(now),
                 created_at: Some(now),
                 version: Some("0.1.17".into()),

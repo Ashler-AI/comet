@@ -155,7 +155,7 @@ APP_TARBALL="$OUT_DIR/$ARTIFACT_PREFIX-$VERSION-macos-$ARCH-app.tar.gz"
 cd "$ROOT"
 BUILD_BIN="$(mktemp)"
 trap 'rm -f "$BUILD_BIN"' EXIT
-python3 scripts/local-cargo.py build --locked --release -p zeron --target-dir "$BUILD_DIR" \
+python3 scripts/local-cargo.py build --locked --release -p zeron --bin zeron --target-dir "$BUILD_DIR" \
   --copy-binary release/zeron "$BUILD_BIN"
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
@@ -176,7 +176,7 @@ elif [[ "$PACKAGE_ENVIRONMENT" == canary ]]; then
 else
   /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 comet" "$APP/Contents/Info.plist"
 fi
-/usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.session" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.invitation" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile comet.icns" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 
@@ -220,9 +220,44 @@ if [[ "$SIGNING" == distribution ]]; then
   "$ROOT/scripts/verify-macos-app.sh" "$APP" "$BUNDLE_ID"
 fi
 
-# Both artifacts contain the same signed, stapled bundle. Release promotion
-# continues to reuse this exact production-identity artifact in every channel.
-hdiutil create -volname "$APP_NAME" -srcfolder "$APP" -ov -format UDZO "$DMG"
+# Keep the drag-into-Applications layout and committed retina brand artwork.
+python3 -c 'import dmgbuild' 2>/dev/null ||
+  python3 -m pip install --quiet --user dmgbuild 2>/dev/null ||
+  python3 -m pip install --quiet --user --break-system-packages dmgbuild
+BG_TIFF="$NOTARY_DIR/dmg-background.tiff"
+tiffutil -cathidpicheck "$ROOT/dist/macos/dmg-background.png" \
+  "$ROOT/dist/macos/dmg-background@2x.png" -out "$BG_TIFF" >/dev/null 2>&1
+APP="$APP" APP_NAME="$APP_NAME" DMG="$DMG" BG_TIFF="$BG_TIFF" python3 - <<'PY'
+import os
+import dmgbuild
+
+app = os.environ["APP"]
+app_name = os.environ["APP_NAME"]
+dmgbuild.build_dmg(
+    filename=os.environ["DMG"],
+    volume_name=app_name,
+    settings={
+        "format": "UDZO",
+        "files": [app],
+        "symlinks": {"Applications": "/Applications"},
+        "icon": os.path.join(app, "Contents/Resources/comet.icns"),
+        "background": os.environ["BG_TIFF"],
+        "show_status_bar": False,
+        "show_tab_view": False,
+        "show_toolbar": False,
+        "show_pathbar": False,
+        "show_sidebar": False,
+        "default_view": "icon-view",
+        # Window and icon geometry must match scripts/dmg-background.py.
+        "window_rect": ((200, 120), (660, 400)),
+        "icon_size": 104,
+        "text_size": 12,
+        "icon_locations": {app_name + ".app": (165, 195), "Applications": (495, 195)},
+    },
+)
+PY
+# Both artifacts contain the same signed, stapled bundle. Production promotion
+# reuses this exact production-identity artifact in every release channel.
 if [[ "$SIGNING" == distribution ]]; then
   codesign "${SIGN_ARGS[@]}" "$DMG"
   notarize "$DMG"

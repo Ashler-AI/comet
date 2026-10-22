@@ -166,24 +166,13 @@ fn appshot_labels(text: &str) -> HashMap<String, AppshotLabel> {
 /// message-attachments.ts `parseUserMessageImages`.
 pub fn parse_user_message(content: &str) -> ParsedUserMessage {
     let labels = appshot_labels(content);
-    let lines: Vec<&str> = content.split('\n').collect();
-    let marker = (1..lines.len()).find(|&ix| {
-        let line = lines[ix].trim();
-        lines[ix - 1].trim().is_empty()
-            && line
-                .to_lowercase()
-                .starts_with("attached images (local files")
-            && line.ends_with("):")
-    });
-    let Some(marker) = marker else {
+    let Some((body, references)) = zeron_proto::attachment_trailer(content) else {
         return ParsedUserMessage {
             text: visible_text(content).to_owned(),
             images: Vec::new(),
         };
     };
-    let images: Vec<UserImage> = lines[marker + 1..]
-        .iter()
-        .filter_map(|line| {
+    let images: Vec<UserImage> = references.lines().filter_map(|line| {
             let path = line.trim().strip_prefix("- ")?.trim();
             (!path.is_empty()).then(|| UserImage {
                 path: path.to_owned(),
@@ -203,7 +192,6 @@ pub fn parse_user_message(content: &str) -> ParsedUserMessage {
             images,
         };
     }
-    let body = lines[..marker - 1].join("\n");
     let visible = visible_text(body.trim()).to_owned();
     ParsedUserMessage {
         text: if visible == ATTACHMENT_ONLY_TEXT || visible == FILE_ATTACHMENT_ONLY_TEXT {

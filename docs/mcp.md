@@ -345,4 +345,6 @@ changing your running app's sessions or requiring provider credentials.
 The `mcp_standalone_session_executes_on_the_selected_device` test in
 `device_routing` additionally runs two engines with a shared registry and device
 relay, verifies execution on the selected host (and absence of execution on the
-caller), and retrieves responses through MCP.
+caller), and retrieves responses through MCP. Both `read_chat` and `get_chat`
+read the selected chat's host, just like turn waits; a completed remote reply
+does not depend on the caller's asynchronously replicated transcript.

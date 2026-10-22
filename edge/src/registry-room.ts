@@ -575,7 +575,7 @@ export class RegistryRoom implements DurableObject {
         if (!socketState?.ready) continue;
         this.send(socket, { t: "rows", seq, rows });
       }
-      this.notifySessions(sessionsBefore, touched);
+      this.notifySessions(sessionsBefore, touched, authority);
     }
     return { ok: true, batch, seq, applied };
   }
@@ -594,8 +594,11 @@ export class RegistryRoom implements DurableObject {
   /** Session rows that changed in a batch → the desktop's notifications
    * (done / needs input / failed), sent to every registered phone after the
    * batch commits. Best effort: a failed delivery is logged, never retried. */
-  private notifySessions(before: Map<string, Row | undefined>, touched: Map<string, Row>): void {
-    if (before.size === 0) return;
+  private notifySessions(before: Map<string, Row | undefined>, touched: Map<string, Row>, authority?: SocketAuthority): void {
+    if (before.size === 0 || !authority?.userId ||
+        !authority.projectId || authority.projectId !== this.env.SCAFFOLD_PROJECT_SCOPE ||
+        !authority.deploymentId || authority.deploymentId !== this.env.SCAFFOLD_DEPLOYMENT_ID) return;
+    const scope = { userId: authority.userId, projectScope: authority.projectId, deploymentId: authority.deploymentId };
     const now = Date.now();
     const notes: Notification[] = [];
     for (const [chatId, prev] of before) {
@@ -623,7 +626,7 @@ export class RegistryRoom implements DurableObject {
         }
         sends.push(async () => {
           try {
-            const r = await sendApns(config, target.environment, target.token, apnsPayload(note.chatId, note.title, note.category), note.chatId);
+            const r = await sendApns(config, target.environment, target.token, apnsPayload(note.chatId, note.title, note.category, scope), note.chatId);
             entry.result = r.reason ? `${r.status} ${r.reason}` : String(r.status);
             if (isDeadToken(r)) {
               this.ctx.storage.sql.exec("DELETE FROM push_targets WHERE device = ? AND token = ?", target.device, target.token);

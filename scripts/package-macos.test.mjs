@@ -14,7 +14,11 @@ function probe(overrides, certificateTeam) {
   const bin = mkdtempSync(path.join(tmpdir(), "crew-package-preflight-"));
   try {
     const cargo = path.join(bin, "cargo");
-    writeFileSync(cargo, '#!/bin/sh\nprintf "BUILD_BOUNDARY %s %s\\n" "$COMET_PACKAGE_ENVIRONMENT" "$COMET_DEFAULT_ENVIRONMENT"\nexit 86\n');
+    writeFileSync(cargo, `#!/bin/sh
+printf 'BUILD_BOUNDARY %s %s\\n' "$COMET_PACKAGE_ENVIRONMENT" "$COMET_DEFAULT_ENVIRONMENT"
+printf 'CARGO_ARGS %s\\n' "$*"
+exit 86
+`);
     chmodSync(cargo, 0o700);
     const xcrun = path.join(bin, "xcrun");
     writeFileSync(xcrun, '#!/bin/sh\nprintf "NOTARY_BOUNDARY\\n"\nexit 87\n');
@@ -47,7 +51,7 @@ function probe(overrides, certificateTeam) {
     // Exercise the packaging policy, not the earlier host-architecture guard.
     return spawnSync("/usr/bin/arch", ["-arm64", "/bin/bash", "scripts/package-macos.sh"], {
       cwd: root,
-      env: { ...env, PATH: `${bin}${path.delimiter}${env.PATH}`, ASHLER_INCREMENTAL_TSC_CHECKS: "false", ...overrides },
+      env: { ...env, PATH: `${bin}${path.delimiter}${env.PATH}`, ASHLER_INCREMENTAL_TSC_CHECKS: "false", CARGO_TARGET_DIR: path.join(bin, "target"), CARGO_BUILD_JOBS: "2", ...overrides },
       encoding: "utf8",
       timeout: 10_000,
     });
@@ -94,6 +98,7 @@ test("ad-hoc packaging is forbidden in CI but accepts an explicitly local CI=fal
   assert.ifError(local.error);
   assert.equal(local.status, 86, local.stderr + local.stdout);
   assert.match(local.stdout, /BUILD_BOUNDARY staging staging/);
+  assert.match(local.stdout, /CARGO_ARGS build --locked --release -p zeron --bin zeron --target-dir .+\/target\/staging --jobs=2\n/);
 });
 
 test("unselected local packaging retains Canary and explicit production stays production", { skip: !nativeHost }, () => {
@@ -102,9 +107,10 @@ test("unselected local packaging retains Canary and explicit production stays pr
     assert.ifError(result.error);
     assert.equal(result.status, 86, result.stderr + result.stdout);
     assert.ok(result.stdout.includes(`BUILD_BOUNDARY ${expected} ${expected}`));
+    const targetSuffix = expected === "canary" ? "/canary" : "";
+    assert.match(result.stdout, new RegExp(`CARGO_ARGS build --locked --release -p zeron --bin zeron --target-dir .+/target${targetSuffix} --jobs=2\\n`));
   }
 });
-
 
 test("distribution verification rejects wrong bundle metadata and unsigned executables", { skip: !nativeHost }, () => {
   const directory = mkdtempSync(path.join(tmpdir(), "crew-verify-app-"));
@@ -130,4 +136,11 @@ test("distribution verification rejects wrong bundle metadata and unsigned execu
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("invalid package environments, signing modes, and release versions fail before compilation", { skip: !nativeHost }, () => {
+  rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "adhoc", COMET_PACKAGE_ENVIRONMENT: "invalid" }));
+  rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "unsigned" }));
+  rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "adhoc", COMET_RELEASE_VERSION: "0.0.0" }));
+  rejectedBeforeBuild(probe({ COMET_MACOS_SIGNING: "adhoc", CODESIGN_IDENTITY: "unused" }));
 });

@@ -535,6 +535,8 @@ impl EngineHandle {
                 workspace_scope: WorkspaceScope::Local,
                 cursor_sdk_version: None,
                 capabilities: Vec::new(),
+                devbox_provider: None,
+                devbox_id: None,
             },
             deferred_state: None,
         }
@@ -587,6 +589,8 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
                 workspace_scope: WorkspaceScope::Synced,
                 cursor_sdk_version: None,
                 capabilities: Vec::new(),
+                devbox_provider: None,
+                devbox_id: None,
             })
         }
         Err(err) => Err(err),
@@ -667,6 +671,7 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
 struct PendingSend {
     message_id: String,
     started: DateTime<Utc>,
+    delivery: Option<zeron_doc::CommandDeliveryStatus>,
 }
 
 /// How long an unadopted send reads as Working/Sending (or Queued when the
@@ -1624,6 +1629,13 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> Result<(), TranscriptDesync> {
         self.receive_transcript_frame(update.frame, cx)?;
+        if let Some(pending) = self.selected_chat.as_ref().and_then(|id| self.pending_sends.get_mut(id)) {
+            let delivery = update.command_delivery.get(&pending.message_id).cloned();
+            if pending.delivery != delivery {
+                pending.delivery = delivery;
+                cx.notify();
+            }
+        }
         if let (Some(doc_id), Some(baseline)) = (&self.selected_chat, update.replay_baseline) {
             self.transcript_baselines
                 .insert(doc_id.clone(), Arc::new(baseline));
@@ -1760,6 +1772,7 @@ impl AppState {
             PendingSend {
                 message_id: message_id.to_string(),
                 started: now,
+                delivery: None,
             },
         );
     }
@@ -1835,6 +1848,19 @@ impl AppState {
         Some(((done.min(total) * 100) / total).min(99) as u8)
     }
 
+    pub fn send_preparing(&self, chat_id: &str) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|pending| {
+            matches!(pending.delivery, Some(zeron_doc::CommandDeliveryStatus::Preparing))
+        }) && !self.chat_delivery_degraded(chat_id)
+    }
+
+    pub fn send_failure(&self, chat_id: &str) -> Option<&str> {
+        match self.pending_sends.get(chat_id)?.delivery.as_ref()? {
+            zeron_doc::CommandDeliveryStatus::Failed { reason } => Some(reason),
+            zeron_doc::CommandDeliveryStatus::Preparing => None,
+        }
+    }
+
     /// Is a send still in flight for this chat (unacked)? Inside the grace
     /// window normally; while the chat's delivery path is degraded the
     /// overlay holds indefinitely — the truth IS "Queued", and silently
@@ -1842,8 +1868,10 @@ impl AppState {
     /// all (the 30s→silence hole, 2026-08-19).
     pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         self.pending_sends.get(chat_id).is_some_and(|p| {
-            now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
-                || self.chat_delivery_degraded(chat_id)
+            self.send_failure(chat_id).is_none()
+                && (self.send_preparing(chat_id)
+                    || now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                    || self.chat_delivery_degraded(chat_id))
         })
     }
 
@@ -1852,7 +1880,9 @@ impl AppState {
     /// faking progress or silently forgetting the send ever happened.
     pub fn send_undelivered(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         self.pending_sends.get(chat_id).is_some_and(|p| {
-            now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
+            self.send_failure(chat_id).is_some()
+                || (!self.send_preparing(chat_id)
+                    && now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS)
         })
     }
 
@@ -1861,6 +1891,7 @@ impl AppState {
     pub fn retry_pending_send(&mut self, chat_id: &str, now: DateTime<Utc>) {
         if let Some(p) = self.pending_sends.get_mut(chat_id) {
             p.started = now;
+            p.delivery = None;
         }
     }
 
@@ -1872,10 +1903,7 @@ impl AppState {
     pub fn pending_send_started(&self, chat_id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.pending_sends
             .get(chat_id)
-            .filter(|p| {
-                now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
-                    || self.chat_delivery_degraded(chat_id)
-            })
+            .filter(|_| self.send_pending(chat_id, now))
             .map(|p| p.started)
     }
 
@@ -2000,6 +2028,13 @@ impl AppState {
         self.selected_device
             .clone()
             .or_else(|| self.local_device_id.clone())
+    }
+
+    /// Existing threads keep their host even while their browse row is absent.
+    /// The explicit canvas target is the fallback, never an implicit local host.
+    pub(crate) fn active_device_id(&self) -> Option<String> {
+        self.selected_chat_row().map(|chat| chat.device_id.clone())
+            .or_else(|| self.effective_device_id())
     }
 
     /// Pick the composer's target device. Keeps the project pick consistent:
@@ -2551,6 +2586,9 @@ impl AppState {
     /// Kick off (or retry) the engine bootstrap: probe → connect-or-embed on
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
+        if let Some(update) = crate::app_update::AppUpdate::global(cx) {
+            update.update(cx, |update, _| update.set_engine(None));
+        }
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
@@ -2603,6 +2641,9 @@ impl AppState {
             self.harness_updates.clear();
         }
         self.engine = Some(handle.clone());
+        if let Some(update) = crate::app_update::AppUpdate::global(cx) {
+            update.update(cx, |update, _| update.set_engine(Some(handle.clone())));
+        }
         let mut watch_tasks = Vec::with_capacity(10);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
@@ -2869,6 +2910,12 @@ impl AppState {
             .position(|cached| Some(&cached.chat_id) == chat_id.as_ref())
             .and_then(|index| self.transcript_cache.remove(index));
         if let Some(previous) = &self.selected_chat {
+            // Cancelling this chat's watch ends our evidence of ongoing preparation.
+            if let Some(pending) = self.pending_sends.get_mut(previous)
+                && matches!(pending.delivery, Some(zeron_doc::CommandDeliveryStatus::Preparing))
+            {
+                pending.delivery = None;
+            }
             let old_baseline = self.transcript_baselines.remove(previous);
             cx.background_executor()
                 .spawn(async move {
@@ -2953,6 +3000,7 @@ impl AppState {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) restores the pick set aside above.
             if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
+                self.selected_device = Some(chat.device_id.clone());
                 match chat.space_id.clone() {
                     Some(space_id) => {
                         self.selected_space = Some(space_id);
@@ -2961,7 +3009,6 @@ impl AppState {
                     None => {
                         self.selected_space = None;
                         self.no_project = true;
-                        self.selected_device = Some(chat.device_id.clone());
                     }
                 }
             }
@@ -3807,6 +3854,8 @@ mod tests {
                     workspace_scope: WorkspaceScope::Local,
                     cursor_sdk_version: None,
                     capabilities: zeron_proto::capabilities::current(),
+                    devbox_provider: None,
+                    devbox_id: None,
                 },
                 state: state_rx,
             }),
@@ -4189,6 +4238,7 @@ mod tests {
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, cx| {
             let update = |id: &str| zeron_doc::TranscriptUpdate {
+                command_delivery: Default::default(),
                 frame: TranscriptFrame::reset(&[user_entry(id)]),
                 context_usage: None,
                 replay_baseline: None,
@@ -4396,7 +4446,36 @@ mod tests {
             version: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            devbox_provider: None,
+            devbox_id: None,
         }
+    }
+
+    #[test]
+    fn active_target_keeps_explicit_remote_routing_without_browse_metadata() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        state.selected_device = Some("remote".into());
+        state.selected_chat = Some("rowless".into());
+        assert_eq!(state.active_device_id().as_deref(), Some("remote"));
+        let mut hosted = chat("rowless", 0, None);
+        hosted.device_id = "other-host".into();
+        state.chats = vec![hosted];
+        assert_eq!(state.active_device_id().as_deref(), Some("other-host"));
+    }
+
+    #[test]
+    fn remote_session_activity_survives_selection_and_browse_gaps() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.sessions = vec![zeron_proto::Session {
+            chat_id: "rowless".into(), device_id: "remote".into(),
+            status: zeron_proto::SessionStatus::Working, started_at: Some(now), updated_at: now,
+            running_subagents: 0, last_completed_turn: None,
+        }];
+        state.selected_chat = Some("different".into());
+        assert_eq!(state.indicator_for("rowless", now), Indicator::Working);
+        assert_eq!(state.sessions[0].started_at, Some(now));
     }
 
     #[test]
@@ -4600,6 +4679,84 @@ mod tests {
         );
         assert_eq!(s.indicator_for("c", later), Indicator::None);
         assert!(s.send_undelivered("c", later));
+    }
+
+    #[gpui::test]
+    fn switching_chats_invalidates_preparation_but_preserves_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, cx| {
+            s.selected_chat = Some("c".into());
+            s.begin_pending_send("c", "m1", now);
+            let update = |delivery| zeron_doc::TranscriptUpdate {
+                frame: TranscriptFrame::reset(&[]),
+                context_usage: None,
+                replay_baseline: None,
+                command_delivery: HashMap::from([("m1".into(), delivery)]),
+            };
+            s.receive_transcript_update(update(zeron_doc::CommandDeliveryStatus::Preparing), cx)
+                .unwrap();
+            assert!(s.send_preparing("c"));
+            s.select_chat(Some("other".into()), cx);
+            assert!(!s.send_preparing("c"));
+            assert!(!s.send_pending("c", later));
+            assert!(s.send_undelivered("c", later));
+            s.select_chat(Some("c".into()), cx);
+            assert!(!s.send_preparing("c"), "cached transcript is not a fresh receipt");
+            assert!(s.send_undelivered("c", later));
+            s.receive_transcript_update(
+                update(zeron_doc::CommandDeliveryStatus::Failed { reason: "worktree failed".into() }),
+                cx,
+            ).unwrap();
+            s.select_chat(Some("other".into()), cx);
+            assert_eq!(s.send_failure("c"), Some("worktree failed"));
+            assert!(s.send_undelivered("c", now));
+        });
+    }
+
+    #[gpui::test]
+    fn accepted_preparation_survives_grace_without_ack_and_failure_is_retryable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, cx| {
+            s.selected_chat = Some("c".into());
+            s.begin_pending_send("c", "m1", now);
+            let update = |delivery| zeron_doc::TranscriptUpdate {
+                frame: TranscriptFrame::reset(&[]),
+                context_usage: None,
+                replay_baseline: None,
+                command_delivery: HashMap::from([("m1".into(), delivery)]),
+            };
+            s.receive_transcript_update(update(zeron_doc::CommandDeliveryStatus::Preparing), cx)
+                .unwrap();
+            assert!(s.transcript.is_empty());
+            assert!(s.send_preparing("c"));
+            assert!(s.send_pending("c", later));
+            assert!(s.pending_send_started("c", later).is_some());
+            assert!(!s.send_undelivered("c", later));
+            s.connectivity.state = zeron_proto::ConnectivityState::Offline;
+            assert!(!s.send_preparing("c"));
+            assert!(s.send_undelivered("c", later));
+            s.connectivity.state = zeron_proto::ConnectivityState::Disabled;
+            s.receive_transcript_update(
+                update(zeron_doc::CommandDeliveryStatus::Failed { reason: "worktree failed".into() }),
+                cx,
+            ).unwrap();
+            assert!(s.send_undelivered("c", now));
+            assert!(!s.send_pending("c", now));
+            assert_eq!(s.send_failure("c"), Some("worktree failed"));
+            s.retry_pending_send("c", later);
+            assert!(s.send_pending("c", later));
+            assert!(!s.send_undelivered("c", later));
+            s.apply_transcript(vec![user_entry("m1")]);
+            assert!(!s.send_pending("c", later));
+        });
     }
 
     #[test]
@@ -5973,6 +6130,8 @@ mod tests {
             version: Some("0.2.12".into()),
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            devbox_provider: None,
+            devbox_id: None,
         }];
         assert!(s.device_version_at_least("d1", (0, 2, 12)));
         assert!(!s.device_version_at_least("d1", (0, 2, 13)));
@@ -5996,6 +6155,8 @@ mod tests {
                 version: Some("0.2.31".into()),
                 cursor_sdk_version: None,
                 capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+                devbox_provider: None,
+                devbox_id: None,
             },
             Device {
                 id: "upstream".into(),
@@ -6006,6 +6167,8 @@ mod tests {
                 version: Some("0.2.31".into()),
                 cursor_sdk_version: None,
                 capabilities: Vec::new(),
+                devbox_provider: None,
+                devbox_id: None,
             },
         ];
 
@@ -6033,6 +6196,8 @@ mod tests {
             version: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            devbox_provider: None,
+            devbox_id: None,
         }];
         s.connectivity.state = ConnectivityState::Connected;
         s.connectivity.chats = vec![ChatConnectivity {

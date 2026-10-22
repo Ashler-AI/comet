@@ -644,7 +644,11 @@ mod tests {
     use crate::repos::Repos;
 
     async fn git(cwd: &Path, args: &[&str]) {
+        // Fixture commits must not leave detached maintenance mutating the
+        // object database while snapshot isolation is asserted. Scope this to
+        // setup commands so the snapshot itself keeps normal Git behavior.
         let output = tokio::process::Command::new("git")
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
             .args(args)
             .current_dir(cwd)
             .env("GIT_AUTHOR_NAME", "test")

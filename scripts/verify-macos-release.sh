@@ -46,6 +46,14 @@ for channel in desktop desktop-staging; do
   ARCHIVE="$CANDIDATE/$PREFIX-$VERSION-macos-arm64-app.tar.gz"
   test -f "$DMG"
   test -f "$ARCHIVE"
+  # Checking a sums file alone does not require it to cover these artifacts.
+  for artifact in "$DMG" "$ARCHIVE"; do
+    expected="$(awk -v file="${artifact##*/}" '$2 == file || $2 == "*" file { print $1 }' "$CANDIDATE/$channel-SHA256SUMS")"
+    if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      echo "Expected one SHA-256 entry for ${artifact##*/} in $channel-SHA256SUMS" >&2
+      exit 1
+    fi
+  done
   (cd "$CANDIDATE" && shasum -a 256 --check "$channel-SHA256SUMS")
   mkdir "$TEMP/$channel"
   tar -xzf "$ARCHIVE" -C "$TEMP/$channel"

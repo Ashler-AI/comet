@@ -6,7 +6,7 @@ fn annotations_require_verified_scope_and_survive_rebuild() {
     let scope = CollaborationScope { project_id:"project".into(), deployment_id:Some("canary".into()),
         session_id:Some("session".into()), unknown:Default::default() };
     let metadata = CrewChatMetadata { owner_subject:"owner".into(), scope:scope.clone(),
-        session_id:"session".into(), environment:None, agent_route:None };
+        session_id:"session".into(), environment:None, agent_route:None, original_epoch_history:None };
     let mut principal = CollaborationPrincipal { subject:"owner".into(), email:None,
         project_id:"project".into(), deployment_id:Some("canary".into()), session_id:None,
         capabilities:vec![CAPABILITY_SESSION_ANNOTATE.into()], unknown:Default::default() };

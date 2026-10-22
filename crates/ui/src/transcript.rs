@@ -7091,7 +7091,7 @@ impl Transcript {
         // `turn` (the turn's start, ms) keys the rolling word and timer, so a
         // new turn's labels appear fresh instead of rolling from the last
         // turn's final values.
-        let (sending, queued, elapsed_secs, seed, turn) = if let Some(doc_id) = &self.doc_override {
+        let (sending, preparing, queued, elapsed_secs, seed, turn) = if let Some(doc_id) = &self.doc_override {
             // A subagent doc has no Session row — `indicator_for` would read
             // the PARENT chat's live state into this tab. Liveness rides the
             // doc itself instead: the sink's assistant entry streams until
@@ -7109,13 +7109,17 @@ impl Transcript {
                 return None;
             }
             let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
-            (false, false, elapsed, flavour_seed(doc_id), last.created_at)
+            (false, false, false, elapsed, flavour_seed(doc_id), last.created_at)
         } else {
             let chat_id = self.chat_id.clone()?;
             // Failed-send state first: past the grace window the trailer IS
             // the retry affordance, whatever the indicator fell back to.
             if self.state.read(cx).send_undelivered(&chat_id, now) {
                 let theme = Theme::of(cx).clone();
+                let label = self.state.read(cx).send_failure(&chat_id).map_or_else(
+                    || "Not delivered — click to retry".to_string(),
+                    |reason| format!("Not delivered: {reason} — click to retry"),
+                );
                 return Some(
                     div()
                         .id("undelivered-retry")
@@ -7128,11 +7132,11 @@ impl Transcript {
                         .text_color(theme.danger)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
-                        .child(SharedString::from("Not delivered — click to retry"))
+                        .child(SharedString::from(label))
                         .into_any_element(),
                 );
             }
-            let (sending, queued, elapsed, turn) = {
+            let (sending, preparing, queued, elapsed, turn) = {
                 let state = self.state.read(cx);
                 if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
                     return None;
@@ -7145,7 +7149,8 @@ impl Transcript {
                 // turn.
                 let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
                 let send_started = state.pending_send_started(&chat_id, now);
-                let sending = sending_bridge(send_started, turn_started);
+                let preparing = state.send_preparing(&chat_id);
+                let sending = preparing || sending_bridge(send_started, turn_started);
                 // Degraded delivery path: the send is a durable local write
                 // waiting on connectivity — say so instead of faking
                 // progress. (The overlay holds while degraded, so this line
@@ -7159,9 +7164,9 @@ impl Transcript {
                 // rolls out of that turn's word or an earlier send's.
                 let turn = if sending { send_started } else { turn_started }
                     .map_or(0, |t| t.timestamp_millis());
-                (sending, queued, elapsed, turn)
+                (sending, preparing, queued, elapsed, turn)
             };
-            (sending, queued, elapsed, flavour_seed(&chat_id), turn)
+            (sending, preparing, queued, elapsed, flavour_seed(&chat_id), turn)
         };
         if self.compact_mode && !sending && !queued && elapsed_secs > 0 {
             let entry_id = if let Some(doc_id) = &self.doc_override {
@@ -7185,6 +7190,8 @@ impl Transcript {
         }
         let word = if queued {
             "Queued — will send automatically"
+        } else if preparing {
+            "Preparing workspace"
         } else if sending {
             "Sending"
         } else {
@@ -10038,6 +10045,8 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         Some(MessageStatus::Streaming) => 1,
         Some(MessageStatus::Complete) => 2,
         Some(MessageStatus::Aborted) => 3,
+        Some(MessageStatus::Queued) => 4,
+        Some(MessageStatus::Steered) => 5,
     });
     acc.push(pending as u8);
     acc.extend_from_slice(&entry.duration_ms.unwrap_or(0).to_le_bytes());
@@ -10541,6 +10550,7 @@ mod tests {
                     state
                         .receive_transcript_update(
                             zeron_doc::TranscriptUpdate {
+                                command_delivery: Default::default(),
                                 frame,
                                 replay_baseline,
                                 context_usage: None,
@@ -10654,6 +10664,7 @@ mod tests {
         ];
         let first = worker
             .prepare(&zeron_doc::TranscriptUpdate {
+                command_delivery: Default::default(),
                 frame: zeron_doc::TranscriptFrame::reset(&original),
                 context_usage: None,
                 replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&original)),
@@ -10666,6 +10677,7 @@ mod tests {
         }];
         let next = worker
             .prepare(&zeron_doc::TranscriptUpdate {
+                command_delivery: Default::default(),
                 frame: zeron_doc::diff_transcript(&original, &changed),
                 context_usage: None,
                 replay_baseline: None,
@@ -10689,6 +10701,7 @@ mod tests {
                 }).collect())]
             };
             let update = zeron_doc::TranscriptUpdate {
+                command_delivery: Default::default(),
                 replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
                 frame: zeron_doc::TranscriptFrame::Reset { reset: entries },
                 context_usage: None,
@@ -10773,6 +10786,7 @@ mod tests {
                     state
                         .receive_opening_transcript_update(
                             zeron_doc::TranscriptUpdate {
+                                command_delivery: Default::default(),
                                 frame: zeron_doc::TranscriptFrame::reset(entries),
                                 replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
                                     entries,
@@ -10829,6 +10843,7 @@ mod tests {
                 state
                     .receive_transcript_update(
                         zeron_doc::TranscriptUpdate {
+                            command_delivery: Default::default(),
                             frame: zeron_doc::diff_transcript(&full, &live),
                             replay_baseline: None,
                             context_usage: None,
@@ -10869,6 +10884,7 @@ mod tests {
                 state
                     .receive_transcript_update(
                         zeron_doc::TranscriptUpdate {
+                            command_delivery: Default::default(),
                             frame,
                             context_usage: None,
                             replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&history)),
@@ -10880,6 +10896,7 @@ mod tests {
                 state
                     .receive_transcript_update(
                         zeron_doc::TranscriptUpdate {
+                            command_delivery: Default::default(),
                             frame: zeron_doc::diff_transcript(&history, &live),
                             context_usage: None,
                             replay_baseline: None,
@@ -10915,6 +10932,7 @@ mod tests {
                     state
                         .receive_transcript_update(
                             zeron_doc::TranscriptUpdate {
+                                command_delivery: Default::default(),
                                 frame,
                                 replay_baseline: baseline,
                                 context_usage: None,
@@ -10972,6 +10990,7 @@ mod tests {
                 state
                     .receive_transcript_update(
                         zeron_doc::TranscriptUpdate {
+                            command_delivery: Default::default(),
                             frame: zeron_doc::TranscriptFrame::reset(&[]),
                             context_usage: None,
                             replay_baseline: Some(Default::default()),
@@ -10990,6 +11009,7 @@ mod tests {
                 state
                     .receive_transcript_update(
                         zeron_doc::TranscriptUpdate {
+                            command_delivery: Default::default(),
                             frame: zeron_doc::diff_transcript(&[], &live),
                             context_usage: None,
                             replay_baseline: None,
@@ -11024,6 +11044,7 @@ mod tests {
                 state
                     .receive_transcript_update(
                         zeron_doc::TranscriptUpdate {
+                            command_delivery: Default::default(),
                             frame,
                             context_usage: None,
                             replay_baseline: None,
@@ -12810,6 +12831,52 @@ mod tests {
         assert!(rows[0].turn_start && !rows[1].turn_start);
     }
 
+    #[test]
+    fn failed_agent_diagnostic_survives_doc_fold_and_renders_bounded_detail() {
+        use zeron_doc::{SegmentWriter, SessionDoc, TOOL_OUTPUT_SUMMARY_MAX, fold_event_into_parts};
+        use zeron_proto::AgentEvent;
+
+        let diagnostic = "sourceSession is only accepted for the seance agent.";
+        for (is_error, output, expected) in [
+            (true, diagnostic.to_owned(), Some(diagnostic.to_owned())),
+            (true, "é".repeat(TOOL_OUTPUT_SUMMARY_MAX + 40), Some(format!("{}…", "é".repeat(TOOL_OUTPUT_SUMMARY_MAX)))),
+            (false, "successful private tool output".to_owned(), None),
+        ] {
+            let doc = SessionDoc::init("agent-error").unwrap();
+            let mut writer = SegmentWriter::begin(&doc, "a1", "device-a", 1).unwrap();
+            let mut parts = Vec::new();
+            fold_event_into_parts(&mut parts, &AgentEvent::ToolCall {
+                id: "task-1".into(),
+                call: ToolCall::Unknown { name: "Agent".into(), input: None },
+            });
+            writer.sync(&parts).unwrap();
+            fold_event_into_parts(&mut parts, &AgentEvent::ToolResult {
+                id: "task-1".into(), is_error, output: Some(output), diff: None,
+            });
+            writer.finish(&parts, MessageStatus::Complete).unwrap();
+
+            let entries = doc.read_entries().unwrap();
+            let rows = rows_for_entry(&entries[0], false, false, &mut parse);
+            let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+                panic!("agent tool group expected")
+            };
+            assert_eq!(tools.len(), 1);
+            let tool = &tools[0];
+            assert_eq!(tool.is_error, is_error);
+            assert!(tool.resolved);
+            assert!(!is_spawn_link(tool), "failed launch has no child session");
+            assert!(tool.output_ref.is_none() && tool.output_bytes.is_none());
+            match (expected, tool.detail.as_deref()) {
+                (Some(expected), Some(ToolDetail::Output { lines, truncated_by })) => {
+                    assert_eq!(lines.iter().map(|line| line.as_ref()).collect::<Vec<&str>>().join("\n"), expected);
+                    assert_eq!(*truncated_by, 0);
+                }
+                (None, None) => {}
+                (expected, detail) => panic!("expected diagnostic {expected:?}, got {detail:?}"),
+            }
+        }
+    }
+
     fn agent_part(id: &str, description: &str) -> MessagePart {
         MessagePart::Tool {
             id: id.into(),
@@ -13189,6 +13256,7 @@ mod tests {
                         state
                             .receive_transcript_update(
                                 zeron_doc::TranscriptUpdate {
+                                    command_delivery: Default::default(),
                                     frame: zeron_doc::TranscriptFrame::reset(&history),
                                     context_usage: None,
                                     replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
@@ -13217,6 +13285,7 @@ mod tests {
                         state
                             .receive_transcript_update(
                                 zeron_doc::TranscriptUpdate {
+                                    command_delivery: Default::default(),
                                     frame: zeron_doc::diff_transcript(&history, &next),
                                     context_usage: None,
                                     // The RPC must retain its opening cutoff when
@@ -13272,6 +13341,7 @@ mod tests {
                         state
                             .receive_transcript_update(
                                 zeron_doc::TranscriptUpdate {
+                                    command_delivery: Default::default(),
                                     frame: zeron_doc::TranscriptFrame::reset(&history),
                                     context_usage: None,
                                     replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
@@ -13284,6 +13354,7 @@ mod tests {
                         state
                             .receive_transcript_update(
                                 zeron_doc::TranscriptUpdate {
+                                    command_delivery: Default::default(),
                                     frame: zeron_doc::diff_transcript(&history, &live),
                                     context_usage: None,
                                     replay_baseline: None,
@@ -13334,6 +13405,7 @@ mod tests {
                         state
                             .receive_transcript_update(
                                 zeron_doc::TranscriptUpdate {
+                                    command_delivery: Default::default(),
                                     frame: zeron_doc::diff_transcript(&live, &next),
                                     context_usage: None,
                                     replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
@@ -13441,6 +13513,7 @@ mod tests {
                             state
                                 .receive_transcript_update(
                                     zeron_doc::TranscriptUpdate {
+                                        command_delivery: Default::default(),
                                         frame,
                                         context_usage: None,
                                         replay_baseline: Some(

@@ -74,6 +74,16 @@ impl CrewLogin {
     pub fn cancel(&self) { self.auth.cancel_sign_in(); }
 }
 
+/// Convert the stopped legacy phone cache before constructing a live client.
+#[uniffi::export]
+pub async fn crew_prepare_legacy_backup(
+    config: super::CoreConfig, credentials: Credentials, source_path: String,
+) -> CoreResult<String> {
+    super::on_runtime(async move {
+        zeron_client::Client::crew_import_legacy_backup(config.into(), credentials.into(), source_path.into()).await
+    }).await
+}
+
 #[uniffi::export]
 pub fn crew_is_session_link(url: String) -> bool {
     zeron_client::crew::parse_session_link(&url).is_some()
@@ -110,8 +120,4 @@ impl CoreClient {
         Ok(value.to_string())
     }
 
-    pub async fn crew_import_legacy_backup(&self, source_path: String) -> CoreResult<String> {
-        let client = self.client.clone();
-        super::on_runtime(async move { client.crew_import_legacy_backup(source_path.into()).await }).await
-    }
 }

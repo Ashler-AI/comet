@@ -1,0 +1,12 @@
+{
+  "name": "loro-internal",
+  "version": "1.13.9",
+  "license": "MIT",
+  "license_source": "https://raw.githubusercontent.com/loro-dev/loro/1e529a6841b35572b05c3cb1258c0862b3aaef40/LICENSE",
+  "repository": "https://github.com/loro-dev/loro/",
+  "revision": "1e529a6841b35572b05c3cb1258c0862b3aaef40",
+  "path_in_repository": "crates/loro-internal",
+  "archive": "https://static.crates.io/crates/loro-internal/loro-internal-1.13.9.crate",
+  "archive_sha256": "6fec47acf8db115b7146da5e1d5b18d0cf58032e6012c0c1ee3ec3442d1e936f",
+  "local_patch": "Read-only causal metadata and bounded per-operation JSON inspection for migration. Standalone packaged tests use raw byte counts instead of unpublished dev_utils::ByteSize and omit its optional logging initializer; behavioral assertions are preserved."
+}

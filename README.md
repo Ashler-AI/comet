@@ -33,6 +33,53 @@ zeron update      # update to the latest release
 zeron daemon start|stop|restart|status
 ```
 
+### Native session search
+
+`comet session search --query "title words" --limit 50` searches the signed-in
+controller's own directory entries; `--source-url URL` can replace or accompany
+the query. Omitted options use directory defaults. `--owner-id` may explicitly
+select that same verified owner, but cannot select another account. Search uses
+the engine at `--ipc-port` (or inherited `COMET_IPC_PORT`); updating the CLI alone
+does not update an already-running engine's search behavior.
+
+### Native Scaffold handoff
+
+`comet session handoff [CHAT_ID] --prompt-file FILE` forks the last completed
+native OMP turn, retaining history, attachments, source model and source context.
+The default mode transfers the Git-visible worktree; its limits distinguish
+25,000 changed entries from 50,000 materialized tracked files. New sandboxes use
+the deployment's published source, not the controller's branch label.
+
+Use `--session-only` to import native history into the existing published sandbox
+checkout without capturing or replacing local worktree changes. Creation and
+`--recover-chat-id ID --recover-sandbox-id ID` use dedicated session-only RPCs:
+unsupported engines fail closed, never falling back to another creation or
+worktree transfer. Recovery retains the immutable command, prompt and transfer mode.
+
+The native chat2 browser contract is `crew.native.web.v1`: verified assets install
+under `.scaffold/crew/web`, runtime under `.scaffold/crew`, data under
+`.scaffold/crew-data`, all relative to the sandbox API workspace (normally
+`/workspace/ashler-platform`), with IPC port 39400. The supervisor waits for
+`runtime-ready`; legacy session records are not reinterpreted as chat2.
+Device bootstrap must match the configured project, optional pinned deployment
+and Edge origin before the native host can attach.
+
+Stopped/failed imported epochs remain immutable history, but their same public
+session and deep link can explicitly **Start new epoch**. Desktop and mobile
+require confirmation plus the observed `expectedLifecycleEpoch`; CLI callers use
+`comet scaffold control --command-id ID --request-file FILE` with operation
+`start`, `sandbox_id`, `scope`, and `expectedLifecycleEpoch`. This calls the
+control plane's dedicated `/api/code-sandboxes/:id/start` transition, not Resume
+or Attach. Unknown delivery is reconciled under the same command ID, never replayed.
+
+Only its verified next-epoch response and fresh exact host authority can publish
+the new association. The durable native-ID tombstone and runtime-cache reset
+precede the epoch-specific release receipt; old history, config, source context
+and the original import receipt remain intact. Refresh or an editable larger
+epoch never authorizes this transition. Starting a host queues no agent prompt:
+continuation requires a fresh user request and a new native conversation, never
+resurrection of the destroyed original native process.
+
 ## Multi-device sync (optional)
 
 Sign in to start an agent on one device and follow or drive it from another:

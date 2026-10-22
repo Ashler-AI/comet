@@ -1,27 +1,24 @@
 import UIKit
-import UniformTypeIdentifiers
 
-/// An explicitly selected copied backup is quarantined in this verified profile.
-/// No legacy snapshot is ever connected to the live upstream sync transport.
-final class CrewMigrationViewController: UIViewController, UIDocumentPickerDelegate {
+/// Migration runs before the live client opens. This screen only reads its receipt.
+final class CrewMigrationViewController: UIViewController {
     private let app: AppModel
     private let status = UITextView()
-    private var lastDirectory: URL?
-    private let storageKey: String
+    private var exportURLs: [URL] = []
 
     init(app: AppModel) {
         self.app = app
-        self.storageKey = "crew.legacyImport.\(app.crewStorageKey ?? "signed-out")"
         super.init(nibName: nil, bundle: nil)
-        title = "Legacy iOS backup"
+        title = "Legacy iOS migration"
     }
     required init?(coder: NSCoder) { fatalError() }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = Palette.background
         status.isEditable = false
         status.font = UIFont.preferredFont(forTextStyle: .body)
-        status.text = "Select a consistent COPY of the old app's Application Support/CometDocs folder. Keep the old app installed and do not clear its data.\n\nCrew Canary preserves every selected file with a SHA-256 manifest, exports readable snapshots as offline JSON, and quarantines pending commands/outcomes without executing them. No old credentials are imported.\n\nThis is preservation, not permission to publish cached records. Reconcile retained session IDs and pending outcomes through the authenticated desktop importer before cutover. Cache-only records remain available in the exported archive; do not uninstall the old app until reconciliation is complete."
+        status.text = "Crew Staging checks the existing CometDocs cache after verifying your account and before opening live sync. Originals and legacy Keychain entries are never deleted. Pending work is retained, never blindly replayed.\n\nNo legacy cache was migrated for this profile."
         status.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(status)
         NSLayoutConstraint.activate([
@@ -30,46 +27,23 @@ final class CrewMigrationViewController: UIViewController, UIDocumentPickerDeleg
             status.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             status.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
         ])
-        navigationItem.rightBarButtonItems = [
-            UIBarButtonItem(title: "Import copy", primaryAction: UIAction { [weak self] _ in self?.pickBackup() }),
-            UIBarButtonItem(title: "Export", primaryAction: UIAction { [weak self] _ in self?.exportBackup() }),
-        ]
-        if let path = UserDefaults.standard.string(forKey: storageKey) {
-            lastDirectory = URL(fileURLWithPath: path, isDirectory: true)
-            if let data = try? Data(contentsOf: lastDirectory!.appendingPathComponent("manifest.json")), let text = String(data: data, encoding: .utf8) {
-                status.text += "\n\nLast preservation report:\n\(text)"
-            }
+        guard let key = app.crewStorageKey else { return }
+        let profile = AppModel.profilesDir.appendingPathComponent(key, isDirectory: true)
+        let receipt = profile.appendingPathComponent("legacy-ios-import.json")
+        guard FileManager.default.fileExists(atPath: receipt.path) else { return }
+        do {
+            let data = try Data(contentsOf: receipt)
+            let report = try JSONSerialization.jsonObject(with: data)
+            let formatted = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+            status.text = "Native migration receipt. Any missing data or unknown command outcomes below still require reconciliation with the owning host; they were not fabricated or replayed.\n\n" + String(decoding: formatted, as: UTF8.self)
+            exportURLs = [receipt, profile.appendingPathComponent("originals", isDirectory: true)]
+            navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Export originals", primaryAction: UIAction { [weak self] _ in
+                guard let self else { return }
+                // Only immutable migration input and receipt, never the live SQLite store.
+                self.present(UIDocumentPickerViewController(forExporting: self.exportURLs, asCopy: true), animated: true)
+            })
+        } catch {
+            status.text = "Cannot read the migration receipt. Originals are retained. \(error.localizedDescription)"
         }
-    }
-    private func pickBackup() {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-        picker.delegate = self
-        picker.allowsMultipleSelection = false
-        present(picker, animated: true)
-    }
-    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        guard let source = urls.first, let client = app.client else { return }
-        let access = source.startAccessingSecurityScopedResource()
-        navigationItem.rightBarButtonItems?.forEach { $0.isEnabled = false }
-        Task { @MainActor in
-            defer {
-                if access { source.stopAccessingSecurityScopedResource() }
-                navigationItem.rightBarButtonItems?.forEach { $0.isEnabled = true }
-            }
-            do {
-                let report = try await client.crewImportLegacyBackup(sourcePath: source.path)
-                guard let value = try JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any],
-                      let path = value["directory"] as? String else { throw CoreError.Storage(message: "Missing migration report") }
-                lastDirectory = URL(fileURLWithPath: path, isDirectory: true)
-                UserDefaults.standard.set(path, forKey: storageKey)
-                let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
-                status.text = "Original backup untouched. Preserved files are isolated from live sync. Pending work was NOT replayed. Export this archive for authenticated reconciliation.\n\n" + String(decoding: data, as: UTF8.self)
-            } catch { status.text += "\n\nImport stopped; originals retained. \(error.localizedDescription)" }
-        }
-    }
-    private func exportBackup() {
-        guard let lastDirectory else { return }
-        // The native export picker gives the user explicit control over disclosure.
-        present(UIDocumentPickerViewController(forExporting: [lastDirectory], asCopy: true), animated: true)
     }
 }

@@ -37,6 +37,8 @@ export default defineConfig({
     alias: { "loro-crdt": "loro-crdt/base64" }
   },
   test: {
+    // Each worker owns a Miniflare/SQLite runtime; bound resources while keeping files parallel.
+    maxWorkers: 2,
     include: ["test/workerd/**/*.test.ts"]
   }
 });

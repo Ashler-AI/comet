@@ -185,8 +185,12 @@ impl HarnessRegistry {
         id: HarnessId,
         cwd: &Path,
     ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
-        if self.managed_inference {
-            return Err(HarnessError::Protocol("CLI catalog probes require explicit local mode".into()));
+        // OMP has catalog-specific admission; Codex commands are static metadata.
+        // Other adapters can run startup hooks without an inference deny boundary.
+        if self.managed_inference && !matches!(id, HarnessId::Omp | HarnessId::Codex) {
+            return Err(HarnessError::Protocol(
+                "Command discovery for this harness is unavailable under this Crew execution policy".into(),
+            ));
         }
         let cwd = cwd.to_owned();
         let lease = self.execution_lease(id).await;
@@ -1246,13 +1250,14 @@ mod gate_tests {
     use super::*;
 
     struct DiscoveryHarness {
+        id: HarnessId,
         started: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
     #[async_trait::async_trait]
     impl Harness for DiscoveryHarness {
         fn id(&self) -> HarnessId {
-            HarnessId::Codex
+            self.id
         }
         fn display_name(&self) -> &str {
             "Discovery fixture"
@@ -1289,11 +1294,35 @@ mod gate_tests {
     }
 
     #[tokio::test]
+    async fn managed_command_metadata_preserves_provider_policy() {
+        for scaffold in [false, true] {
+            let registry = HarnessRegistry::new().with_execution_policy(true, scaffold);
+            for id in [HarnessId::Omp, HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Pi] {
+                let harness = Arc::new(DiscoveryHarness {
+                    id,
+                    started: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                });
+                harness.release.notify_one();
+                registry.register(harness);
+                let result = registry.discover_commands(id, Path::new("/catalog-checkout")).await;
+                if id == HarnessId::Omp || (!scaffold && id == HarnessId::Codex) {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result, Err(HarnessError::Protocol(_))));
+                }
+                assert!(matches!(registry.discover_models(id).await, Err(HarnessError::Protocol(_))));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn discovery_waits_for_updates_and_keeps_lease_after_caller_cancellation() {
         use std::time::Duration;
         for commands in [false, true] {
             let registry = Arc::new(HarnessRegistry::new());
             let harness = Arc::new(DiscoveryHarness {
+                id: HarnessId::Codex,
                 started: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
             });

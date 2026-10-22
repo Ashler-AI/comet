@@ -121,7 +121,7 @@ jobs:
             echo "::error::release version $requested does not match workspace version $workspace_version"
             exit 1
           fi
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[] | select(.name == "zeron") | .version] | unique | .[]')"
+          cargo_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '[.packages[] | select(.name == "zeron") | .version] | unique | .[]')"
           if [[ "$cargo_version" != "$workspace_version" ]]; then
             echo "::error::Cargo metadata reports $cargo_version, expected $workspace_version"
             exit 1
@@ -177,18 +177,24 @@ jobs:
         run: |
           cd target/package
           sha256sum comet-*.tar.gz > SHA256SUMS
+          for archive in comet-*-linux-*.tar.gz; do
+            binary="${archive%.tar.gz}/comet"
+            digest="$(tar -xOf "$archive" "$binary" | sha256sum | cut -d' ' -f1)"
+            printf '%s  %s\n' "$digest" "$binary"
+          done > COMET_SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
             target/package/comet-*.tar.gz
             target/package/SHA256SUMS
+            target/package/COMET_SHA256SUMS
           if-no-files-found: error
 
   macos:
     if: ${{ inputs.candidate_run_id == '' }}
     needs: version
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       COMET_RELEASE_VERSION: ${{ needs.version.outputs.version }}
       SOURCE_DATE_EPOCH: ${{ needs.version.outputs.source_epoch }}
@@ -372,6 +378,12 @@ jobs:
           scaffold_runtime_version="$(cat scaffold-runtime-version.txt)"
           mkdir -p candidate
           find incoming -type f -name 'comet-*' -exec cp '{}' candidate/ \;
+          jq -n --arg version "$VERSION" --arg sourceRevision "$GITHUB_SHA" \
+            --arg runtimeContract "$scaffold_runtime_version" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{schemaVersion:1,version:$version,sourceRevision:$sourceRevision,runtimeContract:$runtimeContract,repository:$repository,workflowRun:$workflowRun,delivery:"authenticated-private-gcs"}' \
+            > candidate/provenance.json
 
           for channel in desktop desktop-staging; do
             prefix=comet
@@ -402,6 +414,7 @@ jobs:
             for file in "${scaffold_files[@]}"; do test -f "candidate/$file"; done
             cp install.sh candidate/install.sh
             (cd candidate && sha256sum "${scaffold_files[@]}" > scaffold-SHA256SUMS)
+            cat incoming/linux-*/COMET_SHA256SUMS > candidate/COMET_SHA256SUMS
             jq -n \
               --arg version "$VERSION" \
               --arg commit "$GITHUB_SHA" \
@@ -488,7 +501,7 @@ jobs:
   verify-macos-candidate:
     if: ${{ always() && needs.version.result == 'success' && needs.candidate.result == 'success' }}
     needs: [version, candidate]
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       COMET_MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
       VERSION: ${{ needs.version.outputs.version }}
@@ -580,6 +593,10 @@ jobs:
           SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
         run: |
           set -euo pipefail
+          if [[ "${COMET_RELEASES_GCS_BUCKET:-}" != "ashler-comet-releases-staging" ]]; then
+            echo "::error::staging release bucket configuration is invalid"
+            exit 1
+          fi
           publish_immutable() {
             source="$1"
             object="$2"
@@ -631,12 +648,15 @@ jobs:
           for file in candidate/*; do
             name="$(basename "$file")"
             case "$name" in
-              *manifest.json|*SHA256SUMS|install.sh) ;;
+              *manifest.json|*SHA256SUMS|provenance.json|install.sh) ;;
               *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
             esac
           done
           require_forward_version desktop
           require_forward_version desktop-staging
+          if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
+            require_forward_version scaffold
+          fi
           for channel in desktop desktop-staging; do
             gcloud storage cp "candidate/$channel-manifest.json" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$channel-manifest.json"
             gcloud storage cp "candidate/$channel-SHA256SUMS" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$channel-SHA256SUMS"
@@ -645,7 +665,6 @@ jobs:
           done
 
           if [[ "$RELEASE_SURFACE" == "desktop-and-scaffold" ]]; then
-            require_forward_version scaffold
             gcloud storage cp candidate/scaffold-manifest.json "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json"
             gcloud storage cp candidate/scaffold-SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-SHA256SUMS"
             gcloud storage cp candidate/install.sh "gs://$COMET_RELEASES_GCS_BUCKET/releases/install.sh"
@@ -709,6 +728,7 @@ jobs:
       needs.candidate.result == 'success' &&
       needs['verify-macos-candidate'].result == 'success' &&
       needs['publish-staging'].result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
       needs.version.outputs.promotion_target == 'production'
     needs: [version, candidate, verify-macos-candidate, publish-staging]
     runs-on: ubuntu-24.04
@@ -816,7 +836,7 @@ jobs:
             case "$name" in comet-staging-*|desktop-staging-*) continue ;; esac
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
             case "$name" in
-              *manifest.json|*SHA256SUMS|install.sh) ;;
+              *manifest.json|*SHA256SUMS|provenance.json|install.sh) ;;
               *) publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$name" ;;
             esac
           done
