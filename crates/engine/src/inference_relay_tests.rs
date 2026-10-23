@@ -122,24 +122,34 @@ mod tests {
 
     #[async_trait]
     impl zeron_rpc::TokenSource for StaticToken {
-        async fn token(&self) -> Result<String, zeron_rpc::TokenError> {
-            Ok("comet-access-token".into())
+        async fn token(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
+            Ok(zeron_proto::AccessToken { value: "comet-access-token".into(), generation: 0 })
         }
+
+        fn invalidate(&self, _generation: u64) {}
     }
 
     #[derive(Default)]
     struct ProfileToken {
         signed_out: AtomicBool,
+        generation: AtomicU64,
     }
 
     #[async_trait]
     impl zeron_rpc::TokenSource for ProfileToken {
-        async fn token(&self) -> Result<String, zeron_rpc::TokenError> {
+        async fn token(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
             if self.signed_out.load(Ordering::SeqCst) {
                 Err(zeron_rpc::TokenError::SignedOut)
             } else {
-                Ok("comet-access-token".into())
+                Ok(zeron_proto::AccessToken {
+                    value: "comet-access-token".into(),
+                    generation: self.generation.load(Ordering::SeqCst),
+                })
             }
+        }
+
+        fn invalidate(&self, generation: u64) {
+            let _ = self.generation.compare_exchange(generation, generation + 1, Ordering::SeqCst, Ordering::SeqCst);
         }
     }
 
@@ -149,6 +159,11 @@ mod tests {
         issued: AtomicU64,
         forwarded: AtomicU64,
         fail_issuance: AtomicBool,
+        issuance_gate: parking_lot::Mutex<Option<Arc<Semaphore>>>,
+        principal: parking_lot::Mutex<String>,
+        scope: parking_lot::Mutex<String>,
+        rejection: parking_lot::Mutex<Option<(String, bool)>>,
+        response_gate: parking_lot::Mutex<Option<Arc<Semaphore>>>,
     }
 
     impl AuthorityFixture {
@@ -158,19 +173,25 @@ mod tests {
                 issued: AtomicU64::new(0),
                 forwarded: AtomicU64::new(0),
                 fail_issuance: AtomicBool::new(false),
+                issuance_gate: parking_lot::Mutex::new(None),
+                principal: parking_lot::Mutex::new("identity:owner-1".into()),
+                scope: parking_lot::Mutex::new("user:identity:owner-1".into()),
+                rejection: parking_lot::Mutex::new(None),
+                response_gate: parking_lot::Mutex::new(None),
             })
         }
     }
 
     async fn set_fixture_expiry(
         fixture: &AuthorityFixture,
-        route: &Route,
+        relay: &InferenceRelay,
         expires_at: DateTime<Utc>,
     ) {
         *fixture.expires_at.lock() = expires_at;
-        let mut state = route.authority.lock().await;
-        state.expires_at = expires_at;
-        state.authority.expires_at = expires_at.to_rfc3339();
+        let mut state = relay.inner.authority.lock().await;
+        let lease = Arc::get_mut(state.lease.as_mut().unwrap()).unwrap();
+        lease.expires_at = expires_at;
+        lease.authority.expires_at = expires_at.to_rfc3339();
     }
 
     #[derive(Debug)]
@@ -224,6 +245,10 @@ mod tests {
                                 "/api/agent-auth/v2/authority" => {
                                     let authority_id =
                                         fixture.issued.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let gate = fixture.issuance_gate.lock().clone();
+                                    if let Some(gate) = gate {
+                                        gate.acquire().await.unwrap().forget();
+                                    }
                                     if fixture.fail_issuance.load(Ordering::SeqCst) {
                                         return Ok::<_, Infallible>(Response::builder()
                                             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -238,8 +263,8 @@ mod tests {
                                         "token": format!("remote-agent-auth-authority-{authority_id}"),
                                         "tokenType": "Bearer",
                                         "authorityId": format!("authority-{authority_id}"),
-                                        "principalId": "identity:owner-1",
-                                        "authorityScope": "user:identity:owner-1",
+                                        "principalId": fixture.principal.lock().clone(),
+                                        "authorityScope": fixture.scope.lock().clone(),
                                         "expiresAt": fixture.expires_at.lock().to_rfc3339(),
                                     })
                                 }
@@ -272,6 +297,20 @@ mod tests {
                                             body: serde_json::from_slice(&bytes).unwrap(),
                                         })
                                         .unwrap();
+                                    let rejection = fixture.rejection.lock().clone();
+                                    let gate = fixture.response_gate.lock().clone();
+                                    if let Some(gate) = gate {
+                                        gate.acquire().await.unwrap().forget();
+                                    }
+                                    if let Some((body, selected_account)) = rejection {
+                                        let mut response = Response::builder().status(StatusCode::UNAUTHORIZED)
+                                            .header("transfer-encoding", "chunked")
+                                            .header("x-fixture-error", "preserved");
+                                        if selected_account {
+                                            response = response.header("x-agent-auth-selected-account-id", "account-actual");
+                                        }
+                                        return Ok::<_, Infallible>(response.body(Full::new(Bytes::from(body))).unwrap());
+                                    }
                                     json!({ "ok": true })
                                 }
                                 other => panic!("unexpected control-plane path {other}"),
@@ -361,15 +400,25 @@ mod tests {
     }
 
     async fn streaming_control_plane(captured: mpsc::UnboundedSender<CapturedRequest>) -> String {
+        streaming_control_plane_with_status(captured, StatusCode::OK, None).await
+    }
+
+    async fn streaming_control_plane_with_status(
+        captured: mpsc::UnboundedSender<CapturedRequest>,
+        status: StatusCode,
+        tail_gate: Option<Arc<Semaphore>>,
+    ) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let captured = captured.clone();
+                let tail_gate = tail_gate.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request: Request<Incoming>| {
                         let captured = captured.clone();
+                        let tail_gate = tail_gate.clone();
                         async move {
                             if request.method() == hyper::Method::HEAD && request.uri().path() == "/" {
                                 return Ok::<_, Infallible>(Response::builder().status(StatusCode::NOT_FOUND)
@@ -399,15 +448,23 @@ mod tests {
                                         body: serde_json::from_slice(&bytes).unwrap(),
                                     })
                                     .unwrap();
-                                let body = futures::stream::once(async {
-                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(
-                                        b"data: first\n\n",
-                                    )))
-                                })
-                                .chain(futures::stream::pending());
-                                return Ok::<_, Infallible>(Response::new(BodyExt::boxed(
-                                    StreamBody::new(body),
-                                )));
+                                let body = futures::stream::once(async move {
+                                    let prefix: &'static [u8] = if status == StatusCode::UNAUTHORIZED {
+                                        br#"{"error":"agent_auth_v2_authority_invalid"}"#
+                                    } else {
+                                        b"data: first\n\n"
+                                    };
+                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(prefix)))
+                                }).chain(futures::stream::once(async move {
+                                    match tail_gate {
+                                        Some(gate) => gate.acquire().await.unwrap().forget(),
+                                        None => futures::future::pending::<()>().await,
+                                    }
+                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b" delayed-tail")))
+                                }));
+                                return Ok::<_, Infallible>(Response::builder().status(status)
+                                    .header("x-fixture-stream", "preserved")
+                                    .body(BodyExt::boxed(StreamBody::new(body))).unwrap());
                             }
                             assert_eq!(path, "/api/agent-auth/v2/authority");
                             let authority = json!({
@@ -438,6 +495,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distinct_routes_share_preparation_renewal_and_waiter_cancellation() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+        let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(captured_tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(
+            ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap(),
+        ).unwrap();
+        let sessions = (0..16).map(|index| format!("shared-session-{index}")).collect::<Vec<_>>();
+        let prepared = futures::future::join_all(sessions.iter().map(|session| {
+            relay.prepare(session, HarnessId::Codex, Some("gpt-5.6-sol"), None)
+        })).await;
+        let routes = prepared.into_iter().map(|prepared| {
+            let prepared = prepared.unwrap().unwrap();
+            lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone()
+        }).collect::<Vec<_>>();
+        relay.prepare("later-anthropic", HarnessId::ClaudeCode, Some("claude-opus-5"), Some("pinned-account"))
+            .await.unwrap().unwrap();
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
+
+        let boundary = Utc::now() + TimeDelta::milliseconds(900);
+        set_fixture_expiry(&fixture, &relay, boundary).await;
+        let calls = futures::future::join_all(routes.iter().map(|route| relay.current_authority(route)));
+        tokio::pin!(calls);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut calls).await.is_err());
+        routes[0].cancellation.cancel();
+        *fixture.expires_at.lock() = Utc::now() + TimeDelta::minutes(5);
+        let renewed = tokio::time::timeout(Duration::from_secs(2), &mut calls).await.unwrap();
+        assert_eq!(renewed[0].as_ref().err().unwrap().reason, "route_cancelled");
+        for lease in &renewed[1..] {
+            assert_eq!(lease.as_ref().unwrap().authority.authority_id, "authority-2");
+        }
+        assert!(Utc::now() >= boundary);
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_generation_discards_cached_authority_and_signout_fails_closed() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+        let token = Arc::new(ProfileToken::default());
+        let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(captured_tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(
+            ScaffoldClient::new(origin, "project-1", token.clone()).unwrap(),
+        ).unwrap();
+        let prepared = relay.prepare("generation-session", HarnessId::Codex, None, None)
+            .await.unwrap().unwrap();
+        let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
+        token.generation.fetch_add(1, Ordering::SeqCst);
+        let renewed = relay.current_authority(&route).await.unwrap();
+        assert_eq!(renewed.credential_generation, 1);
+        assert_eq!(renewed.authority.authority_id, "authority-2");
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        token.signed_out.store(true, Ordering::SeqCst);
+        assert!(relay.current_authority(&route).await.is_err());
+        assert!(relay.prepare("signed-out", HarnessId::Codex, None, None).await.is_err());
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn authority_rejection_is_exactly_once_and_stale_rejection_cannot_evict_new_grant() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+        let rejected_body = r#"{"error":"agent_auth_v2_authority_invalid"}"#;
+        *fixture.rejection.lock() = Some((rejected_body.into(), false));
+        let gate = Arc::new(Semaphore::new(0));
+        *fixture.response_gate.lock() = Some(gate.clone());
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(captured_tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(
+            ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap(),
+        ).unwrap();
+        let route = relay.prepare("rejected-route", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        let url = format!("{}/v1/responses", route.base_url);
+        let http = reqwest::Client::new();
+        let mut requests = tokio::task::JoinSet::new();
+        for input in ["first", "stale"] {
+            let request = http.post(&url).bearer_auth(&route.token).json(&json!({ "input": input }));
+            requests.spawn(async move { request.send().await.unwrap() });
+        }
+        for _ in 0..2 {
+            let sent = captured_rx.recv().await.unwrap();
+            assert_eq!(sent.authorization, "Bearer remote-agent-auth-authority-1");
+        }
+        gate.add_permits(1);
+        let rejected = requests.join_next().await.unwrap().unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(rejected.headers()["x-fixture-error"], "preserved");
+        assert_eq!(rejected.text().await.unwrap(), rejected_body);
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 2);
+
+        relay.prepare("independent-route", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        gate.add_permits(1);
+        let stale = requests.join_next().await.unwrap().unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(stale.text().await.unwrap(), rejected_body);
+        *fixture.rejection.lock() = None;
+        *fixture.response_gate.lock() = None;
+        let subsequent = http.post(&url).bearer_auth(&route.token)
+            .json(&json!({ "input": "independent-new-request" })).send().await.unwrap();
+        assert_eq!(subsequent.status(), StatusCode::OK);
+        let sent = captured_rx.recv().await.unwrap();
+        assert_eq!(sent.authorization, "Bearer remote-agent-auth-authority-2");
+        assert_eq!(sent.body["input"], "independent-new-request");
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 3);
+        assert!(captured_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stalled_401_probe_forwards_headers_prefix_and_remaining_body_without_eviction() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let tail_gate = Arc::new(Semaphore::new(0));
+        let origin = streaming_control_plane_with_status(
+            captured_tx, StatusCode::UNAUTHORIZED, Some(tail_gate.clone()),
+        ).await;
+        let relay = InferenceRelay::start(
+            ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap(),
+        ).unwrap();
+        let route = relay.prepare("stalled-error", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        let request = reqwest::Client::new().post(format!("{}/v1/responses", route.base_url))
+            .bearer_auth(&route.token).json(&json!({ "input": "once" }));
+        let mut response = tokio::time::timeout(Duration::from_secs(2), request.send())
+            .await.expect("stalled authority error must not withhold response headers").unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["x-fixture-stream"], "preserved");
+        let prefix = tokio::time::timeout(Duration::from_millis(500), response.chunk())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(prefix, Bytes::from_static(br#"{"error":"agent_auth_v2_authority_invalid"}"#));
+        relay.prepare("after-stalled-error", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        assert_eq!(relay.inner.authority.lock().await.lease.as_ref().unwrap().generation, 1);
+        tail_gate.add_permits(1);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), response.bytes()).await.unwrap().unwrap(),
+            Bytes::from_static(b" delayed-tail"));
+        assert_eq!(captured_rx.recv().await.unwrap().body["input"], "once");
+        assert!(captured_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_and_unrecognized_401_responses_never_invalidate_authority() {
+        for (body, selected_account) in [
+            (r#"{"error":"agent_auth_v2_authority_invalid"}"#.to_string(), true),
+            (r#"{"error":"provider_credentials_invalid"}"#.to_string(), false),
+            ("not-json".to_string(), false),
+            (format!(r#"{{"error":"agent_auth_v2_authority_invalid","padding":"{}"}}"#, "x".repeat(4096)), false),
+        ] {
+            let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+            *fixture.rejection.lock() = Some((body.clone(), selected_account));
+            let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+            let origin = test_control_plane_with_authority(captured_tx, fixture.clone()).await;
+            let relay = InferenceRelay::start(
+                ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap(),
+            ).unwrap();
+            let route = relay.prepare("provider-error", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            let response = reqwest::Client::new().post(format!("{}/v1/responses", route.base_url))
+                .bearer_auth(&route.token).json(&json!({ "input": "once" })).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()["x-fixture-error"], "preserved");
+            assert_eq!(response.text().await.unwrap(), body);
+            assert_eq!(captured_rx.recv().await.unwrap().body["input"], "once");
+            relay.prepare("after-provider-error", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_change_during_issuance_cannot_publish_old_profile_authority() {
+        for signed_out in [false, true] {
+            let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+            let gate = Arc::new(Semaphore::new(0));
+            *fixture.issuance_gate.lock() = Some(gate.clone());
+            let token = Arc::new(ProfileToken::default());
+            let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
+            let origin = test_control_plane_with_authority(captured_tx, fixture.clone()).await;
+            let relay = InferenceRelay::start(
+                ScaffoldClient::new(origin, "project-1", token.clone()).unwrap(),
+            ).unwrap();
+            let preparing = {
+                let relay = relay.clone();
+                tokio::spawn(async move { relay.prepare("changing-profile", HarnessId::Codex, None, None).await })
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fixture.issued.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            token.generation.fetch_add(1, Ordering::SeqCst);
+            token.signed_out.store(signed_out, Ordering::SeqCst);
+            gate.add_permits(1);
+            assert!(preparing.await.unwrap().is_err());
+            assert!(relay.inner.authority.lock().await.lease.is_none());
+            assert!(lock(&relay.inner.route_state).active.is_empty());
+            if !signed_out {
+                *fixture.issuance_gate.lock() = None;
+                relay.prepare("new-profile", HarnessId::Codex, None, None).await.unwrap().unwrap();
+                assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_change_cannot_rebind_old_routes_or_retired_credentials() {
+        for change_owner in [false, true] {
+            let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+            let token = Arc::new(ProfileToken::default());
+            let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
+            let origin = test_control_plane_with_authority(captured_tx, fixture.clone()).await;
+            let relay = InferenceRelay::start(
+                ScaffoldClient::new(origin, "project-1", token.clone()).unwrap(),
+            ).unwrap();
+            let prepared = relay.prepare("profile-route", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            let old = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
+            let retired = relay.prepare("retired-profile-route", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            relay.remove(&retired.token);
+            token.generation.fetch_add(1, Ordering::SeqCst);
+            *fixture.scope.lock() = "user:another-scope".into();
+            if change_owner {
+                *fixture.principal.lock() = "identity:another-owner".into();
+            }
+            let replacement = relay.prepare("retired-profile-route", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            assert_ne!(replacement.token, retired.token);
+            assert!(relay.current_authority(&old).await.is_err());
+            assert!(old.cancellation.is_cancelled());
+            let response = reqwest::Client::new().get(format!("{}/v1/models", retired.base_url))
+                .bearer_auth(&retired.token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::GONE);
+            assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn fixture_authority_waits_for_expiry_then_issues_once_for_concurrent_callers() {
         let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::seconds(20));
         let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
@@ -450,12 +741,12 @@ mod tests {
         let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
         for _ in 0..8 {
             let authority = relay.current_authority(&route).await.unwrap();
-            assert_eq!(authority.authority_id, "authority-1");
+            assert_eq!(authority.authority.authority_id, "authority-1");
         }
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
 
         let boundary = Utc::now() + TimeDelta::milliseconds(900);
-        set_fixture_expiry(&fixture, &route, boundary).await;
+        set_fixture_expiry(&fixture, &relay, boundary).await;
         let calls = futures::future::join_all((0..16).map(|_| relay.current_authority(&route)));
         tokio::pin!(calls);
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut calls).await.is_err());
@@ -465,8 +756,8 @@ mod tests {
         assert!(Utc::now() >= boundary);
         for authority in renewed {
             let authority = authority.unwrap();
-            assert_eq!(authority.authority_id, "authority-2");
-            assert_eq!(authority.token, "remote-agent-auth-authority-2");
+            assert_eq!(authority.authority.authority_id, "authority-2");
+            assert_eq!(authority.authority.token, "remote-agent-auth-authority-2");
         }
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
@@ -483,7 +774,7 @@ mod tests {
         let prepared = relay.prepare("session-cancel-expiry", HarnessId::Codex, Some("gpt-5.6-sol"), None)
             .await.unwrap().unwrap();
         let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
-        set_fixture_expiry(&fixture, &route, Utc::now() + TimeDelta::milliseconds(900)).await;
+        set_fixture_expiry(&fixture, &relay, Utc::now() + TimeDelta::milliseconds(900)).await;
         let calls = futures::future::join_all((0..2).map(|_| relay.current_authority(&route)));
         tokio::pin!(calls);
         assert!(tokio::time::timeout(Duration::from_millis(50), &mut calls).await.is_err());
@@ -491,7 +782,6 @@ mod tests {
         let cancelled = tokio::time::timeout(Duration::from_millis(300), &mut calls).await.unwrap();
         assert!(cancelled.into_iter().all(|result| result.is_err()));
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
-        set_fixture_expiry(&fixture, &route, Utc::now() + TimeDelta::seconds(20)).await;
         assert!(relay.current_authority(&route).await.is_err());
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
     }
@@ -510,9 +800,9 @@ mod tests {
                 .await.unwrap().unwrap();
             let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
             if wait == "expiry" {
-                set_fixture_expiry(&fixture, &route, Utc::now() + TimeDelta::milliseconds(900)).await;
+                set_fixture_expiry(&fixture, &relay, Utc::now() + TimeDelta::milliseconds(900)).await;
             }
-            let held = if wait == "mutex" { Some(route.authority.lock().await) } else { None };
+            let held = if wait == "mutex" { Some(relay.inner.authority.lock().await) } else { None };
             let call = relay.current_authority(&route);
             tokio::pin!(call);
             if wait != "cached" {
@@ -537,12 +827,14 @@ mod tests {
         let prepared = relay.prepare("session-cooldown", HarnessId::Codex, Some("gpt-5.6-sol"), None)
             .await.unwrap().unwrap();
         let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
-        set_fixture_expiry(&fixture, &route, Utc::now() - TimeDelta::seconds(1)).await;
+        let sibling = relay.prepare("cooldown-sibling", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        set_fixture_expiry(&fixture, &relay, Utc::now() - TimeDelta::seconds(1)).await;
         fixture.fail_issuance.store(true, Ordering::SeqCst);
         let http = reqwest::Client::new();
         let url = format!("{}/v1/responses", prepared.base_url);
         for _ in 0..2 {
-            let requests = (0..8).map(|_| http.post(&url).bearer_auth(&prepared.token)
+            let requests = (0..8).map(|index| http.post(&url)
+                .bearer_auth(if index % 2 == 0 { &prepared.token } else { &sibling.token })
                 .json(&json!({ "model": "gpt-5.6-sol", "input": "cooldown" })).send());
             let responses = tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(requests))
                 .await.unwrap();
@@ -552,20 +844,21 @@ mod tests {
                 assert_eq!(response.headers()["retry-after"], "1");
                 assert_eq!(response.json::<Value>().await.unwrap()["error"], "agent_auth_unavailable");
             }
+            assert!(relay.prepare("cooldown-prepare", HarnessId::Codex, None, None).await.is_err());
             assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
             assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
             assert!(captured_rx.try_recv().is_err());
         }
 
-        let (started, delay) = route.authority.lock().await.retry_at.unwrap();
-        route.authority.lock().await.retry_at = Some((Instant::now(), Duration::from_secs(u64::MAX)));
+        let (started, delay) = relay.inner.authority.lock().await.retry_at.unwrap();
+        relay.inner.authority.lock().await.retry_at = Some((Instant::now(), Duration::from_secs(u64::MAX)));
         let error = relay.current_authority(&route).await.err().unwrap();
         let remaining = error.retry_after.unwrap();
         assert!(remaining >= Duration::from_secs(u64::MAX - 1));
         assert!(remaining <= Duration::from_secs(u64::MAX));
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
-        route.authority.lock().await.retry_at = Some((started, delay));
+        relay.inner.authority.lock().await.retry_at = Some((started, delay));
         tokio::time::sleep(delay.saturating_sub(started.elapsed()) + Duration::from_millis(20)).await;
         fixture.fail_issuance.store(false, Ordering::SeqCst);
         *fixture.expires_at.lock() = Utc::now() + TimeDelta::minutes(5);
@@ -577,7 +870,7 @@ mod tests {
         let forwarded = captured_rx.recv().await.unwrap();
         assert_eq!(forwarded.authorization, "Bearer remote-agent-auth-authority-3");
         assert_eq!(forwarded.body["input"], "resumed");
-        assert!(route.authority.lock().await.retry_at.is_none());
+        assert!(relay.inner.authority.lock().await.retry_at.is_none());
     }
 
     #[test]
@@ -735,19 +1028,13 @@ mod tests {
         let prepared = relay.prepare("session-owner", HarnessId::Codex, Some("gpt-5.6-sol"), None)
             .await.unwrap().unwrap();
         let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
-        let mut state = route.authority.lock().await;
-        state.expires_at = Utc::now() - TimeDelta::seconds(1);
-        drop(state);
+        relay.inner.authority.lock().await.lease = None;
         let changed_owner = Route {
             request: route.request.clone(),
             local_session_id: None,
             owner_subject: "identity:someone-else".into(),
             cancellation: zeron_harness::CancellationToken::new(),
-            authority: AsyncMutex::new(AuthorityState {
-                authority: route.authority.lock().await.authority.clone(),
-                expires_at: Utc::now() - TimeDelta::seconds(1),
-                retry_at: None,
-            }),
+            authority_scope: route.authority_scope.clone(),
         };
         assert!(relay.current_authority(&changed_owner).await.is_err());
         assert!(changed_owner.cancellation.is_cancelled());
@@ -764,22 +1051,19 @@ mod tests {
         let prepared = relay.prepare("session-scope", HarnessId::Codex, Some("gpt-5.6-sol"), None)
             .await.unwrap().unwrap();
         let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
-        {
-            let mut state = route.authority.lock().await;
-            assert_eq!(state.authority.principal_id, route.owner_subject);
-            state.authority.authority_scope = Some("user:previous-profile-scope".into());
-            state.expires_at = Utc::now() - TimeDelta::seconds(1);
-            state.authority.expires_at = state.expires_at.to_rfc3339();
-        }
-        let error = relay.current_authority(&route).await.err().unwrap();
+        relay.inner.authority.lock().await.lease = None;
+        let changed_scope = Route {
+            request: route.request.clone(),
+            local_session_id: None,
+            owner_subject: route.owner_subject.clone(),
+            authority_scope: Some("user:previous-profile-scope".into()),
+            cancellation: zeron_harness::CancellationToken::new(),
+        };
+        let error = relay.current_authority(&changed_scope).await.err().unwrap();
         assert_eq!(error.reason, "route_scope_changed");
-        assert!(route.cancellation.is_cancelled());
+        assert!(changed_scope.cancellation.is_cancelled());
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
-        let state = route.authority.lock().await;
-        assert_eq!(state.authority.principal_id, route.owner_subject);
-        assert_eq!(state.authority.authority_scope.as_deref(), Some("user:previous-profile-scope"));
-        assert_eq!(state.authority.authority_id, "authority-1");
     }
 
     #[tokio::test]
@@ -1063,6 +1347,7 @@ mod tests {
                     logical_session_id: "persistent-session".into(),
                     local_session_id: None,
                     owner_subject: "identity:owner-1".into(),
+                    authority_scope: Some("user:identity:owner-1".into()),
                     provider: "anthropic".into(),
                     retired_at: Instant::now() - Duration::from_secs(1),
                 },
@@ -1093,7 +1378,7 @@ mod tests {
         let captured = captured_rx.recv().await.unwrap();
         assert_eq!(
             captured.authorization,
-            "Bearer remote-agent-auth-authority-2"
+            "Bearer remote-agent-auth-authority-1"
         );
         assert_eq!(captured.conversation_id, "persistent-session");
 

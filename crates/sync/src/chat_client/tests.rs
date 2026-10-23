@@ -9,6 +9,28 @@ use std::sync::Mutex;
 use super::*;
 use crate::chat_frames::{decode, encode, frame_type};
 
+#[tokio::test]
+async fn websocket_auth_feedback_uses_the_dialed_generation() {
+    use crate::dial::tests::{AUTH_RESPONSES, FeedbackPeer};
+
+    for managed in [true, false] {
+        for (status, close) in AUTH_RESPONSES {
+            let peer = FeedbackPeer::start(status, close, managed).await;
+            let connector = WsBinConnector { url: peer.provider.clone() };
+            let result = tokio::time::timeout(Duration::from_secs(5), connector.connect())
+                .await.unwrap();
+            if status == 101 {
+                let mut pipe = result.unwrap();
+                assert!(tokio::time::timeout(Duration::from_secs(5), pipe.rx.recv())
+                    .await.unwrap().is_none());
+            } else {
+                assert!(matches!(result, Err(SyncError::WebSocket(_))));
+            }
+            peer.finish(status == 401 || close == Some(4401)).await;
+        }
+    }
+}
+
 // ── plumbing: linked pipes + scripted connector ─────────────────────────────
 
 struct ServerEnd {

@@ -144,8 +144,91 @@ fn interleave_families(addrs: Vec<SocketAddr>) -> VecDeque<SocketAddr> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use futures::SinkExt;
+    use crate::{SyncError, UrlLease, UrlProvider};
+
+    pub(crate) const AUTH_RESPONSES: [(u16, Option<u16>); 8] = [
+        (401, None), (403, None), (429, None), (503, None),
+        (101, Some(4401)), (101, Some(4403)), (101, Some(1013)), (101, Some(1000)),
+    ];
+
+    pub(crate) struct FeedbackUrl {
+        url: String,
+        managed: bool,
+        current: AtomicU64,
+        invalidated: AtomicU64,
+    }
+
+    impl UrlProvider for FeedbackUrl {
+        fn url(&self) -> futures::future::BoxFuture<'static, Result<UrlLease, SyncError>> {
+            let lease = UrlLease {
+                url: self.url.clone(),
+                generation: self.managed.then(|| self.current.load(Ordering::SeqCst)),
+            };
+            Box::pin(async move { Ok(lease) })
+        }
+
+        fn invalidate(&self, generation: u64) {
+            assert_eq!(self.invalidated.swap(generation, Ordering::SeqCst), 0);
+            let _ = self.current.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) struct FeedbackPeer {
+        pub(crate) provider: Arc<FeedbackUrl>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl FeedbackPeer {
+        pub(crate) async fn start(status: u16, close: Option<u16>, managed: bool) -> Self {
+            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+            use tokio_tungstenite::tungstenite::{Message, protocol::CloseFrame};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let provider = Arc::new(FeedbackUrl {
+                url: format!("ws://{}/?token=41", listener.local_addr().unwrap()),
+                managed,
+                current: AtomicU64::new(41),
+                invalidated: AtomicU64::new(0),
+            });
+            let source = provider.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let result = tokio_tungstenite::accept_hdr_async(stream, move |request: &Request, response: Response| {
+                    assert_eq!(request.uri().query(), Some("token=41"));
+                    // A refresh wins before the old connection's rejection arrives.
+                    source.current.store(42, Ordering::SeqCst);
+                    if status == 101 {
+                        Ok(response)
+                    } else {
+                        Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                            .status(status).body(Some(String::new())).unwrap())
+                    }
+                }).await;
+                if let Some(code) = close {
+                    let mut ws = result.unwrap();
+                    ws.send(Message::Close(Some(CloseFrame {
+                        code: code.into(),
+                        reason: "test rejection".into(),
+                    }))).await.unwrap();
+                } else {
+                    assert!(matches!(result, Err(WsError::Http(response)) if response.status().as_u16() == status));
+                }
+            });
+            Self { provider, server }
+        }
+
+        pub(crate) async fn finish(self, rejected: bool) {
+            tokio::time::timeout(Duration::from_secs(5), self.server).await.unwrap().unwrap();
+            let expected = if rejected && self.provider.managed { 41 } else { 0 };
+            assert_eq!(self.provider.invalidated.load(Ordering::SeqCst), expected);
+            assert_eq!(self.provider.current.load(Ordering::SeqCst), 42);
+        }
+    }
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()

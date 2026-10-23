@@ -150,12 +150,12 @@ installer. Local typechecks are intentionally not part of this workflow.
 
 ## Managed authority verification
 
-The private runtime reuses the shared desktop/mobile `ScaffoldAuth` verifier:
-one credential-bound verification per 60-second freshness window, aged by both
-monotonic and wall clocks. Cold starts still verify; sign-out, profile changes
-and explicit rejection invalidate authority. Expired success is not an outage
-fallback. Concurrent transient failures share a 1–5-second cooldown; valid
-`Retry-After` dates or seconds set an uncapped minimum delay.
+The private runtime reuses the shared desktop/mobile `ScaffoldAuth` verifier.
+User bearers verify at startup/sign-in and on generation-matched authentication
+failure, not on a freshness timer. Sign-out and profile replacement fence old
+responses. Device grants renew near their actual expiry; expired grants are never
+served after a failed renewal. Concurrent transient failures share a 1–5-second
+fallback cooldown; valid `Retry-After` dates or seconds remain an uncapped minimum.
 
 Canary Edge still validates every protected request. Equivalent concurrent
 checks share only their in-flight request and body decoding; token, control

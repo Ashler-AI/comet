@@ -1575,11 +1575,8 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
                 edge.url.trim_end_matches('/'),
                 device_id
             );
-            let response = client
-                .get(&url)
-                .bearer_auth(&bearer)
-                .timeout(RELAY_PROBE_TIMEOUT)
-                .send()
+            let response = edge
+                .send(client.get(&url).timeout(RELAY_PROBE_TIMEOUT), &bearer)
                 .await;
             let Ok(response) = response else { continue };
             if !response.status().is_success() {
@@ -1693,9 +1690,9 @@ impl WsDerivedRegistryTransport {
     async fn leaf_url(
         provider: &Arc<dyn zeron_sync::UrlProvider>,
         leaf: &str,
-    ) -> Result<(reqwest::Url, Option<String>), zeron_sync::SyncError> {
+    ) -> Result<(reqwest::Url, Option<String>, Option<u64>), zeron_sync::SyncError> {
         let ws = provider.url().await?;
-        let mut u = reqwest::Url::parse(&ws)
+        let mut u = reqwest::Url::parse(&ws.url)
             .map_err(|e| zeron_sync::SyncError::Protocol(format!("bad ws url: {e}")))?;
         let scheme = if u.scheme() == "wss" { "https" } else { "http" };
         let _ = u.set_scheme(scheme);
@@ -1723,7 +1720,7 @@ impl WsDerivedRegistryTransport {
         for (k, v) in kept {
             u.query_pairs_mut().append_pair(&k, &v);
         }
-        Ok((u, token))
+        Ok((u, token, ws.generation))
     }
 }
 
@@ -1735,7 +1732,7 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         let provider = self.url.clone();
         let client = self.client.clone();
         Box::pin(async move {
-            let (mut u, token) = Self::leaf_url(&provider, "rows").await?;
+            let (mut u, token, generation) = Self::leaf_url(&provider, "rows").await?;
             u.query_pairs_mut()
                 .append_pair("since", &since.to_string())
                 .append_pair("beat", "1");
@@ -1747,6 +1744,11 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
                 .send()
                 .await
                 .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(generation) = generation
+            {
+                provider.invalidate(generation);
+            }
             if !resp.status().is_success() {
                 return Err(zeron_sync::SyncError::Protocol(format!(
                     "registry pull http {}",
@@ -1766,7 +1768,7 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         let provider = self.url.clone();
         let client = self.client.clone();
         Box::pin(async move {
-            let (u, token) = Self::leaf_url(&provider, "push").await?;
+            let (u, token, generation) = Self::leaf_url(&provider, "push").await?;
             let mut req = client
                 .post(u)
                 .header("content-type", "application/json")
@@ -1778,6 +1780,11 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
                 .send()
                 .await
                 .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(generation) = generation
+            {
+                provider.invalidate(generation);
+            }
             if !resp.status().is_success() {
                 return Err(zeron_sync::SyncError::Protocol(format!(
                     "registry push http {}",
@@ -1794,6 +1801,107 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
 #[cfg(test)]
 mod tests {
     use super::{device_name_on_boot, linked_worktree_root};
+
+    #[tokio::test]
+    async fn edge_http_rejection_invalidates_only_the_generation_sent() {
+        use super::*;
+        use crate::chat2_host::{EdgeChatTransport, EdgeCheckpointFetcher};
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeron_sync::RegistryTransport;
+        use zeron_sync::chat_client::{ChatTransport, CheckpointFetcher};
+
+        struct Tokens {
+            generation: AtomicU64,
+            rejected: Mutex<Vec<u64>>,
+        }
+        #[async_trait::async_trait]
+        impl zeron_rpc::TokenSource for Tokens {
+            async fn token(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
+                let generation = self.generation.load(Ordering::SeqCst);
+                Ok(zeron_proto::AccessToken {
+                    value: format!("token-{generation}"),
+                    generation,
+                })
+            }
+
+            fn invalidate(&self, generation: u64) {
+                self.rejected.lock().push(generation);
+            }
+        }
+
+        let tokens = Arc::new(Tokens {
+            generation: AtomicU64::new(1),
+            rejected: Mutex::new(Vec::new()),
+        });
+        let status = Arc::new(AtomicU16::new(200));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server_tokens = tokens.clone();
+        let server_status = status.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..20 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                // Rotate while the response is in flight: feedback must not
+                // accidentally reject the newly installed credential.
+                let sent = server_tokens.generation.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.contains(&format!("authorization: bearer token-{sent}\r\n")));
+                assert!(!request.lines().next().unwrap().contains("token="));
+                let code = server_status.load(Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {code} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build().unwrap();
+        let edge = EdgeConfig::new(origin, tokens.clone()).with_device("device");
+        let chat = EdgeChatTransport::new(client.clone(), edge.clone(), "chat", "device");
+        let checkpoint = EdgeCheckpointFetcher::new(client.clone(), edge.clone(), "chat");
+        let registry = WsDerivedRegistryTransport {
+            url: edge.room_url("/registry/org/ws"),
+            client,
+        };
+        let mut expected = Vec::new();
+        for code in [200, 401, 403, 503] {
+            status.store(code, Ordering::SeqCst);
+            for operation in 0..5 {
+                let generation = tokens.generation.load(Ordering::SeqCst);
+                let result = match operation {
+                    0 => chat.fetch_rows(0).await.map(|_| ()),
+                    1 => chat.push("batch".into(), vec![]).await.map(|_| ()),
+                    2 => checkpoint.fetch().await.map(|_| ()),
+                    3 => registry.fetch(0).await.map(|_| ()),
+                    _ => registry.push(String::new()).await.map(|_| ()),
+                };
+                assert_eq!(result.is_ok(), code == 200, "{code}: {result:?}");
+                if code == 401 {
+                    expected.push(generation);
+                }
+                assert_eq!(*tokens.rejected.lock(), expected);
+                assert_eq!(tokens.generation.load(Ordering::SeqCst), generation + 1);
+            }
+        }
+        server.await.unwrap();
+
+        let dns = Arc::new(crate::http_error::test_support::FailingDns::default());
+        let edge = EdgeConfig::new("https://edge.invalid", tokens.clone());
+        let bearer = edge.bearer().await.unwrap();
+        assert!(edge.send(dns.client().get(&edge.url), &bearer).await.is_err());
+        assert_eq!(*tokens.rejected.lock(), expected);
+    }
 
     #[tokio::test]
     async fn registry_http_sync_retains_dns_cause() {

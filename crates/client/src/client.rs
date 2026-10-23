@@ -1213,7 +1213,7 @@ impl Client {
             self.inner.credentials.org_id(),
             &self.inner.config.device_id,
         );
-        let token_value = self.inner.tokens.bearer().await?;
+        let token_value = self.inner.tokens.credential().await?;
         let body = serde_json::json!({
             "token": token,
             "environment": environment,
@@ -1221,11 +1221,14 @@ impl Client {
         });
         let response = crate::auth::http()
             .post(url)
-            .bearer_auth(token_value)
+            .bearer_auth(&token_value.value)
             .json(&body)
             .send()
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.inner.tokens.invalidate(token_value.generation);
+        }
         if !response.status().is_success() {
             return Err(ClientError::HostError(format!(
                 "push registration http {}",
@@ -1245,13 +1248,16 @@ impl Client {
             self.inner.credentials.org_id(),
             &self.inner.config.device_id,
         );
-        let token_value = self.inner.tokens.bearer().await?;
+        let token_value = self.inner.tokens.credential().await?;
         let response = crate::auth::http()
             .delete(url)
-            .bearer_auth(token_value)
+            .bearer_auth(&token_value.value)
             .send()
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.inner.tokens.invalidate(token_value.generation);
+        }
         if !response.status().is_success() {
             return Err(ClientError::HostError(format!(
                 "push removal http {}",

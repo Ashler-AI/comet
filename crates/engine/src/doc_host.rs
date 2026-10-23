@@ -174,8 +174,21 @@ impl EdgeConfig {
     }
 
     /// The current bearer, or a distinct signed-out/temporarily-unavailable error.
-    pub async fn bearer(&self) -> Result<String, zeron_rpc::TokenError> {
+    pub async fn bearer(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
         self.token.token().await
+    }
+
+    /// Send once, reporting explicit credential rejection before callers flatten errors.
+    pub(crate) async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        bearer: &zeron_proto::AccessToken,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let response = request.bearer_auth(&bearer.value).send().await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.token.invalidate(bearer.generation);
+        }
+        Ok(response)
     }
 
     pub fn token_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
@@ -212,14 +225,14 @@ struct EdgeRoomUrl {
 }
 
 impl zeron_sync::UrlProvider for EdgeRoomUrl {
-    fn url(&self) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+    fn url(&self) -> futures::future::BoxFuture<'static, Result<zeron_sync::UrlLease, zeron_sync::SyncError>> {
         let token = self.token.clone();
         let base = self.base.clone();
         let device = self.device_id.clone();
         let host = self.host_device.clone();
         Box::pin(async move {
             let token = token.token().await.map_err(zeron_sync::SyncError::from)?;
-            let mut url = format!("{base}?token={token}");
+            let mut url = format!("{base}?token={}", token.value);
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
             }
@@ -229,8 +242,12 @@ impl zeron_sync::UrlProvider for EdgeRoomUrl {
                 parsed.query_pairs_mut().append_pair("hostDevice", &host);
                 url = parsed.into();
             }
-            Ok(url)
+            Ok(zeron_sync::UrlLease { url, generation: Some(token.generation) })
         })
+    }
+
+    fn invalidate(&self, generation: u64) {
+        self.token.invalidate(generation);
     }
 }
 
@@ -2580,17 +2597,16 @@ impl DocHost {
             .http(zeron_sync::budget::Priority::Background)
             .await
             .map_err(|e| e.to_string())?;
-        let res = self
-            .inner
-            .http
-            .post(&url)
-            .bearer_auth(&bearer)
-            .header(
-                "x-chat2-frontier",
-                base64::engine::general_purpose::STANDARD.encode(&frontier),
+        let res = edge
+            .send(
+                self.inner.http.post(&url)
+                    .header(
+                        "x-chat2-frontier",
+                        base64::engine::general_purpose::STANDARD.encode(&frontier),
+                    )
+                    .body(snapshot.clone()),
+                &bearer,
             )
-            .body(snapshot.clone())
-            .send()
             .await
             .map_err(|e| format!("seed checkpoint POST: {}", describe_http_error(e)))?;
         if !res.status().is_success() {
@@ -2888,12 +2904,13 @@ impl DocHost {
                 else {
                     return;
                 };
-                let _ = http
-                    .put(&url)
-                    .bearer_auth(&bearer)
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .send()
+                let _ = edge_tail
+                    .send(
+                        http.put(&url)
+                            .header("content-type", "application/json")
+                            .body(body),
+                        &bearer,
+                    )
                     .await;
             });
         }
@@ -2969,16 +2986,17 @@ impl DocHost {
                 return;
             };
             let size = snapshot.len() as u64;
-            match http
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(300))
-                .bearer_auth(&bearer)
-                .header(
-                    "x-chat2-frontier",
-                    base64::engine::general_purpose::STANDARD.encode(&frontier),
+            match edge
+                .send(
+                    http.post(&url)
+                        .timeout(std::time::Duration::from_secs(300))
+                        .header(
+                            "x-chat2-frontier",
+                            base64::engine::general_purpose::STANDARD.encode(&frontier),
+                        )
+                        .body(snapshot),
+                    &bearer,
                 )
-                .body(snapshot)
-                .send()
                 .await
             {
                 Ok(res) if res.status().is_success() => {
@@ -4946,12 +4964,13 @@ impl DocHost {
                 puts.push((format!("{base}.diff"), "application/json", json));
             }
             for (url, content_type, body) in puts {
-                let sent = http
-                    .put(&url)
-                    .bearer_auth(&bearer)
-                    .header("content-type", content_type)
-                    .body(body)
-                    .send()
+                let sent = edge
+                    .send(
+                        http.put(&url)
+                            .header("content-type", content_type)
+                            .body(body),
+                        &bearer,
+                    )
                     .await;
                 match sent {
                     Ok(res) if res.status().is_success() => {}
@@ -5000,12 +5019,8 @@ impl DocHost {
             chat,
             encode_part_segment(part)
         );
-        let res = self
-            .inner
-            .http
-            .get(&url)
-            .bearer_auth(&bearer)
-            .send()
+        let res = edge
+            .send(self.inner.http.get(&url), &bearer)
             .await
             .map_err(|e| {
                 EngineError::Other(format!("sidecar fetch failed: {}", describe_http_error(e)))
