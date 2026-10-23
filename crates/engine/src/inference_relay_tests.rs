@@ -8,7 +8,7 @@ mod tests {
     use hyper::{body::Frame, body::Incoming, service::service_fn};
     use serde_json::Value;
     use std::io;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     #[derive(Clone)]
@@ -122,9 +122,339 @@ mod tests {
 
     #[async_trait]
     impl zeron_rpc::TokenSource for StaticToken {
-        async fn token(&self) -> Result<String, zeron_rpc::TokenError> {
-            Ok("comet-access-token".into())
+        async fn token(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
+            Ok(zeron_proto::AccessToken { value: "comet-access-token".into(), generation: 0 })
         }
+
+        fn invalidate(&self, _generation: u64) {}
+    }
+
+    #[derive(Default)]
+    struct ProfileToken {
+        signed_out: AtomicBool,
+        generation: AtomicU64,
+    }
+
+    #[async_trait]
+    impl zeron_rpc::TokenSource for ProfileToken {
+        async fn token(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
+            if self.signed_out.load(Ordering::SeqCst) {
+                Err(zeron_rpc::TokenError::SignedOut)
+            } else {
+                Ok(zeron_proto::AccessToken {
+                    value: "comet-access-token".into(),
+                    generation: self.generation.load(Ordering::SeqCst),
+                })
+            }
+        }
+
+        fn invalidate(&self, generation: u64) {
+            let _ = self.generation.compare_exchange(generation, generation + 1, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    // These local responses exercise scheduling, not cryptographic renewal.
+    struct AuthorityFixture {
+        expires_at: Mutex<DateTime<Utc>>,
+        issued: AtomicU64,
+        forwarded: AtomicU64,
+        fail_issuance: AtomicBool,
+        issuance_gate: Mutex<Option<Arc<Semaphore>>>,
+        principal: Mutex<String>,
+        scope: Mutex<String>,
+        rejection: Mutex<Option<(String, bool)>>,
+        response_gate: Mutex<Option<Arc<Semaphore>>>,
+    }
+
+    impl AuthorityFixture {
+        fn new(expires_at: DateTime<Utc>) -> Arc<Self> {
+            Arc::new(Self {
+                expires_at: Mutex::new(expires_at),
+                issued: AtomicU64::new(0),
+                forwarded: AtomicU64::new(0),
+                fail_issuance: AtomicBool::new(false),
+                issuance_gate: Mutex::new(None),
+                principal: Mutex::new("identity:owner-1".into()),
+                scope: Mutex::new("user:identity:owner-1".into()),
+                rejection: Mutex::new(None),
+                response_gate: Mutex::new(None),
+            })
+        }
+    }
+
+    async fn set_fixture_expiry(fixture: &AuthorityFixture, relay: &InferenceRelay, expires_at: DateTime<Utc>) {
+        *fixture.expires_at.lock() = expires_at;
+        let mut state = relay.inner.authority.lock().await;
+        let lease = Arc::get_mut(state.lease.as_mut().unwrap()).unwrap();
+        lease.expires_at = expires_at;
+        lease.authority.expires_at = expires_at.to_rfc3339();
+    }
+
+    #[tokio::test]
+    async fn distinct_routes_share_preparation_renewal_and_waiter_cancellation() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::seconds(20));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let sessions = (0..16).map(|index| format!("shared-session-{index}")).collect::<Vec<_>>();
+        let prepared = futures::future::join_all(sessions.iter().map(|session| {
+            relay.prepare(session, HarnessId::Codex, None, None)
+        })).await;
+        let routes = prepared.into_iter().map(|prepared| {
+            let prepared = prepared.unwrap().unwrap();
+            lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone()
+        }).collect::<Vec<_>>();
+        relay.prepare("other-provider", HarnessId::ClaudeCode, Some("claude-opus-5"), Some("pinned-account")).await.unwrap().unwrap();
+        for route in &routes {
+            assert_eq!(relay.current_authority(route).await.unwrap().authority.authority_id, "authority-1");
+        }
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
+        let boundary = Utc::now() + TimeDelta::milliseconds(900);
+        set_fixture_expiry(&fixture, &relay, boundary).await;
+        let calls = futures::future::join_all(routes.iter().map(|route| relay.current_authority(route)));
+        tokio::pin!(calls);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut calls).await.is_err());
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
+        routes[0].cancellation.cancel();
+        *fixture.expires_at.lock() = Utc::now() + TimeDelta::minutes(5);
+        let renewed = tokio::time::timeout(Duration::from_secs(2), &mut calls).await.unwrap();
+        assert_eq!(renewed[0].as_ref().err().unwrap().reason, "route_cancelled");
+        for lease in &renewed[1..] {
+            assert_eq!(lease.as_ref().unwrap().authority.authority_id, "authority-2");
+        }
+        assert!(Utc::now() >= boundary);
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn credential_generation_discards_cached_authority_and_signout_fails_closed() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+        let token = Arc::new(ProfileToken::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", token.clone()).unwrap()).unwrap();
+        let prepared = relay.prepare("generation-session", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
+        token.generation.fetch_add(1, Ordering::SeqCst);
+        let renewed = relay.current_authority(&route).await.unwrap();
+        assert_eq!(renewed.credential_generation, 1);
+        assert_eq!(renewed.authority.authority_id, "authority-2");
+        token.signed_out.store(true, Ordering::SeqCst);
+        assert!(relay.current_authority(&route).await.is_err());
+        assert!(relay.prepare("signed-out", HarnessId::Codex, None, None).await.is_err());
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn credential_change_during_issuance_cannot_publish_old_profile_authority() {
+        for signed_out in [false, true] {
+            let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+            let gate = Arc::new(Semaphore::new(0));
+            *fixture.issuance_gate.lock() = Some(gate.clone());
+            let token = Arc::new(ProfileToken::default());
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+            let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", token.clone()).unwrap()).unwrap();
+            let preparing = {
+                let relay = relay.clone();
+                tokio::spawn(async move { relay.prepare("changing-profile", HarnessId::Codex, None, None).await })
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fixture.issued.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            token.generation.fetch_add(1, Ordering::SeqCst);
+            token.signed_out.store(signed_out, Ordering::SeqCst);
+            gate.add_permits(1);
+            assert!(preparing.await.unwrap().is_err());
+            assert!(relay.inner.authority.lock().await.lease.is_none());
+            assert!(lock(&relay.inner.route_state).active.is_empty());
+            if !signed_out {
+                *fixture.issuance_gate.lock() = None;
+                relay.prepare("new-profile", HarnessId::Codex, None, None).await.unwrap().unwrap();
+                assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_change_cannot_rebind_old_routes_or_retired_credentials() {
+        for change_owner in [false, true] {
+            let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+            let token = Arc::new(ProfileToken::default());
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+            let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", token.clone()).unwrap()).unwrap();
+            let prepared = relay.prepare("profile-route", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            let old = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
+            let retired = relay.prepare("retired-profile", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            relay.remove(&retired.token);
+            token.generation.fetch_add(1, Ordering::SeqCst);
+            *fixture.scope.lock() = "user:another-scope".into();
+            if change_owner { *fixture.principal.lock() = "identity:another-owner".into(); }
+            let replacement = relay.prepare("retired-profile", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            assert_ne!(replacement.token, retired.token);
+            assert!(relay.current_authority(&old).await.is_err());
+            assert!(old.cancellation.is_cancelled());
+            let response = reqwest::Client::new().get(format!("{}/v1/models", retired.base_url))
+                .bearer_auth(&retired.token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::GONE);
+            assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_out_profile_fences_cached_authority_and_both_wait_paths() {
+        for wait in ["cached", "mutex", "expiry"] {
+            let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::seconds(20));
+            let token = Arc::new(ProfileToken::default());
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+            let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", token.clone()).unwrap()).unwrap();
+            let prepared = relay.prepare("signout-wait", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
+            if wait == "expiry" {
+                set_fixture_expiry(&fixture, &relay, Utc::now() + TimeDelta::milliseconds(900)).await;
+            }
+            let held = if wait == "mutex" { Some(relay.inner.authority.lock().await) } else { None };
+            let call = relay.current_authority(&route);
+            tokio::pin!(call);
+            if wait != "cached" {
+                assert!(tokio::time::timeout(Duration::from_millis(50), &mut call).await.is_err());
+            }
+            token.signed_out.store(true, Ordering::SeqCst);
+            drop(held);
+            assert!(tokio::time::timeout(Duration::from_secs(2), &mut call).await.unwrap().is_err(), "{wait}");
+            assert_eq!(fixture.issued.load(Ordering::SeqCst), 1, "{wait}");
+            assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0, "{wait}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_issuance_cools_down_routes_without_forwarding() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::seconds(20));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let first = relay.prepare("cooldown", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        let sibling = relay.prepare("cooldown-sibling", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        set_fixture_expiry(&fixture, &relay, Utc::now() - TimeDelta::seconds(1)).await;
+        fixture.fail_issuance.store(true, Ordering::SeqCst);
+        let http = reqwest::Client::new();
+        let url = format!("{}/v1/responses", first.base_url);
+        let requests = (0..16).map(|index| http.post(&url)
+            .bearer_auth(if index % 2 == 0 { &first.token } else { &sibling.token })
+            .json(&json!({ "input": "cooldown" })).send());
+        let responses = tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(requests)).await.unwrap();
+        for response in responses {
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "1");
+            assert_eq!(response.json::<Value>().await.unwrap()["error"], "agent_auth_unavailable");
+        }
+        assert!(relay.prepare("cooldown-prepare", HarnessId::Codex, None, None).await.is_err());
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
+        let (started, delay) = relay.inner.authority.lock().await.retry_at.unwrap();
+        tokio::time::sleep(delay.saturating_sub(started.elapsed()) + Duration::from_millis(20)).await;
+        fixture.fail_issuance.store(false, Ordering::SeqCst);
+        *fixture.expires_at.lock() = Utc::now() + TimeDelta::minutes(5);
+        relay.prepare("recovered", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn authority_rejection_never_replays_and_stale_rejection_cannot_evict_new_grant() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+        let body = r#"{"error":"agent_auth_v2_authority_invalid"}"#;
+        *fixture.rejection.lock() = Some((body.into(), false));
+        let gate = Arc::new(Semaphore::new(0));
+        *fixture.response_gate.lock() = Some(gate.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let route = relay.prepare("rejected", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        let http = reqwest::Client::new();
+        let mut requests = tokio::task::JoinSet::new();
+        for input in ["first", "stale"] {
+            let request = http.post(format!("{}/v1/responses", route.base_url)).bearer_auth(&route.token)
+                .json(&json!({ "input": input }));
+            requests.spawn(async move { request.send().await.unwrap() });
+        }
+        for _ in 0..2 {
+            assert_eq!(rx.recv().await.unwrap().authorization, "Bearer remote-agent-auth-authority-1");
+        }
+        gate.add_permits(1);
+        let rejected = requests.join_next().await.unwrap().unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(rejected.headers()["x-fixture-error"], "preserved");
+        assert_eq!(rejected.text().await.unwrap(), body);
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 2);
+        relay.prepare("independent", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        gate.add_permits(1);
+        assert_eq!(requests.join_next().await.unwrap().unwrap().text().await.unwrap(), body);
+        relay.prepare("after-stale", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_and_unrecognized_401_responses_never_invalidate_authority() {
+        for (body, selected_account) in [
+            (r#"{"error":"agent_auth_v2_authority_invalid"}"#.to_string(), true),
+            (r#"{"error":"provider_credentials_invalid"}"#.to_string(), false),
+            ("not-json".to_string(), false),
+            (format!(r#"{{"error":"agent_auth_v2_authority_invalid","padding":"{}"}}"#, "x".repeat(4096)), false),
+        ] {
+            let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+            *fixture.rejection.lock() = Some((body.clone(), selected_account));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+            let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+            let route = relay.prepare("provider-error", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            let response = reqwest::Client::new().post(format!("{}/v1/responses", route.base_url))
+                .bearer_auth(&route.token).json(&json!({ "input": "once" })).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()["x-fixture-error"], "preserved");
+            assert_eq!(response.text().await.unwrap(), body);
+            relay.prepare("after-provider-error", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_401_preserves_prefix_tail_and_authority() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let tail = Arc::new(Semaphore::new(0));
+        let (origin, mut connections, shutdown, server) =
+            streaming_control_plane_with_status(tx, StatusCode::UNAUTHORIZED, Some(tail.clone())).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let prepared = relay.prepare("stalled", HarnessId::Codex, None, None).await.unwrap().unwrap();
+        let lease = relay.inner.authority.lock().await.lease.clone().unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), reqwest::Client::new()
+            .post(format!("{}/v1/responses", prepared.base_url)).bearer_auth(&prepared.token)
+            .json(&json!({ "input": "once" })).send()).await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["x-fixture-error"], "preserved");
+        assert_eq!(rx.recv().await.unwrap().body["input"], "once");
+        let mut body = response.bytes_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), Bytes::from_static(b"data: first\n\n"));
+        tail.add_permits(1);
+        assert_eq!(body.next().await.unwrap().unwrap(), Bytes::from_static(b"data: tail\n\n"));
+        assert!(body.next().await.is_none());
+        let current = relay.inner.authority.lock().await.lease.clone().unwrap();
+        assert!(Arc::ptr_eq(&lease, &current));
+        assert!(rx.try_recv().is_err());
+        relay.remove(&prepared.token);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        while let Ok(result) = connections.try_recv() { result.unwrap(); }
     }
 
     #[derive(Debug)]
@@ -139,18 +469,24 @@ mod tests {
     }
 
     async fn test_control_plane(captured: mpsc::UnboundedSender<CapturedRequest>) -> String {
+        test_control_plane_with_authority(captured, AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5))).await
+    }
+
+    async fn test_control_plane_with_authority(
+        captured: mpsc::UnboundedSender<CapturedRequest>,
+        fixture: Arc<AuthorityFixture>,
+    ) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let next_authority = Arc::new(AtomicU64::new(0));
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let captured = captured.clone();
-                let next_authority = next_authority.clone();
+                let fixture = fixture.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request: Request<Incoming>| {
                         let captured = captured.clone();
-                        let next_authority = next_authority.clone();
+                        let fixture = fixture.clone();
                         async move {
                             let path = request.uri().path().to_string();
                             let path_and_query = request
@@ -162,19 +498,30 @@ mod tests {
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
                             let response = match path.as_str() {
                                 "/api/agent-auth/v2/authority" => {
-                                    let authority_id =
-                                        next_authority.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let authority_id = fixture.issued.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let gate = fixture.issuance_gate.lock().clone();
+                                    if let Some(gate) = gate {
+                                        gate.acquire().await.unwrap().forget();
+                                    }
+                                    if fixture.fail_issuance.load(Ordering::SeqCst) {
+                                        return Ok::<_, Infallible>(Response::builder()
+                                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                                            .header("retry-after", "1")
+                                            .body(Full::new(Bytes::from_static(br#"{"error":"temporarily_unavailable"}"#)))
+                                            .unwrap());
+                                    }
                                     json!({
                                         "contractVersion": 2,
                                         "token": format!("remote-agent-auth-authority-{authority_id}"),
                                         "tokenType": "Bearer",
                                         "authorityId": format!("authority-{authority_id}"),
-                                        "principalId": "identity:owner-1",
-                                        "authorityScope": "user:identity:owner-1",
-                                        "expiresAt": (Utc::now() + TimeDelta::minutes(5)).to_rfc3339(),
+                                        "principalId": fixture.principal.lock().clone(),
+                                        "authorityScope": fixture.scope.lock().clone(),
+                                        "expiresAt": fixture.expires_at.lock().to_rfc3339(),
                                     })
                                 }
                                 "/api/agent-auth/v2/responses" | "/api/agent-auth/v2/messages" => {
+                                    fixture.forwarded.fetch_add(1, Ordering::SeqCst);
                                     captured
                                         .send(CapturedRequest {
                                             path: path_and_query,
@@ -202,6 +549,19 @@ mod tests {
                                             body: serde_json::from_slice(&bytes).unwrap(),
                                         })
                                         .unwrap();
+                                    let rejection = fixture.rejection.lock().clone();
+                                    let gate = fixture.response_gate.lock().clone();
+                                    if let Some(gate) = gate {
+                                        gate.acquire().await.unwrap().forget();
+                                    }
+                                    if let Some((body, selected_account)) = rejection {
+                                        let mut response = Response::builder().status(StatusCode::UNAUTHORIZED)
+                                            .header("x-fixture-error", "preserved");
+                                        if selected_account {
+                                            response = response.header("x-agent-auth-selected-account-id", "account-actual");
+                                        }
+                                        return Ok::<_, Infallible>(response.body(Full::new(Bytes::from(body))).unwrap());
+                                    }
                                     json!({ "ok": true })
                                 }
                                 other => panic!("unexpected control-plane path {other}"),
@@ -284,6 +644,14 @@ mod tests {
 
     async fn streaming_control_plane(captured: mpsc::UnboundedSender<CapturedRequest>)
         -> (String, mpsc::UnboundedReceiver<Result<(), hyper::Error>>, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        streaming_control_plane_with_status(captured, StatusCode::OK, None).await
+    }
+
+    async fn streaming_control_plane_with_status(
+        captured: mpsc::UnboundedSender<CapturedRequest>,
+        status: StatusCode,
+        tail_gate: Option<Arc<Semaphore>>,
+    ) -> (String, mpsc::UnboundedReceiver<Result<(), hyper::Error>>, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let (connections, streaming_connections) = mpsc::unbounded_channel::<Result<(), hyper::Error>>();
@@ -302,12 +670,14 @@ mod tests {
                     accepted = listener.accept() => accepted.unwrap().0,
                 };
                 let captured = captured.clone();
+                let tail_gate = tail_gate.clone();
                 tasks.spawn(async move {
                     let streaming = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let serving_stream = streaming.clone();
                     let service = service_fn(move |request: Request<Incoming>| {
                         let captured = captured.clone();
                         let streaming = serving_stream.clone();
+                        let tail_gate = tail_gate.clone();
                         async move {
                             let path = request.uri().path().to_string();
                             let headers = request.headers().clone();
@@ -339,10 +709,16 @@ mod tests {
                                         b"data: first\n\n",
                                     )))
                                 })
-                                .chain(futures::stream::pending());
-                                return Ok::<_, Infallible>(Response::new(BodyExt::boxed(
-                                    StreamBody::new(body),
-                                )));
+                                .chain(futures::stream::once(async move {
+                                    match tail_gate {
+                                        Some(gate) => { gate.acquire().await.unwrap().forget(); }
+                                        None => futures::future::pending::<()>().await,
+                                    }
+                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"data: tail\n\n")))
+                                }));
+                                return Ok::<_, Infallible>(Response::builder().status(status)
+                                    .header("x-fixture-error", "preserved")
+                                    .body(BodyExt::boxed(StreamBody::new(body))).unwrap());
                             }
                             assert_eq!(path, "/api/agent-auth/v2/authority");
                             let authority = json!({
@@ -445,19 +821,13 @@ mod tests {
         let prepared = relay.prepare("session-owner", HarnessId::Codex, Some("gpt-5.6-sol"), None)
             .await.unwrap().unwrap();
         let route = lock(&relay.inner.route_state).active.get(&prepared.token).unwrap().clone();
-        let mut state = route.authority.lock().await;
-        state.expires_at = Utc::now() - TimeDelta::seconds(1);
-        drop(state);
         let changed_owner = Route {
             request: route.request.clone(),
             admission: None,
             local_session_id: None,
             owner_subject: "identity:someone-else".into(),
             cancellation: zeron_harness::CancellationToken::new(),
-            authority: AsyncMutex::new(AuthorityState {
-                authority: route.authority.lock().await.authority.clone(),
-                expires_at: Utc::now() - TimeDelta::seconds(1),
-            }),
+            authority_scope: route.authority_scope.clone(),
         };
         assert!(relay.current_authority(&changed_owner).await.is_err());
         assert!(changed_owner.cancellation.is_cancelled());
@@ -745,6 +1115,7 @@ mod tests {
                     run_bound: false,
                     local_session_id: None,
                     owner_subject: "identity:owner-1".into(),
+                    authority_scope: Some("user:identity:owner-1".into()),
                     provider: "anthropic".into(),
                     retired_at: Instant::now() - Duration::from_secs(1),
                 },
@@ -775,7 +1146,7 @@ mod tests {
         let captured = captured_rx.recv().await.unwrap();
         assert_eq!(
             captured.authorization,
-            "Bearer remote-agent-auth-authority-2"
+            "Bearer remote-agent-auth-authority-1"
         );
         assert_eq!(captured.conversation_id, "persistent-session");
 

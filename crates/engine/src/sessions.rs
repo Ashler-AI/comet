@@ -296,7 +296,7 @@ struct Inner {
     crew: OnceLock<crate::crew::CrewServices>,
     imported_native_histories: Mutex<std::collections::BTreeMap<String, std::path::PathBuf>>,
     imported_recovery: OnceLock<Vec<zeron_sync::crew_import::ImportedRecoveryIntent>>,
-    original_epoch_histories: OnceLock<std::collections::BTreeMap<String, zeron_proto::OriginalEpochHistory>>,
+    original_epoch_histories: OnceLock<zeron_sync::crew_import::OriginalEpochHistories>,
     original_epoch_archives: OnceLock<Vec<std::path::PathBuf>>,
     original_epoch_binding: Mutex<()>,
     native_branches: OnceLock<std::path::PathBuf>,
@@ -436,7 +436,7 @@ impl SessionsEngine {
         let mut original_archives = Vec::new();
         for (native, archive) in &histories {
             if self.inner.original_epoch_histories.get().is_some_and(|histories|
-                histories.values().any(|history| history.native_session_id.as_deref() == Some(native.as_str()))) {
+                histories.histories.values().any(|history| history.native_session_id.as_deref() == Some(native.as_str()))) {
                 original_archives.push(archive.canonicalize()?);
             }
         }
@@ -461,7 +461,13 @@ impl SessionsEngine {
         Ok(())
     }
     pub(crate) fn original_epoch_history(&self, chat_id: &str) -> Option<&zeron_proto::OriginalEpochHistory> {
-        self.inner.original_epoch_histories.get()?.get(chat_id)
+        self.inner.original_epoch_histories.get()?.histories.get(chat_id)
+    }
+
+    /// Historical processed claims are provenance, not an interrupted local execution.
+    pub(crate) fn is_original_epoch_command(&self, command_id: &str) -> bool {
+        self.inner.original_epoch_histories.get()
+            .is_some_and(|history| history.command_ids.contains(command_id))
     }
 
     pub(crate) fn reset_original_epoch_native_association(&self, chat_id: &str) {
@@ -474,7 +480,7 @@ impl SessionsEngine {
     pub(crate) fn ensure_execution_allowed(&self, chat_id: &str, resume: Option<&str>) -> Result<(), EngineError> {
         let denied = || EngineError::Other("Original execution epoch is read-only history; explicitly start a verified new epoch before running. Its original native identity cannot be resumed or forked.".into());
         if let Some(selector) = resume
-            && let Some(histories) = self.inner.original_epoch_histories.get().filter(|histories| !histories.is_empty())
+            && let Some(histories) = self.inner.original_epoch_histories.get().filter(|loaded| !loaded.histories.is_empty())
         {
             let selected = std::path::Path::new(selector);
             let resolved = selected.is_absolute().then(|| selected.canonicalize().ok()).flatten();
@@ -483,7 +489,7 @@ impl SessionsEngine {
                 return Err(denied());
             }
             // ponytail: scan the bounded import map; index selectors if profiles grow large.
-            for native in histories.values().filter_map(|history| history.native_session_id.as_deref()) {
+            for native in histories.histories.values().filter_map(|history| history.native_session_id.as_deref()) {
                 if selector == native { return Err(denied()); }
                 if selected.is_absolute() {
                     let launch = self.native_launch_selector(native);
@@ -5345,6 +5351,105 @@ mod tests {
         assert_eq!(handle.doc().read_commands().unwrap().len(), 1);
     }
 
+    fn persist_original_epoch_fixture(
+        store: &zeron_sync::DocsStore,
+        id: &str,
+        outcomes: &std::collections::BTreeMap<String, String>,
+    ) -> zeron_proto::OriginalEpochHistory {
+        use sha2::Digest as _;
+        let principal = zeron_proto::CollaborationPrincipal {
+            subject: "owner".into(), email: None, project_id: "project".into(),
+            deployment_id: Some("staging".into()), session_id: Some(id.into()),
+            capabilities: vec![], unknown: Default::default(),
+        };
+        let proof = serde_json::json!({
+            "version":1, "kind":"terminal-original-epoch", "migrationId":"migration",
+            "sourceSha256":"a".repeat(64), "coordinatorLifecycleEpoch":2,
+            "nativeSessionId":"original-native",
+            "commandOutcomesSha256":format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(outcomes).unwrap())),
+            "scope":{"ownerSubject":"owner", "projectId":"project", "deploymentId":"staging",
+                "logicalSessionId":id, "sandboxId":"sandbox", "deviceId":"comet-scaffold-sandbox", "lifecycleEpoch":1},
+            "terminal":{"status":"stopped", "providerAction":"kill", "terminationReason":"provider_missing",
+                "terminatedAt":"2026-10-21T01:00:00Z", "providerNotFoundObservedAt":"2026-10-21T01:00:01Z",
+                "physicalSandboxId":"sandbox", "retainedSnapshotIds":[]},
+        });
+        let proof_json = serde_json::to_string(&proof).unwrap();
+        let history = zeron_sync::crew_import::validate_original_epoch_bootstrap(
+            proof_json.as_bytes(), outcomes, &principal,
+        ).unwrap();
+        let key = format!("original-epoch-bootstrap:{id}:{}", history.lifecycle_epoch);
+        let request = serde_json::to_vec(&serde_json::json!({
+            "proofJson":proof_json, "commandOutcomes":outcomes, "principal":principal,
+        })).unwrap();
+        store.claim_crew_command(&key, &request).unwrap();
+        for id in outcomes.keys() { store.mark_processed(id).unwrap(); }
+        store.finish_crew_command(&key, &serde_json::to_vec(&history).unwrap()).unwrap();
+        history
+    }
+
+    #[tokio::test]
+    async fn original_pending_commands_survive_sweep_and_retry_before_terminal_sync() {
+        use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+        for retry_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let id = "11111111-1111-4111-8111-111111111111";
+            let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+            let history = persist_original_epoch_fixture(&store, id,
+                &std::collections::BTreeMap::from([("historical".into(), "rejected".into())]));
+            let sessions = SessionsEngine::new("host".into(),
+                Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+                Arc::new(HarnessRegistry::new()));
+            // Reload verified persisted evidence, not a synced marker or injected runtime map.
+            sessions.load_crew_import(dir.path()).unwrap();
+            assert_eq!(sessions.original_epoch_history(id), Some(&history));
+            let host = DocHost::new(store.clone(), crate::DocHostConfig {
+                device_id: "host".into(), default_harness: HarnessId::Omp, edge: None,
+            });
+            sessions.set_doc_host(host.clone());
+            host.set_sessions(sessions.clone());
+            let handle = host.open(id).unwrap();
+            let original = SessionCommandEntry {
+                id: "historical".into(), issued_by: "comet-scaffold-sandbox".into(), issued_at: now_ms(),
+                payload: SessionCommandPayload::Run { request: request(), message_id: "old-message".into() },
+                based_on: None, expires_at: None, status: SessionCommandStatus::Pending, resolution: None,
+            };
+            handle.doc().queue_command(&original).unwrap();
+            if retry_first { host.retry_delivery(id).unwrap(); }
+            host.drain_commands(&handle).await;
+            host.retry_delivery(id).unwrap();
+            let commands = handle.doc().read_commands().unwrap();
+            assert_eq!(commands.len(), 1, "history must never mint a retry attempt");
+            assert_eq!(commands[0].status, SessionCommandStatus::Pending);
+            assert!(commands[0].resolution.is_none());
+            assert!(handle.doc().read_entries().unwrap().is_empty());
+            // The source terminal outcome can arrive later; no local crash outcome replaces it.
+            handle.doc().set_command_status("historical", SessionCommandStatus::Rejected, Some("source outcome")).unwrap();
+            host.retry_delivery(id).unwrap();
+            host.drain_commands(&handle).await;
+            let commands = handle.doc().read_commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].status, SessionCommandStatus::Rejected);
+            assert_eq!(commands[0].resolution.as_deref(), Some("source outcome"));
+
+            // A current command in the same bootstrapped chat still gets ordinary crash recovery.
+            let mut current = original;
+            current.id = "current-crash".into();
+            current.payload = SessionCommandPayload::Run { request: request(), message_id: "current-message".into() };
+            store.mark_processed(&current.id).unwrap();
+            handle.doc().queue_command(&current).unwrap();
+            if !retry_first { host.drain_commands(&handle).await; }
+            host.retry_delivery(id).unwrap();
+            let commands = handle.doc().read_commands().unwrap();
+            assert_eq!(commands.len(), 3, "only the current crash may mint a retry");
+            let crashed = commands.iter().find(|c| c.id == "current-crash").unwrap();
+            assert_eq!(crashed.status, SessionCommandStatus::Rejected);
+            assert!(crashed.resolution.as_deref().unwrap().contains("interrupted before completion"));
+            assert!(commands.iter().any(|c| c.id != "historical" && c.id != "current-crash"
+                && matches!(&c.payload, SessionCommandPayload::Run { message_id, .. } if message_id == "current-message")));
+            sessions.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn original_epoch_requires_trusted_start_and_never_reuses_old_native_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -5355,11 +5460,7 @@ mod tests {
         }).unwrap();
         let id = "11111111-1111-4111-8111-111111111111";
         workspace.create_chat(id, None, Some("importer"), None, Some("/original/repo".into())).unwrap();
-        let history = zeron_proto::OriginalEpochHistory {
-            sandbox_id: "sandbox".into(), lifecycle_epoch: 1, coordinator_lifecycle_epoch: 2, source_device_id: "comet-scaffold-sandbox".into(),
-            original_status: "stopped".into(), native_session_id: Some("original-native".into()),
-            source_evidence_sha256: "a".repeat(64),
-        };
+        let history = persist_original_epoch_fixture(&store, id, &Default::default());
         let mut chat = workspace.chat(id).unwrap().unwrap();
         chat.harness_session_id = history.native_session_id.clone();
         chat.harness_session_cwd = Some("/original/repo".into());
@@ -5374,7 +5475,9 @@ mod tests {
         registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(events)), steering: None }));
         let sessions = SessionsEngine::new("importer".into(),
             Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry));
-        sessions.inner.original_epoch_histories.set(std::collections::BTreeMap::from([(id.into(), history.clone())])).unwrap();
+        sessions.inner.original_epoch_histories.set(
+            zeron_sync::crew_import::imported_original_epoch_histories(dir.path()).unwrap(),
+        ).unwrap();
         let host = DocHost::new(store.clone(), crate::DocHostConfig {
             device_id: "importer".into(), default_harness: HarnessId::Omp, edge: None,
         });

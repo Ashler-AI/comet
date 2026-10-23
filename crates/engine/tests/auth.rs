@@ -374,7 +374,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     assert!(
         matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1")
     );
-    assert!(auth.token().await.is_ok());
+    assert_eq!(auth.token().await.unwrap().value, auth.access_token().await.unwrap());
     assert_eq!(
         edge.state
             .refresh_tokens
@@ -632,6 +632,83 @@ async fn explicit_retry_allows_one_shared_attempt_before_cooldown_expires() {
     auth.retry_refresh();
     assert!(twenty_consumers(&auth).await.iter().all(Result::is_ok));
     assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rejected_workos_generation_refreshes_once_and_stale_rejection_is_ignored() {
+    let edge = StubEdge::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    let first = auth.token().await.unwrap();
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 1);
+    let changes = auth.subscribe().unwrap();
+    auth.invalidate(first.generation);
+    assert_ne!(*changes.borrow(), first.generation, "invalidate fences the rejected lease synchronously");
+    for _ in 0..20 { auth.invalidate(first.generation); }
+    assert!(twenty_consumers(&auth).await.iter().all(Result::is_ok));
+    let fresh = auth.token().await.unwrap();
+    assert_ne!(fresh.generation, first.generation);
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+    auth.invalidate(first.generation);
+    assert_eq!(auth.token().await.unwrap(), fresh);
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+    auth.sign_out();
+    auth.invalidate(fresh.generation);
+    assert!(matches!(auth.token().await, Err(TokenError::SignedOut)));
+    assert!(!dir.path().join("session.json").exists());
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rejected_access_lease_preserves_an_in_flight_workos_rotation() {
+    let edge = StubEdge::start().await;
+    // Mint an immediately refreshable lease without timing-dependent sleeps.
+    edge.state.token_ttl.store(20, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    let old = auth.token().await.unwrap();
+    edge.state.token_ttl.store(3600, Ordering::SeqCst);
+    edge.state.block_refresh.store(true, Ordering::SeqCst);
+    let pending = tokio::spawn({
+        let auth = auth.clone();
+        async move { auth.token().await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        edge.state.refresh_started.notified(),
+    )
+    .await
+    .expect("rotation started");
+
+    let changes = auth.subscribe().unwrap();
+    auth.invalidate(old.generation);
+    assert_ne!(*changes.borrow(), old.generation, "rejected lease is fenced immediately");
+    edge.state.block_refresh.store(false, Ordering::SeqCst);
+    edge.state.release_refresh.notify_one();
+    let fresh = pending.await.unwrap().expect("rotation survives access rejection");
+    assert_ne!(fresh.generation, old.generation);
+    assert_ne!(fresh.value, old.value);
+    let session_file = dir.path().join("session.json");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&session_file).unwrap()).unwrap();
+    assert_eq!(stored["refreshToken"], "rotated-2");
+
+    auth.invalidate(old.generation);
+    assert_eq!(auth.token().await.unwrap(), fresh);
+    assert_eq!(*changes.borrow(), fresh.generation);
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+    let stored_after_rejection: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&session_file).unwrap()).unwrap();
+    assert_eq!(stored_after_rejection, stored, "stale feedback cannot erase the rotation");
+
+    // The next real refresh must use the replacement secret, never consumed R.
+    auth.invalidate(fresh.generation);
+    assert!(auth.token().await.is_ok());
+    assert_eq!(
+        edge.state.refresh_tokens.lock().unwrap().as_slice(),
+        ["offline", "rotated-1", "rotated-2"]
+    );
+    assert!(auth.state().is_signed_in());
 }
 
 #[tokio::test]

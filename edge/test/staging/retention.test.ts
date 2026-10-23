@@ -317,12 +317,22 @@ it("admits the published v1 authority profile for archive-v2 native grant issuan
   await mf.setOptions(scaffold);
   const request = { deploymentId: nativeScope, sandboxId: "sandbox", targetDeviceId: "sandbox-device", sessionId: randomUUID(), lifecycleEpoch: 1, capabilities: nativeCapabilities };
   const auth = { authorization: "Bearer sc_rc_synthetic" };
+  const verificationName = `scaffold-verification:${createHash("sha256").update(JSON.stringify([
+    "sc_rc_synthetic", "https://authority.invalid", nativeScope,
+    [...nativeCapabilities].sort(), "local", nativeScope
+  ])).digest("base64url")}`;
+  const nativeGrants = await mf.getDurableObjectNamespace("NATIVE_AUTH_GRANTS");
   for (const version of ["scaffold.comet-runtime.v2", "unsupported-runtime"]) {
     authorityVersion = version;
     const rejected = await http("/auth/device-grants", { ...post(request), headers: auth });
     expect(rejected.status).toBe(403);
     expect(await rejected.json()).toEqual({ error: "grant_target_forbidden" });
-    expect(await mf.listDurableObjectIds("NativeAuthGrant")).toEqual([]);
+    // Authentication may create only its storage-free coordinator, never a device grant or epoch fence.
+    expect((await mf.listDurableObjectIds("NativeAuthGrant")).map(id => id.toString())).toEqual([
+      nativeGrants.idFromName(verificationName).toString()
+    ]);
+    const coordinator = nativeGrants.get(nativeGrants.idFromName(verificationName));
+    expect((await coordinator.fetch("https://grant.internal/authenticate", post({ secret: nativeSecret }))).status).toBe(401);
   }
   authorityVersion = "scaffold.comet-runtime.v1";
   const accepted = await http("/auth/device-grants", { ...post(request), headers: auth });

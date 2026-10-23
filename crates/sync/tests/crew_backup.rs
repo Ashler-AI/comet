@@ -961,10 +961,10 @@ fn coordinator_original_epoch_authority_exports_and_verifies_inert_history_witho
     assert_eq!(selected.command_outcomes, expected_outcomes);
     assert_eq!(selected.native_session_ids[CHAT], "native-retained");
     assert!(selected.native_histories.is_empty());
-    assert_eq!(
-        imported_original_epoch_histories(&destination).unwrap(),
-        manifest.original_epoch_histories
-    );
+    let history = imported_original_epoch_histories(&destination).unwrap();
+    assert_eq!(history.histories, manifest.original_epoch_histories);
+    assert_eq!(history.command_ids, expected_outcomes.keys().cloned().collect());
+    assert!(!history.command_ids.contains("unbound-historical-claim"));
     let proof_json = imported_original_epoch_proof_json(&destination, &selected)
         .unwrap()
         .unwrap();
@@ -990,6 +990,23 @@ fn coordinator_original_epoch_authority_exports_and_verifies_inert_history_witho
             1
         );
     }
+    // Runtime provenance must come from exact retained outcomes, not editable report markers.
+    let retained: Vec<u8> = db.query_row(
+        "SELECT value FROM legacy_crew_records WHERE doc_id=?1 AND container='commands' AND record_id='original-pending'",
+        [CHAT], |row| row.get(0),
+    ).unwrap();
+    let mut tampered: serde_json::Value = serde_json::from_slice(&retained).unwrap();
+    tampered["status"] = json!("rejected");
+    db.execute("UPDATE legacy_crew_records SET value=?1 WHERE doc_id=?2 AND container='commands' AND record_id='original-pending'",
+        rusqlite::params![serde_json::to_vec(&tampered).unwrap(), CHAT]).unwrap();
+    assert!(imported_original_epoch_histories(&destination).is_err());
+    db.execute("DELETE FROM legacy_crew_records WHERE doc_id=?1 AND container='commands' AND record_id='original-pending'", [CHAT]).unwrap();
+    assert!(imported_original_epoch_histories(&destination).is_err());
+    db.execute("INSERT INTO legacy_crew_records(doc_id,container,record_id,value) VALUES (?1,'commands','original-pending',?2)",
+        rusqlite::params![CHAT, retained]).unwrap();
+    assert!(imported_original_epoch_histories(&destination).is_ok());
+    db.execute("DELETE FROM processed_commands WHERE command_id='original-pending'", []).unwrap();
+    assert!(imported_original_epoch_histories(&destination).is_err());
 }
 
 #[test]

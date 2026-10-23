@@ -31,11 +31,13 @@ pub(crate) async fn post_checkpoint(
     let bearer = edge.bearer().await.map_err(|e| e.to_string())?;
     let _permit = zeron_sync::budget::shared().http(zeron_sync::budget::Priority::Background)
         .await.map_err(|e| e.to_string())?;
-    let response = http.post(format!("{}/chat2/{chat_id}/checkpoint?seqCovered={seq_covered}", edge.url.trim_end_matches('/')))
-        .timeout(std::time::Duration::from_secs(300))
-        .bearer_auth(bearer)
-        .header("x-chat2-frontier", base64::engine::general_purpose::STANDARD.encode(frontier))
-        .body(snapshot).send().await.map_err(describe_http_error)?;
+    let response = edge.send(
+        http.post(format!("{}/chat2/{chat_id}/checkpoint?seqCovered={seq_covered}", edge.url.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(300))
+            .header("x-chat2-frontier", base64::engine::general_purpose::STANDARD.encode(frontier))
+            .body(snapshot),
+        &bearer,
+    ).await.map_err(describe_http_error)?;
     if !response.status().is_success() { return Err(format!("checkpoint HTTP {}", response.status())); }
     Ok(())
 }
@@ -298,12 +300,11 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                 let bearer = edge.bearer().await.map_err(SyncError::from)?;
                 let mut req = http
                     .get(&url)
-                    .bearer_auth(&bearer)
                     .timeout(std::time::Duration::from_secs(300));
                 if !got.is_empty() {
                     req = req.header("range", format!("bytes={}-", got.len()));
                 }
-                let res = match req.send().await {
+                let res = match edge.send(req, &bearer).await {
                     Ok(res) => res,
                     Err(err) => {
                         let err = describe_http_error(err);
@@ -424,11 +425,12 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         Box::pin(async move {
             let _permit = zeron_sync::budget::shared().http(priority).await?;
             let bearer = edge.bearer().await.map_err(SyncError::from)?;
-            let res = http
-                .get(&url)
-                .query(&[("after", after.to_string()), ("device", device)])
-                .bearer_auth(&bearer)
-                .send()
+            let res = edge
+                .send(
+                    http.get(&url)
+                        .query(&[("after", after.to_string()), ("device", device)]),
+                    &bearer,
+                )
                 .await
                 .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {
@@ -462,13 +464,12 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
             let mut request = http
                 .post(&url)
                 .query(&[("batchId", batch_id), ("device", device)])
-                .bearer_auth(&bearer)
                 .body(bytes);
             if let Some(host) = host {
                 request = request.query(&[("hostDevice", host)]);
             }
-            let res = request
-                .send()
+            let res = edge
+                .send(request, &bearer)
                 .await
                 .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {

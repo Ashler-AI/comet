@@ -102,13 +102,12 @@ async fn deliver(weak: std::sync::Weak<DocHostInner>, chat: &str) {
         let sent = async {
             let bearer = edge.bearer().await?;
             let url = format!("{}/device/{target}/nudge", edge.url.trim_end_matches('/'));
-            host.inner
-                .http
-                .post(url)
-                .bearer_auth(bearer)
-                .json(&serde_json::json!({ "chatId": chat }))
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
+            edge.send(
+                host.inner.http.post(url)
+                    .json(&serde_json::json!({ "chatId": chat }))
+                    .timeout(std::time::Duration::from_secs(10)),
+                &bearer,
+            )
                 .await
                 .map_err(|err| EngineError::Other(describe_http_error(err)))
         }
@@ -182,7 +181,7 @@ mod tests {
             .url()
             .await
             .unwrap();
-        let url = reqwest::Url::parse(&url).unwrap();
+        let url = reqwest::Url::parse(&url.url).unwrap();
         assert!(
             url.query_pairs()
                 .any(|(key, value)| key == "hostDevice" && value == "remote-host")

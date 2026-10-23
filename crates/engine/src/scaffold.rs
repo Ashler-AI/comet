@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeron_harness::CancellationToken;
 use zeron_proto::{
-    AgentRoute, AgentRouteReceipt, CAPABILITY_SESSION_ANNOTATE,
+    AccessToken, AgentRoute, AgentRouteReceipt, CAPABILITY_SESSION_ANNOTATE,
     CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL, CAPABILITY_SESSION_ENVIRONMENT,
     CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ, CollaborationScope, ScaffoldControlGrant,
     ScaffoldDatabaseEnvironment, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
@@ -119,6 +119,7 @@ pub struct ScaffoldApiError {
     pub status: u16,
     pub code: String,
     pub message: Option<String>,
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +269,16 @@ impl ScaffoldError {
         )
     }
 
+    pub(crate) fn retry_after(&self) -> Option<Duration> {
+        self.api_error().and_then(|error| error.retry_after)
+    }
+
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Self::Transport { .. } | Self::AuthTemporarilyUnavailable(_))
+            // Match the existing control-plane retry contract for temporary 5xx.
+            || self.api_error().is_some_and(|error| matches!(error.status, 429 | 500 | 502 | 503 | 504))
+    }
+
     fn is_runtime_starting(&self) -> bool {
         self.api_error()
             .is_some_and(|error| error.status == 503 && error.code == "sandbox_runtime_starting")
@@ -281,12 +292,51 @@ impl ScaffoldError {
     }
 }
 
-async fn control_bearer(source: &dyn TokenSource) -> Result<String, ScaffoldError> {
+async fn control_credential(source: &dyn TokenSource) -> Result<AccessToken, ScaffoldError> {
     match source.token().await {
-        Ok(token) if !token.trim().is_empty() => Ok(token),
+        Ok(token) if !token.value.trim().is_empty() => Ok(token),
         Ok(_) | Err(zeron_rpc::TokenError::SignedOut) => Err(ScaffoldError::AuthUnavailable),
         Err(zeron_rpc::TokenError::TemporarilyUnavailable(reason)) => Err(ScaffoldError::AuthTemporarilyUnavailable(reason)),
     }
+}
+
+/// Invalidate only the credential sent, before decoding a rejected response.
+async fn send_authenticated(
+    source: &dyn TokenSource,
+    request: reqwest::RequestBuilder,
+    cancellation: &CancellationToken,
+) -> Result<(reqwest::Response, u64), ScaffoldError> {
+    let credential = control_credential(source).await?;
+    let generation = credential.generation;
+    let send = request.bearer_auth(&credential.value).send();
+    drop(credential);
+    tokio::pin!(send);
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+        response = &mut send => response.map_err(|error| {
+            let error = ScaffoldError::request_send_failure(error);
+            tracing::warn!(
+                transport_cause = %error.transport_cause().expect("transport error"),
+                "Scaffold request send failed"
+            );
+            error
+        })?,
+    };
+    if response.status() == StatusCode::UNAUTHORIZED {
+        source.invalidate(generation);
+    }
+    Ok((response, generation))
+}
+
+fn authenticated_error(source: &dyn TokenSource, generation: u64, error: ScaffoldError) -> ScaffoldError {
+    // Resource-level 403s and temporary 503 validation failures do not revoke credentials.
+    if error.api_error().is_some_and(|error| error.status == 403 && matches!(error.code.as_str(),
+        "remote_code_token_forbidden" | "crew_device_authority_unavailable" | "crew_device_scope_denied"
+    )) {
+        source.invalidate(generation);
+    }
+    error
 }
 
 #[derive(Clone)]
@@ -431,8 +481,8 @@ impl ScaffoldClient {
         &self.project_scope
     }
 
-    pub(crate) async fn require_auth(&self) -> Result<(), ScaffoldError> {
-        control_bearer(self.bearer.as_ref()).await.map(|_| ())
+    pub(crate) async fn credential(&self) -> Result<AccessToken, ScaffoldError> {
+        control_credential(self.bearer.as_ref()).await
     }
 
     pub async fn search_crew_sessions(&self, input: &Value) -> Result<Value, ScaffoldError> {
@@ -455,14 +505,15 @@ impl ScaffoldClient {
         if body.len() > 60 * 1024 {
             return Err(ScaffoldError::InvalidResponse("directory request exceeds 60 KiB".into()));
         }
-        let bearer = control_bearer(self.bearer.as_ref()).await?;
-        let response = self.http.post(self.origin.join(&format!("/api/crew-directory/{operation}")).expect("directory API path"))
-            .bearer_auth(bearer).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send().await?;
-        Self::bounded_json(response).await
+        let request = self.http.post(self.origin.join(&format!("/api/crew-directory/{operation}")).expect("directory API path"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json").body(body);
+        let (response, generation) = send_authenticated(self.bearer.as_ref(), request, &CancellationToken::new()).await?;
+        self.bounded_json(response, generation).await
     }
 
-    async fn bounded_json(mut response: reqwest::Response) -> Result<Value, ScaffoldError> {
+    async fn bounded_json(&self, mut response: reqwest::Response, generation: u64) -> Result<Value, ScaffoldError> {
         let status = response.status();
+        let retry_after = response_retry_after(&response);
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             if body.len() + chunk.len() > 128 * 1024 {
@@ -470,7 +521,9 @@ impl ScaffoldClient {
             }
             body.extend_from_slice(&chunk);
         }
-        if !status.is_success() { return Err(api_error(status, &body)); }
+        if !status.is_success() {
+            return Err(authenticated_error(self.bearer.as_ref(), generation, api_error(status, &body, retry_after)));
+        }
         serde_json::from_slice(&body).map_err(|_| ScaffoldError::InvalidResponse("invalid JSON response".into()))
     }
 
@@ -764,16 +817,46 @@ impl ScaffoldClient {
         &self, sandbox_id: &str, scope: &CollaborationScope, cancellation: &CancellationToken,
     ) -> Result<Option<OriginalEpochBootstrap>, ScaffoldError> {
         self.validate_scope(scope)?;
+        // ponytail: bounded bootstrap, not pagination; larger histories need a streaming import protocol.
+        const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+        const MAX_OUTCOMES: usize = 10_000;
+        let request = self.http.get(self.sandbox_url(sandbox_id, Some("original-epoch-history"))?)
+            .header(reqwest::header::ACCEPT, "application/json")
+            // Reqwest's total deadline covers headers and all decoded body chunks, not each chunk.
+            .timeout(REQUEST_TIMEOUT);
+        let (mut response, generation) = send_authenticated(self.bearer.as_ref(), request, cancellation).await?;
+        let status = response.status();
+        let retry_after = response_retry_after(&response);
+        // Content-Length is only an allocation hint; decoded bytes are authoritative.
+        let mut bytes = Vec::with_capacity(response.content_length().unwrap_or(0).min(8192) as usize);
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+                chunk = response.chunk() => chunk?,
+            };
+            let Some(chunk) = chunk else { break; };
+            if chunk.len() > MAX_BODY_BYTES - bytes.len() {
+                return Err(ScaffoldError::InvalidResponse("original epoch bootstrap response exceeds 4 MiB".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(authenticated_error(self.bearer.as_ref(), generation, api_error(status, &bytes, retry_after)));
+        }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Response { original_epoch_history: serde_json::Value }
-        let response: Response = self.request(
-            Method::GET, self.sandbox_url(sandbox_id, Some("original-epoch-history"))?,
-            None::<&serde_json::Value>, cancellation, None,
-        ).await?;
+        let response: Response = serde_json::from_slice(&bytes)
+            .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))?;
         if response.original_epoch_history.is_null() { return Ok(None); }
-        serde_json::from_value(response.original_epoch_history).map(Some)
-            .map_err(|_| ScaffoldError::InvalidResponse("invalid original epoch bootstrap evidence".into()))
+        let evidence: OriginalEpochBootstrap = serde_json::from_value(response.original_epoch_history)
+            .map_err(|_| ScaffoldError::InvalidResponse("invalid original epoch bootstrap evidence".into()))?;
+        // Reject the entire import before callers can persist a ledger or any command outcome.
+        if evidence.command_outcomes.len() > MAX_OUTCOMES {
+            return Err(ScaffoldError::InvalidResponse("original epoch bootstrap exceeds 10000 command outcomes".into()));
+        }
+        Ok(Some(evidence))
     }
 
     pub async fn pause(
@@ -1109,11 +1192,9 @@ impl ScaffoldClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize + ?Sized,
     {
-        let bearer = control_bearer(self.bearer.as_ref()).await?;
         let mut request = self
             .http
             .request(method, url)
-            .bearer_auth(&bearer)
             .header(reqwest::header::ACCEPT, "application/json");
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
@@ -1121,33 +1202,16 @@ impl ScaffoldClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let send = request.send();
-        tokio::pin!(send);
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-            response = &mut send => match response {
-                Ok(response) => response,
-                Err(error) => {
-                    let error = ScaffoldError::request_send_failure(error);
-                    tracing::warn!(
-                        transport_cause = %error.transport_cause().expect("transport error"),
-                        "Scaffold request send failed"
-                    );
-                    return Err(error);
-                }
-            },
-        };
-        // The bearer is dropped before any response body is retained or decoded.
-        drop(bearer);
+        let (response, generation) = send_authenticated(self.bearer.as_ref(), request, cancellation).await?;
         let status = response.status();
+        let retry_after = response_retry_after(&response);
         let bytes = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
             bytes = response.bytes() => bytes?,
         };
         if !status.is_success() {
-            return Err(api_error(status, &bytes));
+            return Err(authenticated_error(self.bearer.as_ref(), generation, api_error(status, &bytes, retry_after)));
         }
         serde_json::from_slice(&bytes)
             .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))
@@ -1538,7 +1602,16 @@ fn exact_origin(value: &str) -> Result<Url, ScaffoldError> {
     Ok(url)
 }
 
-fn api_error(status: StatusCode, body: &[u8]) -> ScaffoldError {
+fn response_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some((date.with_timezone(&chrono::Utc) - chrono::Utc::now()).to_std().unwrap_or_default())
+}
+
+fn api_error(status: StatusCode, body: &[u8], retry_after: Option<Duration>) -> ScaffoldError {
     #[derive(Deserialize)]
     struct Envelope {
         #[serde(default)]
@@ -1588,6 +1661,7 @@ fn api_error(status: StatusCode, body: &[u8]) -> ScaffoldError {
         status: status.as_u16(),
         code,
         message,
+        retry_after,
     }))
 }
 
@@ -2612,27 +2686,25 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             ttl_seconds: request.expires_in_seconds,
         };
 
-        let bearer = control_bearer(self.bearer.as_ref()).await?;
         let mut url = self.origin.clone();
         url.path_segments_mut()
             .expect("validated HTTP origin")
             .extend(JOIN_GRANT_PATH);
-        let send = self
+        let http_request = self
             .http
             .post(url)
-            .bearer_auth(&bearer)
             .header(reqwest::header::ACCEPT, "application/json")
-            .json(&body)
-            .send();
-        tokio::pin!(send);
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-            response = &mut send => response.map_err(|_| ScaffoldError::DeviceJoinGrantUnavailable)?,
-        };
-        drop(bearer);
+            .json(&body);
+        let (response, generation) = send_authenticated(self.bearer.as_ref(), http_request, cancellation).await.map_err(|error| {
+            if matches!(error, ScaffoldError::Transport { .. }) {
+                ScaffoldError::DeviceJoinGrantUnavailable
+            } else {
+                error
+            }
+        })?;
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = response_retry_after(&response);
             let mut response = response;
             let mut bytes = Vec::new();
             loop {
@@ -2670,13 +2742,14 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
                         })
                 })
                 .unwrap_or("device_join_grant_rejected");
-            return Err(ScaffoldError::Api(ScaffoldApiErrorDisplay(
-                ScaffoldApiError {
+            return Err(authenticated_error(self.bearer.as_ref(), generation,
+                ScaffoldError::Api(ScaffoldApiErrorDisplay(ScaffoldApiError {
                     status: status.as_u16(),
                     code: code.to_string(),
                     message: None,
-                },
-            )));
+                    retry_after,
+                })),
+            ));
         }
         let response: Response = response
             .json()
@@ -3415,6 +3488,136 @@ mod tests {
     use zeron_rpc::StaticToken;
     #[cfg(unix)]
     use sha2::Digest as _;
+    struct ReplacingCredential {
+        generation: std::sync::atomic::AtomicU64,
+        rejected: parking_lot::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl TokenSource for ReplacingCredential {
+        async fn token(&self) -> Result<AccessToken, zeron_rpc::TokenError> {
+            let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(AccessToken { value: format!("test-credential-{generation}"), generation })
+        }
+
+        fn invalidate(&self, generation: u64) {
+            self.rejected.lock().push(generation);
+            let _ = self.generation.compare_exchange(
+                generation, generation + 1,
+                std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_rejects_only_the_sent_credential_without_replaying() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for endpoint in ["directory", "accounts", "authority", "join-grant"] {
+            for (status, code, credential_rejected) in [
+                (401, "request_rejected", true),
+                (403, "request_rejected", false),
+                (429, "request_rejected", false),
+                (503, "request_rejected", false),
+                (403, "remote_code_token_forbidden", true),
+                (403, "crew_device_authority_unavailable", true),
+                (403, "crew_device_scope_denied", true),
+                (503, "remote_code_token_forbidden", false),
+                (503, "crew_device_authority_unavailable", false),
+                (503, "crew_device_scope_denied", false),
+                (503, "remote_code_token_validation_failed", false),
+                (503, "remote_code_token_store_unavailable", false),
+            ] {
+                for replaced in [false, true] {
+                    let source = Arc::new(ReplacingCredential {
+                        generation: AtomicU64::new(7), rejected: parking_lot::Mutex::new(Vec::new()),
+                    });
+                    let server_source = source.clone();
+                    let (origin, captured) = mock_server_for_requests(move |request, _| {
+                        assert!(request.to_ascii_lowercase().contains("authorization: bearer test-credential-7\r\n"));
+                        if replaced { server_source.generation.store(8, Ordering::SeqCst); }
+                        (MockResponse::Http { status, body: serde_json::json!({"error": code}).to_string() }, true)
+                    }).await;
+                    let client = ScaffoldClient::new(&origin, "project-a", source.clone()).unwrap();
+                    let cancellation = CancellationToken::new();
+                    let error = match endpoint {
+                        "directory" => client.get_crew_session("9dd173da-fb53-48df-9581-026009c783e2", None).await.err(),
+                        "accounts" => client.list_agent_accounts().await.err(),
+                        "authority" => client.issue_agent_inference_authority(&cancellation).await.err(),
+                        _ => EdgeDeviceJoinGrantClient::new(&origin, source.clone()).unwrap().mint(
+                            &DeviceJoinGrantRequest {
+                                principal_subject: "subject".into(), scope: scope(),
+                                sandbox_id: "sandbox-a".into(), device_id: "device-a".into(),
+                                lifecycle_epoch: 1, capabilities: vec![], expires_in_seconds: 900,
+                            }, &cancellation,
+                        ).await.err(),
+                    }.expect("server rejects request");
+                    assert_eq!(error.api_error().unwrap().status, status);
+                    assert_eq!(captured.await.unwrap().len(), 1, "must not replay the request");
+                    let rejected = source.rejected.lock();
+                    assert_eq!(rejected.as_slice(), if credential_rejected { &[7][..] } else { &[][..] });
+                    assert_eq!(source.generation.load(Ordering::SeqCst),
+                        if replaced || credential_rejected { 8 } else { 7 });
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_and_control_preserve_retry_after_from_http() {
+        for directory in [true, false] {
+            for status in [429, 503] {
+                let date = (chrono::Utc::now() + chrono::TimeDelta::seconds(125))
+                    .format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                for header in ["125", date.as_str(), "18446744073709551615", "invalid", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+                    let (origin, captured) = mock_server_steps(vec![MockResponse::RetryAfter {
+                        status, body: r#"{"error":"rate_limited","message":"try later"}"#.into(),
+                        retry_after: header.into(),
+                    }]).await;
+                    let client = ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap();
+                    let before = chrono::Utc::now();
+                    let error = if directory {
+                        client.get_crew_session("9dd173da-fb53-48df-9581-026009c783e2", None).await.unwrap_err()
+                    } else {
+                        client.list_agent_accounts().await.err().expect("expected temporary authority failure")
+                    };
+                    let after = chrono::Utc::now();
+                    assert_eq!(captured.await.unwrap().len(), 1, "API client must not replay requests");
+                    let api = error.api_error().unwrap();
+                    assert_eq!((api.status, api.code.as_str(), api.message.as_deref()),
+                        (status, "rate_limited", Some("try later")));
+                    assert!(error.is_transient());
+                    if header == date {
+                        let date = chrono::DateTime::parse_from_rfc2822(header).unwrap().with_timezone(&chrono::Utc);
+                        let retry = error.retry_after().unwrap();
+                        assert!(retry >= (date - after).to_std().unwrap_or_default());
+                        assert!(retry <= (date - before).to_std().unwrap_or_default());
+                    } else {
+                        let expected = match header {
+                            "125" => Some(Duration::from_secs(125)),
+                            "18446744073709551615" => Some(Duration::from_secs(u64::MAX)),
+                            "invalid" => None,
+                            _ => Some(Duration::ZERO),
+                        };
+                        assert_eq!(error.retry_after(), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_transient_classification_excludes_row_conflicts_and_revocation() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(api_error(StatusCode::from_u16(status).unwrap(), b"{}", None).is_transient());
+        }
+        for status in [400, 401, 403, 404, 409, 410, 501] {
+            assert!(!api_error(StatusCode::from_u16(status).unwrap(), b"{}", None).is_transient());
+        }
+        assert!(ScaffoldError::AuthTemporarilyUnavailable("offline".into()).is_transient());
+        assert!(!ScaffoldError::AuthUnavailable.is_transient());
+        assert!(!ScaffoldError::Cancelled.is_transient());
+    }
+
     #[test]
     fn remote_agent_account_tolerates_unknown_status() {
         let account: RemoteAgentAccount = serde_json::from_value(serde_json::json!({
@@ -3494,6 +3697,7 @@ mod tests {
                     status: 403,
                     code: expected_code.into(),
                     message: None,
+                    retry_after: None,
                 })
             );
             assert!(!error.is_runtime_starting());
@@ -3506,7 +3710,7 @@ mod tests {
     fn scaffold_startup_retry_requires_exact_provider_state() {
         let starting =
             br#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting"}}"#;
-        let error = api_error(StatusCode::SERVICE_UNAVAILABLE, starting);
+        let error = api_error(StatusCode::SERVICE_UNAVAILABLE, starting, None);
         assert!(error.is_runtime_starting());
         assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             error.to_string()
@@ -3516,7 +3720,7 @@ mod tests {
             (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"sandbox_provider_error","message":"sandbox_runtime_starting"}"#.as_slice()),
             (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting_failed"}}"#.as_slice()),
         ] {
-            let error = api_error(status, body);
+            let error = api_error(status, body, None);
             assert!(!error.is_runtime_starting());
             assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(error.to_string())));
         }
@@ -3651,6 +3855,7 @@ mod tests {
 
     enum MockResponse {
         Http { status: u16, body: String },
+        RetryAfter { status: u16, body: String, retry_after: String },
         Close,
         HeadersThenClose,
         CancelThenClose(CancellationToken),
@@ -3677,6 +3882,204 @@ mod tests {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn original_epoch_bootstrap_requires_the_exact_evidence_envelope() {
+        for (body, accepted) in [
+            (serde_json::json!({"originalEpochHistory": null}), true),
+            (serde_json::json!({"originalEpochHistory": {"proofJson":"signed-proof","commandOutcomes":{"request-a":"completed"}}}), true),
+            (serde_json::json!({}), false),
+            (serde_json::json!({"originalEpochHistory": {"proofJson":"signed-proof"}}), false),
+            (serde_json::json!({"originalEpochHistory": {"proofJson":"signed-proof","commandOutcomes":{},"rollback":true}}), false),
+            (serde_json::json!({"originalEpochHistory": null,"rollback":true}), false),
+        ] {
+            let (origin, captured) = mock_server(vec![body.to_string()]).await;
+            let client = ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap();
+            let result = client.original_epoch_history("sandbox-a", &scope(), &CancellationToken::new()).await;
+            assert_eq!(result.is_ok(), accepted);
+            let requests = captured.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /api/code-sandboxes/sandbox-a/original-epoch-history "));
+        }
+    }
+
+    #[tokio::test]
+    async fn original_epoch_bootstrap_preserves_authentication_generation_and_errors() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for (status, code, rejected) in [
+            (401, "request_rejected", true),
+            (403, "request_rejected", false),
+            (403, "remote_code_token_forbidden", true),
+            (403, "crew_device_authority_unavailable", true),
+            (403, "crew_device_scope_denied", true),
+            (503, "crew_device_authority_unavailable", false),
+            (503, "remote_code_token_validation_failed", false),
+            (429, "request_rejected", false),
+        ] {
+            for replaced in [false, true] {
+                let source = Arc::new(ReplacingCredential {
+                    generation: AtomicU64::new(7), rejected: parking_lot::Mutex::new(Vec::new()),
+                });
+                let server_source = source.clone();
+                let (origin, captured) = mock_server_for_requests(move |request, _| {
+                    assert!(request.to_ascii_lowercase().contains("authorization: bearer test-credential-7\r\n"));
+                    if replaced { server_source.generation.store(8, Ordering::SeqCst); }
+                    (MockResponse::RetryAfter {
+                        status, body: serde_json::json!({"error": code}).to_string(), retry_after: "9".into(),
+                    }, true)
+                }).await;
+                let client = ScaffoldClient::new(&origin, "project-a", source.clone()).unwrap();
+                let error = client.original_epoch_history("sandbox-a", &scope(), &CancellationToken::new()).await.err().unwrap();
+                let api = error.api_error().unwrap();
+                assert_eq!(api.status, status);
+                assert_eq!(api.code, code);
+                assert_eq!(error.retry_after(), Some(Duration::from_secs(9)));
+                assert_eq!(captured.await.unwrap().len(), 1, "bootstrap must not replay");
+                assert_eq!(source.rejected.lock().as_slice(), if rejected { &[7][..] } else { &[][..] });
+                assert_eq!(source.generation.load(Ordering::SeqCst), if replaced || rejected { 8 } else { 7 });
+            }
+        }
+    }
+
+    // A raw peer exercises decoded chunk accounting without relying on Content-Length.
+    async fn original_epoch_body_server(
+        body: String, chunked: bool, complete: bool,
+    ) -> (String, tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() < 8192);
+            }
+            let framing = if chunked {
+                "transfer-encoding: chunked".to_owned()
+            } else {
+                // An oversized hint must not cause rejection before observed bytes exceed the limit.
+                format!("content-length: {}", if complete { body.len() } else { 4 * 1024 * 1024 + 1 })
+            };
+            stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{framing}\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            for chunk in body.as_bytes().chunks(16 * 1024) {
+                if chunked {
+                    stream.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await.unwrap();
+                }
+                stream.write_all(chunk).await.unwrap();
+                if chunked && stream.write_all(b"\r\n").await.is_err() { return; }
+            }
+            // The client may close immediately on observing the first over-limit byte.
+            if chunked && complete { let _ = stream.write_all(b"0\r\n\r\n").await; }
+            let _ = sent.send(());
+            if !complete {
+                let mut byte = [0];
+                while matches!(stream.read(&mut byte).await, Ok(1)) {}
+            }
+        });
+        (origin, server, received)
+    }
+
+    #[tokio::test]
+    async fn original_epoch_bootstrap_body_accepts_limit_and_rejects_limit_plus_one() {
+        for chunked in [false, true] {
+            for extra in [0, 1] {
+                let mut body = r#"{"originalEpochHistory":null}"#.to_owned();
+                body.extend(std::iter::repeat_n(' ', 4 * 1024 * 1024 + extra - body.len()));
+                let (origin, server, _) = original_epoch_body_server(body, chunked, true).await;
+                let client = ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap();
+                let result = client.original_epoch_history("sandbox-a", &scope(), &CancellationToken::new()).await;
+                if extra == 0 {
+                    assert!(matches!(result, Ok(None)), "exactly 4 MiB must be accepted");
+                } else {
+                    assert!(matches!(result, Err(ScaffoldError::InvalidResponse(message))
+                        if message == "original epoch bootstrap response exceeds 4 MiB"));
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn original_epoch_bootstrap_outcomes_accept_limit_and_reject_limit_plus_one() {
+        for count in [10_000, 10_001] {
+            let outcomes: BTreeMap<_, _> = (0..count).map(|index| (format!("request-{index}"), "completed")).collect();
+            let body = serde_json::json!({"originalEpochHistory": {
+                "proofJson":"signed-proof", "commandOutcomes":outcomes,
+            }}).to_string();
+            let (origin, captured) = mock_server(vec![body]).await;
+            let client = ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap();
+            let result = client.original_epoch_history("sandbox-a", &scope(), &CancellationToken::new()).await;
+            if count == 10_000 {
+                let evidence = result.ok().flatten().expect("complete bootstrap evidence at the entry limit");
+                assert_eq!(evidence.proof_json, "signed-proof");
+                assert_eq!(evidence.command_outcomes.len(), count);
+                assert!(outcomes.iter().all(|(id, outcome)| evidence.command_outcomes.get(id).map(String::as_str) == Some(*outcome)));
+            } else {
+                assert!(matches!(result, Err(ScaffoldError::InvalidResponse(message))
+                    if message == "original epoch bootstrap exceeds 10000 command outcomes"));
+            }
+            assert_eq!(captured.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn original_epoch_bootstrap_incomplete_body_is_cancellable_and_has_total_deadline() {
+        for chunked in [false, true] {
+            for cancel in [false, true] {
+                let (origin, server, body_sent) = original_epoch_body_server("{".into(), chunked, false).await;
+                let source = Arc::new(ReplacingCredential {
+                    generation: std::sync::atomic::AtomicU64::new(7), rejected: parking_lot::Mutex::new(Vec::new()),
+                });
+                let client = ScaffoldClient::new(&origin, "project-a", source.clone()).unwrap();
+                let cancellation = CancellationToken::new();
+                let cancelled = cancellation.clone();
+                let request = tokio::spawn(async move {
+                    client.original_epoch_history("sandbox-a", &scope(), &cancelled).await
+                });
+                body_sent.await.unwrap();
+                // Let the response headers reach the client before advancing the body deadline.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(!request.is_finished(), "Content-Length is not an observed body size");
+                if cancel {
+                    cancellation.cancel();
+                } else {
+                    tokio::time::pause();
+                    tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+                }
+                let result = tokio::time::timeout(Duration::from_secs(1), request).await.unwrap().unwrap();
+                if !cancel { tokio::time::resume(); }
+                server.abort();
+                if cancel {
+                    assert!(matches!(result, Err(ScaffoldError::Cancelled)));
+                } else {
+                    assert!(matches!(result, Err(ScaffoldError::Transport {
+                        cause: ScaffoldTransportCause::RequestTimeout, before_response: false, ..
+                    })));
+                }
+                assert!(source.rejected.lock().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn original_epoch_bootstrap_transport_failures_do_not_revoke_credentials() {
+        for response in [MockResponse::Close, MockResponse::HeadersThenClose] {
+            let source = Arc::new(ReplacingCredential {
+                generation: std::sync::atomic::AtomicU64::new(7), rejected: parking_lot::Mutex::new(Vec::new()),
+            });
+            let (origin, captured) = mock_server_steps(vec![response]).await;
+            let client = ScaffoldClient::new(&origin, "project-a", source.clone()).unwrap();
+            let error = client.original_epoch_history("sandbox-a", &scope(), &CancellationToken::new()).await.err().unwrap();
+            assert!(matches!(error, ScaffoldError::Transport { .. }));
+            assert!(source.rejected.lock().is_empty());
+            assert_eq!(captured.await.unwrap().len(), 1);
+        }
+    }
+
 
 
     #[tokio::test]
@@ -3723,12 +4126,22 @@ mod tests {
     async fn mock_server_steps(
         responses: Vec<MockResponse>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let mut responses = std::collections::VecDeque::from(responses);
+        mock_server_for_requests(move |_, _| {
+            let response = responses.pop_front().unwrap();
+            (response, responses.is_empty())
+        }).await
+    }
+
+    async fn mock_server_for_requests(
+        mut respond: impl FnMut(&str, &Value) -> (MockResponse, bool) + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            let mut responses = std::collections::VecDeque::from(responses);
-            while !responses.is_empty() {
+            let mut finished = false;
+            while !finished {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -3754,9 +4167,18 @@ mod tests {
                         }
                     }
                 }
+                // Cancelled sockets and discovery probes are not API requests.
+                if bytes.is_empty() { continue; }
                 let request = String::from_utf8(bytes).unwrap();
+                if request.lines().next() == Some("HEAD / HTTP/1.1") {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let (response, last) = respond(&request, &value);
+                finished = last;
                 requests.push(request);
-                let response = responses.pop_front().unwrap();
                 match response {
                     MockResponse::Close => continue,
                     MockResponse::CancelThenClose(cancellation) => {
@@ -3771,6 +4193,13 @@ mod tests {
                             .await
                             .unwrap();
                         continue;
+                    }
+                    MockResponse::RetryAfter { status, body, retry_after } => {
+                        let response = format!(
+                            "HTTP/1.1 {status} Response\r\nRetry-After: {retry_after}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
                     }
                     MockResponse::Http { status, body } => {
                         let response = format!(
@@ -5001,20 +5430,54 @@ mod tests {
     #[tokio::test]
     async fn attach_waits_for_explicit_runtime_starting_before_bootstrap() {
         let join_expires_at = now_ms() + 60_000;
-        let (origin, captured) = mock_server_with_status(vec![
-            (200, comet_sandbox("starting")),
-            (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into()),
-            (200, comet_sandbox("starting")),
-            (200, r#"{"ok":false,"exitCode":1}"#.into()),
-            (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#)),
-            (200, r#"{"ok":true}"#.into()),
-            (200, r#"{"ok":true,"exitCode":0}"#.into()),
-            (200, r#"{"ok":true,"runId":"run-a","supervised":true}"#.into()),
-            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
-            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
-            (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at)),
-            (200, r#"{"ok":true,"exitCode":0}"#.into()), // Cleanup after confirmed attachment.
-        ]).await;
+        let mut authority_probes = 0;
+        let mut inspections = 0;
+        let mut launched = false;
+        let mut confirmation_probes = 0;
+        let (origin, captured) = mock_server_for_requests(move |request, body| {
+            let mut finished = false;
+            let (status, response) = if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+                inspections += 1;
+                (200, comet_sandbox("starting"))
+            } else if request.starts_with("POST /auth/device-grants ") {
+                assert!(authority_probes >= 2 && inspections >= 2);
+                assert!(!launched);
+                (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#))
+            } else if request.starts_with("PUT /api/code-sandboxes/sandbox-a/files?") {
+                (200, r#"{"ok":true}"#.into())
+            } else {
+                assert!(request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "));
+                let argv = body["argv"].as_array().unwrap();
+                if argv.iter().any(|arg| arg == "scaffold-authority") {
+                    authority_probes += 1;
+                    if authority_probes == 1 {
+                        (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into())
+                    } else if !launched {
+                        (200, r#"{"ok":false,"exitCode":1}"#.into())
+                    } else {
+                        confirmation_probes += 1;
+                        if confirmation_probes < 3 {
+                            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into())
+                        } else {
+                            (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at))
+                        }
+                    }
+                } else if argv.iter().any(|arg| arg == "--device-bootstrap-file") {
+                    assert!(!launched);
+                    launched = true;
+                    (200, r#"{"ok":true,"runId":"run-a","supervised":true}"#.into())
+                } else if argv.first().and_then(Value::as_str) == Some("rm") {
+                    assert!(launched && confirmation_probes >= 3);
+                    finished = true;
+                    (200, r#"{"ok":true,"exitCode":0}"#.into())
+                } else {
+                    assert!(argv.iter().any(|arg| arg == "--version")
+                        || (argv[0] == "chmod" && argv[1] == "600"));
+                    (200, r#"{"ok":true,"exitCode":0}"#.into())
+                }
+            };
+            (MockResponse::Http { status, body: response }, finished)
+        }).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
@@ -5064,13 +5527,29 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn authority_probe_outlives_the_old_startup_deadline() {
-        let mut responses = Vec::new();
-        for _ in 0..241 {
-            responses.push((503, r#"{"error":"sandbox_runtime_starting"}"#.into()));
-            responses.push((200, comet_sandbox("starting")));
-        }
-        responses.push((200, r#"{"ok":true,"exitCode":0}"#.into()));
-        let (origin, captured) = mock_server_with_status(responses).await;
+        let mut authority_probes = 0;
+        let (origin, captured) = mock_server_for_requests(move |request, body| {
+            let (status, response, finished) = if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+                (200, comet_sandbox("starting"), false)
+            } else {
+                assert!(
+                    request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "),
+                    "unexpected fixture request line: {:?}",
+                    request.lines().next().unwrap_or("")
+                );
+                assert!(body["argv"].as_array().unwrap().iter().any(|arg| arg == "scaffold-authority"));
+                authority_probes += 1;
+                if authority_probes <= 241 {
+                    (503, r#"{"error":"sandbox_runtime_starting"}"#.into(), false)
+                } else {
+                    (200, host_authority("native-grant", now_ms() + 60_000), true)
+                }
+            };
+            (MockResponse::Http { status, body: response }, finished)
+        }).await;
+        // A listener-discovery probe must not steal a scripted API response.
+        let discovery = reqwest::Client::new().head(&origin).send().await.unwrap();
+        assert_eq!(discovery.status(), StatusCode::NOT_FOUND);
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer).unwrap(),
@@ -5089,20 +5568,16 @@ mod tests {
         });
         let started = tokio::time::Instant::now();
         let result = runtime
-            .probe_attach_authority(
-                "sandbox-a",
-                &scope(),
-                &environment,
-                &["comet".into(), "scaffold-authority".into()],
-                &CancellationToken::new(),
-            )
+            .observe_attachment(environment, &CancellationToken::new())
             .await;
         clock.abort();
         let _ = clock.await;
-        let authority = result.unwrap();
-        assert!(authority.ok);
+        let attachment = result.unwrap().unwrap();
+        assert_eq!(attachment.attached_device_id.as_deref(), Some("comet-scaffold-sandbox-a-e1"));
+        assert_eq!(attachment.control_grant.unwrap().id, "native-grant");
         assert!(started.elapsed() > Duration::from_secs(120));
         let requests = captured.await.unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("GET /api/code-sandboxes/sandbox-a ")).count(), 241);
         assert!(!requests.iter().any(|request| {
             request.contains("/auth/device-grants")
                 || request.starts_with("POST /api/code-sandboxes HTTP")

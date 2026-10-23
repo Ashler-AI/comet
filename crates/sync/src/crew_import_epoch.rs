@@ -2,7 +2,7 @@
 use crate::crew_import::{CrewBackupManifest, CrewImportError, CrewImportReport};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 use zeron_proto::{CollaborationPrincipal, OriginalEpochHistory};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +159,25 @@ pub fn validate_original_epoch_bootstrap(
     Ok(marker)
 }
 
+#[cfg(test)]
+fn persist_original_epoch_bootstrap(
+    store: &crate::DocsStore,
+    proof_json: &str,
+    outcomes: &BTreeMap<String, String>,
+    principal: &CollaborationPrincipal,
+) -> Result<OriginalEpochHistory, CrewImportError> {
+    let history = validate_original_epoch_bootstrap(proof_json.as_bytes(), outcomes, principal)?;
+    let proof: OriginalEpochProof = serde_json::from_str(proof_json)?;
+    let key = format!("original-epoch-bootstrap:{}:{}", proof.scope.logical_session_id, history.lifecycle_epoch);
+    let request = serde_json::to_vec(&serde_json::json!({
+        "proofJson":proof_json, "commandOutcomes":outcomes, "principal":principal,
+    }))?;
+    store.claim_crew_command(&key, &request)?;
+    for id in outcomes.keys() { store.mark_processed(id)?; }
+    store.finish_crew_command(&key, &serde_json::to_vec(&history)?)?;
+    Ok(history)
+}
+
 /// Return only the selected session's original receipt from a freshly verified profile report.
 pub fn imported_original_epoch_proof_json(
     profile: &Path,
@@ -256,14 +275,23 @@ struct BootstrapRequest {
     principal: CollaborationPrincipal,
 }
 
+/// A single verified ledger snapshot. Command IDs fence historical rows even
+/// when their terminal doc outcomes have not yet arrived over sync.
+#[derive(Debug, Default)]
+pub struct OriginalEpochHistories {
+    pub histories: BTreeMap<String, OriginalEpochHistory>,
+    pub command_ids: BTreeSet<String>,
+}
+
 /// Loaded into host-only runtime state, independent of remotely editable metadata.
 pub fn imported_original_epoch_histories(
     profile: &Path,
-) -> Result<BTreeMap<String, OriginalEpochHistory>, CrewImportError> {
+) -> Result<OriginalEpochHistories, CrewImportError> {
     if profile.join("crew-import-incomplete").exists() {
         return Err(unsafe_data("original-epoch import is incomplete"));
     }
-    let mut histories = BTreeMap::new();
+    let mut loaded = OriginalEpochHistories::default();
+    let mut offline_proofs = BTreeMap::new();
     let bytes = match std::fs::read(profile.join("crew-import-report.json")) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -294,25 +322,51 @@ pub fn imported_original_epoch_histories(
                 capabilities: Vec::new(),
                 unknown: Default::default(),
             };
-            validate(profile, &manifest, &principal)?;
-            histories = manifest.original_epoch_histories;
+            offline_proofs = validate(profile, &manifest, &principal)?;
+            loaded.histories = manifest.original_epoch_histories;
         }
     }
     let database = profile.join("docs.sqlite3");
     if !database.try_exists()? {
-        return Ok(histories);
+        if !offline_proofs.is_empty() {
+            return Err(unsafe_data("original-epoch offline command ledger is missing"));
+        }
+        return Ok(loaded);
     }
     let mut conn = rusqlite::Connection::open_with_flags(
         database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let tx = conn.transaction()?;
+    // Offline imports retain exact source commands separately from the mutable
+    // session doc. Bind their complete outcome map to the already verified proof.
+    for (chat_id, proof) in offline_proofs {
+        let mut statement = tx.prepare(
+            "SELECT record_id,value,EXISTS(SELECT 1 FROM processed_commands WHERE command_id=record_id) FROM legacy_crew_records WHERE doc_id=?1 AND container='commands'",
+        )?;
+        let rows = statement.query_map([chat_id], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, bool>(2)?,
+        )))?;
+        let mut outcomes = BTreeMap::new();
+        for row in rows {
+            let (id, bytes, processed) = row?;
+            #[derive(Deserialize)]
+            struct Command { id: String, status: String }
+            let command: Command = serde_json::from_slice(&bytes)?;
+            if command.id != id || !processed {
+                return Err(unsafe_data("original-epoch offline command differs from its processed ledger"));
+            }
+            outcomes.insert(id, command.status);
+        }
+        verify_outcomes(&proof, &outcomes)?;
+        loaded.command_ids.extend(outcomes.into_keys());
+    }
     if !tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='crew_commands')",
         [],
         |row| row.get::<_, bool>(0),
     )? {
-        return Ok(histories);
+        return Ok(loaded);
     }
     // This internal ledger is installed only after fresh authenticated CP bootstrap,
     // under the profile lock. Its stored principal is not a caller authentication API.
@@ -357,15 +411,16 @@ pub fn imported_original_epoch_histories(
                 ));
             }
         }
-        if histories
+        if loaded.histories
             .get(&proof.scope.logical_session_id)
             .is_some_and(|existing| existing != &marker)
         {
             return Err(unsafe_data("conflicting original-epoch bootstrap history"));
         }
-        histories.insert(proof.scope.logical_session_id, marker);
+        loaded.histories.insert(proof.scope.logical_session_id, marker);
+        loaded.command_ids.extend(request.command_outcomes.into_keys());
     }
-    Ok(histories)
+    Ok(loaded)
 }
 
 #[cfg(test)]
@@ -552,6 +607,49 @@ mod tests {
     }
 
     #[test]
+    fn persisted_bootstrap_reloads_provenance_and_rejects_immutable_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::DocsStore::open(temp.path()).unwrap();
+        let (proof, outcomes, principal) = bootstrap_fixture();
+        let proof_json = serde_json::to_string(&proof).unwrap();
+        let marker = persist_original_epoch_bootstrap(&store, &proof_json, &outcomes, &principal).unwrap();
+        assert_eq!(persist_original_epoch_bootstrap(&store, &proof_json, &outcomes, &principal).unwrap(), marker);
+        let key = format!("original-epoch-bootstrap:{}:{}", proof.scope.logical_session_id, proof.scope.lifecycle_epoch);
+        let saved = store.crew_command(&key).unwrap();
+        // Semantically identical proof with different raw bytes cannot replace the claim.
+        let reformatted = serde_json::to_string_pretty(&proof).unwrap();
+        assert!(persist_original_epoch_bootstrap(&store, &reformatted, &outcomes, &principal).is_err());
+        let mut changed_outcomes = outcomes.clone();
+        changed_outcomes.insert("new-command".into(), "completed".into());
+        let mut changed_proof = proof.clone();
+        changed_proof.command_outcomes_sha256 = sha(&serde_json::to_vec(&changed_outcomes).unwrap());
+        assert!(persist_original_epoch_bootstrap(&store, &serde_json::to_string(&changed_proof).unwrap(), &changed_outcomes, &principal).is_err());
+        assert!(!store.is_processed("new-command").unwrap());
+        let mut changed_principal = principal.clone();
+        changed_principal.email = Some("changed@example.com".into());
+        assert!(persist_original_epoch_bootstrap(&store, &proof_json, &outcomes, &changed_principal).is_err());
+        assert_eq!(store.crew_command(&key).unwrap(), saved);
+        drop(store);
+        let loaded = imported_original_epoch_histories(temp.path()).unwrap();
+        assert_eq!(loaded.histories, BTreeMap::from([(proof.scope.logical_session_id, marker)]));
+        assert_eq!(loaded.command_ids, outcomes.into_keys().collect());
+
+        let conflicting = tempfile::tempdir().unwrap();
+        let store = crate::DocsStore::open(conflicting.path()).unwrap();
+        let (_, outcomes, principal) = bootstrap_fixture();
+        let request = serde_json::to_vec(&serde_json::json!({
+            "proofJson":proof_json, "commandOutcomes":outcomes, "principal":principal,
+        })).unwrap();
+        store.claim_crew_command(&key, &request).unwrap();
+        let mut wrong = validate_original_epoch_bootstrap(proof_json.as_bytes(), &outcomes, &principal).unwrap();
+        wrong.original_status = "failed".into();
+        store.finish_crew_command(&key, &serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(persist_original_epoch_bootstrap(&store, &proof_json, &outcomes, &principal).is_err());
+        assert!(imported_original_epoch_histories(conflicting.path()).is_err());
+        assert_eq!(store.crew_command(&key).unwrap().unwrap().1, Some(serde_json::to_vec(&wrong).unwrap()));
+    }
+
+    #[test]
     fn bootstrap_only_profile_requires_completed_ledger_and_every_processed_command() {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::DocsStore::open(temp.path()).unwrap();
@@ -574,7 +672,7 @@ mod tests {
         assert!(imported_original_epoch_histories(temp.path()).is_err());
         store.mark_processed("command-b").unwrap();
         assert_eq!(
-            imported_original_epoch_histories(temp.path()).unwrap(),
+            imported_original_epoch_histories(temp.path()).unwrap().histories,
             BTreeMap::from([(proof.scope.logical_session_id, marker)])
         );
     }

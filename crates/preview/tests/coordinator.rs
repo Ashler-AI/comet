@@ -18,9 +18,13 @@ use zeron_preview::{
 struct Token(String);
 #[async_trait::async_trait]
 impl TokenSource for Token {
-    async fn token(&self) -> anyhow::Result<String> {
-        Ok(self.0.clone())
+    async fn token(&self) -> anyhow::Result<zeron_proto::AccessToken> {
+        Ok(zeron_proto::AccessToken {
+            value: self.0.clone(),
+            generation: 0,
+        })
     }
+    fn invalidate(&self, _: u64) {}
 }
 struct Backend(Catalog);
 #[async_trait::async_trait]

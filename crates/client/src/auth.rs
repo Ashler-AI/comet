@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use zeron_proto::AccessToken;
 
 use crate::config::AuthTokens;
 use crate::error::{ClientError, Result};
@@ -309,9 +310,27 @@ enum Mode {
     WorkOs {
         edge_url: String,
         org_id: String,
-        tokens: Arc<Mutex<AuthTokens>>,
+        tokens: Arc<Mutex<WorkOsTokens>>,
         refresh_gate: Arc<tokio::sync::Mutex<()>>,
     },
+}
+
+struct WorkOsTokens {
+    pair: AuthTokens,
+    generation: u64,
+    invalidated: bool,
+}
+
+impl WorkOsTokens {
+    fn lease(&self) -> AccessToken {
+        AccessToken { value: self.pair.access_token.clone(), generation: self.generation }
+    }
+
+    fn replace(&mut self, pair: AuthTokens) {
+        self.pair = pair;
+        self.generation += 1;
+        self.invalidated = false;
+    }
 }
 
 /// Per-client bearer source: dev bearer, or a WorkOS access token refreshed
@@ -356,7 +375,9 @@ impl TokenProvider {
             Credentials::WorkOs { org_id, tokens, .. } => Mode::WorkOs {
                 edge_url: edge_url.to_owned(),
                 org_id: org_id.clone(),
-                tokens: Arc::new(Mutex::new(tokens.clone())),
+                tokens: Arc::new(Mutex::new(WorkOsTokens {
+                    pair: tokens.clone(), generation: 0, invalidated: false,
+                })),
                 refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
             },
         };
@@ -370,26 +391,42 @@ impl TokenProvider {
     /// Replace the pair (the platform re-signed-in or restored newer tokens).
     pub(crate) fn update_tokens(&self, next: AuthTokens) {
         if let Mode::WorkOs { tokens, .. } = &self.mode {
-            *lock(tokens) = next;
+            let mut tokens = lock(tokens);
+            tokens.replace(next);
             self.expired.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn invalidate(&self, generation: u64) {
+        match &self.mode {
+            Mode::Scaffold { auth, .. } => auth.invalidate(generation),
+            Mode::WorkOs { tokens, .. } => {
+                let mut tokens = lock(tokens);
+                if tokens.generation == generation {
+                    tokens.invalidated = true;
+                }
+            }
+            Mode::Dev { .. } | Mode::Demo => {}
         }
     }
 
     /// Current bearer, refreshing first when the access token is (nearly)
     /// expired. Network failures fall back to the stale token — the server
     /// rejects and the caller's backoff retries through here.
-    pub(crate) async fn bearer(&self) -> Result<String> {
+    pub(crate) async fn access_token(&self) -> Result<AccessToken> {
         match &self.mode {
             Mode::Demo => Err(ClientError::Auth(
                 "demo mode has no edge credentials".into(),
             )),
-            Mode::Dev { bearer } => Ok(bearer.clone()),
+            Mode::Dev { bearer } => Ok(AccessToken {
+                value: bearer.clone(), generation: 0,
+            }),
             Mode::Scaffold { auth, session } => {
-                if self.expired.load(Ordering::Acquire) {
-                    return Err(ClientError::Auth("Crew session revoked; sign in again".into()));
-                }
-                match auth.verify(session).await.map_err(scaffold_error) {
-                    Ok(verified) => Ok(verified.access_token),
+                match auth.verify_credential(session).await.map_err(scaffold_error) {
+                    Ok(verified) => {
+                        self.expired.store(false, Ordering::Release);
+                        Ok(verified)
+                    }
                     Err(ClientError::Auth(reason)) => {
                         if !self.expired.swap(true, Ordering::AcqRel) {
                             self.events.ordered(ClientEvent::AuthExpired { reason: reason.clone() });
@@ -405,13 +442,14 @@ impl TokenProvider {
                 tokens,
                 refresh_gate,
             } => {
-                let now = chrono::Utc::now().timestamp();
-                let current = lock(tokens).clone();
-                if !jwt_expired(&current.access_token, now) {
-                    return Ok(current.access_token);
-                }
-                if self.expired.load(Ordering::Acquire) {
-                    return Err(ClientError::Auth("session expired".into()));
+                {
+                    let current = lock(tokens);
+                    if self.expired.load(Ordering::Acquire) {
+                        return Err(ClientError::Auth("session expired".into()));
+                    }
+                    if !current.invalidated && !jwt_expired(&current.pair.access_token, chrono::Utc::now().timestamp()) {
+                        return Ok(current.lease());
+                    }
                 }
                 // The refresh runs as its own task that stores the rotated
                 // pair itself: callers wrap this in timeouts, and dropping a
@@ -439,25 +477,37 @@ impl TokenProvider {
 async fn refresh_task(
     edge_url: String,
     org_id: String,
-    tokens: Arc<Mutex<AuthTokens>>,
+    tokens: Arc<Mutex<WorkOsTokens>>,
     gate: Arc<tokio::sync::Mutex<()>>,
     events: Arc<EventPump>,
     expired: Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<AccessToken> {
     let _gate = gate.lock_owned().await;
     // Joined an in-flight refresh: it already rotated the pair.
-    let current = lock(&tokens).clone();
-    if !jwt_expired(&current.access_token, chrono::Utc::now().timestamp()) {
-        return Ok(current.access_token);
+    let (current, generation) = {
+        let current = lock(&tokens);
+        if expired.load(Ordering::Acquire) {
+            return Err(ClientError::Auth("session expired".into()));
+        }
+        if !current.invalidated && !jwt_expired(&current.pair.access_token, chrono::Utc::now().timestamp()) {
+            return Ok(current.lease());
+        }
+        (current.pair.clone(), current.generation)
+    };
+    let result = refresh(&edge_url, &current.refresh_token, Some(&org_id)).await;
+    let mut tokens = lock(&tokens);
+    // A platform replacement wins over any old refresh result or rejection.
+    if tokens.generation != generation {
+        if expired.load(Ordering::Acquire) {
+            return Err(ClientError::Auth("session expired".into()));
+        }
+        return Ok(tokens.lease());
     }
-    if expired.load(Ordering::Acquire) {
-        return Err(ClientError::Auth("session expired".into()));
-    }
-    match refresh(&edge_url, &current.refresh_token, Some(&org_id)).await {
+    match result {
         Ok(next) => {
-            *lock(&tokens) = next.clone();
-            events.ordered(ClientEvent::AuthRefreshed(next.clone()));
-            Ok(next.access_token)
+            tokens.replace(next);
+            events.ordered(ClientEvent::AuthRefreshed(tokens.pair.clone()));
+            Ok(tokens.lease())
         }
         Err(ClientError::Auth(reason)) => {
             if !expired.swap(true, Ordering::AcqRel) {
@@ -469,7 +519,7 @@ async fn refresh_task(
         }
         Err(err) => {
             tracing::warn!(error = %err, "token refresh failed; using the stale access token");
-            Ok(current.access_token)
+            Ok(tokens.lease())
         }
     }
 }
@@ -517,15 +567,20 @@ mod tests {
         let credentials = crate::config::Credentials::Scaffold { user_id: "owner".into(), org_id: "project".into(), control_origin: origin.clone(), session_json: serde_json::to_string(&session).unwrap() };
         let events = EventPump::new(Arc::new(crate::events::NullListener));
         let tokens = TokenProvider::new(&credentials, &origin, events).unwrap();
-        let results = futures::future::join_all((0..16).map(|_| tokens.bearer())).await;
-        assert!(results.iter().all(|result| result.as_ref().is_ok_and(|token| token == "sc_rc_secret")));
-        assert_eq!(tokens.bearer().await.unwrap(), "sc_rc_secret");
+        let results = futures::future::join_all((0..16).map(|_| tokens.access_token())).await;
+        assert!(results.iter().all(|result| result.as_ref().is_ok_and(|token| token.value == "sc_rc_secret")));
+        let first = tokens.access_token().await.unwrap();
+        assert_eq!(first.value, "sc_rc_secret");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         status.store(429, Ordering::SeqCst);
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
         tokio::time::resume();
-        let results = futures::future::join_all((0..16).map(|_| tokens.bearer())).await;
+        assert_eq!(tokens.access_token().await.unwrap().generation, first.generation);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "warm verification never time-expires");
+        tokens.invalidate(first.generation);
+        tokens.invalidate(first.generation);
+        let results = futures::future::join_all((0..16).map(|_| tokens.access_token())).await;
         assert!(results.iter().all(|result| matches!(result, Err(ClientError::Network(_)))));
         assert!(!tokens.expired.load(Ordering::Acquire));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -533,15 +588,17 @@ mod tests {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(120)).await;
         tokio::time::resume();
-        assert_eq!(tokens.bearer().await.unwrap(), "sc_rc_secret");
+        let renewed = tokens.access_token().await.unwrap();
+        assert_eq!(renewed.value, "sc_rc_secret");
+        assert_ne!(renewed.generation, first.generation);
+        tokens.invalidate(first.generation);
+        assert_eq!(tokens.access_token().await.unwrap().generation, renewed.generation);
         assert_eq!(calls.load(Ordering::SeqCst), 5);
         status.store(403, Ordering::SeqCst);
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::time::resume();
-        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
+        tokens.invalidate(renewed.generation);
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
         assert!(tokens.expired.load(Ordering::Acquire));
-        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 6);
         server.abort();
     }
@@ -684,11 +741,11 @@ mod tests {
                 socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
             });
             let (tokens, _) = provider(&edge);
-            let result = tokens.bearer().await;
+            let result = tokens.access_token().await;
             source.await.unwrap();
             sink.abort();
             assert!(lock(&captured).is_none(), "HTTP {status} forwarded refresh credentials to another origin");
-            assert_eq!(result.unwrap(), expired_jwt());
+            assert_eq!(result.unwrap().value, expired_jwt());
         }
     }
 
@@ -700,10 +757,10 @@ mod tests {
         let tokens = Arc::new(tokens);
         let calls = (0..8).map(|_| {
             let tokens = tokens.clone();
-            tokio::spawn(async move { tokens.bearer().await })
+            tokio::spawn(async move { tokens.access_token().await })
         });
         for call in futures::future::join_all(calls).await {
-            assert_eq!(call.unwrap().unwrap(), "fresh-access");
+            assert_eq!(call.unwrap().unwrap().value, "fresh-access");
         }
         // The fresh token has no parseable exp → treated valid: one refresh.
         assert_eq!(hits.load(Ordering::SeqCst), 1, "single-flight refresh");
@@ -712,14 +769,65 @@ mod tests {
             e,
             ClientEvent::AuthRefreshed(t) if t.refresh_token == "r2"
         )));
+        let first = tokens.access_token().await.unwrap();
+        tokens.invalidate(first.generation);
+        let renewed = tokens.access_token().await.unwrap();
+        assert_ne!(renewed.generation, first.generation);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "rejection forces refresh without JWT expiry");
+        tokens.invalidate(first.generation);
+        assert_eq!(tokens.access_token().await.unwrap().generation, renewed.generation);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "stale rejection cannot refresh newer tokens");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn platform_replacement_fences_pending_refresh_results() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [200, 401] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let edge = format!("http://{}", listener.local_addr().unwrap());
+            let (requested, request_seen) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                socket.read(&mut request).await.unwrap();
+                requested.send(()).unwrap();
+                released.await.unwrap();
+                let body = r#"{"accessToken":"old-refresh","refreshToken":"r2"}"#;
+                socket.write_all(format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            });
+            let (tokens, events) = provider(&edge);
+            let tokens = Arc::new(tokens);
+            let pending = {
+                let tokens = tokens.clone();
+                tokio::spawn(async move { tokens.access_token().await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), request_seen).await.unwrap().unwrap();
+            tokens.update_tokens(AuthTokens {
+                access_token: "replacement".into(), refresh_token: "replacement-refresh".into(),
+            });
+            let replacement = tokens.access_token().await.unwrap();
+            release.send(()).unwrap();
+            let completed = pending.await.unwrap().unwrap();
+            assert_eq!(completed.value, replacement.value);
+            assert_eq!(completed.generation, replacement.generation);
+            assert!(!tokens.expired.load(Ordering::Acquire));
+            server.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!lock(&events.0).iter().any(|event| matches!(
+                event, ClientEvent::AuthExpired { .. } | ClientEvent::AuthRefreshed(_)
+            )));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_refresh_expires_the_session_once() {
         let (edge, _hits) = serve_http(401, r#"{"error":"invalid_grant"}"#).await;
         let (tokens, events) = provider(&edge);
-        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
-        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let expired = lock(&events.0)
             .iter()
@@ -731,7 +839,7 @@ mod tests {
             access_token: "x.y.z".into(),
             refresh_token: "r9".into(),
         });
-        assert_eq!(tokens.bearer().await.unwrap(), "x.y.z");
+        assert_eq!(tokens.access_token().await.unwrap().value, "x.y.z");
     }
 
     #[tokio::test]
@@ -742,7 +850,7 @@ mod tests {
             org_id: "acme".into(),
         };
         let tokens = TokenProvider::new(&credentials, "http://unused", events).unwrap();
-        assert_eq!(tokens.bearer().await.unwrap(), "wing@acme");
+        assert_eq!(tokens.access_token().await.unwrap().value, "wing@acme");
     }
 
     #[test]

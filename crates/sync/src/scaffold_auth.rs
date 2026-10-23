@@ -5,9 +5,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use reqwest::Url;
+use zeron_proto::AccessToken;
 
 const TTL: Duration = Duration::from_secs(900);
-const VERIFICATION_FRESHNESS: Duration = Duration::from_secs(60);
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(5);
 pub const DEFAULT_OAUTH_SCOPES: &str = "remote_code:create remote_code:read remote_code:write remote_code:exec remote_code:lifecycle";
@@ -97,13 +97,15 @@ struct Pending {
 #[derive(Default)]
 struct SignIns {
     generation: u64,
+    // Unlike generation, this changes only on cancellation/credential replacement.
+    credential_generation: u64,
     pending: HashMap<String, Pending>,
+    credential: Option<String>,
     verification: Option<Verification>,
 }
-// One credential per helper: configuration is immutable, cancellation clears this
-// alongside the generation, and caller-provided identity never enters the cache.
+// One credential per helper; identity is always supplied by the authority, never
+// the caller. Only transient failures expire: success needs explicit invalidation.
 struct Verification {
-    token: String,
     result: Result<ScaffoldSession, AuthError>,
     at: tokio::time::Instant,
     wall: SystemTime,
@@ -181,8 +183,21 @@ impl ScaffoldAuth {
     pub fn cancel_sign_in(&self) {
         let mut flow = lock(&self.sign_ins);
         flow.generation = flow.generation.wrapping_add(1);
+        flow.credential_generation = flow.credential_generation.wrapping_add(1);
         flow.pending.clear();
+        flow.credential = None;
         flow.verification = None;
+    }
+    pub fn generation(&self) -> u64 { lock(&self.sign_ins).generation }
+    pub fn invalidate(&self, generation: u64) {
+        let mut flow = lock(&self.sign_ins);
+        if flow.generation != generation { return; }
+        flow.generation = flow.generation.wrapping_add(1);
+        // Rejection feedback fences old work, but cannot shorten an active
+        // server cooldown for the same credential. Cancel/replacement clears it.
+        if !flow.verification.as_ref().is_some_and(|cached| matches!(cached.result, Err(AuthError::Unavailable { .. })) && !cached.remaining().is_zero()) {
+            flow.verification = None;
+        }
     }
     pub async fn begin_sign_in(&self, redirect_uri: &str) -> Result<String, AuthError> {
         let redirect = Url::parse(redirect_uri).map_err(|_| AuthError::Rejected)?;
@@ -229,24 +244,36 @@ impl ScaffoldAuth {
         #[derive(Deserialize)] struct Tokens { access_token: String, token_type: String, scope: String, resource: String }
         let tokens: Tokens = self.json("token exchange", self.http.post(&pending.token_endpoint).form(&[("grant_type", "authorization_code"), ("code", &code), ("client_id", &pending.client_id), ("redirect_uri", &pending.redirect_uri), ("code_verifier", &pending.verifier), ("resource", &pending.resource)])).await?;
         if !tokens.token_type.eq_ignore_ascii_case("Bearer") || !tokens.access_token.starts_with("sc_rc_") || tokens.resource != pending.resource || !has_scopes(&self.config.oauth_scopes, &tokens.scope.split_whitespace().map(str::to_owned).collect::<Vec<_>>()) { return Err(AuthError::Rejected); }
-        let session = self.verified_token(&tokens.access_token, pending.generation).await?;
-        if lock(&self.sign_ins).generation != pending.generation { return Err(AuthError::Rejected); }
+        let (session, generation) = self.verified_token(&tokens.access_token, pending.generation).await?;
+        if self.generation() != generation { return Err(AuthError::Rejected); }
         Ok(session)
     }
-    async fn verified_token(&self, token: &str, generation: u64) -> Result<ScaffoldSession, AuthError> {
+    async fn verified_token(&self, token: &str, generation: u64) -> Result<(ScaffoldSession, u64), AuthError> {
         if !token.starts_with("sc_rc_") { return Err(AuthError::Rejected); }
+        let (generation, credential_generation) = {
+            let mut flow = lock(&self.sign_ins);
+            if flow.generation != generation { return Err(unavailable("Scaffold verification superseded")); }
+            if flow.credential.as_deref() != Some(token) {
+                flow.generation = flow.generation.wrapping_add(1);
+                flow.credential_generation = flow.credential_generation.wrapping_add(1);
+                flow.credential = Some(token.into());
+                flow.verification = None;
+            }
+            (flow.generation, flow.credential_generation)
+        };
         let _gate = self.verification_gate.lock().await;
         let failures = {
             let flow = lock(&self.sign_ins);
-            if flow.generation != generation { return Err(AuthError::Rejected); }
-            match flow.verification.as_ref().filter(|cached| cached.token == token) {
+            if flow.generation != generation { return Err(unavailable("Scaffold verification superseded")); }
+            match flow.verification.as_ref() {
                 Some(cached) => {
-                    let remaining = cached.remaining();
-                    if matches!(cached.result, Err(AuthError::Rejected)) || !remaining.is_zero() {
-                        return match &cached.result {
-                            Err(AuthError::Unavailable { message, .. }) => Err(AuthError::Unavailable { message: message.clone(), retry_after: Some(remaining) }),
-                            result => result.clone(),
-                        };
+                    match &cached.result {
+                        Ok(session) => return Ok((session.clone(), generation)),
+                        Err(AuthError::Rejected) => return Err(AuthError::Rejected),
+                        Err(AuthError::Unavailable { message, .. }) => {
+                            let remaining = cached.remaining();
+                            if !remaining.is_zero() { return Err(AuthError::Unavailable { message: message.clone(), retry_after: Some(remaining) }); }
+                        }
                     }
                     cached.failures
                 }
@@ -257,9 +284,14 @@ impl ScaffoldAuth {
         let mut wall = SystemTime::now();
         let mut result = self.verify_token(token).await;
         let mut flow = lock(&self.sign_ins);
-        if flow.generation != generation { return Err(AuthError::Rejected); }
+        // Feedback can arrive before a same-credential Retry-After response.
+        // Preserve that cooldown, but never publish stale success/rejection or
+        // carry a late failure across cancellation/replacement (including ABA).
+        if flow.generation != generation && (flow.credential_generation != credential_generation || !matches!(result, Err(AuthError::Unavailable { .. }))) {
+            return Err(unavailable("Scaffold verification superseded"));
+        }
         let (lifetime, failures) = match &mut result {
-            Ok(_) => (VERIFICATION_FRESHNESS, 0),
+            Ok(_) => (Duration::ZERO, 0),
             Err(AuthError::Rejected) => (Duration::ZERO, 0),
             Err(AuthError::Unavailable { retry_after, .. }) => {
                 let delay = retry_after.unwrap_or_else(|| RETRY_BASE.saturating_mul(1 << failures.min(3)).min(RETRY_CAP)).max(RETRY_BASE);
@@ -269,8 +301,8 @@ impl ScaffoldAuth {
                 (delay, failures.saturating_add(1))
             }
         };
-        flow.verification = Some(Verification { token: token.into(), result: result.clone(), at, wall, lifetime, failures });
-        result
+        flow.verification = Some(Verification { result: result.clone(), at, wall, lifetime, failures });
+        result.map(|session| (session, generation))
     }
     async fn verify_token(&self, token: &str) -> Result<ScaffoldSession, AuthError> {
         #[derive(Deserialize)] #[serde(rename_all="camelCase")] struct Actor { sub: String, auth: String, display_name: Option<String> }
@@ -283,12 +315,19 @@ impl ScaffoldAuth {
         if edge.credential != "scaffold" || edge.user_id != verified.actor.sub || edge.project_scope != self.config.project_scope || self.config.deployment_id.as_ref().is_some_and(|expected| Some(expected) != edge.deployment_id.as_ref()) { return Err(AuthError::Rejected); }
         Ok(ScaffoldSession { access_token: token.into(), identity: ScaffoldIdentity { user_id: edge.user_id, email: edge.email, name: verified.actor.display_name, project_scope: edge.project_scope, capabilities: edge.capabilities, deployment_id: edge.deployment_id }, resource: resource.clone(), edge_origin: self.config.edge_origin.clone(), device: None })
     }
-    pub async fn verify(&self, session: &ScaffoldSession) -> Result<ScaffoldSession, AuthError> {
+    async fn verified_session(&self, session: &ScaffoldSession) -> Result<(ScaffoldSession, u64), AuthError> {
         if session.resource != self.config.control_origin || session.edge_origin != self.config.edge_origin || session.identity.project_scope != self.config.project_scope || session.device.is_some() { return Err(AuthError::Rejected); }
-        let generation = lock(&self.sign_ins).generation;
-        let verified = self.verified_token(&session.access_token, generation).await?;
+        let (verified, generation) = self.verified_token(&session.access_token, self.generation()).await?;
+        if self.generation() != generation { return Err(unavailable("Scaffold verification superseded")); }
         if verified.identity.user_id != session.identity.user_id || verified.identity.deployment_id != session.identity.deployment_id { return Err(AuthError::Rejected); }
-        Ok(verified)
+        Ok((verified, generation))
+    }
+    pub async fn verify(&self, session: &ScaffoldSession) -> Result<ScaffoldSession, AuthError> {
+        self.verified_session(session).await.map(|(verified, _)| verified)
+    }
+    pub async fn verify_credential(&self, session: &ScaffoldSession) -> Result<AccessToken, AuthError> {
+        let (verified, generation) = self.verified_session(session).await?;
+        Ok(AccessToken { value: verified.access_token, generation })
     }
     pub async fn exchange_device(&self, config: &DeviceConfig) -> Result<ScaffoldSession, AuthError> {
         let grant_id = grant_token_id(&config.join_grant, "cg1").ok_or(AuthError::Rejected)?;
@@ -478,6 +517,7 @@ mod tests {
                 _ => wrong.device = Some(DeviceAuthority { grant_id: "grant".into(), expires_at: i64::MAX, device_id: "device".into(), session_id: "session".into(), deployment_id: "deployment".into(), sandbox_id: "sandbox".into(), lifecycle_epoch: 1 }),
             }
             assert!(matches!(server.auth.verify(&wrong).await, Err(AuthError::Rejected)), "{field}");
+            assert!(matches!(server.auth.verify_credential(&wrong).await, Err(AuthError::Rejected)), "{field}");
         }
         assert_eq!(server.calls(), 2);
         server.auth.cancel_sign_in();
@@ -503,23 +543,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_verification_shares_cooldown_without_stale_success() {
+    async fn warm_verification_survives_idle_and_stale_generation_feedback() {
+        let server = VerificationServer::new().await;
+        let first = server.auth.verify_credential(&server.session).await.unwrap();
+        assert_eq!(first.value, server.session.access_token);
+        {
+            let mut flow = lock(&server.auth.sign_ins);
+            let cached = flow.verification.as_mut().unwrap();
+            cached.at -= Duration::from_secs(3600);
+            cached.wall -= Duration::from_secs(3600);
+        }
+        let warm = server.auth.verify_credential(&server.session).await.unwrap();
+        assert_eq!(warm.generation, first.generation);
+        assert_eq!(server.calls(), 2, "idle beyond 60 seconds never revalidates success");
+        server.auth.invalidate(first.generation);
+        let next_generation = server.auth.generation();
+        server.auth.invalidate(first.generation);
+        assert_eq!(server.auth.generation(), next_generation, "concurrent old feedback coalesces");
+        let results = futures::future::join_all((0..16).map(|_| server.auth.verify_credential(&server.session))).await;
+        assert!(results.iter().all(|result| result.as_ref().is_ok_and(|token| token.generation == next_generation)));
+        assert_eq!(server.calls(), 4, "current-generation invalidation reverifies once");
+        server.auth.invalidate(first.generation);
+        server.auth.verify_credential(&server.session).await.unwrap();
+        assert_eq!(server.calls(), 4, "late rejection cannot clear a newer success");
+        let mut replacement = server.session.clone();
+        replacement.access_token = "sc_rc_replacement".into();
+        let replaced = server.auth.verify_credential(&replacement).await.unwrap();
+        assert_ne!(replaced.generation, next_generation);
+        server.auth.invalidate(next_generation);
+        assert_eq!(server.auth.verify_credential(&replacement).await.unwrap().generation, replaced.generation);
+        assert_eq!(server.calls(), 6, "old credential feedback cannot invalidate replacement");
+    }
+
+    #[tokio::test]
+    async fn credential_replacement_fences_inflight_verification() {
+        let server = VerificationServer::new().await;
+        server.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+        let flight = server.auth.verify_credential(&server.session);
+        tokio::pin!(flight);
+        tokio::select! {
+            _ = server.entered.notified() => {},
+            _ = &mut flight => panic!("verification must wait for the server"),
+        }
+        let generation = server.auth.generation();
+        let mut replacement = server.session.clone();
+        replacement.access_token = "sc_rc_replacement".into();
+        let next = server.auth.verify_credential(&replacement);
+        tokio::pin!(next);
+        assert!(futures::poll!(&mut next).is_pending());
+        assert_ne!(server.auth.generation(), generation);
+        server.release.notify_one();
+        assert!(matches!(flight.await, Err(AuthError::Unavailable { .. })));
+        let token = next.await.unwrap();
+        assert_eq!(token.value, replacement.access_token);
+        assert_eq!(token.generation, server.auth.generation());
+        server.auth.invalidate(generation);
+        server.auth.verify_credential(&replacement).await.unwrap();
+        assert_eq!(server.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn invalidation_preserves_server_cooldown_and_bounds_fallback_backoff() {
         let server = VerificationServer::new().await;
         server.auth.verify(&server.session).await.unwrap();
-        *lock(&server.response) = (429, 200, "120".into());
+        *lock(&server.response) = (429, 200, "30".into());
         server.auth.verify(&server.session).await.unwrap();
         assert_eq!(server.calls(), 2);
-        server.expire(false);
+        server.auth.invalidate(server.auth.generation());
         let results = futures::future::join_all((0..16).map(|_| server.auth.verify(&server.session))).await;
-        assert!(results.iter().all(|result| matches!(result, Err(AuthError::Unavailable { retry_after: Some(delay), .. }) if *delay > Duration::from_secs(119))));
+        assert!(results.iter().all(|result| matches!(result, Err(AuthError::Unavailable { retry_after: Some(delay), .. }) if *delay > Duration::from_secs(29) && *delay <= Duration::from_secs(30))));
         assert_eq!(server.calls(), 3);
         *lock(&server.response) = (200, 200, String::new());
-        assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Unavailable { .. })));
+        let generation = server.auth.generation();
+        let started = {
+            let flow = lock(&server.auth.sign_ins);
+            let cached = flow.verification.as_ref().unwrap();
+            (cached.at, cached.wall)
+        };
+        server.auth.invalidate(generation);
+        assert_ne!(server.auth.generation(), generation);
+        {
+            let flow = lock(&server.auth.sign_ins);
+            let cached = flow.verification.as_ref().unwrap();
+            assert_eq!((cached.at, cached.wall), started, "feedback neither restarts nor clears the cooldown");
+        }
+        assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Unavailable { retry_after: Some(delay), .. }) if delay > Duration::from_secs(29)), "current-generation rejection cannot bypass the server's 30-second cooldown");
         assert_eq!(server.calls(), 3);
         server.expire(true);
         server.auth.verify(&server.session).await.unwrap();
         assert_eq!(server.calls(), 5);
-        server.expire(true);
+        server.auth.invalidate(server.auth.generation());
         let date = (chrono::Utc::now() + chrono::Duration::hours(1)).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         *lock(&server.response) = (200, 503, date);
         let error = server.auth.verify(&server.session).await.unwrap_err();
@@ -541,12 +654,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_or_suspended_verification_observes_revocation() {
-        for (status, suspend) in [(401, false), (403, true)] {
+    async fn cancellation_and_replacement_clear_previous_credential_cooldown() {
+        for replace in [false, true] {
+            let server = VerificationServer::new().await;
+            *lock(&server.response) = (503, 200, "30".into());
+            assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Unavailable { retry_after: Some(delay), .. }) if delay == Duration::from_secs(30)));
+            let generation = server.auth.generation();
+            *lock(&server.response) = (200, 200, String::new());
+            let mut session = server.session.clone();
+            if replace { session.access_token = "sc_rc_replacement".into(); } else { server.auth.cancel_sign_in(); }
+            let token = server.auth.verify_credential(&session).await.unwrap();
+            assert_ne!(token.generation, generation);
+            assert_eq!(server.calls(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn late_unavailable_preserves_cooldown_only_across_feedback() {
+        for transition in ["invalidate", "cancel", "replace", "replace_back"] {
+            let server = VerificationServer::new().await;
+            *lock(&server.response) = (503, 200, "30".into());
+            server.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+            let flight = server.auth.verify_credential(&server.session);
+            tokio::pin!(flight);
+            tokio::select! {
+                _ = server.entered.notified() => {},
+                _ = &mut flight => panic!("verification must wait for the server"),
+            }
+            let mut session = server.session.clone();
+            match transition {
+                "invalidate" => server.auth.invalidate(server.auth.generation()),
+                "cancel" => server.auth.cancel_sign_in(),
+                "replace" => session.access_token = "sc_rc_replacement".into(),
+                _ => {
+                    let mut replacement = session.clone();
+                    replacement.access_token = "sc_rc_replacement".into();
+                    let intermediate = server.auth.verify_credential(&replacement);
+                    tokio::pin!(intermediate);
+                    assert!(futures::poll!(&mut intermediate).is_pending());
+                }
+            }
+            let next = server.auth.verify_credential(&session);
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            server.release.notify_one();
+            assert!(matches!(flight.await, Err(AuthError::Unavailable { .. })));
+            *lock(&server.response) = (200, 200, String::new());
+            if transition == "invalidate" {
+                assert!(matches!(next.await, Err(AuthError::Unavailable { retry_after: Some(delay), .. }) if delay > Duration::from_secs(29)), "late feedback cannot bypass the server cooldown");
+                assert_eq!(server.calls(), 1);
+                server.expire(false);
+                server.auth.verify_credential(&session).await.unwrap();
+            } else {
+                next.await.unwrap();
+            }
+            assert_eq!(server.calls(), 3, "{transition}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidated_verification_observes_revocation() {
+        for (status, edge) in [(401, false), (403, true)] {
             let server = VerificationServer::new().await;
             server.auth.verify(&server.session).await.unwrap();
-            *lock(&server.response) = if suspend { (200, status, String::new()) } else { (status, 200, String::new()) };
-            server.expire(suspend);
+            *lock(&server.response) = if edge { (200, status, String::new()) } else { (status, 200, String::new()) };
+            server.auth.invalidate(server.auth.generation());
             assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Rejected)));
             let calls = server.calls();
             *lock(&server.response) = (200, 200, String::new());
@@ -556,28 +728,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_fences_inflight_and_queued_verification() {
-        let server = VerificationServer::new().await;
-        server.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
-        let flight = server.auth.verify(&server.session);
-        tokio::pin!(flight);
-        tokio::select! {
-            _ = server.entered.notified() => {},
-            _ = &mut flight => panic!("verification must wait for the server"),
+    async fn invalidation_and_cancellation_fence_inflight_and_queued_verification() {
+        for cancel in [false, true] {
+            let server = VerificationServer::new().await;
+            server.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+            let flight = server.auth.verify_credential(&server.session);
+            tokio::pin!(flight);
+            tokio::select! {
+                _ = server.entered.notified() => {},
+                _ = &mut flight => panic!("verification must wait for the server"),
+            }
+            let generation = server.auth.generation();
+            let waiter = server.auth.verify_credential(&server.session);
+            tokio::pin!(waiter);
+            assert!(futures::poll!(&mut waiter).is_pending());
+            if cancel { server.auth.cancel_sign_in(); } else { server.auth.invalidate(generation); }
+            assert_ne!(server.auth.generation(), generation);
+            server.release.notify_one();
+            assert!(matches!(flight.await, Err(AuthError::Unavailable { .. })));
+            assert!(matches!(waiter.await, Err(AuthError::Unavailable { .. })));
+            assert!(lock(&server.auth.sign_ins).verification.is_none());
+            assert_eq!(server.calls(), 2);
+            assert!(matches!(server.auth.verified_token(&server.session.access_token, generation).await, Err(AuthError::Unavailable { .. })), "a superseded token exchange cannot refill the cache");
+            assert_eq!(server.calls(), 2);
+            let token = server.auth.verify_credential(&server.session).await.unwrap();
+            assert_eq!(token.generation, server.auth.generation());
+            assert_eq!(server.calls(), 4, "post-invalidation verification starts cold");
         }
-        let waiter = server.auth.verify(&server.session);
-        tokio::pin!(waiter);
-        assert!(futures::poll!(&mut waiter).is_pending());
-        server.auth.cancel_sign_in();
-        server.release.notify_one();
-        assert!(matches!(flight.await, Err(AuthError::Rejected)));
-        assert!(matches!(waiter.await, Err(AuthError::Rejected)));
-        assert!(lock(&server.auth.sign_ins).verification.is_none());
-        assert_eq!(server.calls(), 2);
-        assert!(matches!(server.auth.verified_token(&server.session.access_token, 0).await, Err(AuthError::Rejected)), "a token exchange from the cancelled generation cannot refill the cache");
-        assert_eq!(server.calls(), 2);
-        server.auth.verify(&server.session).await.unwrap();
-        assert_eq!(server.calls(), 4, "post-cancel verification starts cold");
     }
 
     #[test]
@@ -592,13 +769,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backwards_wall_clock_cannot_extend_verification_freshness() {
+    async fn backwards_wall_clock_cannot_extend_unavailable_cooldown() {
         let server = VerificationServer::new().await;
-        server.auth.verify(&server.session).await.unwrap();
+        *lock(&server.response) = (503, 200, String::new());
+        assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Unavailable { .. })));
         lock(&server.auth.sign_ins).verification.as_mut().unwrap().wall += Duration::from_secs(3600);
         server.expire(false);
-        *lock(&server.response) = (401, 200, String::new());
-        assert!(matches!(server.auth.verify(&server.session).await, Err(AuthError::Rejected)));
+        *lock(&server.response) = (200, 200, String::new());
+        server.auth.verify(&server.session).await.unwrap();
         assert_eq!(server.calls(), 3);
     }
     #[tokio::test]

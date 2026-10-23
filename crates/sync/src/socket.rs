@@ -52,7 +52,8 @@ pub(crate) async fn pump<S, T>(
     in_tx: mpsc::Sender<T>,
     encode: fn(T) -> WsMessage,
     decode: fn(WsMessage) -> Option<T>,
-) where
+) -> bool
+where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     pump_with_timing(
@@ -64,7 +65,7 @@ pub(crate) async fn pump<S, T>(
         PING_INTERVAL,
         SILENCE_LEASE,
     )
-    .await;
+    .await
 }
 
 /// Drive a session's ordered frames with independent reads and writes.
@@ -73,6 +74,7 @@ pub(crate) async fn pump<S, T>(
 /// consumer. Expiry closes the entire session: callers must recover using
 /// their protocol's cursor or fail pending RPCs, never resume a partial send.
 /// Dropping this future or the inbound receiver releases both socket halves.
+/// Returns true only when the peer explicitly rejects authentication (4401).
 pub async fn pump_with_timing<S, T>(
     ws: Connection<S>,
     mut out_rx: mpsc::Receiver<T>,
@@ -81,7 +83,8 @@ pub async fn pump_with_timing<S, T>(
     decode: fn(WsMessage) -> Option<T>,
     ping_interval: Duration,
     lease: Duration,
-) where
+) -> bool
+where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let progress = ws.progress;
@@ -126,11 +129,14 @@ pub async fn pump_with_timing<S, T>(
                 .while_progressing(lease, false, stream.next())
                 .await
             {
-                Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) => return,
+                Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                    return frame.is_some_and(|frame| u16::from(frame.code) == 4401);
+                }
+                Ok(None) => return false,
                 Ok(Some(Ok(frame))) => frame,
                 _ => {
                     tracing::warn!("socket read failed or silent past lease; reconnecting");
-                    return;
+                    return false;
                 }
             };
             if let Some(value) = decode(frame) {
@@ -141,15 +147,16 @@ pub async fn pump_with_timing<S, T>(
                     Ok(Ok(()))
                 ) {
                     tracing::warn!("socket consumer closed or stalled; reconnecting");
-                    return;
+                    return false;
                 }
             }
         }
     };
     tokio::select! {
-        _ = writer => {},
-        _ = reader => {},
-        _ = in_tx.closed() => {},
+        biased;
+        rejected = reader => rejected,
+        _ = writer => false,
+        _ = in_tx.closed() => false,
     }
 }
 
@@ -164,7 +171,7 @@ mod tests {
         server: WebSocketStream<DuplexStream>,
         tx: mpsc::Sender<WsMessage>,
         rx: mpsc::Receiver<WsMessage>,
-        task: JoinHandle<()>,
+        task: JoinHandle<bool>,
     }
 
     async fn harness() -> Harness {
@@ -204,9 +211,11 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
-    async fn finishes(mut task: JoinHandle<()>, within: Duration) {
+    async fn finishes(mut task: JoinHandle<bool>, within: Duration) {
         match tokio::time::timeout(within, &mut task).await {
-            Ok(result) => result.expect("socket pump panicked"),
+            Ok(result) => {
+                result.expect("socket pump panicked");
+            }
             Err(_) => {
                 task.abort();
                 panic!("socket pump did not terminate within {within:?}");

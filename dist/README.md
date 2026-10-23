@@ -93,7 +93,7 @@ scripts/package-linux.sh
 # PROFILE=debug scripts/package-linux.sh  # local fixture package
 ```
 
-Produces `target/package/comet-0.2.116-linux-<arch>.tar.gz` for `x86_64` or `aarch64`,
+Produces `target/package/comet-<version>-linux-<arch>.tar.gz` for `x86_64` or `aarch64`,
 containing the native `comet` executable, Crew desktop entry/icons, licenses,
 installer, and the complete `crew-web/` fixed-session browser assets. The browser
 contract sidecar travels with these assets. Scaffold supplies Node and selects
@@ -221,6 +221,35 @@ only into a temporary keychain with unconditional cleanup; do not enable shell
 tracing around secrets. Storage publication uses GitHub OIDC, checks required
 permissions and bucket privacy, and never grants public access. The production
 environment should require explicit operator approval.
+
+### Native authority refresh
+
+The 0.2.117 source carries the Canary credential-generation, startup deferral,
+directory backpressure and inference-renewal fixes onto the existing native-v2
+contract. Rejection feedback invalidates only the sent access lease; WorkOS
+refresh-secret rotation remains fenced against sign-out/replacement, not against
+rejection of its old access token. Mutations and provider requests are not replayed.
+
+Edge verification coalesces pending work only. Its active envelope is 8 KiB per
+UTF-8 token, 64 KiB per JSON stream, 32 combined admissions per isolate and an
+8-second caller deadline. At most 16 outbound dispatches reserve headroom for
+same-isolate coordinators. Cancelled callers retain admission until underlying
+work settles; one waiter cannot cancel another. Fresh batches recheck revocation,
+and upstream Retry-After remains authoritative. These are active-work bounds,
+not a measured isolate RSS ceiling or a global resident-coordinator count limit.
+
+Original-epoch bootstrap rejects streamed responses over 4 MiB or more than
+10,000 outcomes before local writes. Historical pending commands are not current
+crash-recovery commands and cannot be reissued while terminal history syncs.
+Start requires matching trusted local provenance before dispatch when history is
+present; a synced marker alone is insufficient. Existing offline import support
+remains separate. The server's retained-history storage has no established total
+byte ceiling; the client limit does not bound that server storage.
+
+Canonical publication still requires reviewed `main` source and the immutable
+candidate workflow. A separately built Canary controller is not the canonical
+Linux release, even when both report 0.2.117. No source check authorizes existing
+profile conversion, channel promotion, Edge activation or production changes.
 
 ### Checks for the integration owner
 

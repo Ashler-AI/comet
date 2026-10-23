@@ -9,16 +9,59 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_sync::DocsStore;
 
-use crate::{DocHost, EngineError, WorkspaceHost, auth::Auth, crew::CrewServices};
+use crate::{DocHost, EngineError, WorkspaceHost, auth::{Auth, AuthState}, crew::CrewServices, scaffold::ScaffoldError};
 
 type Version = BTreeMap<String, u64>;
 const JOB: &str = "crew-directory";
 const REGISTRY_VERSION: &str = "r:registry1";
 
+const RETRY_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug, thiserror::Error)]
+enum PublishError {
+    #[error(transparent)]
+    Row(#[from] EngineError),
+    #[error("directory {operation}: {source}")]
+    Remote { operation: &'static str, source: ScaffoldError },
+}
+
+// Elapsed time avoids overflowing Instant for a very large Retry-After. Sleep in
+// bounded chunks without doing any work or allowing notifications to cut it short.
+async fn wait_for_retry(started: tokio::time::Instant, delay: Duration) {
+    loop {
+        let remaining = delay.saturating_sub(started.elapsed());
+        if remaining.is_zero() { return; }
+        tokio::time::sleep(remaining.min(Duration::from_secs(24 * 60 * 60))).await;
+    }
+}
+
+async fn wait_for_work(
+    registry: &mut tokio::sync::watch::Receiver<u64>,
+    snapshots: &mut tokio::sync::watch::Receiver<u64>,
+    identity: &mut tokio::sync::watch::Receiver<AuthState>,
+    cooldown: Option<Duration>,
+) -> Option<bool> {
+    let started = tokio::time::Instant::now();
+    let mut inventory = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_for_retry(started, cooldown.unwrap_or_default()), if cooldown.is_some() => return Some(inventory),
+            result = registry.changed() => { if result.is_err() { return None; } inventory = true; },
+            result = snapshots.changed() => { if result.is_err() { return None; } },
+            result = identity.changed() => { if result.is_err() { return None; } inventory = true; },
+        }
+        if cooldown.is_none() { return Some(inventory); }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Evidence {
     source_version: Version,
     confirmed: bool,
+    // Suppress only the rejected local candidate, never adopt remote evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejected_source_version: Option<Version>,
 }
 
 fn failure(message: &str) -> EngineError { EngineError::Other(message.into()) }
@@ -36,9 +79,11 @@ pub(crate) fn start(auth: Auth, services: CrewServices, workspace: WorkspaceHost
         // Remote versions are prerequisites only, never local projection evidence.
         let mut required_sources = BTreeMap::new();
         loop {
+            inventory |= registry.has_changed().unwrap_or(false) || identity.has_changed().unwrap_or(false);
             registry.borrow_and_update();
             snapshots.borrow_and_update();
             identity.borrow_and_update();
+            let mut cooldown = RETRY_DELAY;
             if services.ensure_identity().is_ok() && workspace.registry_synced() {
                 if inventory {
                     if let Err(error) = enqueue_registry(&store, &workspace).await {
@@ -47,19 +92,17 @@ pub(crate) fn start(auth: Auth, services: CrewServices, workspace: WorkspaceHost
                         inventory = false;
                     }
                 }
-                if let Err(error) = drain(&store, &services, &workspace, &mut required_sources).await {
-                    tracing::warn!(%error, "directory pending work retained for retry");
+                match drain(&store, &services, &workspace, &mut required_sources).await {
+                    Ok(Some(delay)) => cooldown = delay,
+                    Ok(None) => {},
+                    Err(error) => tracing::warn!(%error, "directory pending work retained for retry"),
                 }
             }
-            // Only outstanding work retries on a timer. Registry ACK/reconnect,
-            // snapshot commits, and sign-in wake immediately.
+            // Notifications accumulate inventory but cannot bypass backpressure.
             let pending = store.pending_sync_jobs(JOB, "", 1).map_or(true, |ids| !ids.is_empty());
-            tokio::select! {
-                result = registry.changed() => { if result.is_err() { return; } inventory = true; },
-                result = snapshots.changed() => { if result.is_err() { return; } },
-                result = identity.changed() => { if result.is_err() { return; } inventory = true; },
-                _ = tokio::time::sleep(Duration::from_secs(30)), if pending || inventory => {},
-            }
+            let Some(changed) = wait_for_work(&mut registry, &mut snapshots, &mut identity,
+                (pending || inventory).then_some(cooldown)).await else { return };
+            inventory |= changed;
         }
     })
 }
@@ -78,11 +121,11 @@ async fn enqueue_registry(store: &DocsStore, workspace: &WorkspaceHost) -> Resul
 }
 
 async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
-    required_sources: &mut BTreeMap<String, Version>) -> Result<(), EngineError> {
+    required_sources: &mut BTreeMap<String, Version>) -> Result<Option<Duration>, EngineError> {
     let mut after = String::new();
     loop {
         let ids = store.pending_sync_jobs(JOB, &after, 64)?;
-        if ids.is_empty() { return Ok(()); }
+        if ids.is_empty() { return Ok(None); }
         for id in ids {
             after.clone_from(&id);
             services.ensure_identity()?;
@@ -93,7 +136,13 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
                     required_sources.remove(&id);
                 }
                 Ok(false) => {}, // Keep the durable job until its own source catches up.
-                Err(error) => tracing::warn!(session = %id, %error, "directory update awaits synchronization or reconciliation"),
+                Err(error) => {
+                    tracing::warn!(session = %id, %error, "directory update awaits synchronization or reconciliation");
+                    if let PublishError::Remote { source, .. } = error
+                        && source.is_transient() {
+                        return Ok(Some(source.retry_after().unwrap_or(RETRY_DELAY).max(RETRY_DELAY)));
+                    }
+                },
             }
         }
         tokio::task::yield_now().await;
@@ -101,21 +150,21 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
 }
 
 async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
-    id: &str, required_sources: &mut BTreeMap<String, Version>) -> Result<bool, EngineError> {
+    id: &str, required_sources: &mut BTreeMap<String, Version>) -> Result<bool, PublishError> {
     if !zeron_proto::is_cloud_session_id(id) { return Ok(true); }
     if workspace.directory_reconciliation_required() {
-        return Err(failure("registry server reset observed; directory reconciliation required"));
+        return Err(failure("registry server reset observed; directory reconciliation required").into());
     }
     let Some(row) = workspace.acknowledged_chat(id) else {
         // Absence is not a deletion; optimistic creations await their server ACK.
-        return Err(failure("directory awaits acknowledged registry row"));
+        return Err(failure("directory awaits acknowledged registry row").into());
     };
-    if row.seq == 0 { return Err(failure("directory awaits server registry sequence")); }
+    if row.seq == 0 { return Err(failure("directory awaits server registry sequence").into()); }
     let expected = services.session_metadata(id)?;
     let deployment = expected.scope.deployment_id.as_deref()
         .ok_or_else(|| failure("directory requires exact deployment"))?;
     if deployment != services.runtime().deployment_id() {
-        return Err(failure("directory runtime differs from verified deployment"));
+        return Err(failure("directory runtime differs from verified deployment").into());
     }
     if !row.deleted {
         // Phones create crew:None. Stamp only through the shared, identity-checked
@@ -127,10 +176,10 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         metadata.validate().map_err(failure)?;
         if metadata.owner_subject != expected.owner_subject || metadata.scope != expected.scope
             || metadata.session_id != id {
-            return Err(failure("directory owner or scope mismatch"));
+            return Err(failure("directory owner or scope mismatch").into());
         }
     }
-    let mut evidence: Evidence = match store.directory_state(id)? {
+    let mut evidence: Evidence = match store.directory_state(id).map_err(EngineError::from)? {
         Some(saved) => serde_json::from_str(&saved).map_err(|_| failure("invalid directory evidence"))?,
         None => Evidence::default(),
     };
@@ -152,18 +201,23 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         || required_sources.get(id).is_some_and(|required| require_observed(&version, required).is_err()) {
         return Ok(false);
     }
+    if evidence.rejected_source_version.as_ref() == Some(&version) { return Ok(false); }
     if evidence.confirmed && evidence.source_version == version { return Ok(true); }
     services.ensure_identity()?;
     let client = services.runtime().client();
     let remote = client.get_crew_session(id, Some(deployment)).await
-        .map_err(|_| failure("directory revision lookup failed"))?;
+        .map_err(|source| PublishError::Remote { operation: "revision lookup", source })?;
     let previous = remote.get("session").ok_or_else(|| failure("invalid directory response"))?;
     let revision = if !previous.is_null() {
         let observed: Version = serde_json::from_value(previous["sourceVersion"].clone())
             .map_err(|_| failure("invalid directory server version"))?;
+        require_observed(&observed, &Version::new())?;
         if let Err(error) = require_observed(&version, &observed) {
             required_sources.insert(id.to_owned(), observed);
-            return Err(error);
+            evidence.rejected_source_version = Some(version.clone());
+            store.save_directory_state(id, &serde_json::to_string(&evidence)
+                .map_err(|_| failure("invalid directory evidence"))?).map_err(EngineError::from)?;
+            return Err(error.into());
         }
         if previous.get("deleted").and_then(Value::as_bool) == Some(true) { return Ok(true); }
         Some(previous["revision"].as_u64().filter(|revision| *revision > 0)
@@ -172,15 +226,16 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
     // Do not send a projection captured before a registry ACK arriving during
     // HTTP lookup. Concurrent later writers still meet expectedRevision at SQL.
     if workspace.directory_reconciliation_required() {
-        return Err(failure("registry server reset observed; directory reconciliation required"));
+        return Err(failure("registry server reset observed; directory reconciliation required").into());
     }
     if workspace.acknowledged_chat(id).as_ref() != Some(&row) {
-        return Err(failure("directory registry changed during projection"));
+        return Err(failure("directory registry changed during projection").into());
     }
+    evidence.rejected_source_version = None;
     evidence.source_version = version;
     evidence.confirmed = false;
     store.save_directory_state(id, &serde_json::to_string(&evidence)
-        .map_err(|_| failure("invalid directory evidence"))?)?;
+        .map_err(|_| failure("invalid directory evidence"))?).map_err(EngineError::from)?;
     services.ensure_identity()?;
     // Platform authorizes upsert via the read-only existing-chat2 owner endpoint.
     // Empty new chats with no room owner remain pending; this never creates one.
@@ -190,13 +245,13 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         "title": row.fields.get("title").and_then(Value::as_str).unwrap_or_default()
             .chars().take(140).collect::<String>(),
         "links": links, "deleted": row.deleted,
-    })).await.map_err(|_| failure("directory upsert unacknowledged; retained for reconciliation"))?;
+    })).await.map_err(|source| PublishError::Remote { operation: "upsert", source })?;
     if ack["revision"].as_u64().filter(|revision| *revision > 0).is_none() {
-        return Err(failure("invalid directory acknowledgement"));
+        return Err(failure("invalid directory acknowledgement").into());
     }
     evidence.confirmed = true;
     store.save_directory_state(id, &serde_json::to_string(&evidence)
-        .map_err(|_| failure("invalid directory evidence"))?)?;
+        .map_err(|_| failure("invalid directory evidence"))?).map_err(EngineError::from)?;
     Ok(true)
 }
 
@@ -339,6 +394,42 @@ fn extract_links(text: &str, links: &mut BTreeSet<String>) -> Result<(), EngineE
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn signal_storm_cannot_shorten_or_extend_worker_cooldown() {
+        for delay in [RETRY_DELAY, Duration::from_secs(125)] {
+            let (registry_tx, mut registry) = tokio::sync::watch::channel(0);
+            let (snapshots_tx, mut snapshots) = tokio::sync::watch::channel(0);
+            let (identity_tx, mut identity) = tokio::sync::watch::channel(AuthState::SignedOut);
+            // Include the inventory's own wake already pending before waiting.
+            snapshots_tx.send_replace(1);
+            let waiter = tokio::spawn(async move {
+                wait_for_work(&mut registry, &mut snapshots, &mut identity, Some(delay)).await
+            });
+            tokio::task::yield_now().await;
+            for index in 1..delay.as_secs() {
+                registry_tx.send_replace(index);
+                snapshots_tx.send_replace(index);
+                identity_tx.send_replace(AuthState::SignedOut);
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+                assert!(!waiter.is_finished(), "notification bypassed cooldown");
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(waiter.await.unwrap(), Some(true));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrepresentable_deadline_never_overflows_or_retries_early() {
+        let started = tokio::time::Instant::now();
+        let waiter = tokio::spawn(wait_for_retry(started, Duration::MAX));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2 * 24 * 60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        waiter.abort();
+    }
+
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflicted_jobs_wait_for_own_source_and_retry_transport_failures() {
@@ -364,7 +455,6 @@ mod tests {
         let remote = json!({"session":{"revision":7, "sourceVersion":version, "deleted":false}});
         let responses = Arc::new(Mutex::new(VecDeque::from([
             (200_u16, remote.clone()), // First stale source.
-            (200, remote.clone()), // A fresh worker must rediscover the conflict.
             (503, json!({})), // Catch-up is not suppressed after a failed GET.
             (200, remote.clone()), (503, json!({})), // Nor after a failed upsert.
             (200, remote), (200, json!({"revision":8})),
@@ -471,7 +561,9 @@ mod tests {
         drain(&store, &services, &workspace, &mut required).await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(required[id], version);
-        assert!(store.directory_state(id).unwrap().is_none(), "remote counters are not evidence");
+        let rejected: Evidence = serde_json::from_str(&store.directory_state(id).unwrap().unwrap()).unwrap();
+        assert!(rejected.source_version.is_empty(), "remote counters are not evidence");
+        assert!(rejected.rejected_source_version.is_some());
 
         for _ in 0..3 {
             // The worker inventories on any registry wake and drains on any snapshot wake.
@@ -481,23 +573,23 @@ mod tests {
             assert_eq!(requests.lock().unwrap().len(), 1);
             assert!(store.sync_job_version(id, JOB).unwrap().is_some());
         }
-        required.clear(); // Worker-local suppression does not persist across restart.
+        required.clear(); // Persisted candidate rejection also survives worker restart.
         drain(&store, &services, &workspace, &mut required).await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().unwrap().len(), 1);
         store.save_snapshot(id, &snapshot).unwrap();
-        for expected_requests in [3, 5] {
-            drain(&store, &services, &workspace, &mut required).await.unwrap();
+        for expected_requests in [2, 4] {
+            assert_eq!(drain(&store, &services, &workspace, &mut required).await.unwrap(), Some(RETRY_DELAY));
             assert_eq!(requests.lock().unwrap().len(), expected_requests);
             assert!(store.sync_job_version(id, JOB).unwrap().is_some());
         }
         drain(&store, &services, &workspace, &mut required).await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 7);
+        assert_eq!(requests.lock().unwrap().len(), 6);
         assert!(responses.lock().unwrap().is_empty());
         assert!(store.sync_job_version(id, JOB).unwrap().is_none());
         assert!(required.is_empty());
         {
             let requests = requests.lock().unwrap();
-            let published = &requests[6];
+            let published = &requests[5];
             assert_eq!(published.0, "/api/crew-directory/upsert");
             assert_eq!(published.1["sourceVersion"], json!(version));
             assert_eq!(published.1["expectedRevision"], 7);
@@ -513,12 +605,12 @@ mod tests {
         for _ in 0..2 {
             drain(&store, &services, &workspace, &mut required).await.unwrap();
             assert!(store.sync_job_version(id, JOB).unwrap().is_some());
-            assert_eq!(requests.lock().unwrap().len(), 7);
+            assert_eq!(requests.lock().unwrap().len(), 6);
         }
         store.save_snapshot(id, &snapshot).unwrap();
         drain(&store, &services, &workspace, &mut required).await.unwrap();
         assert!(store.sync_job_version(id, JOB).unwrap().is_none());
-        assert_eq!(requests.lock().unwrap().len(), 7);
+        assert_eq!(requests.lock().unwrap().len(), 6);
         assert_eq!(store.directory_state(id).unwrap().unwrap(), saved);
         workspace.shutdown();
         server.abort();
@@ -567,7 +659,8 @@ mod tests {
         let store = DocsStore::open(dir.path()).unwrap();
         store.save_snapshot(id, b"first").unwrap();
         let first = store.sync_job_version(id, JOB).unwrap().unwrap();
-        let evidence = Evidence { source_version: BTreeMap::from([(REGISTRY_VERSION.into(), 12)]), confirmed: false };
+        let evidence = Evidence { source_version: BTreeMap::from([(REGISTRY_VERSION.into(), 12)]), confirmed: false,
+            ..Evidence::default() };
         store.save_directory_state(id, &serde_json::to_string(&evidence).unwrap()).unwrap();
         store.save_snapshot(id, b"second").unwrap();
         store.complete_sync_job(id, JOB, first).unwrap();

@@ -38,7 +38,9 @@ struct InferenceRouteRequest {
 }
 
 const MAX_CONNECTIONS: usize = 64;
-const REFRESH_SKEW_SECONDS: i64 = 60;
+// Issuer reuse ends at millisecond expiry, while signed tokens expire at whole
+// seconds. Wait out the final second before asking for the next authority.
+const EXPIRY_BOUNDARY_SECONDS: i64 = 1;
 const RETIRED_ROUTE_TTL: Duration = Duration::from_secs(30 * 60);
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -62,6 +64,7 @@ struct Inner {
     client: ScaffoldClient,
     port: u16,
     route_state: Mutex<RouteState>,
+    authority: Arc<AsyncMutex<AuthorityState>>,
 }
 
 struct Route {
@@ -69,7 +72,7 @@ struct Route {
     /// Original local chat id when Agent Auth needs a UUID projection.
     local_session_id: Option<String>,
     owner_subject: String,
-    authority: AsyncMutex<AuthorityState>,
+    authority_scope: Option<String>,
     cancellation: zeron_harness::CancellationToken,
     admission: Option<RunInferenceAdmission>,
 }
@@ -82,9 +85,46 @@ impl Route {
     }
 }
 
+#[derive(Default)]
 struct AuthorityState {
+    credential_generation: Option<u64>,
+    generation: u64,
+    lease: Option<Arc<AuthorityLease>>,
+    retry_at: Option<(Instant, Duration)>,
+}
+
+struct AuthorityLease {
     authority: AgentInferenceAuthority,
     expires_at: DateTime<Utc>,
+    credential_generation: u64,
+    generation: u64,
+}
+
+#[derive(Debug)]
+struct AuthorityRefreshError {
+    reason: &'static str,
+    retry_after: Option<Duration>,
+    cause: Option<String>,
+}
+
+impl AuthorityRefreshError {
+    fn new(reason: &'static str) -> Self {
+        Self { reason, retry_after: None, cause: None }
+    }
+
+    fn scaffold(reason: &'static str, error: &crate::scaffold::ScaffoldError) -> Self {
+        // API response strings are untrusted; retain only typed status here.
+        use crate::scaffold::ScaffoldError;
+        let cause = match error {
+            ScaffoldError::Api(error) => format!("scaffold_api_error:{}", error.0.status),
+            ScaffoldError::InvalidResponse(_) => "scaffold_response_invalid".into(),
+            _ => error.to_string(),
+        };
+        let retry_after = error.is_transient().then(|| {
+            error.retry_after().unwrap_or(Duration::from_secs(1)).max(Duration::from_secs(1))
+        });
+        Self { reason, retry_after, cause: Some(cause) }
+    }
 }
 
 #[derive(Default)]
@@ -97,6 +137,7 @@ struct RetiredRoute {
     logical_session_id: String,
     local_session_id: Option<String>,
     owner_subject: String,
+    authority_scope: Option<String>,
     provider: String,
     retired_at: Instant,
     run_bound: bool,
@@ -120,6 +161,7 @@ impl RouteState {
         &mut self,
         session_id: &str,
         owner_subject: &str,
+        authority_scope: Option<&str>,
         provider: &str,
     ) -> Option<String> {
         let token = self
@@ -128,6 +170,7 @@ impl RouteState {
             .filter(|(_, route)| {
                 route.session_id() == session_id
                     && route.owner_subject == owner_subject
+                    && route.authority_scope.as_deref() == authority_scope
                     && route.provider == provider
                     && !route.run_bound
             })
@@ -333,6 +376,7 @@ impl InferenceRelay {
                 client,
                 port,
                 route_state: Mutex::new(RouteState::default()),
+                authority: Arc::new(AsyncMutex::new(AuthorityState::default())),
             }),
         };
         let runtime_listener = TcpListener::from_std(listener)?;
@@ -368,37 +412,33 @@ impl InferenceRelay {
             tracing::debug!(?harness, "inference relay skipped for unsupported harness");
             return Ok(None);
         };
-        let authority = self
-            .inner
-            .client
-            .issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
-            .await
-            .map_err(|error| {
-                EngineError::Other(format!("Agent Auth authority issuance failed: {error}"))
-            })?;
-        let expires_at = validate_authority(&authority)?;
-        let provider = request.provider.clone();
-        let model = request.model.clone();
-        let owner_subject = authority.principal_id.clone();
-        let run_bound = admission.is_some();
         let cancellation = admission.as_ref().map(|gate| gate.cancellation.child_token())
             .unwrap_or_default();
+        let lease = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(EngineError::Other("Agent Auth route cancelled".into())),
+            lease = self.shared_authority() => lease.map_err(|error| {
+                EngineError::Other(format!("Agent Auth authority issuance failed: {}", error.reason))
+            })?,
+        };
+        let provider = request.provider.clone();
+        let model = request.model.clone();
+        let owner_subject = lease.authority.principal_id.clone();
+        let authority_scope = lease.authority.authority_scope.clone();
+        let run_bound = admission.is_some();
         let route = Arc::new(Route {
             request,
             local_session_id,
             owner_subject: owner_subject.clone(),
             cancellation,
             admission,
-            authority: AsyncMutex::new(AuthorityState {
-                authority,
-                expires_at,
-            }),
+            authority_scope: authority_scope.clone(),
         });
         let local_token = {
             let mut state = lock(&self.inner.route_state);
             state.prune_retired();
             let token = if run_bound { None } else {
-                state.take_retired_token(session_id, &owner_subject, &provider)
+                state.take_retired_token(session_id, &owner_subject, authority_scope.as_deref(), &provider)
             }.unwrap_or_else(|| local_relay_token(&provider));
             state.active.insert(token.clone(), route);
             token
@@ -432,6 +472,7 @@ impl InferenceRelay {
                             logical_session_id: route.request.logical_session_id.clone(),
                             local_session_id: route.local_session_id.clone(),
                             owner_subject: route.owner_subject.clone(),
+                            authority_scope: route.authority_scope.clone(),
                             provider: route.request.provider.clone(),
                             retired_at,
                             run_bound: route.admission.is_some(),
@@ -497,6 +538,7 @@ impl InferenceRelay {
                         (
                             route.session_id().to_string(),
                             route.owner_subject.clone(),
+                            route.authority_scope.clone(),
                             route.provider.clone(),
                             route.run_bound,
                         )
@@ -506,13 +548,14 @@ impl InferenceRelay {
                 None
             };
             let retired_route =
-                if let Some((session_id, owner_subject, provider, run_bound)) = retired {
+                if let Some((session_id, owner_subject, authority_scope, provider, run_bound)) = retired {
                     let replacement = state
                         .active
                         .values()
                         .find(|candidate| {
                             candidate.session_id() == session_id
                                 && candidate.owner_subject == owner_subject
+                                && candidate.authority_scope == authority_scope
                                 && candidate.request.provider == provider
                                 && !run_bound && candidate.admission.is_none()
                         })
@@ -612,11 +655,18 @@ impl InferenceRelay {
         let authority = match self.current_authority(&route).await {
             Ok(authority) => authority,
             Err(error) => {
-                tracing::warn!(err = %error, "inference relay authority refresh failed");
-                return json_response(
+                tracing::warn!(reason = error.reason, cause = error.cause.as_deref(),
+                    "inference relay authority refresh failed");
+                let mut response = json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     json!({ "error": "agent_auth_unavailable" }),
                 );
+                if let Some(delay) = error.retry_after {
+                    let seconds = delay.as_secs().saturating_add(u64::from(delay.subsec_nanos() > 0));
+                    response.headers_mut().insert(hyper::header::RETRY_AFTER,
+                        hyper::header::HeaderValue::from_str(&seconds.to_string()).expect("integer retry delay"));
+                }
+                return response;
             }
         };
         let cancellation = route.cancellation.clone();
@@ -645,7 +695,7 @@ impl InferenceRelay {
             .proxy_agent_inference(AgentInferenceProxyRequest {
                 endpoint,
                 query,
-                authority: &authority,
+                authority: &authority.authority,
                 conversation_id: &route.request.logical_session_id,
                 requested_account_id: route.request.requested_account_id.as_deref(),
                 request_id: &request_id,
@@ -656,7 +706,7 @@ impl InferenceRelay {
             })
             .await;
         match upstream {
-            Ok(response) => stream_response(response, cancellation, stream_context, activity),
+            Ok(response) => self.authority_response(response, &authority, cancellation, stream_context, activity).await,
             Err(error) => {
                 tracing::warn!(err = %error, "inference relay upstream failed");
                 json_response(
@@ -667,34 +717,167 @@ impl InferenceRelay {
         }
     }
 
-    async fn current_authority(
+    async fn authority_response(
         &self,
-        route: &Route,
-    ) -> Result<AgentInferenceAuthority, EngineError> {
-        // A cached authority must not outlive a sign-out/profile switch.
-        self.inner.client.require_auth().await
-            .map_err(|error| EngineError::Other(error.to_string()))?;
-        let mut current = route.authority.lock().await;
-        if current.expires_at <= Utc::now() + TimeDelta::seconds(REFRESH_SKEW_SECONDS) {
-            let authority = self
-                .inner
-                .client
-                .issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
-                .await
-                .map_err(|error| {
-                    EngineError::Other(format!("Agent Auth authority renewal failed: {error}"))
-                })?;
-            let expires_at = validate_authority(&authority)?;
-            if authority.principal_id != route.owner_subject {
-                route.cancellation.cancel();
-                return Err(EngineError::Other("Agent Auth route owner changed".into()));
-            }
-            *current = AuthorityState {
-                authority,
-                expires_at,
-            };
+        response: reqwest::Response,
+        lease: &AuthorityLease,
+        cancellation: zeron_harness::CancellationToken,
+        context: RelayStreamContext,
+        activity: Option<crate::sessions::InferenceActivity>,
+    ) -> Response<RelayBody> {
+        const MAX_AUTH_ERROR_BYTES: usize = 4096;
+        if response.status() != StatusCode::UNAUTHORIZED
+            || response.headers().contains_key("x-agent-auth-selected-account-id")
+            || response.content_length().is_some_and(|length| length > MAX_AUTH_ERROR_BYTES as u64)
+        {
+            return stream_response(response, cancellation, context, activity);
         }
-        Ok(current.authority.clone())
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut upstream = response.bytes_stream()
+            .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
+        let mut prefix = Vec::new();
+        let mut length = 0;
+        let deadline = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(deadline);
+        let complete = loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break false,
+                _ = &mut deadline => break false,
+                chunk = upstream.next() => chunk,
+            };
+            let Some(chunk) = chunk else { break true };
+            if chunk.as_ref().is_ok_and(Bytes::is_empty) { continue; }
+            let failed = chunk.is_err();
+            length += chunk.as_ref().map_or(0, Bytes::len);
+            prefix.push(chunk);
+            if failed || length > MAX_AUTH_ERROR_BYTES { break false; }
+        };
+        if complete {
+            #[derive(serde::Deserialize)]
+            struct AuthorityError<'a> { error: &'a str }
+            let bytes: Cow<'_, [u8]> = match prefix.as_slice() {
+                [Ok(bytes)] => Cow::Borrowed(bytes),
+                chunks => Cow::Owned(chunks.iter().filter_map(|chunk| chunk.as_ref().ok())
+                    .flat_map(|chunk| chunk.iter().copied()).collect()),
+            };
+            if serde_json::from_slice::<AuthorityError<'_>>(&bytes).ok()
+                .is_some_and(|body| body.error == "agent_auth_v2_authority_invalid")
+            {
+                self.invalidate_authority(lease).await;
+            }
+        }
+        // Never replay a model POST or consume/rewrite its response. Only a later
+        // independent request may reissue; retain the native activity until EOF.
+        let stream = futures::stream::iter(prefix).chain(upstream);
+        instrumented_streamed_response(status, headers, Box::pin(stream), cancellation, context, activity)
+    }
+
+    async fn invalidate_authority(&self, rejected: &AuthorityLease) {
+        let mut current = self.inner.authority.lock().await;
+        if current.lease.as_ref().is_some_and(|lease| {
+            lease.generation == rejected.generation
+                && lease.credential_generation == rejected.credential_generation
+        }) {
+            current.lease = None;
+            current.retry_at = None;
+        }
+    }
+
+    async fn current_authority(&self, route: &Route) -> Result<Arc<AuthorityLease>, AuthorityRefreshError> {
+        let lease = tokio::select! {
+            biased;
+            _ = route.cancellation.cancelled() => return Err(AuthorityRefreshError::new("route_cancelled")),
+            lease = self.shared_authority() => lease?,
+        };
+        let reason = if lease.authority.principal_id != route.owner_subject {
+            Some("route_owner_changed")
+        } else if lease.authority.authority_scope != route.authority_scope {
+            Some("route_scope_changed")
+        } else { None };
+        if let Some(reason) = reason {
+            route.cancellation.cancel();
+            return Err(AuthorityRefreshError::new(reason));
+        }
+        Ok(lease)
+    }
+
+    async fn shared_authority(&self) -> Result<Arc<AuthorityLease>, AuthorityRefreshError> {
+        // This pool belongs to one immutable Scaffold client/profile, not an
+        // account/provider. Credential rotation discards all cached authorization.
+        let mut current = self.inner.authority.clone().lock_owned().await;
+        let credential_generation = self.inner.client.credential().await
+            .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?.generation;
+        if current.credential_generation != Some(credential_generation) {
+            current.credential_generation = Some(credential_generation);
+            current.lease = None;
+            current.retry_at = None;
+        }
+        if let Some(remaining) = current.retry_at
+            .map(|(started, delay)| delay.saturating_sub(started.elapsed()))
+            .filter(|remaining| !remaining.is_zero())
+        {
+            return Err(AuthorityRefreshError {
+                reason: "authority_issuance_cooldown", retry_after: Some(remaining), cause: None,
+            });
+        }
+        if let Some(lease) = current.lease.as_ref() {
+            if lease.expires_at > Utc::now() + TimeDelta::seconds(EXPIRY_BOUNDARY_SECONDS) {
+                return Ok(lease.clone());
+            }
+        }
+        // Only misses spawn work. The owned lock coalesces routes, and cancelling
+        // a waiter cannot abort another run's acquisition or take its admission.
+        let client = self.inner.client.clone();
+        tokio::spawn(async move {
+            let result = async {
+                if let Some(lease) = current.lease.as_ref() {
+                    let now = Utc::now();
+                    if lease.expires_at > now {
+                        let remaining = (lease.expires_at - now).to_std()
+                            .map_err(|_| AuthorityRefreshError::new("invalid_expiry"))?;
+                        tokio::time::sleep(remaining).await;
+                        if lease.expires_at > Utc::now() {
+                            return Err(AuthorityRefreshError {
+                                reason: "expiry_boundary_pending",
+                                retry_after: Some(Duration::from_secs(1)), cause: None,
+                            });
+                        }
+                    }
+                }
+                let before = client.credential().await
+                    .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?.generation;
+                if before != credential_generation {
+                    return Err(AuthorityRefreshError::new("credential_changed"));
+                }
+                let authority = client.issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
+                    .await.map_err(|error| AuthorityRefreshError::scaffold("authority_issuance_failed", &error))?;
+                let expires_at = validate_authority(&authority).map_err(|error| AuthorityRefreshError {
+                    reason: "invalid_authority", retry_after: None, cause: Some(error.to_string()),
+                })?;
+                let after = client.credential().await
+                    .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?.generation;
+                if after != credential_generation {
+                    return Err(AuthorityRefreshError::new("credential_changed"));
+                }
+                current.generation += 1;
+                Ok(Arc::new(AuthorityLease {
+                    authority, expires_at, credential_generation, generation: current.generation,
+                }))
+            }.await;
+            match &result {
+                Ok(lease) => {
+                    current.lease = Some(lease.clone());
+                    current.retry_at = None;
+                }
+                Err(error) => {
+                    // Coalesce failures without permanently poisoning a credential.
+                    current.retry_at = Some((Instant::now(), error.retry_after.unwrap_or(Duration::from_secs(1))));
+                }
+            }
+            result
+        }).await.map_err(|_| AuthorityRefreshError::new("authority_acquisition_cancelled"))?
     }
 }
 
@@ -817,7 +1000,18 @@ fn stream_response(
     let upstream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(|error| -> BoxError { Box::new(error) }));
-    let mut stream = InstrumentedRelayStream::new(Box::pin(upstream), cancellation, context, status);
+    instrumented_streamed_response(status, headers, Box::pin(upstream), cancellation, context, activity)
+}
+
+fn instrumented_streamed_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    upstream: RelayByteStream,
+    cancellation: zeron_harness::CancellationToken,
+    context: RelayStreamContext,
+    activity: Option<crate::sessions::InferenceActivity>,
+) -> Response<RelayBody> {
+    let mut stream = InstrumentedRelayStream::new(upstream, cancellation, context, status);
     stream.activity = activity;
     streamed_response(status, headers, Box::pin(stream))
 }
