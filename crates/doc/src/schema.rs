@@ -614,6 +614,13 @@ impl SessionDoc {
     /// here, and one malformed entry must not wedge command draining for the
     /// chat forever (an unparseable command can't be executed anyway).
     pub fn read_commands(&self) -> Result<Vec<SessionCommandEntry>, DocError> {
+        self.read_commands_with_receipts(&self.read_command_receipts()?)
+    }
+
+    fn read_commands_with_receipts(
+        &self,
+        receipts: &std::collections::HashMap<String, crate::commands::CommandReceipt>,
+    ) -> Result<Vec<SessionCommandEntry>, DocError> {
         // Container-scoped for the same reason as `read_entries`: the drain
         // loop runs this per tick and must not pay for the transcript.
         let commands = self
@@ -624,14 +631,95 @@ impl SessionDoc {
         let raw: Vec<serde_json::Value> = serde_json::from_value(commands)?;
         Ok(raw
             .into_iter()
-            .filter_map(|v| match serde_json::from_value(v) {
-                Ok(entry) => Some(entry),
+            .filter_map(|v| match serde_json::from_value::<SessionCommandEntry>(v) {
+                Ok(mut entry) => {
+                    if let Some(receipt) = receipts.get(&entry.id) {
+                        entry.accepted_at = Some(receipt.accepted_at);
+                        entry.status = receipt.status;
+                        entry.resolution = receipt.resolution.clone();
+                    }
+                    Some(entry)
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "skipping malformed command entry");
                     None
                 }
             })
             .collect())
+    }
+
+    pub(crate) fn read_command_receipts(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::commands::CommandReceipt>, DocError> {
+        let raw: std::collections::HashMap<String, serde_json::Value> = serde_json::from_value(
+            self.doc.get_map("commandReceipts").get_deep_value().to_json_value(),
+        )?;
+        Ok(raw.into_iter().filter_map(|(id, value)| {
+            match serde_json::from_value(value) {
+                Ok(receipt) => Some((id, receipt)),
+                Err(error) => {
+                    tracing::warn!(%error, "skipping malformed command receipt");
+                    None
+                }
+            }
+        }).collect())
+    }
+
+    /// Host receipts also cover relayed commands whose sender row has not synced yet.
+    pub fn command_delivery(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::CommandDeliveryStatus>, DocError> {
+        let receipts = self.read_command_receipts()?;
+        let commands = self.read_commands_with_receipts(&receipts)?;
+        let command_ids: std::collections::HashSet<&str> =
+            commands.iter().map(|command| command.id.as_str()).collect();
+        let rows = commands.iter().filter_map(|command| {
+            Some((command.payload.message_id()?, command.issued_at, command.status,
+                command.accepted_at, command.resolution.as_deref()))
+        });
+        let mut missing_rows: Vec<_> = receipts.iter()
+            .filter(|(id, _)| !command_ids.contains(id.as_str()))
+            .collect();
+        // Equal timestamps use stable receipt IDs, then authoritative row order.
+        missing_rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let missing_rows = missing_rows.into_iter().filter_map(|(_, receipt)| {
+            Some((receipt.message_id.as_deref()?, receipt.issued_at, receipt.status,
+                Some(receipt.accepted_at), receipt.resolution.as_deref()))
+        });
+        Ok(crate::commands::project_command_delivery(missing_rows.chain(rows)))
+    }
+
+    pub fn pending_command_receipt_ids(&self) -> Result<Vec<String>, DocError> {
+        Ok(self.read_command_receipts()?.into_iter()
+            .filter_map(|(id, receipt)| (receipt.status == SessionCommandStatus::Pending).then_some(id))
+            .collect())
+    }
+
+    /// Host-only acceptance; never appends a second sender-owned command row.
+    pub fn accept_command(&self, entry: &SessionCommandEntry, accepted_at: i64) -> Result<(), DocError> {
+        let receipts = self.doc.get_map("commandReceipts");
+        if receipts.get(&entry.id).is_some() {
+            return Ok(());
+        }
+        let receipt = crate::commands::CommandReceipt {
+            message_id: entry.payload.message_id().map(str::to_owned),
+            issued_at: entry.issued_at,
+            accepted_at,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        receipts.insert(&entry.id, loro_value_from_json(&serde_json::to_value(receipt)?))?;
+        let commands = self.doc.get_list("commands");
+        for i in 0..commands.len() {
+            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = commands.get(i)
+                && matches!(map.get("id"), Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == entry.id)
+            {
+                map.insert("acceptedAt", accepted_at)?;
+                break;
+            }
+        }
+        self.doc.commit();
+        Ok(())
     }
 
     /// Append a command entry (rule 1: own entries only, append-only).
@@ -660,6 +748,12 @@ impl SessionDoc {
         if let Some(expires_at) = entry.expires_at {
             map.insert("expiresAt", expires_at)?;
         }
+        if let Some(accepted_at) = entry.accepted_at {
+            map.insert("acceptedAt", accepted_at)?;
+        }
+        if let Some(resolution) = &entry.resolution {
+            map.insert("resolution", resolution.as_str())?;
+        }
         map.insert(
             "status",
             serde_json::to_value(entry.status)?
@@ -677,6 +771,19 @@ impl SessionDoc {
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) -> Result<(), DocError> {
+        let receipts = self.doc.get_map("commandReceipts");
+        let receipt_updated = if let Some(value) = receipts.get(command_id) {
+            let mut receipt: crate::commands::CommandReceipt =
+                serde_json::from_value(value.get_deep_value().to_json_value())?;
+            receipt.status = status;
+            receipt.resolution = resolution.map(str::to_owned);
+            receipts.insert(
+                command_id, loro_value_from_json(&serde_json::to_value(receipt)?),
+            )?;
+            true
+        } else {
+            false
+        };
         let commands = self.doc.get_list("commands");
         for i in 0..commands.len() {
             if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
@@ -700,6 +807,10 @@ impl SessionDoc {
                     return Ok(());
                 }
             }
+        }
+        if receipt_updated {
+            self.doc.commit();
+            return Ok(());
         }
         Err(DocError::Schema(format!("command {command_id} not found")))
     }
@@ -2221,15 +2332,142 @@ mod tests {
             based_on: None,
             expires_at: None,
             status: SessionCommandStatus::Pending,
+            accepted_at: None,
             resolution: None,
         };
         doc.queue_command(&entry).unwrap();
+        doc.accept_command(&entry, 12).unwrap();
+        let accepted = doc.read_commands().unwrap();
+        assert!(accepted[0].is_accepted());
+        assert_eq!(accepted[0].accepted_at, Some(12));
+        let rebuilt = SessionDoc::init("rebuilt").unwrap();
+        rebuilt.queue_command(&accepted[0]).unwrap();
+        assert!(rebuilt.read_commands().unwrap()[0].is_accepted());
         doc.set_command_status("c1", SessionCommandStatus::Applied, None)
             .unwrap();
         let commands = doc.read_commands().unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, SessionCommandStatus::Applied);
         assert_eq!(commands[0].payload, entry.payload);
+    }
+
+    #[test]
+    fn relay_receipt_precedes_sender_row_and_retains_terminal_outcome() {
+        let doc = SessionDoc::init("relay").unwrap();
+        let entry = SessionCommandEntry {
+            id: "relay-command".into(),
+            payload: crate::SessionCommandPayload::Steer {
+                prompt: "go".into(), message_id: Some("message".into()),
+            },
+            issued_by: "sender".into(), issued_at: 1, based_on: None, expires_at: None,
+            status: SessionCommandStatus::Pending, accepted_at: None, resolution: None,
+        };
+        doc.accept_command(&entry, 2).unwrap();
+        assert!(doc.read_commands().unwrap().is_empty());
+        assert_eq!(doc.pending_command_receipt_ids().unwrap(), vec![entry.id.clone()]);
+        assert_eq!(doc.command_delivery().unwrap()["message"], crate::CommandDeliveryStatus::Preparing);
+        let pending = crate::rebuild::rebuild_thin_doc(&doc).unwrap().doc;
+        assert!(pending.read_commands().unwrap().is_empty());
+        assert_eq!(pending.pending_command_receipt_ids().unwrap(), vec![entry.id.clone()]);
+        let remote = SessionDoc::from_doc(LoroDoc::new());
+        remote.doc().import(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(remote.command_delivery().unwrap()["message"], crate::CommandDeliveryStatus::Preparing);
+        doc.set_command_status(&entry.id, SessionCommandStatus::Rejected, Some("Retry with another branch.")).unwrap();
+        assert!(doc.pending_command_receipt_ids().unwrap().is_empty());
+        let doc = crate::rebuild::rebuild_thin_doc(&doc).unwrap().doc;
+        assert!(doc.read_commands().unwrap().is_empty());
+        assert_eq!(doc.command_delivery().unwrap()["message"], crate::CommandDeliveryStatus::Failed {
+            reason: "Retry with another branch.".into(),
+        });
+        doc.queue_command(&entry).unwrap();
+        let commands = doc.read_commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, SessionCommandStatus::Rejected);
+        assert_eq!(commands[0].accepted_at, Some(2));
+        assert_eq!(commands[0].payload, entry.payload);
+        assert_eq!(commands[0].resolution.as_deref(), Some("Retry with another branch."));
+        assert_eq!(doc.command_delivery().unwrap()["message"], crate::CommandDeliveryStatus::Failed {
+            reason: "Retry with another branch.".into(),
+        });
+        doc.push_message(&user_entry("message", "go")).unwrap();
+        let rebuilt = crate::rebuild::rebuild_thin_doc(&doc).unwrap().doc;
+        assert!(rebuilt.read_command_receipts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebuild_retains_latest_unlanded_failed_preparation_for_retry() {
+        for status in [SessionCommandStatus::Rejected, SessionCommandStatus::Expired] {
+            let doc = SessionDoc::init("failed-preparation").unwrap();
+            let mut entry = SessionCommandEntry {
+                id: "old".into(),
+                payload: crate::SessionCommandPayload::Steer {
+                    prompt: "original retry payload".into(), message_id: Some("message".into()),
+                },
+                issued_by: "sender".into(), issued_at: 1, based_on: None, expires_at: None,
+                status, accepted_at: Some(2), resolution: Some("Checkout failed: branch unavailable.".into()),
+            };
+            doc.queue_command(&entry).unwrap();
+            entry.id = "latest".into();
+            entry.issued_at = 3;
+            doc.queue_command(&entry).unwrap();
+            let rebuilt = crate::rebuild::rebuild_thin_doc(&doc).unwrap().doc;
+            let commands = rebuilt.read_commands().unwrap();
+            assert_eq!(commands, vec![entry.clone()]);
+            assert_eq!(rebuilt.command_delivery().unwrap()["message"], crate::CommandDeliveryStatus::Failed {
+                reason: entry.resolution.clone().unwrap(),
+            });
+            let mut retry = commands[0].clone();
+            retry.id = "retry".into();
+            retry.issued_at = 4;
+            retry.status = SessionCommandStatus::Pending;
+            retry.accepted_at = None;
+            retry.resolution = None;
+            rebuilt.queue_command(&retry).unwrap();
+            assert!(rebuilt.command_delivery().unwrap().is_empty());
+            assert_eq!(crate::rebuild::rebuild_thin_doc(&rebuilt).unwrap().doc.read_commands().unwrap(), vec![retry]);
+            doc.push_message(&user_entry("message", "original retry payload")).unwrap();
+            assert!(crate::rebuild::rebuild_thin_doc(&doc).unwrap().doc.read_commands().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn equal_timestamp_sender_retry_suppresses_orphan_failure() {
+        let doc = SessionDoc::init("relay-retry").unwrap();
+        let mut entry = SessionCommandEntry {
+            id: "z-old-orphan".into(),
+            payload: crate::SessionCommandPayload::Steer {
+                prompt: "go".into(), message_id: Some("message".into()),
+            },
+            issued_by: "sender".into(), issued_at: 1, based_on: None, expires_at: None,
+            status: SessionCommandStatus::Pending, accepted_at: None, resolution: None,
+        };
+        doc.accept_command(&entry, 2).unwrap();
+        doc.set_command_status(&entry.id, SessionCommandStatus::Rejected, Some("Retry sending.")).unwrap();
+        entry.id = "a-new-row".into();
+        doc.queue_command(&entry).unwrap();
+        assert!(doc.command_delivery().unwrap().is_empty());
+    }
+
+    #[test]
+    fn equal_timestamp_orphan_receipts_use_stable_id_order() {
+        for ids in [["z", "a"], ["a", "z"]] {
+            let doc = SessionDoc::init("relay-ties").unwrap();
+            for id in ids {
+                let entry = SessionCommandEntry {
+                    id: id.into(),
+                    payload: crate::SessionCommandPayload::Steer {
+                        prompt: "go".into(), message_id: Some("message".into()),
+                    },
+                    issued_by: "sender".into(), issued_at: 1, based_on: None, expires_at: None,
+                    status: SessionCommandStatus::Pending, accepted_at: None, resolution: None,
+                };
+                doc.accept_command(&entry, 2).unwrap();
+                if id == "a" {
+                    doc.set_command_status(id, SessionCommandStatus::Rejected, Some("Retry sending.")).unwrap();
+                }
+            }
+            assert_eq!(doc.command_delivery().unwrap()["message"], crate::CommandDeliveryStatus::Preparing);
+        }
     }
 
     #[test]

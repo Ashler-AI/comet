@@ -2497,9 +2497,11 @@ async fn stalled_prompt_post_has_a_bounded_timeout() {
     .await;
     wire.request("/prompt_async").await;
     wire.status("busy");
-    tokio::task::yield_now().await;
     tokio::time::pause();
-    tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
+    // The request receipt above proves the POST timeout is armed. Let the
+    // timer driver process it before starting done()'s deadline: advance()
+    // jumps the clock without waiting for expired timers to be processed.
+    tokio::time::sleep(CALL_TIMEOUT + Duration::from_secs(1)).await;
     assert_eq!(wire.done().await.0, DoneStatus::Errored);
 }
 

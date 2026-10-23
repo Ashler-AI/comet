@@ -40,6 +40,9 @@ fn scaffold_host_rpc_allowed(method: &str, params: &Value, session_id: &str) -> 
 
 fn own_directory_search(params: &mut Value, owner: &str) -> Result<(), RpcError> {
     let object = params.as_object_mut().ok_or_else(|| denied("Session search requires an object"))?;
+    // CLI Option fields arrive as null; the directory API requires omission.
+    object.retain(|key, value| !value.is_null()
+        || !matches!(key.as_str(), "query" | "sourceUrl" | "ownerId" | "limit" | "cursor"));
     if object.get("ownerId").is_some_and(|value| value.as_str() != Some(owner)) {
         return Err(denied("Personal session search cannot select another owner"));
     }
@@ -610,9 +613,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn personal_directory_search_rejects_a_foreign_owner() {
-        let mut request = json!({"query": "private", "ownerId": "another@example.com"});
-        assert!(own_directory_search(&mut request, "owner@example.com").is_err());
+    fn personal_directory_search_accepts_cli_defaults_and_preserves_owner_scope() {
+        let cli = json!({"query": "deprecat", "sourceUrl": null, "ownerId": null, "limit": 50, "cursor": null});
+        let mut request = cli.clone();
+        own_directory_search(&mut request, "owner@example.com").unwrap();
+        assert_eq!(request, json!({"query": "deprecat", "ownerId": "owner@example.com", "limit": 50}));
+
+        for owner in [None, Some(json!(null)), Some(json!("owner@example.com"))] {
+            let mut request = json!({"query": null, "sourceUrl": "https://example.slack.com/archives/C123/p1234567890123456",
+                "limit": null, "cursor": "next-page"});
+            if let Some(owner) = owner { request["ownerId"] = owner; }
+            own_directory_search(&mut request, "owner@example.com").unwrap();
+            assert_eq!(request, json!({"sourceUrl": "https://example.slack.com/archives/C123/p1234567890123456",
+                "ownerId": "owner@example.com", "cursor": "next-page"}));
+        }
+
+        for owner in [json!("another@example.com"), json!(""), json!(false), json!(42), json!([]), json!({})] {
+            let mut request = cli.clone();
+            request["ownerId"] = owner;
+            assert!(own_directory_search(&mut request, "owner@example.com").is_err());
+        }
+        let mut invalid = json!(null);
+        assert!(own_directory_search(&mut invalid, "owner@example.com").is_err());
     }
 
     #[test]

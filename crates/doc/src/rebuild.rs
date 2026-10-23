@@ -5,9 +5,10 @@
 //! fat inline tool outputs become one-line summaries, inline diffs become
 //! per-file stats — and the stripped full payloads are returned so the host
 //! can upload them to the A2 sidecar (existing whale outputs stay viewable;
-//! zero information loss). Commands: only unresolved entries carry over (the
-//! `processed_commands` mark-before-execute ledger protects against
-//! re-execution regardless).
+//! zero information loss). Commands retain unresolved work and the latest
+//! unlanded preparation failure needed for explicit retry. Rowless receipts
+//! survive until the sender row arrives; the `processed_commands` ledger
+//! protects against re-execution regardless.
 //!
 //! `meta.epoch = 2` marks the new lineage. Other devices seeing a
 //! `roomGen: 2` chat with a local `epoch < 2` doc discard-and-adopt (M3);
@@ -72,6 +73,7 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
     let mut sidecar = Vec::new();
     let entries = source.read_entries()?;
     let entry_count = entries.len();
+    let mut message_ids = std::collections::HashSet::with_capacity(entry_count);
     for mut entry in entries {
         for part in entry.parts.iter_mut() {
             if let Some(payload) = strip_part(&chat_id, part) {
@@ -79,15 +81,44 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
             }
         }
         thin.push_message(&entry)?;
+        message_ids.insert(entry.id);
     }
 
     let mut commands_copied = 0;
-    for command in source.read_commands()? {
-        // Only unresolved work crosses the epoch: resolved/expired ledger
-        // history is exactly the bulk a wedged room can't afford to carry.
-        if command.status == SessionCommandStatus::Pending {
-            thin.queue_command(&command)?;
+    let commands = source.read_commands()?;
+    let mut latest = std::collections::HashMap::<&str, &crate::SessionCommandEntry>::new();
+    for command in &commands {
+        if let Some(message_id) = command.payload.message_id() {
+            let attempt = latest.entry(message_id).or_insert(command);
+            if command.issued_at >= attempt.issued_at {
+                *attempt = command;
+            }
+        }
+    }
+    let mut retained_commands = std::collections::HashMap::with_capacity(commands.len());
+    for command in &commands {
+        // Keep only unresolved work and the latest unlanded preparation failure
+        // whose original request is still needed for an explicit retry.
+        let actionable_failure = command.accepted_at.is_some()
+            && matches!(command.status, SessionCommandStatus::Rejected | SessionCommandStatus::Expired)
+            && command.payload.message_id().is_some_and(|id| {
+                !message_ids.contains(id) && latest.get(id).is_some_and(|latest| latest.id == command.id)
+            });
+        let retain = command.status == SessionCommandStatus::Pending || actionable_failure;
+        retained_commands.insert(command.id.as_str(), retain);
+        if retain {
+            thin.queue_command(command)?;
             commands_copied += 1;
+        }
+    }
+    // A rowless outcome must survive until its original sender-owned row arrives.
+    for (id, receipt) in source.read_command_receipts()? {
+        if receipt.status == SessionCommandStatus::Pending
+            || retained_commands.get(id.as_str()).is_none_or(|retain| *retain)
+        {
+            thin.doc().get_map("commandReceipts").insert(
+                &id, loro::LoroValue::from(serde_json::to_value(receipt)?),
+            )?;
         }
     }
     thin.doc().commit();
@@ -215,6 +246,7 @@ mod tests {
             based_on: None,
             expires_at: None,
             status,
+            accepted_at: None,
             resolution: None,
         }
     }

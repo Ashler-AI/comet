@@ -79,6 +79,7 @@ fn main() {
         based_on: None,
         expires_at: None,
         status: SessionCommandStatus::Pending,
+        accepted_at: None,
         resolution: None,
     })
     .expect("queue command");

@@ -65,6 +65,14 @@ impl SessionCommandPayload {
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
         }
     }
+
+    pub(crate) fn message_id(&self) -> Option<&str> {
+        match self {
+            Self::Run { message_id, .. } => Some(message_id),
+            Self::Steer { message_id, .. } => message_id.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -88,6 +96,9 @@ pub struct SessionCommandEntry {
     #[serde(default)]
     pub expires_at: Option<i64>,
     pub status: SessionCommandStatus,
+    /// Epoch millis when the host accepted this attempt for preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<i64>,
     #[serde(default)]
     pub resolution: Option<String>,
 }
@@ -97,10 +108,77 @@ impl SessionCommandEntry {
         self.payload.kind()
     }
 
+    pub fn is_accepted(&self) -> bool {
+        self.status == SessionCommandStatus::Pending && self.accepted_at.is_some()
+    }
+
     pub fn effective_expiry(&self) -> i64 {
         self.expires_at
             .unwrap_or(self.issued_at + COMMAND_DEFAULT_TTL_MS)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandDeliveryStatus {
+    Preparing,
+    Failed { reason: String },
+}
+
+/// Latest attempt per message wins, including attempts with no delivery overlay.
+pub fn command_delivery(
+    commands: &[SessionCommandEntry],
+) -> std::collections::HashMap<String, CommandDeliveryStatus> {
+    project_command_delivery(commands.iter().filter_map(|command| {
+        Some((command.payload.message_id()?, command.issued_at, command.status,
+            command.accepted_at, command.resolution.as_deref()))
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CommandReceipt {
+    pub message_id: Option<String>,
+    pub issued_at: i64,
+    pub accepted_at: i64,
+    pub status: SessionCommandStatus,
+    pub resolution: Option<String>,
+}
+
+pub(crate) fn project_command_delivery<'a>(
+    attempts: impl Iterator<Item = (&'a str, i64, SessionCommandStatus, Option<i64>, Option<&'a str>)>,
+) -> std::collections::HashMap<String, CommandDeliveryStatus> {
+    let mut latest = std::collections::HashMap::new();
+    for (message_id, issued_at, status, accepted_at, resolution) in attempts {
+        let attempt = latest.entry(message_id).or_insert((issued_at, status, accepted_at, resolution));
+        if issued_at >= attempt.0 {
+            *attempt = (issued_at, status, accepted_at, resolution);
+        }
+    }
+    latest
+        .into_iter()
+        .filter_map(|(message_id, (_, status, accepted_at, resolution))| {
+            let status = match status {
+                SessionCommandStatus::Pending if accepted_at.is_some() => {
+                    CommandDeliveryStatus::Preparing
+                }
+                SessionCommandStatus::Rejected | SessionCommandStatus::Expired => {
+                    let fallback = if status == SessionCommandStatus::Expired {
+                        "Delivery expired. Retry when the host is available."
+                    } else {
+                        "The host could not prepare this message. Retry sending it."
+                    };
+                    CommandDeliveryStatus::Failed {
+                        reason: resolution
+                            .filter(|reason| !reason.trim().is_empty())
+                            .unwrap_or(fallback).to_owned(),
+                    }
+                }
+                _ => return None,
+            };
+            Some((message_id.to_owned(), status))
+        })
+        .collect()
 }
 
 /// Rule 2: only the composer that issued a still-pending command may cancel it.
@@ -185,6 +263,7 @@ mod tests {
             based_on: None,
             expires_at: None,
             status: SessionCommandStatus::Pending,
+            accepted_at: None,
             resolution: None,
         }
     }
@@ -198,6 +277,37 @@ mod tests {
             },
             issued_at,
         )
+    }
+
+    #[test]
+    fn delivery_projection_uses_latest_attempt_and_typed_acceptance() {
+        let mut failed = entry("old", SessionCommandPayload::Steer {
+            prompt: "go".into(), message_id: Some("message".into()),
+        }, 1);
+        failed.status = SessionCommandStatus::Rejected;
+        failed.resolution = Some("Select an available model and retry.".into());
+        assert_eq!(command_delivery(&[failed.clone()])["message"],
+            CommandDeliveryStatus::Failed { reason: failed.resolution.clone().unwrap() });
+        let mut retry = failed.clone();
+        retry.id = "retry".into();
+        retry.issued_at = 2;
+        retry.status = SessionCommandStatus::Pending;
+        assert!(!retry.is_accepted());
+        assert!(command_delivery(&[retry.clone(), failed.clone()]).is_empty());
+        retry.accepted_at = Some(3);
+        assert!(retry.is_accepted());
+        assert_eq!(command_delivery(&[failed.clone(), retry.clone()])["message"],
+            CommandDeliveryStatus::Preparing);
+        retry.status = SessionCommandStatus::Applied;
+        assert!(!retry.is_accepted());
+        assert!(command_delivery(&[failed, retry.clone()]).is_empty());
+        retry.status = SessionCommandStatus::Expired;
+        retry.resolution = None;
+        assert!(matches!(&command_delivery(&[retry])["message"],
+            CommandDeliveryStatus::Failed { reason } if reason.contains("Retry")));
+        let legacy = serde_json::to_value(steer("legacy", 1)).unwrap();
+        assert!(legacy.get("acceptedAt").is_none());
+        assert!(!serde_json::from_value::<SessionCommandEntry>(legacy).unwrap().is_accepted());
     }
 
     fn cx<'a>(

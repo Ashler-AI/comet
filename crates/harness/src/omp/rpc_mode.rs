@@ -301,8 +301,8 @@ impl Drop for ProcessGroupGuard {
 
 pub(crate) struct RpcModeProcess {
     pub child: Child,
-    /// Dedicated process group for this persistent run (supervisor + OMP +
-    /// tool descendants). `None` only for one-shot catalogs and legacy tests.
+    /// Dedicated process group for this RPC child and its descendants.
+    /// `None` on non-Unix hosts and in legacy tests.
     pub process_group: Option<i32>,
     /// Drop guard for task cancellation, panic unwind, and setup failures.
     pub process_group_guard: ProcessGroupGuard,
@@ -1271,22 +1271,41 @@ pub(crate) async fn command_catalog(
                     }
                     Some("response")
                         if frame.get("command").and_then(Value::as_str)
-                            == Some("get_available_commands")
-                            && frame.get("success").and_then(Value::as_bool) == Some(true) =>
+                            == Some("get_available_commands") =>
                     {
-                        if let Some(commands) = frame.get("data").and_then(commands_from_frame) {
-                            latest = Some(commands);
+                        if frame.get("success").and_then(Value::as_bool) != Some(true) {
+                            return Err(HarnessError::Protocol(format!(
+                                "OMP RPC get_available_commands: {}",
+                                frame.get("error").and_then(Value::as_str).unwrap_or("command failed"),
+                            )));
                         }
+                        latest = Some(frame.get("data").and_then(commands_from_frame).ok_or_else(|| {
+                            HarnessError::Protocol("OMP RPC get_available_commands returned no commands array".into())
+                        })?);
+                    }
+                    Some("agent_start") => return Err(HarnessError::Protocol(
+                        "OMP command discovery attempted to start inference".into(),
+                    )),
+                    Some("notice")
+                        if matches!(frame.get("source").and_then(Value::as_str),
+                            Some("command-catalog" | "command-catalog-supervisor"))
+                            && frame.get("level").and_then(Value::as_str) == Some("error") =>
+                    {
+                        return Err(HarnessError::Protocol(
+                            frame.get("message").and_then(Value::as_str)
+                                .unwrap_or("OMP command catalog failed").to_owned(),
+                        ));
                     }
                     _ => {}
                 },
                 Some(RpcFrame::Eof) | None => {
-                    if let Some(commands) = latest {
+                    let status = process.child.wait().await?;
+                    if status.success() && let Some(commands) = latest {
                         return Ok(commands);
                     }
                     return Err(HarnessError::Protocol(crate::crash_message(
                         "OMP RPC command catalog",
-                        process.child.try_wait().ok().flatten(),
+                        Some(status),
                         &process.stderr_tail,
                     )));
                 }
@@ -1294,14 +1313,153 @@ pub(crate) async fn command_catalog(
         }
     })
     .await
-    .map_err(|_| HarnessError::Protocol("OMP command catalog timed out".into()))?;
+    .map_err(|_| HarnessError::Protocol("OMP command catalog timed out".into()));
+    #[cfg(unix)]
+    if !process.process_group_guard.supervised && let Some(pid) = process.child.id() {
+        // Extension/MCP children can lead their own groups; collect them before
+        // ending OMP so they do not become untraceable orphans.
+        let descendants = crate::process::descendants(pid).await;
+        crate::process::terminate_tree(&descendants, Duration::ZERO).await;
+    }
     kill_rpc_process(&mut process.child, process.process_group, Duration::ZERO).await;
-    result
+    result?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_catalog_reports_failures_and_reaps_before_returning() {
+        for (response, expected) in [
+            (r#"{"type":"response","command":"get_available_commands","success":false,"error":"catalog provider unavailable"}"#, "catalog provider unavailable"),
+            (r#"{"type":"response","command":"get_available_commands","success":true,"data":{}}"#, "returned no commands array"),
+            (r#"{"type":"agent_start"}"#, "attempted to start inference"),
+            (concat!(r#"{"type":"available_commands_update","commands":[]}"#, "\n",
+                r#"{"type":"notice","source":"command-catalog","level":"error","message":"catalog inference denied"}"#), "catalog inference denied"),
+            ("", "command catalog timed out"),
+        ] {
+            let mut child = crate::process::Command::new("sh")
+                .args(["-c", r#"sleep 60 & trap 'wait; exit' TERM; printf '%s\n' '{"type":"ready"}'; while IFS= read -r line; do printf '%s\n' "$1"; done"#, "catalog-test", response])
+                .stdin(crate::process::Stdio::piped())
+                .stdout(crate::process::Stdio::piped())
+                .stderr(crate::process::Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0)
+                .spawn().unwrap();
+            let pid = child.id().unwrap() as i32;
+            let (client, frames) = RpcModeClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+            let process = RpcModeProcess {
+                child, client, frames, stderr_tail: crate::StderrTail::default(),
+                process_group: Some(pid), process_group_guard: ProcessGroupGuard::new(Some(pid), false), run_config: None,
+            };
+            let error = command_catalog(process, Duration::from_secs(1)).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            // SAFETY: signal 0 only checks this fixture process's existence.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "catalog child survived its result");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            // The owned group must be gone too, including its startup child.
+            assert_eq!(unsafe { libc::kill(-pid, 0) }, -1, "catalog descendant survived its result");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper for the catalog supervisor lifecycle regression"]
+    fn command_catalog_supervisor_process() {
+        let Some(exit) = std::env::var_os("COMET_TEST_CATALOG_EXIT") else { return };
+        let pid_file = std::env::var_os("COMET_TEST_CATALOG_PID_FILE").unwrap();
+        // Finish and reap the startup shell before the supervisor's first scan.
+        // Its workload remains in our private group but is no longer a descendant.
+        assert!(std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"if [ "$1" = 0 ]; then
+  sleep 60 &
+else
+  sh -c 'trap "" TERM; : > "$1"; exec sleep 60' resistant "$2.ready" &
+fi
+printf '%s\n' "$!" > "$2"
+if [ "$1" != 0 ]; then
+  while [ ! -f "$2.ready" ]; do sleep 0.01; done
+fi"#)
+            .arg("catalog-startup-test").arg(&exit).arg(&pid_file)
+            .status().unwrap().success());
+        let args = [
+            std::env::var_os("COMET_TEST_CATALOG_PARENT").unwrap(),
+            "/bin/sh".into(), "-c".into(),
+            r#"printf '%s\n' '{"type":"available_commands_update","commands":[{"name":"advisor"}]}'
+exit "$1""#.into(),
+            "catalog-exit-test".into(), exit,
+            "--comet-command-catalog".into(),
+        ];
+        super::super::run_omp_supervisor(args.into_iter()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_catalog_snapshot_requires_successful_exit() {
+        for exit in ["0", "17"] {
+            let temp = tempfile::tempdir().unwrap();
+            let pid_file = temp.path().join("startup-child");
+            let mut child = crate::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "omp::rpc_mode::tests::command_catalog_supervisor_process", "--nocapture", "--format=terse"])
+                .env("COMET_TEST_CATALOG_EXIT", exit)
+                .env("COMET_TEST_CATALOG_PARENT", std::process::id().to_string())
+                .env("COMET_TEST_CATALOG_PID_FILE", &pid_file)
+                .stdin(crate::process::Stdio::piped())
+                .stdout(crate::process::Stdio::piped())
+                .stderr(crate::process::Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0)
+                .spawn().unwrap();
+            let pid = child.id().unwrap() as i32;
+            let (client, frames) = RpcModeClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+            let process = RpcModeProcess {
+                child, client, frames, stderr_tail: crate::StderrTail::default(),
+                process_group: Some(pid), process_group_guard: ProcessGroupGuard::new(Some(pid), true), run_config: None,
+            };
+            let result = command_catalog(process, Duration::from_secs(5)).await;
+            if exit == "0" {
+                assert!(result.unwrap().iter().any(|command| command.name == "advisor"));
+            } else {
+                assert!(result.is_err(), "a snapshot must not hide a failed catalog exit");
+            }
+            // SAFETY: signal 0 only inspects this fixture process.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "catalog child was not reaped");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+            // The startup shell was reaped before supervision began. Its orphan
+            // remains group-owned on both platforms; Linux init may leave a zombie
+            // after cleanup. Require no live workload, not unrelated init reaping.
+            let descendant_is_live = || {
+                #[cfg(target_os = "linux")]
+                {
+                    match std::fs::read_to_string(format!("/proc/{descendant}/stat")) {
+                        Ok(stat) => stat.rsplit_once(')').expect("process stat comm").1
+                            .split_whitespace().next().expect("process stat state") != "Z",
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => panic!("cannot inspect startup child {descendant}: {error}"),
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // SAFETY: signal 0 only inspects this fixture process.
+                    if unsafe { libc::kill(descendant, 0) } == 0 {
+                        return true;
+                    }
+                    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                    false
+                }
+            };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while descendant_is_live() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!descendant_is_live(), "startup child {descendant} survived catalog exit");
+        }
+    }
 
     #[test]
     fn native_chunks_round_trip_and_reject_out_of_order_frames() {

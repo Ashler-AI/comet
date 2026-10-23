@@ -31,6 +31,7 @@ fn run_request_attachments_survive_command_round_trip() {
         based_on: None,
         expires_at: None,
         status: SessionCommandStatus::Pending,
+        accepted_at: None,
         resolution: None,
     })
     .unwrap();

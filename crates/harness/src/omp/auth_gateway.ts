@@ -143,7 +143,11 @@ export async function registerGateway(pi: ExtensionAPI, tokenEnv: string) {
       apiKey: tokenEnv,
       api: "openai-responses",
       authHeader: true,
-      models: openaiModels.map(modelConfig),
+      // Preserve explicit strict:false; Responses otherwise requires optional task fields.
+      models: openaiModels.map((model) => ({
+        ...modelConfig(model),
+        compat: { supportsStrictMode: true },
+      })),
     });
   }
 

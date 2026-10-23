@@ -29,44 +29,47 @@ new bundle assets; generation alone never changes a running/installed app.
 From this worktree on a macOS host:
 
 ```sh
-ASHLER_INCREMENTAL_TSC_CHECKS=false scripts/package-macos.sh
+CI=false COMET_PACKAGE_ENVIRONMENT=canary COMET_DEFAULT_ENVIRONMENT=canary \
+  COMET_MACOS_SIGNING=adhoc ASHLER_INCREMENTAL_TSC_CHECKS=false \
+  scripts/package-macos.sh
 open --env ASHLER_INCREMENTAL_TSC_CHECKS=false --env COMET_IPC_PORT=27954 \
   --env "COMET_DATA_DIR=$HOME/.crew-upstream-canary" \
-  'target/package/Crew Canary.app' --args \
+  'target/package/canary/local/Crew Canary.app' --args \
   --ipc-port 27954 --data-dir "$HOME/.crew-upstream-canary"
 ```
 
 The script builds the upstream Cargo package/binary `zeron` with `--locked
---release`, discovers Cargo's actual target directory, and copies that exact
-artifact into `target/package/Crew Canary.app/Contents/MacOS/comet`. Internal
-Cargo/crate and artwork filenames deliberately retain upstream names.
+--release` and copies that exact artifact into the bundle. `scripts/local-cargo.py`
+selects the shared local Cargo cache, limits build concurrency and snapshots the
+binary while holding the build lock. Internal Cargo/crate and artwork filenames
+deliberately retain upstream names.
 
 Pin the launch coordinates when running from another Crew agent session: its
-inherited `COMET_IPC_PORT` addresses that session's engine, not Canary. For the
-existing lightweight local build cache, use `CARGO_BUILD_JOBS=2`,
-`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0` and `CREW_PACKAGE_PROFILE=dev`.
-Do not switch these flags between incremental smoke runs: Cargo rebuilds the
-dependency graph for a different profile configuration.
+inherited `COMET_IPC_PORT` addresses that session's engine, not Canary.
 
 The bundle has identifier `ai.ashler.crew.upstream-canary`, display name
 `Crew Canary`, and registers **only** `crew-upstream-canary:`. Runtime defaults
 are `~/.crew-upstream-canary` and IPC port `27954`; the bundle does not replace
-Crew.app or register its production/staging schemes. Move only Crew Canary.app
-to Applications if a persistent installation is wanted.
+Crew.app or register its production/staging schemes. For a persistent install,
+quit only Crew Canary, preserve the previous app, and copy the complete new bundle
+to `/Applications/Crew Canary.app`. Do not overlay an existing bundle: obsolete
+resources invalidate its signature. Verify the installed copy with
+`codesign --verify --deep --strict '/Applications/Crew Canary.app'` before launch.
+Keep the existing data directory, device identity and native session histories.
 New worktrees default to the selected data directory's `worktrees` folder,
 not another installed client's `~/.zeron/worktrees`. Explicit existing worktree
 paths and user-selected custom locations remain unchanged.
 
 Artifacts:
 
-- `target/package/Crew Canary.app`
-- `target/package/crew-upstream-canary-<version>-macos-<arch>.dmg`
-- `target/package/crew-upstream-canary-<version>-macos-<arch>-app.tar.gz`
+- `target/package/canary/local/Crew Canary.app`
+- `target/package/canary/local/crew-upstream-canary-<version>-macos-<arch>.dmg`
+- `target/package/canary/local/crew-upstream-canary-<version>-macos-<arch>-app.tar.gz`
 
-Ad-hoc signing is the local default. Set `CODESIGN_IDENTITY` for an explicitly
-selected Developer ID. Optional `NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, and
-`NOTARY_ISSUER_ID` submit to Apple and staple the bundle and disk image. Neither
-signing nor notarization creates or enables a release channel.
+Ad-hoc signing requires the explicit local-only mode above; it is not notarized
+distribution. Distribution mode requires `CODESIGN_IDENTITY`,
+`COMET_MACOS_SIGNING_TEAM_ID` and `NOTARYTOOL_KEYCHAIN_PROFILE`, and omits the
+`local` directory. Neither signing nor notarization enables a release channel.
 
 For an additional debug-only instance, `scripts/run-macos-dev.sh` builds
 `target/macos-dev/Crew Canary Dev.app`, uses bundle identifier

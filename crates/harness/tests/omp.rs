@@ -654,6 +654,11 @@ async fn catalog_uses_native_omp_model_and_command_discovery() {
     assert!(models.iter().any(|model| model.id == "openai-codex/gpt-5.6-sol"));
     let commands = harness.commands_for(temp.path()).await.unwrap();
     assert!(commands.iter().any(|command| command.name == "ralplan"));
+    assert!(commands.iter().any(|command| command.name == "advisor"));
+    let argv = std::fs::read_to_string(temp.path().join("argv")).unwrap();
+    let args: Vec<_> = argv.lines().collect();
+    let guard = args.windows(2).find(|pair| pair[0] == "--extension").unwrap()[1];
+    assert!(!std::path::Path::new(guard).exists(), "catalog guard must be removed after reaping");
     unsafe { std::env::remove_var("OMP_ARGV_LOG"); }
 }
 

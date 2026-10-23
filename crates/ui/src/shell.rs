@@ -4451,6 +4451,7 @@ impl Shell {
                     let entries: Vec<zeron_doc::SessionMessageEntry> =
                         serde_json::from_str(value.get("text")?.as_str()?).ok()?;
                     let update = zeron_doc::TranscriptUpdate {
+                        command_delivery: Default::default(),
                         replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
                         frame: zeron_doc::TranscriptFrame::Reset { reset: entries },
                         context_usage: None,
@@ -8109,12 +8110,13 @@ impl Shell {
         // FAILED (explicit, with the transcript's retry affordance); a send
         // whose delivery path is degraded is QUEUED, not Working — the
         // pending pill tells the truth instead of faking a spinner.
-        let (queued, undelivered) = {
+        let (queued, undelivered, preparing) = {
             let now = Utc::now();
             let state = self.state.read(cx);
             (
                 state.send_queued(&id, now),
                 state.send_undelivered(&id, now),
+                state.send_preparing(&id),
             )
         };
         let status_color = if undelivered {
@@ -8128,6 +8130,8 @@ impl Shell {
             Some("Failed")
         } else if queued {
             Some("Queued")
+        } else if preparing {
+            Some("Preparing workspace…")
         } else {
             match status {
                 zeron_proto::ChatIndicator::Working => Some("Working"),
