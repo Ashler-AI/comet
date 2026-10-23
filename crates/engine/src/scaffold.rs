@@ -4020,7 +4020,7 @@ mod tests {
                     let error = if directory {
                         client.get_crew_session("session", None).await.unwrap_err()
                     } else {
-                        client.list_agent_accounts().await.unwrap_err()
+                        client.list_agent_accounts().await.err().expect("expected temporary authority failure")
                     };
                     let after = chrono::Utc::now();
                     assert_eq!(captured.await.unwrap().len(), 1, "API client must not replay requests");

@@ -91,8 +91,9 @@ pub(crate) fn start(auth: Auth, services: CrewServices, workspace: WorkspaceHost
                         inventory = false;
                     }
                 }
-                match drain(&store, || services.ensure_identity(), async |id| {
-                    publish(&store, &services, &workspace, id).await
+                let (store, services, workspace) = (&store, &services, &workspace);
+                match drain(store, || services.ensure_identity(), |id| async move {
+                    publish(store, services, workspace, &id).await
                 }).await {
                     Ok(Some(delay)) => cooldown = delay,
                     Ok(None) => {},
@@ -122,11 +123,12 @@ async fn enqueue_registry(store: &DocsStore, workspace: &WorkspaceHost) -> Resul
     }
 }
 
-async fn drain(
+async fn drain<Fut>(
     store: &DocsStore,
     ensure_identity: impl Fn() -> Result<(), EngineError>,
-    mut publish: impl for<'a> AsyncFnMut(&'a str) -> Result<(), PublishError>,
-) -> Result<Option<Duration>, EngineError> {
+    mut publish: impl FnMut(String) -> Fut,
+) -> Result<Option<Duration>, EngineError>
+where Fut: std::future::Future<Output = Result<(), PublishError>> {
     let mut after = String::new();
     loop {
         let ids = store.pending_sync_jobs(JOB, &after, 64)?;
@@ -135,10 +137,10 @@ async fn drain(
             after.clone_from(&id);
             ensure_identity()?;
             let Some(generation) = store.sync_job_version(&id, JOB)? else { continue };
-            match publish(&id).await {
-                Ok(()) => store.complete_sync_job(&id, JOB, generation)?,
+            match publish(id).await {
+                Ok(()) => store.complete_sync_job(&after, JOB, generation)?,
                 Err(error) => {
-                    tracing::warn!(session = %id, %error, "directory update awaits synchronization or reconciliation");
+                    tracing::warn!(session = %after, %error, "directory update awaits synchronization or reconciliation");
                     if let PublishError::Remote { source, .. } = error
                         && source.is_transient() {
                         return Ok(Some(source.retry_after().unwrap_or(RETRY_DELAY).max(RETRY_DELAY)));
@@ -436,12 +438,17 @@ mod tests {
                 }
             });
             // Old evidence (without the new optional field) remains readable.
-            let mut evidence: Evidence = serde_json::from_value(json!({
+            store.save_directory_state(id, &json!({
                 "source_version": local, "confirmed": false,
-            })).unwrap();
-            drain(&store, || Ok(()), async |id| {
-                lookup_remote(&store, &client, id, None, &local, &mut evidence).await.map(|_| ())
+            }).to_string()).unwrap();
+            drain(&store, || Ok(()), |id| {
+                let (store, client, local) = (&store, &client, &local);
+                async move {
+                    let mut evidence: Evidence = serde_json::from_str(&store.directory_state(&id).unwrap().unwrap()).unwrap();
+                    lookup_remote(store, client, &id, None, local, &mut evidence).await.map(|_| ())
+                }
             }).await.unwrap();
+            let evidence: Evidence = serde_json::from_str(&store.directory_state(id).unwrap().unwrap()).unwrap();
             assert_eq!(requests.load(Ordering::SeqCst), 1);
             assert_eq!(store.sync_job_version(id, JOB).unwrap(), generation);
             assert_eq!(evidence.source_version, local, "never borrow remote version evidence");
@@ -450,10 +457,14 @@ mod tests {
             drop(store);
 
             let store = DocsStore::open(dir.path()).unwrap();
-            let mut evidence: Evidence = serde_json::from_str(&store.directory_state(id).unwrap().unwrap()).unwrap();
+            let evidence: Evidence = serde_json::from_str(&store.directory_state(id).unwrap().unwrap()).unwrap();
             for _ in 0..3 {
-                drain(&store, || Ok(()), async |id| {
-                    lookup_remote(&store, &client, id, None, &local, &mut evidence).await.map(|_| ())
+                drain(&store, || Ok(()), |id| {
+                    let (store, client, local) = (&store, &client, &local);
+                    async move {
+                        let mut evidence: Evidence = serde_json::from_str(&store.directory_state(&id).unwrap().unwrap()).unwrap();
+                        lookup_remote(store, client, &id, None, local, &mut evidence).await.map(|_| ())
+                    }
                 }).await.unwrap();
             }
             assert_eq!(requests.load(Ordering::SeqCst), 1, "unchanged source must not query after restart");
@@ -461,19 +472,22 @@ mod tests {
             assert_eq!(evidence.source_version, local);
             assert!(!evidence.confirmed);
 
-            drain(&store, || Ok(()), async |id| {
-                let remote = lookup_remote(&store, &client, id, None, &advanced, &mut evidence).await?;
-                assert_eq!(remote["session"]["revision"], 9);
-                // A snapshot arriving during this fresh request must survive its
-                // completion, just as it does during a normal publication.
-                store.queue_directory(id).unwrap();
-                Ok(())
+            drain(&store, || Ok(()), |id| {
+                let (store, client, local, advanced) = (&store, &client, &local, &advanced);
+                async move {
+                    let mut evidence: Evidence = serde_json::from_str(&store.directory_state(&id).unwrap().unwrap()).unwrap();
+                    let remote = lookup_remote(store, client, &id, None, advanced, &mut evidence).await?;
+                    assert_eq!(remote["session"]["revision"], 9);
+                    assert!(evidence.rejected_source_version.is_none());
+                    assert_eq!(&evidence.source_version, local);
+                    assert!(!evidence.confirmed);
+                    // A newer snapshot must survive this request's completion.
+                    store.queue_directory(&id).unwrap();
+                    Ok(())
+                }
             }).await.unwrap();
             assert_eq!(requests.load(Ordering::SeqCst), 2);
             server.await.unwrap();
-            assert!(evidence.rejected_source_version.is_none());
-            assert_eq!(evidence.source_version, local);
-            assert!(!evidence.confirmed);
             assert!(store.sync_job_version(id, JOB).unwrap().is_some());
             assert_ne!(store.sync_job_version(id, JOB).unwrap(), generation);
         }
@@ -499,10 +513,13 @@ mod tests {
             stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 125\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
         let mut attempts = 0;
-        let cooldown = drain(&store, || Ok(()), async |id| {
+        let cooldown = drain(&store, || Ok(()), |id| {
             attempts += 1;
-            client.get_crew_session(id, None).await.map(|_| ())
-                .map_err(|source| PublishError::Remote { operation: "revision lookup", source })
+            let client = &client;
+            async move {
+                client.get_crew_session(&id, None).await.map(|_| ())
+                    .map_err(|source| PublishError::Remote { operation: "revision lookup", source })
+            }
         }).await.unwrap();
         server.await.unwrap();
         assert_eq!(attempts, 1);
@@ -560,18 +577,18 @@ mod tests {
             store.queue_directory(id).unwrap();
         }
         let mut visited = Vec::new();
-        let cooldown = drain(&store, || Ok(()), async |id| {
-            visited.push(id.to_owned());
-            match id {
+        let cooldown = drain(&store, || Ok(()), |id| {
+            visited.push(id.clone());
+            std::future::ready(match id.as_str() {
                 "a-local" => Err(failure("directory awaits acknowledged registry row").into()),
                 "b-conflict" => Err(PublishError::Remote { operation: "upsert", source:
                     ScaffoldError::Api(ScaffoldApiErrorDisplay(ScaffoldApiError {
                         status: 409, code: "revision_conflict".into(), message: None,
                         retry_after: Some(Duration::from_secs(300)),
                     })) }),
-                "c-new-generation" => { store.queue_directory(id).unwrap(); Ok(()) },
+                "c-new-generation" => { store.queue_directory(&id).unwrap(); Ok(()) },
                 _ => Ok(()),
-            }
+            })
         }).await.unwrap();
         assert_eq!(cooldown, None);
         assert_eq!(visited, ["a-local", "b-conflict", "c-new-generation", "d-success"]);
