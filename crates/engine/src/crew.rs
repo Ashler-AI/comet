@@ -505,7 +505,7 @@ impl CrewServices {
         self.store.claim_crew_command(&root_id,&immutable).map_err(failed)?;
         if let Some((_,Some(receipt))) = self.store.crew_command(&root_id).map_err(failed)? {
             let receipt: HandoffReceipt = serde_json::from_slice(&receipt).map_err(failed)?;
-            if self.retired(&receipt.sandbox_id, &receipt.environment.scope)? {
+            if self.retired(&receipt.sandbox_id, &receipt.environment.scope, environment_epoch(&receipt.environment))? {
                 return Err(denied("Stopped handoff cannot recover"));
             }
             self.validate_environment(&receipt.environment, &receipt.environment.scope)?;
@@ -523,7 +523,7 @@ impl CrewServices {
             if request.recover_chat_id.is_none() { return Err(bad("Recovery requires both chat and sandbox IDs")); }
             let env = self.runtime.client().inspect(id,&scope,cancellation).await.map_err(failed)?;
             self.validate_environment(&env,&scope)?;
-            if self.retired(id,&scope)? { return Err(denied("Stopped handoff cannot recover")); }
+            if self.retired(id,&scope,environment_epoch(&env))? { return Err(denied("Stopped handoff cannot recover")); }
             id.clone()
         } else {
             let create_id = format!("{root_id}:create");
@@ -535,8 +535,8 @@ impl CrewServices {
             let created = confirmed(create)?;
             environment_id(&created.environment).ok_or_else(|| failed("Created environment has no sandbox"))?.into()
         };
-        // Attach installs the verified runtime and releases its startup marker;
-        // waiting for application readiness first would strand a fresh sandbox.
+        // Attach establishes verified native host authority; application
+        // readiness depends on that host, so it must be checked afterward.
         let attach_id = format!("{root_id}:attach");
         let mut attachment = self.control(&attach_id,Control::Attach {
             sandbox_id:sandbox.clone(),scope:scope.clone(),
@@ -592,7 +592,7 @@ impl CrewServices {
         tokio::task::spawn_blocking(move || {
             let _gate = gate;
             services.validate_environment(&receipt.environment, &receipt.environment.scope)?;
-            if services.retired(&receipt.sandbox_id, &receipt.environment.scope)? {
+            if services.retired(&receipt.sandbox_id, &receipt.environment.scope, environment_epoch(&receipt.environment))? {
                 return Err(denied("Stopped handoff cannot admit a command"));
             }
             admit()
