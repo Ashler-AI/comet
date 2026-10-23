@@ -19,6 +19,28 @@ pub const CAPABILITY_SESSION_ENVIRONMENT: &str = "session.environment";
 
 pub type UnknownFields = BTreeMap<String, serde_json::Value>;
 
+/// Control-plane session metadata and directory endpoints require canonical UUIDs.
+pub fn is_cloud_session_id(chat_id: &str) -> bool {
+    chat_id.len() == 36
+        && !chat_id.bytes().any(|byte| byte.is_ascii_uppercase())
+        && uuid::Uuid::parse_str(chat_id).is_ok()
+}
+
+/// Immutable provenance for an extinct imported execution epoch, not retirement
+/// of its logical session. The inventoried server receipt establishes this fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OriginalEpochHistory {
+    pub sandbox_id: String,
+    pub lifecycle_epoch: u64,
+    /// Control-plane epoch at migration; may exceed the original writer epoch.
+    pub coordinator_lifecycle_epoch: u64,
+    pub source_device_id: String,
+    pub original_status: String,
+    pub native_session_id: Option<String>,
+    pub source_evidence_sha256: String,
+}
+
 /// Index metadata, never proof of authority. Populate only from a verified
 /// controller response; the Edge still authorizes every room independently.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,6 +53,8 @@ pub struct CrewChatMetadata {
     pub environment: Option<SessionEnvironment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_route: Option<AgentRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_epoch_history: Option<OriginalEpochHistory>,
 }
 
 impl CrewChatMetadata {
@@ -49,6 +73,16 @@ impl CrewChatMetadata {
         }
         if let Some(route) = &self.agent_route {
             route.validate()?;
+        }
+        if let Some(history) = &self.original_epoch_history {
+            if history.sandbox_id.is_empty() || history.source_device_id.is_empty()
+                || history.lifecycle_epoch == 0
+                || history.coordinator_lifecycle_epoch < history.lifecycle_epoch
+                || !matches!(history.original_status.as_str(), "stopped" | "failed")
+                || history.native_session_id.as_deref().is_some_and(str::is_empty)
+                || history.source_evidence_sha256.len() != 64
+                || !history.source_evidence_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            { return Err("Original epoch history requires its exact inventoried source evidence"); }
         }
         Ok(())
     }
@@ -730,6 +764,13 @@ pub enum ScaffoldEnvironmentControl {
     Resume {
         sandbox_id: String,
         scope: CollaborationScope,
+    },
+    /// Explicitly start a fresh host epoch for this logical session; never resume its terminal native process.
+    Start {
+        sandbox_id: String,
+        scope: CollaborationScope,
+        #[serde(rename = "expectedLifecycleEpoch")]
+        expected_lifecycle_epoch: u64,
     },
     Stop {
         sandbox_id: String,

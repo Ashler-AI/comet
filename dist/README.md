@@ -83,35 +83,53 @@ ASHLER_INCREMENTAL_TSC_CHECKS=false scripts/package-linux.sh
 ```
 
 Output: `target/package/crew-upstream-canary-<version>-linux-<arch>.tar.gz`.
-The archive root has the same stem and contains `comet`, licenses,
-`crew-upstream-canary.desktop`, `crew-upstream-canary.png`, and `install.sh`.
+The archive root contains `comet`, licenses, desktop assets, `install.sh`, the
+matching `crew-web` bundle, `crew-web-contract.json`, and the runtime marker.
 
-The manual installer stores immutable binary-digest-qualified versions under
-`~/.crew-upstream-canary/app/<version>-<sha256>`, changes only that directory's
-`current` link, and links `~/.local/bin/crew-upstream-canary`. Desktop entry and
-icon names are also canary-specific. It does not overwrite a shared `comet`
-launcher, touch existing Crew/Zeron data, or install/restart any service. A new
-artifact of the same workspace version gets a distinct installation directory.
-The Scaffold handoff must select this exact binary with its SHA-256 and the
-checked-in `scaffold-runtime-version.txt` contract, not a mutable release feed.
+The manual installer stores immutable whole-bundle-digest-qualified versions
+under `~/.crew-upstream-canary/app/<version>-<sha256>`, changes only that
+directory's `current` link, and links `~/.local/bin/crew-upstream-canary`.
+Desktop entry and icon names are Canary-specific. It does not overwrite a
+shared `comet` launcher, touch Crew/Zeron data, or restart a service. Changed
+browser assets receive a new installation directory even when the binary and
+workspace version are unchanged.
 
 `bash scripts/test-linux-desktop-entry.sh` is an offline Linux regression for
 launcher quoting, XDG paths, repeated installation, same-version new artifacts,
 and preservation of existing installations. It uses a throwaway HOME.
 
+### Canonical native attachment
+
+This branch selects release contract `scaffold.comet-runtime.v2` and browser
+contract `crew.native.web.v1`; persisted authority profiles remain independently
+`scaffold.comet-runtime.v1`. Platform owns verified archive installation and
+readiness at `.scaffold/crew/bin/comet` and `.scaffold/crew/web`, with DATA
+`.scaffold/crew-data` and IPC `39400`. The controller no longer uploads a captured
+binary or embedded web assets. Attachment requires a supervised nonempty run ID,
+explicit authority coordinates, and matching verified host authority. Every
+bootstrap upload attempt receives independently bounded credential-file cleanup.
+
+Canonical tests require a separate fresh local profile, explicit unused IPC and
+canonical Edge/Scaffold/project/deployment coordinates, with independent human
+authentication. Do not replace or retarget existing private Canary profiles,
+clients, jobs or channels with this build. Packaging is not rollout authority.
+
+Original-epoch bootstrap is bounded to 4 MiB and 10,000 outcomes before local
+writes. Verified historical commands remain inert while terminal outcomes sync.
+Start accepts fresh sessions or matching trusted local provenance; a synced
+history marker alone is rejected before mutation. Unsupported offline
+original-epoch imports remain rejected before destination writes.
+
 ## Build-only workflow and update policy
 
 `.github/workflows/release.yml` is **Crew Canary artifacts**. Manual dispatch
-requires the exact reviewed SHA and only builds/packages that immutable
-`github.sha`, uploading private Actions artifacts with archive `SHA256SUMS`, raw
-Linux executable `COMET_SHA256SUMS`, and `provenance.json`, with `contents: read`.
-Behavior checks and typechecks are not deployment-pipeline jobs. Run required
-focused checks and actual runtime/inference smokes separately.
-`COMET_SHA256SUMS` names the extracted archive-root `comet` file; its digest
-is the value for `COMET_SCAFFOLD_RUNTIME_SHA256`, not the archive digest.
-The isolated auth maintenance branch `crew/canary-agent-auth-fix-20261022` is
-also accepted by the same exact-SHA gate. Dispatch it with that explicit `--ref`;
-never move `crew/upstream-canary` backwards or include unrelated staging changes.
+requires the exact reviewed SHA and builds only that immutable `github.sha`.
+Browser, Linux installer, Rust authority/history and macOS launch regressions
+gate private Actions artifacts with archive `SHA256SUMS` and provenance.
+The workflow has `contents: read`; it is not the canonical GCS publisher.
+The isolated native-compatible branch `fix/canary-native-controller-95e5` and
+existing private maintenance branches use the same exact-SHA gate. Dispatch
+the intended branch explicitly; never overwrite another lane to run its build.
 
 It does not deploy, publish GitHub Releases, use shared release credentials, or
 change signed stable/staging channels. Dispatch the registered workflow after review:
@@ -121,11 +139,12 @@ gh workflow run release.yml --repo Ashler-AI/comet --ref crew/upstream-canary \
   -f "reviewed_sha=${REVIEWED_SHA:?Set the exact reviewed integration commit}"
 ```
 
-Verify that the run's `headSha` is the reviewed commit before consuming its private
-artifacts. Edge deployment is a separate operator action: from `edge/`, run
-`npx wrangler deploy --env canary` after separately verifying the changed Worker
-behavior; unrelated desktop/runtime packaging does not block it. The isolated
-controller uses Platform's `internal/scaffold/scripts/deploy-upstream-canary.mjs`.
+Verify the run's `headSha`, archive digest and provenance before consuming its
+artifacts. Canonical publication separately requires reviewed source on `main`
+and the canonical release workflow. A matching version label does not establish
+compatibility between these two artifact families. Edge activation and client
+authentication remain separate authorized operations; private Canary deployment
+commands are not a canonical activation path.
 
 `zeron-update::AUTOMATIC_UPDATES_SUPPORTED` is false for this branch. Direct
 CLI/UI checks, staging and apply paths fail closed before a shared channel can

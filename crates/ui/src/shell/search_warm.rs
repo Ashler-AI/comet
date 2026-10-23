@@ -92,7 +92,6 @@ mod tests {
                     workos_client_id: None,
                     scaffold: None,
                     managed_inference: false,
-                    scaffold_runtime_artifact: None,
                     default_harness: zeron_proto::HarnessId::Mock,
                 },
                 cx,

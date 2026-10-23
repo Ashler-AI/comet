@@ -15,6 +15,7 @@ permissions:
 
 env:
   ASHLER_INCREMENTAL_TSC_CHECKS: 'false'
+  CARGO_PROFILE_DEV_DEBUG: '0'
 
 jobs:
   approve-source:
@@ -26,12 +27,36 @@ jobs:
         run: |
           set -euo pipefail
           case "$GITHUB_REF" in
-            refs/heads/crew/upstream-canary|refs/heads/crew/canary-agent-auth-fix-20261022) ;;
+            refs/heads/crew/upstream-canary|refs/heads/crew/canary-agent-auth-fix-20261022|refs/heads/fix/canary-native-controller-95e5) ;;
             *) exit 1 ;;
           esac
           test "$REVIEWED_SHA" = "$GITHUB_SHA"
-  linux:
+  native-contracts:
     needs: approve-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Native browser and package contracts
+        run: |
+          node --test apps/web/*.test.mjs
+          bash scripts/test-linux-desktop-entry.sh
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Native authority and historical command regressions
+        run: >-
+          cargo test --locked --features zeron-sync/mock-server
+          -p zeron-engine -p zeron-sync -p zeron-doc
+          --lib --test auth --test scaffold_auth --test crew_import --test crew_annotations
+
+  linux:
+    needs: [approve-source, native-contracts]
     strategy:
       fail-fast: false
       matrix:
@@ -52,31 +77,29 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
       - name: Package exact checkout
         run: scripts/package-linux.sh
       - name: Record private artifact provenance
         run: |
           cd target/package
           sha256sum crew-upstream-canary-*-linux-*.tar.gz > SHA256SUMS
-          for archive in crew-upstream-canary-*-linux-*.tar.gz; do
-            binary="${archive%.tar.gz}/comet"
-            digest="$(tar -xOf "$archive" "$binary" | sha256sum | cut -d' ' -f1)"
-            printf '%s  %s\n' "$digest" "$binary"
-          done > COMET_SHA256SUMS
-          printf '{"sourceRevision":"%s","runtimeContract":"%s","delivery":"private-manual"}\n' \
-            "$GITHUB_SHA" "$(cat ../../scaffold-runtime-version.txt)" > provenance.json
+          printf '{"sourceRevision":"%s","runtimeContract":"%s","webContract":"%s","delivery":"private-manual"}\n' \
+            "$GITHUB_SHA" "$(cat ../../scaffold-runtime-version.txt)" \
+            "$(node -p 'JSON.parse(require("fs").readFileSync("../../apps/web/contract.json", "utf8")).version')" > provenance.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: crew-upstream-canary-linux-${{ runner.arch }}-${{ github.sha }}
           path: |
             target/package/crew-upstream-canary-*-linux-*.tar.gz
             target/package/SHA256SUMS
-            target/package/COMET_SHA256SUMS
             target/package/provenance.json
           if-no-files-found: error
 
   macos:
-    needs: approve-source
+    needs: [approve-source, native-contracts]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -85,14 +108,16 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Canary launch authority and browser suppression
+        run: cargo test --locked -p zeron --bin zeron --test noop_browser
       - name: Package isolated ad-hoc signed app
         run: scripts/package-macos.sh
       - name: Record private artifact provenance
         run: |
           cd target/package
           shasum -a 256 crew-upstream-canary-*-macos-*.dmg crew-upstream-canary-*-macos-*-app.tar.gz > SHA256SUMS
-          printf '{"sourceRevision":"%s","delivery":"private-manual","bundleId":"ai.ashler.crew.upstream-canary"}\n' \
-            "$GITHUB_SHA" > provenance.json
+          printf '{"sourceRevision":"%s","runtimeContract":"%s","delivery":"private-manual","bundleId":"ai.ashler.crew.upstream-canary"}\n' \
+            "$GITHUB_SHA" "$(cat ../../scaffold-runtime-version.txt)" > provenance.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: crew-upstream-canary-macos-${{ runner.arch }}-${{ github.sha }}

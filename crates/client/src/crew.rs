@@ -98,6 +98,7 @@ impl Client {
         let scope: &CollaborationScope = match &control {
             ScaffoldEnvironmentControl::Inspect { scope, .. } | ScaffoldEnvironmentControl::Create { scope, .. }
             | ScaffoldEnvironmentControl::Pause { scope, .. } | ScaffoldEnvironmentControl::Resume { scope, .. }
+            | ScaffoldEnvironmentControl::Start { scope, .. }
             | ScaffoldEnvironmentControl::Stop { scope, .. } | ScaffoldEnvironmentControl::Attach { scope, .. }
             | ScaffoldEnvironmentControl::UpdateAgentRoute { scope, .. } => scope,
             ScaffoldEnvironmentControl::HandoffOmpSession { .. } => {

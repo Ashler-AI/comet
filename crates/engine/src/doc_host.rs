@@ -1372,6 +1372,25 @@ impl DocHost {
         self.inner.store.clone()
     }
 
+    pub(crate) fn ensure_execution_allowed(&self, chat_id: &str, resume: Option<&str>) -> Result<(), EngineError> {
+        if let Some(sessions) = self.sessions() {
+            return sessions.ensure_execution_allowed(chat_id, resume);
+        }
+        if self.workspace().map(|workspace| workspace.chat(chat_id)).transpose()?.flatten()
+            .and_then(|chat| chat.crew).is_some_and(|metadata| metadata.original_epoch_history.is_some()) {
+            return Err(EngineError::Other("Original execution epoch is read-only history; verified execution authority is unavailable".into()));
+        }
+        Ok(())
+    }
+
+    fn ensure_command_execution_allowed(&self, chat_id: &str, payload: &SessionCommandPayload) -> Result<(), EngineError> {
+        match payload {
+            SessionCommandPayload::Run { request, .. } => self.ensure_execution_allowed(chat_id, request.resume.as_deref()),
+            SessionCommandPayload::Steer { .. } => self.ensure_execution_allowed(chat_id, None),
+            _ => Ok(()),
+        }
+    }
+
     pub fn device_id(&self) -> &str {
         &self.inner.config.device_id
     }
@@ -3470,6 +3489,7 @@ impl DocHost {
         command_id: Option<&str>,
         expected_turn_id: Option<&str>,
     ) -> Result<String, EngineError> {
+        self.ensure_command_execution_allowed(chat_id, &payload)?;
         let handle = self.open(chat_id)?;
         let _owner = lock(&handle.transcript_import);
         if expected_turn_id.is_some_and(|id| id.is_empty() || id.len() > 256)
@@ -4659,7 +4679,13 @@ impl DocHost {
         let messages = handle.doc.read_entries().unwrap_or_default();
         let message_landed = |mid: &str| messages.iter().any(|m| m.id == mid);
         let mut latest_dead: HashMap<String, &SessionCommandEntry> = HashMap::new();
+        let sessions = self.sessions();
         for c in &commands {
+            // Verified original-epoch claims must retain their source outcome, never
+            // become crash retries even when sync has only delivered Pending so far.
+            if sessions.as_ref().is_some_and(|sessions| sessions.is_original_epoch_command(&c.id)) {
+                continue;
+            }
             let Some(mid) = (match &c.payload {
                 SessionCommandPayload::Run { message_id, .. } => Some(message_id.as_str()),
                 SessionCommandPayload::Steer { message_id, .. } => message_id.as_deref(),
@@ -4767,6 +4793,7 @@ impl DocHost {
         chat_id: &str,
         entry: SessionCommandEntry,
     ) -> Result<&'static str, EngineError> {
+        self.ensure_command_execution_allowed(chat_id, &entry.payload)?;
         let handle = self.open(chat_id)?;
         // The sender sequences attachment transfers BEFORE the relay; refuse
         // (retryably) rather than run without the images.
@@ -5108,6 +5135,7 @@ impl DocHost {
                 if c.status == SessionCommandStatus::Pending
                     && !skipped.contains(&c.id)
                     && is_processed(&c.id)
+                    && !sessions.is_original_epoch_command(&c.id)
                     && !lock(&self.inner.executing).contains(&c.id)
                 {
                     tracing::warn!(chat = %handle.chat_id, command = %c.id,
@@ -5409,6 +5437,7 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        self.ensure_command_execution_allowed(chat_id, &entry.payload)?;
         if let Some(message_id) = self.cancelled_by_stop(handle, entry) {
             // Still the user's message: it stays in the transcript, unrun.
             let prompt = match &entry.payload {
@@ -6111,6 +6140,41 @@ mod transfer_progress_tests {
             },
         );
         (dir, host)
+    }
+
+    #[tokio::test]
+    async fn original_epoch_without_executor_rejects_commands_before_admission() {
+        use super::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+        let (_dir, host) = host();
+        let workspace = crate::WorkspaceHost::open(host.crew_store(), crate::workspace_host::WorkspaceHostConfig {
+            device_id: "dev-test".into(), device_name: "Host".into(), platform: "linux".into(),
+            org_id: "project".into(), user_id: "owner".into(), edge: None, local_only: false,
+        }).unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        workspace.create_chat(id, None, Some("dev-test"), None, None).unwrap();
+        let mut chat = workspace.chat(id).unwrap().unwrap();
+        chat.crew = Some(serde_json::from_value(serde_json::json!({
+            "ownerSubject":"owner", "sessionId":id,
+            "scope":{"projectId":"project","deploymentId":"staging","sessionId":id},
+            "originalEpochHistory":{
+                "sandboxId":"sandbox", "lifecycleEpoch":1, "coordinatorLifecycleEpoch":2,
+                "sourceDeviceId":"comet-scaffold-sandbox", "originalStatus":"stopped",
+                "nativeSessionId":"original-native", "sourceEvidenceSha256":"a".repeat(64)
+            }
+        })).unwrap());
+        workspace.import_chat_row(&chat).unwrap();
+        host.set_workspace(workspace);
+        let payload = SessionCommandPayload::Steer { prompt: "must not run".into(), message_id: None };
+        let queued = host.queue_command_named(id, payload.clone(), vec![], Some("blocked"), None);
+        assert!(queued.unwrap_err().to_string().contains("Original execution epoch"));
+        let entry = SessionCommandEntry {
+            id: "blocked-relay".into(), payload, issued_by: "sender".into(), issued_at: crate::now_ms(),
+            based_on: None, expires_at: None, status: SessionCommandStatus::Pending, resolution: None,
+        };
+        assert!(host.ingest_relayed_command(id, entry).await.unwrap_err().to_string().contains("Original execution epoch"));
+        let handle = host.open(id).unwrap();
+        assert!(handle.doc().read_commands().unwrap().is_empty());
+        assert!(host.queue_command_named(id, SessionCommandPayload::Interrupt {}, vec![], Some("stop"), None).is_ok());
     }
 
     #[tokio::test]

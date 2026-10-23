@@ -43,8 +43,6 @@ enum Command {
     Status,
     #[command(hide = true)]
     ScaffoldAuthority,
-    #[command(hide = true)]
-    ScaffoldInstallWeb,
     /// Coordinate native Crew sessions through the connected engine.
     Session {
         #[command(subcommand)]
@@ -83,6 +81,32 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn runtime_package_cutover_preserves_explicit_canary_coordinates() {
+        assert!(Cli::command().find_subcommand("scaffold-install-web").is_none());
+        assert!(Cli::try_parse_from(["comet", "--scaffold-runtime-artifact", "/obsolete/comet"]).is_err());
+        let cli = Cli::try_parse_from([
+            "comet", "--data-dir", "/isolated/.scaffold/crew-data", "--ipc-port", "39400",
+            "--edge-url", "https://edge.invalid", "--scaffold-url", "https://control.invalid",
+            "--project-scope", "project", "--deployment-id", "deployment",
+            "headless", "--device-bootstrap-file", "/isolated/bootstrap.json",
+        ]).unwrap();
+        assert_eq!(cli.runtime.data_dir.as_deref(), Some(std::path::Path::new("/isolated/.scaffold/crew-data")));
+        assert_eq!(cli.runtime.ipc_port, Some(39400));
+        assert_eq!(cli.runtime.edge_url.as_deref(), Some("https://edge.invalid"));
+        assert_eq!(cli.runtime.scaffold_url.as_deref(), Some("https://control.invalid"));
+        assert_eq!(cli.runtime.project_scope.as_deref(), Some("project"));
+        assert_eq!(cli.runtime.deployment_id.as_deref(), Some("deployment"));
+        let Some(Command::Headless(args)) = cli.command else { panic!("expected headless command") };
+        assert_eq!(args.device_bootstrap_file.as_deref(), Some(std::path::Path::new("/isolated/bootstrap.json")));
+    }
 }
 
 #[derive(Subcommand)]
@@ -258,7 +282,6 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(crew_cli::scaffold_authority(config.ipc_port))
         }
-        Some(Command::ScaffoldInstallWeb) => crew_cli::install_scaffold_web(),
         Some(Command::Session { command }) => {
             tokio::runtime::Runtime::new()?.block_on(session_cli::run(command, config.ipc_port))
         }
@@ -317,7 +340,6 @@ fn main() -> anyhow::Result<()> {
                 initial_url: cli.open_url,
                 scaffold: config.scaffold,
                 managed_inference: config.managed_inference,
-                scaffold_runtime_artifact: config.scaffold_runtime_artifact,
             });
             Ok(())
         }

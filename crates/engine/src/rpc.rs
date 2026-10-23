@@ -2107,6 +2107,7 @@ impl RpcService for EngineRpc {
                     .chat(&p.source_chat_id)
                     .map_err(failed)?
                     .ok_or_else(|| RpcError::Failed("Source chat no longer exists".into()))?;
+                self.sessions.ensure_execution_allowed(&source.id, source.harness_session_id.as_deref()).map_err(failed)?;
                 if source.device_id != self.doc_host.device_id() {
                     return Err(RpcError::Failed(
                         "Fork must be created on the source device".into(),

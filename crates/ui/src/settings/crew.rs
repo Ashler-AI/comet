@@ -57,9 +57,31 @@ pub(crate) fn attached_session(outcome: &Outcome) -> Option<(&str, &str)> {
     Some((result.environment.scope.session_id.as_deref()?, result.attached_device_id.as_deref()?))
 }
 
+fn startable_epoch(role: &str, lifecycle: zeron_proto::ScaffoldLifecycle, epoch: Option<u64>) -> Option<u64> {
+    if role != "local_controller" || !matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Stopped | zeron_proto::ScaffoldLifecycle::Failed) {
+        return None;
+    }
+    epoch.filter(|epoch| *epoch > 0)
+}
+
 #[cfg(test)]
 mod provisioning_tests {
     use super::*;
+
+    #[test]
+    fn starting_a_new_epoch_requires_local_authority_and_an_observed_terminal_epoch() {
+        use zeron_proto::ScaffoldLifecycle::*;
+        for lifecycle in [Stopped, Failed] {
+            assert_eq!(startable_epoch("local_controller", lifecycle, Some(7)), Some(7));
+            assert_eq!(startable_epoch("local_controller", lifecycle, None), None);
+            assert_eq!(startable_epoch("local_controller", lifecycle, Some(0)), None);
+            assert_eq!(startable_epoch("sandbox_host", lifecycle, Some(7)), None);
+            assert_eq!(startable_epoch("", lifecycle, Some(7)), None);
+        }
+        for lifecycle in [Creating, RestoringSnapshot, Starting, Ready, AgentRunning, Paused, Resuming] {
+            assert_eq!(startable_epoch("local_controller", lifecycle, Some(7)), None);
+        }
+    }
 
     #[test]
     fn create_requires_a_distinct_durable_attach_and_unknown_never_advances() {
@@ -470,9 +492,10 @@ impl Render for CrewAccounts {
         body = body.child(widgets::row_title(&theme, "Use an existing sandbox"));
         if self.environments.is_empty() { body = body.child(widgets::page_subtitle(&theme, "No sandboxes yet. Create one above to run Crew in Scaffold, or refresh to find an existing environment.")); }
         for environment in self.environments.clone() {
-            let SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle, .. } = &environment.source else { continue; };
+            let SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle, lifecycle_epoch, .. } = &environment.source else { continue; };
             let name = environment.name.clone().unwrap_or_else(|| format!("Sandbox · {}", environment.source_ref.as_deref().unwrap_or("Scaffold")));
             let stopped = matches!(lifecycle, zeron_proto::ScaffoldLifecycle::Stopped);
+            let expected_epoch = startable_epoch(&status.role, *lifecycle, *lifecycle_epoch);
             let mut row = widgets::section_card(&theme).p(px(12.0)).flex().flex_col().gap(px(8.0))
                 .child(div().id(SharedString::from(format!("crew-sandbox-details-{sandbox_id}"))).min_w_0().truncate()
                     .tooltip(widgets::text_tooltip(format!("Sandbox {sandbox_id}\nOwner {}\nProject {}\nDeployment {}\nSession {}", environment.owner_principal, environment.scope.project_id, environment.scope.deployment_id.as_deref().unwrap_or("none"), environment.scope.session_id.as_deref().unwrap_or("unassigned"))))
@@ -485,10 +508,11 @@ impl Render for CrewAccounts {
             let mut controls = div().flex().flex_wrap().gap(px(8.0));
             let expanded = self.managed_sandbox.as_ref() == Some(sandbox_id);
             let mut has_maintenance = false;
-            for operation in ["Use sandbox…", "Resume…", "Pause…", "Apply model/account…", "Inspect", "Stop sandbox…"] {
+            for operation in ["Use sandbox…", "Start new epoch…", "Resume…", "Pause…", "Apply model/account…", "Inspect", "Stop sandbox…"] {
                 if status.role != "local_controller" && operation != "Inspect" { continue; }
-                if stopped && operation != "Inspect" { continue; }
-                if *lifecycle == zeron_proto::ScaffoldLifecycle::Failed && !matches!(operation, "Inspect" | "Stop sandbox…") { continue; }
+                if stopped && !matches!(operation, "Inspect" | "Start new epoch…") { continue; }
+                if *lifecycle == zeron_proto::ScaffoldLifecycle::Failed && !matches!(operation, "Inspect" | "Stop sandbox…" | "Start new epoch…") { continue; }
+                if operation == "Start new epoch…" && expected_epoch.is_none() { continue; }
                 if operation == "Pause…" && *lifecycle == zeron_proto::ScaffoldLifecycle::Paused { continue; }
                 if operation == "Resume…" && *lifecycle != zeron_proto::ScaffoldLifecycle::Paused { continue; }
                 if operation != "Use sandbox…" && !(operation == "Inspect" && *lifecycle == zeron_proto::ScaffoldLifecycle::Failed) {
@@ -507,12 +531,13 @@ impl Render for CrewAccounts {
                         "Inspect" => ScaffoldEnvironmentControl::Inspect { sandbox_id: sandbox.clone(), scope: scope.clone() },
                         "Pause…" => ScaffoldEnvironmentControl::Pause { sandbox_id: sandbox.clone(), scope: scope.clone() },
                         "Resume…" => ScaffoldEnvironmentControl::Resume { sandbox_id: sandbox.clone(), scope: scope.clone() },
+                        "Start new epoch…" => ScaffoldEnvironmentControl::Start { sandbox_id: sandbox.clone(), scope: scope.clone(), expected_lifecycle_epoch: expected_epoch.expect("eligible observed epoch") },
                         "Stop sandbox…" => ScaffoldEnvironmentControl::Stop { sandbox_id: sandbox.clone(), scope: scope.clone() },
                         _ => ScaffoldEnvironmentControl::Attach { sandbox_id: sandbox.clone(), scope: scope.clone() },
                     };
                     if operation == "Inspect" { page.control(control, cx); }
                     else {
-                        let warning = if operation == "Stop sandbox…" { "Stop is terminal: this sandbox cannot be resumed. This is NOT the composer Stop button, which only stops an agent turn." } else if operation == "Use sandbox…" { "Attach to this same sandbox; if paused, it will resume. This does not create another sandbox." } else { "Apply this operation to the selected sandbox?" };
+                        let warning = if operation == "Stop sandbox…" { "Stop permanently ends this host epoch. The same logical session may later explicitly start a fresh epoch; its old native process is never resumed. This is NOT the composer Stop button." } else if operation == "Start new epoch…" { "Start a fresh verified host epoch for this same session. Original history and its receipt stay immutable; only a new user request may begin a new native conversation. This does not resume the destroyed native process." } else if operation == "Use sandbox…" { "Attach to this same sandbox; if paused, it will resume. This does not create another sandbox." } else { "Apply this operation to the selected sandbox?" };
                         page.confirmation = Some(("scaffold.control", json!({"commandId": uuid::Uuid::new_v4().to_string(), "control": control}), format!("{operation} {label}\n{warning}"))); cx.notify();
                     }
                 })));

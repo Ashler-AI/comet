@@ -13,6 +13,11 @@ use zeron_doc::{RegistryDoc, SessionDoc, REGISTRY_DOC_ID};
 use zeron_proto::{CollaborationPrincipal, CrewChatMetadata, PublicationRecord, PublicationValue};
 use crate::{DocsStore, StoreError};
 
+pub use crate::crew_import_epoch::{
+    OriginalEpochHistories, OriginalEpochProof, ensure_supported_import_report, imported_original_epoch_histories,
+    validate_original_epoch_bootstrap,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum CrewImportError {
     #[error("unsupported or unsafe Crew backup: {0}")]
@@ -428,6 +433,9 @@ pub fn import_legacy_crew_backup(
     for (id, raw) in documents {
         let metadata = manifest.chats.get(&id).ok_or_else(|| unsafe_data(format!("snapshot has no verified chat binding: {id}")))?;
         metadata.validate().map_err(unsafe_data)?;
+        if metadata.original_epoch_history.is_some() {
+            return Err(unsafe_data("offline original-epoch import is unsupported; use authenticated bootstrap"));
+        }
         if metadata.session_id != id || uuid::Uuid::parse_str(&id).is_err() {
             return Err(unsafe_data(format!("chat ID must preserve the exact public session UUID: {id}")));
         }

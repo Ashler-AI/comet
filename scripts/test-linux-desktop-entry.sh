@@ -20,6 +20,8 @@ printf '#!/bin/sh\nexit 0\n' >"$WORK/pkg/$PKG/comet"
 chmod 755 "$WORK/pkg/$PKG/comet"
 cp "$ROOT/dist/zeron.desktop" "$WORK/pkg/$PKG/crew-upstream-canary.desktop"
 printf 'not-really-a-png' >"$WORK/pkg/$PKG/crew-upstream-canary.png"
+mkdir -p "$WORK/pkg/$PKG/crew-web"
+printf 'native browser assets' >"$WORK/pkg/$PKG/crew-web/server.mjs"
 
 # The tarball's install.sh lives in a heredoc inside package-linux.sh.
 sed -n "/<<'INSTALL'/,/^INSTALL\$/p" "$ROOT/scripts/package-linux.sh" | sed '1d;$d' \
@@ -78,6 +80,14 @@ for installer in tarball; do
   second="$(readlink "$home/.crew-upstream-canary/app/current")"
   [ "$first" != "$second" ] || fail "same-version new artifact not installed"
   [ -x "$first/comet" ] || fail "old artifact was deleted"
+  printf '\nchanged browser, same native binary\n' >>"$WORK/pkg/$PKG/crew-web/server.mjs"
+  run "$home"
+  third="$(readlink "$home/.crew-upstream-canary/app/current")"
+  [ "$second" != "$third" ] || fail "same-version browser asset update not installed"
+  cmp "$WORK/pkg/$PKG/crew-web/server.mjs" "$third/crew-web/server.mjs" || fail "stale browser assets installed"
+  [ -x "$second/comet" ] || fail "previous native bundle was deleted"
+  run "$home"
+  [ "$third" = "$(readlink "$home/.crew-upstream-canary/app/current")" ] || fail "identical native bundle changed install identity"
   [ "$(cat "$home/.crew/sentinel")" = preserve ] || fail "Crew changed"
   [ "$(cat "$home/.zeron/sentinel")" = preserve ] || fail "Zeron changed"
   [ "$(cat "$home/.local/bin/comet")" = preserve ] || fail "shared comet launcher changed"

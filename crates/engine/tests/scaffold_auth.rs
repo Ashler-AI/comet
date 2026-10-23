@@ -125,7 +125,7 @@ async fn absent_or_invalid_managed_configuration_never_enables_development() {
         data_dir: dir.path().into(), edge_url: config.edge_url.clone(), edge_token: None,
         ipc_port: 0, default_harness: HarnessId::Mock, org_id: None, workos_client_id: None,
         scaffold: config.scaffold.clone(), device: None, managed_inference: false,
-        device_bootstrap_file: None, scaffold_runtime_artifact: None,
+        device_bootstrap_file: None,
     };
     let retained = Auth::detect(config).await;
     let scope = Engine::initial_workspace_scope(&retained);
@@ -352,7 +352,7 @@ async fn managed_startup_outage_defers_the_same_synced_profile_until_background_
         data_dir: dir.path().to_path_buf(), edge_url: server.origin.clone(), edge_token: None,
         ipc_port: 0, default_harness: HarnessId::Mock, org_id: None, workos_client_id: None,
         scaffold: Some(ScaffoldConfig::new(&server.origin, &server.origin, "canary")),
-        device: None, managed_inference: false, device_bootstrap_file: None, scaffold_runtime_artifact: None,
+        device: None, managed_inference: false, device_bootstrap_file: None,
     };
     let original = server.auth(dir.path());
     original.access_token().await.unwrap();

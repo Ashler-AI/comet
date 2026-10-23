@@ -142,8 +142,6 @@ pub struct EngineConfig {
     pub managed_inference: bool,
     /// Consume the private one-use bootstrap only after verified exchange.
     pub device_bootstrap_file: Option<PathBuf>,
-    /// Immutable Linux runtime artifact installed into isolated canary sandboxes.
-    pub scaffold_runtime_artifact: Option<(PathBuf, String)>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -219,6 +217,8 @@ impl EngineCore {
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
     ) -> Result<Self, EngineError> {
+        zeron_sync::crew_import::ensure_supported_import_report(profile.store_root())
+            .map_err(|error| EngineError::Other(error.to_string()))?;
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         // Single-instance guard: two engines on one data dir would race the
@@ -249,6 +249,8 @@ impl EngineCore {
         lock: InstanceLock,
         crew_context: Option<(Auth, scaffold::ScaffoldRuntime)>,
     ) -> Result<Self, EngineError> {
+        zeron_sync::crew_import::ensure_supported_import_report(profile.store_root())
+            .map_err(|error| EngineError::Other(error.to_string()))?;
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
@@ -835,6 +837,7 @@ impl Engine {
         profile: EngineProfile,
         lock: Option<InstanceLock>,
     ) -> anyhow::Result<EngineRuntime> {
+        zeron_sync::crew_import::ensure_supported_import_report(profile.store_root())?;
         if profile.scaffold_profile_key() != auth.verified_profile_key().as_deref() {
             anyhow::bail!("Crew profile authority changed during initialization");
         }
@@ -898,14 +901,8 @@ impl Engine {
                 &authority.control_origin, &authority.project_scope, tokens.clone(),
             )?;
             let grants = scaffold::EdgeDeviceJoinGrantClient::new(&config.edge_url, tokens.clone())?;
-            let mut runtime = scaffold::ScaffoldRuntime::new(client, &config.edge_url, Arc::new(grants))
-                .with_deployment_id(deployment)
-                .with_remote_executable(".scaffold/crew-upstream-canary/bin/comet".into())
-                .with_remote_data_dir(".scaffold/crew-upstream-canary/data".into())
-                .with_remote_ipc_port(27954);
-            if let Some((path, sha256)) = &config.scaffold_runtime_artifact {
-                runtime = runtime.with_runtime_artifact(path.clone(), sha256.clone())?;
-            }
+            let runtime = scaffold::ScaffoldRuntime::new(client, &config.edge_url, Arc::new(grants))
+                .with_deployment_id(deployment);
             Some((auth.clone(), runtime))
         } else {
             None
@@ -914,6 +911,41 @@ impl Engine {
             Some(lock) => lock,
             None => InstanceLock::acquire(profile.device_root())?,
         };
+        // Device bootstrap verifies canonical original-epoch evidence before
+        // document sync or command drain can observe historical requests.
+        if let Some(authority) = auth.device_grant_authority()
+            && let Some((_, runtime)) = &crew_context
+            && let Some(evidence) = runtime.client().original_epoch_history(
+                &authority.sandbox_id, &authority.scope, &tokio_util::sync::CancellationToken::new(),
+            ).await?
+        {
+            let root = profile.store_root().to_owned();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let chat = authority.scope.session_id.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Original epoch bootstrap requires an exact session grant"))?;
+                let principal = zeron_proto::CollaborationPrincipal {
+                    subject: authority.principal_subject.clone(), email: None,
+                    project_id: authority.scope.project_id.clone(), deployment_id: authority.scope.deployment_id.clone(),
+                    session_id: Some(chat.to_owned()), capabilities: Vec::new(), unknown: Default::default(),
+                };
+                let history = zeron_sync::crew_import::validate_original_epoch_bootstrap(
+                    evidence.proof_json.as_bytes(), &evidence.command_outcomes, &principal,
+                )?;
+                if authority.expires_at <= now_ms() || authority.grant_id.is_empty()
+                    || authority.sandbox_id != history.sandbox_id || authority.lifecycle_epoch <= history.coordinator_lifecycle_epoch
+                    || authority.device_id != scaffold::device_id_for(&authority.sandbox_id, authority.lifecycle_epoch)
+                { anyhow::bail!("Original epoch bootstrap differs from the verified new host grant"); }
+                let store = zeron_sync::DocsStore::open(&root)?;
+                let key = format!("original-epoch-bootstrap:{chat}:{}", history.lifecycle_epoch);
+                let request = serde_json::to_vec(&serde_json::json!({
+                    "proofJson":evidence.proof_json, "commandOutcomes":evidence.command_outcomes, "principal":principal,
+                }))?;
+                store.claim_crew_command(&key, &request)?;
+                for id in evidence.command_outcomes.keys() { store.mark_processed(id)?; }
+                store.finish_crew_command(&key, &serde_json::to_vec(&history)?)?;
+                Ok(())
+            }).await??;
+        }
         let core = EngineCore::assemble_with_services_locked(
             profile, registry, config.default_harness, edge.clone(), lock, crew_context,
         )?;
@@ -1403,6 +1435,24 @@ mod device_bootstrap_tests {
     use super::*;
     use zeron_sync::scaffold_auth::{DeviceConfig, ScaffoldConfig};
 
+    #[test]
+    fn unsupported_epoch_import_is_rejected_before_engine_store_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = EngineProfile::synced(directory.path(), "project-a", "owner-a");
+        let store_root = profile.store_root().to_owned();
+        std::fs::create_dir_all(&store_root).unwrap();
+        let report = store_root.join("crew-import-report.json");
+        let bytes = br#"{"originalEpochHistories":{"chat-a":{}}}"#;
+        std::fs::write(&report, bytes).unwrap();
+        let result = EngineCore::assemble_with_profile(
+            profile, Arc::new(HarnessRegistry::new()), HarnessId::Mock, None,
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&report).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&store_root).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
     #[tokio::test]
     async fn rejected_device_bootstrap_never_opens_a_local_profile_on_start_or_restart() {
         let directory = tempfile::tempdir().unwrap();
@@ -1416,7 +1466,7 @@ mod device_bootstrap_tests {
                 session_id: "session".into(), deployment_id: "deployment".into(),
                 sandbox_id: "box".into(), lifecycle_epoch: 1,
             }),
-            device_bootstrap_file: None, scaffold_runtime_artifact: None,
+            device_bootstrap_file: None,
         };
         for restart in [false, true] {
             if restart { config.device = None; }

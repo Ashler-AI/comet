@@ -13,7 +13,7 @@ fn browser_suppression_exits_without_starting_the_app() {
 }
 
 #[test]
-fn session_read_uses_inherited_ipc_without_rewriting_saved_runtime() {
+fn session_read_ignores_legacy_artifact_env_and_preserves_saved_runtime() {
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -39,6 +39,8 @@ fn session_read_uses_inherited_ipc_without_rewriting_saved_runtime() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_zeron"))
         .env_clear()
         .env("COMET_IPC_PORT", inherited_port.to_string())
+        .env("COMET_SCAFFOLD_RUNTIME_BINARY", "/obsolete/comet")
+        .env("CREW_RUNTIME_BINARY", "/obsolete/upstream-comet")
         .arg("--data-dir").arg(profile.path())
         .args(["session", "read", "95e5f344-d332-445d-b91e-dd2e691153f6"])
         .stdout(Stdio::piped()).stderr(Stdio::piped())

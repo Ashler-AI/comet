@@ -125,6 +125,7 @@ impl EngineRpc {
 
     fn native_source(&self, id: &str) -> Result<BranchIntent, RpcError> {
         let source = self.crew_services()?.adopt_chat(&self.workspace, id).map_err(failed)?;
+        self.sessions.ensure_execution_allowed(id, source.harness_session_id.as_deref()).map_err(failed)?;
         if source.device_id != self.doc_host.device_id() { return Err(failed("Native source must be hosted on this engine")); }
         if !matches!(source.config.as_ref().map(|config| config.harness), Some(HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex)) {
             return Err(failed("This harness has no supported native fork; no transcript-only fallback is permitted"));
@@ -146,6 +147,7 @@ impl EngineRpc {
     }
 
     async fn prepare_native_branch(&self, key: &str, source_id: &str) -> Result<(BranchIntent, String, String), RpcError> {
+        self.sessions.ensure_execution_allowed(source_id, None).map_err(failed)?;
         let store = self.doc_host.crew_store();
         let intent_key = format!("{key}:snapshot");
         let intent: BranchIntent = match store.crew_command(&intent_key).map_err(failed)? {
@@ -156,6 +158,7 @@ impl EngineRpc {
                 intent
             }
         };
+        self.sessions.ensure_execution_allowed(source_id, Some(&intent.native_id)).map_err(failed)?;
         if intent.source.config.as_ref().map(|config| config.harness) != Some(HarnessId::Omp) {
             return Err(failed("Scaffold native transfer requires an OMP source"));
         }
@@ -213,6 +216,7 @@ impl EngineRpc {
                 self.native_controller()?;
                 let _gate = NATIVE_GATE.lock().await;
                 let source_id = string(&params, "sourceChatId")?;
+                self.sessions.ensure_execution_allowed(source_id, None).map_err(failed)?;
                 let command = string(&params, "commandId")?;
                 if command.len() > 256 { return Err(RpcError::BadParams("commandId exceeds 256 bytes".into())); }
                 let key = format!("native-fork:{command}");
@@ -230,6 +234,7 @@ impl EngineRpc {
                         seed
                     }
                 };
+                self.sessions.ensure_execution_allowed(source_id, Some(&seed.native_id)).map_err(failed)?;
                 let native_fork_pending = seed.source.config.as_ref().map(|config| config.harness) != Some(HarnessId::Omp);
                 let (intent, id) = if native_fork_pending {
                     let id = seed.native_id.clone();

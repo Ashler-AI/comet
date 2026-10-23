@@ -12,9 +12,19 @@ set -euo pipefail
 export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "Linux packaging requires a Linux runner" >&2
+  exit 1
+fi
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 PROFILE="${PROFILE:-release}"
 ARCH="$(uname -m)"
+case "$ARCH" in
+  amd64) ARCH=x86_64 ;;
+  arm64) ARCH=aarch64 ;;
+  x86_64|aarch64) ;;
+  *) echo "Unsupported Linux architecture: $ARCH" >&2; exit 1 ;;
+esac
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 OUT_DIR="$ROOT/target/package"
 STAGE="$OUT_DIR/crew-upstream-canary-$VERSION-linux-$ARCH"
@@ -43,9 +53,12 @@ mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
 mkdir -p "$STAGE/crew-web/public"
-install -m 644 "$ROOT/apps/web/server.mjs" "$ROOT/apps/web/rpc.mjs" "$ROOT/apps/web/package.json" "$ROOT/apps/web/contract.json" "$STAGE/crew-web/"
-install -m 644 "$ROOT/apps/web/public/app.js" "$ROOT/apps/web/public/index.html" "$ROOT/apps/web/public/style.css" "$STAGE/crew-web/public/"
-install -m 644 "$ROOT/apps/web/contract.json" "$STAGE/crew-web-contract.json"
+for asset in server.mjs rpc.mjs package.json contract.json public/index.html public/app.js public/style.css; do
+  test -s "$ROOT/apps/web/$asset"
+  install -m 644 "$ROOT/apps/web/$asset" "$STAGE/crew-web/$asset"
+done
+install -m 644 "$STAGE/crew-web/contract.json" "$STAGE/crew-web-contract.json"
+install -m 644 "$ROOT/scaffold-runtime-version.txt" "$STAGE/scaffold-runtime-version.txt"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
@@ -55,22 +68,28 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="__VERSION__"
 APP_ROOT="$HOME/.crew-upstream-canary/app"
-DIGEST="$(sha256sum "$HERE/comet" | cut -d' ' -f1)"
+# A same-version browser bundle must not reuse a stale binary-only install.
+DIGEST="$(cd "$HERE" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 DEST="$APP_ROOT/$VERSION-$DIGEST"
 mkdir -p "$APP_ROOT"
 if [ ! -x "$DEST/comet" ]; then
   # Copy beside the final name, then rename: an interrupted install never
   # leaves a half-copied version the updater would trust.
   STAGE="$(mktemp -d "$APP_ROOT/.install-$VERSION-XXXXXX")"
+  trap 'rm -rf "$STAGE"' EXIT
   cp -R "$HERE/." "$STAGE/"
-  rm -rf "$DEST"
-  mv "$STAGE" "$DEST"
+  # Another installer may have published this digest while we copied.
+  # Never delete a live release or move our stage inside its directory.
+  if ! mv -T "$STAGE" "$DEST"; then
+    [ -x "$DEST/comet" ] || exit 1
+  fi
 fi
 if ! "$DEST/comet" --version >/dev/null; then
   echo "Crew Canary could not start; see the loader error above. Install the missing runtime libraries (including ALSA, libasound.so.2), then retry." >&2
   exit 1
 fi
-ln -sfn "$DEST" "$APP_ROOT/current"
+ln -sfn "$DEST" "$APP_ROOT/.current.$$"
+mv -Tf "$APP_ROOT/.current.$$" "$APP_ROOT/current"
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$APP_ROOT/current/comet" "$HOME/.local/bin/crew-upstream-canary"
 

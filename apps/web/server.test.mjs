@@ -19,8 +19,8 @@ async function fixture(t, publish = true) {
   t.after(() => rm(root, { recursive: true, force: true }));
   const env = {
     SCAFFOLD_CREW_SYNC_GENERATION: 'chat2', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify(profile),
-    CREW_WEB_AUTH_TOKEN: 'private-token-'.repeat(4), COMET_IPC_PORT: '27954',
-    COMET_DATA_DIR: join(root, '.scaffold/crew-upstream-canary/data'), SCAFFOLD_RUNTIME_DIR: root,
+    CREW_WEB_AUTH_TOKEN: 'private-token-'.repeat(4), COMET_IPC_PORT: '39400',
+    COMET_DATA_DIR: join(root, '.scaffold/crew-data'), SCAFFOLD_RUNTIME_DIR: root,
   };
   const config = loadConfig(env);
   await mkdir(join(root, 'omp-inference'));
@@ -76,12 +76,13 @@ async function fixture(t, publish = true) {
   return { env, config, authority, context, commands, calls, watches, rpc, viewport, publishSnapshots, url, headers, get, post };
 }
 
-test('only trusted chat2 configuration enables the isolated bridge', async t => {
+test('only trusted chat2 configuration enables the canonical native bridge', async t => {
   const f = await fixture(t);
-  assert.equal(f.config.ipcPort, 27954);
   for (const change of [
     { SCAFFOLD_CREW_SYNC_GENERATION: '' }, { SCAFFOLD_CREW_SYNC_GENERATION: 'legacy' },
-    { COMET_IPC_PORT: '39400' }, { COMET_DATA_DIR: '/tmp/shared-data' },
+    { COMET_IPC_PORT: '27954' }, { COMET_DATA_DIR: '/tmp/shared-data' },
+    { COMET_DATA_DIR: '/tmp/.scaffold/crew-upstream-canary/data' },
+    { SCAFFOLD_RUNTIME_DIR: 'relative/runtime' },
     { CREW_WEB_AUTH_TOKEN: 'short' }, { CREW_WEB_SESSION_ID: 'another-session' },
     { SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify({ ...profile, actor: {} }) },
   ]) assert.throws(() => loadConfig({ ...f.env, ...change }));
@@ -93,18 +94,23 @@ test('real health requires authority and all native snapshots; private native op
   assert.equal((await f.get('/health')).status, 503);
   f.publishSnapshots();
   assert.equal((await f.get('/health')).status, 200);
-  assert.deepEqual([...f.watches.keys()], ['WatchChats', 'WatchSessions', 'WatchDocMessages']);
-  assert.deepEqual(f.watches.get('WatchDocMessages').params, { chatId: profile.sessionId });
   const state = await (await f.get('/api/session')).json();
   assert.equal(state.capabilities.message, true);
   assert.equal(state.session.cwd, '/workspace');
   assert.equal(JSON.stringify(state).includes('private-grant'), false);
   assert.equal(JSON.stringify(state).includes('opaque-edge-owner'), false);
-  assert.deepEqual(await (await f.get('/api/native-open')).json(), {
-    url: 'crew-upstream-canary://scaffold/crew-upstream-canary/crew-upstream-canary/session-a/sandbox-a',
-  });
+  const native = new URL((await (await f.get('/api/native-open')).json()).url);
+  assert.equal(native.protocol, 'crew-upstream-canary:');
+  assert.equal(native.hostname, 'scaffold');
+  assert.equal(native.pathname, '/crew-upstream-canary/crew-upstream-canary/session-a/sandbox-a');
+  assert.equal(native.username + native.password + native.search + native.hash, '');
+  assert.equal(f.commands.size, 0);
+  assert.ok(f.calls.every(({ method }) => ['ScaffoldHostAuthority', 'ListModels'].includes(method)));
   assert.throws(() => f.watches.get('WatchChats').callback([{ ...f.context, deviceId: 'other-device' }]));
   assert.equal(f.viewport.state().capabilities.message, false);
+  assert.equal((await f.get('/health')).status, 503);
+  f.authority.scope.sessionId = 'other-session';
+  assert.equal((await f.get('/api/native-open')).status, 503);
 });
 
 test('proxy authentication, mutation origin, bounded bodies and exact grant binding fail closed', async t => {
@@ -256,7 +262,7 @@ test('SSE coalesces backpressure, disconnects oversized backlog, and erases stat
 });
 
 test('native subscriptions cancel their own wire request without closing other streams', () => {
-  const rpc = new CrewRpc(27954);
+  const rpc = new CrewRpc(39400);
   const frames = [];
   rpc.socket = { readyState: WebSocket.OPEN, send: frame => frames.push(JSON.parse(frame)), close: () => assert.fail('Cancellation must not close the engine connection') };
   const cancel = rpc.watch('WatchDocMessages', { chatId: 'session-a' }, () => {});

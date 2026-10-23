@@ -672,10 +672,15 @@ impl Auth {
         if *self.inner.token_tx.borrow() != generation || !self.is_authenticated_mode() {
             return;
         }
-        lifecycle.generation = lifecycle.generation.wrapping_add(1);
-        lifecycle.invalidated = true;
-        if let Some(helper) = &self.inner.scaffold {
-            helper.invalidate(helper.generation());
+        // WorkOS rejection concerns the access lease, not its rotating refresh
+        // secret. Keep that flight's lifecycle valid so its replacement commits;
+        // token_tx below still fences every rejected access lease immediately.
+        if self.scaffold_enabled() {
+            lifecycle.generation = lifecycle.generation.wrapping_add(1);
+            lifecycle.invalidated = true;
+            if let Some(helper) = &self.inner.scaffold {
+                helper.invalidate(helper.generation());
+            }
         }
         *lock(&self.inner.access) = None;
         self.inner.token_tx.send_modify(|epoch| *epoch = epoch.wrapping_add(1));

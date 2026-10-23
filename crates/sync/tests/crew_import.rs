@@ -141,7 +141,7 @@ fn backup(path: &std::path::Path, pending: bool) -> CollaborationPrincipal {
         native_histories:BTreeMap::from([("native-unchanged".into(), "native-histories/omp.jsonl".into())]),
         project_id:principal.project_id.clone(), deployment_id:principal.deployment_id.clone(), files,
         chats:BTreeMap::from([(CHAT.into(), CrewChatMetadata { owner_subject:principal.subject.clone(),
-            scope, session_id:CHAT.into(), environment:None, agent_route:None })]) };
+            scope, session_id:CHAT.into(), environment:None, agent_route:None, original_epoch_history:None })]) };
     std::fs::write(path.join("crew-backup.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
     principal
 }
@@ -242,6 +242,26 @@ fn unknown_pending_work_and_tampered_assets_fail_before_destination_creation() {
     assert!(!target.exists());
     std::fs::write(source.join("attachments/image.png"), b"changed").unwrap();
     assert!(import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap_err().to_string().contains("integrity mismatch"));
+    assert!(!target.exists());
+}
+
+#[test]
+fn offline_original_epoch_metadata_requires_authenticated_bootstrap() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("backup");
+    std::fs::create_dir(&source).unwrap();
+    let principal = backup(&source, false);
+    let path = source.join("crew-backup.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["chats"][CHAT]["originalEpochHistory"] = serde_json::json!({
+        "sandboxId":"box", "lifecycleEpoch":1, "coordinatorLifecycleEpoch":2,
+        "sourceDeviceId":"comet-scaffold-box", "originalStatus":"stopped",
+        "nativeSessionId":"native-unchanged", "sourceEvidenceSha256":"a".repeat(64),
+    });
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let target = root.path().join("new-profile");
+    let error = import_legacy_crew_backup(&source, &target, &principal, "controller").unwrap_err();
+    assert!(error.to_string().contains("offline original-epoch import is unsupported"));
     assert!(!target.exists());
 }
 

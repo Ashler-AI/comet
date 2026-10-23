@@ -37,7 +37,6 @@ struct RuntimeSettings {
     project_scope: Option<String>,
     deployment_id: Option<String>,
     ipc_port: Option<u16>,
-    scaffold_runtime_artifact: Option<(PathBuf, String)>,
 }
 
 fn setting(name: &str, upstream: &str) -> Option<String> {
@@ -94,13 +93,6 @@ impl RuntimeArgs {
         };
         let managed_inference = std::env::var("COMET_INFERENCE_MODE").as_deref() != Ok("local")
             && harness != HarnessId::Mock;
-        let artifact_path = setting("COMET_SCAFFOLD_RUNTIME_BINARY", "CREW_RUNTIME_BINARY");
-        let artifact_hash = setting("COMET_SCAFFOLD_RUNTIME_SHA256", "CREW_RUNTIME_SHA256");
-        let scaffold_runtime_artifact = match (artifact_path, artifact_hash) {
-            (Some(path), Some(hash)) => Some((PathBuf::from(path), hash)),
-            (None, None) => saved.scaffold_runtime_artifact,
-            _ => bail!("runtime artifact requires both its binary path and SHA256"),
-        };
         // These are non-secret launch coordinates, retained for Finder launches
         // and device restarts. Credential storage belongs to the auth service.
         if persist && scaffold.is_some() {
@@ -108,7 +100,6 @@ impl RuntimeArgs {
             let settings = RuntimeSettings {
                 edge_url: Some(edge_url.clone()), scaffold_url, project_scope,
                 deployment_id, ipc_port: Some(ipc_port),
-                scaffold_runtime_artifact: scaffold_runtime_artifact.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&settings)?;
             let mut file = tempfile::NamedTempFile::new_in(&data_dir)?;
@@ -122,7 +113,6 @@ impl RuntimeArgs {
             org_id: setting("COMET_PROJECT_SCOPE", "ZERON_ORG_ID"),
             workos_client_id: None, scaffold, device: None, managed_inference,
             device_bootstrap_file: None,
-            scaffold_runtime_artifact,
         })
     }
 }
@@ -168,6 +158,7 @@ pub fn configure_device(config: &mut EngineConfig, path: &Path) -> anyhow::Resul
         .map_err(|_| anyhow::anyhow!("invalid device bootstrap"))?;
     let authority = config.scaffold.as_ref().context("device bootstrap requires a configured Scaffold authority")?;
     if bootstrap.project_id != authority.project_scope
+        || authority.deployment_id.as_deref().is_some_and(|deployment| deployment != bootstrap.deployment_id)
         || bootstrap.edge_url.as_deref().is_some_and(|edge| edge.trim_end_matches('/') != config.edge_url.trim_end_matches('/'))
     {
         bail!("device bootstrap does not match the configured authority");
@@ -193,95 +184,6 @@ pub async fn scaffold_authority(ipc_port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-// These bytes are authenticated by the same executable SHA-256 as the engine.
-const SCAFFOLD_WEB_ASSETS: &[(&str, &[u8])] = &[
-    ("server.mjs", include_bytes!("../../web/server.mjs")),
-    ("rpc.mjs", include_bytes!("../../web/rpc.mjs")),
-    ("package.json", include_bytes!("../../web/package.json")),
-    ("contract.json", include_bytes!("../../web/contract.json")),
-    ("public/app.js", include_bytes!("../../web/public/app.js")),
-    ("public/index.html", include_bytes!("../../web/public/index.html")),
-    ("public/style.css", include_bytes!("../../web/public/style.css")),
-];
-
-pub fn install_scaffold_web() -> anyhow::Result<()> {
-    let executable = std::env::current_exe()?;
-    let bin = executable.parent().context("runtime executable directory unavailable")?;
-    let root = bin.parent().context("runtime root unavailable")?;
-    if executable.file_name().is_none_or(|name| name != "comet")
-        || bin.file_name().is_none_or(|name| name != "bin")
-        || root.file_name().is_none_or(|name| name != "crew-upstream-canary")
-        || root.parent().and_then(Path::file_name).is_none_or(|name| name != ".scaffold")
-    { bail!("browser assets require the isolated Scaffold runtime layout"); }
-    install_web_assets(root)
-}
-
-fn install_web_assets(root: &Path) -> anyhow::Result<()> {
-    let web = root.join("web");
-    let public = web.join("public");
-    for directory in [root, web.as_path(), public.as_path()] {
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)] {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&directory) {
-            Ok(()) => {},
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = std::fs::symlink_metadata(&directory)?;
-        if !metadata.is_dir() { bail!("browser asset directory is not a regular directory"); }
-        #[cfg(unix)] {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.mode() & 0o022 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
-                bail!("browser asset directory is writable by another user");
-            }
-        }
-    }
-    for (name, bytes) in SCAFFOLD_WEB_ASSETS {
-        install_runtime_file(&web.join(name), bytes)?;
-    }
-    // The supervisor cannot execute the uploaded engine or browser before this.
-    install_runtime_file(&root.join("runtime-ready"), b"crew-upstream-canary\n")
-}
-
-fn install_runtime_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)] {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    }
-    match options.open(path) {
-        Ok(mut file) => {
-            let metadata = file.metadata()?;
-            if !metadata.is_file() || metadata.len() != bytes.len() as u64 { bail!("existing browser asset differs from the verified runtime"); }
-            #[cfg(unix)] {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
-                    bail!("existing browser asset is not a private owned file");
-                }
-            }
-            let mut buffer = [0u8; 8192];
-            for expected in bytes.chunks(buffer.len()) {
-                file.read_exact(&mut buffer[..expected.len()])?;
-                if buffer[..expected.len()] != *expected { bail!("existing browser asset differs from the verified runtime"); }
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut file = tempfile::NamedTempFile::new_in(path.parent().context("asset parent unavailable")?)?;
-            file.write_all(bytes)?;
-            file.as_file().sync_all()?;
-            file.persist_noclobber(path).map_err(|error| error.error)?;
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -300,19 +202,65 @@ mod tests {
     }
 
     #[test]
-    fn embedded_web_install_rejects_changed_assets_and_directory_links() {
-        let root = tempfile::tempdir().unwrap();
-        install_web_assets(root.path()).unwrap();
-        install_web_assets(root.path()).unwrap();
-        let server = root.path().join("web/server.mjs");
-        std::fs::write(&server, b"changed").unwrap();
-        assert!(install_web_assets(root.path()).is_err());
-        assert_eq!(std::fs::read(&server).unwrap(), b"changed");
-        let unbound = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), unbound.path().join("web")).unwrap();
-        assert!(install_web_assets(unbound.path()).is_err());
-        assert!(!unbound.path().join("runtime-ready").exists());
-        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    fn bootstrap_requires_the_configured_authority_without_consuming_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut authority = ScaffoldConfig::new("https://control.invalid", "https://edge.invalid", "project");
+        authority.deployment_id = Some("expected".into());
+        let mut config = EngineConfig {
+            data_dir: dir.path().join("profile"), edge_url: "https://edge.invalid".into(),
+            edge_token: None, ipc_port: 39400, default_harness: HarnessId::Mock,
+            org_id: None, workos_client_id: None, scaffold: Some(authority),
+            device: None, managed_inference: false, device_bootstrap_file: None,
+        };
+        let bootstrap = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let value = serde_json::json!({
+            "deviceJoinGrant":"private", "projectId":"project", "deploymentId":"expected",
+            "sessionId":"session", "deviceId":"device", "lifecycleEpoch":7,
+            "sandboxId":"sandbox", "edgeUrl":"https://edge.invalid/"
+        });
+        for (field, wrong) in [
+            ("deploymentId", "other"), ("projectId", "other"),
+            ("edgeUrl", "https://other.invalid"),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = wrong.into();
+            let bytes = serde_json::to_vec(&invalid).unwrap();
+            std::fs::write(bootstrap.path(), &bytes).unwrap();
+            assert!(configure_device(&mut config, bootstrap.path()).is_err(), "{field}");
+            assert!(config.device.is_none() && config.device_bootstrap_file.is_none());
+            assert_eq!(config.default_harness, HarnessId::Mock);
+            assert!(!config.managed_inference);
+            assert_eq!(std::fs::read(bootstrap.path()).unwrap(), bytes);
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(bootstrap.path(), &bytes).unwrap();
+        configure_device(&mut config, bootstrap.path()).unwrap();
+        let device = config.device.as_ref().unwrap();
+        assert_eq!(device.deployment_id, "expected");
+        assert_eq!(device.session_id, "session");
+        assert_eq!(device.device_id, "device");
+        assert_eq!(device.sandbox_id, "sandbox");
+        assert_eq!(device.lifecycle_epoch, 7);
+        assert_eq!(config.device_bootstrap_file.as_deref(), Some(bootstrap.path()));
+        assert_eq!(config.default_harness, HarnessId::Omp);
+        assert!(config.managed_inference);
+        assert_eq!(std::fs::read(bootstrap.path()).unwrap(), bytes);
+        config.scaffold.as_mut().unwrap().deployment_id = None;
+        configure_device(&mut config, bootstrap.path()).unwrap();
+        assert_eq!(config.device.as_ref().unwrap().deployment_id, "expected");
+    }
+
+    #[test]
+    fn runtime_settings_drop_legacy_artifact_but_keep_explicit_coordinates() {
+        let saved = serde_json::json!({
+            "edgeUrl":"https://edge.invalid", "scaffoldUrl":"https://control.invalid",
+            "projectScope":"project", "deploymentId":"expected", "ipcPort":39400,
+            "scaffoldRuntimeArtifact":["/obsolete/comet", "obsolete-digest"]
+        });
+        let settings: RuntimeSettings = serde_json::from_value(saved.clone()).unwrap();
+        let persisted = serde_json::to_value(settings).unwrap();
+        let mut expected = saved;
+        expected.as_object_mut().unwrap().remove("scaffoldRuntimeArtifact");
+        assert_eq!(persisted, expected);
     }
 }

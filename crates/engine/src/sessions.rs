@@ -234,6 +234,9 @@ struct Inner {
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     crew: OnceLock<crate::crew::CrewServices>,
     imported_native_histories: Mutex<std::collections::BTreeMap<String, std::path::PathBuf>>,
+    original_epoch_histories: OnceLock<zeron_sync::crew_import::OriginalEpochHistories>,
+    original_epoch_archives: OnceLock<Vec<std::path::PathBuf>>,
+    original_epoch_binding: Mutex<()>,
     native_branches: OnceLock<std::path::PathBuf>,
     /// [`crate::Repos::scratch_root`]; bare tests fall back to
     /// `~/.zeron/scratch`.
@@ -283,6 +286,9 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 crew: OnceLock::new(),
                 imported_native_histories: Mutex::new(Default::default()),
+                original_epoch_histories: OnceLock::new(),
+                original_epoch_archives: OnceLock::new(),
+                original_epoch_binding: Mutex::new(()),
                 native_branches: OnceLock::new(),
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
@@ -298,12 +304,149 @@ impl SessionsEngine {
     }
 
     pub(crate) fn load_crew_import(&self, profile: &std::path::Path) -> Result<(), EngineError> {
+        let original_epochs = zeron_sync::crew_import::imported_original_epoch_histories(profile)
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let _ = self.inner.original_epoch_histories.set(original_epochs);
         let branches = profile.join("native-branches");
         std::fs::create_dir_all(&branches)?;
         let _ = self.inner.native_branches.set(branches.canonicalize()?);
-        *lock(&self.inner.imported_native_histories) =
-            zeron_sync::crew_import::imported_native_histories(profile)
-                .map_err(|error| EngineError::Other(error.to_string()))?;
+        let histories = zeron_sync::crew_import::imported_native_histories(profile)
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let mut original_archives = Vec::new();
+        for (native, archive) in &histories {
+            if self.inner.original_epoch_histories.get().is_some_and(|histories|
+                histories.histories.values().any(|history| history.native_session_id.as_deref() == Some(native.as_str()))) {
+                original_archives.push(archive.canonicalize()?);
+            }
+        }
+        let _ = self.inner.original_epoch_archives.set(original_archives);
+        *lock(&self.inner.imported_native_histories) = histories;
+        Ok(())
+    }
+    pub(crate) fn original_epoch_history(&self, chat_id: &str) -> Option<&zeron_proto::OriginalEpochHistory> {
+        self.inner.original_epoch_histories.get()?.histories.get(chat_id)
+    }
+
+    /// Historical processed claims are provenance, not an interrupted local execution.
+    pub(crate) fn is_original_epoch_command(&self, command_id: &str) -> bool {
+        self.inner.original_epoch_histories.get()
+            .is_some_and(|history| history.command_ids.contains(command_id))
+    }
+
+    pub(crate) fn reset_original_epoch_native_association(&self, chat_id: &str) {
+        lock(&self.inner.harness_sessions).remove(chat_id);
+        lock(&self.inner.last_requests).remove(chat_id);
+    }
+
+    /// Only the importer's immutable proof and an explicit, verified Start receipt
+    /// can release a logical session. Editable index metadata cannot release it.
+    pub(crate) fn ensure_execution_allowed(&self, chat_id: &str, resume: Option<&str>) -> Result<(), EngineError> {
+        let denied = || EngineError::Other("Original execution epoch is read-only history; explicitly start a verified new epoch before running. Its original native identity cannot be resumed or forked.".into());
+        if let Some(selector) = resume
+            && let Some(histories) = self.inner.original_epoch_histories.get().filter(|loaded| !loaded.histories.is_empty())
+        {
+            let selected = std::path::Path::new(selector);
+            let resolved = selected.is_absolute().then(|| selected.canonicalize().ok()).flatten();
+            if self.inner.original_epoch_archives.get().is_some_and(|archives|
+                archives.iter().any(|archive| archive == selected || resolved.as_ref() == Some(archive))) {
+                return Err(denied());
+            }
+            // ponytail: scan the bounded import map; index selectors if profiles grow large.
+            for native in histories.histories.values().filter_map(|history| history.native_session_id.as_deref()) {
+                if selector == native { return Err(denied()); }
+                if selected.is_absolute() {
+                    let launch = self.native_launch_selector(native);
+                    let launch = std::path::Path::new(&launch);
+                    if selected == launch || resolved.as_deref() == Some(launch) { return Err(denied()); }
+                }
+            }
+        }
+        let host = self.inner.doc_host();
+        let chat = host.as_ref().and_then(|host| host.workspace()).map(|workspace| workspace.chat(chat_id)).transpose()?.flatten();
+        let Some(history) = self.original_epoch_history(chat_id) else {
+            if chat.as_ref().and_then(|chat| chat.crew.as_ref()).is_some_and(|metadata| metadata.original_epoch_history.is_some()) {
+                return Err(denied());
+            }
+            return Ok(());
+        };
+        let host = host.ok_or_else(denied)?;
+        let _binding = lock(&self.inner.original_epoch_binding);
+        let workspace = host.workspace().ok_or_else(denied)?;
+        let mut chat = workspace.chat(chat_id)?.ok_or_else(denied)?;
+        if let Some(crew) = self.inner.crew.get()
+            && let Some(authority) = crew.device_grant_authority()
+        {
+            if chat.crew.is_none() { chat = crew.adopt_chat(workspace, chat_id)?; }
+            let metadata = chat.crew.as_ref().ok_or_else(denied)?;
+            let marker_missing = metadata.original_epoch_history.is_none();
+            if authority.grant_id.is_empty() || authority.expires_at <= now_ms()
+                || authority.device_id != self.inner.device_id
+                || authority.device_id != crate::scaffold::device_id_for(&authority.sandbox_id, authority.lifecycle_epoch)
+                || authority.sandbox_id != history.sandbox_id || authority.lifecycle_epoch <= history.coordinator_lifecycle_epoch
+                || authority.principal_subject != metadata.owner_subject || authority.scope != metadata.scope
+                || authority.scope.session_id.as_deref() != Some(chat_id)
+                || metadata.original_epoch_history.as_ref().is_some_and(|marker| marker != history)
+            { return Err(denied()); }
+            if marker_missing { chat.crew.as_mut().ok_or_else(denied)?.original_epoch_history = Some(history.clone()); }
+            // The server mints this exact new-epoch grant only after its explicit
+            // Start intent. Bootstrap must first restore the verified import proof.
+            let key = format!("original-epoch-start:{chat_id}:{}:{}", history.lifecycle_epoch, authority.lifecycle_epoch);
+            let store = host.crew_store();
+            let request = serde_json::to_vec(history).map_err(|_| denied())?;
+            let outcome = serde_json::to_vec(&serde_json::json!({
+                "sandboxId":authority.sandbox_id, "lifecycleEpoch":authority.lifecycle_epoch, "deviceId":authority.device_id,
+            })).map_err(|_| denied())?;
+            store.claim_crew_command(&key, &request)?;
+            let (saved_request, saved) = store.crew_command(&key)?.ok_or_else(denied)?;
+            if saved_request != request { return Err(denied()); }
+            if let Some(saved) = saved {
+                if saved != outcome { return Err(denied()); }
+                if marker_missing { workspace.publish_crew_chat(&chat, None)?; }
+            } else {
+                let metadata = chat.crew.as_mut().ok_or_else(denied)?;
+                if let Some(environment) = metadata.environment.as_mut() {
+                    let zeron_proto::SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle_epoch, .. } = &mut environment.source else {
+                        return Err(denied());
+                    };
+                    if sandbox_id != &authority.sandbox_id { return Err(denied()); }
+                    *lifecycle_epoch = Some(authority.lifecycle_epoch);
+                }
+                chat.device_id = authority.device_id.clone();
+                chat.harness_session_id = Some(String::new());
+                chat.harness_session_cwd = None;
+                workspace.publish_crew_chat(&chat, None)?;
+                self.reset_original_epoch_native_association(chat_id);
+                store.finish_crew_command(&key, &outcome)?;
+            }
+            if chat.device_id != authority.device_id
+                || chat.harness_session_id.as_deref().filter(|id| !id.is_empty())
+                    .is_some_and(|id| history.native_session_id.as_deref() == Some(id))
+            { return Err(denied()); }
+            return Ok(());
+        }
+        let metadata = chat.crew.as_ref().ok_or_else(denied)?;
+        let environment = metadata.environment.as_ref().ok_or_else(denied)?;
+        let zeron_proto::SessionEnvironmentSource::Scaffold { lifecycle_epoch: Some(epoch), .. } = &environment.source else {
+            return Err(denied());
+        };
+        let (request, outcome) = host.crew_store().crew_command(&format!("original-epoch-start:{chat_id}:{}:{epoch}", history.lifecycle_epoch))?
+            .ok_or_else(denied)?;
+        if serde_json::from_slice::<zeron_proto::OriginalEpochHistory>(&request).ok().as_ref() != Some(history) {
+            return Err(denied());
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Binding { sandbox_id: String, lifecycle_epoch: u64, device_id: String }
+        let binding: Binding = serde_json::from_slice(outcome.as_deref().ok_or_else(denied)?).map_err(|_| denied())?;
+        if metadata.original_epoch_history.as_ref() != Some(history)
+            || binding.lifecycle_epoch <= history.coordinator_lifecycle_epoch
+            || binding.sandbox_id != history.sandbox_id
+            || binding.device_id != crate::scaffold::device_id_for(&binding.sandbox_id, binding.lifecycle_epoch)
+            || chat.device_id != binding.device_id
+            || !matches!(&environment.source, zeron_proto::SessionEnvironmentSource::Scaffold { sandbox_id, lifecycle_epoch: Some(epoch), .. }
+                if sandbox_id == &binding.sandbox_id && *epoch == binding.lifecycle_epoch)
+            || chat.harness_session_id.as_deref().filter(|id| !id.is_empty()).is_some_and(|id| history.native_session_id.as_deref() == Some(id))
+        { return Err(denied()); }
         Ok(())
     }
 
@@ -547,6 +690,7 @@ impl SessionsEngine {
         chat_id: &str,
         request: RunRequest,
     ) -> Result<String, EngineError> {
+        self.ensure_execution_allowed(chat_id, request.resume.as_deref())?;
         // A fresh explicit request may renew an identity-invalidated idle
         // process. Never interrupt a native delegated turn to recover voice.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
@@ -610,6 +754,7 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        self.ensure_execution_allowed(chat_id, request.resume.as_deref())?;
         let result = self.dispatch_with(chat_id, harness_id, request, message_id, false)
             .await;
         // Admission can fail before drive_run exists (for example Agent Auth).
@@ -666,6 +811,7 @@ impl SessionsEngine {
         startup_retry: bool,
         idle: bool,
     ) -> Result<String, EngineError> {
+        self.ensure_execution_allowed(chat_id, request.resume.as_deref())?;
         let managed = self.managed_services()?.is_some();
         if let Some(crew) = self.inner.crew.get() {
             let workspace = self.inner.workspace().ok_or_else(|| EngineError::Other("Crew workspace unavailable".into()))?;
@@ -851,8 +997,10 @@ impl SessionsEngine {
             request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
         }
+        self.ensure_execution_allowed(chat_id, request.resume.as_deref())?;
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let fork_from = self.native_fork_source(chat_id, harness_id, request.resume.as_deref())?;
+        if let Some(source) = &fork_from { self.ensure_execution_allowed(chat_id, Some(source))?; }
         if harness_id == HarnessId::Omp {
             request.resume = request.resume.as_deref().map(|id| self.native_launch_selector(id));
         }
@@ -1040,6 +1188,7 @@ impl SessionsEngine {
         message_id: Option<String>,
         issued_at: i64,
     ) -> Result<SteerOutcome, EngineError> {
+        self.ensure_execution_allowed(chat_id, None)?;
         self.managed_services()?;
         let target = lock(&self.inner.runs)
             .get(chat_id)
@@ -1297,6 +1446,15 @@ impl SessionsEngine {
         for chat_id in stale {
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
+            }
+            // Only a proven new-epoch journal may recover; old native identity stays inert.
+            if let Some(history) = self.original_epoch_history(&chat_id) {
+                let Some((native, _)) = self.inner.journal_harness_session(&chat_id) else { continue; };
+                if history.native_session_id.as_deref() == Some(native.as_str())
+                    || self.ensure_execution_allowed(&chat_id, Some(&native)).is_err()
+                    || self.inner.workspace().and_then(|workspace| workspace.chat_harness_session(&chat_id))
+                        .is_none_or(|(stored, _)| stored != native)
+                { continue; }
             }
             let handle = self.doc_handle(&chat_id)?;
             // Harness continuity first: the crashed run's session id may only
@@ -4325,5 +4483,225 @@ mod tests {
         // Missing copied data remains a failed exact-path resume, never a lookup
         // against another user's or the old installed app's native store.
         assert_eq!(sessions.native_launch_selector(&id), copied_path);
+    }
+    fn persist_original_epoch_fixture(
+        store: &zeron_sync::DocsStore,
+        id: &str,
+        outcomes: &std::collections::BTreeMap<String, String>,
+    ) -> zeron_proto::OriginalEpochHistory {
+        use sha2::Digest as _;
+        let principal = zeron_proto::CollaborationPrincipal {
+            subject: "owner".into(), email: None, project_id: "project".into(),
+            deployment_id: Some("staging".into()), session_id: Some(id.into()),
+            capabilities: vec![], unknown: Default::default(),
+        };
+        let proof = serde_json::json!({
+            "version":1, "kind":"terminal-original-epoch", "migrationId":"migration",
+            "sourceSha256":"a".repeat(64), "coordinatorLifecycleEpoch":2,
+            "nativeSessionId":"original-native",
+            "commandOutcomesSha256":format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(outcomes).unwrap())),
+            "scope":{"ownerSubject":"owner", "projectId":"project", "deploymentId":"staging",
+                "logicalSessionId":id, "sandboxId":"sandbox", "deviceId":"comet-scaffold-sandbox", "lifecycleEpoch":1},
+            "terminal":{"status":"stopped", "providerAction":"kill", "terminationReason":"provider_missing",
+                "terminatedAt":"2026-10-21T01:00:00Z", "providerNotFoundObservedAt":"2026-10-21T01:00:01Z",
+                "physicalSandboxId":"sandbox", "retainedSnapshotIds":[]},
+        });
+        let proof_json = serde_json::to_string(&proof).unwrap();
+        let history = zeron_sync::crew_import::validate_original_epoch_bootstrap(
+            proof_json.as_bytes(), outcomes, &principal,
+        ).unwrap();
+        let key = format!("original-epoch-bootstrap:{id}:{}", history.lifecycle_epoch);
+        let request = serde_json::to_vec(&serde_json::json!({
+            "proofJson":proof_json, "commandOutcomes":outcomes, "principal":principal,
+        })).unwrap();
+        store.claim_crew_command(&key, &request).unwrap();
+        for id in outcomes.keys() { store.mark_processed(id).unwrap(); }
+        store.finish_crew_command(&key, &serde_json::to_vec(&history).unwrap()).unwrap();
+        history
+    }
+
+    #[tokio::test]
+    async fn original_pending_commands_survive_sweep_and_retry_before_terminal_sync() {
+        use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+        for retry_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let id = "11111111-1111-4111-8111-111111111111";
+            let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+            let history = persist_original_epoch_fixture(&store, id,
+                &std::collections::BTreeMap::from([("historical".into(), "rejected".into())]));
+            let sessions = SessionsEngine::new("host".into(),
+                Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+                Arc::new(HarnessRegistry::new()));
+            // Reload verified persisted evidence, not a synced marker or injected runtime map.
+            sessions.load_crew_import(dir.path()).unwrap();
+            assert_eq!(sessions.original_epoch_history(id), Some(&history));
+            let host = DocHost::new(store.clone(), crate::DocHostConfig {
+                device_id: "host".into(), default_harness: HarnessId::Omp, edge: None,
+            });
+            sessions.set_doc_host(host.clone());
+            host.set_sessions(sessions.clone());
+            let handle = host.open(id).unwrap();
+            let original = SessionCommandEntry {
+                id: "historical".into(), issued_by: "comet-scaffold-sandbox".into(), issued_at: now_ms(),
+                payload: SessionCommandPayload::Run { request: request(), message_id: "old-message".into() },
+                based_on: None, expires_at: None, status: SessionCommandStatus::Pending, resolution: None,
+            };
+            handle.doc().queue_command(&original).unwrap();
+            if retry_first { host.retry_delivery(id).unwrap(); }
+            host.drain_commands(&handle).await;
+            host.retry_delivery(id).unwrap();
+            let commands = handle.doc().read_commands().unwrap();
+            assert_eq!(commands.len(), 1, "history must never mint a retry attempt");
+            assert_eq!(commands[0].status, SessionCommandStatus::Pending);
+            assert!(commands[0].resolution.is_none());
+            assert!(handle.doc().read_entries().unwrap().is_empty());
+            // The source terminal outcome can arrive later; no local crash outcome replaces it.
+            handle.doc().set_command_status("historical", SessionCommandStatus::Rejected, Some("source outcome")).unwrap();
+            host.retry_delivery(id).unwrap();
+            host.drain_commands(&handle).await;
+            let commands = handle.doc().read_commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].status, SessionCommandStatus::Rejected);
+            assert_eq!(commands[0].resolution.as_deref(), Some("source outcome"));
+
+            // A current command in the same bootstrapped chat still gets ordinary crash recovery.
+            let mut current = original;
+            current.id = "current-crash".into();
+            current.payload = SessionCommandPayload::Run { request: request(), message_id: "current-message".into() };
+            store.mark_processed(&current.id).unwrap();
+            handle.doc().queue_command(&current).unwrap();
+            if !retry_first { host.drain_commands(&handle).await; }
+            host.retry_delivery(id).unwrap();
+            let commands = handle.doc().read_commands().unwrap();
+            assert_eq!(commands.len(), 3, "only the current crash may mint a retry");
+            let crashed = commands.iter().find(|c| c.id == "current-crash").unwrap();
+            assert_eq!(crashed.status, SessionCommandStatus::Rejected);
+            assert!(crashed.resolution.as_deref().unwrap().contains("interrupted before completion"));
+            assert!(commands.iter().any(|c| c.id != "historical" && c.id != "current-crash"
+                && matches!(&c.payload, SessionCommandPayload::Run { message_id, .. } if message_id == "current-message")));
+            sessions.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn original_epoch_requires_trusted_start_and_never_reuses_old_native_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let workspace = crate::WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
+            device_id: "importer".into(), device_name: "Host".into(), platform: "linux".into(),
+            org_id: "project".into(), user_id: "owner".into(), edge: None, local_only: false,
+        }).unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        workspace.create_chat(id, None, Some("importer"), None, Some("/original/repo".into())).unwrap();
+        let history = persist_original_epoch_fixture(&store, id, &Default::default());
+        let mut chat = workspace.chat(id).unwrap().unwrap();
+        chat.harness_session_id = history.native_session_id.clone();
+        chat.harness_session_cwd = Some("/original/repo".into());
+        chat.crew = Some(serde_json::from_value(serde_json::json!({
+            "ownerSubject":"owner", "sessionId":id,
+            "scope":{"projectId":"project","deploymentId":"staging","sessionId":id},
+            "originalEpochHistory":history,
+        })).unwrap());
+        workspace.import_chat_row(&chat).unwrap();
+        let (feed, events) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(events)) }));
+        let sessions = SessionsEngine::new("importer".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry));
+        sessions.inner.original_epoch_histories.set(
+            zeron_sync::crew_import::imported_original_epoch_histories(dir.path()).unwrap(),
+        ).unwrap();
+        let host = DocHost::new(store.clone(), crate::DocHostConfig {
+            device_id: "importer".into(), default_harness: HarnessId::Omp, edge: None,
+        });
+        host.set_workspace(workspace.clone());
+        sessions.set_doc_host(host.clone());
+        host.set_sessions(sessions.clone());
+        let document = host.open(id).unwrap();
+        document.write_user_message("original-message", "preserved source history", now_ms()).unwrap();
+        assert!(sessions.ensure_execution_allowed(id, None).is_err());
+        let metadata = chat.crew.take();
+        workspace.import_chat_row(&chat).unwrap();
+        assert!(sessions.ensure_execution_allowed(id, None).is_err(), "dropping index metadata cannot drop trusted provenance");
+        chat.crew = metadata;
+        workspace.import_chat_row(&chat).unwrap();
+        assert!(host.queue_command(id, zeron_doc::SessionCommandPayload::Run {
+            request: request(), message_id: "must-not-write".into(),
+        }).is_err());
+        assert!(document.doc().read_commands().unwrap().is_empty());
+        // The stopped coordinator epoch is not a new execution, even though
+        // it is newer than the original writer and has a confirmed binding.
+        let stopped_device = crate::scaffold::device_id_for("sandbox", 2);
+        chat.device_id = stopped_device.clone();
+        chat.harness_session_id = Some(String::new());
+        chat.harness_session_cwd = None;
+        chat.crew.as_mut().unwrap().environment = Some(zeron_proto::SessionEnvironment {
+            source: zeron_proto::SessionEnvironmentSource::Scaffold {
+                sandbox_id: "sandbox".into(), region: None, lifecycle: zeron_proto::ScaffoldLifecycle::Ready,
+                lifecycle_epoch: Some(2), links: Default::default(),
+            }, name: None, owner_principal: "owner".into(), scope: chat.crew.as_ref().unwrap().scope.clone(),
+            source_ref: None, last_activity_at: None, database_environment: None, unknown: Default::default(),
+        });
+        workspace.import_chat_row(&chat).unwrap();
+        let stopped_key = format!("original-epoch-start:{id}:1:2");
+        store.claim_crew_command(&stopped_key, &serde_json::to_vec(&history).unwrap()).unwrap();
+        store.finish_crew_command(&stopped_key, &serde_json::to_vec(&serde_json::json!({
+            "sandboxId":"sandbox","lifecycleEpoch":2,"deviceId":stopped_device,
+        })).unwrap()).unwrap();
+        assert!(sessions.ensure_execution_allowed(id, None).is_err(), "fresh execution must be newer than coordinator epoch 2, not just original epoch 1");
+        // A client-projected larger epoch and cleared association are not authority.
+        let device = crate::scaffold::device_id_for("sandbox", 3);
+        chat.device_id = device.clone();
+        chat.harness_session_id = Some(String::new());
+        chat.harness_session_cwd = None;
+        chat.crew.as_mut().unwrap().environment = Some(zeron_proto::SessionEnvironment {
+            source: zeron_proto::SessionEnvironmentSource::Scaffold {
+                sandbox_id: "sandbox".into(), region: None, lifecycle: zeron_proto::ScaffoldLifecycle::Ready,
+                lifecycle_epoch: Some(3), links: Default::default(),
+            }, name: None, owner_principal: "owner".into(), scope: chat.crew.as_ref().unwrap().scope.clone(),
+            source_ref: None, last_activity_at: None, database_environment: None, unknown: Default::default(),
+        });
+        workspace.import_chat_row(&chat).unwrap();
+        assert!(sessions.ensure_execution_allowed(id, None).is_err());
+        let key = format!("original-epoch-start:{id}:1:3");
+        store.claim_crew_command(&key, &serde_json::to_vec(&history).unwrap()).unwrap();
+        assert!(sessions.ensure_execution_allowed(id, None).is_err(), "unknown start outcome is not permission");
+        store.finish_crew_command(&key, &serde_json::to_vec(&serde_json::json!({
+            "sandboxId":"sandbox","lifecycleEpoch":3,"deviceId":device,
+        })).unwrap()).unwrap();
+        sessions.reset_original_epoch_native_association(id);
+        assert!(sessions.ensure_execution_allowed(id, None).is_ok());
+        assert_eq!(sessions.inner.resume_for(id, "/original/repo"), None);
+        assert!(sessions.ensure_execution_allowed(id, Some("original-native")).is_err());
+        assert!(sessions.ensure_execution_allowed("different-chat", Some("original-native")).is_err());
+        let old_selector = dir.path().join("native-resumes/original-native.jsonl");
+        lock(&sessions.inner.imported_native_histories).insert("original-native".into(), old_selector.clone());
+        assert!(sessions.ensure_execution_allowed("different-chat", old_selector.to_str()).is_err());
+        let raw_archive = dir.path().join("native-histories/original.jsonl");
+        sessions.inner.original_epoch_archives.set(vec![raw_archive.clone()]).unwrap();
+        assert!(sessions.ensure_execution_allowed("different-chat", raw_archive.to_str()).is_err());
+        let messages = document.doc().read_entries().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "original-message");
+        let mut fresh = request();
+        fresh.cwd = "/original/repo".into();
+        let run = sessions.dispatch(id, HarnessId::Mock, fresh, Some("fresh-user-request".into())).await.unwrap();
+        assert!(!run.is_empty());
+        assert_eq!(sessions.last_request(id).unwrap().resume, None);
+        feed.send(AgentEvent::SessionStarted {
+            harness: HarnessId::Mock, model: "mock-1".into(), tools: vec![], cwd: "/original/repo".into(),
+            session_id: "fresh-native".into(), assistant_message_id: "fresh-response".into(),
+        }).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while workspace.chat(id).unwrap().unwrap().harness_session_id.as_deref() != Some("fresh-native") {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(sessions.ensure_execution_allowed(id, Some("fresh-native")).is_ok());
+        assert_eq!(workspace.chat(id).unwrap().unwrap().crew.unwrap().original_epoch_history, Some(history));
+        assert_eq!(document.doc().read_entries().unwrap()[0].id, "original-message");
+        feed.send(AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("fresh-native".into()) }).unwrap();
+        drop(feed);
+        sessions.shutdown().await;
     }
 }
