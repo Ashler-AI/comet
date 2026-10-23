@@ -724,7 +724,7 @@ impl Engine {
     /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
     pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
         if auth.scaffold_enabled() {
-            if auth.device_mode() || auth.verified_scaffold_session().is_some() {
+            if auth.device_mode() || auth.loaded_scaffold_session() || auth.verified_scaffold_session().is_some() {
                 WorkspaceScope::Synced
             } else {
                 WorkspaceScope::Local
@@ -742,9 +742,9 @@ impl Engine {
         }
     }
 
-    /// Resolve a profile for the captured scope. A synced session without an
-    /// organization returns `None` until onboarding selects one; it never falls
-    /// through to the local or development profile.
+    /// Resolve a profile for the captured scope. A synced session awaiting managed
+    /// verification or organization onboarding returns `None`; it never falls
+    /// through to the local or development profile or trusts a persisted identity.
     pub fn resolve_profile(
         config: &EngineConfig,
         auth: &Auth,
@@ -773,6 +773,9 @@ impl Engine {
             }
             WorkspaceScope::Synced => {
                 if auth.scaffold_enabled() {
+                    if auth.pending_scaffold_verification() {
+                        return Ok(None);
+                    }
                     return EngineProfile::scaffold(&config.data_dir, auth).map(Some);
                 }
                 let state = auth.state();
@@ -982,7 +985,7 @@ impl Engine {
             let tokens = tokens.clone();
             Arc::new(move || {
                 let tokens = tokens.clone();
-                Box::pin(async move { tokens.token().await.map_err(anyhow::Error::from) })
+                Box::pin(async move { tokens.token().await.map(|credential| credential.value).map_err(anyhow::Error::from) })
             })
         };
         let updater = zeron_update::Updater::spawn(config.edge_url.clone(), update_tokens, Some(quiescent));
@@ -1052,6 +1055,26 @@ impl Engine {
         let workspace_scope = Self::initial_workspace_scope(&auth);
         let mut profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
         let _refresh_loop = auth.spawn_refresh_loop();
+        // Keep signal listeners alive across verification and runtime assembly.
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+
+        // Retained managed credentials are workspace intent, not authorization.
+        // Let the existing refresh loop recover them before terminal onboarding;
+        // an unattended daemon must neither prompt nor create a local workspace.
+        while profile.is_none() && auth.pending_scaffold_verification() {
+            tokio::select! {
+                changed = auth_state.changed() => {
+                    changed.map_err(|_| EngineError::Other("authentication state closed before managed verification".into()))?;
+                }
+                result = &mut shutdown => {
+                    result?;
+                    _refresh_loop.abort();
+                    return Ok(());
+                }
+            }
+            profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
+        }
 
         // A captured cloud session without an organization must finish onboarding
         // before its profile can open. A clean signed-out install is local and never
@@ -1084,7 +1107,7 @@ impl Engine {
         runtime.core().sessions.set_ipc_port(config.ipc_port);
 
         tokio::select! {
-            result = shutdown_signal() => result?,
+            result = &mut shutdown => result?,
             requested = stop_rx.recv() => {
                 if requested.is_some() {
                     tracing::info!("headless shutdown requested over IPC");

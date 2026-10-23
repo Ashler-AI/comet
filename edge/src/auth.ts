@@ -1,11 +1,13 @@
 /**
  * Authenticates Scaffold control-plane bearers without handling Google/IAP
  * assertions in Comet. Scaffold's IAP-protected OAuth authorize route binds a
- * bearer to an internal principal; this Worker validates it on every request
- * through `/api/code-sandboxes/auth/session` so revocation is fail-closed.
+ * bearer to an internal principal. HTTP and socket authorization rendezvous in
+ * an AUTH_GRANTS coordinator before fresh `/api/code-sandboxes/auth/session`
+ * checks, sharing pending work across isolates but never completed authorization.
  */
 import type { Env } from "./env";
-import { authenticateDeviceToken } from "./auth-routes";
+import { authenticateDeviceToken, verifyScaffoldThroughCoordinator } from "./auth-routes";
+import { boundedAuthJson, scaffoldTokenFits, SCAFFOLD_JSON_BYTES } from "./auth-envelope";
 
 export type ScaffoldAuthEnv = Omit<
   Pick<
@@ -15,6 +17,8 @@ export type ScaffoldAuthEnv = Omit<
     | "SCAFFOLD_CONTROL_PLANE_URL"
     | "SCAFFOLD_PROJECT_SCOPE"
     | "SCAFFOLD_REQUIRED_CAPABILITIES"
+    | "AUTH_GRANTS"
+    | "SCAFFOLD_DEPLOYMENT_ID"
   >,
   "SCAFFOLD_REQUIRED_CAPABILITIES"
 > & {
@@ -40,7 +44,7 @@ export interface Verified {
 export type ScaffoldAuthenticationResult =
   | { status: "authenticated"; identity: Verified }
   | { status: "invalid" }
-  | { status: "unavailable" };
+  | { status: "unavailable"; retryAfter?: string };
 
 interface ScaffoldSession {
   readonly ok?: unknown;
@@ -115,40 +119,70 @@ export const bearerFromRequest = (request: Request): string | undefined => {
   return url.searchParams.get("token")?.trim() || undefined;
 };
 
-// ponytail: the exact callback stall is unknown; 2,918 ms is the retained
-// successful-launch p50, so two attempts leave 9,164 ms of the 15-second budget.
+// ponytail: retain the measured 2,918 ms attempt budget; the shared 8-second
+// envelope also bounds coordinator dispatch, queueing and response decoding.
 const SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS = 2_918;
-const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): Promise<ScaffoldAuthenticationResult> => {
+const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string, signal?: AbortSignal): Promise<ScaffoldAuthenticationResult> => {
+  if (!token.startsWith("sc_rc_")) return { status: "invalid" };
+  return verifyScaffoldThroughCoordinator(env, token, signal);
+};
+
+/** Called only by the internal grant coordinator with its own trusted bindings. */
+export const verifyScaffoldSessionResult = async (
+  env: ScaffoldAuthEnv, token: string, signal: AbortSignal
+): Promise<ScaffoldAuthenticationResult> => {
+  if (!scaffoldTokenFits(token)) return { status: "unavailable", retryAfter: "1" };
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
   const projectScope = env.SCAFFOLD_PROJECT_SCOPE.trim();
   const required = requiredCapabilities(env);
   if (!resource || !projectScope || required.length === 0) return { status: "unavailable" };
 
-  let response: Response | undefined;
+  let session: ScaffoldSession | undefined;
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (signal.aborted) return { status: "unavailable", retryAfter: "1" };
+    const controller = new AbortController();
+    const abort = () => { controller.abort(); };
+    signal.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(abort, SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS);
     try {
-      response = await fetch(`${resource}/api/code-sandboxes/auth/session`, {
+      const response = await fetch(`${resource}/api/code-sandboxes/auth/session`, {
         headers: { authorization: `Bearer ${token}`, accept: "application/json" },
         redirect: "manual",
-        signal: AbortSignal.timeout(SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS)
+        signal: controller.signal
       });
-      if (response.status !== 408 && response.status !== 429 && response.status < 500) break;
+      if (controller.signal.aborted) {
+        await response.body?.cancel();
+        controller.signal.throwIfAborted();
+      }
+      if (!response.ok) {
+        await response.body?.cancel();
+        // Only explicit credential rejection revokes state. Preserve authority
+        // Retry-After exactly, and never amplify throttling with another attempt.
+        if (response.status === 401 || response.status === 403) return { status: "invalid" };
+        const retryAfter = response.headers.get("retry-after");
+        if (retryAfter !== null) {
+          if (retryAfter.length > SCAFFOLD_JSON_BYTES || new TextEncoder().encode(retryAfter).byteLength > SCAFFOLD_JSON_BYTES) {
+            return { status: "unavailable", retryAfter: "1" };
+          }
+          return { status: "unavailable", retryAfter };
+        }
+        if (attempt === 0 && (response.status === 408 || response.status >= 500)) continue;
+        return { status: "unavailable" };
+      }
+      try {
+        session = await boundedAuthJson<ScaffoldSession>(response, controller.signal);
+      } catch {
+        return controller.signal.aborted ? { status: "unavailable", retryAfter: "1" } : { status: "unavailable" };
+      }
+      break;
     } catch {
-      response = undefined;
+      if (signal.aborted) return { status: "unavailable", retryAfter: "1" };
+      if (attempt === 1) return controller.signal.aborted ? { status: "unavailable", retryAfter: "1" } : { status: "unavailable" };
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
     }
-  }
-  if (!response) return { status: "unavailable" };
-  // Only an explicit credential rejection is authoritative. Network errors,
-  // other HTTP failures and malformed authority responses must not revoke state.
-  if (response.status === 401 || response.status === 403) return { status: "invalid" };
-  if (!response.ok) return { status: "unavailable" };
-
-  let session: ScaffoldSession;
-  try {
-    session = (await response.json()) as ScaffoldSession;
-  } catch {
-    return { status: "unavailable" };
   }
   if (!session || typeof session !== "object") return { status: "unavailable" };
   const subject = typeof session.actor?.sub === "string" ? session.actor.sub.trim().toLowerCase() : "";
@@ -205,7 +239,7 @@ export const authenticateScaffoldResult = async (env: ScaffoldAuthEnv, request: 
       }
     };
   }
-  return verifyScaffoldTokenResult(env, token);
+  return verifyScaffoldTokenResult(env, token, request.signal);
 };
 
 export const authenticateScaffold = async (env: ScaffoldAuthEnv, request: Request): Promise<Verified | undefined> => {

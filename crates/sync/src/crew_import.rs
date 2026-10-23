@@ -15,7 +15,7 @@ use zeron_doc::{RegistryDoc, SessionDoc, REGISTRY_DOC_ID};
 use zeron_proto::{CollaborationPrincipal, CrewChatMetadata, PublicationRecord, PublicationValue};
 use crate::{DocsStore, StoreError};
 pub use crate::crew_import_recovery::{ImportedRecoveryIntent, imported_recovery_intents};
-pub use crate::crew_import_epoch::{OriginalEpochProof, imported_original_epoch_histories, validate_original_epoch_bootstrap, imported_original_epoch_proof_json};
+pub use crate::crew_import_epoch::{OriginalEpochHistories, OriginalEpochProof, imported_original_epoch_histories, validate_original_epoch_bootstrap, imported_original_epoch_proof_json};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CrewImportError {

@@ -50,6 +50,18 @@ fn own_directory_search(params: &mut Value, owner: &str) -> Result<(), RpcError>
     Ok(())
 }
 
+fn validate_start_history(sandbox_id: &str, expected_epoch: u64,
+    trusted: Option<&zeron_proto::OriginalEpochHistory>, marker: Option<&zeron_proto::OriginalEpochHistory>) -> Result<(), RpcError> {
+    match trusted {
+        Some(history) if history.sandbox_id != sandbox_id
+            || expected_epoch < history.coordinator_lifecycle_epoch
+            || marker.is_some_and(|marker| marker != history) =>
+            Err(denied("Start differs from the immutable original epoch")),
+        None if marker.is_some() => Err(denied("Original epoch receipt is not trusted by this profile; the control plane exposes bootstrap evidence only to a verified new-epoch host, not to this controller. Start was not sent.")),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayAuthority {
@@ -284,6 +296,23 @@ impl EngineRpc {
                     }
                     let session_id = scope.session_id.as_deref().ok_or_else(|| denied("Native handoff requires its exact target session"))?;
                     self.sessions.ensure_execution_allowed(session_id, Some(native_session_id)).map_err(failed)?;
+                }
+                if method == "scaffold.control"
+                    && let Some(ScaffoldEnvironmentControl::Start { sandbox_id, scope, expected_lifecycle_epoch }) = &control
+                {
+                    if !self.workspace.registry_synced() {
+                        return Err(denied("Start requires synchronized session history before changing the sandbox"));
+                    }
+                    let session_id = scope.session_id.as_deref().ok_or_else(|| denied("Start requires an exact session"))?;
+                    let expected = self.crew_services()?.session_metadata(session_id).map_err(failed)?;
+                    if scope != &expected.scope { return Err(denied("Start belongs to another project or deployment")); }
+                    let chat = self.workspace.chat(session_id).map_err(failed)?;
+                    let metadata = chat.as_ref().and_then(|chat| chat.crew.as_ref());
+                    if metadata.is_some_and(|metadata| metadata.owner_subject != expected.owner_subject || metadata.scope != expected.scope) {
+                        return Err(denied("Start session belongs to another owner or deployment"));
+                    }
+                    validate_start_history(sandbox_id, *expected_lifecycle_epoch,
+                        self.sessions.original_epoch_history(session_id), metadata.and_then(|metadata| metadata.original_epoch_history.as_ref()))?;
                 }
                 let route = control.and_then(|control| match control {
                         ScaffoldEnvironmentControl::Create { agent_route, .. }
@@ -684,6 +713,24 @@ impl EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_preflight_rejects_untrusted_history_before_control_dispatch() {
+        let history = zeron_proto::OriginalEpochHistory {
+            sandbox_id: "box".into(), lifecycle_epoch: 4, coordinator_lifecycle_epoch: 7,
+            source_device_id: "original-host".into(), original_status: "stopped".into(),
+            native_session_id: Some("original-native".into()), source_evidence_sha256: "a".repeat(64),
+        };
+        assert!(validate_start_history("box", 7, None, Some(&history)).is_err());
+        assert!(validate_start_history("box", 7, None, None).is_ok(), "fresh sessions remain startable");
+        assert!(validate_start_history("box", 7, Some(&history), Some(&history)).is_ok());
+        assert!(validate_start_history("box", 7, Some(&history), None).is_ok(), "a missing synced marker cannot erase trusted history");
+        assert!(validate_start_history("other", 7, Some(&history), None).is_err());
+        assert!(validate_start_history("box", 6, Some(&history), None).is_err());
+        let mut altered = history.clone();
+        altered.source_evidence_sha256 = "b".repeat(64);
+        assert!(validate_start_history("box", 7, Some(&history), Some(&altered)).is_err());
+    }
 
     #[test]
     fn imported_profile_proof_never_accepts_session_or_peer_grants() {

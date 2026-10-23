@@ -164,27 +164,69 @@ impl TextConnector for WsTextConnector {
     fn connect(&self) -> BoxFuture<'static, Result<TextPipe, SyncError>> {
         let provider = self.url.clone();
         Box::pin(async move {
-            let url = provider.url().await?;
-            let ws = crate::dial::connect_ws(&url)
+            let lease = provider.url().await?;
+            let generation = lease.generation;
+            let ws = crate::dial::connect_ws(&lease.url)
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| {
+                    if matches!(&e, tokio_tungstenite::tungstenite::Error::Http(response) if response.status().as_u16() == 401) {
+                        if let Some(generation) = generation {
+                            provider.invalidate(generation);
+                        }
+                    }
+                    SyncError::WebSocket(e.to_string())
+                })?;
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
-            tokio::spawn(crate::socket::pump(
-                ws,
-                out_rx,
-                in_tx,
-                WsMessage::Text,
-                |frame| match frame {
-                    WsMessage::Text(text) if text != "pong" => Some(text),
-                    _ => None,
-                },
-            ));
+            tokio::spawn(async move {
+                let rejected = crate::socket::pump(
+                    ws,
+                    out_rx,
+                    in_tx,
+                    WsMessage::Text,
+                    |frame| match frame {
+                        WsMessage::Text(text) if text != "pong" => Some(text),
+                        _ => None,
+                    },
+                ).await;
+                if rejected {
+                    if let Some(generation) = generation {
+                        provider.invalidate(generation);
+                    }
+                }
+            });
             Ok(TextPipe {
                 tx: out_tx,
                 rx: in_rx,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod auth_feedback_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn websocket_auth_feedback_uses_the_dialed_generation() {
+        use crate::dial::tests::{AUTH_RESPONSES, FeedbackPeer};
+
+        for managed in [true, false] {
+            for (status, close) in AUTH_RESPONSES {
+                let peer = FeedbackPeer::start(status, close, managed).await;
+                let connector = WsTextConnector { url: peer.provider.clone() };
+                let result = tokio::time::timeout(Duration::from_secs(5), connector.connect())
+                    .await.unwrap();
+                if status == 101 {
+                    let mut pipe = result.unwrap();
+                    assert!(tokio::time::timeout(Duration::from_secs(5), pipe.rx.recv())
+                        .await.unwrap().is_none());
+                } else {
+                    assert!(matches!(result, Err(SyncError::WebSocket(_))));
+                }
+                peer.finish(status == 401 || close == Some(4401)).await;
+            }
+        }
     }
 }
 

@@ -236,8 +236,14 @@ impl BinConnector for WsBinConnector {
         Box::pin(async move {
             let socket_permit = crate::budget::shared().socket().await?;
             let dial_permit = crate::budget::shared().dial().await?;
-            let url = provider.url().await?;
-            let ws = crate::dial::connect_ws(&url).await.map_err(|e| {
+            let lease = provider.url().await?;
+            let generation = lease.generation;
+            let ws = crate::dial::connect_ws(&lease.url).await.map_err(|e| {
+                if matches!(&e, tokio_tungstenite::tungstenite::Error::Http(response) if response.status().as_u16() == 401) {
+                    if let Some(generation) = generation {
+                        provider.invalidate(generation);
+                    }
+                }
                 crate::budget::shared().observe_error(&e);
                 SyncError::WebSocket(e.to_string())
             })?;
@@ -246,11 +252,16 @@ impl BinConnector for WsBinConnector {
             let (in_tx, in_rx) = mpsc::channel(64);
             tokio::spawn(async move {
                 let _socket_permit = socket_permit;
-                crate::socket::pump(ws, out_rx, in_tx, WsMessage::Binary, |frame| match frame {
+                let rejected = crate::socket::pump(ws, out_rx, in_tx, WsMessage::Binary, |frame| match frame {
                     WsMessage::Binary(bytes) => Some(bytes),
                     _ => None,
                 })
                 .await;
+                if rejected {
+                    if let Some(generation) = generation {
+                        provider.invalidate(generation);
+                    }
+                }
             });
             Ok(BinPipe {
                 tx: out_tx,

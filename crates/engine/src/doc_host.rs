@@ -174,8 +174,21 @@ impl EdgeConfig {
     }
 
     /// The current bearer, or a distinct signed-out/temporarily-unavailable error.
-    pub async fn bearer(&self) -> Result<String, zeron_rpc::TokenError> {
+    pub async fn bearer(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
         self.token.token().await
+    }
+
+    /// Send once, reporting explicit credential rejection before callers flatten errors.
+    pub(crate) async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        bearer: &zeron_proto::AccessToken,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let response = request.bearer_auth(&bearer.value).send().await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.token.invalidate(bearer.generation);
+        }
+        Ok(response)
     }
 
     pub fn token_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
@@ -212,14 +225,14 @@ struct EdgeRoomUrl {
 }
 
 impl zeron_sync::UrlProvider for EdgeRoomUrl {
-    fn url(&self) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+    fn url(&self) -> futures::future::BoxFuture<'static, Result<zeron_sync::UrlLease, zeron_sync::SyncError>> {
         let token = self.token.clone();
         let base = self.base.clone();
         let device = self.device_id.clone();
         let host = self.host_device.clone();
         Box::pin(async move {
             let token = token.token().await.map_err(zeron_sync::SyncError::from)?;
-            let mut url = format!("{base}?token={token}");
+            let mut url = format!("{base}?token={}", token.value);
             if !device.is_empty() {
                 url.push_str(&format!("&device={device}"));
             }
@@ -229,8 +242,12 @@ impl zeron_sync::UrlProvider for EdgeRoomUrl {
                 parsed.query_pairs_mut().append_pair("hostDevice", &host);
                 url = parsed.into();
             }
-            Ok(url)
+            Ok(zeron_sync::UrlLease { url, generation: Some(token.generation) })
         })
+    }
+
+    fn invalidate(&self, generation: u64) {
+        self.token.invalidate(generation);
     }
 }
 
@@ -2895,12 +2912,13 @@ impl DocHost {
                 else {
                     return;
                 };
-                let _ = http
-                    .put(&url)
-                    .bearer_auth(&bearer)
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .send()
+                let _ = edge_tail
+                    .send(
+                        http.put(&url)
+                            .header("content-type", "application/json")
+                            .body(body),
+                        &bearer,
+                    )
                     .await;
             });
         }
@@ -4647,6 +4665,7 @@ impl DocHost {
             chat2.redial();
         }
         self.nudge_remote_host(chat_id);
+        let sessions = self.sessions();
         // Read outcomes and execution liveness together, and serialize retry
         // reissues: retiring preparation must not look like a dead attempt.
         let executing = lock(&self.inner.executing);
@@ -4675,6 +4694,11 @@ impl DocHost {
         let message_landed = |mid: &str| messages.iter().any(|m| m.id == mid);
         let mut latest_dead: HashMap<String, &SessionCommandEntry> = HashMap::new();
         for c in &commands {
+            // Verified original-epoch claims retain their source outcome, even
+            // when sync has only delivered Pending so far; never reissue them.
+            if sessions.as_ref().is_some_and(|sessions| sessions.is_original_epoch_command(&c.id)) {
+                continue;
+            }
             let Some(mid) = (match &c.payload {
                 SessionCommandPayload::Run { message_id, .. } => Some(message_id.as_str()),
                 SessionCommandPayload::Steer { message_id, .. } => message_id.as_deref(),
@@ -4991,12 +5015,13 @@ impl DocHost {
                 puts.push((format!("{base}.diff"), "application/json", json));
             }
             for (url, content_type, body) in puts {
-                let sent = http
-                    .put(&url)
-                    .bearer_auth(&bearer)
-                    .header("content-type", content_type)
-                    .body(body)
-                    .send()
+                let sent = edge
+                    .send(
+                        http.put(&url)
+                            .header("content-type", content_type)
+                            .body(body),
+                        &bearer,
+                    )
                     .await;
                 match sent {
                     Ok(res) if res.status().is_success() => {}
@@ -5041,12 +5066,8 @@ impl DocHost {
             chat,
             encode_part_segment(part)
         );
-        let res = self
-            .inner
-            .http
-            .get(&url)
-            .bearer_auth(&bearer)
-            .send()
+        let res = edge
+            .send(self.inner.http.get(&url), &bearer)
             .await
             .map_err(|e| {
                 EngineError::Other(format!("sidecar fetch failed: {}", describe_http_error(e)))
@@ -5139,6 +5160,7 @@ impl DocHost {
                     if c.status == SessionCommandStatus::Pending
                         && !skipped.contains(&c.id)
                         && is_processed(&c.id)
+                        && !sessions.is_original_epoch_command(&c.id)
                         && !executing.contains(&c.id)
                     {
                         tracing::warn!(chat = %handle.chat_id, command = %c.id,
@@ -5157,7 +5179,7 @@ impl DocHost {
                 // never turn a receipt into an executable command.
                 if let Ok(receipts) = handle.doc.pending_command_receipt_ids() {
                     for id in receipts {
-                        if is_processed(&id) && !executing.contains(&id) {
+                        if is_processed(&id) && !sessions.is_original_epoch_command(&id) && !executing.contains(&id) {
                             self.resolve_command(
                                 handle,
                                 &id,

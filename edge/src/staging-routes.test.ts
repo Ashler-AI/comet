@@ -3,6 +3,7 @@ import worker from "./index";
 import type { Env } from "./env";
 import { authorizeRoute } from "./authority";
 import { fetchReleaseObject } from "./release-feed";
+import { AuthGrant } from "./auth-routes";
 
 vi.mock("./release-feed", () => ({ fetchReleaseObject: vi.fn(async () => new Response("private artifact")) }));
 const env = {
@@ -11,10 +12,26 @@ const env = {
   SCAFFOLD_PROJECT_SCOPE: "ashler-staging", SCAFFOLD_DEPLOYMENT_ID: "ashler-staging",
   SCAFFOLD_REQUIRED_CAPABILITIES: "session.read session.chat session.control session.annotate session.invite session.files session.environment",
 } as Env;
-const authority = (resource = env.SCAFFOLD_CONTROL_PLANE_URL, scopes = ["remote_code:create", "remote_code:read", "remote_code:write", "remote_code:exec"]) =>
+const authority = (resource = env.SCAFFOLD_CONTROL_PLANE_URL, scopes = ["remote_code:create", "remote_code:read", "remote_code:write", "remote_code:exec"]) => {
+  const grants = new Map<string, AuthGrant>();
+  env.AUTH_GRANTS = {
+    idFromName: (name: string) => name,
+    get: (id: string) => {
+      let grant = grants.get(id);
+      if (!grant) {
+        grant = new AuthGrant({
+          id,
+          blockConcurrencyWhile: () => { throw new Error("verification must not enter grant storage"); }
+        } as unknown as DurableObjectState, env);
+        grants.set(id, grant);
+      }
+      return { fetch: (input: string | Request, init?: RequestInit) => grant!.fetch(input instanceof Request ? input : new Request(input, init)) };
+    }
+  } as unknown as DurableObjectNamespace;
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({
     ok: true, actor: { sub: "owner@example.com", auth: "iap" }, resource, scopes,
   })));
+};
 const request = (path: string, method = "GET", token = "sc_rc_existing-stage-client") =>
   new Request(`https://comet-staging.internal.ashler.com${path}`, {
     method, headers: token ? { authorization: `Bearer ${token}` } : {},
@@ -44,6 +61,7 @@ it("fails closed for other authority resources, insufficient scopes, unavailable
   }
   authority(undefined, ["remote_code:read"]);
   expect((await worker.fetch(request("/api/releases/desktop-staging-manifest.json"), env)).status).toBe(503);
+  authority();
   vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
   expect((await worker.fetch(request("/api/releases/desktop-staging-manifest.json"), env)).status).toBe(503);
   authority();

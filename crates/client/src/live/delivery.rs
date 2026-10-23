@@ -98,15 +98,18 @@ async fn deliver(weak: std::sync::Weak<ClientInner>, chat: &str) {
         // No registry wait: hosts durably admit a wake before CreateChat
         // arrives and default missing rows to chat2 (the born-chat race).
         let result = async {
-            let token = inner.tokens.bearer().await?;
+            let token = inner.tokens.access_token().await?;
             let response = crate::auth::http()
                 .post(super::urls::nudge(&live.edge, &row.device_id))
-                .bearer_auth(token)
+                .bearer_auth(&token.value)
                 .json(&serde_json::json!({ "chatId": chat }))
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await
                 .map_err(|err| crate::ClientError::Network(err.to_string()))?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                inner.tokens.invalidate(token.generation);
+            }
             // Another owner's device (403) or a chat id its room refuses
             // (400): no retry can change that, so the wake is settled. The
             // receipt still waits for the outgoing rows. Unclaimed (404:
