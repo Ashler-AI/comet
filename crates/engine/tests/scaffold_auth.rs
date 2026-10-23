@@ -3,7 +3,7 @@ use std::sync::{Arc, atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering}};
 use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use zeron_engine::{Auth, AuthConfig, AuthState};
+use zeron_engine::{Auth, AuthConfig, AuthState, Engine, EngineConfig, EngineCore, HarnessId, WorkspaceScope, default_registry};
 use zeron_rpc::TokenError;
 use zeron_sync::scaffold_auth::{save_session, ScaffoldConfig, ScaffoldIdentity, ScaffoldSession, DEFAULT_OAUTH_SCOPES};
 
@@ -106,10 +106,36 @@ async fn absent_or_invalid_managed_configuration_never_enables_development() {
     assert_eq!(auth.access_token().await, Err(TokenError::SignedOut));
     config.allow_dev_auth = true;
     config.scaffold = Some(ScaffoldConfig::new("http://untrusted.example", "https://edge.example", "canary"));
-    let auth = Auth::detect(config).await;
+    let auth = Auth::detect(config.clone()).await;
     assert_eq!(auth.state(), AuthState::SignedOut);
+    assert_eq!(Engine::initial_workspace_scope(&auth), WorkspaceScope::Local);
+    assert!(!auth.pending_scaffold_verification());
     assert!(!auth.dev_enabled());
     assert!(matches!(auth.access_token().await, Err(TokenError::TemporarilyUnavailable(_))));
+
+    save_session(&dir.path().join("scaffold-session.json"), &ScaffoldSession {
+        access_token: "sc_rc_retained".into(), resource: "https://control.example".into(),
+        edge_origin: "https://edge.example".into(), device: None,
+        identity: ScaffoldIdentity { user_id: "retained".into(), email: "retained@example.com".into(),
+            name: None, project_scope: "canary".into(), capabilities: vec![], deployment_id: None },
+    }).unwrap();
+    let credential = std::fs::read(dir.path().join("scaffold-session.json")).unwrap();
+    let engine_config = EngineConfig {
+        data_dir: dir.path().into(), edge_url: config.edge_url.clone(), edge_token: None,
+        ipc_port: 0, default_harness: HarnessId::Mock, org_id: None, workos_client_id: None,
+        scaffold: config.scaffold.clone(), device: None, managed_inference: false,
+        device_bootstrap_file: None, scaffold_runtime_artifact: None,
+    };
+    let retained = Auth::detect(config).await;
+    let scope = Engine::initial_workspace_scope(&retained);
+    assert_eq!(scope, WorkspaceScope::Synced);
+    assert!(Engine::resolve_profile(&engine_config, &retained, scope).is_err());
+    assert!(retained.loaded_scaffold_session());
+    assert!(!retained.pending_scaffold_verification());
+    assert_eq!(retained.state(), AuthState::SignedOut);
+    assert!(retained.verified_scaffold_session().is_none());
+    assert_eq!(std::fs::read(dir.path().join("scaffold-session.json")).unwrap(), credential);
+    assert!(!dir.path().join("local-profile.json").exists());
 }
 
 #[tokio::test]
@@ -165,6 +191,8 @@ async fn device_resume_enrolls_new_grant_and_restarts_preserve_its_authority() {
     config.allow_dev_auth = true;
     let restarted = Auth::new(config);
     assert!(restarted.device_mode());
+    assert_eq!(Engine::initial_workspace_scope(&restarted), WorkspaceScope::Synced);
+    assert!(!restarted.pending_scaffold_verification());
     assert!(!restarted.dev_enabled());
     assert_eq!(restarted.state(), AuthState::SignedOut);
     assert!(!std::fs::read_to_string(&path).unwrap().contains("cs1."));
@@ -220,7 +248,13 @@ impl ManagedServer {
                         if request.windows(4).any(|part| part == b"\r\n\r\n") { break; }
                     }
                     let request = String::from_utf8(request).unwrap();
-                    let path = request.split_whitespace().nth(1).unwrap();
+                    let mut parts = request.split_whitespace();
+                    let method = parts.next().unwrap();
+                    let path = parts.next().unwrap();
+                    if method == "HEAD" && path == "/" {
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        return;
+                    }
                     let user = if request.contains("Bearer sc_rc_new") {
                         *state.replacement_user.lock()
                     } else { "original" };
@@ -270,6 +304,86 @@ impl ManagedServer {
     fn calls(&self) -> (usize, usize) {
         (self.state.control_calls.load(Ordering::SeqCst), self.state.edge_calls.load(Ordering::SeqCst))
     }
+}
+
+#[tokio::test]
+async fn managed_startup_outage_defers_the_same_synced_profile_until_background_recovery() {
+    let server = ManagedServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(), edge_url: server.origin.clone(), edge_token: None,
+        ipc_port: 0, default_harness: HarnessId::Mock, org_id: None, workos_client_id: None,
+        scaffold: Some(ScaffoldConfig::new(&server.origin, &server.origin, "canary")),
+        device: None, managed_inference: false, device_bootstrap_file: None, scaffold_runtime_artifact: None,
+    };
+    let original = server.auth(dir.path());
+    original.access_token().await.unwrap();
+    let historical = Engine::resolve_profile(&config, &original, WorkspaceScope::Synced).unwrap().unwrap();
+    let core = EngineCore::assemble_with_profile(historical.clone(), Arc::new(default_registry()), HarnessId::Mock, None).unwrap();
+    core.workspace.create_chat("retained-chat", None, Some(&core.device_id), None, None).unwrap();
+    core.doc_host.open("retained-chat").unwrap()
+        .write_user_message("retained-message", "Existing synced history", 1).unwrap();
+    core.shutdown().await;
+    drop(core);
+    drop(original);
+    let credential = std::fs::read(dir.path().join("scaffold-session.json")).unwrap();
+
+    server.state.control_status.store(503, Ordering::SeqCst);
+    let auth = Engine::build_auth(&config).await;
+    let scope = Engine::initial_workspace_scope(&auth);
+    assert_eq!(scope, WorkspaceScope::Synced);
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(auth.loaded_scaffold_session());
+    assert!(auth.pending_scaffold_verification());
+    assert!(auth.verified_scaffold_session().is_none());
+    assert!(Engine::resolve_profile(&config, &auth, scope).unwrap().is_none());
+    let unverified_tokens = auth.for_profile_tokens();
+    assert!(matches!(zeron_rpc::TokenSource::token(unverified_tokens.as_ref()).await, Err(TokenError::TemporarilyUnavailable(_))),
+        "verification outages deny a bearer without claiming the retained credential was revoked");
+    assert!(!dir.path().join("local-profile.json").exists());
+    assert!(!dir.path().join("profiles/local").exists());
+    assert_eq!(std::fs::read(dir.path().join("scaffold-session.json")).unwrap(), credential);
+
+    // Both boot paths wait on this state; only the existing background scheduler
+    // retries. Expire its shared failure cooldown before delivering an online hint.
+    elapse(Duration::from_secs(6)).await;
+    server.state.control_status.store(200, Ordering::SeqCst);
+    let mut state = auth.watch_state();
+    let refresh_loop = auth.spawn_refresh_loop();
+    tokio::task::yield_now().await;
+    zeron_sync::wake::notify_online();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !state.borrow().is_signed_in() { state.changed().await.unwrap(); }
+    }).await.expect("background verification activates the deferred workspace without restart");
+    refresh_loop.abort();
+    assert!(!auth.pending_scaffold_verification());
+    assert_eq!(zeron_rpc::TokenSource::token(unverified_tokens.as_ref()).await, Err(TokenError::SignedOut),
+        "a token source captured without verified identity cannot adopt the recovered profile");
+    let recovered = Engine::resolve_profile(&config, &auth, scope).unwrap().unwrap();
+    assert_eq!(recovered, historical);
+    assert_eq!(Engine::initial_workspace_scope(&auth), scope);
+    let core = EngineCore::assemble_with_profile(recovered, Arc::new(default_registry()), HarnessId::Mock, None).unwrap();
+    assert!(core.workspace.chat("retained-chat").unwrap().is_some());
+    let entries = core.doc_host.open("retained-chat").unwrap().doc().read_entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, "retained-message");
+    core.shutdown().await;
+    drop(core);
+    assert!(!dir.path().join("local-profile.json").exists());
+    assert_eq!(std::fs::read(dir.path().join("scaffold-session.json")).unwrap(), credential);
+
+    // Rejection is not pending recovery and may never turn the captured boundary
+    // local. A new signed-out process, unlike this one, has no synced intent.
+    server.state.control_status.store(401, Ordering::SeqCst);
+    let rejected = Engine::build_auth(&config).await;
+    assert_eq!(Engine::initial_workspace_scope(&rejected), WorkspaceScope::Synced);
+    assert!(!rejected.pending_scaffold_verification());
+    assert!(Engine::resolve_profile(&config, &rejected, WorkspaceScope::Synced).is_err());
+    assert!(!dir.path().join("scaffold-session.json").exists());
+    let signed_out = Engine::build_auth(&config).await;
+    assert_eq!(Engine::initial_workspace_scope(&signed_out), WorkspaceScope::Local);
+    assert!(!signed_out.pending_scaffold_verification());
+    assert!(Engine::resolve_profile(&config, &signed_out, WorkspaceScope::Local).unwrap().is_some());
 }
 
 async fn consumers(auth: &Auth) -> Vec<Result<String, TokenError>> {
@@ -363,6 +477,9 @@ async fn managed_signout_fences_inflight_success_and_failure() {
         assert_eq!(pending.await.unwrap(), Err(TokenError::SignedOut));
         assert_eq!(auth.access_token().await, Err(TokenError::SignedOut));
         assert_eq!(auth.state(), AuthState::SignedOut);
+        assert!(auth.loaded_scaffold_session());
+        assert!(!auth.pending_scaffold_verification());
+        assert_eq!(Engine::initial_workspace_scope(&auth), WorkspaceScope::Synced);
         assert!(auth.verified_profile_key().is_none());
         assert!(!dir.path().join("scaffold-session.json").exists());
         server.state.control_status.store(200, Ordering::SeqCst);

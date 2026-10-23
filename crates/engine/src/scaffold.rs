@@ -3957,7 +3957,19 @@ mod tests {
                         }
                     }
                 }
+                // A cancelled connection is not an HTTP request and must not
+                // consume a scripted response or advance the fixture's state.
+                if bytes.is_empty() {
+                    continue;
+                }
                 let request = String::from_utf8(bytes).unwrap();
+                // Native preview discovery probes project-owned listeners.
+                // The root is not a Scaffold endpoint: reject it without
+                // consuming an API response or advancing attachment state.
+                if request.lines().next() == Some("HEAD / HTTP/1.1") {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
                 let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
                 let argv = value.get("argv").and_then(Value::as_array);
@@ -5088,7 +5100,11 @@ mod tests {
             let (status, response, finished) = if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
                 (200, comet_sandbox("starting"), false)
             } else {
-                assert!(request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "));
+                assert!(
+                    request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "),
+                    "unexpected fixture request line: {:?}",
+                    request.lines().next().unwrap_or("")
+                );
                 assert!(body["argv"].as_array().unwrap().iter().any(|arg| arg == "scaffold-authority"));
                 authority_probes += 1;
                 if authority_probes <= 241 {
@@ -5099,6 +5115,9 @@ mod tests {
             };
             (MockResponse::Http { status, body: response }, finished)
         }).await;
+        // A listener-discovery probe must not steal a scripted API response.
+        let discovery = reqwest::Client::new().head(&origin).send().await.unwrap();
+        assert_eq!(discovery.status(), StatusCode::NOT_FOUND);
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer).unwrap(),

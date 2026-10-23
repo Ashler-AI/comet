@@ -752,3 +752,20 @@ Legacy Crew links below are pinned to its committed source, not the new integrat
 - Upstream [comments](https://github.com/zeronsh/zeron/blob/3b2f78027a2c31622c39c35716da4d6e1af8de15/crates/ui/src/comments.rs), [shared comment controls](https://github.com/zeronsh/zeron/blob/3b2f78027a2c31622c39c35716da4d6e1af8de15/crates/ui/src/comment_ui.rs), and [settings](https://github.com/zeronsh/zeron/tree/3b2f78027a2c31622c39c35716da4d6e1af8de15/crates/ui/src/settings).
 - Upstream mobile [architecture](https://github.com/zeronsh/zeron/blob/3b2f78027a2c31622c39c35716da4d6e1af8de15/docs/mobile-rewrite.md), [shared live sync](https://github.com/zeronsh/zeron/blob/3b2f78027a2c31622c39c35716da4d6e1af8de15/crates/client/src/live/mod.rs), [foreground/background handling](https://github.com/zeronsh/zeron/blob/3b2f78027a2c31622c39c35716da4d6e1af8de15/crates/client/src/client.rs), and [UniFFI bridge](https://github.com/zeronsh/zeron/blob/3b2f78027a2c31622c39c35716da4d6e1af8de15/crates/mobile/src/client_ffi/mod.rs).
 - Current Crew [desktop URL handling](https://github.com/Ashler-AI/comet/blob/297717c55beab9323c53095f3f5f683f00676a5e/crates/ui/src/state.rs) and [iOS URL handling](https://github.com/Ashler-AI/comet/blob/297717c55beab9323c53095f3f5f683f00676a5e/apps/ios/Comet/App/AppModel.swift).
+
+## Private Canary managed-startup recovery (October 23)
+
+Retained managed-user credentials preserve synced intent during a temporary
+verification failure, without opening a profile or granting authority. The
+existing background refresh activates the same scoped profile after recovery;
+invalid helper configuration and definitive rejection fail closed. Device
+bootstrap still requires verified authority. Headed sign-in stays interactive,
+and headless startup retains its shutdown future while waiting, including SIGTERM.
+
+The preserved newer Mac integration passed an isolated native CLI cold-start
+HTTP 503 outage: the production refresh recovered after 60,058 ms with the same
+process, device, profile and seeded chat, and no temporary local authority.
+SIGTERM during the wait exited successfully. No live provider credentials were
+used; fixture processes and data were removed. This is local startup proof,
+not a claim of deployed natural authority renewal or shared release promotion.
+

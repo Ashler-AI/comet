@@ -242,6 +242,8 @@ struct AuthInner {
     config: AuthConfig,
     scaffold: Option<ScaffoldAuth>,
     scaffold_session: Mutex<Option<ScaffoldSession>>,
+    /// Startup workspace intent only, never evidence of verified authority.
+    loaded_scaffold_session: bool,
     device_mode: bool,
     /// `Some(client_id)` = WorkOS mode; `None` = dev mode.
     workos: Option<String>,
@@ -331,6 +333,7 @@ impl Auth {
             (None, _) => AuthState::SignedOut,
         };
         let loaded_workos_session = workos.is_some() && stored.is_some();
+        let loaded_scaffold_session = scaffold_session.is_some();
         let (state_tx, _) = watch::channel(initial);
         let (token_tx, _) = watch::channel(0);
         let (retry_tx, _) = watch::channel(0);
@@ -342,6 +345,7 @@ impl Auth {
             inner: Arc::new(AuthInner {
                 scaffold,
                 scaffold_session: Mutex::new(scaffold_session),
+                loaded_scaffold_session,
                 device_mode,
                 config,
                 workos,
@@ -366,9 +370,15 @@ impl Auth {
         let auth = Self::new(config);
         if auth.scaffold_enabled()
             && let Err(error) = auth.access_token().await
-            && auth.device_mode()
         {
-            tracing::error!(%error, "Crew sandbox device authentication failed; native host startup requires verified authority");
+            if auth.device_mode() {
+                tracing::error!(%error, "Crew sandbox device authentication failed; native host startup requires verified authority");
+            } else if auth.loaded_scaffold_session() {
+                match error {
+                    TokenError::TemporarilyUnavailable(_) => tracing::warn!("initial managed session verification unavailable; synced profile requires verified authority"),
+                    TokenError::SignedOut => tracing::warn!("initial managed session verification rejected; synced workspace remains unavailable"),
+                }
+            }
         }
         auth
     }
@@ -433,6 +443,22 @@ impl Auth {
         let _lifecycle = lock(&self.inner.sign_in);
         if !self.state().is_signed_in() { return None; }
         lock(&self.inner.scaffold_session).clone()
+    }
+
+    /// A retained session reserves the synced boundary, not its unverified identity.
+    /// Like loaded_workos_session, sign-out cannot rewrite this startup fact.
+    pub fn loaded_scaffold_session(&self) -> bool {
+        self.inner.loaded_scaffold_session
+    }
+
+    /// Only retained user credentials may defer startup for background verification.
+    /// Device bootstrap stays fail closed; rejection/sign-out removes this pending state.
+    pub fn pending_scaffold_verification(&self) -> bool {
+        let _lifecycle = lock(&self.inner.sign_in);
+        !self.device_mode()
+            && self.inner.scaffold.is_some()
+            && !self.inner.state_tx.borrow().is_signed_in()
+            && lock(&self.inner.scaffold_session).is_some()
     }
 
     pub fn is_authenticated_mode(&self) -> bool {

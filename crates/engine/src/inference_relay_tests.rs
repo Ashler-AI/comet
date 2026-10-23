@@ -208,6 +208,10 @@ mod tests {
                         let captured = captured.clone();
                         let fixture = fixture.clone();
                         async move {
+                            if request.method() == hyper::Method::HEAD && request.uri().path() == "/" {
+                                return Ok::<_, Infallible>(Response::builder().status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::new())).unwrap());
+                            }
                             let path = request.uri().path().to_string();
                             let path_and_query = request
                                 .uri()
@@ -287,10 +291,12 @@ mod tests {
                             )
                         }
                     });
-                    hyper::server::conn::http1::Builder::new()
+                    if let Err(error) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await
-                        .unwrap();
+                    {
+                        assert!(error.is_incomplete_message(), "unexpected fixture connection error: {error}");
+                    }
                 });
             }
         });
@@ -308,6 +314,10 @@ mod tests {
                     let service = service_fn(move |request: Request<Incoming>| {
                         let captured = captured.clone();
                         async move {
+                            if request.method() == hyper::Method::HEAD && request.uri().path() == "/" {
+                                return Ok::<_, Infallible>(Response::builder().status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::new())).unwrap());
+                            }
                             let path = request.uri().path().to_string();
                             let response = match path.as_str() {
                                 "/api/agent-auth/v2/authority" => {
@@ -338,10 +348,12 @@ mod tests {
                             ))))
                         }
                     });
-                    hyper::server::conn::http1::Builder::new()
+                    if let Err(error) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await
-                        .unwrap();
+                    {
+                        assert!(error.is_incomplete_message(), "unexpected fixture connection error: {error}");
+                    }
                 });
             }
         });
@@ -359,6 +371,10 @@ mod tests {
                     let service = service_fn(move |request: Request<Incoming>| {
                         let captured = captured.clone();
                         async move {
+                            if request.method() == hyper::Method::HEAD && request.uri().path() == "/" {
+                                return Ok::<_, Infallible>(Response::builder().status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::new()).boxed()).unwrap());
+                            }
                             let path = request.uri().path().to_string();
                             let headers = request.headers().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
@@ -409,10 +425,12 @@ mod tests {
                             Ok(Response::new(BodyExt::boxed(StreamBody::new(body))))
                         }
                     });
-                    hyper::server::conn::http1::Builder::new()
+                    if let Err(error) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await
-                        .unwrap();
+                    {
+                        assert!(error.is_incomplete_message(), "unexpected fixture connection error: {error}");
+                    }
                 });
             }
         });
