@@ -110,6 +110,51 @@ describe("scoped transport authority", () => {
     expect(result.status === "authenticated" && result.identity.userId).toBe(identity.userId);
     expect(fetcher.mock.calls[0][1].redirect).toBe("manual");
   });
+  it("shares only in-flight equivalent verification through decoding and rechecks revocation", async () => {
+    const session = { ok: true, actor: { sub: identity.userId, auth: "iap" }, resource: config.SCAFFOLD_CONTROL_PLANE_URL, scopes: ["remote_code:read"] };
+    let release!: () => void, decodingStarted!: () => void;
+    const bodyReady = new Promise<void>(resolve => { release = resolve; });
+    const decoding = new Promise<void>(resolve => { decodingStarted = resolve; });
+    const response = Response.json(session);
+    const decode = vi.spyOn(response, "json").mockImplementation(async () => {
+      decodingStarted();
+      await bodyReady;
+      return session;
+    });
+    const fetcher = vi.fn().mockResolvedValueOnce(response).mockImplementation(async (url: string, init: RequestInit) => Response.json({
+      ...session,
+      resource: new URL(url).origin,
+      actor: { sub: new Headers(init.headers).get("authorization") === "Bearer sc_rc_other" ? "other@example.com" : identity.userId, auth: "iap" }
+    }));
+    vi.stubGlobal("fetch", fetcher);
+    const request = (token = "sc_rc_test") => new Request("https://edge.example/auth/session", { headers: { authorization: `Bearer ${token}` } });
+    const first = authenticateResult(config as Env, request());
+    const concurrent = authenticateResult({ ...config } as Env, request());
+    await decoding;
+    const duringDecode = authenticateResult(config as Env, request());
+    const otherToken = authenticateResult(config as Env, request("sc_rc_other"));
+    const otherOrigin = authenticateResult({ ...config, SCAFFOLD_CONTROL_PLANE_URL: "https://other.example" } as Env, request());
+    const otherProject = authenticateResult({ ...config, SCAFFOLD_PROJECT_SCOPE: "other" } as Env, request());
+    const otherCapabilities = authenticateResult({ ...config, SCAFFOLD_REQUIRED_CAPABILITIES: "session.control" } as Env, request());
+    release();
+    const [verified, shared, decoded, token, origin, project, capabilities] = await Promise.all([
+      first, concurrent, duringDecode, otherToken, otherOrigin, otherProject, otherCapabilities
+    ]);
+    expect(verified.status).toBe("authenticated");
+    expect(shared).toEqual(verified);
+    expect(decoded).toEqual(verified);
+    expect(token.status === "authenticated" && token.identity.userId).toBe("other@example.com");
+    expect(origin.status).toBe("authenticated");
+    expect(project.status === "authenticated" && project.identity.projectScope).toBe("other");
+    expect(capabilities).toEqual({ status: "unavailable" });
+    expect(fetcher).toHaveBeenCalledTimes(5);
+    expect(decode).toHaveBeenCalledTimes(1);
+    fetcher.mockResolvedValue(new Response("", { status: 401 }));
+    expect(await authenticateResult(config as Env, request())).toEqual({ status: "invalid" });
+    expect(fetcher).toHaveBeenCalledTimes(6);
+    expect(await authenticateResult(config as Env, request())).toEqual({ status: "invalid" });
+    expect(fetcher).toHaveBeenCalledTimes(7);
+  });
   it.each([
     [429, undefined, "unavailable"],
     [429, "120", "unavailable"],

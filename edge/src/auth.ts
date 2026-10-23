@@ -3,6 +3,7 @@
  * assertions in Comet. Scaffold's IAP-protected OAuth authorize route binds a
  * bearer to an internal principal; this Worker validates it on every request
  * through `/api/code-sandboxes/auth/session` so revocation is fail-closed.
+ * Concurrent equivalent checks share only pending verification, never completed results.
  */
 import type { Env } from "./env";
 import { authenticateDeviceToken } from "./auth-routes";
@@ -118,6 +119,7 @@ export const bearerFromRequest = (request: Request): string | undefined => {
 // ponytail: the exact callback stall is unknown; 2,918 ms is the retained
 // successful-launch p50, so two attempts leave 9,164 ms of the 15-second budget.
 const SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS = 2_918;
+const scaffoldVerifications = new Map<string, Promise<ScaffoldAuthenticationResult>>();
 const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): Promise<ScaffoldAuthenticationResult> => {
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
@@ -125,6 +127,18 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string): P
   const required = requiredCapabilities(env);
   if (!resource || !projectScope || required.length === 0) return { status: "unavailable" };
 
+  const key = JSON.stringify([token, resource, projectScope, required]);
+  const pending = scaffoldVerifications.get(key);
+  if (pending) return pending;
+  const verification = verifyScaffoldSessionResult(token, resource, projectScope, required)
+    .finally(() => { scaffoldVerifications.delete(key); });
+  scaffoldVerifications.set(key, verification);
+  return verification;
+};
+
+const verifyScaffoldSessionResult = async (
+  token: string, resource: string, projectScope: string, required: readonly string[]
+): Promise<ScaffoldAuthenticationResult> => {
   let response: Response | undefined;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {

@@ -123,8 +123,8 @@ gh workflow run release.yml --repo Ashler-AI/comet --ref crew/upstream-canary \
 
 Verify that the run's `headSha` is the reviewed commit before consuming its private
 artifacts. Edge deployment is a separate operator action: from `edge/`, run
-`npx wrangler deploy --env canary` only after that revision has verified private
-artifacts and separately exercised behavior checks. The isolated
+`npx wrangler deploy --env canary` after separately verifying the changed Worker
+behavior; unrelated desktop/runtime packaging does not block it. The isolated
 controller uses Platform's `internal/scaffold/scripts/deploy-upstream-canary.mjs`.
 
 `zeron-update::AUTOMATIC_UPDATES_SUPPORTED` is false for this branch. Direct
@@ -157,10 +157,13 @@ and explicit rejection invalidate authority. Expired success is not an outage
 fallback. Concurrent transient failures share a 1–5-second cooldown; valid
 `Retry-After` dates or seconds set an uncapped minimum delay.
 
-Canary Edge still validates every protected request. It does not immediately
-retry HTTP 429 or responses carrying `Retry-After`; unavailable HTTP responses
-retain that header on the existing 503 contract. No quota or broker change is
-part of this fix. Existing profiles and independently pinned runtimes stay in
+Canary Edge still validates every protected request. Equivalent concurrent
+checks share only their in-flight request and body decoding; token, control
+origin, project and required capabilities bind the key. The entry is removed
+on settlement, so the next request freshly checks revocation. It does not
+immediately retry HTTP 429 or responses carrying `Retry-After`; unavailable
+HTTP responses retain that header on the existing 503 contract. No quota or
+broker change is part of this fix. Existing profiles and independently pinned runtimes stay in
 place; verify each executable and runtime-artifact digest separately. A newer
 Mac build already carrying this verifier must not be downgraded to update an
 older Linux runtime pin.
