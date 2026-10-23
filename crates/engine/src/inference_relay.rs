@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{Stream, StreamExt};
@@ -38,7 +39,9 @@ struct InferenceRouteRequest {
 }
 
 const MAX_CONNECTIONS: usize = 64;
-const REFRESH_SKEW_SECONDS: i64 = 60;
+// The issuer reuses an authority until its millisecond expiry. Its signed token
+// rounds expiry down to seconds, so wait out the final second before issuing.
+const EXPIRY_BOUNDARY_SECONDS: i64 = 1;
 const RETIRED_ROUTE_TTL: Duration = Duration::from_secs(30 * 60);
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -77,6 +80,106 @@ impl Route {
 struct AuthorityState {
     authority: AgentInferenceAuthority,
     expires_at: DateTime<Utc>,
+    retry_at: Option<(Instant, Duration)>,
+}
+
+#[derive(Debug)]
+struct AuthorityRefreshError {
+    reason: &'static str,
+    retry_after: Option<Duration>,
+    cause: Option<String>,
+}
+
+impl AuthorityRefreshError {
+    fn new(reason: &'static str) -> Self {
+        Self { reason, retry_after: None, cause: None }
+    }
+
+    fn scaffold(reason: &'static str, error: &crate::scaffold::ScaffoldError) -> Self {
+        // API code/message are response-body strings. Preserve typed status,
+        // not those strings; auth and transport Display retain sanitized stages.
+        use crate::scaffold::ScaffoldError;
+        let cause = match error {
+            ScaffoldError::Api(error) => format!("scaffold_api_error:{}", error.0.status),
+            ScaffoldError::InvalidResponse(_) => "scaffold_response_invalid".into(),
+            _ => error.to_string(),
+        };
+        Self { reason, retry_after: None, cause: Some(cause) }
+    }
+}
+
+struct AuthorityObservation {
+    authority_id_digest: String,
+    epoch: u64,
+    issued_at: i64,
+    expires_at: i64,
+}
+
+// Diagnostic decoding only: this is not signature verification and must never
+// authorize a request or change the grant validation path.
+fn authority_observation(authority: &AgentInferenceAuthority) -> Option<AuthorityObservation> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Claims<'a> {
+        version: u8,
+        authority_id: &'a str,
+        principal_id: &'a str,
+        authority_scope: Option<&'a str>,
+        authority_epoch: u64,
+        issued_at: i64,
+        expires_at: i64,
+    }
+
+    if authority.token.len() > 8192 {
+        return None;
+    }
+    let mut parts = authority.token.split('.');
+    if parts.next()? != "ia2" {
+        return None;
+    }
+    let payload = parts.next()?;
+    if parts.next()?.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Claims<'_> = serde_json::from_slice(&decoded).ok()?;
+    let expires_at = DateTime::parse_from_rfc3339(&authority.expires_at).ok()?;
+    if claims.version != 2 || claims.version != authority.contract_version
+        || claims.authority_id != authority.authority_id
+        || claims.principal_id != authority.principal_id
+        || claims.authority_scope != authority.authority_scope.as_deref()
+        || claims.authority_epoch == 0
+        || claims.issued_at >= claims.expires_at
+        || claims.expires_at != expires_at.timestamp()
+    {
+        return None;
+    }
+    Some(AuthorityObservation {
+        authority_id_digest: format!("{:x}", Sha256::digest(claims.authority_id.as_bytes())),
+        epoch: claims.authority_epoch,
+        issued_at: claims.issued_at,
+        expires_at: claims.expires_at,
+    })
+}
+
+fn observe_authority(
+    event: &'static str,
+    authority: &AgentInferenceAuthority,
+    previous: Option<&AgentInferenceAuthority>,
+) {
+    let Some(observation) = authority_observation(authority) else { return };
+    let previous = previous.and_then(authority_observation);
+    tracing::info!(
+        event,
+        authority_id_digest = %observation.authority_id_digest,
+        epoch = observation.epoch,
+        issued_at = observation.issued_at,
+        expires_at = observation.expires_at,
+        observed_at = %Utc::now().to_rfc3339(),
+        previous_epoch = previous.as_ref().map(|value| value.epoch),
+        previous_expiry = previous.as_ref().map(|value| value.expires_at),
+        "inference authority observation"
+    );
 }
 
 #[derive(Default)]
@@ -357,6 +460,7 @@ impl InferenceRelay {
                 EngineError::Other(format!("Agent Auth authority issuance failed: {error}"))
             })?;
         let expires_at = validate_authority(&authority)?;
+        observe_authority("prepare", &authority, None);
         let provider = request.provider.clone();
         let model = request.model.clone();
         let owner_subject = authority.principal_id.clone();
@@ -368,6 +472,7 @@ impl InferenceRelay {
             authority: AsyncMutex::new(AuthorityState {
                 authority,
                 expires_at,
+                retry_at: None,
             }),
         });
         let local_token = {
@@ -585,11 +690,24 @@ impl InferenceRelay {
         let authority = match self.current_authority(&route).await {
             Ok(authority) => authority,
             Err(error) => {
-                tracing::warn!(err = %error, "inference relay authority refresh failed");
-                return json_response(
+                tracing::warn!(
+                    reason = error.reason,
+                    cause = error.cause.as_deref(),
+                    "inference relay authority refresh failed"
+                );
+                let mut response = json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     json!({ "error": "agent_auth_unavailable" }),
                 );
+                if let Some(delay) = error.retry_after {
+                    let seconds = delay.as_secs().saturating_add(u64::from(delay.subsec_nanos() > 0));
+                    response.headers_mut().insert(
+                        hyper::header::RETRY_AFTER,
+                        hyper::header::HeaderValue::from_str(&seconds.to_string())
+                            .expect("integer retry delay"),
+                    );
+                }
+                return response;
             }
         };
         let cancellation = route.cancellation.clone();
@@ -625,29 +743,84 @@ impl InferenceRelay {
     async fn current_authority(
         &self,
         route: &Route,
-    ) -> Result<AgentInferenceAuthority, EngineError> {
+    ) -> Result<AgentInferenceAuthority, AuthorityRefreshError> {
         // A cached authority must not outlive a sign-out/profile switch.
         self.inner.client.require_auth().await
-            .map_err(|error| EngineError::Other(error.to_string()))?;
-        let mut current = route.authority.lock().await;
-        if current.expires_at <= Utc::now() + TimeDelta::seconds(REFRESH_SKEW_SECONDS) {
-            let authority = self
-                .inner
-                .client
-                .issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
-                .await
-                .map_err(|error| {
-                    EngineError::Other(format!("Agent Auth authority renewal failed: {error}"))
+            .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?;
+        let mut current = tokio::select! {
+            _ = route.cancellation.cancelled() => return Err(AuthorityRefreshError::new("route_cancelled")),
+            current = route.authority.lock() => current,
+        };
+        self.inner.client.require_auth().await
+            .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?;
+        let now = Utc::now();
+        if current.expires_at > now
+            && current.expires_at <= now + TimeDelta::seconds(EXPIRY_BOUNDARY_SECONDS)
+        {
+            let remaining = (current.expires_at - now).to_std()
+                .map_err(|_| AuthorityRefreshError::new("invalid_expiry"))?;
+            tokio::select! {
+                _ = route.cancellation.cancelled() => return Err(AuthorityRefreshError::new("route_cancelled")),
+                _ = tokio::time::sleep(remaining) => {}
+            }
+            // Fail closed if the wall clock moved backwards while sleeping.
+            if current.expires_at > Utc::now() {
+                return Err(AuthorityRefreshError::new("expiry_boundary_pending"));
+            }
+            self.inner.client.require_auth().await
+                .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?;
+        }
+        if route.cancellation.is_cancelled() {
+            return Err(AuthorityRefreshError::new("route_cancelled"));
+        }
+        if current.expires_at <= Utc::now() {
+            if let Some(remaining) = current.retry_at
+                .map(|(started, delay)| delay.saturating_sub(started.elapsed()))
+                .filter(|remaining| !remaining.is_zero())
+            {
+                return Err(AuthorityRefreshError {
+                    reason: "authority_issuance_cooldown",
+                    retry_after: Some(remaining),
+                    cause: None,
+                });
+            }
+            let authority = match self.inner.client
+                .issue_agent_inference_authority(&route.cancellation).await
+            {
+                Ok(authority) => authority,
+                Err(error) => {
+                    let retry_after = error.is_transient().then(|| {
+                        error.retry_after().unwrap_or(Duration::from_secs(1)).max(Duration::from_secs(1))
+                    });
+                    current.retry_at = retry_after.map(|delay| (Instant::now(), delay));
+                    return Err(AuthorityRefreshError {
+                        retry_after,
+                        ..AuthorityRefreshError::scaffold("authority_issuance_failed", &error)
+                    });
+                }
+            };
+            let expires_at = validate_authority(&authority)
+                .map_err(|error| AuthorityRefreshError {
+                    reason: "invalid_authority",
+                    retry_after: None,
+                    // validate_authority emits fixed local diagnostic strings.
+                    cause: Some(error.to_string()),
                 })?;
-            let expires_at = validate_authority(&authority)?;
             if authority.principal_id != route.owner_subject {
                 route.cancellation.cancel();
-                return Err(EngineError::Other("Agent Auth route owner changed".into()));
+                return Err(AuthorityRefreshError::new("route_owner_changed"));
             }
-            *current = AuthorityState {
-                authority,
-                expires_at,
-            };
+            if authority.authority_scope != current.authority.authority_scope {
+                route.cancellation.cancel();
+                return Err(AuthorityRefreshError::new("route_scope_changed"));
+            }
+            self.inner.client.require_auth().await
+                .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?;
+            if route.cancellation.is_cancelled() {
+                return Err(AuthorityRefreshError::new("route_cancelled"));
+            }
+            observe_authority("validated_reissue", &authority, Some(&current.authority));
+            *current = AuthorityState { authority, expires_at, retry_at: None };
         }
         Ok(current.authority.clone())
     }
