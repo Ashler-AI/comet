@@ -327,7 +327,42 @@ verification pair without restarting. This used a private loopback fixture,
 not a live backend outage. The desktop helper was closed, so native macOS window
 capture supplied the headed screenshot; no permissions were changed.
 
-The complete targeted run passed 25 checks: shared auth 11, engine auth 6 and
+The October 22 Mac auth integration preserves the newer Canary source instead
+of replacing it with the older 0.2.113 auth branch. Its baseline is `7125cba2`
+plus the retained local first-send, subagent, command-catalog and UI corrections.
+The pre-fix `ef224f8740534179e24cc1f2414d4ffac99cc309abf39b88a14eb5d2e4692a34`
+executable matches the retained local-only 0.2.114 package, not the shared staging
+artifact. The final local rebuild followed the scoped directory-search and
+catalog-child cleanup corrections; its executable was hashed before activation.
+No exact pre-fix source-tree digest was recorded, so the preserved dirty
+source baseline is evidence-qualified rather than byte-exact source attestation.
+
+The narrow auth delta shares cancellation-resistant engine verification, honors
+typed transient/Retry-After failures in durable directory work, and reissues
+inference authority only after the issuer's expiry boundary with single-flight
+cooldown and owner/profile/scope fencing. Existing profile/storage identities,
+voice media, sidebar links, first-send receipts and `scaffold.comet-runtime.v1`
+are retained. The preserved baseline is recorded separately as `7bdef109`;
+private packaging must bind the complete source tree and artifact checksums,
+not just a version string or the baseline commit.
+
+Configured managed startup retains synced intent during temporary verification
+failure, but opens no scoped profile or local fallback until verified. The
+existing background loop then activates the same retained identity. Invalid
+helper configuration and definitive rejection fail closed; device bootstrap
+still requires verified authority. Headed sign-in stays interactive. Headless
+startup retains its shutdown future across auth changes, including SIGTERM
+while awaiting verification.
+
+An isolated native Mac CLI cold start recovered after a controlled HTTP 503
+outage through the production 60-second refresh interval (60,058 ms), preserving
+the same process, device, scoped profile and seeded chat. No local profile or
+authority was created during the outage. SIGTERM while awaiting verification
+exited successfully. Fixtures used private loopback credentials, not live
+providers; all owned fixture processes and data were removed. This is local
+startup proof, not evidence of deployed natural authority renewal.
+
+The earlier auth-only run passed 25 checks: shared auth 11, engine auth 6 and
 client auth 8. The first command exhausted its deadline during compilation;
 the remaining suites completed after resuming. The engine regression initially
 counted an independent cold-auth instance in its warm-read expectation; it now

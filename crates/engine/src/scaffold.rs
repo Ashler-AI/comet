@@ -116,6 +116,7 @@ pub struct ScaffoldApiError {
     pub status: u16,
     pub code: String,
     pub message: Option<String>,
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +257,16 @@ impl ScaffoldError {
                 ..
             }
         )
+    }
+
+    pub(crate) fn retry_after(&self) -> Option<Duration> {
+        self.api_error().and_then(|error| error.retry_after)
+    }
+
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Self::Transport { .. } | Self::AuthTemporarilyUnavailable(_))
+            // Match the existing control-plane retry contract for temporary 5xx.
+            || self.api_error().is_some_and(|error| matches!(error.status, 429 | 500 | 502 | 503 | 504))
     }
 
     fn is_runtime_starting(&self) -> bool {
@@ -450,6 +461,7 @@ impl ScaffoldClient {
 
     async fn bounded_json(mut response: reqwest::Response) -> Result<Value, ScaffoldError> {
         let status = response.status();
+        let retry_after = response_retry_after(&response);
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             if body.len() + chunk.len() > 128 * 1024 {
@@ -457,7 +469,7 @@ impl ScaffoldClient {
             }
             body.extend_from_slice(&chunk);
         }
-        if !status.is_success() { return Err(api_error(status, &body)); }
+        if !status.is_success() { return Err(api_error(status, &body, retry_after)); }
         serde_json::from_slice(&body).map_err(|_| ScaffoldError::InvalidResponse("invalid JSON response".into()))
     }
 
@@ -1082,13 +1094,14 @@ impl ScaffoldClient {
         // The bearer is dropped before any response body is retained or decoded.
         drop(bearer);
         let status = response.status();
+        let retry_after = response_retry_after(&response);
         let bytes = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
             bytes = response.bytes() => bytes?,
         };
         if !status.is_success() {
-            return Err(api_error(status, &bytes));
+            return Err(api_error(status, &bytes, retry_after));
         }
         serde_json::from_slice(&bytes)
             .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))
@@ -1479,7 +1492,16 @@ fn exact_origin(value: &str) -> Result<Url, ScaffoldError> {
     Ok(url)
 }
 
-fn api_error(status: StatusCode, body: &[u8]) -> ScaffoldError {
+fn response_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some((date.with_timezone(&chrono::Utc) - chrono::Utc::now()).to_std().unwrap_or_default())
+}
+
+fn api_error(status: StatusCode, body: &[u8], retry_after: Option<Duration>) -> ScaffoldError {
     #[derive(Deserialize)]
     struct Envelope {
         #[serde(default)]
@@ -1529,6 +1551,7 @@ fn api_error(status: StatusCode, body: &[u8]) -> ScaffoldError {
         status: status.as_u16(),
         code,
         message,
+        retry_after,
     }))
 }
 
@@ -2551,6 +2574,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
         drop(bearer);
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = response_retry_after(&response);
             let mut response = response;
             let mut bytes = Vec::new();
             loop {
@@ -2593,6 +2617,7 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
                     status: status.as_u16(),
                     code: code.to_string(),
                     message: None,
+                    retry_after,
                 },
             )));
         }
@@ -3633,6 +3658,7 @@ mod tests {
                     status: 403,
                     code: expected_code.into(),
                     message: None,
+                    retry_after: None,
                 })
             );
             assert!(!error.is_runtime_starting());
@@ -3645,7 +3671,7 @@ mod tests {
     fn scaffold_startup_retry_requires_exact_provider_state() {
         let starting =
             br#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting"}}"#;
-        let error = api_error(StatusCode::SERVICE_UNAVAILABLE, starting);
+        let error = api_error(StatusCode::SERVICE_UNAVAILABLE, starting, None);
         assert!(error.is_runtime_starting());
         assert!(is_retryable_scaffold_control_error(&RpcError::Failed(
             error.to_string()
@@ -3655,7 +3681,7 @@ mod tests {
             (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"sandbox_provider_error","message":"sandbox_runtime_starting"}"#.as_slice()),
             (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting_failed"}}"#.as_slice()),
         ] {
-            let error = api_error(status, body);
+            let error = api_error(status, body, None);
             assert!(!error.is_runtime_starting());
             assert!(!is_retryable_scaffold_control_error(&RpcError::Failed(error.to_string())));
         }
@@ -3754,6 +3780,7 @@ mod tests {
 
     enum MockResponse {
         Http { status: u16, body: String },
+        RetryAfter { status: u16, body: String, retry_after: String },
         Close,
         HeadersThenClose,
     }
@@ -3892,12 +3919,23 @@ mod tests {
     async fn mock_server_steps(
         responses: Vec<MockResponse>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let mut responses = std::collections::VecDeque::from(responses);
+        mock_server_for_requests(move |_, _| {
+            let response = responses.pop_front().unwrap();
+            (response, responses.is_empty())
+        })
+        .await
+    }
+
+    async fn mock_server_for_requests(
+        mut respond: impl FnMut(&str, &Value) -> (MockResponse, bool) + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            let mut responses = std::collections::VecDeque::from(responses);
-            while !responses.is_empty() {
+            let mut finished = false;
+            while !finished {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -3923,7 +3961,19 @@ mod tests {
                         }
                     }
                 }
+                // A cancelled connection is not an HTTP request and must not
+                // consume a scripted response or advance the fixture's state.
+                if bytes.is_empty() {
+                    continue;
+                }
                 let request = String::from_utf8(bytes).unwrap();
+                // Native preview discovery probes project-owned listeners.
+                // The root is not a Scaffold endpoint: reject it without
+                // consuming an API response or advancing attachment state.
+                if request.lines().next() == Some("HEAD / HTTP/1.1") {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
                 let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
                 let argv = value.get("argv").and_then(Value::as_array);
@@ -3946,8 +3996,9 @@ mod tests {
                     stream.write_all(response.as_bytes()).await.unwrap();
                     continue;
                 }
+                let (response, last) = respond(&request, &value);
+                finished = last;
                 requests.push(request);
-                let response = responses.pop_front().unwrap();
                 match response {
                     MockResponse::Close => continue,
                     MockResponse::HeadersThenClose => {
@@ -3958,6 +4009,13 @@ mod tests {
                             .await
                             .unwrap();
                         continue;
+                    }
+                    MockResponse::RetryAfter { status, body, retry_after } => {
+                        let response = format!(
+                            "HTTP/1.1 {status} Response\r\nRetry-After: {retry_after}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
                     }
                     MockResponse::Http { status, body } => {
                         let response = format!(
@@ -3972,6 +4030,62 @@ mod tests {
             requests
         });
         (origin, task)
+    }
+
+    #[tokio::test]
+    async fn directory_and_control_preserve_retry_after_from_http() {
+        for directory in [true, false] {
+            for status in [429, 503] {
+                let date = (chrono::Utc::now() + chrono::TimeDelta::seconds(125))
+                    .format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                for header in ["125", date.as_str(), "18446744073709551615", "invalid", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+                    let (origin, captured) = mock_server_steps(vec![MockResponse::RetryAfter {
+                        status, body: r#"{"error":"rate_limited","message":"try later"}"#.into(),
+                        retry_after: header.into(),
+                    }]).await;
+                    let client = ScaffoldClient::new(&origin, "project-a", Arc::new(StaticToken("token".into()))).unwrap();
+                    let before = chrono::Utc::now();
+                    let error = if directory {
+                        client.get_crew_session("session", None).await.unwrap_err()
+                    } else {
+                        client.list_agent_accounts().await.err().expect("control request must fail")
+                    };
+                    let after = chrono::Utc::now();
+                    assert_eq!(captured.await.unwrap().len(), 1, "API client must not replay requests");
+                    let api = error.api_error().unwrap();
+                    assert_eq!((api.status, api.code.as_str(), api.message.as_deref()),
+                        (status, "rate_limited", Some("try later")));
+                    assert!(error.is_transient());
+                    if header == date {
+                        let date = chrono::DateTime::parse_from_rfc2822(header).unwrap().with_timezone(&chrono::Utc);
+                        let retry = error.retry_after().unwrap();
+                        assert!(retry >= (date - after).to_std().unwrap_or_default());
+                        assert!(retry <= (date - before).to_std().unwrap_or_default());
+                    } else {
+                        let expected = match header {
+                            "125" => Some(Duration::from_secs(125)),
+                            "18446744073709551615" => Some(Duration::from_secs(u64::MAX)),
+                            "invalid" => None,
+                            _ => Some(Duration::ZERO),
+                        };
+                        assert_eq!(error.retry_after(), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_transient_classification_excludes_row_conflicts_and_revocation() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(api_error(StatusCode::from_u16(status).unwrap(), b"{}", None).is_transient());
+        }
+        for status in [400, 401, 403, 404, 409, 410, 501] {
+            assert!(!api_error(StatusCode::from_u16(status).unwrap(), b"{}", None).is_transient());
+        }
+        assert!(ScaffoldError::AuthTemporarilyUnavailable("offline".into()).is_transient());
+        assert!(!ScaffoldError::AuthUnavailable.is_transient());
+        assert!(!ScaffoldError::Cancelled.is_transient());
     }
 
     fn test_inference_authority() -> AgentInferenceAuthority {
@@ -5020,20 +5134,51 @@ mod tests {
     #[tokio::test]
     async fn attach_waits_for_explicit_runtime_starting_before_bootstrap() {
         let join_expires_at = now_ms() + 60_000;
-        let (origin, captured) = mock_server_with_status(vec![
-            (200, comet_sandbox("starting")),
-            (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into()),
-            (200, comet_sandbox("starting")),
-            (200, r#"{"ok":false,"exitCode":1}"#.into()),
-            (200, r#"{"ok":true,"exitCode":0}"#.into()),
-            (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#)),
-            (200, r#"{"ok":true}"#.into()),
-            (200, r#"{"ok":true,"exitCode":0}"#.into()),
-            (200, r#"{"ok":true,"runId":"run-a"}"#.into()),
-            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
-            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
-            (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at)),
-        ]).await;
+        let mut authority_probes = 0;
+        let mut inspections = 0;
+        let mut launched = false;
+        let mut confirmation_probes = 0;
+        let (origin, captured) = mock_server_for_requests(move |request, body| {
+            let mut finished = false;
+            let (status, response) = if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+                inspections += 1;
+                (200, comet_sandbox("starting"))
+            } else if request.starts_with("POST /auth/device-grants ") {
+                assert!(authority_probes >= 2 && inspections >= 2);
+                assert!(!launched);
+                (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#))
+            } else if request.starts_with("PUT /api/code-sandboxes/sandbox-a/files?") {
+                (200, r#"{"ok":true}"#.into())
+            } else {
+                assert!(request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "));
+                let argv = body["argv"].as_array().unwrap();
+                if argv.iter().any(|arg| arg == "scaffold-authority") {
+                    authority_probes += 1;
+                    if authority_probes == 1 {
+                        (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into())
+                    } else if !launched {
+                        (200, r#"{"ok":false,"exitCode":1}"#.into())
+                    } else {
+                        confirmation_probes += 1;
+                        if confirmation_probes < 3 {
+                            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into())
+                        } else {
+                            finished = true;
+                            (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at))
+                        }
+                    }
+                } else if argv.iter().any(|arg| arg == "--device-bootstrap-file") {
+                    assert!(!launched);
+                    launched = true;
+                    (200, r#"{"ok":true,"runId":"run-a"}"#.into())
+                } else {
+                    assert!(argv.iter().any(|arg| arg == "--version")
+                        || (argv[0] == "chmod" && argv[1] == "600"));
+                    (200, r#"{"ok":true,"exitCode":0}"#.into())
+                }
+            };
+            (MockResponse::Http { status, body: response }, finished)
+        }).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
@@ -5083,13 +5228,29 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn authority_probe_outlives_the_old_startup_deadline() {
-        let mut responses = Vec::new();
-        for _ in 0..241 {
-            responses.push((503, r#"{"error":"sandbox_runtime_starting"}"#.into()));
-            responses.push((200, comet_sandbox("starting")));
-        }
-        responses.push((200, r#"{"ok":true,"exitCode":0}"#.into()));
-        let (origin, captured) = mock_server_with_status(responses).await;
+        let mut authority_probes = 0;
+        let (origin, captured) = mock_server_for_requests(move |request, body| {
+            let (status, response, finished) = if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+                (200, comet_sandbox("starting"), false)
+            } else {
+                assert!(
+                    request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "),
+                    "unexpected fixture request line: {:?}",
+                    request.lines().next().unwrap_or("")
+                );
+                assert!(body["argv"].as_array().unwrap().iter().any(|arg| arg == "scaffold-authority"));
+                authority_probes += 1;
+                if authority_probes <= 241 {
+                    (503, r#"{"error":"sandbox_runtime_starting"}"#.into(), false)
+                } else {
+                    (200, host_authority("native-grant", now_ms() + 60_000), true)
+                }
+            };
+            (MockResponse::Http { status, body: response }, finished)
+        }).await;
+        // A listener-discovery probe must not steal a scripted API response.
+        let discovery = reqwest::Client::new().head(&origin).send().await.unwrap();
+        assert_eq!(discovery.status(), StatusCode::NOT_FOUND);
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer).unwrap(),
@@ -5108,20 +5269,16 @@ mod tests {
         });
         let started = tokio::time::Instant::now();
         let result = runtime
-            .probe_attach_authority(
-                "sandbox-a",
-                &scope(),
-                &environment,
-                &["comet".into(), "scaffold-authority".into()],
-                &CancellationToken::new(),
-            )
+            .observe_attachment(environment, &CancellationToken::new())
             .await;
         clock.abort();
         let _ = clock.await;
-        let authority = result.unwrap();
-        assert!(authority.ok);
+        let attachment = result.unwrap().unwrap();
+        assert_eq!(attachment.attached_device_id.as_deref(), Some("comet-scaffold-sandbox-a-e1"));
+        assert_eq!(attachment.control_grant.unwrap().id, "native-grant");
         assert!(started.elapsed() > Duration::from_secs(120));
         let requests = captured.await.unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("GET /api/code-sandboxes/sandbox-a ")).count(), 241);
         assert!(!requests.iter().any(|request| {
             request.contains("/auth/device-grants")
                 || request.starts_with("POST /api/code-sandboxes HTTP")
