@@ -3915,12 +3915,23 @@ mod tests {
     async fn mock_server_steps(
         responses: Vec<MockResponse>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let mut responses = std::collections::VecDeque::from(responses);
+        mock_server_for_requests(move |_, _| {
+            let response = responses.pop_front().unwrap();
+            (response, responses.is_empty())
+        })
+        .await
+    }
+
+    async fn mock_server_for_requests(
+        mut respond: impl FnMut(&str, &Value) -> (MockResponse, bool) + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            let mut responses = std::collections::VecDeque::from(responses);
-            while !responses.is_empty() {
+            let mut finished = false;
+            while !finished {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -3969,8 +3980,9 @@ mod tests {
                     stream.write_all(response.as_bytes()).await.unwrap();
                     continue;
                 }
+                let (response, last) = respond(&request, &value);
+                finished = last;
                 requests.push(request);
-                let response = responses.pop_front().unwrap();
                 match response {
                     MockResponse::Close => continue,
                     MockResponse::HeadersThenClose => {
@@ -4977,20 +4989,51 @@ mod tests {
     #[tokio::test]
     async fn attach_waits_for_explicit_runtime_starting_before_bootstrap() {
         let join_expires_at = now_ms() + 60_000;
-        let (origin, captured) = mock_server_with_status(vec![
-            (200, comet_sandbox("starting")),
-            (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into()),
-            (200, comet_sandbox("starting")),
-            (200, r#"{"ok":false,"exitCode":1}"#.into()),
-            (200, r#"{"ok":true,"exitCode":0}"#.into()),
-            (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#)),
-            (200, r#"{"ok":true}"#.into()),
-            (200, r#"{"ok":true,"exitCode":0}"#.into()),
-            (200, r#"{"ok":true,"runId":"run-a"}"#.into()),
-            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
-            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into()),
-            (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at)),
-        ]).await;
+        let mut authority_probes = 0;
+        let mut inspections = 0;
+        let mut launched = false;
+        let mut confirmation_probes = 0;
+        let (origin, captured) = mock_server_for_requests(move |request, body| {
+            let mut finished = false;
+            let (status, response) = if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+                inspections += 1;
+                (200, comet_sandbox("starting"))
+            } else if request.starts_with("POST /auth/device-grants ") {
+                assert!(authority_probes >= 2 && inspections >= 2);
+                assert!(!launched);
+                (200, format!(r#"{{"grant":"cg1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narrow_secret","expiresAt":{join_expires_at}}}"#))
+            } else if request.starts_with("PUT /api/code-sandboxes/sandbox-a/files?") {
+                (200, r#"{"ok":true}"#.into())
+            } else {
+                assert!(request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "));
+                let argv = body["argv"].as_array().unwrap();
+                if argv.iter().any(|arg| arg == "scaffold-authority") {
+                    authority_probes += 1;
+                    if authority_probes == 1 {
+                        (503, r#"{"error":"sandbox_provider_error","body":{"error":"sandbox_runtime_starting","sessionId":"sandbox-a","lifecycleEpoch":1,"status":"starting"}}"#.into())
+                    } else if !launched {
+                        (200, r#"{"ok":false,"exitCode":1}"#.into())
+                    } else {
+                        confirmation_probes += 1;
+                        if confirmation_probes < 3 {
+                            (200, r#"{"ok":false,"exitCode":1,"stderr":"scaffold host unavailable"}"#.into())
+                        } else {
+                            finished = true;
+                            (200, host_authority("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", join_expires_at))
+                        }
+                    }
+                } else if argv.iter().any(|arg| arg == "--device-bootstrap-file") {
+                    assert!(!launched);
+                    launched = true;
+                    (200, r#"{"ok":true,"runId":"run-a"}"#.into())
+                } else {
+                    assert!(argv.iter().any(|arg| arg == "--version")
+                        || (argv[0] == "chmod" && argv[1] == "600"));
+                    (200, r#"{"ok":true,"exitCode":0}"#.into())
+                }
+            };
+            (MockResponse::Http { status, body: response }, finished)
+        }).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer.clone()).unwrap(),
@@ -5040,13 +5083,22 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn authority_probe_outlives_the_old_startup_deadline() {
-        let mut responses = Vec::new();
-        for _ in 0..241 {
-            responses.push((503, r#"{"error":"sandbox_runtime_starting"}"#.into()));
-            responses.push((200, comet_sandbox("starting")));
-        }
-        responses.push((200, r#"{"ok":true,"exitCode":0}"#.into()));
-        let (origin, captured) = mock_server_with_status(responses).await;
+        let mut authority_probes = 0;
+        let (origin, captured) = mock_server_for_requests(move |request, body| {
+            let (status, response, finished) = if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+                (200, comet_sandbox("starting"), false)
+            } else {
+                assert!(request.starts_with("POST /api/code-sandboxes/sandbox-a/exec "));
+                assert!(body["argv"].as_array().unwrap().iter().any(|arg| arg == "scaffold-authority"));
+                authority_probes += 1;
+                if authority_probes <= 241 {
+                    (503, r#"{"error":"sandbox_runtime_starting"}"#.into(), false)
+                } else {
+                    (200, host_authority("native-grant", now_ms() + 60_000), true)
+                }
+            };
+            (MockResponse::Http { status, body: response }, finished)
+        }).await;
         let bearer: Arc<dyn TokenSource> = Arc::new(StaticToken("token".into()));
         let runtime = test_runtime(
             ScaffoldClient::new(&origin, "project-a", bearer).unwrap(),
@@ -5065,20 +5117,16 @@ mod tests {
         });
         let started = tokio::time::Instant::now();
         let result = runtime
-            .probe_attach_authority(
-                "sandbox-a",
-                &scope(),
-                &environment,
-                &["comet".into(), "scaffold-authority".into()],
-                &CancellationToken::new(),
-            )
+            .observe_attachment(environment, &CancellationToken::new())
             .await;
         clock.abort();
         let _ = clock.await;
-        let authority = result.unwrap();
-        assert!(authority.ok);
+        let attachment = result.unwrap().unwrap();
+        assert_eq!(attachment.attached_device_id.as_deref(), Some("comet-scaffold-sandbox-a-e1"));
+        assert_eq!(attachment.control_grant.unwrap().id, "native-grant");
         assert!(started.elapsed() > Duration::from_secs(120));
         let requests = captured.await.unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("GET /api/code-sandboxes/sandbox-a ")).count(), 241);
         assert!(!requests.iter().any(|request| {
             request.contains("/auth/device-grants")
                 || request.starts_with("POST /api/code-sandboxes HTTP")
