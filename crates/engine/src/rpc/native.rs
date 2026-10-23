@@ -79,7 +79,7 @@ struct VerifyImportedCrewSessionResult {
     original_epoch_history_proof_json: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HandoffInput {
     source_chat_id: String,
@@ -142,6 +142,117 @@ fn request_for(chat: &Chat, prompt: String) -> Result<RunRequest, RpcError> {
         reasoning: config.reasoning, model_options: config.model_options.clone(),
         cwd: chat.cwd.clone().or_else(|| chat.harness_session_cwd.clone()).ok_or_else(|| failed("Session has no working directory"))?,
         sandbox: config.sandbox, auto_approve: false, resume: None, attachments: vec![], worktree: None, mcp: None })
+}
+
+fn validate_recovered_native_input(original: HandoffInput, requested: &HandoffInput,
+    preparation: &crate::crew::HandoffRequest) -> Result<HandoffInput, RpcError> {
+    if original.source_chat_id != requested.source_chat_id || original.prompt != requested.prompt
+        || original.database_environment != requested.database_environment || original.session_only != requested.session_only
+        || (!requested.command_id.is_empty() && original.command_id != requested.command_id)
+        || original.command_id != preparation.command_id || original.source_chat_id != preparation.source_session_id
+        || original.prompt != preparation.prompt || original.database_environment != preparation.database_environment
+        || original.session_only != preparation.session_only {
+        return Err(failed("Recovery cannot change the caller command, source, prompt, database or transfer mode"));
+    }
+    // Selectors resolve allocation evidence, never become new immutable input.
+    Ok(original)
+}
+
+fn claim_native_handoff(store: &zeron_sync::DocsStore, key: &str, input: &HandoffInput)
+    -> Result<Option<crate::crew::HandoffReceipt>, RpcError> {
+    let (bytes, outcome) = match store.crew_command(key).map_err(failed)? {
+        Some(existing) => existing,
+        None => {
+            store.claim_crew_command(key, &serde_json::to_vec(input).map_err(failed)?).map_err(failed)?;
+            store.crew_command(key).map_err(failed)?.ok_or_else(|| failed("Native handoff claim missing"))?
+        }
+    };
+    // Older durable inputs omit sessionOnly=false. Validate every typed field
+    // without rewriting or re-claiming their original immutable wire bytes.
+    let saved: HandoffInput = serde_json::from_slice(&bytes).map_err(failed)?;
+    if saved != *input { return Err(failed("Native handoff command has a different immutable input")); }
+    let receipt = outcome.map(|bytes| serde_json::from_slice::<crate::crew::HandoffReceipt>(&bytes).map_err(failed)).transpose()?;
+    if receipt.as_ref().is_some_and(|receipt| receipt.command_id != input.command_id) {
+        return Err(failed("Native handoff receipt belongs to another caller command"));
+    }
+    Ok(receipt)
+}
+
+// Return true only for an already-durable admission of this exact original Run.
+// Pending targets may contain an interrupted source copy, never unrelated work.
+fn native_handoff_target(host: &crate::DocHost, workspace: &crate::WorkspaceHost, intent: &BranchIntent,
+    input: &HandoffInput, receipt: &crate::crew::HandoffReceipt, expected_metadata: &zeron_proto::CrewChatMetadata) -> Result<bool, RpcError> {
+    if receipt.command_id != input.command_id || receipt.environment.scope.session_id.as_deref() != Some(&receipt.chat_id)
+        || expected_metadata.session_id != receipt.chat_id || expected_metadata.scope != receipt.environment.scope {
+        return Err(failed("Native handoff receipt differs from its caller or target"));
+    }
+    let chat = workspace.chat(&receipt.chat_id).map_err(failed)?;
+    let target = host.open(&receipt.chat_id).map_err(failed)?;
+    let commands = target.doc().read_commands().map_err(failed)?;
+    if let Some(command) = commands.iter().find(|command| command.id == input.command_id) {
+        let mut request = request_for(&intent.source, input.prompt.clone())?;
+        request.cwd = receipt.cwd.clone();
+        let expected = SessionCommandPayload::Run { request, message_id: input.command_id.clone() };
+        if command.payload != expected || command.issued_by != host.device_id() {
+            return Err(failed("Native handoff command has a different immutable request"));
+        }
+        return Ok(true);
+    }
+    if !commands.is_empty() { return Err(failed("Pending native handoff target already contains other commands")); }
+    let entries = target.doc().read_entries().map_err(failed)?;
+    if let Some(chat) = chat {
+        if chat.crew.as_ref().is_some_and(|metadata| metadata.owner_subject != expected_metadata.owner_subject
+            || metadata.scope != expected_metadata.scope || metadata.session_id != expected_metadata.session_id) {
+            return Err(failed("Pending native handoff target belongs to another owner or session scope"));
+        }
+        if receipt.attachment.attached_device_id.as_ref().is_some_and(|attached| !chat.device_id.is_empty()
+            && &chat.device_id != attached && (chat.device_id != host.device_id() || chat.crew.is_some()
+                || chat.harness_session_id.as_ref().is_some_and(|id| !id.is_empty()) || chat.config.is_some()
+                || chat.source_context.is_some() || !entries.is_empty())) {
+            return Err(failed("Pending native handoff target belongs to another hosting device"));
+        }
+        if chat.harness_session_id.as_ref().is_some_and(|id| !id.is_empty() && (id != &receipt.native_session_id
+                || chat.harness_session_cwd.as_ref() != Some(&receipt.cwd) || chat.cwd.as_ref() != Some(&receipt.cwd)))
+            || chat.harness_session_cwd.as_ref().is_some_and(|cwd| !cwd.is_empty() && cwd != &receipt.cwd)
+            || chat.cwd.as_ref().is_some_and(|cwd| cwd != &receipt.cwd && cwd != "/workspace/ashler-platform")
+        { return Err(failed("Pending native handoff target already has a different native association")); }
+        if let Some(config) = &chat.config
+            && Some(config) != intent.source.config.as_ref() {
+            // Attach may have published only the route's default configuration.
+            let source_config = intent.source.config.as_ref().ok_or_else(|| failed("Missing source model"))?;
+            let mut route = AgentRoute::from_omp_model(source_config.model.as_deref().unwrap_or_default())
+                .ok_or_else(|| failed("Native handoff requires an explicit provider-qualified OMP model"))?;
+            route.account_id = source_config.model_options.get("crewAccountId").and_then(Value::as_str).map(str::to_owned);
+            let mut model_options = serde_json::Map::new();
+            if let Some(account) = &route.account_id { model_options.insert("crewAccountId".into(), json!(account)); }
+            let published = zeron_proto::ChatConfig { harness: HarnessId::Omp, model: Some(route.omp_model()), reasoning: None,
+                model_options, sandbox: zeron_proto::SandboxLevel::DangerFullAccess };
+            if config != &published {
+                return Err(failed("Pending native handoff target already has different source configuration"));
+            }
+        }
+        if chat.source_context.as_ref().is_some_and(|context| Some(context) != intent.source.source_context.as_ref()) {
+            return Err(failed("Pending native handoff target already has different source context"));
+        }
+    }
+    let count = intent.transcript.iter().rposition(|entry| entry.role == zeron_doc::MessageRole::Assistant
+        && entry.status == Some(zeron_doc::MessageStatus::Complete)).map_or(0, |index| index + 1);
+    let mut source = intent.transcript[..count].iter();
+    for entry in entries {
+        let saved = source.next().filter(|saved| saved.id == entry.id)
+            .ok_or_else(|| failed("Pending native handoff target contains unrelated transcript progress"))?;
+        if entry.role != saved.role || entry.created_at != saved.created_at || entry.device_id != saved.device_id
+            || entry.status != saved.status || entry.continuation_of != saved.continuation_of || entry.duration_ms != saved.duration_ms
+            || entry.parts.len() != saved.parts.len() || !entry.parts.iter().zip(&saved.parts).all(|(known, original)| match (known, original) {
+                (zeron_doc::MessagePart::Input { id, request_id, questions, resolved: true },
+                    zeron_doc::MessagePart::Input { id: original_id, request_id: original_request, questions: original_questions, .. }) =>
+                    id == original_id && request_id == original_request && questions == original_questions,
+                (zeron_doc::MessagePart::Input { .. }, _) => false,
+                _ => known == original,
+            })
+        { return Err(failed("Pending native handoff transcript differs from the immutable source snapshot")); }
+    }
+    Ok(false)
 }
 
 impl EngineRpc {
@@ -400,17 +511,28 @@ impl EngineRpc {
                     return Err(failed("Session-only transfer requires its dedicated RPC method"));
                 }
                 input.session_only = session_only;
-                if matches!(method, "RecoverSessionHandoffToScaffold" | "RecoverSessionOnlyHandoffToScaffold") {
-                    input = self.recover_native_input(input)?;
-                } else if input.recover_chat_id.is_some() || input.recover_sandbox_id.is_some() {
-                    return Err(failed("Preserved targets require the recovery method"));
-                }
+                let recovery = if matches!(method, "RecoverSessionHandoffToScaffold" | "RecoverSessionOnlyHandoffToScaffold") {
+                    let chat = input.recover_chat_id.clone().filter(|id| !id.trim().is_empty()).ok_or_else(|| failed("Recovery requires chat ID"))?;
+                    let sandbox = input.recover_sandbox_id.clone().filter(|id| !id.trim().is_empty()).ok_or_else(|| failed("Recovery requires sandbox ID"))?;
+                    let (original, preparation) = self.recover_native_input(input).await?;
+                    input = original;
+                    Some((preparation, chat, sandbox))
+                } else {
+                    if input.recover_chat_id.is_some() || input.recover_sandbox_id.is_some() {
+                        return Err(failed("Preserved targets require the recovery method"));
+                    }
+                    None
+                };
                 if input.prompt.trim().is_empty() || input.prompt.len() > 1024 * 1024 || input.command_id.is_empty() || input.command_id.len() > 256 {
                     return Err(RpcError::BadParams("Nonempty bounded prompt and immutable commandId required".into()));
                 }
                 let key = format!("native-handoff:{}", input.command_id);
                 let store = self.doc_host.crew_store();
-                store.claim_crew_command(&key, &serde_json::to_vec(&input).map_err(failed)?).map_err(failed)?;
+                if let Some(receipt) = claim_native_handoff(&store, &key, &input)? {
+                    self.crew_services()?.admit_handoff(&receipt, || Ok(())).await?;
+                    if recovery.is_some() { self.crew_services()?.cleanup_handoff_recovery(&input.command_id)?; }
+                    return RpcReply::value(&receipt);
+                }
                 let (intent, _, selector) = self.prepare_native_branch(&key, &input.source_chat_id).await?;
                 let config = intent.source.config.as_ref().ok_or_else(|| failed("Missing source model"))?;
                 let mut route = AgentRoute::from_omp_model(config.model.as_deref().unwrap_or_default())
@@ -418,13 +540,29 @@ impl EngineRpc {
                 if let Some(account) = config.model_options.get("crewAccountId").and_then(Value::as_str) {
                     route.account_id = Some(account.into()); route.routing_mode = zeron_proto::AgentRoutingMode::Pinned;
                 }
-                let receipt = self.crew_services()?.prepare_handoff(crate::crew::HandoffRequest {
+                let preparation = crate::crew::HandoffRequest {
                     command_id: input.command_id.clone(), source_session_id: input.source_chat_id.clone(),
-                    native_session_id: selector, cwd: intent.cwd, prompt: input.prompt.clone(),
+                    native_session_id: selector, cwd: intent.cwd.clone(), prompt: input.prompt.clone(),
                     agent_route: route.clone(), database_environment: input.database_environment,
                     session_only: input.session_only,
-                    recover_chat_id: input.recover_chat_id, recover_sandbox_id: input.recover_sandbox_id,
-                }, &CancellationToken::new()).await?;
+                    recover_chat_id: input.recover_chat_id.clone(), recover_sandbox_id: input.recover_sandbox_id.clone(),
+                };
+                let explicit_recovery = recovery.is_some();
+                let receipt = if let Some((original, chat, sandbox)) = recovery {
+                    if preparation != original {
+                        return Err(failed("Recovery saved native fork or immutable request changed"));
+                    }
+                    self.crew_services()?.recover_handoff(original, &chat, &sandbox, &CancellationToken::new()).await?
+                } else {
+                    self.crew_services()?.prepare_handoff(preparation, &CancellationToken::new()).await?
+                };
+                let expected_metadata = self.crew_services()?.session_metadata(&receipt.chat_id).map_err(failed)?;
+                if native_handoff_target(&self.doc_host, &self.workspace, &intent, &input, &receipt, &expected_metadata)? {
+                    self.crew_services()?.admit_handoff(&receipt, || Ok(())).await?;
+                    store.finish_crew_command(&key, &serde_json::to_vec(&receipt).map_err(failed)?).map_err(failed)?;
+                    if explicit_recovery { self.crew_services()?.cleanup_handoff_recovery(&input.command_id)?; }
+                    return RpcReply::value(&receipt);
+                }
                 let mut chat = self.publish_crew_environment(receipt.attachment.clone(), Some(route)).await?;
                 chat.config = intent.source.config.clone(); chat.cwd = Some(receipt.cwd.clone());
                 chat.source_context = intent.source.source_context.clone();
@@ -440,6 +578,7 @@ impl EngineRpc {
                     host.queue_command_named(&chat_id, payload, vec![], Some(&command), None).map_err(failed)
                 }).await?;
                 store.finish_crew_command(&key, &serde_json::to_vec(&receipt).map_err(failed)?).map_err(failed)?;
+                if explicit_recovery { self.crew_services()?.cleanup_handoff_recovery(&input.command_id)?; }
                 RpcReply::value(&receipt)
             }
             "DeliverPeerMessage" => {
@@ -461,29 +600,14 @@ impl EngineRpc {
         }
     }
 
-    fn recover_native_input(&self, requested: HandoffInput) -> Result<HandoffInput, RpcError> {
+    async fn recover_native_input(&self, requested: HandoffInput) -> Result<(HandoffInput, crate::crew::HandoffRequest), RpcError> {
         let chat = requested.recover_chat_id.as_deref().ok_or_else(|| failed("Recovery requires chat ID"))?;
         let sandbox = requested.recover_sandbox_id.as_deref().ok_or_else(|| failed("Recovery requires sandbox ID"))?;
-        let store = self.doc_host.crew_store();
-        for (key, _, outcome) in store.crew_commands().map_err(failed)? {
-            if !key.starts_with("crew-handoff:") { continue; }
-            let Some(outcome) = outcome else { continue };
-            let Ok(receipt) = serde_json::from_slice::<crate::crew::HandoffReceipt>(&outcome) else { continue };
-            if receipt.chat_id != chat || receipt.sandbox_id != sandbox { continue; }
-            let (bytes, _) = store.crew_command(&format!("native-handoff:{}", receipt.command_id)).map_err(failed)?
-                .ok_or_else(|| failed("Native recovery intent unavailable"))?;
-            let original: HandoffInput = serde_json::from_slice(&bytes).map_err(failed)?;
-            if original.source_chat_id != requested.source_chat_id || original.prompt != requested.prompt
-                || original.database_environment != requested.database_environment
-                || original.session_only != requested.session_only
-                || (!requested.command_id.is_empty() && original.command_id != requested.command_id) {
-                return Err(failed("Recovery cannot change the caller command, source, prompt, database or transfer mode"));
-            }
-            // prepare_handoff revalidates Stop/owner/scope before the same durable
-            // prompt admission; never transfer another native branch to this target.
-            return Ok(original);
-        }
-        Err(failed("No durable native preparation receipt matches those target IDs. Outcome may be unknown; reconcile the existing operation, never create a replacement"))
+        let preparation = self.crew_services()?.recover_handoff_request(chat, sandbox).await?;
+        let (bytes, _) = self.doc_host.crew_store().crew_command(&format!("native-handoff:{}", preparation.command_id)).map_err(failed)?
+            .ok_or_else(|| failed("Native recovery intent unavailable"))?;
+        let original: HandoffInput = serde_json::from_slice(&bytes).map_err(failed)?;
+        Ok((validate_recovered_native_input(original, &requested, &preparation)?, preparation))
     }
 
     fn copy_native_transcript(&self, entries: &[zeron_doc::SessionMessageEntry], target: &str) -> Result<(), RpcError> {
@@ -667,6 +791,347 @@ impl EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_recovery_returns_original_native_input_and_rejects_changed_callers() {
+        let original = HandoffInput { source_chat_id: "source".into(), command_id: "caller".into(), prompt: "original".into(),
+            database_environment: ScaffoldDatabaseEnvironment::Local, session_only: false, recover_chat_id: None, recover_sandbox_id: None };
+        let preparation = crate::crew::HandoffRequest { source_session_id: original.source_chat_id.clone(), command_id: original.command_id.clone(), prompt: original.prompt.clone(),
+            native_session_id: "native".into(), cwd: "/repo".into(), agent_route: AgentRoute::from_omp_model("anthropic/claude-sonnet-4-5").unwrap(),
+            database_environment: original.database_environment, session_only: original.session_only, recover_chat_id: None, recover_sandbox_id: None };
+        for changed in ["none", "source", "prompt", "command", "mode", "database"] {
+            let mut requested = original.clone();
+            requested.recover_chat_id = Some("chat".into()); requested.recover_sandbox_id = Some("box".into());
+            match changed {
+                "source" => requested.source_chat_id = "other".into(),
+                "prompt" => requested.prompt = "other".into(),
+                "command" => requested.command_id = "other".into(),
+                "mode" => requested.session_only = true,
+                "database" => requested.database_environment = ScaffoldDatabaseEnvironment::StagingSnapshot,
+                _ => {}
+            }
+            let recovered = validate_recovered_native_input(original.clone(), &requested, &preparation);
+            if changed == "none" {
+                assert_eq!(serde_json::to_value(recovered.unwrap()).unwrap(), serde_json::to_value(&original).unwrap());
+            } else { assert!(recovered.is_err(), "{changed}"); }
+        }
+        let mut changed = preparation.clone(); changed.source_session_id = "other".into();
+        assert!(validate_recovered_native_input(original.clone(), &original, &changed).is_err());
+    }
+
+    struct NativeReplayFixture {
+        _dir: tempfile::TempDir,
+        store: std::sync::Arc<zeron_sync::DocsStore>,
+        workspace: crate::WorkspaceHost,
+        host: crate::DocHost,
+        intent: BranchIntent,
+        input: HandoffInput,
+        receipt: crate::crew::HandoffReceipt,
+    }
+    impl NativeReplayFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store = std::sync::Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+            let workspace = crate::WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
+                device_id: "controller".into(), device_name: "Host".into(), platform: "linux".into(),
+                org_id: "project".into(), user_id: "owner".into(), edge: None, local_only: false,
+            }).unwrap();
+            workspace.create_chat("source", None, Some("controller"), None, Some("/source".into())).unwrap();
+            workspace.create_chat("target", None, Some(&crate::scaffold::device_id_for("box", 7)), None, Some("/workspace/ashler-platform".into())).unwrap();
+            let host = crate::DocHost::new(store.clone(), crate::DocHostConfig {
+                device_id: "controller".into(), default_harness: HarnessId::Omp, edge: None,
+            });
+            host.set_workspace(workspace.clone());
+            let mut source = workspace.chat("source").unwrap().unwrap();
+            source.config = Some(zeron_proto::ChatConfig { harness: HarnessId::Omp,
+                model: Some("anthropic/claude-sonnet-4-5".into()), reasoning: None,
+                model_options: serde_json::from_value(json!({"source-setting":true})).unwrap(), sandbox: zeron_proto::SandboxLevel::DangerFullAccess });
+            workspace.import_chat_row(&source).unwrap();
+            let source_doc = host.open("source").unwrap();
+            for id in ["saved-first", "saved-last"] {
+                source_doc.doc().push_message(&zeron_doc::SessionMessageEntry {
+                    id: id.into(), role: zeron_doc::MessageRole::Assistant,
+                    parts: vec![zeron_doc::MessagePart::Input { id: format!("part-{id}"), request_id: format!("input-{id}"),
+                        questions: vec![], resolved: false }],
+                    created_at: 1, device_id: "controller".into(), status: Some(zeron_doc::MessageStatus::Complete),
+                    continuation_of: None, duration_ms: None,
+                }).unwrap();
+            }
+            host.persist_fork(&source_doc).unwrap();
+            let intent = BranchIntent { source, native_id: "source-native".into(), cwd: "/source".into(),
+                transcript: source_doc.doc().read_entries().unwrap() };
+            let input = HandoffInput { source_chat_id: "source".into(), command_id: "caller".into(), prompt: "original prompt".into(),
+                database_environment: ScaffoldDatabaseEnvironment::Local, session_only: false, recover_chat_id: None, recover_sandbox_id: None };
+            let environment: zeron_proto::SessionEnvironment = serde_json::from_value(json!({
+                "source": {"kind":"scaffold", "sandbox_id":"box", "lifecycle":"ready", "lifecycle_epoch":7},
+                "ownerPrincipal":"owner@example.com", "scope":{"projectId":"project", "deploymentId":"deployment", "sessionId":"target"},
+                "databaseEnvironment":"local"
+            })).unwrap();
+            let receipt = crate::crew::HandoffReceipt { chat_id: "target".into(), sandbox_id: "box".into(), command_id: "caller".into(),
+                attachment: zeron_proto::ScaffoldEnvironmentControlResult { environment: environment.clone(), preparation_generation: None,
+                    attached_device_id: Some(crate::scaffold::device_id_for("box", 7)), run_id: None, room_projection: None, control_grant: None,
+                    handoff_native_session_id: None, handoff_cwd: None },
+                environment, native_session_id: "recovered-fork-B".into(), cwd: "/workspace/crew-native-recovery".into() };
+            Self { _dir: dir, store, workspace, host, intent, input, receipt }
+        }
+        fn metadata(&self) -> zeron_proto::CrewChatMetadata {
+            zeron_proto::CrewChatMetadata { owner_subject: "owner".into(), scope: self.receipt.environment.scope.clone(),
+                session_id: self.receipt.chat_id.clone(), environment: None, agent_route: None, original_epoch_history: None }
+        }
+        fn admit_and_progress(&self) {
+            let mut original = self.intent.source.clone();
+            original.cwd = Some(self.receipt.cwd.clone());
+            let payload = SessionCommandPayload::Run { request: request_for(&original, self.input.prompt.clone()).unwrap(),
+                message_id: self.input.command_id.clone() };
+            self.host.queue_command_named("target", payload, vec![], Some("caller"), None).unwrap();
+            let target = self.host.open("target").unwrap();
+            target.doc().set_command_status("caller", zeron_doc::SessionCommandStatus::Cancelled, Some("Stopped")).unwrap();
+            target.write_user_message("later-user", "do not erase progress", 2).unwrap();
+            self.host.persist_fork(&target).unwrap();
+            let mut chat = self.workspace.chat("target").unwrap().unwrap();
+            chat.harness_session_id = Some("later-native-session".into());
+            chat.harness_session_cwd = Some("/later/cwd".into());
+            chat.cwd = Some("/later/cwd".into());
+            chat.config = self.intent.source.config.clone();
+            chat.config.as_mut().unwrap().model_options.insert("later-option".into(), json!(true));
+            self.workspace.import_chat_row(&chat).unwrap();
+        }
+        fn reopened_host(&self) -> crate::DocHost {
+            let host = crate::DocHost::new(self.store.clone(), crate::DocHostConfig {
+                device_id: "controller".into(), default_harness: HarnessId::Omp, edge: None,
+            });
+            host.set_workspace(self.workspace.clone());
+            host
+        }
+
+        async fn completed_rpc(&self) -> (crate::EngineCore, EngineRpc, tokio::task::JoinHandle<()>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use zeron_sync::scaffold_auth::{save_session, ScaffoldConfig, ScaffoldIdentity, ScaffoldSession, DEFAULT_OAUTH_SCOPES};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let resource = origin.clone();
+            let server = tokio::spawn(async move {
+                for expected in ["GET /api/code-sandboxes/auth/session ", "GET /auth/session ", "GET /api/code-sandboxes/box "] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = [0_u8; 8192];
+                    let size = stream.read(&mut bytes).await.unwrap();
+                    let request = String::from_utf8_lossy(&bytes[..size]);
+                    assert!(request.starts_with(expected), "unexpected mutation or request: {request}");
+                    let body = if expected == "GET /auth/session " {
+                        json!({"userId":"owner", "email":"owner@example.com", "projectScope":"project", "deploymentId":"deployment",
+                            "credential":"scaffold", "capabilities":["session.read"]})
+                    } else if expected == "GET /api/code-sandboxes/auth/session " {
+                        json!({"ok":true, "resource":resource, "actor":{"sub":"owner", "auth":"iap"},
+                            "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})
+                    } else {
+                        json!({"sandbox":{"id":"box", "lifecycleEpoch":7, "status":"ready", "kind":"remote_code", "runtimeProfile":"comet_remote",
+                            "cometRuntimeProfile":{"version":"scaffold.comet-runtime.v1", "projectId":"project", "deploymentId":"deployment", "sessionId":"target", "sandboxId":"box", "databaseEnvironment":"local"},
+                            "databaseEnvironment":"local", "ownerEmail":"owner@example.com", "createdAt":"2026-08-04T00:00:00Z", "updatedAt":"2026-08-04T00:01:00Z"}})
+                    }.to_string();
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let auth_dir = self._dir.path().join("auth");
+            std::fs::create_dir_all(&auth_dir).unwrap();
+            save_session(&auth_dir.join("scaffold-session.json"), &ScaffoldSession {
+                access_token: "sc_rc_test".into(), resource: origin.clone(), edge_origin: origin.clone(), device: None,
+                identity: ScaffoldIdentity { user_id: "owner".into(), email: "owner@example.com".into(), name: None,
+                    project_scope: "project".into(), deployment_id: Some("deployment".into()), capabilities: vec!["session.read".into()] },
+            }).unwrap();
+            let mut config = crate::auth::AuthConfig::new(&origin, &auth_dir);
+            config.scaffold = Some(ScaffoldConfig::new(&origin, &origin, "project"));
+            let auth = crate::auth::Auth::detect(config).await;
+            assert!(auth.state().is_signed_in());
+            let runtime = crate::scaffold::ScaffoldRuntime::new(
+                crate::scaffold::ScaffoldClient::new(&origin, "project", auth.for_profile_tokens()).unwrap(),
+                &origin, std::sync::Arc::new(crate::scaffold::UnavailableDeviceJoinGrantProvider),
+            ).with_deployment_id("deployment".into());
+            let crew = crate::crew::CrewServices::new(auth.clone(), runtime, self.store.clone()).unwrap();
+            let core = crate::EngineCore::assemble_with_profile(
+                crate::EngineProfile::local(&self._dir.path().join("engine")).unwrap(),
+                std::sync::Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp, None,
+            ).unwrap();
+            let mut rpc = core.build_rpc().with_auth(auth).with_crew(crew);
+            rpc.doc_host = self.reopened_host();
+            rpc.workspace = self.workspace.clone();
+            (core, rpc, server)
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_native_receipt_replay_preserves_progress_without_source_preparation() {
+        let fixture = NativeReplayFixture::new();
+        fixture.admit_and_progress();
+        let key = "native-handoff:caller";
+        fixture.store.claim_crew_command(key, &serde_json::to_vec(&fixture.input).unwrap()).unwrap();
+        fixture.store.finish_crew_command(key, &serde_json::to_vec(&fixture.receipt).unwrap()).unwrap();
+        let host = fixture.reopened_host();
+        let before_chat = fixture.workspace.chat("target").unwrap().unwrap();
+        let before_entries = host.open("target").unwrap().doc().read_entries().unwrap();
+        let replay = claim_native_handoff(&fixture.store, key, &fixture.input).unwrap().unwrap();
+        let (core, rpc, server) = fixture.completed_rpc().await;
+        rpc.native_rpc("HandoffSessionToScaffold", serde_json::to_value(&fixture.input).unwrap()).await.unwrap();
+        server.await.unwrap();
+        core.sessions.shutdown().await;
+        assert_eq!(serde_json::to_value(replay).unwrap(), serde_json::to_value(&fixture.receipt).unwrap());
+        assert!(fixture.store.crew_command("native-handoff:caller:snapshot").unwrap().is_none());
+        assert_eq!(fixture.workspace.chat("target").unwrap().unwrap(), before_chat);
+        assert_eq!(host.open("target").unwrap().doc().read_entries().unwrap(), before_entries);
+        let commands = host.open("target").unwrap().doc().read_commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].id, "caller");
+        assert_eq!(commands[0].status, zeron_doc::SessionCommandStatus::Cancelled);
+        let mut changed = fixture.input.clone(); changed.prompt = "different".into();
+        assert!(claim_native_handoff(&fixture.store, key, &changed).is_err());
+        let mut wrong = fixture.receipt.clone(); wrong.command_id = "another-caller".into();
+        fixture.store.claim_crew_command("wrong-receipt", &serde_json::to_vec(&fixture.input).unwrap()).unwrap();
+        fixture.store.finish_crew_command("wrong-receipt", &serde_json::to_vec(&wrong).unwrap()).unwrap();
+        assert!(claim_native_handoff(&fixture.store, "wrong-receipt", &fixture.input).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_native_handoff_claim_preserves_bytes_and_validates_every_input() {
+        for completed in [false, true] {
+            let fixture = NativeReplayFixture::new();
+            let key = "native-handoff:caller";
+            let mut legacy = serde_json::to_value(&fixture.input).unwrap();
+            for field in ["sessionOnly", "recoverChatId", "recoverSandboxId"] {
+                legacy.as_object_mut().unwrap().remove(field);
+            }
+            let original = serde_json::to_vec_pretty(&legacy).unwrap();
+            fixture.store.claim_crew_command(key, &original).unwrap();
+            if completed {
+                fixture.store.finish_crew_command(key, &serde_json::to_vec(&fixture.receipt).unwrap()).unwrap();
+            }
+            let outcome = fixture.store.crew_command(key).unwrap().unwrap().1;
+            let receipt = claim_native_handoff(&fixture.store, key, &fixture.input).unwrap();
+            assert_eq!(receipt.is_some(), completed);
+            assert_eq!(fixture.store.crew_command(key).unwrap().unwrap(), (original.clone(), outcome.clone()));
+            for field in ["source", "prompt", "command", "database", "mode", "chat-selector", "sandbox-selector"] {
+                let mut changed = fixture.input.clone();
+                match field {
+                    "source" => changed.source_chat_id = "other-source".into(),
+                    "prompt" => changed.prompt = "changed prompt".into(),
+                    "command" => changed.command_id = "other-command".into(),
+                    "database" => changed.database_environment = ScaffoldDatabaseEnvironment::StagingSnapshot,
+                    "mode" => changed.session_only = true,
+                    "chat-selector" => changed.recover_chat_id = Some("other-chat".into()),
+                    _ => changed.recover_sandbox_id = Some("other-sandbox".into()),
+                }
+                assert!(claim_native_handoff(&fixture.store, key, &changed).is_err(), "{field}");
+                assert_eq!(fixture.store.crew_command(key).unwrap().unwrap(), (original.clone(), outcome.clone()));
+            }
+            let mut fresh = fixture.input.clone(); fresh.command_id = "new-caller".into();
+            let fresh_key = "native-handoff:new-caller";
+            assert!(claim_native_handoff(&fixture.store, fresh_key, &fresh).unwrap().is_none());
+            assert_eq!(fixture.store.crew_command(fresh_key).unwrap().unwrap(), (serde_json::to_vec(&fresh).unwrap(), None));
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_native_outcome_adopts_exact_original_admission_without_resetting_progress() {
+        let fixture = NativeReplayFixture::new();
+        let key = "native-handoff:caller";
+        assert!(claim_native_handoff(&fixture.store, key, &fixture.input).unwrap().is_none());
+        fixture.admit_and_progress();
+        let host = fixture.reopened_host();
+        let before_chat = fixture.workspace.chat("target").unwrap().unwrap();
+        let before_entries = host.open("target").unwrap().doc().read_entries().unwrap();
+        assert!(native_handoff_target(&host, &fixture.workspace, &fixture.intent, &fixture.input, &fixture.receipt, &fixture.metadata()).unwrap());
+        fixture.store.finish_crew_command(key, &serde_json::to_vec(&fixture.receipt).unwrap()).unwrap();
+        for changed in ["prompt", "message", "config", "cwd"] {
+            let mut input = fixture.input.clone();
+            let mut intent = fixture.intent.clone();
+            let mut receipt = fixture.receipt.clone();
+            match changed {
+                "prompt" => input.prompt = "changed".into(),
+                "message" => input.command_id = "other".into(),
+                "config" => intent.source.config.as_mut().unwrap().model = Some("openai/other".into()),
+                _ => receipt.cwd = "/different".into(),
+            }
+            assert!(native_handoff_target(&host, &fixture.workspace, &intent, &input, &receipt, &fixture.metadata()).is_err(), "{changed}");
+        }
+        assert_eq!(fixture.workspace.chat("target").unwrap().unwrap(), before_chat);
+        assert_eq!(host.open("target").unwrap().doc().read_entries().unwrap(), before_entries);
+        let commands = host.open("target").unwrap().doc().read_commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, zeron_doc::SessionCommandStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn pending_native_target_rejects_unrelated_association_and_progress_but_allows_exact_partial_copy() {
+        for scenario in ["partial", "attach-default", "stale-fork", "private-path", "unrelated", "wrong-cwd", "missing-native-cwd",
+            "extra-entry", "changed-entry", "missing-prefix", "config", "command"] {
+            let fixture = NativeReplayFixture::new();
+            let mut chat = fixture.workspace.chat("target").unwrap().unwrap();
+            chat.harness_session_id = Some(match scenario {
+                "stale-fork" => "saved-fork-A".into(),
+                "private-path" => "/native/recovered/journal.jsonl".into(),
+                "unrelated" => "unrelated-native".into(),
+                _ => fixture.receipt.native_session_id.clone(),
+            });
+            chat.harness_session_cwd = Some(fixture.receipt.cwd.clone());
+            chat.cwd = Some(fixture.receipt.cwd.clone());
+            chat.config = fixture.intent.source.config.clone();
+            if scenario == "config" { chat.config.as_mut().unwrap().model = Some("openai/other".into()); }
+            if scenario == "attach-default" { chat.config.as_mut().unwrap().model_options.clear(); }
+            if scenario == "wrong-cwd" { chat.cwd = Some("/user/progress".into()); }
+            if scenario == "missing-native-cwd" { chat.harness_session_cwd = None; }
+            fixture.workspace.import_chat_row(&chat).unwrap();
+            let target = fixture.host.open("target").unwrap();
+            let mut entry = fixture.intent.transcript[usize::from(scenario == "missing-prefix")].clone();
+            for part in &mut entry.parts {
+                if let zeron_doc::MessagePart::Input { resolved, .. } = part { *resolved = true; }
+            }
+            if scenario == "changed-entry" { entry.created_at += 1; }
+            target.doc().push_message(&entry).unwrap();
+            if scenario == "extra-entry" { target.write_user_message("unrelated-user", "new work", 3).unwrap(); }
+            fixture.host.persist_fork(&target).unwrap();
+            if scenario == "command" {
+                fixture.host.queue_command_named("target", SessionCommandPayload::Steer {
+                    prompt: "unrelated work".into(), message_id: None,
+                }, vec![], Some("other-command"), None).unwrap();
+            }
+            let host = fixture.reopened_host();
+            let before_entries = host.open("target").unwrap().doc().read_entries().unwrap();
+            let guarded = native_handoff_target(&host, &fixture.workspace, &fixture.intent, &fixture.input, &fixture.receipt, &fixture.metadata());
+            if matches!(scenario, "partial" | "attach-default") { assert!(!guarded.unwrap()); }
+            else { assert!(guarded.is_err(), "{scenario}"); }
+            assert_eq!(fixture.workspace.chat("target").unwrap().unwrap(), chat);
+            assert_eq!(host.open("target").unwrap().doc().read_entries().unwrap(), before_entries);
+            assert_eq!(host.open("source").unwrap().doc().read_entries().unwrap(), fixture.intent.transcript);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_native_target_rejects_foreign_owner_scope_session_and_host_without_mutation() {
+        for scenario in ["owner", "scope", "session", "host", "active-local-host", "placeholder", "admitted-foreign"] {
+            let fixture = NativeReplayFixture::new();
+            if scenario == "admitted-foreign" { fixture.admit_and_progress(); }
+            let mut chat = fixture.workspace.chat("target").unwrap().unwrap();
+            chat.device_id = fixture.receipt.attachment.attached_device_id.clone().unwrap();
+            chat.crew = Some(fixture.metadata());
+            match scenario {
+                "owner" | "admitted-foreign" => chat.crew.as_mut().unwrap().owner_subject = "another-owner".into(),
+                "scope" => chat.crew.as_mut().unwrap().scope.project_id = "another-project".into(),
+                "session" => chat.crew.as_mut().unwrap().session_id = "another-session".into(),
+                "host" => chat.device_id = "another-host".into(),
+                "active-local-host" => { chat.crew = None; chat.device_id = "controller".into(); chat.config = fixture.intent.source.config.clone(); }
+                _ => { chat.crew = None; chat.device_id = "controller".into(); }
+            }
+            fixture.workspace.import_chat_row(&chat).unwrap();
+            let host = fixture.reopened_host();
+            let entries = host.open("target").unwrap().doc().read_entries().unwrap();
+            let guarded = native_handoff_target(&host, &fixture.workspace, &fixture.intent, &fixture.input, &fixture.receipt, &fixture.metadata());
+            match scenario {
+                "placeholder" => assert!(!guarded.unwrap()),
+                "admitted-foreign" => assert!(guarded.unwrap()),
+                _ => assert!(guarded.is_err(), "{scenario}"),
+            }
+            assert_eq!(fixture.workspace.chat("target").unwrap().unwrap(), chat);
+            assert_eq!(host.open("target").unwrap().doc().read_entries().unwrap(), entries);
+        }
+    }
+
 
     #[tokio::test]
     async fn imported_profile_verification_authenticates_before_profile_lookup() {

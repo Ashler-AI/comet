@@ -56,6 +56,24 @@ checkout without capturing or replacing local worktree changes. Creation and
 unsupported engines fail closed, never falling back to another creation or
 worktree transfer. Recovery retains the immutable command, prompt and transfer mode.
 
+For an interrupted handoff, retain the original command, prompt, database mode
+and transfer mode, then name both already allocated targets:
+
+```bash
+comet session handoff CHAT_ID --command-id ORIGINAL_COMMAND --prompt-file FILE \
+  --database-environment local --recover-chat-id TARGET_CHAT --recover-sandbox-id TARGET_SANDBOX
+```
+
+Recovery reuses confirmed allocation without replaying its ambiguous transfer.
+It seals a separate recovery capture, publishes only an isolated workspace and
+derived saved-history identity, then admits the original user command once.
+Session-only recovery leaves the published checkout untouched. Pending captures
+with missing or changed artifacts fail closed; later history never substitutes
+for the saved fork. Update and restart the running Crew controller: updating its
+CLI alone does not install this recovery behavior.
+Isolated preparation requires a macOS or Linux controller; other platforms fail
+before preparation without changing the existing handoff or deleting captures.
+
 The native chat2 browser contract is `crew.native.web.v1`: verified assets install
 under `.scaffold/crew/web`, runtime under `.scaffold/crew`, data under
 `.scaffold/crew-data`, all relative to the sandbox API workspace (normally

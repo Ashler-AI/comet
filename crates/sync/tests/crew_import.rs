@@ -325,6 +325,77 @@ fn immutable_claims_and_outcomes_survive_reopening() {
 }
 
 #[test]
+fn crew_handoff_key_discovery_preserves_pending_completed_and_child_records() {
+    let root = tempfile::tempdir().unwrap();
+    let store = DocsStore::open(root.path()).unwrap();
+    let db = rusqlite::Connection::open(root.path().join("docs.sqlite3")).unwrap();
+    let records = [
+        ("crew-handoff:complete", true),
+        ("crew-handoff:complete:transfer", false),
+        ("crew-handoff:pending", false),
+        ("crew-handoff:pending:attach", true),
+        ("crew-handoffish:excluded", false),
+        ("Crew-handoff:excluded", true),
+        ("native-handoff:excluded", false),
+    ];
+    for (id, complete) in records {
+        db.execute(
+            "INSERT INTO crew_commands(command_id,request,outcome) VALUES (?1,zeroblob(?2),CASE WHEN ?3 THEN zeroblob(?2) ELSE NULL END)",
+            rusqlite::params![id, 2 * 1024 * 1024, complete],
+        ).unwrap();
+    }
+    db.execute("INSERT INTO crew_commands(command_id,request) VALUES (?1,zeroblob(1))",
+        [format!("unrelated:{}", "x".repeat(2048))]).unwrap();
+    assert_eq!(store.crew_handoff_command_ids("", 64).unwrap(), vec![
+        "crew-handoff:complete", "crew-handoff:complete:transfer",
+        "crew-handoff:pending", "crew-handoff:pending:attach",
+    ]);
+    for (id, complete) in records {
+        let retained: (usize, Option<usize>) = db.query_row(
+            "SELECT length(request),length(outcome) FROM crew_commands WHERE command_id=?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(retained, (2 * 1024 * 1024, complete.then_some(2 * 1024 * 1024)));
+    }
+}
+
+#[test]
+fn crew_handoff_key_discovery_uses_bounded_exclusive_ordered_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let store = DocsStore::open(root.path()).unwrap();
+    let expected: Vec<String> = (0..130).map(|i| format!("crew-handoff:{i:03}")).collect();
+    for (i, id) in expected.iter().enumerate().rev() {
+        store.claim_crew_command(id, b"not JSON").unwrap();
+        if i % 2 == 0 { store.finish_crew_command(id, b"also not JSON").unwrap(); }
+    }
+    assert_eq!(store.crew_handoff_command_ids("", 0).unwrap(), expected[..1]);
+    let first = store.crew_handoff_command_ids("", usize::MAX).unwrap();
+    assert_eq!(first, expected[..64]);
+    let second = store.crew_handoff_command_ids(first.last().unwrap(), 64).unwrap();
+    assert_eq!(second, expected[64..128]);
+    let third = store.crew_handoff_command_ids(second.last().unwrap(), 64).unwrap();
+    assert_eq!(third, expected[128..]);
+    assert!(store.crew_handoff_command_ids(third.last().unwrap(), 64).unwrap().is_empty());
+    assert_eq!(store.crew_handoff_command_ids("crew-handoff:063:missing", 1).unwrap(), expected[64..65]);
+    assert!(store.crew_handoff_command_ids("z", 64).unwrap().is_empty());
+}
+
+#[test]
+fn crew_handoff_key_discovery_rejects_oversized_utf8_keys_without_skipping_them() {
+    let root = tempfile::tempdir().unwrap();
+    let store = DocsStore::open(root.path()).unwrap();
+    let boundary = format!("crew-handoff:{}x", "é".repeat((1024 - "crew-handoff:".len()) / 2));
+    assert_eq!(boundary.len(), 1024);
+    store.claim_crew_command(&boundary, b"intent").unwrap();
+    assert_eq!(store.crew_handoff_command_ids("", 64).unwrap(), vec![boundary.clone()]);
+    let oversized = format!("{boundary}x");
+    store.claim_crew_command(&oversized, b"intent").unwrap();
+    assert_eq!(store.crew_handoff_command_ids("", 1).unwrap(), vec![boundary.clone()]);
+    assert!(store.crew_handoff_command_ids("", 64).is_err());
+    assert!(store.crew_handoff_command_ids(&boundary, 64).is_err());
+}
+
+#[test]
 fn durable_terminal_journal_outcome_reconciles_a_pending_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("backup");
