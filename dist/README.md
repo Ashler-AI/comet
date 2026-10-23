@@ -224,11 +224,13 @@ environment should require explicit operator approval.
 
 ### Native authority refresh
 
-The 0.2.117 source carries the Canary credential-generation, startup deferral,
+The 0.2.118 source carries the Canary credential-generation, startup deferral,
 directory backpressure and inference-renewal fixes onto the existing native-v2
 contract. Rejection feedback invalidates only the sent access lease; WorkOS
 refresh-secret rotation remains fenced against sign-out/replacement, not against
 rejection of its old access token. Mutations and provider requests are not replayed.
+Version 0.2.118 keeps this source distinct from the independently built canonical
+0.2.117 handoff-recovery candidate; its immutable objects must not be replaced.
 
 Edge verification coalesces pending work only. Its active envelope is 8 KiB per
 UTF-8 token, 64 KiB per JSON stream, 32 combined admissions per isolate and an
@@ -248,7 +250,7 @@ byte ceiling; the client limit does not bound that server storage.
 
 Canonical publication still requires reviewed `main` source and the immutable
 candidate workflow. A separately built Canary controller is not the canonical
-Linux release, even when both report 0.2.117. No source check authorizes existing
+Linux release, even when their version labels match. No source check authorizes existing
 profile conversion, channel promotion, Edge activation or production changes.
 
 ### Checks for the integration owner
