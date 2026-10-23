@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tracing::Instrument;
 use zeron_harness::{CancellationToken, InferenceRoute};
 use zeron_proto::{AgentRoute, CollaborationScope, HarnessId, ScaffoldDatabaseEnvironment,
     ScaffoldEnvironmentControl as Control, ScaffoldEnvironmentControlResult as ControlResult,
@@ -41,7 +42,7 @@ pub struct ControlOutcome {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffRequest {
     pub command_id: String,
@@ -231,7 +232,9 @@ impl CrewServices {
         if matches!(command.control, Control::Stop { .. }) {
             self.retire_pending(command_id, &command)?;
         }
-        let result = match self.runtime.control(command.control.clone(), cancellation).await {
+        let result = match self.runtime.control(command.control.clone(), cancellation)
+            .instrument(tracing::info_span!("crew_control", command_id, sandbox_id = sandbox_id(&command.control)))
+            .await {
             Ok(mut result) => {
                 self.validate_environment(&result.environment, scope)?;
                 if let Some(before) = before.as_ref() {
@@ -294,6 +297,9 @@ impl CrewServices {
     }
 
     fn record_error(&self, id: &str, error: ScaffoldError) -> Result<ControlOutcome, RpcError> {
+        if let ScaffoldError::RepositoryImport { diagnostic, .. } = &error {
+            persist_repository_diagnostic(&self.store, id, diagnostic)?;
+        }
         // No retry for ambiguous mutation delivery (including cancellation or malformed replies).
         if matches!(&error, ScaffoldError::AttachRejected(_))
             || matches!(&error, ScaffoldError::Api(api) if (400..500).contains(&api.0.status) && api.0.status != 408 && api.0.status != 429) {
@@ -512,6 +518,86 @@ impl CrewServices {
         serde_json::to_value(accounts.import_local_shared(&self.runtime.client(),harness,account_id).await.map_err(failed)?).map_err(failed)
     }
 
+    pub(crate) async fn recover_handoff_request(&self, chat: &str, sandbox: &str) -> Result<HandoffRequest, RpcError> {
+        let (principal, mut scope) = self.controller()?;
+        scope.session_id = Some(chat.into());
+        let owner = self.auth.verified_owner_email().ok_or_else(|| denied("Verified sandbox owner unavailable"))?;
+        let (request, environment) = recover_handoff_request(&self.store, &principal, &scope, &owner, chat, sandbox)?;
+        let observed = self.runtime.client().inspect(sandbox, &scope, &CancellationToken::new()).await.map_err(failed)?;
+        self.validate_environment(&observed, &scope)?;
+        validate_handoff_epoch(&environment, &observed)?;
+        if !matches!(&observed.source, SessionEnvironmentSource::Scaffold { lifecycle: ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning, .. }) {
+            return Err(denied("Handoff target is not running"));
+        }
+        if self.retired(sandbox, &scope, environment_epoch(&environment))? {
+            return Err(denied("Stopped handoff cannot recover"));
+        }
+        Ok(request)
+    }
+    /// Explicit recovery prepares a separate child; the ambiguous legacy transfer is never replayed.
+    pub(crate) async fn recover_handoff(&self, request: HandoffRequest, chat: &str, sandbox: &str,
+        cancellation: &CancellationToken) -> Result<HandoffReceipt, RpcError> {
+        let (principal, mut scope) = self.controller()?;
+        scope.session_id = Some(chat.into());
+        let owner = self.auth.verified_owner_email().ok_or_else(|| denied("Verified sandbox owner unavailable"))?;
+        let (original, environment) = recover_handoff_request(&self.store, &principal, &scope, &owner, chat, sandbox)?;
+        if request != original {
+            return Err(denied("Recovery cannot change the immutable handoff request"));
+        }
+        let root = format!("crew-handoff:{}", original.command_id);
+        if let Some((_, Some(bytes))) = self.store.crew_command(&root).map_err(failed)? {
+            let receipt: HandoffReceipt = serde_json::from_slice(&bytes).map_err(failed)?;
+            self.admit_handoff(&receipt, || Ok(())).await?;
+            return Ok(receipt);
+        }
+        let child = format!("{root}:isolated-recovery");
+        let immutable = serde_json::to_vec(&json!({"principal":principal,"root":root,"environment":environment,
+            "sourceSelector":original.native_session_id,"sourceCwd":original.cwd,"sessionOnly":original.session_only})).map_err(failed)?;
+        self.store.claim_crew_command(&child, &immutable).map_err(failed)?;
+        let (_, attachment) = self.store.crew_command(&format!("{root}:attach")).map_err(failed)?
+            .ok_or_else(|| denied("Confirmed original attachment missing"))?;
+        let attachment = confirmed(serde_json::from_slice(&attachment.ok_or_else(|| denied("Original attachment is unknown"))?).map_err(failed)?)?;
+        self.validate_recovery_target(&environment, cancellation).await?;
+        let capsule_root = self.store.profile_root().map_err(failed)?.join("native-handoff-recovery");
+        let prepared = match self.runtime.recover_native_handoff(&child, &environment, &original.native_session_id,
+            &original.cwd, original.session_only, &capsule_root, cancellation).await {
+            Ok(prepared) => prepared,
+            Err(ScaffoldError::IsolatedRecovery { stage, diagnostic }) => {
+                let evidence = persist_isolated_recovery_diagnostic(&self.store, &child, &diagnostic)?;
+                return Err(failed(format!("{stage}; diagnostic={evidence}; sandbox={sandbox}; {}", diagnostic.stderr)));
+            }
+            Err(error) => return Err(failed(error)),
+        };
+        // Stop owns this same gate. A guest receipt alone never authorizes local publication.
+        let _gate = self.control_gate.lock().await;
+        self.validate_recovery_target(&environment, cancellation).await?;
+        let receipt = HandoffReceipt { chat_id: chat.into(), sandbox_id: sandbox.into(), command_id: original.command_id,
+            environment, attachment, native_session_id: prepared.native_session_id.clone(),
+            cwd: prepared.cwd.clone() };
+        self.store.finish_crew_command(&child, &serde_json::to_vec(&prepared).map_err(failed)?).map_err(failed)?;
+        self.store.finish_crew_command(&root, &serde_json::to_vec(&receipt).map_err(failed)?).map_err(failed)?;
+        Ok(receipt)
+    }
+
+    async fn validate_recovery_target(&self, before: &SessionEnvironment, cancellation: &CancellationToken) -> Result<(), RpcError> {
+        let sandbox = environment_id(before).ok_or_else(|| denied("Handoff sandbox missing"))?;
+        self.validate_environment(before, &before.scope)?;
+        let observed = self.runtime.client().inspect(sandbox, &before.scope, cancellation).await.map_err(failed)?;
+        self.validate_environment(&observed, &before.scope)?;
+        validate_handoff_epoch(before, &observed)?;
+        if !matches!(&observed.source, SessionEnvironmentSource::Scaffold { lifecycle: ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning, .. })
+            || self.retired(sandbox, &before.scope, environment_epoch(before))? {
+            return Err(denied("Stopped or superseded handoff cannot recover"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_handoff_recovery(&self, command: &str) -> Result<(), RpcError> {
+        let root = self.store.profile_root().map_err(failed)?.join("native-handoff-recovery");
+        self.runtime.cleanup_native_handoff_recovery(&format!("crew-handoff:{command}:isolated-recovery"), &root).map_err(failed)
+    }
+
+
     /// Prepare a completed-turn native fork. Keep the source writer alive;
     /// publish the target and durably admit the original immutable command ID.
     pub async fn prepare_handoff(&self, request: HandoffRequest, cancellation: &CancellationToken) -> Result<HandoffReceipt, RpcError> {
@@ -568,6 +654,10 @@ impl CrewServices {
             loop {
                 let environment = self.runtime.client().inspect(&sandbox, &scope, cancellation).await.map_err(failed)?;
                 self.validate_environment(&environment, &scope)?;
+                validate_handoff_epoch(&attachment.environment, &environment)?;
+                if self.retired(&sandbox, &scope, environment_epoch(&environment))? {
+                    return Err(denied("Stopped handoff cannot recover"));
+                }
                 match environment.source {
                     SessionEnvironmentSource::Scaffold { lifecycle: ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning, .. } => return Ok::<(), RpcError>(()),
                     SessionEnvironmentSource::Scaffold { lifecycle: ScaffoldLifecycle::Stopped | ScaffoldLifecycle::Failed | ScaffoldLifecycle::Paused, .. } => return Err(failed("Handoff target is not running")),
@@ -603,11 +693,10 @@ impl CrewServices {
             &receipt.sandbox_id, &receipt.environment.scope, &CancellationToken::new(),
         ).await.map_err(failed)?;
         self.validate_environment(&environment, &receipt.environment.scope)?;
-        match (&receipt.environment.source, &environment.source) {
-            (SessionEnvironmentSource::Scaffold { lifecycle_epoch: before, .. },
-                SessionEnvironmentSource::Scaffold { lifecycle: ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning, lifecycle_epoch: after, .. })
-                if before.is_some() && before == after => {}
-            _ => return Err(denied("Handoff target is stopped, paused, or changed epoch; do not replay its prompt")),
+        validate_handoff_epoch(&receipt.environment, &environment)?;
+        if !matches!(&environment.source, SessionEnvironmentSource::Scaffold {
+            lifecycle: ScaffoldLifecycle::Ready | ScaffoldLifecycle::AgentRunning, .. }) {
+            return Err(denied("Handoff target is stopped or paused; do not replay its prompt"));
         }
         let services = self.clone();
         let receipt = receipt.clone();
@@ -620,6 +709,107 @@ impl CrewServices {
             admit()
         }).await.map_err(failed)?
     }
+}
+
+fn persist_repository_diagnostic(store: &DocsStore, command: &str,
+    diagnostic: &crate::scaffold::RepositoryImportDiagnostic) -> Result<String, RpcError> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(diagnostic).map_err(failed)?;
+    let id = format!("{command}:repository-diagnostic:{:x}", Sha256::digest(&bytes));
+    // Evidence is immutable and separate from the transfer's still-unknown outcome.
+    store.claim_crew_command(&id, &bytes).map_err(failed)?;
+    Ok(id)
+}
+
+fn persist_isolated_recovery_diagnostic(store: &DocsStore, child: &str,
+    diagnostic: &crate::scaffold::IsolatedRecoveryDiagnostic) -> Result<String, RpcError> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(diagnostic).map_err(failed)?;
+    let id = format!("{child}:diagnostic:{:x}", Sha256::digest(&bytes));
+    store.claim_crew_command(&id, &bytes).map_err(failed)?;
+    Ok(id)
+}
+
+/// Resolve allocation evidence only. This never marks preparation or transfer complete.
+fn recover_handoff_request(store: &DocsStore, principal: &str, scope: &CollaborationScope,
+    owner: &str, chat: &str, sandbox: &str) -> Result<(HandoffRequest, SessionEnvironment), RpcError> {
+    #[derive(Deserialize)]
+    struct Root { principal: String, request: HandoffRequest }
+    let mut found = None;
+    let mut after = String::new();
+    loop {
+        let ids = store.crew_handoff_command_ids(&after, 64).map_err(failed)?;
+        let Some(last) = ids.last() else { break };
+        after = last.clone();
+        for id in ids {
+        let Some((bytes, outcome)) = store.crew_command(&id).map_err(failed)? else { continue };
+        let Ok(root) = serde_json::from_slice::<Root>(&bytes) else { continue };
+        if id != format!("crew-handoff:{}", root.request.command_id) { return Err(denied("Handoff root identity mismatch")); }
+        let completed = outcome.as_deref().map(serde_json::from_slice::<HandoffReceipt>).transpose().map_err(failed)?;
+        let attachment = store.crew_command(&format!("{id}:attach")).map_err(failed)?;
+        let attached = attachment.as_ref().and_then(|(_, bytes)| bytes.as_deref())
+            .map(serde_json::from_slice::<ControlOutcome>).transpose().map_err(failed)?;
+        let environment = completed.as_ref().map(|receipt| &receipt.environment)
+            .or_else(|| attached.as_ref()?.result.as_ref().map(|result| &result.environment));
+        let Some(environment) = environment else { continue };
+        if environment.scope.session_id.as_deref() != Some(chat) || environment_id(environment) != Some(sandbox) { continue; }
+        if found.is_some() { return Err(denied("Multiple handoffs bind these target IDs")); }
+        if root.principal != principal || environment.scope != *scope || !environment.owner_principal.eq_ignore_ascii_case(owner)
+            || environment.database_environment != Some(root.request.database_environment) {
+            return Err(denied("Handoff owner, scope or database binding changed"));
+        }
+        if let Some(receipt) = completed {
+            if receipt.chat_id != chat || receipt.sandbox_id != sandbox || receipt.command_id != root.request.command_id {
+                return Err(denied("Handoff receipt identity mismatch"));
+            }
+            found = Some((root.request, receipt.environment));
+            continue;
+        }
+        for suffix in ["create", "attach", "transfer"] {
+            let child_id = format!("{id}:{suffix}");
+            let (bytes, outcome) = store.crew_command(&child_id).map_err(failed)?
+                .ok_or_else(|| denied("Partial handoff lacks confirmed allocation evidence"))?;
+            let child: Command = serde_json::from_slice(&bytes).map_err(failed)?;
+            if child.principal_id != principal || control_scope(&child.control) != scope {
+                return Err(denied("Handoff child owner or scope changed"));
+            }
+            let matches = match (&child.control, suffix) {
+                (Control::Create { database_environment, agent_route, .. }, "create") =>
+                    *database_environment == root.request.database_environment && *agent_route == root.request.agent_route,
+                (Control::Attach { sandbox_id, .. }, "attach") => sandbox_id == sandbox,
+                (Control::HandoffOmpSession { sandbox_id, native_session_id, cwd, session_only, .. }, "transfer") =>
+                    sandbox_id == sandbox && *native_session_id == root.request.native_session_id
+                        && *cwd == root.request.cwd && *session_only == root.request.session_only,
+                _ => false,
+            };
+            if !matches { return Err(denied("Handoff child input or target changed")); }
+            if suffix != "transfer" {
+                let outcome: ControlOutcome = serde_json::from_slice(&outcome.ok_or_else(|| denied("Allocation is not confirmed"))?).map_err(failed)?;
+                if outcome.command_id != child_id || outcome.status != "confirmed" || outcome.error.is_some() {
+                    return Err(denied("Allocation is not confirmed"));
+                }
+                let result = outcome.result.ok_or_else(|| denied("Allocation result missing"))?;
+                validate_handoff_epoch(environment, &result.environment)?;
+            }
+            if suffix != "create" {
+                let (binding, _) = store.crew_command(&format!("{child_id}:binding")).map_err(failed)?
+                    .ok_or_else(|| denied("Handoff child binding missing"))?;
+                validate_handoff_epoch(environment, &serde_json::from_slice(&binding).map_err(failed)?)?;
+            }
+        }
+        found = Some((root.request, environment.clone()));
+        }
+    }
+    found.ok_or_else(|| denied("No unique durable allocation matches those target IDs; never create a replacement"))
+}
+
+fn validate_handoff_epoch(before: &SessionEnvironment, after: &SessionEnvironment) -> Result<(), RpcError> {
+    validate_transition(before, after)?;
+    if environment_epoch(before).is_none() || environment_epoch(before) != environment_epoch(after)
+        || before.database_environment != after.database_environment {
+        return Err(denied("Handoff lifecycle epoch or database changed"));
+    }
+    Ok(())
 }
 
 fn control_scope(control:&Control)->&CollaborationScope {
@@ -686,6 +876,156 @@ fn bad(message:impl ToString)->RpcError{RpcError::BadParams(message.to_string())
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repository_diagnostic_survives_reopen_without_completing_transfer() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(temp.path()).unwrap();
+        let transfer = "crew-handoff:original:transfer";
+        store.claim_crew_command(transfer, b"immutable transfer").unwrap();
+        let diagnostic = crate::scaffold::RepositoryImportDiagnostic {
+            sandbox_id: "original-box".into(), exit_code: Some(45), stderr: "crew_repository:tree_entry_unsupported".into(),
+            manifest_sha256: "a".repeat(64), base_sha: "b".repeat(40), archive_bytes: 10240,
+            bundle_sha256: "c".repeat(64), bundle_bytes: 512, prerequisite_sha: None, shallow: Some(true),
+        };
+        let key = persist_repository_diagnostic(&store, transfer, &diagnostic).unwrap();
+        assert_eq!(persist_repository_diagnostic(&store, transfer, &diagnostic).unwrap(), key);
+        let child = "crew-handoff:original:isolated-recovery";
+        store.claim_crew_command(child, b"immutable recovery").unwrap();
+        let isolated = crate::scaffold::IsolatedRecoveryDiagnostic {
+            operation_id: child.into(), sandbox_id: "original-box".into(), descriptor_sha256: Some("d".repeat(64)),
+            exit_code: Some(60), stderr: "crew_repository:tree_entry_unsupported".into(),
+            artifacts: json!({"repository":{"archive_sha256":"e".repeat(64),"bundle_sha256":"f".repeat(64)},"native":{"native_session_id":"saved-fork-A"}}),
+        };
+        let isolated_key = persist_isolated_recovery_diagnostic(&store, child, &isolated).unwrap();
+        assert_eq!(persist_isolated_recovery_diagnostic(&store, child, &isolated).unwrap(), isolated_key);
+        drop(store);
+        let reopened = DocsStore::open(temp.path()).unwrap();
+        assert!(reopened.crew_command(transfer).unwrap().unwrap().1.is_none());
+        assert!(key.starts_with(&format!("{transfer}:repository-diagnostic:")));
+        let (bytes, outcome) = reopened.crew_command(&key).unwrap().unwrap();
+        assert!(outcome.is_none());
+        let saved: crate::scaffold::RepositoryImportDiagnostic = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved.sandbox_id, diagnostic.sandbox_id);
+        assert_eq!(saved.stderr, diagnostic.stderr);
+        assert_eq!(saved.manifest_sha256, diagnostic.manifest_sha256);
+        assert!(reopened.crew_command(child).unwrap().unwrap().1.is_none());
+        let (bytes, outcome) = reopened.crew_command(&isolated_key).unwrap().unwrap();
+        assert!(outcome.is_none());
+        let saved: crate::scaffold::IsolatedRecoveryDiagnostic = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved.operation_id, child);
+        assert_eq!(saved.stderr, isolated.stderr);
+        assert_eq!(saved.artifacts, isolated.artifacts);
+    }
+
+    #[test]
+    fn partial_handoff_recovery_survives_reopen_and_rejects_conflicting_evidence() {
+        for scenario in ["valid", "completed", "owner", "scope", "sandbox", "mode", "binding_epoch", "unknown_create", "ambiguous", "paged", "paged_completed_ambiguity"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = DocsStore::open(temp.path()).unwrap();
+            let scope = CollaborationScope { project_id: "p".into(), deployment_id: Some("d".into()), session_id: Some("chat".into()), unknown: Default::default() };
+            let environment = SessionEnvironment {
+                source: SessionEnvironmentSource::Scaffold { sandbox_id: "box".into(), region: None, lifecycle: ScaffoldLifecycle::Ready, lifecycle_epoch: Some(7), links: Default::default() },
+                name: None, owner_principal: "owner@example.com".into(), scope: scope.clone(), source_ref: None,
+                last_activity_at: None, database_environment: Some(ScaffoldDatabaseEnvironment::Local), unknown: Default::default(),
+            };
+            let request = HandoffRequest { command_id: "caller".into(), source_session_id: "source".into(), native_session_id: "native".into(), cwd: "/repo".into(), prompt: "original prompt".into(),
+                agent_route: AgentRoute::from_omp_model("anthropic/claude-sonnet-4-5").unwrap(), database_environment: ScaffoldDatabaseEnvironment::Local,
+                session_only: false, recover_sandbox_id: None, recover_chat_id: None };
+            let root = "crew-handoff:caller";
+            let save = |id: &str, value: Value, outcome: Option<Value>| {
+                store.claim_crew_command(id, &serde_json::to_vec(&value).unwrap()).unwrap();
+                if let Some(outcome) = outcome { store.finish_crew_command(id, &serde_json::to_vec(&outcome).unwrap()).unwrap(); }
+            };
+            save(root, json!({"principal":"principal", "request":request}), None);
+            // Force discovery through multiple key pages without reading unrelated payloads.
+            if scenario.starts_with("paged") {
+                for index in 0..130 {
+                    save(&format!("crew-handoff:aaa-{index:03}:child"), json!({"unrelated":true}), None);
+                    save(&format!("crew-handoff:mmm-{index:03}:child"), json!({"unrelated":true}), None);
+                }
+            }
+            let mut child_scope = scope.clone();
+            if scenario == "scope" { child_scope.project_id = "other".into(); }
+            let principal = if scenario == "owner" { "other" } else { "principal" };
+            for (suffix, control) in [
+                ("create", Control::Create { scope: child_scope.clone(), name: Some("Crew handoff".into()), source_ref: None, region: None, database_environment: request.database_environment, agent_route: request.agent_route.clone() }),
+                ("attach", Control::Attach { sandbox_id: if scenario == "sandbox" { "other" } else { "box" }.into(), scope: child_scope.clone() }),
+                ("transfer", Control::HandoffOmpSession { sandbox_id: "box".into(), scope: child_scope, native_session_id: request.native_session_id.clone(), cwd: request.cwd.clone(), session_only: scenario == "mode" }),
+            ] {
+                let id = format!("{root}:{suffix}");
+                let result = ControlResult { environment: environment.clone(), preparation_generation: None, attached_device_id: Some("device".into()), run_id: None, room_projection: None, control_grant: None, handoff_native_session_id: None, handoff_cwd: None };
+                let outcome = (suffix != "transfer" && !(scenario == "unknown_create" && suffix == "create"))
+                    .then(|| json!(ControlOutcome { command_id: id.clone(), status: "confirmed".into(), result: Some(result), error: None }));
+                save(&id, json!(Command { principal_id: principal.into(), control }), outcome);
+                if suffix != "create" {
+                    let mut binding = environment.clone();
+                    if scenario == "binding_epoch" && suffix == "transfer" {
+                        if let SessionEnvironmentSource::Scaffold { lifecycle_epoch, .. } = &mut binding.source { *lifecycle_epoch = Some(8); }
+                    }
+                    save(&format!("{id}:binding"), json!(binding), None);
+                }
+            }
+            if scenario == "completed" {
+                let (_, bytes) = store.crew_command(&format!("{root}:attach")).unwrap().unwrap();
+                let attachment: ControlOutcome = serde_json::from_slice(&bytes.unwrap()).unwrap();
+                save(root, json!({"principal":"principal", "request":request}), Some(json!(HandoffReceipt {
+                    chat_id: "chat".into(), sandbox_id: "box".into(), command_id: request.command_id.clone(),
+                    environment: environment.clone(), attachment: attachment.result.unwrap(), native_session_id: "native".into(), cwd: "/remote".into(),
+                })));
+            }
+            if matches!(scenario, "ambiguous" | "paged_completed_ambiguity") {
+                let mut other = request.clone(); other.command_id = "other".into();
+                save("crew-handoff:other", json!({"principal":"principal", "request":other}), None);
+                for suffix in ["create", "attach", "attach:binding", "transfer", "transfer:binding"] {
+                    let (bytes, outcome) = store.crew_command(&format!("{root}:{suffix}")).unwrap().unwrap();
+                    let mut outcome: Option<Value> = outcome.map(|bytes| serde_json::from_slice(&bytes).unwrap());
+                    if let Some(outcome) = outcome.as_mut() { outcome["commandId"] = json!(format!("crew-handoff:other:{suffix}")); }
+                    save(&format!("crew-handoff:other:{suffix}"), serde_json::from_slice(&bytes).unwrap(), outcome);
+                }
+                if scenario == "paged_completed_ambiguity" {
+                    let (_, bytes) = store.crew_command(&format!("{root}:attach")).unwrap().unwrap();
+                    let attachment: ControlOutcome = serde_json::from_slice(&bytes.unwrap()).unwrap();
+                    save("crew-handoff:other", json!({"principal":"principal", "request":other}), Some(json!(HandoffReceipt {
+                        chat_id: "chat".into(), sandbox_id: "box".into(), command_id: other.command_id.clone(),
+                        environment: environment.clone(), attachment: attachment.result.unwrap(), native_session_id: "native".into(), cwd: "/remote".into(),
+                    })));
+                }
+            }
+            drop(store);
+            let reopened = DocsStore::open(temp.path()).unwrap();
+            let recovered = recover_handoff_request(&reopened, "principal", &scope, "owner@example.com", "chat", "box");
+            if matches!(scenario, "valid" | "completed" | "paged") {
+                assert_eq!(serde_json::to_value(recovered.unwrap().0).unwrap(), serde_json::to_value(request).unwrap());
+                assert_eq!(reopened.crew_command(root).unwrap().unwrap().1.is_some(), scenario == "completed");
+                assert!(reopened.crew_command(&format!("{root}:transfer")).unwrap().unwrap().1.is_none());
+                assert!(!reopened.claim_crew_command(&format!("{root}:create"), &reopened.crew_command(&format!("{root}:create")).unwrap().unwrap().0).unwrap());
+                assert!(!reopened.claim_crew_command(&format!("{root}:attach"), &reopened.crew_command(&format!("{root}:attach")).unwrap().unwrap().0).unwrap());
+                assert!(recover_handoff_request(&reopened, "principal", &scope, "owner@example.com", "other", "box").is_err());
+                assert!(recover_handoff_request(&reopened, "principal", &scope, "owner@example.com", "chat", "other").is_err());
+            } else { assert!(recovered.is_err(), "{scenario}"); }
+        }
+    }
+
+    #[test]
+    fn handoff_recovery_rejects_changed_or_missing_epoch_before_transfer() {
+        let before = SessionEnvironment {
+            source: SessionEnvironmentSource::Scaffold { sandbox_id: "box".into(), region: None,
+                lifecycle: ScaffoldLifecycle::Ready, lifecycle_epoch: Some(7), links: Default::default() },
+            name: None, owner_principal: "owner@example.com".into(),
+            scope: CollaborationScope { project_id: "p".into(), deployment_id: Some("d".into()), session_id: Some("s".into()), unknown: Default::default() },
+            source_ref: None, last_activity_at: None, database_environment: Some(ScaffoldDatabaseEnvironment::Local), unknown: Default::default(),
+        };
+        assert!(validate_handoff_epoch(&before, &before).is_ok());
+        for epoch in [None, Some(6), Some(8)] {
+            let mut after = before.clone();
+            if let SessionEnvironmentSource::Scaffold { lifecycle_epoch, .. } = &mut after.source { *lifecycle_epoch = epoch; }
+            assert!(validate_handoff_epoch(&before, &after).is_err());
+        }
+        let mut changed = before.clone(); changed.database_environment = Some(ScaffoldDatabaseEnvironment::StagingSnapshot);
+        assert!(validate_handoff_epoch(&before, &changed).is_err());
+    }
+
+
     #[test]
     fn explicit_start_requires_exact_next_epoch_and_preserves_logical_scope() {
         let before = SessionEnvironment {

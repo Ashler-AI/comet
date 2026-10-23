@@ -5,6 +5,8 @@
 //! collaboration records, watch snapshots, errors, or logs. A sandbox receives only
 //! a short-lived Comet device-join credential minted by the edge.
 
+mod native_recovery;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -174,6 +176,32 @@ fn classify_transport_error(error: &reqwest::Error) -> ScaffoldTransportCause {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryImportDiagnostic {
+    pub sandbox_id: String,
+    pub exit_code: Option<i32>,
+    pub stderr: String,
+    pub manifest_sha256: String,
+    pub base_sha: String,
+    pub archive_bytes: u64,
+    pub bundle_sha256: String,
+    pub bundle_bytes: u64,
+    pub prerequisite_sha: Option<String>,
+    pub shallow: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IsolatedRecoveryDiagnostic {
+    pub operation_id: String,
+    pub sandbox_id: String,
+    pub descriptor_sha256: Option<String>,
+    pub exit_code: Option<i32>,
+    pub stderr: String,
+    pub artifacts: Value,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ScaffoldError {
     #[error("scaffold_auth_unavailable")]
@@ -191,6 +219,8 @@ pub enum ScaffoldError {
     },
     #[error("scaffold_response_invalid: {0}")]
     InvalidResponse(String),
+    #[error("scaffold_operation_unsupported: {0}")]
+    UnsupportedPlatform(&'static str),
     #[error("scaffold_attach_rejected: sandbox lifecycle {0:?}")]
     AttachRejected(zeron_proto::ScaffoldLifecycle),
     #[error("scaffold_scope_invalid: {0}")]
@@ -205,6 +235,10 @@ pub enum ScaffoldError {
     OmpSessionHandoffFailed,
     #[error("omp_session_handoff_failed:{0}")]
     HandoffStage(&'static str),
+    #[error("omp_session_handoff_failed:{stage}")]
+    RepositoryImport { stage: &'static str, diagnostic: Box<RepositoryImportDiagnostic> },
+    #[error("omp_session_handoff_failed:{stage}")]
+    IsolatedRecovery { stage: &'static str, diagnostic: Box<IsolatedRecoveryDiagnostic> },
 }
 
 #[derive(Deserialize)]
@@ -1292,6 +1326,14 @@ impl ScaffoldClient {
                 ok = verified.ok,
                 exit_code = ?verified.exit_code,
                 stderr = &stderr[..stderr_end],
+                sandbox_id,
+                manifest_sha256 = %snapshot.manifest_sha256,
+                base_sha = %snapshot.base_sha,
+                archive_bytes = snapshot.byte_count,
+                bundle_sha256 = %snapshot.repository.sha256,
+                bundle_bytes = snapshot.repository.byte_count,
+                prerequisite_sha = ?snapshot.repository.prerequisite_sha,
+                shallow = ?snapshot.repository.shallow,
                 "Scaffold worktree handoff verification failed"
             );
             let stage = match verified.exit_code {
@@ -1302,7 +1344,12 @@ impl ScaffoldClient {
                 Some(49) => "source_import_destination",
                 _ => "source_repository_import",
             };
-            return Err(ScaffoldError::HandoffStage(stage));
+            return Err(ScaffoldError::RepositoryImport { stage, diagnostic: Box::new(RepositoryImportDiagnostic {
+                sandbox_id: sandbox_id.into(), exit_code: verified.exit_code, stderr: stderr[..stderr_end].into(),
+                manifest_sha256: snapshot.manifest_sha256.clone(), base_sha: snapshot.base_sha.clone(), archive_bytes: snapshot.byte_count,
+                bundle_sha256: snapshot.repository.sha256.clone(), bundle_bytes: snapshot.repository.byte_count,
+                prerequisite_sha: snapshot.repository.prerequisite_sha.clone(), shallow: snapshot.repository.shallow,
+            }) });
         }
         Ok(remote_cwd)
     }
@@ -1898,11 +1945,19 @@ struct UploadGrant {
 
 const VERIFY_WORKTREE_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, posixpath, resource, shutil, signal, stat, struct, subprocess, sys, tempfile, time
 platform = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
+recovery = globals().get("CREW_ISOLATED_RECOVERY")
 destination = pathlib.Path("/workspace/crew-handoff")
 staging = pathlib.Path(sys.argv[1]).resolve(strict=True)
 expected_manifest_sha, expected_base, expected_count = sys.argv[2], sys.argv[3].lower(), int(sys.argv[4])
 expected_cwd = json.loads(sys.argv[5])
-if platform not in staging.parents or staging.relative_to(platform).as_posix() != ".scaffold/crew-handoff-staging":
+if recovery is not None:
+    namespace = recovery["namespace"]
+    if len(namespace) != 64 or any(c not in "0123456789abcdef" for c in namespace): raise SystemExit(40)
+    operation = platform / ".scaffold" / ("crew-native-" + namespace)
+    if operation != pathlib.Path(recovery["operation_root"]) or operation.resolve(strict=True) != operation or operation not in staging.parents: raise SystemExit(40)
+    if stat.S_IMODE(staging.stat().st_mode) != 0o700: raise SystemExit(40)
+    destination = platform.parent / ("crew-native-" + namespace)
+elif platform not in staging.parents or staging.relative_to(platform).as_posix() != ".scaffold/crew-handoff-staging":
     raise SystemExit(40)
 MAX_TOTAL = 256 * 1024 * 1024
 MAX_CHECKOUT_BYTES = 1024 * 1024 * 1024
@@ -1913,6 +1968,10 @@ MAX_FILES = 50000
 MAX_DIRECTORIES = 25000
 MAX_MEMORY = 512 * 1024 * 1024
 deadline = time.monotonic() + 50
+
+def repository_failure(reason):
+    print("crew_repository:" + reason, file=sys.stderr)
+    raise SystemExit(45)
 
 def sha(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
@@ -1929,7 +1988,7 @@ def safe_path(value):
     return pathlib.PurePosixPath(value)
 
 def digest_file(path, limit, contents=False):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | (getattr(os, "O_NONBLOCK", 0) if recovery is not None else 0))
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
@@ -1954,7 +2013,7 @@ def git(cwd, args, output=False):
         if sys.platform == "linux":
             resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY, MAX_MEMORY))
     with tempfile.TemporaryFile(dir=temporary) as stdout, tempfile.TemporaryFile(dir=temporary) as stderr:
-        process = subprocess.Popen(["git", "-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1", "-c", "core.preloadIndex=false", "-c", "index.threads=1", "-C", str(cwd), *args], stdout=stdout if output else subprocess.DEVNULL, stderr=stderr, env=environment, preexec_fn=limits, start_new_session=True)
+        process = subprocess.Popen(["git", "-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1", "-c", "core.preloadIndex=false", "-c", "index.threads=1", "-C", str(cwd), *args], stdout=stdout if output else subprocess.DEVNULL, stderr=stderr, env=environment, preexec_fn=limits, start_new_session=True, pass_fds=(recovery["lock_fd"],) if recovery is not None else ())
         try:
             if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
                 stderr.seek(0)
@@ -1963,7 +2022,7 @@ def git(cwd, args, output=False):
             if output:
                 stdout.seek(0)
                 result = stdout.read(32 * 1024 * 1024 + 1)
-                if len(result) > 32 * 1024 * 1024: raise SystemExit(45)
+                if len(result) > 32 * 1024 * 1024: repository_failure("git_output_bounds")
                 return result
         finally:
             # wait() already reaped completed commands; never signal a stale PGID.
@@ -1997,13 +2056,13 @@ def inspect_bundle(path):
         while True:
             line = source.readline(65537)
             header_bytes += len(line)
-            if not line or header_bytes > 65536: raise SystemExit(45)
+            if not line or header_bytes > 65536: repository_failure("bundle_header_bounds")
             if line == b"\n": break
         header = source.read(12)
-        if len(header) != 12: raise SystemExit(45)
+        if len(header) != 12: repository_failure("bundle_pack_header")
         signature, version, count = struct.unpack(">4sII", header)
         if signature != b"PACK" or version not in (2, 3) or not 0 < count <= MAX_OBJECTS:
-            raise SystemExit(45)
+            repository_failure("bundle_pack_bounds")
 
 def inspect_objects(workspace):
     # Enumerate imported objects only, not the platform's entire object store.
@@ -2017,9 +2076,9 @@ def inspect_objects(workspace):
     count, expanded = 0, 0
     for line in listing.splitlines():
         size = int(line)
-        if size < 0: raise SystemExit(45)
+        if size < 0: repository_failure("object_size_invalid")
         count += 1; expanded += size
-        if size > MAX_TOTAL or count > MAX_OBJECTS or expanded > MAX_HISTORY_BYTES: raise SystemExit(45)
+        if size > MAX_TOTAL or count > MAX_OBJECTS or expanded > MAX_HISTORY_BYTES: repository_failure("object_expansion_bounds")
     listing = git(workspace, ["ls-tree", "-r", "-t", "-l", "-z", expected_base], True)
     count, directories, expanded = 0, 0, 0
     for entry in listing.split(b"\0"):
@@ -2029,14 +2088,14 @@ def inspect_objects(workspace):
         safe_path(path.decode("utf-8"))
         if kind == b"tree" and mode == b"040000":
             directories += 1
-            if directories > MAX_DIRECTORIES: raise SystemExit(45)
+            if directories > MAX_DIRECTORIES: repository_failure("tree_directory_bounds")
             continue
         # Gitlinks cannot be reconstructed from the source repository's bundle.
-        if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"): raise SystemExit(45)
+        if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"): repository_failure("tree_entry_unsupported")
         count += 1
         size = int(size)
         expanded += size
-        if size < 0 or count > MAX_FILES or expanded > MAX_CHECKOUT_BYTES: raise SystemExit(45)
+        if size < 0 or count > MAX_FILES or expanded > MAX_CHECKOUT_BYTES: repository_failure("tree_expansion_bounds")
 
 def inspect_materialized_tree(workspace):
     count, directories, expanded = 0, 0, 0
@@ -2121,8 +2180,10 @@ try:
             info = candidate.lstat()
             if stat.S_ISDIR(info.st_mode):
                 if key not in expected_dirs: raise SystemExit(44)
+                if recovery is not None and stat.S_IMODE(info.st_mode) != 0o700: raise SystemExit(44)
             elif stat.S_ISREG(info.st_mode):
                 if key not in expected_files: raise SystemExit(44)
+                if recovery is not None and stat.S_IMODE(info.st_mode) != 0o600: raise SystemExit(44)
                 found.add(key)
             else: raise SystemExit(44)
     if found != expected_files: raise SystemExit(44)
@@ -2132,9 +2193,11 @@ try:
         if (actual_sha, count) != (entry["sha256"], entry["byteCount"]): raise SystemExit(44)
         total += count
     if total > MAX_TOTAL: raise SystemExit(44)
+    if recovery is not None and recovery.get("validate_only"):
+        raise SystemExit(0)
 
     # Platform commands are read-only; all refs and imported objects stay isolated.
-    temporary = pathlib.Path(tempfile.mkdtemp(prefix=".crew-handoff-", dir=destination.parent))
+    temporary = pathlib.Path(tempfile.mkdtemp(prefix="build-" if recovery is not None else ".crew-handoff-", dir=operation if recovery is not None else destination.parent))
     workspace = temporary / "checkout"
     workspace.mkdir()
     git(workspace, ["init", "-q", "--template=", "--object-format=" + ("sha256" if len(expected_base) == 64 else "sha1")])
@@ -2142,15 +2205,15 @@ try:
     platform_shallow = b""
     if prerequisite is not None:
         objects_path = pathlib.Path(git(platform, ["rev-parse", "--path-format=absolute", "--git-path", "objects"], True).decode("utf-8").strip()).resolve(strict=True)
-        if not objects_path.is_dir() or any(c in str(objects_path) for c in "\r\n"): raise SystemExit(45)
+        if not objects_path.is_dir() or any(c in str(objects_path) for c in "\r\n"): repository_failure("prerequisite_objects_path")
         (workspace / ".git/objects/info/alternates").write_text(str(objects_path) + "\n")
-        if git(workspace, ["cat-file", "-t", prerequisite], True).strip() != b"commit": raise SystemExit(45)
+        if git(workspace, ["cat-file", "-t", prerequisite], True).strip() != b"commit": repository_failure("prerequisite_not_commit")
         git(workspace, ["update-ref", "refs/crew-handoff/prerequisite", prerequisite])
         platform_shallow_path = pathlib.Path(git(platform, ["rev-parse", "--path-format=absolute", "--git-path", "shallow"], True).decode("utf-8").strip())
         if platform_shallow_path.exists():
             with platform_shallow_path.open("rb") as source: platform_shallow = source.read(MAX_OBJECTS * (len(expected_base) + 1) + 1)
             boundaries = platform_shallow.splitlines()
-            if len(boundaries) > MAX_OBJECTS or any(len(oid) != len(expected_base) or any(c not in b"0123456789abcdef" for c in oid) for oid in boundaries): raise SystemExit(45)
+            if len(boundaries) > MAX_OBJECTS or any(len(oid) != len(expected_base) or any(c not in b"0123456789abcdef" for c in oid) for oid in boundaries): repository_failure("prerequisite_shallow_bounds")
             shallow_path.write_bytes(platform_shallow)
     elif shallow:
         shallow_path.write_text(expected_base + "\n")
@@ -2159,7 +2222,7 @@ try:
         git(workspace, ["bundle", "verify", str(bundle)])
         git(workspace, ["bundle", "unbundle", str(bundle)])
     inspect_objects(workspace)
-    if git(workspace, ["cat-file", "-t", expected_base], True).strip() != b"commit": raise SystemExit(45)
+    if git(workspace, ["cat-file", "-t", expected_base], True).strip() != b"commit": repository_failure("base_not_commit")
     if prerequisite is not None:
         # Validate the imported graph and complete checkout tree, stopping at the
         # trusted prerequisite instead of traversing all platform history.
@@ -2171,7 +2234,7 @@ try:
             for pack in (workspace / ".git/objects/pack").glob("*.pack"):
                 git(workspace, ["index-pack", "--strict", "--verify", str(pack)])
             reachable = git(workspace, ["rev-list", "--objects", "--no-object-names", "--missing=error", expected_base], True)
-            if reachable.count(b"\n") > MAX_OBJECTS: raise SystemExit(45)
+            if reachable.count(b"\n") > MAX_OBJECTS: repository_failure("reachable_object_bounds")
         finally:
             if platform_shallow: shallow_path.write_bytes(platform_shallow)
             else: shallow_path.unlink()
@@ -2209,36 +2272,65 @@ try:
     inspect_materialized_tree(workspace)
     remote_cwd = workspace.joinpath(*cwd_parts)
     if not remote_cwd.is_dir() or remote_cwd.resolve(strict=True) != remote_cwd: raise SystemExit(49)
-    backup = temporary / "previous"
-    if destination.exists() or destination.is_symlink():
-        if destination.is_symlink() or not destination.is_dir(): raise SystemExit(49)
-        os.replace(destination, backup)
-    try: os.replace(workspace, destination)
-    except BaseException:
-        if backup.exists(): os.replace(backup, destination)
-        raise
-    published = True
-    print("verified:" + expected_manifest_sha + ":" + str(destination.joinpath(*cwd_parts)))
+    if recovery is not None:
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_dir() or destination.resolve(strict=True) != destination: raise SystemExit(49)
+            recovery["compare_tree"](workspace, destination)
+            for relative in ("config", "HEAD", "objects/info/alternates", "shallow"):
+                left, right = workspace / ".git" / relative, destination / ".git" / relative
+                if left.exists() != right.exists(): raise SystemExit(49)
+                if left.exists() and digest_file(left, MAX_TOTAL)[:3] != digest_file(right, MAX_TOTAL)[:3]: raise SystemExit(49)
+            recovery["check_metadata"](workspace / ".git", destination / ".git")
+            inspect_objects(destination)
+            if git(destination, ["rev-parse", "HEAD"], True).strip().decode("ascii") != expected_base: raise SystemExit(49)
+            if git(workspace, ["ls-files", "-v", "--stage", "-z"], True) != git(destination, ["ls-files", "-v", "--stage", "-z"], True): raise SystemExit(49)
+            if prerequisite is None: git(destination, ["fsck", "--full", "--strict"])
+        else:
+            recovery["sync_tree"](workspace)
+            recovery["publish_directory"](workspace, destination)
+        published = True
+        recovery["phase"]("repository")
+        recovery["cwd"] = str(destination.joinpath(*cwd_parts))
+    else:
+        backup = temporary / "previous"
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_dir(): raise SystemExit(49)
+            os.replace(destination, backup)
+        try: os.replace(workspace, destination)
+        except BaseException:
+            if backup.exists(): os.replace(backup, destination)
+            raise
+        published = True
+        print("verified:" + expected_manifest_sha + ":" + str(destination.joinpath(*cwd_parts)))
 except (OSError, ValueError, subprocess.SubprocessError):
     raise SystemExit(50)
 finally:
     if temporary is not None and (published or not (temporary / "previous").exists()):
         shutil.rmtree(temporary, ignore_errors=True)
-    shutil.rmtree(staging, ignore_errors=True)
+    if recovery is None: shutil.rmtree(staging, ignore_errors=True)
 "#;
 
 const VERIFY_HANDOFF_PYTHON: &str = r#"import hashlib, json, os, pathlib, shutil, stat, sys, tempfile, uuid
 probe_only = sys.argv[1] == "--probe"
 platform_root = pathlib.Path("/workspace/ashler-platform").resolve(strict=True)
+recovery = globals().get("CREW_ISOLATED_RECOVERY")
+if recovery is not None:
+    namespace = recovery["namespace"]
+    if probe_only or len(namespace) != 64 or any(c not in "0123456789abcdef" for c in namespace): raise SystemExit(20)
+    operation = platform_root / ".scaffold" / ("crew-native-" + namespace)
+    if operation != pathlib.Path(recovery["operation_root"]) or operation.resolve(strict=True) != operation: raise SystemExit(20)
 if not probe_only:
     staging_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
     workspace = platform_root
-    if workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging":
+    if (recovery is not None and operation not in staging_root.parents) or (recovery is None and (workspace not in staging_root.parents or staging_root.relative_to(workspace).as_posix() != ".scaffold/omp-handoff-staging")):
         raise SystemExit(20)
 handoff_root = pathlib.Path("/workspace/crew-handoff")
 workspace = pathlib.Path(sys.argv[7])
-if workspace != workspace.resolve(strict=not probe_only) or (not probe_only and not workspace.is_dir()) or (workspace != platform_root and workspace != handoff_root and handoff_root not in workspace.parents):
+if recovery is not None: handoff_root = platform_root if recovery["session_only"] else platform_root.parent / ("crew-native-" + namespace)
+validate_only = recovery is not None and recovery.get("validate_only")
+if workspace != workspace.resolve(strict=not probe_only and not validate_only) or (not probe_only and not validate_only and not workspace.is_dir()) or (workspace != platform_root and workspace != handoff_root and handoff_root not in workspace.parents) or (recovery is not None and workspace != handoff_root and handoff_root not in workspace.parents):
     raise SystemExit(29)
+if recovery is not None and recovery["session_only"] and workspace != platform_root: raise SystemExit(29)
 rel = pathlib.PurePosixPath(sys.argv[2])
 if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
     raise SystemExit(21)
@@ -2252,21 +2344,31 @@ if not expected_native_id or len(expected_native_id) > 128 or any(ord(c) < 32 fo
     raise SystemExit(29)
 if not expected_local_cwd or len(expected_local_cwd) > 4096 or any(ord(c) < 32 for c in expected_local_cwd):
     raise SystemExit(29)
+if recovery is not None and not 0 < expected_bytes <= 64 * 1024 * 1024: raise SystemExit(29)
+target_native_id = expected_native_id
+if recovery is not None:
+    identity = bytearray(bytes.fromhex(namespace)[:16])
+    identity[6] = (identity[6] & 15) | 128
+    identity[8] = (identity[8] & 63) | 128
+    target_native_id = str(uuid.UUID(bytes=bytes(identity)))
+    if recovery["target_native_id"] != target_native_id or target_native_id == expected_native_id: raise SystemExit(29)
 
 def file_digest(path, require_mode):
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | (getattr(os, "O_NONBLOCK", 0) if recovery is not None else 0))
     except (FileNotFoundError, OSError):
         return None
     with os.fdopen(fd, "rb") as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != require_mode:
             return None
+        if recovery is not None and (st.st_nlink != 1 or st.st_size > expected_bytes + 65536): return None
         h, count = hashlib.sha256(), 0
         while True:
             block = f.read(1024 * 1024)
             if not block: break
             count += len(block); h.update(block)
+            if recovery is not None and count > expected_bytes + 65536: return None
     return h.hexdigest(), count
 
 def exact_file(path, require_mode, digest):
@@ -2305,11 +2407,23 @@ def copy_rebound_session(source, out):
         if not isinstance(record, dict) or record.get("type") != "session": continue
         if record.get("id") != expected_native_id or record.get("cwd") != expected_local_cwd:
             raise SystemExit(29)
+        if validate_only: return
         record["cwd"] = str(workspace)
+        if recovery is not None: record["id"] = target_native_id
         for original in prefix[:-1]: out.write(original)
         out.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         if line.endswith(b"\n"): out.write(b"\n")
-        shutil.copyfileobj(source, out, length=1024 * 1024)
+        if recovery is None:
+            shutil.copyfileobj(source, out, length=1024 * 1024)
+        else:
+            copied = scanned
+            while True:
+                block = source.read(min(1024 * 1024, expected_bytes - copied + 1))
+                if not block: break
+                copied += len(block)
+                if copied > expected_bytes: raise SystemExit(29)
+                out.write(block)
+            if copied != expected_bytes: raise SystemExit(29)
         return
     raise SystemExit(29)
 
@@ -2349,7 +2463,8 @@ def secure_dirs(root, parts):
             st = candidate.lstat()
             if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
                 raise SystemExit(25)
-            os.chmod(candidate, 0o700, follow_symlinks=False)
+            if recovery is None or (not recovery["session_only"] and current != root):
+                os.chmod(candidate, 0o700, follow_symlinks=False)
         current = candidate
     return current
 
@@ -2363,7 +2478,10 @@ try:
             raise SystemExit(22)
         if not exact_file(staged, 0o600, expected_digest):
             raise SystemExit(22)
-
+        if validate_only:
+            with staged.open("rb") as source:
+                copy_rebound_session(source, None)
+            raise SystemExit(0)
     runtime_value = os.environ.get("SCAFFOLD_RUNTIME_DIR", "")
     runtime_input = pathlib.Path(runtime_value)
     if not runtime_value or not runtime_input.is_absolute():
@@ -2395,14 +2513,7 @@ try:
     agent_dir = models_path.parent
     if tuple(agent_dir.parts[-4:]) != (".omp", "profiles", "scaffold-host", "agent") or not exact_dir(agent_dir):
         raise SystemExit(28)
-    if probe_only:
-        parent = agent_dir / "sessions" / omp_session_dir_name(workspace)
-        for directory in (parent.parent, parent):
-            if directory.is_symlink() or (directory.exists() and not exact_dir(directory)):
-                raise SystemExit(25)
-        target = parent / rel.name
-        if target.exists() or target.is_symlink():
-            print("present"); raise SystemExit(0)
+    def native_identity_present(exclude=None):
         roots = [agent_dir / "sessions"]
         home_root = pathlib.Path.home().resolve(strict=True) / os.environ.get("PI_CONFIG_DIR", ".omp") / "profiles/scaffold-host/agent/sessions"
         if home_root not in roots: roots.append(home_root)
@@ -2428,6 +2539,7 @@ try:
                         pending.append(pathlib.Path(entry.path)); continue
                     if not stat.S_ISREG(mode): raise SystemExit(25)
                     if not entry.name.endswith(".jsonl"): continue
+                    if exclude is not None and pathlib.Path(entry.path) == exclude: continue
                     fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                     with os.fdopen(fd, "rb") as journal:
                         if not stat.S_ISREG(os.fstat(journal.fileno()).st_mode): raise SystemExit(25)
@@ -2442,17 +2554,29 @@ try:
                             if isinstance(record, dict) and record.get("type") == "session":
                                 native_id = record.get("id")
                                 if not isinstance(native_id, str) or not native_id: raise SystemExit(25)
-                                if native_id == expected_native_id:
-                                    print("present"); raise SystemExit(0)
+                                if native_id == target_native_id: return True
                                 identified = True; break
                         if not identified: raise SystemExit(25)
+        return False
+    if probe_only:
+        parent = agent_dir / "sessions" / omp_session_dir_name(workspace)
+        for directory in (parent.parent, parent):
+            if directory.is_symlink() or (directory.exists() and not exact_dir(directory)):
+                raise SystemExit(25)
+        target = parent / rel.name
+        if target.exists() or target.is_symlink() or native_identity_present():
+            print("present"); raise SystemExit(0)
         print("absent"); raise SystemExit(0)
-    os.chmod(agent_dir, 0o700, follow_symlinks=False)
+    if recovery is None: os.chmod(agent_dir, 0o700, follow_symlinks=False)
 
 
     parent = secure_dirs(agent_dir, ("sessions", omp_session_dir_name(workspace)))
-    target = parent / rel.name
-    temporary = parent / (".comet-handoff-" + uuid.uuid4().hex)
+    target = parent / (("recovered-" + namespace + ".jsonl") if recovery is not None else rel.name)
+    if recovery is not None:
+        if not recovery["session_only"] and omp_session_dir_name(workspace) in (omp_session_dir_name(platform_root), omp_session_dir_name(pathlib.Path("/workspace/crew-handoff"))): raise SystemExit(25)
+        if parent.resolve(strict=True) != parent or not target.is_absolute(): raise SystemExit(25)
+    temporary = parent / ((".crew-native-" + namespace + "-") if recovery is not None else ".comet-handoff-")
+    temporary = temporary.with_name(temporary.name + uuid.uuid4().hex)
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         with os.fdopen(fd, "wb") as out, staged.open("rb") as source:
@@ -2461,14 +2585,22 @@ try:
         os.chmod(temporary, 0o600, follow_symlinks=False)
         rebound_digest = file_digest(temporary, 0o600)
         if rebound_digest is None: raise SystemExit(27)
+        if recovery is not None:
+            excluded = None
+            if target.exists() or target.is_symlink():
+                if target.is_symlink() or not exact_file(target, 0o600, rebound_digest): raise SystemExit(26)
+                excluded = target
+            if native_identity_present(excluded): raise SystemExit(26)
         if target.exists() or target.is_symlink():
             if target.is_symlink(): raise SystemExit(26)
-            if exact_file(target, 0o600, expected_digest):
+            if recovery is None and exact_file(target, 0o600, expected_digest):
                 os.replace(temporary, target)
             elif not exact_file(target, 0o600, rebound_digest):
                 raise SystemExit(26)
         else:
-            try: os.link(temporary, target, follow_symlinks=False)
+            try:
+                if recovery is not None: recovery["publish_directory"](temporary, target)
+                else: os.link(temporary, target, follow_symlinks=False)
             except FileExistsError:
                 if target.is_symlink() or not exact_file(target, 0o600, rebound_digest):
                     raise SystemExit(26)
@@ -2476,9 +2608,16 @@ try:
     finally:
         try: temporary.unlink()
         except FileNotFoundError: pass
-    print("verified")
+    if recovery is not None:
+        directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+        recovery["launch_selector"] = str(target)
+        recovery["rebound_sha256"], recovery["rebound_bytes"] = rebound_digest
+        recovery["phase"]("native")
+    else: print("verified")
 finally:
-    if not probe_only:
+    if not probe_only and recovery is None:
         try: staged.unlink()
         except FileNotFoundError: pass
 "#;
@@ -5363,6 +5502,7 @@ mod tests {
         let snapshot = crate::worktree_handoff::capture_worktree_handoff(repo.path()).unwrap();
         let mut expected_archive = Vec::new();
         std::io::Read::read_to_end(&mut snapshot.reopen().unwrap(), &mut expected_archive).unwrap();
+        for failure in [false, true] {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -5387,8 +5527,11 @@ mod tests {
             .to_string(),
             "{}".to_string(),
             "{}".to_string(),
-            serde_json::json!({"ok": true, "exitCode": 0, "stdout": verified_stdout})
-                .to_string(),
+            if failure {
+                serde_json::json!({"ok":false,"exitCode":45,"stderr":format!("crew_repository:tree_entry_unsupported\n{}", "λ".repeat(4096))}).to_string()
+            } else {
+                serde_json::json!({"ok": true, "exitCode": 0, "stdout": verified_stdout}).to_string()
+            },
             r#"{"ok":true,"exitCode":0}"#.to_string(),
         ];
         let captured = tokio::spawn(async move {
@@ -5465,15 +5608,28 @@ mod tests {
             Arc::new(StaticToken("scaffold_control_secret".into())),
         )
         .unwrap();
-        client
+        let result = client
             .handoff_worktree(
                 "sandbox-a",
                 &snapshot,
                 SCAFFOLD_HANDOFF_CWD.to_string(),
                 &CancellationToken::new(),
             )
-            .await
-            .unwrap();
+            .await;
+        if failure {
+            let ScaffoldError::RepositoryImport { stage, diagnostic } = result.unwrap_err() else { panic!("repository diagnostic lost") };
+            assert_eq!(stage, "source_import_repository");
+            assert_eq!(diagnostic.sandbox_id, "sandbox-a");
+            assert_eq!(diagnostic.exit_code, Some(45));
+            assert_eq!(diagnostic.manifest_sha256, snapshot.manifest_sha256);
+            assert_eq!(diagnostic.base_sha, snapshot.base_sha);
+            assert_eq!(diagnostic.archive_bytes, snapshot.byte_count);
+            assert_eq!(diagnostic.bundle_sha256, snapshot.repository.sha256);
+            assert_eq!(diagnostic.bundle_bytes, snapshot.repository.byte_count);
+            assert!(diagnostic.stderr.starts_with("crew_repository:tree_entry_unsupported\n"));
+            assert!(diagnostic.stderr.len() <= 2048);
+            assert!(!diagnostic.stderr.contains("worktree_upload_secret"));
+        } else { result.unwrap(); }
 
         let requests = captured.await.unwrap();
         let upload_header_end = requests[2]
@@ -5485,6 +5641,7 @@ mod tests {
         assert!(verify.contains(&snapshot.manifest_sha256));
         assert!(verify.contains(&snapshot.base_sha));
         assert!(!verify.contains("worktree_upload_secret"));
+        }
     }
 
     #[cfg(unix)]
@@ -5710,6 +5867,7 @@ mod tests {
             "delta",
             "equal",
             "shallow_platform",
+            "nonshallow_promisor_shallow_platform",
             "missing_prerequisite",
             "unrelated_prerequisite",
             "invalid_prerequisite",
@@ -5743,9 +5901,15 @@ mod tests {
             git(&source, &["config", "user.email", "crew@example.com"]);
             git(&source, &["config", "user.name", "Crew"]);
             std::fs::write(source.join("history"), vec![b'x'; 600 * 1024]).unwrap();
+            if scenario == "nonshallow_promisor_shallow_platform" {
+                std::fs::write(source.join("restored.txt"), vec![b'r'; 8192]).unwrap();
+            }
             git(&source, &["add", "."]);
             git(&source, &["commit", "-qm", "large historical object"]);
             std::fs::remove_file(source.join("history")).unwrap();
+            if scenario == "nonshallow_promisor_shallow_platform" {
+                std::fs::remove_file(source.join("restored.txt")).unwrap();
+            }
             std::fs::write(source.join("tracked.txt"), "base\n").unwrap();
             std::fs::write(source.join("deleted.txt"), "delete\n").unwrap();
             git(&source, &["add", "-A"]);
@@ -5754,7 +5918,7 @@ mod tests {
                 .unwrap()
                 .trim()
                 .to_string();
-            if scenario == "shallow_platform" {
+            if matches!(scenario, "shallow_platform" | "nonshallow_promisor_shallow_platform") {
                 git(
                     &root,
                     &[
@@ -5792,20 +5956,50 @@ mod tests {
             std::fs::write(platform.join("platform.txt"), "platform dirty\n").unwrap();
             if !matches!(scenario, "equal" | "zero_wrong_prerequisite") {
                 std::fs::write(source.join("committed.txt"), "source delta\n").unwrap();
+                if scenario == "nonshallow_promisor_shallow_platform" {
+                    std::fs::write(source.join("restored.txt"), vec![b'r'; 8192]).unwrap();
+                }
                 git(&source, &["add", "."]);
                 git(&source, &["commit", "-qm", "local change"]);
+            }
+            let origin = root.join("origin");
+            if scenario == "nonshallow_promisor_shallow_platform" {
+                git(&source, &["config", "uploadpack.allowFilter", "true"]);
+                std::fs::rename(&source, &origin).unwrap();
+                git(&root, &["clone", "-q", "--filter=blob:none", "--no-checkout", &format!("file://{}", origin.display()), source.to_str().unwrap()]);
+                git(&source, &["checkout", "-q", "HEAD"]);
+                assert_eq!(String::from_utf8_lossy(&git(&source, &["rev-parse", "--is-shallow-repository"])).trim(), "false");
+                assert_eq!(String::from_utf8_lossy(&git(&source, &["config", "remote.origin.promisor"])).trim(), "true");
+                assert!(git(&source, &["rev-list", "--objects", "--all", "--missing=print"]).split(|byte| *byte == b'\n').any(|line| line.starts_with(b"?")), "fixture must genuinely lack historical blobs");
             }
             std::fs::write(source.join("tracked.txt"), "overlay\n").unwrap();
             std::fs::remove_file(source.join("deleted.txt")).unwrap();
             std::fs::create_dir(source.join("nested")).unwrap();
             std::fs::write(source.join("nested/new.txt"), "untracked\n").unwrap();
             symlink("tracked.txt", source.join("tracked-link")).unwrap();
+            let source_refs = git(&source, &["show-ref"]);
+            let source_index = std::fs::read(source.join(".git/index")).unwrap();
+            let source_config = std::fs::read(source.join(".git/config")).unwrap();
+            let source_objects = git(&source, &["count-objects", "-v"]);
+            let pack_contents = || std::fs::read_dir(source.join(".git/objects/pack")).unwrap()
+                .map(|entry| { let entry = entry.unwrap(); (entry.file_name(), std::fs::read(entry.path()).unwrap()) })
+                .collect::<BTreeMap<_, _>>();
+            let source_packs = pack_contents();
             let snapshot = crate::worktree_handoff::capture_worktree_handoff_cancellable(
                 &source.join("nested"),
                 Some(&prerequisite),
                 &CancellationToken::new(),
             )
             .unwrap();
+            assert_eq!(git(&source, &["show-ref"]), source_refs);
+            assert_eq!(std::fs::read(source.join(".git/index")).unwrap(), source_index);
+            assert_eq!(std::fs::read(source.join(".git/config")).unwrap(), source_config);
+            assert_eq!(git(&source, &["count-objects", "-v"]), source_objects);
+            assert_eq!(pack_contents(), source_packs);
+            if scenario == "nonshallow_promisor_shallow_platform" {
+                // The receiver must not need either source origin at import time.
+                std::fs::rename(&origin, root.join("offline-origin")).unwrap();
+            }
             let staging = platform.join(".scaffold/crew-handoff-staging");
             std::fs::create_dir_all(&staging).unwrap();
             let archive = tempfile::NamedTempFile::new().unwrap();
@@ -5869,7 +6063,7 @@ mod tests {
                 ])
                 .output()
                 .unwrap();
-            if matches!(scenario, "delta" | "equal" | "shallow_platform") {
+            if matches!(scenario, "delta" | "equal" | "shallow_platform" | "nonshallow_promisor_shallow_platform") {
                 assert!(
                     result.status.success(),
                     "{scenario}: status={} stderr={}",
@@ -5903,6 +6097,9 @@ mod tests {
                 let history = git(&remote, &["rev-list", "--count", "HEAD"]);
                 let expected_history = if scenario == "delta" { "3" } else { "2" };
                 assert_eq!(String::from_utf8_lossy(&history).trim(), expected_history);
+                if scenario == "nonshallow_promisor_shallow_platform" {
+                    assert_eq!(std::fs::read(remote.join("restored.txt")).unwrap(), vec![b'r'; 8192]);
+                }
             } else {
                 let expected_code =
                     if matches!(scenario, "missing_prerequisite" | "unrelated_prerequisite") {
@@ -6230,6 +6427,17 @@ mod tests {
                 "{scenario} must fail at the safety bound before publication: {}",
                 String::from_utf8_lossy(&result.stderr)
             );
+            if result.status.code() == Some(45) {
+                let reason = match scenario {
+                    "object_count" => "bundle_pack_bounds",
+                    "object_expansion" | "import_expansion" => "object_expansion_bounds",
+                    "tree_expansion" | "committed_file_over_limit" => "tree_expansion_bounds",
+                    "committed_directory_over_limit" => "tree_directory_bounds",
+                    _ => panic!("missing diagnostic expectation for {scenario}"),
+                };
+                assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), format!("crew_repository:{reason}"));
+                assert!(result.stderr.len() <= 2048);
+            }
             assert_eq!(
                 std::fs::read(platform.join("sentinel")).unwrap(),
                 b"platform\n"
@@ -6272,6 +6480,230 @@ mod tests {
             .unwrap();
         assert!(prepare_omp_handoff_archive(artifact, &CancellationToken::new()).is_err());
     }
+    #[cfg(unix)]
+    #[test]
+    fn isolated_recovery_restarts_and_isolates_legacy_and_duplicate_native_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let script = format!("REPOSITORY_SOURCE = {}\nNATIVE_SOURCE = {}\n{}",
+            serde_json::to_string(&VERIFY_WORKTREE_HANDOFF_PYTHON.replace("/workspace/ashler-platform", root.join("ashler-platform").to_str().unwrap())).unwrap(),
+            serde_json::to_string(&VERIFY_HANDOFF_PYTHON.replace("/workspace", root.to_str().unwrap())).unwrap(),
+            include_str!("isolated_recovery.py").replace("/workspace/ashler-platform", root.join("ashler-platform").to_str().unwrap()));
+        let helper = root.join("helper.py");
+        std::fs::write(&helper, script).unwrap();
+        let fixture = r#"import hashlib, json, os, pathlib, subprocess, sys, time, uuid
+root, helper = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+platform = root / 'ashler-platform'; platform.mkdir()
+source = root / 'source'; source.mkdir()
+def git(*args):
+    return subprocess.check_output(['git', '-C', str(source), *args], stderr=subprocess.DEVNULL)
+git('init', '-q'); git('config', 'user.email', 'crew@example.com'); git('config', 'user.name', 'Crew')
+(source / 'tracked').write_text('base\n'); git('add', '.'); git('commit', '-qm', 'base')
+base = git('rev-parse', 'HEAD').decode().strip()
+operation = 'crew-handoff:original-command:isolated-recovery'
+namespace = hashlib.sha256(operation.encode()).hexdigest()
+op = platform / '.scaffold' / ('crew-native-' + namespace)
+attempt = op / 'uploads' / uuid.uuid4().hex
+repo, native = attempt / 'repository', attempt / 'native'
+repo.mkdir(parents=True); (native / 'by-cwd').mkdir(parents=True)
+git('bundle', 'create', str(repo / 'source.bundle'), 'HEAD')
+bundle = (repo / 'source.bundle').read_bytes()
+manifest = {'version':'crew.scaffold.worktree.v2','baseSha':base,'cwdRelativePath':'nested','entries':[{'path':'tracked','kind':'regular','sha256':hashlib.sha256(b'overlay\n').hexdigest(),'byteCount':8,'executable':False}], 'repository':{'path':'source.bundle','sha256':hashlib.sha256(bundle).hexdigest(),'byteCount':len(bundle)}}
+(repo / 'files').mkdir(); (repo / 'files/tracked').write_bytes(b'overlay\n')
+manifest_bytes = json.dumps(manifest).encode(); (repo / '.crew-handoff-manifest.json').write_bytes(manifest_bytes)
+journal = b'{"type":"session","version":3,"id":"native-A","cwd":"/original"}\n{"type":"message","content":[{"type":"image","data":"attachment"}]}\n'
+source_journal = journal
+def recovery_journal(operation_id):
+    identity = bytearray(hashlib.sha256(operation_id.encode()).digest()[:16])
+    identity[6] = (identity[6] & 15) | 128; identity[8] = (identity[8] & 63) | 128
+    native_id = str(uuid.UUID(bytes=bytes(identity)))
+    header, history = source_journal.split(b'\n', 1); record = json.loads(header); record['id'] = native_id
+    return native_id, json.dumps(record,separators=(',',':')).encode()+b'\n'+history
+derived_id, conflicting_journal = recovery_journal(operation)
+(native / 'by-cwd/A.jsonl').write_bytes(journal); (native / 'by-cwd/A.jsonl').chmod(0o600)
+descriptor = {'version':'crew.native-isolated-recovery.v1','provenance':'legacy-recapture','operation_id':operation,'namespace':namespace,'sandbox_id':'sandbox-a','scope':{'organizationId':'org'},'environment':{'epoch':1,'database':'local'},'source_selector':'/original/A.jsonl','source_cwd':'/original','session_only':False,'native':{'archive_sha256':'a'*64,'archive_bytes':10240,'storage_relative_path':'by-cwd/A.jsonl','sha256':hashlib.sha256(journal).hexdigest(),'byte_count':len(journal),'native_session_id':'native-A','cwd':'/original'},'repository':{'archive_sha256':'b'*64,'archive_bytes':10240,'manifest_sha256':hashlib.sha256(manifest_bytes).hexdigest(),'base_sha':base,'entry_count':1,'cwd_relative_path':'nested'}}
+descriptor['target_native_id'] = derived_id
+descriptor['published_cwd'] = str(root / ('crew-native-' + namespace) / 'nested')
+descriptor_path = attempt / 'descriptor.json'; descriptor_path.write_text(json.dumps(descriptor))
+runtime = root / 'runtime'; (runtime / 'omp-inference').mkdir(parents=True)
+agent = root / 'home/.omp/profiles/scaffold-host/agent'; agent.mkdir(parents=True)
+models = agent / 'models.yml'; models.write_text('providers: {}\n'); models.chmod(0o600)
+(runtime / 'omp-inference/profile.json').write_text(json.dumps({'modelsPath':str(models)}))
+env = dict(os.environ, SCAFFOLD_RUNTIME_DIR=str(runtime), HOME=str(root / 'home'))
+env.pop('XDG_DATA_HOME', None); env.pop('PI_CONFIG_DIR', None)
+legacy = root / 'crew-handoff'; legacy.mkdir(); (legacy / 'sentinel').write_text('legacy')
+legacy_staging = platform / '.scaffold/crew-handoff-staging'; legacy_staging.mkdir()
+(legacy_staging / 'sentinel').write_text('legacy upload')
+sessions = agent / 'sessions/legacy-cwd'; sessions.mkdir(parents=True)
+(sessions / 'A.jsonl').write_bytes(source_journal); (sessions / 'A.jsonl').chmod(0o600)
+# Exercise upload API defaults; only the operation namespace may be tightened.
+for owned in (op, op / 'uploads', attempt): owned.chmod(0o755)
+descriptor_path.chmod(0o644)
+uploaded_helper = attempt / 'recovery.py'; uploaded_helper.write_text(helper.read_text()); uploaded_helper.chmod(0o644)
+legacy_modes = {path: path.stat().st_mode & 0o777 for path in (platform, platform / '.scaffold', legacy, legacy_staging, sessions)}
+# Object packs/index/logs have their own strict Git verification, not the upload cap.
+metadata_check = __import__('runpy').run_path(str(helper))['check_metadata']
+metadata_expected, metadata_actual = root / 'metadata-expected', root / 'metadata-actual'
+for git_dir in (metadata_expected, metadata_actual):
+    (git_dir / 'objects').mkdir(parents=True); (git_dir / 'logs').mkdir()
+    (git_dir / 'HEAD').write_text(base+'\n'); (git_dir / 'config').write_text('same protected config\n')
+with (metadata_actual / 'objects/large-pack').open('wb') as sparse: sparse.truncate(256*1024*1024+1)
+with (metadata_actual / 'index').open('wb') as sparse: sparse.truncate(256*1024*1024+1)
+(metadata_actual / 'logs/arbitrary').write_text('different volatile log')
+metadata_check(metadata_expected, metadata_actual)
+(metadata_actual / 'config').write_text('changed protected config\n')
+try:
+    metadata_check(metadata_expected, metadata_actual)
+except ValueError:
+    pass
+else:
+    raise AssertionError('protected Git metadata changes must still fail')
+def run(path=descriptor_path, program=helper):
+    return subprocess.run([sys.executable, str(program), str(path), str(attempt)], env=env, capture_output=True)
+destination = root / ('crew-native-' + namespace)
+destination.mkdir(); (destination / 'unverified').write_text('must remain')
+blocked = run(); assert blocked.returncode != 0
+assert (destination / 'unverified').read_text() == 'must remain'
+assert not (destination / '.git').exists()
+(destination / 'unverified').unlink(); destination.rmdir()
+# A real process exit immediately after directory publication, before phase/receipt.
+crasher = root / 'crasher.py'
+crasher.write_text('import sys, os\ndef crash(frame,event,arg):\n if event == "call" and frame.f_code.co_name == "phase" and frame.f_locals.get("value") == "repository": os._exit(77)\nsys.setprofile(crash)\n' + helper.read_text())
+crash = run(program=crasher); assert crash.returncode == 77, crash.stderr
+destination = root / ('crew-native-' + namespace)
+assert (destination / 'tracked').read_bytes() == b'overlay\n'
+assert not (op / 'receipt.json').exists()
+# A conflicting B anywhere in the native store blocks first publication.
+global_conflict = sessions / 'conflicting-B.jsonl'; global_conflict.write_bytes(conflicting_journal); global_conflict.chmod(0o600)
+assert run().returncode != 0
+assert not list((agent / 'sessions').rglob('recovered-' + namespace + '.jsonl'))
+global_conflict.unlink()
+# Continue legacy writes while exact isolated publication is adopted.
+writer = subprocess.Popen([sys.executable, '-c', 'import pathlib,sys,time\np=pathlib.Path(sys.argv[1])\nwhile True:\n p.write_text("legacy continues"); time.sleep(.005)', str(legacy / 'sentinel')])
+try:
+    # Exit after the actual native no-replace rename, before cleanup/phase/receipt.
+    native_crasher = root / 'native-crasher.py'
+    native_crasher.write_text('import sys,os\ndef crash_native(frame,event,arg):\n if event == "return" and frame.f_code.co_name == "publish_directory" and str(frame.f_locals.get("destination", "")).endswith("recovered-' + namespace + '.jsonl"): os._exit(78)\nsys.setprofile(crash_native)\n' + helper.read_text())
+    native_crash = run(program=native_crasher); assert native_crash.returncode == 78, native_crash.stderr
+    assert not (op / 'receipt.json').exists()
+    renamed_native = list((agent / 'sessions').rglob('recovered-' + namespace + '.jsonl'))
+    assert len(renamed_native) == 1 and renamed_native[0].stat().st_nlink == 1
+    first = run(); assert first.returncode == 0, first.stderr
+    receipt = json.loads(first.stdout); selector = pathlib.Path(receipt['launch_selector'])
+    assert selector.is_absolute() and selector.parent != sessions
+    imported = selector.read_bytes()
+    assert imported.split(b'\n',1)[1] == journal.split(b'\n',1)[1]
+    assert json.loads(imported.splitlines()[0])['cwd'] == str(destination / 'nested')
+    assert json.loads(imported.splitlines()[0])['id'] == derived_id
+    assert receipt['native_session_id'] == derived_id
+    assert receipt['source_native_session_id'] == 'native-A'
+    assert receipt['source_sha256'] == hashlib.sha256(source_journal).hexdigest()
+    assert receipt['rebound_sha256'] == hashlib.sha256(imported).hexdigest()
+    assert receipt['rebound_bytes'] == len(imported)
+    assert (op / 'sealed/native/by-cwd/A.jsonl').read_bytes() == source_journal
+    duplicate = sessions / 'duplicate-B.jsonl'; duplicate.write_bytes(imported); duplicate.chmod(0o600)
+    assert run().returncode != 0
+    assert selector.read_bytes() == imported
+    duplicate.unlink()
+    assert (sessions / 'A.jsonl').read_bytes() == source_journal
+    assert (legacy_staging / 'sentinel').read_text() == 'legacy upload'
+    assert (legacy / 'sentinel').exists()
+    for owned in (op, op / 'uploads', attempt, op / 'sealed'):
+        assert owned.stat().st_mode & 0o777 == 0o700, owned
+    for record in (descriptor_path, uploaded_helper, op / 'lock', op / 'descriptor.json', op / 'phase.json', op / 'receipt.json'):
+        assert record.stat().st_mode & 0o777 == 0o600, record
+    for parent, dirs, files in os.walk(op / 'sealed'):
+        assert pathlib.Path(parent).stat().st_mode & 0o777 == 0o700
+        for name in files: assert (pathlib.Path(parent) / name).stat().st_mode & 0o777 == 0o600
+    assert {path: path.stat().st_mode & 0o777 for path in legacy_modes} == legacy_modes
+    # Simulate native publication completed but final receipt write interrupted.
+    (op / 'receipt.json').unlink(); (op / 'phase.json').unlink()
+    again = run(); assert again.returncode == 0 and json.loads(again.stdout) == receipt, again.stderr
+    simultaneous = [subprocess.Popen([sys.executable,str(helper),str(descriptor_path),str(attempt)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE) for _ in range(2)]
+    for child in simultaneous:
+        stdout, stderr = child.communicate(); assert child.returncode == 0 and json.loads(stdout) == receipt, stderr
+    conflict = dict(descriptor, source_selector='/changed/A.jsonl')
+    conflicting_path = attempt / 'conflicting.json'; conflicting_path.write_text(json.dumps(conflict))
+    rejected = run(conflicting_path); assert rejected.returncode != 0
+    assert selector.read_bytes() == imported
+    # Neither receipt nor phase can authorize adopting changed actual contents.
+    (destination / 'tracked').write_text('tampered\n'); assert run().returncode != 0
+    (destination / 'tracked').write_text('overlay\n')
+    selector.write_bytes(imported + b'changed history\n'); assert run().returncode != 0
+    selector.write_bytes(imported)
+    selector.chmod(0o644); assert run().returncode != 0; selector.chmod(0o600)
+    sealed_native = op / 'sealed/native/by-cwd/A.jsonl'
+    sealed_native.write_bytes(journal + b'changed source\n'); assert run().returncode != 0
+    sealed_native.write_bytes(journal)
+    missing_native = sealed_native.with_name('saved.jsonl'); sealed_native.rename(missing_native)
+    assert run().returncode != 0
+    missing_native.rename(sealed_native)
+    # An inherited publisher FD keeps the permanent flock alive after its parent dies.
+    lock = op / 'lock'; original_inode = lock.stat().st_ino
+    tools = root / 'tools'; tools.mkdir(); marker = root / 'publisher-held'
+    real_git = __import__('shutil').which('git')
+    wrapper = tools / 'git'
+    # Inspect the inherited descriptors themselves, not Darwin's /dev/fd nodes.
+    wrapper.write_text('#!' + sys.executable + '\nimport os,pathlib,sys,time\nmarker=pathlib.Path(os.environ["LOCK_MARKER"])\nif not marker.exists():\n held=False\n target=os.stat(os.environ["LOCK_TARGET"])\n for name in os.listdir("/dev/fd"):\n  try:\n   inherited=os.fstat(int(name))\n   if (inherited.st_dev,inherited.st_ino)==(target.st_dev,target.st_ino): held=True\n  except (OSError,ValueError): pass\n marker.write_text("inherited" if held else "missing")\n release=marker.with_suffix(".release"); deadline=time.monotonic()+10\n while not release.exists() and time.monotonic()<deadline: time.sleep(.01)\nos.execv(os.environ["REAL_GIT"],[os.environ["REAL_GIT"],*sys.argv[1:]])\n')
+    wrapper.chmod(0o755)
+    wrapped_env = dict(env, PATH=str(tools)+os.pathsep+env['PATH'], LOCK_MARKER=str(marker), LOCK_TARGET=str(lock), REAL_GIT=real_git)
+    holder = subprocess.Popen([sys.executable,str(helper),str(descriptor_path),str(attempt)],env=wrapped_env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    waiting = None
+    try:
+        deadline = time.monotonic() + 10
+        while (not marker.exists() or not marker.read_text()) and time.monotonic() < deadline: time.sleep(.01)
+        assert marker.read_text() == 'inherited', 'actual Git publisher must inherit the helper lock FD'
+        holder.kill(); holder.wait()
+        waiting = subprocess.Popen([sys.executable,str(helper),str(descriptor_path),str(attempt)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        time.sleep(.1); assert waiting.poll() is None
+        marker.with_suffix('.release').write_text('release')
+        stdout,stderr = waiting.communicate(); assert waiting.returncode == 0, stderr
+        assert lock.stat().st_ino == original_inode
+    finally:
+        marker.with_suffix('.release').write_text('release')
+        for child in (holder, waiting):
+            if child is not None:
+                if child.poll() is None: child.kill()
+                child.wait()
+    # Session-only never touches Git or the published platform checkout.
+    (platform / 'platform-file').write_text('dirty platform\n')
+    only_operation = 'crew-handoff:session-only:isolated-recovery'
+    only_namespace = hashlib.sha256(only_operation.encode()).hexdigest()
+    only_attempt = platform / '.scaffold' / ('crew-native-'+only_namespace) / 'uploads' / uuid.uuid4().hex
+    (only_attempt / 'native/by-cwd').mkdir(parents=True)
+    only_id, _ = recovery_journal(only_operation)
+    (only_attempt / 'native/by-cwd/A.jsonl').write_bytes(source_journal)
+    only_descriptor = dict(descriptor, operation_id=only_operation, namespace=only_namespace, target_native_id=only_id, repository=None, session_only=True, published_cwd=str(platform))
+    only_path = only_attempt / 'descriptor.json'; only_path.write_text(json.dumps(only_descriptor))
+    only = subprocess.run([sys.executable,str(helper),str(only_path),str(only_attempt)],env=env,capture_output=True)
+    assert only.returncode == 0, only.stderr
+    only_receipt = json.loads(only.stdout); only_cwd = pathlib.Path(only_receipt['cwd'])
+    assert only_cwd == platform
+    assert (only_cwd / 'platform-file').read_text() == 'dirty platform\n'
+    only_selector = pathlib.Path(only_receipt['launch_selector'])
+    assert only_selector.name == 'recovered-' + only_namespace + '.jsonl'
+    assert only_receipt['launch_selector'] != receipt['launch_selector']
+    # The legacy writer can keep writing the original basename in the SAME cwd.
+    old_same_cwd = only_selector.with_name('A.jsonl'); old_same_cwd.write_bytes(source_journal)
+    only_writer = subprocess.Popen([sys.executable,'-c','import pathlib,sys,time\np=pathlib.Path(sys.argv[1])\nwith p.open("ab",buffering=0) as journal:\n while True:\n  journal.write(b"{\\"type\\":\\"message\\",\\"id\\":\\"legacy-live\\"}\\n");time.sleep(.005)',str(old_same_cwd)])
+    try:
+        only_imported = only_selector.read_bytes()
+        only_again = subprocess.run([sys.executable,str(helper),str(only_path),str(only_attempt)],env=env,capture_output=True)
+        assert only_again.returncode == 0 and json.loads(only_again.stdout) == only_receipt, only_again.stderr
+        assert only_selector.read_bytes() == only_imported
+    finally:
+        only_writer.terminate(); only_writer.wait()
+    assert old_same_cwd.read_bytes().startswith(source_journal)
+    assert (platform / 'platform-file').read_text() == 'dirty platform\n'
+finally:
+    writer.terminate(); writer.wait()
+"#;
+        let result = std::process::Command::new("python3")
+            .args(["-c", fixture, root.to_str().unwrap(), helper.to_str().unwrap()])
+            .output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
     #[cfg(unix)]
     #[test]
     fn materializer_accepts_session_only_in_published_checkout() {

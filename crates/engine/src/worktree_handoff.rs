@@ -34,34 +34,39 @@ pub(crate) struct WorktreeHandoffArchive {
     pub base_sha: String,
     pub cwd_relative_path: String,
     pub entry_count: usize,
+    pub repository: Repository,
 }
 
 impl WorktreeHandoffArchive {
     pub fn reopen(&self) -> io::Result<File> {
         self.file.reopen()
     }
+
+    pub(crate) fn into_file(self) -> NamedTempFile {
+        self.file
+    }
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Manifest {
+struct Manifest<'a> {
     version: &'static str,
     base_sha: String,
     cwd_relative_path: String,
-    repository: Repository,
+    repository: &'a Repository,
     entries: Vec<ManifestEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Repository {
+pub(crate) struct Repository {
     path: &'static str,
-    sha256: String,
-    byte_count: u64,
+    pub sha256: String,
+    pub byte_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prerequisite_sha: Option<String>,
+    pub prerequisite_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    shallow: Option<bool>,
+    pub shallow: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -238,7 +243,7 @@ pub(crate) fn capture_worktree_handoff_cancellable(
         version: "crew.scaffold.worktree.v2",
         base_sha: base_sha.clone(),
         cwd_relative_path: cwd_relative_path.clone(),
-        repository,
+        repository: &repository,
         entries,
     })
     .map_err(|error| invalid(&format!("Could not encode worktree manifest: {error}")))?;
@@ -260,6 +265,7 @@ pub(crate) fn capture_worktree_handoff_cancellable(
         base_sha,
         cwd_relative_path,
         entry_count,
+        repository,
     })
 }
 

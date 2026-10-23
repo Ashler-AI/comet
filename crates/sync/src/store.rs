@@ -752,6 +752,30 @@ impl DocsStore {
         })
     }
 
+    /// Discover pending and completed handoff roots and children without loading
+    /// their payloads. Pages are key-ordered and exclusive of `after`, with at
+    /// most 64 keys of at most 1 KiB each; malformed keys fail the entire page.
+    pub fn crew_handoff_command_ids(&self, after: &str, limit: usize) -> Result<Vec<String>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT command_id FROM crew_commands WHERE command_id GLOB 'crew-handoff:*' AND command_id>?1 ORDER BY command_id LIMIT ?2")?;
+            let mut rows = stmt.query(params![after, limit.clamp(1, 64) as i64])?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                let rusqlite::types::ValueRef::Text(id) = row.get_ref(0)? else {
+                    return Err(StoreError::CommandConflict("invalid handoff command ID".into()));
+                };
+                if id.len() > 1024 {
+                    return Err(StoreError::CommandConflict("handoff command ID exceeds 1024 bytes".into()));
+                }
+                let id = std::str::from_utf8(id)
+                    .map_err(|_| StoreError::CommandConflict("invalid UTF-8 handoff command ID".into()))?;
+                ids.push(id.to_owned());
+            }
+            Ok(ids)
+        })
+    }
+
     pub fn pending_crew_commands(&self, after: &str, limit: usize) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
         store_blocking(|| {
             let conn = self.conn();
