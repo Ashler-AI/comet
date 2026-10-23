@@ -1,4 +1,4 @@
-import { bearerFromRequest, credentialTransportAllowed, type Verified } from "./auth";
+import { bearerFromRequest, credentialTransportAllowed, requiredCapabilities, verifyScaffoldSessionResult, type ScaffoldAuthEnv, type ScaffoldAuthenticationResult, type Verified } from "./auth";
 import { AUTH_USER_HEADER, type Env } from "./env";
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -51,6 +51,46 @@ const hash = async (value: string): Promise<string> => {
     .replaceAll("=", "");
 };
 
+/** A separate name space from the hexadecimal device-grant IDs; no token is stored. */
+export const scaffoldVerificationName = async (env: ScaffoldAuthEnv, token: string): Promise<string> =>
+  `scaffold-verification:${await hash(JSON.stringify([
+    token, env.SCAFFOLD_CONTROL_PLANE_URL, env.SCAFFOLD_PROJECT_SCOPE,
+    [...requiredCapabilities(env)].sort(), env.ENVIRONMENT, env.SCAFFOLD_DEPLOYMENT_ID
+  ]))}`;
+
+export const verifyScaffoldThroughCoordinator = async (
+  env: ScaffoldAuthEnv, token: string
+): Promise<ScaffoldAuthenticationResult> => {
+  try {
+    const name = await scaffoldVerificationName(env, token);
+    const response = await env.AUTH_GRANTS.get(env.AUTH_GRANTS.idFromName(name)).fetch("https://grant.internal/verify-scaffold", {
+      method: "POST", body: JSON.stringify({ token })
+    });
+    if (!response.ok) return { status: "unavailable" };
+    const result = await bodyJson<ScaffoldAuthenticationResult>(response);
+    if (result?.status === "invalid") return { status: "invalid" };
+    if (result?.status === "unavailable") {
+      return typeof result.retryAfter === "string" ? { status: "unavailable", retryAfter: result.retryAfter } : { status: "unavailable" };
+    }
+    if (result?.status === "authenticated") {
+      const identity = result.identity;
+      if (
+        identity?.credential === "scaffold" &&
+        typeof identity.userId === "string" && identity.userId.length > 0 &&
+        typeof identity.email === "string" && identity.email.length > 0 &&
+        identity.projectScope === env.SCAFFOLD_PROJECT_SCOPE.trim() &&
+        identity.orgId === identity.projectScope &&
+        Array.isArray(identity.capabilities) &&
+        identity.capabilities.every((value) => typeof value === "string") &&
+        requiredCapabilities(env).every((value) => identity.capabilities.includes(value))
+      ) return { status: "authenticated", identity };
+    }
+  } catch {
+    // A failed binding or malformed coordinator result never bypasses the authority.
+  }
+  return { status: "unavailable" };
+};
+
 export const parseGrantToken = (
   value: string,
   prefix: "cg1" | "cs1"
@@ -64,12 +104,57 @@ export const parseGrantToken = (
 const grantStub = (env: Env, id: string): DurableObjectStub =>
   env.AUTH_GRANTS.get(env.AUTH_GRANTS.idFromName(id));
 
-/** One DO per grant keeps exchange atomic and makes unknown/revoked grants deny. */
+/** Grant storage stays atomic; prefixed verification coordinators retain only pending work/cooldown. */
 export class AuthGrant implements DurableObject {
-  constructor(private readonly ctx: DurableObjectState, _env: Env) {}
+  private verification?: Promise<ScaffoldAuthenticationResult>;
+  private unavailableUntil = 0;
+  private unavailableRetryAfter?: string;
+
+  constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {}
 
   async fetch(request: Request): Promise<Response> {
+    // Do not hold the storage gate here: other isolates must join pending verification.
+    if (new URL(request.url).pathname === "/verify-scaffold") {
+      if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+      const body = await bodyJson<{ token?: unknown }>(request);
+      if (typeof body?.token !== "string" || !body.token.startsWith("sc_rc_")) return json({ status: "invalid" });
+      const name = await scaffoldVerificationName(this.env, body.token);
+      if (this.ctx.id.toString() !== this.env.AUTH_GRANTS.idFromName(name).toString()) {
+        return json({ status: "unavailable" });
+      }
+      return json(await this.verify(body.token));
+    }
     return this.ctx.blockConcurrencyWhile(() => this.handle(request));
+  }
+
+  private async verify(token: string): Promise<ScaffoldAuthenticationResult> {
+    if (this.unavailableUntil > Date.now()) {
+      return { status: "unavailable", retryAfter: this.unavailableRetryAfter ?? String(Math.ceil((this.unavailableUntil - Date.now()) / 1000)) };
+    }
+    if (!this.verification) {
+      this.verification = (async (): Promise<ScaffoldAuthenticationResult> => {
+        // A rendezvous, not an authorization TTL: each new batch checks fresh revocation.
+        await new Promise<void>((resolve) => setTimeout(resolve, 200));
+        let result: ScaffoldAuthenticationResult;
+        try {
+          result = await verifyScaffoldSessionResult(this.env, token);
+        } catch {
+          result = { status: "unavailable" };
+        }
+        if (result.status === "unavailable") {
+          const now = Date.now();
+          const value = result.retryAfter?.trim();
+          const numeric = value !== undefined && /^\d+$/.test(value);
+          const deadline = numeric ? now + Number(value) * 1000 : value ? Date.parse(value) : NaN;
+          // Unrepresentable valid delays must not become an early retry or an invalid Infinity header.
+          this.unavailableUntil = numeric && !Number.isSafeInteger(deadline) ? Infinity
+            : Number.isFinite(deadline) ? Math.max(now, deadline) : now + 1000;
+          this.unavailableRetryAfter = this.unavailableUntil === Infinity ? value : undefined;
+        }
+        return result;
+      })().finally(() => { this.verification = undefined; });
+    }
+    return this.verification;
   }
 
   private async handle(request: Request): Promise<Response> {

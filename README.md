@@ -45,6 +45,12 @@ zeron daemon start
 
 Devices signed in to the same account can read and write each other's workspace files, so only sign in devices you trust. Existing local sessions are never uploaded.
 
+## Crew Canary authentication
+
+Crew Canary groups pending HTTP and WebSocket authorization checks by credential and deployment in the existing `AUTH_GRANTS` namespace. Each 200 ms rendezvous performs a fresh control-plane check; successful authorization is never cached between batches.
+
+Temporary authority failures share a fail-closed cooldown and preserve `Retry-After`. This does not change verification quotas, credentials, account routing, or device-grant storage.
+
 ## Sponsors
 
 Thank you to [The Context Company](https://www.thecontextcompany.com/) for sponsoring Zeron. You can help fund Zeron's development too by [becoming a sponsor on GitHub](https://github.com/sponsors/zeronsh).

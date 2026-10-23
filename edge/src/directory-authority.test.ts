@@ -2,14 +2,34 @@ import { afterEach, expect, it, vi } from "vitest";
 import worker from "./index";
 import { AUTH_USER_HEADER, type Env } from "./env";
 import { requestAuthority } from "./authority";
+import { AuthGrant } from "./auth-routes";
 
 const session = "01956000-0000-7000-8000-000000000001";
-const env = {
-  AUTH_MODE: "scaffold", ENVIRONMENT: "crew-upstream-canary",
-  SCAFFOLD_PROJECT_SCOPE: "canary", SCAFFOLD_DEPLOYMENT_ID: "canary",
-  SCAFFOLD_CONTROL_PLANE_URL: "https://scaffold.example",
-  SCAFFOLD_REQUIRED_CAPABILITIES: "session.read",
-} as Env;
+const authorityEnv = (): Env => {
+  const grants = new Map<string, AuthGrant>();
+  const env = {
+    AUTH_MODE: "scaffold", ENVIRONMENT: "crew-upstream-canary",
+    SCAFFOLD_PROJECT_SCOPE: "canary", SCAFFOLD_DEPLOYMENT_ID: "canary",
+    SCAFFOLD_CONTROL_PLANE_URL: "https://scaffold.example",
+    SCAFFOLD_REQUIRED_CAPABILITIES: "session.read",
+  } as Env;
+  env.AUTH_GRANTS = {
+    idFromName: (name: string) => name,
+    get: (id: string) => {
+      let grant = grants.get(id);
+      if (!grant) {
+        grant = new AuthGrant({
+          id,
+          storage: { get: vi.fn(), put: vi.fn() },
+          blockConcurrencyWhile: () => { throw new Error("verification must not enter grant storage"); }
+        } as unknown as DurableObjectState, env);
+        grants.set(id, grant);
+      }
+      return { fetch: (input: string | Request, init?: RequestInit) => grant!.fetch(input instanceof Request ? input : new Request(input, init)) };
+    }
+  } as unknown as DurableObjectNamespace;
+  return env;
+};
 afterEach(() => vi.unstubAllGlobals());
 
 it("reads existing chat2 ownership, strips forged claims, and fails closed", async () => {
@@ -24,7 +44,7 @@ it("reads existing chat2 ownership, strips forged claims, and fails closed", asy
     return Response.json({ ownsSession: true });
   });
   const idFromName = vi.fn((name: string) => name);
-  const config = { ...env, CHAT_ROOMS: { idFromName, get: () => ({ fetch: roomFetch }) } } as unknown as Env;
+  const config = { ...authorityEnv(), CHAT_ROOMS: { idFromName, get: () => ({ fetch: roomFetch }) } } as unknown as Env;
   const request = (suffix = "?deploymentId=canary", method = "GET") => new Request(
     `https://edge.example/session/${session}/directory-authority${suffix}`, {
       method, headers: { authorization: "Bearer sc_rc_test", [AUTH_USER_HEADER]: "attacker", "x-crew-authority": "forged" },
@@ -55,7 +75,7 @@ it.each([429, 503, 401, 403])("preserves the auth HTTP contract for upstream %s 
     vi.stubGlobal("fetch", fetcher);
     const response = await worker.fetch(new Request("https://edge.example/auth/session", {
       headers: { authorization: "Bearer sc_rc_test" },
-    }), env);
+    }), authorityEnv());
     const rejected = status === 401 || status === 403;
     expect(response.status).toBe(rejected ? 401 : 503);
     expect(await response.json()).toEqual({ error: rejected ? "unauthenticated" : "authority_unavailable" });

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticateResult, type Verified } from "./auth";
 import { AuthGrant, authenticateDeviceToken, handleAuthenticatedAuthRoute, handlePublicAuthRoute } from "./auth-routes";
 import { authorizeRoute, requestAuthority, scopedRpcAllowed, socketAuthorized, sendAuthorized, stampRpcAuthority, trustedRequest } from "./authority";
@@ -6,7 +6,29 @@ import type { Env } from "./env";
 
 const identity: Verified = { userId: "owner@example.com", email: "owner@example.com", projectScope: "ashler", orgId: "ashler", deploymentId: "staging", capabilities: ["session.read", "session.chat", "session.control", "session.environment", "session.sync.write"], credential: "scaffold" };
 const device: Verified = { ...identity, orgId: undefined, credential: "device", sessionId: "session-a", targetDeviceId: "device-a", capabilities: ["session.read", "session.chat"] };
-const config = { AUTH_MODE: "scaffold", ENVIRONMENT: "crew-upstream-canary", SCAFFOLD_PROJECT_SCOPE: "ashler", SCAFFOLD_DEPLOYMENT_ID: "staging", SCAFFOLD_CONTROL_PLANE_URL: "https://scaffold.example", SCAFFOLD_REQUIRED_CAPABILITIES: "session.read" };
+const baseConfig = { AUTH_MODE: "scaffold", ENVIRONMENT: "crew-upstream-canary", SCAFFOLD_PROJECT_SCOPE: "ashler", SCAFFOLD_DEPLOYMENT_ID: "staging", SCAFFOLD_CONTROL_PLANE_URL: "https://scaffold.example", SCAFFOLD_REQUIRED_CAPABILITIES: "session.read" };
+const authorityEnv = (overrides: Partial<Env> = {}): Env => {
+  const grants = new Map<string, AuthGrant>();
+  const env = { ...baseConfig, ...overrides } as Env;
+  env.AUTH_GRANTS = {
+    idFromName: (name: string) => name,
+    get: (id: string) => {
+      let grant = grants.get(id);
+      if (!grant) {
+        grant = new AuthGrant({
+          id,
+          storage: { get: vi.fn(), put: vi.fn() },
+          blockConcurrencyWhile: () => { throw new Error("verification must not enter grant storage"); }
+        } as unknown as DurableObjectState, env);
+        grants.set(id, grant);
+      }
+      return { fetch: (input: string | Request, init?: RequestInit) => grant!.fetch(input instanceof Request ? input : new Request(input, init)) };
+    }
+  } as unknown as DurableObjectNamespace;
+  return env;
+};
+let config: Env;
+beforeEach(() => { config = authorityEnv(); });
 const req = (path: string, method = "GET") => new Request(`https://edge.example${path}`, { method });
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -99,6 +121,7 @@ describe("scoped transport authority", () => {
     const request = new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 503 })));
     expect((await authenticateResult(config as Env, request)).status).toBe("unavailable");
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1001);
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 401 })));
     expect((await authenticateResult(config as Env, request)).status).toBe("invalid");
     expect((await authenticateResult({ ...config, AUTH_MODE: "dev" } as Env, request)).status).toBe("unavailable");
@@ -136,24 +159,73 @@ describe("scoped transport authority", () => {
     const otherOrigin = authenticateResult({ ...config, SCAFFOLD_CONTROL_PLANE_URL: "https://other.example" } as Env, request());
     const otherProject = authenticateResult({ ...config, SCAFFOLD_PROJECT_SCOPE: "other" } as Env, request());
     const otherCapabilities = authenticateResult({ ...config, SCAFFOLD_REQUIRED_CAPABILITIES: "session.control" } as Env, request());
+    const [token, origin, project, capabilities] = await Promise.all([otherToken, otherOrigin, otherProject, otherCapabilities]);
     release();
-    const [verified, shared, decoded, token, origin, project, capabilities] = await Promise.all([
-      first, concurrent, duringDecode, otherToken, otherOrigin, otherProject, otherCapabilities
-    ]);
+    const [verified, shared, decoded] = await Promise.all([first, concurrent, duringDecode]);
     expect(verified.status).toBe("authenticated");
     expect(shared).toEqual(verified);
     expect(decoded).toEqual(verified);
     expect(token.status === "authenticated" && token.identity.userId).toBe("other@example.com");
-    expect(origin.status).toBe("authenticated");
-    expect(project.status === "authenticated" && project.identity.projectScope).toBe("other");
+    expect(origin).toEqual({ status: "unavailable" });
+    expect(project).toEqual({ status: "unavailable" });
     expect(capabilities).toEqual({ status: "unavailable" });
-    expect(fetcher).toHaveBeenCalledTimes(5);
+    expect(fetcher).toHaveBeenCalledTimes(2);
     expect(decode).toHaveBeenCalledTimes(1);
     fetcher.mockResolvedValue(new Response("", { status: 401 }));
     expect(await authenticateResult(config as Env, request())).toEqual({ status: "invalid" });
-    expect(fetcher).toHaveBeenCalledTimes(6);
+    expect(fetcher).toHaveBeenCalledTimes(3);
     expect(await authenticateResult(config as Env, request())).toEqual({ status: "invalid" });
-    expect(fetcher).toHaveBeenCalledTimes(7);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+  it.each(["2", "Thu, 22 Oct 2026 12:00:02 GMT"])("shares unavailable cooldown until Retry-After %s, not beyond it", async (retryAfter) => {
+    const start = Date.parse("2026-10-22T12:00:00Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response("", { status: 429, headers: { "retry-after": retryAfter } }))
+      .mockImplementation(async (_url: string, init: RequestInit) => new Headers(init.headers).get("authorization") === "Bearer sc_rc_other"
+        ? Response.json({ ok: true, actor: { sub: "other@example.com", auth: "iap" }, resource: config.SCAFFOLD_CONTROL_PLANE_URL, scopes: ["remote_code:read"] })
+        : new Response("", { status: 401 }));
+    vi.stubGlobal("fetch", fetcher);
+    const request = (token = "sc_rc_test") => new Request("https://edge.example/auth/session", { headers: { authorization: `Bearer ${token}` } });
+    const results = await Promise.all(Array.from({ length: 12 }, () => authenticateResult({ ...config }, request())));
+    expect(results).toEqual(Array.from({ length: 12 }, () => ({ status: "unavailable", retryAfter })));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect((await authenticateResult(config, request("sc_rc_other"))).status).toBe("authenticated");
+    clock.mockReturnValue(start + 1999);
+    expect(await authenticateResult({ ...config }, request())).toEqual({ status: "unavailable", retryAfter: "1" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    clock.mockReturnValue(start + 2000);
+    expect(await authenticateResult({ ...config }, request())).toEqual({ status: "invalid" });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+  it.each(["9007199254740992", "9".repeat(307), "9".repeat(309)])("never shortens an unrepresentable numeric Retry-After %s", async (retryAfter) => {
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    const fetcher = vi.fn().mockResolvedValue(new Response("", { status: 429, headers: { "retry-after": retryAfter } }));
+    vi.stubGlobal("fetch", fetcher);
+    const request = new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } });
+    expect(await authenticateResult(config, request)).toEqual({ status: "unavailable", retryAfter });
+    for (const now of [start + 1001, start + 86_400_000, Number.MAX_SAFE_INTEGER]) {
+      clock.mockReturnValue(now);
+      expect(await authenticateResult({ ...config }, request)).toEqual({ status: "unavailable", retryAfter });
+    }
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it("rejects mismatched deployment/config and malformed or throwing coordinator bindings without an upstream fallback", async () => {
+    const fetcher = vi.fn();
+    vi.stubGlobal("fetch", fetcher);
+    const request = new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } });
+    for (const overrides of [
+      { SCAFFOLD_DEPLOYMENT_ID: "other" }, { ENVIRONMENT: "other" },
+      { SCAFFOLD_CONTROL_PLANE_URL: "https://other.example" },
+      { SCAFFOLD_PROJECT_SCOPE: "other" }, { SCAFFOLD_REQUIRED_CAPABILITIES: "session.control" }
+    ]) expect(await authenticateResult({ ...config, ...overrides }, request)).toEqual({ status: "unavailable" });
+    for (const reply of [null, {}, { status: "authenticated" }, { status: "authenticated", identity: { ...identity, capabilities: [] } }]) {
+      const env = { ...config, AUTH_GRANTS: { idFromName: (name: string) => name, get: () => ({ fetch: async () => Response.json(reply) }) } } as unknown as Env;
+      expect(await authenticateResult(env, request)).toEqual({ status: "unavailable" });
+    }
+    const env = { ...config, AUTH_GRANTS: { idFromName: () => { throw new Error("binding unavailable"); } } } as unknown as Env;
+    expect(await authenticateResult(env, request)).toEqual({ status: "unavailable" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
   it.each([
     [429, undefined, "unavailable"],
@@ -186,6 +258,7 @@ describe("scoped transport authority", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(await authenticateResult(config as Env, request)).toEqual({ status: "unavailable" });
     expect(fetcher).toHaveBeenCalledTimes(3);
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1001);
     expect(await authenticateResult(config as Env, request)).toEqual({ status: "unavailable" });
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
@@ -195,6 +268,8 @@ describe("scoped transport authority", () => {
     else fetcher.mockResolvedValue(new Response("", { status: failure }));
     vi.stubGlobal("fetch", fetcher);
     expect(await authenticateResult(config as Env, new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } }))).toEqual({ status: "unavailable" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await authenticateResult({ ...config }, new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } }))).toEqual({ status: "unavailable", retryAfter: "1" });
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
   it("preserves backfill order with one check per batch and blocks later delivery after revocation", async () => {
