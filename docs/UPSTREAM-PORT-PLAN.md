@@ -769,3 +769,39 @@ SIGTERM during the wait exited successfully. No live provider credentials were
 used; fixture processes and data were removed. This is local startup proof,
 not a claim of deployed natural authority renewal or shared release promotion.
 
+## Private Canary authentication-lifecycle activation (October 23)
+
+Private **0.2.115** artifacts from Linux source
+`d75dd68ef95a33a7cac6f0e6ba59073449e8b6ef` passed
+[exact-source CI](https://github.com/Ashler-AI/comet/actions/runs/39999420133)
+on Linux x64, Linux ARM64 and macOS. The installed Mac and iOS builds instead
+use `ebb18f0f0b548e8e67e5313d2fdab85c5bcf3500`, preserving the newer Mac baseline
+while applying the same authentication-lifecycle changes. Delivery remains
+private/manual; no shared release channel or Scaffold image pin changed.
+
+Crew Canary, its isolated developer app, and both existing owner Devboxes run
+0.2.115. The Mac retained 83 owned chats, 94 native-history/journal prefixes,
+and all captured active worktree identities. Seven immediately active Mac
+sessions resumed on their original native histories; the three active Devbox
+sessions each received one same-history continuation, not an original-task
+replay. Models, profile/device identities, and pending durable data were retained.
+Both Mac controllers now pin the verified 0.2.115 Linux runtime artifact.
+
+The existing iPhone received **Crew Canary by Ashler 1.0 (4)** through TestFlight;
+Apple reports it installed, and the authenticated retained Sessions surface was
+verified. The existing one-tester, manual-distribution group is unchanged.
+An isolated signed simulator build also launched. The prebuilt WebRTC dSYM
+upload warning remains non-blocking.
+
+Two limits remain explicit: Benchy's old read-only staging tunnel was terminated
+with its harness process tree; its task owner restored Tilt, but not that tunnel
+at the recorded check. The archived, idle Scaffold runtime
+`rcs_45837a965d535e2024147fed` remains on 0.2.113: its live supervisor has no
+supported single-engine restart using retained device authority, and its
+one-time bootstrap was consumed. Its process, grant, device/chat identity and
+lifecycle epoch were left untouched rather than forcing a supervisor restart.
+
+A later read-only Benchy service check could not complete: Namespace exec timed
+out and SSH failed. The verified installation and native-continuation receipts
+are point-in-time evidence; current tunnel restoration is not claimed.
+
