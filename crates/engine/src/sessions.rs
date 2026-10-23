@@ -5412,6 +5412,7 @@ mod tests {
                 id: "historical".into(), issued_by: "comet-scaffold-sandbox".into(), issued_at: now_ms(),
                 payload: SessionCommandPayload::Run { request: request(), message_id: "old-message".into() },
                 based_on: None, expires_at: None, status: SessionCommandStatus::Pending, resolution: None,
+                accepted_at: None,
             };
             handle.doc().queue_command(&original).unwrap();
             if retry_first { host.retry_delivery(id).unwrap(); }

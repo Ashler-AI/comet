@@ -34,7 +34,7 @@ export async function boundedAuthJson<T>(message: Request | Response, signal: Ab
       bytes.set(value, size);
       size += value.byteLength;
     }
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size))) as T;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes.subarray(0, size))) as T;
   } catch (error) {
     cancel();
     throw error;
