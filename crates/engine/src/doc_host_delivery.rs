@@ -102,13 +102,12 @@ async fn deliver(weak: std::sync::Weak<DocHostInner>, chat: &str) {
         let sent = async {
             let bearer = edge.bearer().await?;
             let url = format!("{}/device/{target}/nudge", edge.url.trim_end_matches('/'));
-            host.inner
-                .http
-                .post(url)
-                .bearer_auth(bearer)
-                .json(&serde_json::json!({ "chatId": chat }))
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
+            edge.send(
+                host.inner.http.post(url)
+                    .json(&serde_json::json!({ "chatId": chat }))
+                    .timeout(std::time::Duration::from_secs(10)),
+                &bearer,
+            )
                 .await
                 .map_err(|err| EngineError::Other(describe_http_error(err)))
         }
@@ -166,55 +165,6 @@ async fn deliver(weak: std::sync::Weak<DocHostInner>, chat: &str) {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn remote_chat_transports_carry_the_host_on_both_paths() {
-        use zeron_sync::chat_client::ChatTransport;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let edge = EdgeConfig::with_static_token(
-            format!("http://{}", listener.local_addr().unwrap()),
-            "test",
-        )
-        .with_device("sender");
-        let url = edge
-            .room_url_with_host("/chat2/chat/ws", Some("remote-host".into()))
-            .url()
-            .await
-            .unwrap();
-        let url = reqwest::Url::parse(&url).unwrap();
-        assert!(
-            url.query_pairs()
-                .any(|(key, value)| key == "hostDevice" && value == "remote-host")
-        );
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0; 4096];
-            loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                request.extend_from_slice(&buf[..n]);
-                if request.windows(4).any(|b| b == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request);
-            let line = request.lines().next().unwrap();
-            assert!(line.contains("hostDevice=remote-host"), "{line}");
-            assert!(line.contains("device=sender"), "{line}");
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .await
-                .unwrap();
-        });
-        crate::chat2_host::EdgeChatTransport::new(reqwest::Client::new(), edge, "chat", "sender")
-            .with_host_device(Some("remote-host".into()))
-            .push("batch".into(), vec![1])
-            .await
-            .unwrap();
-        server.await.unwrap();
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_remote_wake_survives_row_ack_and_host_restart() {

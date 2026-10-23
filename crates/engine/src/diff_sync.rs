@@ -946,12 +946,8 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
                 tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (token unavailable)");
                 continue;
             };
-            let result = inner
-                .http
-                .post(&url)
-                .bearer_auth(&bearer)
-                .json(&sidecar)
-                .send()
+            let result = edge
+                .send(inner.http.post(&url).json(&sidecar), &bearer)
                 .await;
             match result {
                 Ok(response) if !response.status().is_success() => {

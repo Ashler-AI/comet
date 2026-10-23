@@ -182,7 +182,7 @@ async fn transfer(original: bool, download: bool) -> bool {
                 WsMessage::Binary,
                 decode,
             )
-            .await
+            .await;
         }
     });
     let payload = vec![42; 128 * 1024];
@@ -320,7 +320,7 @@ async fn idle_traffic(original: bool) -> (u64, u64) {
                 WsMessage::Binary,
                 |_| None,
             )
-            .await
+            .await;
         }
     });
     let server = tokio::spawn(async move {

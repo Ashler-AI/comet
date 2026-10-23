@@ -143,3 +143,23 @@ checks and applicable updates through existing idle/update locks. Explicit
 per-agent Off and `COMET_UPDATE_HARNESSES=0|false|no` remain respected. OMP uses
 its native `omp update` and `can1357/oh-my-pi` release metadata, never Pi's npm
 installer. Local typechecks are intentionally not part of this workflow.
+
+## Managed authority verification
+
+The private runtime reuses the shared desktop/mobile `ScaffoldAuth` verifier.
+User bearers verify at startup/sign-in and on generation-matched authentication
+failure, not on a freshness timer. Sign-out and profile replacement fence old
+responses. Device grants renew near their actual expiry; expired grants are never
+served after a failed renewal. Concurrent transient failures share a 1–5-second
+fallback cooldown; valid `Retry-After` dates or seconds remain an uncapped minimum.
+
+Canary Edge still validates every protected request. Equivalent concurrent
+checks share only their in-flight request and body decoding; token, control
+origin, project and required capabilities bind the key. The entry is removed
+on settlement, so the next request freshly checks revocation. It does not
+immediately retry HTTP 429 or responses carrying `Retry-After`; unavailable
+HTTP responses retain that header on the existing 503 contract. No quota or
+broker change is part of this fix. Existing profiles and independently pinned runtimes stay in
+place; verify each executable and runtime-artifact digest separately. A newer
+Mac build already carrying this verifier must not be downgraded to update an
+older Linux runtime pin.

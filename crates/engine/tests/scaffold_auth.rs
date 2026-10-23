@@ -60,13 +60,15 @@ async fn persisted_identity_is_revalidated_and_revocation_is_not_an_outage() {
     // The unbound profile above verified through a separate cold Auth instance.
     let verified_calls = calls.load(Ordering::SeqCst);
     let bound = auth.for_profile_tokens();
-    assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_test");
+    let credential = zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap();
+    assert_eq!(credential.value, "sc_rc_test");
     let tokens = futures::future::join_all((0..16).map(|_| auth.access_token())).await;
     assert!(tokens.iter().all(|token| token.as_deref() == Ok("sc_rc_test")));
     assert_eq!(calls.load(Ordering::SeqCst), verified_calls, "warm engine token reads do not reverify");
     status.store(503, Ordering::SeqCst);
-    assert_eq!(auth.access_token().await.unwrap(), "sc_rc_test", "fresh verification is reused during an outage");
     elapse(Duration::from_secs(60)).await;
+    assert_eq!(auth.access_token().await.unwrap(), "sc_rc_test", "verification is reused until explicit rejection during an outage");
+    zeron_rpc::TokenSource::invalidate(bound.as_ref(), credential.generation);
     assert!(matches!(auth.access_token().await, Err(TokenError::TemporarilyUnavailable(_))));
     assert_eq!(calls.load(Ordering::SeqCst), verified_calls + 1);
     let client = zeron_engine::scaffold::ScaffoldClient::new(&origin, "canary", bound).unwrap();
@@ -514,6 +516,10 @@ struct Authority {
     edge_status: AtomicU16,
     control_calls: AtomicUsize,
     edge_calls: AtomicUsize,
+    device_calls: AtomicUsize,
+    device_ttl_ms: AtomicUsize,
+    fixed_device_expiry: Mutex<Option<i64>>,
+    device_bearers: Mutex<Vec<String>>,
     retry_after: Mutex<String>,
     replacement_user: Mutex<&'static str>,
     hold: AtomicBool,
@@ -538,6 +544,9 @@ impl ManagedServer {
         let state = Arc::new(Authority {
             control_status: AtomicU16::new(200), edge_status: AtomicU16::new(200),
             control_calls: AtomicUsize::new(0), edge_calls: AtomicUsize::new(0),
+            device_calls: AtomicUsize::new(0), device_ttl_ms: AtomicUsize::new(3_600_000),
+            fixed_device_expiry: Mutex::new(None),
+            device_bearers: Mutex::new(Vec::new()),
             retry_after: Mutex::new(String::new()), replacement_user: Mutex::new("replacement"),
             hold: AtomicBool::new(false), entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(),
         });
@@ -586,6 +595,24 @@ impl ManagedServer {
                             code = state.edge_status.load(Ordering::SeqCst);
                             serde_json::json!({"userId":user,"email":format!("{user}@example.com"),"projectScope":"canary","credential":"scaffold","capabilities":["session.read"]})
                         }
+                        "/auth/device-grants/exchange" | "/auth/device-token/refresh" => {
+                            assert_eq!(method, "POST");
+                            if path.ends_with("/refresh") {
+                                let bearer = request.split_whitespace().find(|part| part.starts_with("cs1.")).unwrap();
+                                assert!(bearer.starts_with("cs1.0123456789abcdef0123456789abcdef."));
+                                state.device_bearers.lock().push(bearer.to_owned());
+                            }
+                            let call = state.device_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                            code = state.control_status.load(Ordering::SeqCst);
+                            if state.hold.swap(false, Ordering::SeqCst) {
+                                state.entered.notify_one();
+                                state.release.notified().await;
+                            }
+                            let fixed_expiry = *state.fixed_device_expiry.lock();
+                            let rotation = if fixed_expiry.is_some() { 1 } else { call };
+                            let expires_at = fixed_expiry.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() + state.device_ttl_ms.load(Ordering::SeqCst) as i64);
+                            serde_json::json!({"accessToken":format!("cs1.0123456789abcdef0123456789abcdef.rotation-{rotation}"),"expiresAt":expires_at,"userId":"original","email":"original@example.com","projectId":"canary","deploymentId":"deployment","sandboxId":"sandbox","targetDeviceId":"device","sessionId":"session","lifecycleEpoch":9,"capabilities":["session.read"]})
+                        }
                         "/.well-known/oauth-protected-resource" => serde_json::json!({"resource":resource,"authorization_servers":[resource],"scopes_supported":scopes}),
                         "/.well-known/oauth-authorization-server" => serde_json::json!({"issuer":resource,"authorization_endpoint":format!("{resource}/authorize"),"token_endpoint":format!("{resource}/token"),"registration_endpoint":format!("{resource}/register"),"code_challenge_methods_supported":["S256"]}),
                         "/register" => serde_json::json!({"client_id":"test-client"}),
@@ -594,7 +621,8 @@ impl ManagedServer {
                     }.to_string();
                     let retry = state.retry_after.lock().clone();
                     let header = if retry.is_empty() { String::new() } else { format!("Retry-After: {retry}\r\n") };
-                    stream.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{header}Connection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    // Timeout regressions deliberately close the client before release.
+                    let _ = stream.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{header}Connection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
                 });
             }
         });
@@ -609,6 +637,17 @@ impl ManagedServer {
         let mut config = AuthConfig::new(&self.origin, dir);
         config.scaffold = Some(ScaffoldConfig::new(&self.origin, &self.origin, "canary"));
         Auth::new(config)
+    }
+
+    async fn device_auth(&self, dir: &std::path::Path) -> Auth {
+        let mut config = AuthConfig::new(&self.origin, dir);
+        config.scaffold = Some(ScaffoldConfig::new(&self.origin, &self.origin, "canary"));
+        config.device = Some(zeron_sync::scaffold_auth::DeviceConfig {
+            join_grant: "cg1.0123456789abcdef0123456789abcdef.grant".into(),
+            device_id: "device".into(), session_id: "session".into(), deployment_id: "deployment".into(),
+            sandbox_id: "sandbox".into(), lifecycle_epoch: 9,
+        });
+        Auth::detect(config).await
     }
 
     fn calls(&self) -> (usize, usize) {
@@ -696,7 +735,7 @@ async fn managed_startup_outage_defers_the_same_synced_profile_until_background_
     assert!(Engine::resolve_profile(&config, &signed_out, WorkspaceScope::Local).unwrap().is_some());
 }
 
-async fn consumers(auth: &Auth) -> Vec<Result<String, TokenError>> {
+async fn consumers(auth: &Auth) -> Vec<Result<zeron_proto::AccessToken, TokenError>> {
     let barrier = Arc::new(tokio::sync::Barrier::new(20));
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..20 {
@@ -716,22 +755,95 @@ async fn replace_credential(auth: &Auth) {
 }
 
 #[tokio::test]
-async fn managed_concurrent_and_sequential_consumers_share_bounded_verification() {
+async fn managed_consumers_idle_past_sixty_seconds_do_not_reverify_with_refresh_loop() {
     let server = ManagedServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = server.auth(dir.path());
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert!(auth.verified_profile_key().is_none());
-    assert!(consumers(&auth).await.iter().all(|result| result.as_deref() == Ok("sc_rc_old")));
+    assert!(consumers(&auth).await.iter().all(|result| matches!(result, Ok(token) if token.value == "sc_rc_old")));
     let bound = auth.for_profile_tokens();
-    for _ in 0..20 { assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), "sc_rc_old"); }
+    let credential = zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap();
+    for _ in 0..20 { assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap(), credential); }
     assert_eq!(server.calls(), (1, 1));
-    elapse(Duration::from_secs(50)).await;
-    assert_eq!(auth.access_token().await.unwrap(), "sc_rc_old");
-    assert_eq!(server.calls(), (1, 1));
-    elapse(Duration::from_secs(10)).await;
-    assert!(consumers(&auth).await.iter().all(Result::is_ok));
+    let state_changes = auth.watch_state();
+    let token_changes = zeron_rpc::TokenSource::subscribe(bound.as_ref()).unwrap();
+    let identity = auth.state();
+    let refresh_loop = auth.spawn_refresh_loop();
+    tokio::task::yield_now().await;
+    for _ in 0..3 {
+        elapse(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(consumers(&auth).await.iter().all(|result| result.as_ref() == Ok(&credential)));
+        assert_eq!(server.calls(), (1, 1));
+        assert_eq!(auth.state(), identity);
+        assert!(!state_changes.has_changed().unwrap(), "idle auth must not signal a profile restart");
+        assert!(!token_changes.has_changed().unwrap(), "idle auth must not signal a room reconnect");
+    }
+    refresh_loop.abort();
+}
+
+#[tokio::test]
+async fn managed_concurrent_rejections_revalidate_once_and_ignore_stale_generations() {
+    let server = ManagedServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.auth(dir.path());
+    let old = auth.credential().await.unwrap();
+    let bound = auth.for_profile_tokens();
+    let changes = zeron_rpc::TokenSource::subscribe(bound.as_ref()).unwrap();
+    zeron_rpc::TokenSource::invalidate(bound.as_ref(), old.generation);
+    assert_ne!(*changes.borrow(), old.generation, "rejection immediately fences the old lease");
+    let barrier = Arc::new(tokio::sync::Barrier::new(20));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let bound = bound.clone();
+        let barrier = barrier.clone();
+        let generation = old.generation;
+        tasks.spawn(async move {
+            barrier.wait().await;
+            zeron_rpc::TokenSource::invalidate(bound.as_ref(), generation);
+            zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap()
+        });
+    }
+    let mut leases = Vec::new();
+    while let Some(result) = tasks.join_next().await { leases.push(result.unwrap()); }
+    let fresh = auth.credential().await.unwrap();
+    assert_eq!(fresh.value, old.value);
+    assert_ne!(fresh.generation, old.generation);
+    assert!(leases.iter().all(|lease| lease == &fresh));
     assert_eq!(server.calls(), (2, 2));
+    auth.invalidate(old.generation);
+    assert_eq!(auth.credential().await.unwrap(), fresh);
+    assert_eq!(server.calls(), (2, 2), "late rejection cannot invalidate the fresh lease");
+}
+
+#[tokio::test]
+async fn managed_verification_timeout_preserves_signed_identity_profile_and_session() {
+    let server = ManagedServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.auth(dir.path());
+    let credential = auth.credential().await.unwrap();
+    let identity = auth.state();
+    let profile = auth.verified_profile_key().unwrap();
+    let session = std::fs::read(dir.path().join("scaffold-session.json")).unwrap();
+    let bound = auth.for_profile_tokens();
+    server.state.hold.store(true, Ordering::SeqCst);
+    auth.invalidate(credential.generation);
+    let pending = tokio::spawn({ let bound = bound.clone(); async move { zeron_rpc::TokenSource::token(bound.as_ref()).await } });
+    server.state.entered.notified().await;
+    elapse(Duration::from_secs(16)).await;
+    let error = pending.await.unwrap().unwrap_err();
+    assert!(matches!(&error, TokenError::TemporarilyUnavailable(reason) if reason.contains("timeout")));
+    assert_eq!(auth.state(), identity);
+    assert_eq!(auth.verified_profile_key().as_deref(), Some(profile.as_str()));
+    assert_eq!(std::fs::read(dir.path().join("scaffold-session.json")).unwrap(), session);
+    assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap_err(), error);
+    assert_eq!(server.calls(), (2, 1));
+    server.state.release.notify_one();
+    elapse(Duration::from_secs(6)).await;
+    assert_eq!(zeron_rpc::TokenSource::token(bound.as_ref()).await.unwrap().value, credential.value);
+    assert_eq!(auth.verified_profile_key().as_deref(), Some(profile.as_str()));
+    assert_eq!(server.calls(), (3, 2));
 }
 
 #[tokio::test]
@@ -740,10 +852,10 @@ async fn managed_429_and_503_share_retry_after_and_resume_after_cooldown() {
         let server = ManagedServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let auth = server.auth(dir.path());
-        // One case starts unverified; the other proves expired success is not grace.
+        // One case starts unverified; the other explicitly rejects cached success.
         if edge_failure {
-            auth.access_token().await.unwrap();
-            elapse(Duration::from_secs(60)).await;
+            let credential = auth.credential().await.unwrap();
+            auth.invalidate(credential.generation);
             server.state.edge_status.store(503, Ordering::SeqCst);
             *server.state.retry_after.lock() = (chrono::Utc::now() + chrono::TimeDelta::seconds(30)).to_rfc2822();
         } else {
@@ -761,7 +873,7 @@ async fn managed_429_and_503_share_retry_after_and_resume_after_cooldown() {
         server.state.edge_status.store(200, Ordering::SeqCst);
         auth.retry_refresh(); // connectivity hints must not defeat Retry-After
         elapse(Duration::from_secs(20)).await;
-        assert_eq!(auth.access_token().await, results[0]);
+        assert_eq!(auth.credential().await, results[0]);
         assert_eq!(server.calls(), calls);
         elapse(Duration::from_secs(11)).await;
         assert!(consumers(&auth).await.iter().all(Result::is_ok));
@@ -776,8 +888,8 @@ async fn managed_signout_fences_inflight_success_and_failure() {
         let server = ManagedServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let auth = server.auth(dir.path());
-        auth.access_token().await.unwrap();
-        elapse(Duration::from_secs(60)).await;
+        let credential = auth.credential().await.unwrap();
+        auth.invalidate(credential.generation);
         server.state.control_status.store(status, Ordering::SeqCst);
         server.state.hold.store(true, Ordering::SeqCst);
         let pending = tokio::spawn({ let auth = auth.clone(); async move { auth.access_token().await } });
@@ -806,9 +918,9 @@ async fn managed_replacement_fences_old_success_rejection_and_cooldown() {
             *server.state.replacement_user.lock() = user;
             let dir = tempfile::tempdir().unwrap();
             let auth = server.auth(dir.path());
-            auth.access_token().await.unwrap();
+            let credential = auth.credential().await.unwrap();
             let bound = auth.for_profile_tokens();
-            elapse(Duration::from_secs(60)).await;
+            auth.invalidate(credential.generation);
             server.state.control_status.store(status, Ordering::SeqCst);
             server.state.hold.store(true, Ordering::SeqCst);
             let pending = auth.access_token();
@@ -826,8 +938,13 @@ async fn managed_replacement_fences_old_success_rejection_and_cooldown() {
             replace_credential(&auth).await;
             assert!(matches!(pending.await, Err(TokenError::TemporarilyUnavailable(_))));
             assert_eq!(auth.user_id().as_deref(), Some(user));
+            let fresh = auth.credential().await.unwrap();
+            let calls = server.calls();
+            zeron_rpc::TokenSource::invalidate(bound.as_ref(), credential.generation);
+            assert_eq!(auth.credential().await.unwrap(), fresh);
+            assert_eq!(server.calls(), calls, "the old profile's rejection cannot affect its replacement");
             let result = zeron_rpc::TokenSource::token(bound.as_ref()).await;
-            if user == "original" { assert_eq!(result.unwrap(), "sc_rc_new"); }
+            if user == "original" { assert_eq!(result.unwrap().value, "sc_rc_new"); }
             else { assert_eq!(result, Err(TokenError::SignedOut)); }
             elapse(Duration::from_secs(60)).await;
             assert_eq!(auth.access_token().await.unwrap(), "sc_rc_new");
@@ -856,9 +973,9 @@ async fn managed_explicit_rejection_clears_cached_authority() {
         let server = ManagedServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let auth = server.auth(dir.path());
-        auth.access_token().await.unwrap();
+        let credential = auth.credential().await.unwrap();
         let bound = auth.for_profile_tokens();
-        elapse(Duration::from_secs(60)).await;
+        auth.invalidate(credential.generation);
         if edge_failure { server.state.edge_status.store(403, Ordering::SeqCst); }
         else { server.state.control_status.store(401, Ordering::SeqCst); }
         assert!(consumers(&auth).await.iter().all(|result| *result == Err(TokenError::SignedOut)));
@@ -883,7 +1000,7 @@ async fn managed_headerless_failures_share_local_backoff() {
         let failures = consumers(&auth).await;
         assert!(matches!(&failures[0], Err(TokenError::TemporarilyUnavailable(_))));
         assert!(failures.iter().all(|failure| failure == &failures[0]));
-        assert_eq!(auth.access_token().await, failures[0]);
+        assert_eq!(auth.credential().await, failures[0]);
         assert_eq!(server.calls(), (1, 0));
         server.state.control_status.store(200, Ordering::SeqCst);
         elapse(Duration::from_secs(6)).await;
@@ -906,5 +1023,174 @@ async fn managed_replacement_clears_previous_retry_window() {
     assert_eq!(server.calls(), (2, 1));
     elapse(Duration::from_secs(60)).await;
     assert_eq!(auth.access_token().await.unwrap(), "sc_rc_new");
-    assert_eq!(server.calls(), (3, 2));
+    assert_eq!(server.calls(), (2, 1));
+}
+
+#[tokio::test]
+async fn device_expiry_slack_coalesces_concurrent_renewal() {
+    let server = ManagedServer::start().await;
+    server.state.device_ttl_ms.store(32_000, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.device_auth(dir.path()).await;
+    let initial = auth.credential().await.unwrap();
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 1, "do not renew before the thirty-second slack");
+    let renew_at = auth.device_grant_authority().unwrap().expires_at - 30_000;
+    server.state.device_ttl_ms.store(3_600_000, Ordering::SeqCst);
+    let remaining = renew_at.saturating_sub(chrono::Utc::now().timestamp_millis()).max(0) as u64;
+    tokio::time::sleep(Duration::from_millis(remaining.max(1_000) + 20)).await;
+    let leases = consumers(&auth).await;
+    let renewed = auth.credential().await.unwrap();
+    assert_ne!(initial.value, renewed.value);
+    assert_ne!(initial.generation, renewed.generation);
+    assert!(leases.iter().all(|result| result.as_ref() == Ok(&renewed)));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2);
+    auth.invalidate(initial.generation);
+    assert_eq!(auth.credential().await.unwrap(), renewed);
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn device_expired_token_is_not_served_after_failure_and_retry_after_prevents_amplification() {
+    let server = ManagedServer::start().await;
+    server.state.device_ttl_ms.store(2_000, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.device_auth(dir.path()).await;
+    let initial = auth.credential().await.unwrap();
+    let expires_at = auth.device_grant_authority().unwrap().expires_at;
+    let identity = auth.state();
+    let profile = auth.verified_profile_key().unwrap();
+    let persisted = std::fs::read(dir.path().join("scaffold-device-session.json")).unwrap();
+    server.state.control_status.store(503, Ordering::SeqCst);
+    *server.state.retry_after.lock() = "30".into();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let failures = consumers(&auth).await;
+    assert!(failures.iter().all(|result| matches!(result, Err(TokenError::TemporarilyUnavailable(_)))));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2);
+    let refresh_loop = auth.spawn_refresh_loop();
+    let remaining = expires_at.saturating_sub(chrono::Utc::now().timestamp_millis()).max(0) as u64;
+    tokio::time::sleep(Duration::from_millis(remaining + 20)).await;
+    assert!(auth.device_grant_authority().is_none(), "wall-clock expiry ends grant authority");
+    auth.retry_refresh();
+    zeron_sync::wake::notify_online();
+    assert!(consumers(&auth).await.iter().all(|result| matches!(result, Err(TokenError::TemporarilyUnavailable(_)))));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2, "expired consumers and connectivity hints share Retry-After");
+    assert_eq!(auth.state(), identity);
+    assert_eq!(auth.verified_profile_key().as_deref(), Some(profile.as_str()));
+    assert_eq!(std::fs::read(dir.path().join("scaffold-device-session.json")).unwrap(), persisted);
+    server.state.control_status.store(200, Ordering::SeqCst);
+    server.state.device_ttl_ms.store(3_600_000, Ordering::SeqCst);
+    elapse(Duration::from_secs(6)).await;
+    assert!(consumers(&auth).await.iter().all(|result| matches!(result, Err(TokenError::TemporarilyUnavailable(_)))));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2, "server Retry-After exceeds the five-second exponential-backoff cap");
+    // A late 401 for the still-current lease fences it but must not erase the
+    // server's authoritative retry window. Repeated feedback is then stale.
+    auth.invalidate(initial.generation);
+    for _ in 0..20 { auth.invalidate(initial.generation); }
+    auth.retry_refresh();
+    zeron_sync::wake::notify_online();
+    assert!(consumers(&auth).await.iter().all(|result| matches!(result, Err(TokenError::TemporarilyUnavailable(_)))));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2, "current rejection, stale feedback, and online hints cannot bypass Retry-After");
+    elapse(Duration::from_secs(14)).await;
+    assert!(consumers(&auth).await.iter().all(|result| matches!(result, Err(TokenError::TemporarilyUnavailable(_)))));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2);
+    elapse(Duration::from_secs(11)).await;
+    assert!(consumers(&auth).await.iter().all(Result::is_ok));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 3);
+    assert!(auth.device_grant_authority().is_some());
+    let fresh = auth.credential().await.unwrap();
+    auth.invalidate(initial.generation);
+    assert_eq!(auth.credential().await.unwrap(), fresh);
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 3);
+    refresh_loop.abort();
+}
+
+#[tokio::test]
+async fn device_headerless_failures_share_bounded_backoff() {
+    let server = ManagedServer::start().await;
+    server.state.device_ttl_ms.store(20_000, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.device_auth(dir.path()).await;
+    server.state.control_status.store(429, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    for (attempt, delay) in [1, 2, 4, 5, 5].into_iter().enumerate() {
+        assert!(consumers(&auth).await.iter().all(|result| matches!(result, Err(TokenError::TemporarilyUnavailable(_)))));
+        let calls = attempt + 2;
+        assert_eq!(server.state.device_calls.load(Ordering::SeqCst), calls);
+        elapse(Duration::from_millis(delay * 1_000 - 100)).await;
+        assert!(consumers(&auth).await.iter().all(|result| matches!(result, Err(TokenError::TemporarilyUnavailable(_)))));
+        assert_eq!(server.state.device_calls.load(Ordering::SeqCst), calls);
+        elapse(Duration::from_millis(400)).await; // Cross the deadline including up to 255ms jitter.
+    }
+    server.state.control_status.store(200, Ordering::SeqCst);
+    server.state.device_ttl_ms.store(3_600_000, Ordering::SeqCst);
+    assert!(consumers(&auth).await.iter().all(Result::is_ok));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 7);
+}
+
+#[tokio::test]
+async fn device_short_unchanged_reply_does_not_spin_foreground_or_background_refresh() {
+    let server = ManagedServer::start().await;
+    *server.state.fixed_device_expiry.lock() = Some(chrono::Utc::now().timestamp_millis() + 20_000);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = server.device_auth(dir.path()).await;
+    let initial = auth.credential().await.unwrap();
+    let expiry = auth.device_grant_authority().unwrap().expires_at;
+    let refresh_loop = auth.spawn_refresh_loop();
+    assert!(consumers(&auth).await.iter().all(|result| result.as_ref() == Ok(&initial)));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert!(consumers(&auth).await.iter().all(|result| matches!(result, Ok(token) if token.value == initial.value)));
+    assert_eq!(auth.device_grant_authority().unwrap().expires_at, expiry);
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(consumers(&auth).await.iter().all(Result::is_ok));
+    assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2, "unchanged near-expiry replies must not trigger an immediate retry loop");
+    refresh_loop.abort();
+}
+
+#[tokio::test]
+async fn device_inflight_rotation_survives_rejection_but_never_signout() {
+    for sign_out in [false, true] {
+        let server = ManagedServer::start().await;
+        server.state.device_ttl_ms.store(20_000, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let auth = server.device_auth(dir.path()).await;
+        let initial = auth.credential().await.unwrap();
+        let path = dir.path().join("scaffold-device-session.json");
+        server.state.device_ttl_ms.store(3_600_000, Ordering::SeqCst);
+        server.state.hold.store(true, Ordering::SeqCst);
+        // Reach ordinary near-expiry renewal without invalidating the first lease.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let pending = tokio::spawn({ let auth = auth.clone(); async move { auth.credential().await } });
+        tokio::time::timeout(Duration::from_secs(3), server.state.entered.notified()).await.unwrap();
+        assert_eq!(server.state.device_bearers.lock().as_slice(), &[initial.value.clone()]);
+        if sign_out { auth.sign_out(); }
+        else { auth.invalidate(initial.generation); }
+        server.state.release.notify_one();
+        let late = pending.await.unwrap();
+        if sign_out {
+            assert!(matches!(late, Err(TokenError::SignedOut)));
+            assert!(matches!(auth.credential().await, Err(TokenError::SignedOut)));
+            assert_eq!(auth.state(), AuthState::SignedOut);
+            assert!(auth.device_grant_authority().is_none());
+            assert!(!std::fs::read_to_string(&path).unwrap().contains("cs1."), "late rotation must not overwrite the signout tombstone");
+            assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 2);
+        } else {
+            assert!(matches!(late, Err(TokenError::TemporarilyUnavailable(_))));
+            let rotated = "cs1.0123456789abcdef0123456789abcdef.rotation-2";
+            let persisted = std::fs::read_to_string(&path).unwrap();
+            assert!(persisted.contains(rotated), "server-rotated credentials must survive rejection of the earlier lease");
+            assert!(!persisted.contains(&initial.value));
+            let fresh = auth.credential().await.unwrap();
+            assert_eq!(fresh.value, "cs1.0123456789abcdef0123456789abcdef.rotation-3");
+            assert_ne!(fresh.generation, initial.generation);
+            assert_eq!(server.state.device_bearers.lock().as_slice(), &[initial.value.clone(), rotated.to_owned()]);
+            assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 3);
+            auth.invalidate(initial.generation);
+            assert_eq!(auth.credential().await.unwrap(), fresh);
+            assert_eq!(server.state.device_calls.load(Ordering::SeqCst), 3);
+            assert!(std::fs::read_to_string(&path).unwrap().contains(&fresh.value));
+        }
+    }
 }

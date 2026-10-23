@@ -374,7 +374,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     assert!(
         matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1")
     );
-    assert!(auth.token().await.is_ok());
+    assert_eq!(auth.token().await.unwrap().value, auth.access_token().await.unwrap());
     assert_eq!(
         edge.state
             .refresh_tokens
@@ -631,6 +631,31 @@ async fn explicit_retry_allows_one_shared_attempt_before_cooldown_expires() {
 
     auth.retry_refresh();
     assert!(twenty_consumers(&auth).await.iter().all(Result::is_ok));
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rejected_workos_generation_refreshes_once_and_stale_rejection_is_ignored() {
+    let edge = StubEdge::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    let first = auth.token().await.unwrap();
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 1);
+    let changes = auth.subscribe().unwrap();
+    auth.invalidate(first.generation);
+    assert_ne!(*changes.borrow(), first.generation, "invalidate fences the rejected lease synchronously");
+    for _ in 0..20 { auth.invalidate(first.generation); }
+    assert!(twenty_consumers(&auth).await.iter().all(Result::is_ok));
+    let fresh = auth.token().await.unwrap();
+    assert_ne!(fresh.generation, first.generation);
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+    auth.invalidate(first.generation);
+    assert_eq!(auth.token().await.unwrap(), fresh);
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+    auth.sign_out();
+    auth.invalidate(fresh.generation);
+    assert!(matches!(auth.token().await, Err(TokenError::SignedOut)));
+    assert!(!dir.path().join("session.json").exists());
     assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
 }
 

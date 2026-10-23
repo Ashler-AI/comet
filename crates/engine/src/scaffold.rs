@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeron_harness::CancellationToken;
 use zeron_proto::{
-    AgentRoute, AgentRouteReceipt, CAPABILITY_SESSION_ANNOTATE,
+    AccessToken, AgentRoute, AgentRouteReceipt, CAPABILITY_SESSION_ANNOTATE,
     CAPABILITY_SESSION_CHAT, CAPABILITY_SESSION_CONTROL, CAPABILITY_SESSION_ENVIRONMENT,
     CAPABILITY_SESSION_FILES, CAPABILITY_SESSION_READ, CollaborationScope, ScaffoldControlGrant,
     ScaffoldDatabaseEnvironment, ScaffoldEnvironmentControl, ScaffoldEnvironmentControlResult,
@@ -282,13 +282,57 @@ impl ScaffoldError {
     }
 }
 
-async fn control_bearer(source: &dyn TokenSource) -> Result<String, ScaffoldError> {
+async fn control_credential(source: &dyn TokenSource) -> Result<AccessToken, ScaffoldError> {
     match source.token().await {
-        Ok(token) if !token.trim().is_empty() => Ok(token),
+        Ok(token) if !token.value.trim().is_empty() => Ok(token),
         Ok(_) | Err(zeron_rpc::TokenError::SignedOut) => Err(ScaffoldError::AuthUnavailable),
-        Err(zeron_rpc::TokenError::TemporarilyUnavailable(reason)) => Err(ScaffoldError::AuthTemporarilyUnavailable(reason)),
+        Err(zeron_rpc::TokenError::TemporarilyUnavailable(reason)) => {
+            Err(ScaffoldError::AuthTemporarilyUnavailable(reason))
+        }
     }
 }
+
+/// Report rejection before reading or flattening the response. Only the lease
+/// used for this request may be invalidated; resource-level 403s do not revoke it.
+async fn send_authenticated(
+    source: &dyn TokenSource,
+    request: reqwest::RequestBuilder,
+    cancellation: &CancellationToken,
+) -> Result<(reqwest::Response, u64), ScaffoldError> {
+    let credential = control_credential(source).await?;
+    let generation = credential.generation;
+    let send = request.bearer_auth(&credential.value).send();
+    drop(credential);
+    tokio::pin!(send);
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
+        response = &mut send => response.map_err(|error| {
+            let error = ScaffoldError::request_send_failure(error);
+            tracing::warn!(
+                transport_cause = %error.transport_cause().expect("transport error"),
+                "Scaffold request send failed"
+            );
+            error
+        })?,
+    };
+    if response.status() == StatusCode::UNAUTHORIZED {
+        source.invalidate(generation);
+    }
+    Ok((response, generation))
+}
+
+fn authenticated_error(source: &dyn TokenSource, generation: u64, error: ScaffoldError) -> ScaffoldError {
+    // These control-plane codes reject the credential itself, unlike a resource 403.
+    // The same code with 503 means authority validation is temporarily unavailable.
+    if error.api_error().is_some_and(|error| error.status == 403 && matches!(error.code.as_str(),
+        "remote_code_token_forbidden" | "crew_device_authority_unavailable" | "crew_device_scope_denied"
+    )) {
+        source.invalidate(generation);
+    }
+    error
+}
+
 
 #[derive(Clone)]
 pub struct ScaffoldClient {
@@ -432,8 +476,8 @@ impl ScaffoldClient {
         &self.project_scope
     }
 
-    pub(crate) async fn require_auth(&self) -> Result<(), ScaffoldError> {
-        control_bearer(self.bearer.as_ref()).await.map(|_| ())
+    pub(crate) async fn credential(&self) -> Result<AccessToken, ScaffoldError> {
+        control_credential(self.bearer.as_ref()).await
     }
 
     pub async fn search_crew_sessions(&self, input: &Value) -> Result<Value, ScaffoldError> {
@@ -453,13 +497,13 @@ impl ScaffoldClient {
         if body.len() > 60 * 1024 {
             return Err(ScaffoldError::InvalidResponse("directory request exceeds 60 KiB".into()));
         }
-        let bearer = control_bearer(self.bearer.as_ref()).await?;
-        let response = self.http.post(self.origin.join(&format!("/api/crew-directory/{operation}")).expect("directory API path"))
-            .bearer_auth(bearer).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send().await?;
-        Self::bounded_json(response).await
+        let request = self.http.post(self.origin.join(&format!("/api/crew-directory/{operation}")).expect("directory API path"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json").body(body);
+        let (response, generation) = send_authenticated(self.bearer.as_ref(), request, &CancellationToken::new()).await?;
+        self.bounded_json(response, generation).await
     }
 
-    async fn bounded_json(mut response: reqwest::Response) -> Result<Value, ScaffoldError> {
+    async fn bounded_json(&self, mut response: reqwest::Response, generation: u64) -> Result<Value, ScaffoldError> {
         let status = response.status();
         let retry_after = response_retry_after(&response);
         let mut body = Vec::new();
@@ -469,7 +513,9 @@ impl ScaffoldClient {
             }
             body.extend_from_slice(&chunk);
         }
-        if !status.is_success() { return Err(api_error(status, &body, retry_after)); }
+        if !status.is_success() {
+            return Err(authenticated_error(self.bearer.as_ref(), generation, api_error(status, &body, retry_after)));
+        }
         serde_json::from_slice(&body).map_err(|_| ScaffoldError::InvalidResponse("invalid JSON response".into()))
     }
 
@@ -1062,11 +1108,9 @@ impl ScaffoldClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize + ?Sized,
     {
-        let bearer = control_bearer(self.bearer.as_ref()).await?;
         let mut request = self
             .http
             .request(method, url)
-            .bearer_auth(&bearer)
             .header(reqwest::header::ACCEPT, "application/json");
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
@@ -1074,25 +1118,7 @@ impl ScaffoldClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let send = request.send();
-        tokio::pin!(send);
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-            response = &mut send => match response {
-                Ok(response) => response,
-                Err(error) => {
-                    let error = ScaffoldError::request_send_failure(error);
-                    tracing::warn!(
-                        transport_cause = %error.transport_cause().expect("transport error"),
-                        "Scaffold request send failed"
-                    );
-                    return Err(error);
-                }
-            },
-        };
-        // The bearer is dropped before any response body is retained or decoded.
-        drop(bearer);
+        let (response, generation) = send_authenticated(self.bearer.as_ref(), request, cancellation).await?;
         let status = response.status();
         let retry_after = response_retry_after(&response);
         let bytes = tokio::select! {
@@ -1101,7 +1127,7 @@ impl ScaffoldClient {
             bytes = response.bytes() => bytes?,
         };
         if !status.is_success() {
-            return Err(api_error(status, &bytes, retry_after));
+            return Err(authenticated_error(self.bearer.as_ref(), generation, api_error(status, &bytes, retry_after)));
         }
         serde_json::from_slice(&bytes)
             .map_err(|error| ScaffoldError::InvalidResponse(error.to_string()))
@@ -2553,25 +2579,22 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
             ttl_seconds: request.expires_in_seconds,
         };
 
-        let bearer = control_bearer(self.bearer.as_ref()).await?;
         let mut url = self.origin.clone();
         url.path_segments_mut()
             .expect("validated HTTP origin")
             .extend(JOIN_GRANT_PATH);
-        let send = self
+        let http_request = self
             .http
             .post(url)
-            .bearer_auth(&bearer)
             .header(reqwest::header::ACCEPT, "application/json")
-            .json(&body)
-            .send();
-        tokio::pin!(send);
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ScaffoldError::Cancelled),
-            response = &mut send => response.map_err(|_| ScaffoldError::DeviceJoinGrantUnavailable)?,
-        };
-        drop(bearer);
+            .json(&body);
+        let (response, generation) = send_authenticated(self.bearer.as_ref(), http_request, cancellation).await.map_err(|error| {
+            if matches!(error, ScaffoldError::Transport { .. }) {
+                ScaffoldError::DeviceJoinGrantUnavailable
+            } else {
+                error
+            }
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let retry_after = response_retry_after(&response);
@@ -2612,14 +2635,14 @@ impl DeviceJoinGrantProvider for EdgeDeviceJoinGrantClient {
                         })
                 })
                 .unwrap_or("device_join_grant_rejected");
-            return Err(ScaffoldError::Api(ScaffoldApiErrorDisplay(
-                ScaffoldApiError {
+            return Err(authenticated_error(self.bearer.as_ref(), generation,
+                ScaffoldError::Api(ScaffoldApiErrorDisplay(ScaffoldApiError {
                     status: status.as_u16(),
                     code: code.to_string(),
                     message: None,
                     retry_after,
-                },
-            )));
+                })),
+            ));
         }
         let response: Response = response
             .json()
@@ -4030,6 +4053,80 @@ mod tests {
             requests
         });
         (origin, task)
+    }
+
+    struct ReplacingCredential {
+        generation: std::sync::atomic::AtomicU64,
+        rejected: parking_lot::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl TokenSource for ReplacingCredential {
+        async fn token(&self) -> Result<AccessToken, zeron_rpc::TokenError> {
+            let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(AccessToken { value: format!("test-credential-{generation}"), generation })
+        }
+
+        fn invalidate(&self, generation: u64) {
+            self.rejected.lock().push(generation);
+            let _ = self.generation.compare_exchange(
+                generation, generation + 1,
+                std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_rejects_only_the_sent_credential_without_replaying() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for endpoint in ["directory", "accounts", "authority", "join-grant"] {
+            for (status, code, credential_rejected) in [
+                (401, "request_rejected", true),
+                (403, "request_rejected", false),
+                (429, "request_rejected", false),
+                (503, "request_rejected", false),
+                (403, "remote_code_token_forbidden", true),
+                (403, "crew_device_authority_unavailable", true),
+                (403, "crew_device_scope_denied", true),
+                (503, "remote_code_token_forbidden", false),
+                (503, "crew_device_authority_unavailable", false),
+                (503, "crew_device_scope_denied", false),
+                (503, "remote_code_token_validation_failed", false),
+                (503, "remote_code_token_store_unavailable", false),
+            ] {
+                for replaced in [false, true] {
+                    let source = Arc::new(ReplacingCredential {
+                        generation: AtomicU64::new(7), rejected: parking_lot::Mutex::new(Vec::new()),
+                    });
+                    let server_source = source.clone();
+                    let (origin, captured) = mock_server_for_requests(move |request, _| {
+                        assert!(request.to_ascii_lowercase().contains("authorization: bearer test-credential-7\r\n"));
+                        if replaced { server_source.generation.store(8, Ordering::SeqCst); }
+                        (MockResponse::Http { status, body: serde_json::json!({"error": code}).to_string() }, true)
+                    }).await;
+                    let client = ScaffoldClient::new(&origin, "project-a", source.clone()).unwrap();
+                    let cancellation = CancellationToken::new();
+                    let error = match endpoint {
+                        "directory" => client.get_crew_session("session", None).await.err(),
+                        "accounts" => client.list_agent_accounts().await.err(),
+                        "authority" => client.issue_agent_inference_authority(&cancellation).await.err(),
+                        _ => EdgeDeviceJoinGrantClient::new(&origin, source.clone()).unwrap().mint(
+                            &DeviceJoinGrantRequest {
+                                principal_subject: "subject".into(), scope: scope(),
+                                sandbox_id: "sandbox-a".into(), device_id: "device-a".into(),
+                                lifecycle_epoch: 1, capabilities: vec![], expires_in_seconds: 900,
+                            }, &cancellation,
+                        ).await.err(),
+                    }.expect("server rejects request");
+                    assert_eq!(error.api_error().unwrap().status, status);
+                    assert_eq!(captured.await.unwrap().len(), 1, "must not replay the request");
+                    let rejected = source.rejected.lock();
+                    assert_eq!(rejected.as_slice(), if credential_rejected { &[7][..] } else { &[][..] });
+                    assert_eq!(source.generation.load(Ordering::SeqCst),
+                        if replaced || credential_rejected { 8 } else { 7 });
+                }
+            }
+        }
     }
 
     #[tokio::test]

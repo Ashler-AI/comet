@@ -31,4 +31,4 @@ pub use registry::{
     ReconnectState, RegistryClient, RegistryEvent, RegistryTransport, RegistryTuning,
 };
 pub use store::{DocsStore, StoreError};
-pub use types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
+pub use types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlLease, UrlProvider};

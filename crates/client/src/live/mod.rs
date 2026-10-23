@@ -28,9 +28,10 @@ use futures::future::BoxFuture;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zeron_doc::{REGISTRY_DOC_ID, RegistryDoc};
+use zeron_proto::AccessToken;
 use zeron_sync::{
     DocsStore, RegistryClient, RegistryEvent, RegistryTransport, RegistryTuning, SyncError,
-    UrlProvider,
+    UrlLease, UrlProvider,
 };
 
 use crate::client::ClientInner;
@@ -73,21 +74,35 @@ pub(crate) async fn wait_backoff(cancel: &CancellationToken, wait: Duration) -> 
 pub(crate) struct Bearer(pub(crate) Weak<ClientInner>);
 
 impl Bearer {
-    pub(crate) async fn get(&self) -> std::result::Result<String, SyncError> {
+    pub(crate) async fn get(&self) -> std::result::Result<AccessToken, SyncError> {
         let Some(inner) = self.0.upgrade() else {
             return Err(SyncError::Closed);
         };
-        match inner.tokens.bearer().await {
+        match inner.tokens.credential().await {
             Ok(token) => Ok(token),
             Err(ClientError::Auth(reason)) => Err(SyncError::Auth(reason)),
             Err(err) => Err(SyncError::TemporarilyUnavailable(err.to_string())),
         }
     }
+
+    pub(crate) fn invalidate(&self, generation: u64) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.tokens.invalidate(generation);
+        }
+    }
+
+    fn check_auth(&self, status: reqwest::StatusCode, generation: u64) -> std::result::Result<(), SyncError> {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate(generation);
+            return Err(SyncError::Auth(format!("edge HTTP {status}")));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 impl zeron_rpc::TokenSource for Bearer {
-    async fn token(&self) -> std::result::Result<String, zeron_rpc::TokenError> {
+    async fn token(&self) -> std::result::Result<AccessToken, zeron_rpc::TokenError> {
         match self.get().await {
             Ok(token) => Ok(token),
             Err(SyncError::Auth(_) | SyncError::Closed) => Err(zeron_rpc::TokenError::SignedOut),
@@ -95,6 +110,10 @@ impl zeron_rpc::TokenSource for Bearer {
                 err.to_string(),
             )),
         }
+    }
+
+    fn invalidate(&self, generation: u64) {
+        Bearer::invalidate(self, generation);
     }
 }
 
@@ -106,7 +125,7 @@ struct RegistryUrl {
 }
 
 impl UrlProvider for RegistryUrl {
-    fn url(&self) -> BoxFuture<'static, std::result::Result<String, SyncError>> {
+    fn url(&self) -> BoxFuture<'static, std::result::Result<UrlLease, SyncError>> {
         let bearer = self.bearer.clone();
         let (edge, org, device) = (
             self.edge.clone(),
@@ -115,8 +134,15 @@ impl UrlProvider for RegistryUrl {
         );
         Box::pin(async move {
             let token = bearer.get().await?;
-            Ok(urls::registry_ws(&edge, &org, &token, &device))
+            Ok(UrlLease {
+                url: urls::registry_ws(&edge, &org, &token.value, &device),
+                generation: Some(token.generation),
+            })
         })
+    }
+
+    fn invalidate(&self, generation: u64) {
+        self.bearer.invalidate(generation);
     }
 }
 
@@ -140,10 +166,11 @@ impl RegistryTransport for RegistryHttp {
             let token = bearer.get().await?;
             let response = crate::auth::http()
                 .get(url)
-                .bearer_auth(token)
+                .bearer_auth(&token.value)
                 .send()
                 .await
                 .map_err(http_err)?;
+            bearer.check_auth(response.status(), token.generation)?;
             if !response.status().is_success() {
                 return Err(SyncError::Protocol(format!(
                     "registry pull http {}",
@@ -161,12 +188,13 @@ impl RegistryTransport for RegistryHttp {
             let token = bearer.get().await?;
             let response = crate::auth::http()
                 .post(url)
-                .bearer_auth(token)
+                .bearer_auth(&token.value)
                 .header("content-type", "application/json")
                 .body(body)
                 .send()
                 .await
                 .map_err(http_err)?;
+            bearer.check_auth(response.status(), token.generation)?;
             if !response.status().is_success() {
                 return Err(SyncError::Protocol(format!(
                     "registry push http {}",
