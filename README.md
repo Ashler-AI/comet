@@ -51,6 +51,10 @@ Crew Canary groups pending HTTP and WebSocket authorization checks by credential
 
 Temporary authority failures share a fail-closed cooldown and preserve `Retry-After`. This does not change verification quotas, credentials, account routing, or device-grant storage.
 
+The native directory publisher retains pending jobs but stops querying an unchanged local snapshot after a server-version rejection, including across restarts. Transcript or registry progress enables a fresh lookup; server counters never become local publication evidence. Transient failures pause the worker for at least `Retry-After`.
+
+Native inference reissues an authority at its actual expiry rather than repeatedly requesting the same still-valid grant. Renewal preserves principal and scope, remains fenced against sign-out/cancellation, and logs only authority digests, epochs, and timestamps. A short successful inference turn is not evidence of expiry or renewal.
+
 ## Sponsors
 
 Thank you to [The Context Company](https://www.thecontextcompany.com/) for sponsoring Zeron. You can help fund Zeron's development too by [becoming a sponsor on GitHub](https://github.com/sponsors/zeronsh).
