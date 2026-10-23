@@ -14020,7 +14020,7 @@ version = "0.2.115"
 
 [[package]]
 name = "zeron-visual"
-version = "0.2.114"
+version = "0.2.115"
 dependencies = [
  "base64 0.22.1",
  "gltf",
@@ -14032,7 +14032,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-visual-gpu"
-version = "0.2.114"
+version = "0.2.115"
 dependencies = [
  "image",
  "pollster 0.4.0",
@@ -14043,7 +14043,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-voice"
-version = "0.2.114"
+version = "0.2.115"
 dependencies = [
  "anyhow",
  "cpal 0.17.3",
@@ -14060,7 +14060,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-voice-media"
-version = "0.2.114"
+version = "0.2.115"
 dependencies = [
  "async-trait",
  "semver",
@@ -14075,7 +14075,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-voice-session"
-version = "0.2.114"
+version = "0.2.115"
 dependencies = [
  "async-trait",
  "futures",
