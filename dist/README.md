@@ -201,6 +201,18 @@ without rebuilding or re-signing. Provenance, source ancestry, checksums and bot
 signed macOS variants must pass verification again. No production action is
 authorized by this staging cutover.
 
+The compatibility baseline is the moving `scaffold-manifest.json`, not the last
+versioned candidate or the checked-in runtime marker. A moving v1 channel still
+requires `staging-deployed` before promotion of verified v2 support.
+
+Version 0.2.120 preserves the native-v2 fixes and hosted TCP ticket transport as a
+successor to the reserved 0.2.119 artifacts from release `40216273772`. That run
+passed signing and candidate verification but failed the deployment-acknowledgement
+gate after immutable uploads. Preserve those bytes; the successful-source-run
+reuse requirement remains unchanged. Publish 0.2.120 as `staging-candidate`, deploy
+and verify its exact tuple, then promote that successful candidate run with
+`staging-deployed` without rebuilding or re-signing.
+
 The update CLI retains the sole local credential owner and its lock through
 authenticated update work, resolving current tokens separately for manifest and
 artifact requests, then releases both before restarting a managed daemon. Daemon
