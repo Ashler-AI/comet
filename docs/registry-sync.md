@@ -68,6 +68,10 @@ an empty host profile initially upserts a chat without that metadata. A newer
 binding fences old hosts regardless of their LWW timestamps. Full user access
 continues to see the canonical host updates.
 
+Device rows accept nullable `devboxProvider` (`namespace` or `boat`) and nullable
+string `devboxId`, including independent field clears. These are native host
+metadata, not authorization: the row ID must still equal the granted device ID.
+
 Hello and presence identities come from the verified grant; forged devices are
 rejected. Native RegistryClient presence covers WebSocket and HTTP fallback,
 without a second DeviceRoom-to-Registry presence bridge. DeviceRoom's liveness

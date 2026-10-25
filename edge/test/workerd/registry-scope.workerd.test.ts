@@ -15,6 +15,15 @@ const crew = { ownerSubject: "owner", sessionId: "one", scope,
   environment: { ownerPrincipal: "owner", scope, source: { kind: "scaffold", sandbox_id: "box", lifecycle_epoch: 2, lifecycle: "ready" } },
   agentRoute: { provider: "openai", model: "owner-selected", fallback: "disabled", routingMode: "automatic" },
 };
+// Full RegistryDoc::upsert_device wire row, including absent optional values.
+const nativeDeviceFields = {
+  id: host.deviceId!, name: "sandbox", platform: "linux",
+  lastSeenAt: 1, createdAt: 1, version: "0.2.118",
+  cursorSdkEngineVersion: "0.2.118", capabilities: ["native-omp"],
+};
+const nativeDevice = {
+  ...nativeDeviceFields, devboxProvider: null, devboxId: null, cursorSdkVersion: null,
+};
 const op = (kind: string, id: string, set: NonNullable<Op["set"]>, tick = 1): Op =>
   ({ kind, id, set, op: "upsert", hlc: `${String(tick).padStart(13, "0")}-000000-host` });
 const headers = (authority?: SocketAuthority) => ({ [AUTH_USER_HEADER]: "owner", ...(authority ? { [AUTHORITY_HEADER]: JSON.stringify(authority) } : {}) });
@@ -30,12 +39,46 @@ async function state(stub: DurableObjectStub, authority?: SocketAuthority, query
 
 it("bootstraps device and space before chat without expanding the scoped view", async () => {
   const stub = room();
-  expect((await push(stub, [op("devices", host.deviceId!, { id: host.deviceId!, name: "sandbox", platform: "linux", capabilities: ["native-omp"] })], host)).status).toBe(200);
+  expect((await push(stub, [op("devices", host.deviceId!, nativeDevice)], host)).status).toBe(200);
+  expect((await state(stub, host)).rows.find(row => row.kind === "devices")?.fields).toEqual(nativeDeviceFields);
   expect((await push(stub, [op("spaces", "space", { id: "space", deviceId: host.deviceId!, path: "/workspace/crew-handoff", createdAt: 1 })], host)).status).toBe(200);
   expect((await push(stub, [op("chats", "one", { id: "one", deviceId: host.deviceId!, spaceId: "space", crew: null, title: "Native", cwd: "/workspace/crew-handoff", harnessSessionId: "omp-123" })], host)).status).toBe(200);
   expect((await state(stub, host)).rows.map(row => row.id).sort()).toEqual([host.deviceId!, "one", "space"].sort());
   expect((await push(stub, [op("sessions", "one", { chatId: "one", deviceId: host.deviceId!, status: "working", runningSubagents: 1, updatedAt: 10 })], host)).status).toBe(200);
   expect((await state(stub)).rows.find(row => row.kind === "sessions")?.fields.status).toBe("working");
+});
+
+it("accepts nullable native provider metadata without weakening scoped device ingestion", async () => {
+  const stub = room();
+  expect((await push(stub, [op("devices", host.deviceId!, nativeDevice)], host)).status).toBe(200);
+  let tick = 2;
+  for (const metadata of [
+    { devboxProvider: "namespace", devboxId: "abc123def456g" },
+    { devboxProvider: "boat", devboxId: "bx_jdyh7avc" },
+  ]) {
+    const device = { ...nativeDevice, ...metadata };
+    expect((await push(stub, [op("devices", host.deviceId!, device, tick++)], host)).status).toBe(200);
+    expect((await state(stub, host)).rows.find(row => row.kind === "devices")?.fields).toEqual({ ...nativeDeviceFields, ...metadata });
+  }
+  // Registry patches are incremental: clearing one field must not require its pair.
+  expect((await push(stub, [op("devices", host.deviceId!, { devboxProvider: null }, tick++)], host)).status).toBe(200);
+  expect((await state(stub, host)).rows.find(row => row.kind === "devices")?.fields).toEqual({
+    ...nativeDeviceFields, devboxId: "bx_jdyh7avc",
+  });
+  expect((await push(stub, [op("devices", host.deviceId!, { devboxId: null }, tick++)], host)).status).toBe(200);
+  const retained = await state(stub);
+  expect(retained.rows.find(row => row.kind === "devices")?.fields).toEqual(nativeDeviceFields);
+  for (const bad of [
+    ...["other", 1, true, {}, []].map(devboxProvider => op("devices", host.deviceId!, { devboxProvider }, tick)),
+    ...[1, true, {}, []].map(devboxId => op("devices", host.deviceId!, { devboxId }, tick)),
+    op("devices", host.deviceId!, { devboxId: "x".repeat(16 * 1024) }, tick),
+    op("devices", host.deviceId!, { arbitraryProviderColumn: "must not be accepted" }, tick),
+    op("devices", "desktop", { ...nativeDevice, id: "desktop" }, tick),
+    op("devices", host.deviceId!, { ...nativeDevice, id: "desktop" }, tick),
+  ]) {
+    expect((await push(stub, [op("devices", host.deviceId!, { name: "must not commit" }, tick), bad], host)).status).toBe(400);
+    expect(await state(stub)).toEqual(retained);
+  }
 });
 
 it("publishes scoped host completion to the owner without admitting malformed or foreign status batches", async () => {
