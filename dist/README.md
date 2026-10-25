@@ -47,12 +47,12 @@ is pinned. The executable and app are signed inside-out, notarized and stapled;
 the DMG is also signed, notarized and stapled. Read-only verification checks both
 the app and the extracted updater archive without repairing signatures.
 
-The hosted macOS release job blocks outbound UDP 443 in a dedicated
-`com.apple/crew-notary` packet-filter anchor, preserving the runner's existing
-rules. This forces TCP HTTPS for Apple ticket retrieval around
+The hosted macOS packaging and independent verification jobs share one step
+that blocks outbound UDP 443 in the dedicated `com.apple/crew-notary` filter
+anchor, preserving existing rules and forcing TCP HTTPS for Apple ticket checks:
 [runner issue #14924](https://github.com/actions/runner-images/issues/14924).
-It fails closed if the system anchor is absent and applies only to that disposable
-release VM, never local packaging hosts. Remove the workaround when the upstream
+It fails closed if the system anchor is absent and applies only to these
+disposable hosted VMs, never local hosts. Remove the workaround when the upstream
 HTTP/3 network failure is resolved; all signing, notarization and Gatekeeper
 checks remain required.
 

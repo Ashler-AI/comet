@@ -267,7 +267,8 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Use TCP for Apple ticket delivery
+      - &apple-ticket-transport
+        name: Use TCP for Apple ticket delivery
         shell: bash
         run: |
           set -euo pipefail
@@ -524,6 +525,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-candidate-${{ needs.version.outputs.version }}
+      - *apple-ticket-transport
       - name: Verify exact candidate and signed macOS artifacts
         shell: bash
         run: |
