@@ -47,6 +47,15 @@ is pinned. The executable and app are signed inside-out, notarized and stapled;
 the DMG is also signed, notarized and stapled. Read-only verification checks both
 the app and the extracted updater archive without repairing signatures.
 
+The hosted macOS release job blocks outbound UDP 443 in a dedicated
+`com.apple/crew-notary` packet-filter anchor, preserving the runner's existing
+rules. This forces TCP HTTPS for Apple ticket retrieval around
+[runner issue #14924](https://github.com/actions/runner-images/issues/14924).
+It fails closed if the system anchor is absent and applies only to that disposable
+release VM, never local packaging hosts. Remove the workaround when the upstream
+HTTP/3 network failure is resolved; all signing, notarization and Gatekeeper
+checks remain required.
+
 | Environment | App / identifier | URL scheme | Artifacts |
 | --- | --- | --- | --- |
 | staging | `Crew Staging.app` / `ai.ashler.comet.staging` | `comet-staging:` | `target/package/staging/comet-staging-0.2.116-macos-arm64.dmg`, `comet-staging-0.2.116-macos-arm64-app.tar.gz` |

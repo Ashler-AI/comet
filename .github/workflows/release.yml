@@ -267,6 +267,19 @@ jobs:
       - name: Select checked-in Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Use TCP for Apple ticket delivery
+        shell: bash
+        run: |
+          set -euo pipefail
+          # https://github.com/actions/runner-images/issues/14924
+          # Keep existing rules; this anchor lives only in the hosted release VM.
+          if [[ "$(sudo pfctl -sr)" != *'anchor "com.apple/*"'* ]]; then
+            echo "::error::Expected macOS packet-filter anchor is absent."
+            exit 1
+          fi
+          printf 'block return out quick proto udp from any to any port 443\n' |
+            sudo pfctl -a com.apple/crew-notary -f -
+          sudo pfctl -E
       - name: Package
         run: scripts/package-macos.sh
       - name: Verify packaged native handoff command
