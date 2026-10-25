@@ -72,6 +72,12 @@ Device rows accept nullable `devboxProvider` (`namespace` or `boat`) and nullabl
 string `devboxId`, including independent field clears. These are native host
 metadata, not authorization: the row ID must still equal the granted device ID.
 
+The native host derives registry completeness from its verified profile. A
+single-session device view can be synchronized without being the owner's complete
+registry: it neither initializes nor prunes owner sidebar preferences, and it
+never reports those preferences as synchronized. Device, chat and session lists
+retain their normal synchronization behavior.
+
 Hello and presence identities come from the verified grant; forged devices are
 rejected. Native RegistryClient presence covers WebSocket and HTTP fallback,
 without a second DeviceRoom-to-Registry presence bridge. DeviceRoom's liveness

@@ -236,7 +236,7 @@ pub fn listeners() -> Vec<Listener> {
         let Ok(stat) = fs::read_to_string(path.join("stat")) else {
             continue;
         };
-        let Some((_, tail)) = stat.rsplit_once(") ") else {
+        let Some((process_name, tail)) = stat.rsplit_once(") ") else {
             continue;
         };
         let fields: Vec<_> = tail.split_whitespace().collect();
@@ -244,6 +244,14 @@ pub fn listeners() -> Vec<Listener> {
             continue;
         };
         parents.insert(pid, parent);
+        // Other Crew profiles can share this project's cwd. Their listeners
+        // are control-plane sockets, not development servers to HTTP-probe.
+        if matches!(
+            process_name.split_once('(').map(|(_, name)| name),
+            Some("comet" | "zeron")
+        ) {
+            continue;
+        }
         let Ok(cwd) = fs::read_link(path.join("cwd")) else {
             continue;
         };
@@ -362,20 +370,27 @@ pub fn listeners() -> Vec<Listener> {
             return Vec::new();
         };
         let mut pid = 0;
+        let mut control_plane = false;
         let mut values = Vec::new();
         for field in output.stdout.split(|b| *b == 0) {
             let field = String::from_utf8_lossy(field);
             let field = field.trim_start_matches('\n');
             if let Some(value) = field.strip_prefix('p') {
                 pid = value.parse().unwrap_or(0);
+                control_plane = false;
             }
-            if let Some(value) = field.strip_prefix('n') {
+            // lsof's command field is the process name, even when the
+            // executable's installation path contains spaces.
+            if let Some(name) = field.strip_prefix('c') {
+                control_plane = matches!(name, "comet" | "zeron");
+            }
+            if let Some(value) = field.strip_prefix('n').filter(|_| !control_plane) {
                 values.push((pid, value.to_owned()));
             }
         }
         values
     };
-    let cwds: HashMap<_, _> = fields(&["-nP", "-a", "-u", &uid, "-d", "cwd", "-F0pn"])
+    let cwds: HashMap<_, _> = fields(&["-nP", "-a", "-u", &uid, "-d", "cwd", "-F0pcn"])
         .into_iter()
         .collect();
     let mut parents = HashMap::new();

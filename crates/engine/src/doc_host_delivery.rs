@@ -272,6 +272,7 @@ mod tests {
                 user_id: "user".into(),
                 edge: None,
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -329,6 +330,7 @@ mod tests {
                 user_id: "user".into(),
                 edge: None,
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();

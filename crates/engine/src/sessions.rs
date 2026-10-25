@@ -5276,6 +5276,7 @@ mod tests {
         let workspace = crate::WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
             device_id: "destination".into(), device_name: "Host".into(), platform: "linux".into(),
             org_id: "project".into(), user_id: "owner".into(), edge: None, local_only: false,
+            owner_registry: true,
         }).unwrap();
         let chat_id = "local-chat-recovery";
         workspace.create_chat(chat_id, None, Some("destination"), None, Some("/original/worktree".into())).unwrap();
@@ -5458,6 +5459,7 @@ mod tests {
         let workspace = crate::WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
             device_id: "importer".into(), device_name: "Host".into(), platform: "linux".into(),
             org_id: "project".into(), user_id: "owner".into(), edge: None, local_only: false,
+            owner_registry: true,
         }).unwrap();
         let id = "11111111-1111-4111-8111-111111111111";
         workspace.create_chat(id, None, Some("importer"), None, Some("/original/repo".into())).unwrap();
@@ -5598,6 +5600,7 @@ mod tests {
         let workspace = crate::WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
             device_id: "host".into(), device_name: "Host".into(), platform: "linux".into(),
             org_id: "project".into(), user_id: "owner".into(), edge: None, local_only: false,
+            owner_registry: true,
         }).unwrap();
         workspace.create_chat(chat_id, None, Some("host"), None, Some("/original/repo".into())).unwrap();
         workspace.set_chat_harness_session(chat_id, "original-native", "/original/repo");

@@ -834,6 +834,7 @@ mod tests {
             let workspace = crate::WorkspaceHost::open(store.clone(), crate::workspace_host::WorkspaceHostConfig {
                 device_id: "controller".into(), device_name: "Host".into(), platform: "linux".into(),
                 org_id: "project".into(), user_id: "owner".into(), edge: None, local_only: false,
+                owner_registry: true,
             }).unwrap();
             workspace.create_chat("source", None, Some("controller"), None, Some("/source".into())).unwrap();
             workspace.create_chat("target", None, Some(&crate::scaffold::device_id_for("box", 7)), None, Some("/workspace/ashler-platform".into())).unwrap();

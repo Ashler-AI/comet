@@ -360,6 +360,7 @@ fn workspace(store: Arc<DocsStore>) -> WorkspaceHost {
             user_id: "test-user".into(),
             edge: None,
             local_only: false,
+            owner_registry: true,
         },
     )
     .unwrap()

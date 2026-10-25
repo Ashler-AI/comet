@@ -163,6 +163,8 @@ pub struct WorkspaceHostConfig {
     /// The signed-in user — registries are per-user (`reg1/{orgId}/{userId}`):
     /// spaces/sessions are private to their owner, never org-visible.
     pub user_id: String,
+    /// This profile sees the owner's complete registry, not a device-scoped view.
+    pub owner_registry: bool,
     /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
     pub edge: Option<EdgeConfig>,
@@ -1293,7 +1295,7 @@ impl WorkspaceHostInner {
             .is_some_and(|room| room.stats().synced);
         let snapshot = {
             let mut doc = lock(&self.reg);
-            match doc.reconcile_sidebar_pins(registry_synced) {
+            match doc.reconcile_sidebar_pins(self.config.owner_registry && registry_synced) {
                 Ok(true) => {
                     // Persist and transmit cleanup just like a user mutation.
                     self.bump_changed();
@@ -1360,7 +1362,7 @@ impl WorkspaceHostInner {
         self.sidebar_preferences_tx.send_if_modified(|current| {
             // Readiness is sticky for this host. A caller that sampled stats
             // before another publisher acquired the lock must not regress it.
-            let synced = synced || current.synced;
+            let synced = self.config.owner_registry && (synced || current.synced);
             if current.synced == synced
                 && current.initialized == initialized
                 && current.pinned_session_ids == pins
@@ -1972,6 +1974,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2015,6 +2018,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidebar_preferences_require_owner_complete_registry() {
+        use super::*;
+        use zeron_sync::registry::mock_server::MockRegistryServer;
+
+        for owner_registry in [false, true] {
+            let server = MockRegistryServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let host = WorkspaceHost::open(
+                Arc::new(DocsStore::open(dir.path()).unwrap()),
+                WorkspaceHostConfig {
+                    device_id: "test-device".into(),
+                    device_name: "Test device".into(),
+                    platform: "test".into(),
+                    org_id: "test-org".into(),
+                    user_id: "test-user".into(),
+                    edge: None,
+                    local_only: false,
+                    owner_registry,
+                },
+            )
+            .unwrap();
+            host.create_chat("chat-1", None, Some("test-device"), None, None)
+                .unwrap();
+            host.record_session(&running_session(Utc::now()));
+            let preferences = host.watch_sidebar_preferences();
+            assert!(!preferences.borrow().initialized);
+            assert!(!preferences.borrow().synced);
+            host.connect_registry_url(&server.url());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !host.sync_status().is_some_and(|status| status.synced)
+                    || host.read(|doc| doc.pending_len()) != 0
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("registry delivery and boot writes settle");
+
+            // Delivery is complete for device/session lists, but only an owner
+            // has the complete registry needed to initialize global preferences.
+            host.inner.publish();
+            assert!(host.registry_synced());
+            assert_eq!(host.watch_devices().borrow()[0].id, "test-device");
+            assert_eq!(host.watch_chats().borrow()[0].id, "chat-1");
+            assert_eq!(host.watch_session_rows().borrow()[0].chat_id, "chat-1");
+            assert!(server.row("devices", "test-device").is_some());
+            assert!(server.row("chats", "chat-1").is_some());
+            assert!(server.row("sessions", "chat-1").is_some());
+            assert_eq!(preferences.borrow().synced, owner_registry);
+            assert_eq!(preferences.borrow().initialized, owner_registry);
+            // Snapshot acknowledgements must not bypass the watch's authority gate.
+            let snapshot = host.sidebar_preferences_snapshot();
+            assert_eq!(snapshot.synced, owner_registry);
+            assert_eq!(snapshot.initialized, owner_registry);
+
+            if !owner_registry {
+                assert!(host.read(|doc| doc.sidebar_preferences()).is_none());
+                assert_eq!(host.read(|doc| doc.pending_len()), 0);
+                assert!(server.row("preferences", "sidebarPins").is_none());
+                continue;
+            }
+
+            host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Pin {
+                session_id: "chat-1".into(),
+                after: None,
+                before: None,
+            })
+            .unwrap();
+            assert_eq!(host.sidebar_preferences_snapshot().pinned_session_ids, ["chat-1"]);
+            host.delete_chat("chat-1").unwrap();
+            host.inner.publish();
+            assert!(preferences.borrow().synced);
+            assert!(preferences.borrow().initialized);
+            assert!(preferences.borrow().pinned_session_ids.is_empty());
+            assert!(host.read(|doc| doc.sidebar_preferences()).unwrap().pinned_session_ids.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn sidebar_preferences_watch_preserves_explicit_empty_state() {
         use super::*;
 
@@ -2029,6 +2111,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2130,6 +2213,7 @@ mod tests {
                 device_id: "test-device".into(), device_name: "Host".into(),
                 platform: "test".into(), org_id: "org".into(), user_id: "owner".into(),
                 edge: None, local_only: true,
+                owner_registry: true,
             },
         ).unwrap();
         host.create_chat("chat-1", None, Some("test-device"), None, None).unwrap();
@@ -2167,6 +2251,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: true,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2207,6 +2292,7 @@ mod tests {
                 // Unreachable edge: writes queue (and retry) without acks.
                 edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2274,6 +2360,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: true,
+                owner_registry: true,
             },
         )
         .unwrap();

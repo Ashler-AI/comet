@@ -546,6 +546,7 @@ mod tests {
         let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
             device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
             org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
+            owner_registry: true,
         }).unwrap();
         let local_id = "local-chat-0123456789abcdef";
         workspace.create_chat(local_id, None, Some("test-device"), Some(zeron_proto::ChatConfig {
@@ -654,6 +655,7 @@ mod tests {
         let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
             device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
             org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
+            owner_registry: true,
         }).unwrap();
         responses.lock().extend([
             (200, json!({"session":{"revision":8, "sourceVersion":version, "deleted":false}})),
