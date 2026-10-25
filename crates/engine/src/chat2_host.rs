@@ -600,6 +600,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_publication_is_causal_before_observers_and_queued_commits() {
+        for commit_from_observer in [true, false] {
+            let source = Arc::new(loro::LoroDoc::new());
+            let rows = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let nested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let weak = Arc::downgrade(&source);
+            let did_commit = nested.clone();
+            let observer = source.subscribe_root(Arc::new(move |_| {
+                if commit_from_observer
+                    && !did_commit.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let doc = weak.upgrade().unwrap();
+                    doc.get_map("meta").insert("child", 1).unwrap();
+                    doc.commit();
+                }
+            }));
+            let weak = Arc::downgrade(&source);
+            let captured = rows.clone();
+            let publisher = source.subscribe_local_update(Box::new(move |bytes| {
+                captured.lock().push(bytes.clone());
+                if !commit_from_observer
+                    && !nested.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let doc = weak.upgrade().unwrap();
+                    for value in [1, 2] {
+                        doc.get_map("meta").insert("child", value).unwrap();
+                        doc.commit();
+                    }
+                }
+                true
+            }));
+            source.get_map("meta").insert("parent", true).unwrap();
+            source.commit();
+
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+            let target = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+            let sink = EngineChatSink::new(&target, store.clone(), "publication-order");
+            let rows = rows.lock();
+            assert_eq!(rows.len(), if commit_from_observer { 2 } else { 3 });
+            for (index, bytes) in rows.iter().enumerate() {
+                let cursor = index as u64 + 1;
+                assert_eq!(sink.apply_row(bytes, cursor), RowImportOutcome::Applied,
+                    "row {cursor} needs its unpublished predecessor (observer={commit_from_observer})");
+                assert_eq!(store.snapshot_cursor("publication-order").unwrap(), cursor);
+            }
+            assert_eq!(target.doc().oplog_vv(), source.oplog_vv());
+            assert_eq!(target.doc().get_deep_value(), source.get_deep_value());
+            drop((publisher, observer));
+        }
+    }
+
+    #[test]
+    fn local_publication_is_causal_with_competing_thread_drains() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let source = Arc::new(loro::LoroDoc::new());
+        let target = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let sink = EngineChatSink::new(&target, store.clone(), "concurrent-publication");
+        let received = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel(1);
+        let root_events = AtomicUsize::new(0);
+        let _observer = source.subscribe_root(Arc::new(move |_| {
+            if root_events.fetch_add(1, Ordering::SeqCst) == 1 {
+                committed_tx.send(()).unwrap();
+            }
+        }));
+        let count = received.clone();
+        let parked = pending.clone();
+        let _publisher = source.subscribe_local_update(Box::new(move |bytes| {
+            let cursor = count.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            if sink.apply_row(bytes, cursor) != RowImportOutcome::Applied {
+                parked.fetch_add(1, Ordering::SeqCst);
+            }
+            if cursor == 1 {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            true
+        }));
+
+        let first = source.clone();
+        let first = std::thread::spawn(move || {
+            first.get_text("body").insert(0, "parent").unwrap();
+            first.commit();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let second = source.clone();
+        let second = std::thread::spawn(move || {
+            second.get_text("body").insert(6, " child").unwrap();
+            second.commit();
+        });
+        // B's root event proves its commit has staged the binary update while
+        // A still owns the publisher callback. Both drains then compete.
+        committed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+        assert_eq!(store.snapshot_cursor("concurrent-publication").unwrap(), 2);
+        assert_eq!(target.doc().oplog_vv(), source.oplog_vv());
+        assert_eq!(target.doc().get_deep_value(), source.get_deep_value());
+    }
+
+    #[test]
     fn parked_rows_do_not_persist_a_cursor_until_their_history_arrives() {
         let source = SessionDoc::init("chat").unwrap();
         let text = source.doc().get_text("body");

@@ -72,6 +72,12 @@ Device rows accept nullable `devboxProvider` (`namespace` or `boat`) and nullabl
 string `devboxId`, including independent field clears. These are native host
 metadata, not authorization: the row ID must still equal the granted device ID.
 
+The native host derives registry completeness from its verified profile. A
+single-session device view can be synchronized without being the owner's complete
+registry: it neither initializes nor prunes owner sidebar preferences, and it
+never reports those preferences as synchronized. Device, chat and session lists
+retain their normal synchronization behavior.
+
 Hello and presence identities come from the verified grant; forged devices are
 rejected. Native RegistryClient presence covers WebSocket and HTTP fallback,
 without a second DeviceRoom-to-Registry presence bridge. DeviceRoom's liveness
@@ -85,6 +91,12 @@ ACKs whose optimistic sidebar values did not change), snapshot commits, and auth
 changes. `chat_sync_jobs` retains coalesced pending directory work across restart;
 `crew_directory_state` retains only locally observed source-version evidence and
 whether the directory acknowledged it, including after transcript deletion.
+
+Live registry rows without a local Loro transcript snapshot remain pending without
+directory get/upsert requests, including on repeated drains. Saving a local
+snapshot queues and wakes directory work; publication then follows the existing
+identity and version fences. Acknowledged deletions can still use retained local
+source-version evidence after their transcript snapshot has been removed.
 
 The projection uses the acknowledged chat row's real `seq` as `r:registry1`,
 alongside the saved SessionDoc oplog version vector (`s:<peer>`). Pending overlay
@@ -102,8 +114,9 @@ input cap), with bounded registry/work pages and chunked transcript text scannin
 Slack/Notion URLs retain the source extraction semantics; server upsert and
 SourceURL search share canonical normalization.
 
-Every retry reads the current directory revision before an expected-revision
-upsert. Stale/concurrent transcript evidence waits for synchronization; unseen
+Each publication attempt with eligible local evidence reads the current directory
+revision before an expected-revision upsert. Stale/concurrent transcript evidence
+waits for synchronization; unseen
 server counters are never copied into a candidate. A server sequence rollback
 persists a reconciliation-required flag, even when ordinary registry re-seeding
 succeeds. Directory writes then fail closed; recovery requires reconciling the

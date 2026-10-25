@@ -290,6 +290,7 @@ impl EngineCore {
                 user_id: profile.user_id().to_string(),
                 edge: edge.clone(),
                 local_only: matches!(profile.scope(), WorkspaceScope::Local),
+                owner_registry: profile.device_id_override().is_none(),
             },
         )?;
         doc_host.set_workspace(workspace.clone());

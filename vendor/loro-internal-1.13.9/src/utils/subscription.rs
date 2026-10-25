@@ -228,8 +228,7 @@ Apache License
 
 */
 use crate::sync::{thread, AtomicBool, Mutex};
-use smallvec::SmallVec;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::{fmt::Debug, mem};
@@ -539,7 +538,7 @@ impl Drop for InnerSubscription {
 #[derive(Clone)]
 pub struct SubscriberSetWithQueue<EmitterKey, Callback, Payload> {
     subscriber_set: SubscriberSet<EmitterKey, Callback>,
-    queue: Arc<Mutex<BTreeMap<EmitterKey, Vec<Payload>>>>,
+    queue: Arc<Mutex<BTreeMap<EmitterKey, VecDeque<Payload>>>>,
 }
 
 impl<EmitterKey, Callback, Payload> Debug
@@ -564,7 +563,7 @@ where
 
 pub struct WeakSubscriberSetWithQueue<EmitterKey, Callback, Payload> {
     subscriber_set: Weak<Mutex<SubscriberSetState<EmitterKey, Callback>>>,
-    queue: Weak<Mutex<BTreeMap<EmitterKey, Vec<Payload>>>>,
+    queue: Weak<Mutex<BTreeMap<EmitterKey, VecDeque<Payload>>>>,
 }
 
 impl<EmitterKey, Callback, Payload> Debug
@@ -620,23 +619,56 @@ where
     }
 
     pub fn emit(&self, key: &EmitterKey, payload: Payload) {
-        let mut pending_events: SmallVec<[Payload; 1]> = SmallVec::new();
-        pending_events.push(payload);
-        while let Some(payload) = pending_events.pop() {
-            let result = self
-                .subscriber_set
-                .retain(key, &mut |callback| (callback)(&payload));
-            match result {
-                Ok(_) => {
+        self.enqueue(key, payload);
+        self.emit_pending(key);
+    }
+
+    /// Stage under the producer's ordering lock; invoke callbacks only after
+    /// releasing that lock via `emit_pending`.
+    pub(crate) fn enqueue(&self, key: &EmitterKey, payload: Payload) {
+        self.queue.lock().entry(key.clone()).or_default().push_back(payload);
+    }
+
+    pub(crate) fn emit_pending(&self, key: &EmitterKey) {
+        loop {
+            // Pop only AFTER retain acquires the subscriber execution slot.
+            // Otherwise racing drainers can pop in order but invoke in reverse.
+            let mut event = None;
+            let result = self.subscriber_set.retain(key, &mut |callback| {
+                let payload = event.get_or_insert_with(|| {
                     let mut queue = self.queue.lock();
-                    if let Some(new_pending_events) = queue.remove(key) {
-                        pending_events.extend(new_pending_events);
+                    let pending = queue.get_mut(key)?;
+                    let payload = pending.pop_front();
+                    if pending.is_empty() {
+                        // All consumers use unit keys: retain at most four empty
+                        // slots per document, never payloads or burst capacity.
+                        pending.shrink_to(4);
                     }
+                    payload
+                });
+                payload.as_ref().is_none_or(|payload| callback(payload))
+            });
+            if result.is_err() {
+                // Reentrant callbacks leave their payloads for the outer drain.
+                return;
+            }
+            if event.is_none() {
+                // Serialize disposal with subscription changes: another drainer
+                // or a newly installed callback may now own the queued data.
+                let subscribers = self.subscriber_set.0.lock();
+                let mut queue = self.queue.lock();
+                let active = match subscribers.subscribers.get(key) {
+                    Some(Either::Right(_)) => true,
+                    Some(Either::Left(set)) => set.values().any(|s| s.active.load(Ordering::Relaxed)),
+                    None => false,
+                };
+                if !active {
+                    queue.remove(key);
                 }
-                Err(SubscriptionError::CannotEmitEventDueToRecursiveCall) => {
-                    let mut queue = self.queue.lock();
-                    queue.entry(key.clone()).or_default().push(payload);
-                }
+                return;
+            }
+            if matches!(event, Some(None)) {
+                return;
             }
         }
     }

@@ -271,3 +271,74 @@ c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK'
     assert!(callback.0.wait().unwrap().success());
     service.shutdown().await;
 }
+
+/// Another Crew profile can share a project cwd without becoming a dev server.
+/// Run this test executable under both native binary names to exercise real OS
+/// process metadata, including an installation path containing spaces.
+#[tokio::test]
+async fn crew_control_plane_listeners_receive_no_discovery_connections() {
+    const FIXTURE: &str = "CREW_PREVIEW_CONTROL_PLANE_FIXTURE";
+    if let Some(path) = std::env::var_os(FIXTURE) {
+        let path = std::path::PathBuf::from(path);
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(path.join("ready"), "ready").unwrap();
+        let _connection = socket.accept().unwrap();
+        std::fs::write(path.join("connections"), "connected").unwrap();
+        return;
+    }
+
+    let _serial = SERIAL.lock().await;
+    let executable = std::env::current_exe().unwrap();
+    // Keep hard links on the executable's filesystem without copying the binary.
+    let temp = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+    let app = temp.path().join("shared project");
+    std::fs::create_dir(&app).unwrap();
+    let mut controllers = Vec::new();
+    for name in ["comet", "zeron"] {
+        let fixture = app.join(name);
+        std::fs::create_dir(&fixture).unwrap();
+        let binary = fixture.join(name);
+        std::fs::hard_link(&executable, &binary).unwrap();
+        controllers.push(Child(
+            std::process::Command::new(binary)
+                .args([
+                    "--exact",
+                    "crew_control_plane_listeners_receive_no_discovery_connections",
+                ])
+                .env(FIXTURE, &fixture)
+                .current_dir(&app)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("control-plane fixture did not start");
+    }
+    let server = launch(&app, true);
+    let service = PreviewService::new(
+        temp.path().join("names.json"),
+        "local".into(),
+        "Laptop".into(),
+    )
+    .unwrap();
+    let roots = vec![app.clone()];
+    service.start(Arc::new(move || roots.clone()), None).await;
+    wait(&service, Some(server.0.id())).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for name in ["comet", "zeron"] {
+        assert!(
+            !app.join(name).join("connections").exists(),
+            "preview discovery connected to {name}'s control-plane listener"
+        );
+    }
+    for controller in &mut controllers {
+        assert!(controller.0.try_wait().unwrap().is_none());
+    }
+    service.shutdown().await;
+}

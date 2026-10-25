@@ -191,9 +191,13 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         projection_store.load_directory_snapshot(&projection_id)?
             .map(|bytes| project(&bytes)).transpose()
     }).await.map_err(|_| failure("directory snapshot projection failed"))??;
-    let (mut version, mut links) = projection.unwrap_or_else(|| {
-        (if row.deleted { evidence.source_version.clone() } else { Version::new() }, Vec::new())
-    });
+    let (mut version, mut links) = match projection {
+        Some(projection) => projection,
+        None if row.deleted => (evidence.source_version.clone(), Vec::new()),
+        // Registry-only rows are normal on controllers of remotely hosted chats.
+        // Keep their jobs pending until a local transcript snapshot is saved.
+        None => return Ok(false),
+    };
     if row.deleted { links.clear(); }
     version.insert(REGISTRY_VERSION.into(), row.seq);
     require_observed(&version, &Version::new())?;
@@ -432,8 +436,9 @@ mod tests {
 
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn conflicted_jobs_wait_for_own_source_and_retry_transport_failures() {
-        use std::{collections::VecDeque, convert::Infallible, sync::Mutex};
+    async fn registry_only_jobs_wait_for_snapshot_and_preserve_publication_fences() {
+        use std::{collections::VecDeque, convert::Infallible};
+        use parking_lot::Mutex;
         use bytes::Bytes;
         use http_body_util::{BodyExt, Full};
         use hyper::{Request, Response, body::Incoming, service::service_fn};
@@ -447,7 +452,17 @@ mod tests {
         let id = "9dd173da-fb53-48df-9581-026009c783e2";
         let doc = loro::LoroDoc::new();
         doc.set_peer_id(42).unwrap();
-        doc.get_map("source").insert("observed", true).unwrap();
+        let row = doc.get_list("messages").push_container(loro::LoroMap::new()).unwrap();
+        row.insert("role", "user").unwrap();
+        let parts = row.insert_container("parts", loro::LoroList::new()).unwrap();
+        let part = parts.push_container(loro::LoroMap::new()).unwrap();
+        part.insert("kind", "text").unwrap();
+        let text = part.insert_container("text", loro::LoroText::new()).unwrap();
+        text.insert(0, "Investigate this incident: ").unwrap();
+        doc.commit();
+        let stale_snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+        let url = "https://acme.slack.com/archives/C123/p1234567890123456";
+        text.insert(text.len_unicode(), url).unwrap();
         doc.commit();
         let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
         let (mut version, _) = project(&snapshot).unwrap();
@@ -488,8 +503,8 @@ mod tests {
                                         "resource":origin, "actor":{"sub":"alice", "auth":"iap"},
                                         "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})),
                                     "/api/crew-directory/get" | "/api/crew-directory/upsert" => {
-                                        requests.lock().unwrap().push((path, serde_json::from_slice(&body).unwrap()));
-                                        responses.lock().unwrap().pop_front().unwrap_or((500, json!({})))
+                                        requests.lock().push((path, serde_json::from_slice(&body).unwrap()));
+                                        responses.lock().pop_front().unwrap_or((500, json!({})))
                                     }
                                     _ => panic!("unexpected request: {path}"),
                                 };
@@ -531,6 +546,7 @@ mod tests {
         let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
             device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
             org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
+            owner_registry: true,
         }).unwrap();
         let local_id = "local-chat-0123456789abcdef";
         workspace.create_chat(local_id, None, Some("test-device"), Some(zeron_proto::ChatConfig {
@@ -546,7 +562,7 @@ mod tests {
         assert!(services.session_metadata(local_id).is_err());
         assert!(services.generate_title(local_id, "local prompt").await.is_err());
         assert!(publish(&store, &services, &workspace, local_id, &mut BTreeMap::new()).await.unwrap());
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
         let mut fabricated = local;
         fabricated.crew = Some(services.session_metadata(id).unwrap());
         workspace.import_chat_row(&fabricated).unwrap();
@@ -555,11 +571,23 @@ mod tests {
         assert!(client.get_crew_session(local_id, Some("deployment-a")).await.is_err());
         assert!(client.upsert_crew_session(&json!({"sessionId":local_id})).await.is_err());
         assert!(client.generate_crew_title(local_id, Some("deployment-a"), "private").await.is_err());
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
         let mut required = BTreeMap::new();
         enqueue_registry(&store, &workspace).await.unwrap();
+        let pending = store.sync_job_version(id, JOB).unwrap().unwrap();
+        assert!(store.load_directory_snapshot(id).unwrap().is_none());
+        for _ in 0..2 {
+            assert_eq!(drain(&store, &services, &workspace, &mut required).await.unwrap(), None);
+            assert!(requests.lock().is_empty(), "registry-only rows must not issue directory HTTP");
+            assert_eq!(store.sync_job_version(id, JOB).unwrap(), Some(pending));
+            assert!(store.directory_state(id).unwrap().is_none());
+            assert!(required.is_empty());
+        }
+        // A locally persisted transcript unblocks projection, but cannot bypass
+        // the existing remote-version fence while it still lacks later edits.
+        store.save_snapshot(id, &stale_snapshot).unwrap();
         drain(&store, &services, &workspace, &mut required).await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
         assert_eq!(required[id], version);
         let rejected: Evidence = serde_json::from_str(&store.directory_state(id).unwrap().unwrap()).unwrap();
         assert!(rejected.source_version.is_empty(), "remote counters are not evidence");
@@ -570,29 +598,31 @@ mod tests {
             enqueue_registry(&store, &workspace).await.unwrap();
             store.save_snapshot("unrelated", &snapshot).unwrap();
             drain(&store, &services, &workspace, &mut required).await.unwrap();
-            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(requests.lock().len(), 1);
             assert!(store.sync_job_version(id, JOB).unwrap().is_some());
         }
         required.clear(); // Persisted candidate rejection also survives worker restart.
         drain(&store, &services, &workspace, &mut required).await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
         store.save_snapshot(id, &snapshot).unwrap();
         for expected_requests in [2, 4] {
             assert_eq!(drain(&store, &services, &workspace, &mut required).await.unwrap(), Some(RETRY_DELAY));
-            assert_eq!(requests.lock().unwrap().len(), expected_requests);
+            assert_eq!(requests.lock().len(), expected_requests);
             assert!(store.sync_job_version(id, JOB).unwrap().is_some());
         }
         drain(&store, &services, &workspace, &mut required).await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 6);
-        assert!(responses.lock().unwrap().is_empty());
+        assert_eq!(requests.lock().len(), 6);
+        assert!(responses.lock().is_empty());
         assert!(store.sync_job_version(id, JOB).unwrap().is_none());
         assert!(required.is_empty());
         {
-            let requests = requests.lock().unwrap();
+            let requests = requests.lock();
             let published = &requests[5];
             assert_eq!(published.0, "/api/crew-directory/upsert");
             assert_eq!(published.1["sourceVersion"], json!(version));
             assert_eq!(published.1["expectedRevision"], 7);
+            assert_eq!(published.1["links"], json!([url]));
+            assert_eq!(published.1["deleted"], false);
         }
         let saved = store.directory_state(id).unwrap().unwrap();
         let evidence: Evidence = serde_json::from_str(&saved).unwrap();
@@ -605,13 +635,48 @@ mod tests {
         for _ in 0..2 {
             drain(&store, &services, &workspace, &mut required).await.unwrap();
             assert!(store.sync_job_version(id, JOB).unwrap().is_some());
-            assert_eq!(requests.lock().unwrap().len(), 6);
+            assert_eq!(requests.lock().len(), 6);
         }
         store.save_snapshot(id, &snapshot).unwrap();
         drain(&store, &services, &workspace, &mut required).await.unwrap();
         assert!(store.sync_job_version(id, JOB).unwrap().is_none());
-        assert_eq!(requests.lock().unwrap().len(), 6);
+        assert_eq!(requests.lock().len(), 6);
         assert_eq!(store.directory_state(id).unwrap().unwrap(), saved);
+        workspace.shutdown();
+
+        // Acknowledged deletion still publishes from prior local evidence after
+        // doc_host removes the transcript; the live-row gate must not swallow it.
+        let mut tombstone = workspace.acknowledged_chat(id).unwrap();
+        tombstone.seq = 10;
+        tombstone.deleted = true;
+        let _ = registry.apply_state(10, true, 0, vec![tombstone]);
+        store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+        store.delete_snapshot(id).unwrap();
+        let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
+            device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
+            org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
+            owner_registry: true,
+        }).unwrap();
+        responses.lock().extend([
+            (200, json!({"session":{"revision":8, "sourceVersion":version, "deleted":false}})),
+            (200, json!({"revision":9})),
+        ]);
+        enqueue_registry(&store, &workspace).await.unwrap();
+        drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert!(store.sync_job_version(id, JOB).unwrap().is_none());
+        assert!(responses.lock().is_empty());
+        version.insert(REGISTRY_VERSION.into(), 10);
+        {
+            let requests = requests.lock();
+            assert_eq!(requests.len(), 8);
+            assert_eq!(requests[6].0, "/api/crew-directory/get");
+            let deleted = &requests[7];
+            assert_eq!(deleted.0, "/api/crew-directory/upsert");
+            assert_eq!(deleted.1["sourceVersion"], json!(version));
+            assert_eq!(deleted.1["expectedRevision"], 8);
+            assert_eq!(deleted.1["deleted"], true);
+            assert_eq!(deleted.1["links"], json!([]));
+        }
         workspace.shutdown();
         server.abort();
     }

@@ -68,7 +68,7 @@ impl crate::LoroDoc {
 
         let obs = self.observer.clone();
         let local_update_subs_weak = self.local_update_subs.downgrade();
-        txn.set_on_commit(Box::new(move |state, oplog, id_span| {
+        txn.set_on_commit(Box::new(move |state, _, _| {
             let mut state = state.lock();
             let events = state.take_events();
             drop(state);
@@ -76,15 +76,8 @@ impl crate::LoroDoc {
                 obs.emit(event);
             }
 
-            if id_span.atom_len() == 0 {
-                return;
-            }
-
             if let Some(local_update_subs) = local_update_subs_weak.upgrade() {
-                if !local_update_subs.inner().is_empty() {
-                    let bytes = { export_fast_updates_in_range(&oplog.lock(), &[id_span]) };
-                    local_update_subs.emit(&(), bytes);
-                }
+                local_update_subs.emit_pending(&());
             }
         }));
 
@@ -523,6 +516,12 @@ impl Transaction {
             }),
         );
         drop(state);
+        if !doc.local_update_subs.inner().is_empty() {
+            // Stage before releasing the commit lock. A later commit may run
+            // its callbacks first, but must publish this predecessor first.
+            let bytes = export_fast_updates_in_range(&oplog, &[self.id_span()]);
+            doc.local_update_subs.enqueue(&(), bytes);
+        }
         drop(oplog);
         if let Some(on_commit) = self.on_commit.take() {
             assert!(!doc.txn.is_locked());

@@ -122,6 +122,14 @@ comparison for checkpoint skip, reconnect/backoff/wake plumbing reused from the
 existing supervisor machinery. The layered liveness model (ping lease, join deadline,
 probe clock) carries over — those lessons are transport-level, not CRDT-level.
 
+Native local-update publication preserves commit order before rows enter the
+durable chat outbox. The vendored Loro emitter stages each update while holding
+the commit/oplog lock, then drains a serialized FIFO after releasing that lock.
+Observer-triggered edits, reentrant callbacks and competing commit threads cannot
+publish a dependent update ahead of its predecessor. Receivers still reject
+incomplete causal history without advancing the durable cursor; historical
+out-of-order rows require ordinary catch-up or a covering checkpoint.
+
 **C2. Store migration** (`crates/sync/src/store.rs` MIGRATIONS — append entry #N):
 `ALTER TABLE snapshots ADD COLUMN cursor INTEGER; ADD COLUMN epoch INTEGER` — cursor
 persisted **in the same transaction** as the snapshot bytes, so content and cursor
