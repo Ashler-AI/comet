@@ -94,6 +94,9 @@ const MIGRATIONS: &[&str] = &[
         doc_id TEXT PRIMARY KEY,
         state TEXT NOT NULL
     ) STRICT;",
+    // Relay execution may settle before the original command row syncs.
+    // NULL preserves the crash-recovery meaning of older processed claims.
+    "ALTER TABLE processed_commands ADD COLUMN outcome BLOB;",
 ];
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -624,38 +627,46 @@ impl DocsStore {
         Ok(hit.is_some())
     }
 
-    /// The full command ledger — profile-import reads the source's claims so
-    /// imported pending commands can never re-execute under the new profile.
-    pub fn processed_commands(&self) -> Result<Vec<(String, i64)>, StoreError> {
+    /// The full command ledger — profile-import preserves both at-most-once
+    /// claims and known outcomes for pending command rows that arrive later.
+    pub fn processed_commands(&self) -> Result<Vec<(String, i64, Option<Vec<u8>>)>, StoreError> {
         store_blocking(|| self.processed_commands_blocking())
     }
 
-    fn processed_commands_blocking(&self) -> Result<Vec<(String, i64)>, StoreError> {
+    fn processed_commands_blocking(&self) -> Result<Vec<(String, i64, Option<Vec<u8>>)>, StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT command_id, processed_at FROM processed_commands")?;
+        let mut stmt = conn.prepare("SELECT command_id, processed_at, outcome FROM processed_commands")?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Merge foreign ledger claims (profile import). Existing claims win;
-    /// returns how many rows were newly inserted.
-    pub fn import_processed_commands(&self, rows: &[(String, i64)]) -> Result<usize, StoreError> {
+    /// Merge foreign ledger claims and outcomes (profile import). Existing
+    /// claims and known outcomes win; fill unknown outcomes from the source.
+    /// Returns only the number of newly inserted claims.
+    pub fn import_processed_commands(&self, rows: &[(String, i64, Option<Vec<u8>>)]) -> Result<usize, StoreError> {
         store_blocking(|| self.import_processed_commands_blocking(rows))
     }
 
     fn import_processed_commands_blocking(
         &self,
-        rows: &[(String, i64)],
+        rows: &[(String, i64, Option<Vec<u8>>)],
     ) -> Result<usize, StoreError> {
         let mut inserted = 0;
         let conn = self.conn();
-        for (command_id, processed_at) in rows {
-            inserted += conn.execute(
-                "INSERT OR IGNORE INTO processed_commands (command_id, processed_at) VALUES (?1, ?2)",
-                params![command_id, processed_at],
+        for (command_id, processed_at, outcome) in rows {
+            let added = conn.execute(
+                "INSERT OR IGNORE INTO processed_commands (command_id, processed_at, outcome) VALUES (?1, ?2, ?3)",
+                params![command_id, processed_at, outcome],
             )?;
+            inserted += added;
+            if added == 0 && outcome.is_some() {
+                conn.execute(
+                    "UPDATE processed_commands SET outcome=?2 WHERE command_id=?1 AND outcome IS NULL",
+                    params![command_id, outcome],
+                )?;
+            }
         }
         Ok(inserted)
     }
@@ -690,6 +701,29 @@ impl DocsStore {
             params![command_id, now_ms()],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Record a claimed command's terminal status/resolution before acknowledging
+    /// execution. The outcome shares the processed claim's lifetime and is immutable.
+    pub fn finish_processed_command(&self, id: &str, outcome: &[u8]) -> Result<(), StoreError> {
+        store_blocking(|| {
+            let changed = self.conn().execute(
+                "UPDATE processed_commands SET outcome=?2 WHERE command_id=?1 AND (outcome IS NULL OR outcome=?2)",
+                params![id, outcome],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::CommandConflict(format!("{id}: missing claim or conflicting outcome")));
+            }
+            Ok(())
+        })
+    }
+
+    /// A known terminal outcome, or None for an unclaimed/interrupted legacy id.
+    pub fn processed_command_outcome(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        store_blocking(|| Ok(self.conn().query_row(
+            "SELECT outcome FROM processed_commands WHERE command_id=?1", [id],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        ).optional()?.flatten()))
     }
 
     /// Claim immutable Crew control intent before network delivery. An existing
@@ -1098,6 +1132,104 @@ mod tests {
             "second mark must not re-claim"
         );
     }
+
+    #[test]
+    fn private_auth_baseline_and_existing_boat_store_preserve_claims_and_outcomes() {
+        for existing_boat in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let outcome = br#"["applied",null]"#;
+            {
+                let conn = Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+                conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT;").unwrap();
+                // Private auth 0.2.115 retains the prototype's first nine migrations.
+                for (index, sql) in MIGRATIONS[..9].iter().enumerate() {
+                    conn.execute_batch(sql).unwrap();
+                    conn.execute("INSERT INTO schema_migrations VALUES (?1,0)", [index + 1]).unwrap();
+                }
+                conn.execute("INSERT INTO processed_commands VALUES ('legacy',123)", []).unwrap();
+                conn.execute("INSERT INTO snapshots (doc_id,bytes,saved_at) VALUES ('chat',?1,456)", [b"retained".as_slice()]).unwrap();
+                if existing_boat {
+                    // Freeze the already-deployed prototype's version and SQL,
+                    // rather than constructing it from the migration under test.
+                    conn.execute_batch("ALTER TABLE processed_commands ADD COLUMN outcome BLOB;
+                        INSERT INTO schema_migrations VALUES (10,0);").unwrap();
+                    conn.execute("INSERT INTO processed_commands (command_id,processed_at,outcome) VALUES ('settled',789,?1)", [outcome.as_slice()]).unwrap();
+                }
+            }
+            for _ in 0..2 {
+                let store = DocsStore::open(dir.path()).unwrap();
+                assert_eq!(store.load_snapshot("chat").unwrap().as_deref(), Some(b"retained".as_slice()));
+                assert!(!store.mark_processed("legacy").unwrap());
+                assert_eq!(store.processed_command_outcome("legacy").unwrap(), None);
+                if existing_boat {
+                    assert!(!store.mark_processed("settled").unwrap());
+                    assert_eq!(store.processed_command_outcome("settled").unwrap().as_deref(), Some(outcome.as_slice()));
+                }
+                let conn = store.conn();
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get::<_, usize>(0)).unwrap(), 10);
+                assert_eq!(conn.query_row("SELECT processed_at FROM processed_commands WHERE command_id='legacy'", [], |row| row.get::<_, i64>(0)).unwrap(), 123);
+            }
+        }
+    }
+
+    #[test]
+    fn processed_outcomes_migrate_legacy_claims_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT;
+                INSERT INTO schema_migrations VALUES (1, 0);
+                INSERT INTO processed_commands VALUES ('legacy-interrupted', 0);").unwrap();
+        }
+        let outcome = br#"["applied",null]"#;
+        {
+            let store = DocsStore::open(dir.path()).unwrap();
+            assert!(store.is_processed("legacy-interrupted").unwrap());
+            assert_eq!(store.processed_command_outcome("legacy-interrupted").unwrap(), None);
+            assert_eq!(store.processed_command_outcome("missing").unwrap(), None);
+            assert!(store.finish_processed_command("missing", outcome).is_err());
+            assert!(store.mark_processed("relayed").unwrap());
+            store.finish_processed_command("relayed", outcome).unwrap();
+            store.finish_processed_command("relayed", outcome).unwrap();
+            assert!(store.finish_processed_command("relayed", br#"["rejected","interrupted"]"#).is_err());
+        }
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert_eq!(store.processed_command_outcome("relayed").unwrap().as_deref(), Some(outcome.as_slice()));
+        assert!(!store.mark_processed("relayed").unwrap());
+        assert_eq!(store.processed_command_outcome("legacy-interrupted").unwrap(), None);
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = DocsStore::open(target_dir.path()).unwrap();
+        assert_eq!(target.import_processed_commands(&store.processed_commands().unwrap()).unwrap(), 2);
+        assert_eq!(target.processed_command_outcome("relayed").unwrap().as_deref(), Some(outcome.as_slice()));
+        assert!(target.is_processed("legacy-interrupted").unwrap());
+        assert_eq!(target.processed_command_outcome("legacy-interrupted").unwrap(), None);
+    }
+
+    #[test]
+    fn profile_import_fills_unknown_outcomes_without_replacing_known_results() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = DocsStore::open(source_dir.path()).unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = DocsStore::open(target_dir.path()).unwrap();
+        let applied = br#"["applied",null]"#;
+        let rejected = br#"["rejected","known failure"]"#;
+        for id in ["legacy-claim", "known-result", "new-claim"] {
+            source.mark_processed(id).unwrap();
+            source.finish_processed_command(id, applied).unwrap();
+        }
+        target.mark_processed("legacy-claim").unwrap();
+        target.mark_processed("known-result").unwrap();
+        target.finish_processed_command("known-result", rejected).unwrap();
+        let rows = source.processed_commands().unwrap();
+        assert_eq!(target.import_processed_commands(&rows).unwrap(), 1, "only new claims count as inserted");
+        assert_eq!(target.processed_command_outcome("legacy-claim").unwrap().as_deref(), Some(applied.as_slice()));
+        assert_eq!(target.processed_command_outcome("known-result").unwrap().as_deref(), Some(rejected.as_slice()));
+        assert_eq!(target.processed_command_outcome("new-claim").unwrap().as_deref(), Some(applied.as_slice()));
+        assert_eq!(target.import_processed_commands(&rows).unwrap(), 0);
+        assert!(!target.mark_processed("legacy-claim").unwrap());
+    }
+
 
     #[test]
     fn reopen_preserves_data_and_migrations_are_idempotent() {

@@ -2608,6 +2608,11 @@ impl RpcService for EngineRpc {
                     || self.engine_info.workspace_scope != WorkspaceScope::Synced {
                     return Err(RpcError::Failed("Devbox wake requires explicit local controller consent".into()));
                 }
+                // Fence credential replacement/revocation even if a later sign-in
+                // returns to the same visible owner and scope.
+                let auth = self.auth.as_ref().ok_or_else(|| RpcError::Failed("Crew sign-in required".into()))?;
+                let authority_epoch = zeron_rpc::TokenSource::subscribe(auth)
+                    .ok_or_else(|| RpcError::Failed("Crew authority notifications unavailable".into()))?;
                 let (principal, scope) = self.crew_services()?.controller()?;
                 if scope.project_id != "ashler-staging"
                     || scope.deployment_id.as_deref() != Some("ashler-staging") {
@@ -2622,11 +2627,24 @@ impl RpcService for EngineRpc {
                     return Err(RpcError::BadParams("Select a registered remote device".into()));
                 }
                 let links = self.links.as_ref().ok_or_else(|| RpcError::Failed("Crew peer routing is unavailable".into()))?;
-                let device = crate::devbox::wake(&self.workspace, links, &input.device_id).await.map_err(RpcError::Failed)?;
-                let (current_principal, current_scope) = self.crew_services()?.controller()?;
-                if current_principal != principal || current_scope.project_id != scope.project_id || current_scope.deployment_id != scope.deployment_id {
-                    return Err(RpcError::Failed("Crew controller scope changed during wake".into()));
-                }
+                let authorize = || {
+                    if authority_epoch.has_changed().unwrap_or(true) {
+                        return Err("Crew controller authority changed during wake".to_owned());
+                    }
+                    let (current_principal, current_scope) = self.crew_services()
+                        .and_then(|services| services.controller()).map_err(|error| error.to_string())?;
+                    if current_principal != principal || current_scope != scope {
+                        return Err("Crew controller scope changed during wake".to_owned());
+                    }
+                    Ok(())
+                };
+                let mut authority_changes = authority_epoch.clone();
+                let device = tokio::select! {
+                    biased;
+                    _ = authority_changes.changed() => return Err(RpcError::Failed("Crew controller authority changed during wake".into())),
+                    result = crate::devbox::wake(&self.workspace, links, &input.device_id, &authorize) => result.map_err(RpcError::Failed)?,
+                };
+                authorize().map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({
                     "deviceId": device.id, "devboxProvider": device.devbox_provider,
                     "devboxId": device.devbox_id, "device": device, "ready": true,

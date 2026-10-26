@@ -13,8 +13,10 @@ use zeron_rpc::{LinkCache, PeerLiveness};
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const START_TIMEOUT: Duration = Duration::from_secs(180);
-const PEER_TIMEOUT: Duration = Duration::from_secs(180);
+const WAKE_TIMEOUT: Duration = Duration::from_secs(180);
 const START_HELPER: &str = "exec \"$HOME/.local/bin/crew-devbox-autostart\" staging";
+// ponytail: one explicit wake at a time; use per-device gates if parallel wakes are needed.
+static GATE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 pub fn namespace_host() -> bool {
     cfg!(target_os = "linux") && Path::new("/.namespace/tasks").is_dir()
@@ -257,6 +259,7 @@ async fn run_cli(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    if cancel.is_cancelled() { return Err("Devbox operation cancelled".into()); }
     let mut command = Command::new(executable);
     command
         .args(args)
@@ -314,7 +317,9 @@ async fn prepare_host(
     provider: DeviceEnvironment,
     id: &str,
     cancel: &CancellationToken,
+    authorize: &(impl Fn() -> Result<(), String> + Sync),
 ) -> Result<(), String> {
+    authorize()?;
     if provider == DeviceEnvironment::Namespace {
         let (status, out, err) = run_cli(
             executable,
@@ -340,6 +345,7 @@ async fn prepare_host(
         return Err(provider_failure(&out, &err));
     }
     if wake_action(&out, id)? == WakeAction::Resume {
+        authorize()?;
         let (status, out, err) = run_cli(
             executable,
             &["--no-update", "--json", "resume", id, "--ttl", "3600"],
@@ -351,9 +357,10 @@ async fn prepare_host(
             return Err(provider_failure(&out, &err));
         }
     }
+    authorize()?;
     let (status, out, err) = run_cli(
         executable,
-        &["--no-update", "--json", "exec", id, START_HELPER],
+        &["--no-update", "--json", "exec", id, "--timeout", "180", START_HELPER],
         START_TIMEOUT,
         cancel,
     )
@@ -398,6 +405,19 @@ fn verify_peer<'a>(
     Ok(capabilities)
 }
 
+async fn wait_for_readiness_change(
+    devices: &mut tokio::sync::watch::Receiver<Vec<Device>>,
+    online: &mut tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), String> {
+    tokio::select! {
+        changed = devices.changed() => changed.map_err(|_| "Device registry closed during wake".into()),
+        event = online.recv() => match event {
+            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Ok(()),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => Err("Peer connectivity notifications closed".into()),
+        },
+    }
+}
+
 async fn await_peer(
     workspace: &crate::WorkspaceHost,
     links: &Arc<LinkCache>,
@@ -407,7 +427,7 @@ async fn await_peer(
 ) -> Result<Device, String> {
     let mut devices = workspace.watch_devices();
     let mut online = zeron_sync::wake::subscribe_online();
-    tokio::time::timeout(PEER_TIMEOUT, async {
+    tokio::time::timeout(WAKE_TIMEOUT, async {
         loop {
             {
                 let rows = devices.borrow_and_update();
@@ -439,10 +459,7 @@ async fn await_peer(
                 }
             }
             // The normal registry/presence stream drives readiness; never poll the provider.
-            tokio::select! {
-                changed = devices.changed() => { changed.map_err(|_| "Device registry closed during wake")?; }
-                event = online.recv() => { event.map_err(|_| "Peer connectivity notifications closed")?; }
-            }
+            wait_for_readiness_change(&mut devices, &mut online).await?;
         }
     }).await.map_err(|_| "Devbox started but its exact Crew peer did not become ready; the original draft was not submitted".to_owned())?
 }
@@ -451,13 +468,23 @@ pub(crate) async fn wake(
     workspace: &crate::WorkspaceHost,
     links: &Arc<LinkCache>,
     device_id: &str,
+    authorize: &(impl Fn() -> Result<(), String> + Sync),
+) -> Result<Device, String> {
+    // This deadline includes gate contention, provider operations and exact-peer
+    // readiness. Dropping an in-flight provider future kills only its owned group.
+    tokio::time::timeout(WAKE_TIMEOUT, wake_inner(workspace, links, device_id, authorize)).await
+        .map_err(|_| "Devbox wake timed out; inspect its existing state before retrying. The original draft was not submitted".to_owned())?
+}
+
+async fn wake_inner(
+    workspace: &crate::WorkspaceHost,
+    links: &Arc<LinkCache>,
+    device_id: &str,
+    authorize: &(impl Fn() -> Result<(), String> + Sync),
 ) -> Result<Device, String> {
     if !cfg!(unix) {
         return Err("Devbox wake requires a macOS or Linux controller".into());
     }
-    // ponytail: one explicit wake at a time; use per-device gates if a controller needs parallel wakes.
-    static GATE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
-    let _guard = GATE.lock().await;
     let device = workspace
         .read_devices()
         .map_err(|_| "Could not read the device registry")?
@@ -467,8 +494,21 @@ pub(crate) async fn wake(
     let (provider, id) = device
         .devbox_binding()
         .ok_or("The selected device has no valid immutable Devbox binding")?;
+    let _guard = GATE.lock().await;
+    // Consent belongs to the original binding and live controller authority,
+    // revalidated after gate contention and before every provider command.
+    let authorize_host = || {
+        authorize()?;
+        let current = workspace.read_devices().map_err(|_| "Could not read the device registry")?;
+        if current.iter().find(|row| row.id == device_id).and_then(Device::devbox_binding)
+            != Some((provider, id)) {
+            return Err("The selected Devbox binding changed during wake".into());
+        }
+        Ok(())
+    };
+    authorize_host()?;
     let stop = CancellationToken::new();
-    prepare_host(&executable(provider)?, provider, id, &stop).await?;
+    prepare_host(&executable(provider)?, provider, id, &stop, &authorize_host).await?;
     links.invalidate(device_id);
     await_peer(workspace, links, device_id, provider, id).await
 }

@@ -6044,6 +6044,9 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// Only the existing send task owns the pending message. This signal can
+    /// cancel its pre-admission wake without dropping send recovery cleanup.
+    boat_wake_cancel: Option<(String, futures::channel::oneshot::Sender<()>)>,
     /// Pre-admission only: dropping this task cannot discard an accepted send.
     host_wake_task: Option<Task<()>>,
     host_wake_target: Option<String>,
@@ -6359,6 +6362,7 @@ impl Composer {
             action_task: None,
             advance_task: None,
             send_task: None,
+            boat_wake_cancel: None,
             host_wake_task: None,
             host_wake_target: None,
             interrupting: HashSet::new(),
@@ -8432,6 +8436,12 @@ impl Composer {
         }) {
             self.cancel_host_wake(cx);
         }
+        let wake_target_changed = self.boat_wake_cancel.as_ref().is_some_and(|(target, _)| {
+            let state = self.state.read(cx);
+            let current = state.selected_chat_row().map(|chat| chat.device_id.clone()).or_else(|| state.effective_device_id());
+            current.as_deref() != Some(target.as_str()) || state.selected_chat.as_deref().unwrap_or_default() != self.current_key
+        });
+        if wake_target_changed { self.cancel_boat_wake(cx); }
         let delivered = {
             let state = self.state.read(cx);
             state.selected_chat.as_ref().filter(|chat| {
@@ -8658,6 +8668,57 @@ impl Composer {
             s.indicator_for(chat_id, chrono::Utc::now()),
             Indicator::Working | Indicator::AwaitingInput
         )
+    }
+
+    fn boat_wake_binding(&self, cx: &App) -> Option<(String, String)> {
+        let state = self.state.read(cx);
+        let target = state.active_device_id()?;
+        if state.local_device_id.as_deref() == Some(target.as_str())
+            || state.device_online(&target, chrono::Utc::now()) { return None; }
+        let device = state.devices.iter().find(|device| device.id == target)?;
+        let (provider, boat) = device.devbox_binding()?;
+        if provider != zeron_proto::DeviceEnvironment::Boat { return None; }
+        Some((target, boat.to_owned()))
+    }
+
+    fn cancel_boat_wake(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, cancel)) = self.boat_wake_cancel.take() { let _ = cancel.send(()); }
+        cx.notify();
+    }
+
+    fn publish_send(&mut self, chat_id: &str, select_new: bool, queue: bool, echo: SessionMessageEntry, cx: &mut Context<Self>) {
+        self.launching_new_chat = select_new;
+        if select_new { cx.emit(ComposerEvent::NewThreadTransitionStarted); }
+        let message_id = echo.id.clone();
+        self.state.update(cx, |state, cx| {
+            if select_new { state.select_chat(Some(chat_id.to_owned()), cx); }
+            if should_publish_optimistic_echo(queue) {
+                state.push_echo(chat_id, echo);
+                state.begin_pending_send(chat_id, &message_id, chrono::Utc::now());
+            }
+            cx.notify();
+        });
+        if should_publish_optimistic_echo(queue) {
+            cx.emit(ComposerEvent::Sent { chat_id: chat_id.to_owned(), message_id });
+        }
+    }
+
+    fn seed_send_attachments(device_id: &str, local_device_id: Option<&str>, staged: &[StagedAttachment], upload_ids: &[String], echo_paths: &[String], queued_flow: bool) {
+        // Pending upload aliases survive the host's eventual path rewrite.
+        if queued_flow {
+            for (upload_id, attachment) in upload_ids.iter().zip(staged) {
+                attachments::seed_staged_alias(device_id, upload_id, attachment);
+                if let Some(local) = local_device_id && local != device_id {
+                    attachments::seed_staged_alias(local, upload_id, attachment);
+                }
+            }
+        }
+        for (path, attachment) in echo_paths.iter().zip(staged) {
+            attachments::seed_staged(device_id, path, attachment);
+            if let Some(local) = local_device_id && local != device_id {
+                attachments::seed_staged(local, path, attachment);
+            }
+        }
     }
 
     fn reference_delivery_supported(&self, cx: &App) -> bool {
@@ -8960,7 +9021,7 @@ impl Composer {
         let target = state.active_device_id()?;
         if state.local_device_id.as_deref() == Some(target.as_str())
             || state.device_online(&target, chrono::Utc::now()) { return None; }
-        state.devices.iter().find(|device| device.id == target && device.devbox_binding().is_some()).cloned()
+        state.devices.iter().find(|device| device.id == target && device.devbox_binding().is_some_and(|(provider, _)| provider == zeron_proto::DeviceEnvironment::Namespace)).cloned()
     }
 
     fn cancel_host_wake(&mut self, cx: &mut Context<Self>) {
@@ -9062,7 +9123,9 @@ impl Composer {
             self.provision_scaffold(cx);
             return;
         }
-        if !self.check_reference_delivery(&text, cx) {
+        if self.sending { return; }
+        let wake_binding = self.boat_wake_binding(cx);
+        if wake_binding.is_none() && !self.check_reference_delivery(&text, cx) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -9134,18 +9197,6 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
-        // A host that predates scratch folders runs a projectless chat in `~`.
-        let scratch_folders = {
-            let state = self.state.read(cx);
-            let host = if device_id == "local" {
-                local_device_id.as_deref()
-            } else {
-                Some(device_id.as_str())
-            };
-            host.is_some_and(|host| {
-                state.device_supports(host, zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
-            })
-        };
         let create_side_chat = self.state.update(cx, |state, _| {
             if state.side_chat_unsaved()
                 && let Some(mut config) = resolved.chat_config()
@@ -9159,20 +9210,16 @@ impl Composer {
             }
             state.unsaved_side_chat_create(&chat_id)
         });
-        if queue && !is_new {
-            let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
+        let queue_capability = (queue && !is_new).then(|| {
+            if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
-            } else {
-                capabilities::MESSAGE_QUEUE_ATTACHMENTS_V1
-            };
-            if !engine.engine_info().supports(capability)
-                || !self.state.read(cx).chat_host_supports(&chat_id, capability)
-            {
-                self.failure =
-                    Some("Update the chat's engine to queue messages during a response.".into());
-                cx.notify();
-                return;
-            }
+            } else { capabilities::MESSAGE_QUEUE_ATTACHMENTS_V1 }
+        });
+        if wake_binding.is_none() && let Some(capability) = queue_capability
+            && (!engine.engine_info().supports(capability) || !self.state.read(cx).chat_host_supports(&chat_id, capability)) {
+            self.failure = Some("Update the chat's engine to queue messages during a response.".into());
+            cx.notify();
+            return;
         }
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
@@ -9214,14 +9261,6 @@ impl Composer {
         // Existing busy chats always queue; compatibility was checked before
         // taking the draft, attachments, or review comments.
         let queue = queue && !is_new;
-        let clean_queue_attachment_text = staged.is_empty()
-            || (engine
-                .engine_info()
-                .supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1)
-                && self.state.read(cx).chat_host_supports(
-                    &chat_id,
-                    capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
-                ));
 
         // Queued-attachment flow (durable-by-design): stage the bytes on the
         // LOCAL engine, queue the command immediately with `pending://` refs,
@@ -9240,7 +9279,7 @@ impl Composer {
         // Appshot XML attributes require escaped final paths. The engine's plain
         // string replacement of pending refs cannot safely rewrite those, so
         // rich captures use the existing upload-before-send path.
-        let queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty() && {
+        let mut queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty() && {
             let state = self.state.read(cx);
             let local_ok = local_device_id
                 .as_deref()
@@ -9265,7 +9304,7 @@ impl Composer {
         // refresh replaces with the host's absolute paths. Either way the
         // staged bytes are seeded into the transcript cache under every
         // device key the transcript consults.
-        let echo_paths: Vec<String> = if queued_flow {
+        let mut echo_paths: Vec<String> = if queued_flow {
             staged
                 .iter()
                 .zip(&upload_ids)
@@ -9282,32 +9321,12 @@ impl Composer {
             .zip(&echo_paths)
             .map(|(attachment, path)| (attachment.id.clone(), path.clone()))
             .collect();
-        let echo_text = attachments::with_attachments(
+        let mut echo_text = attachments::with_attachments(
             &appshots::with_appshots(&text, &staged_appshots, &echo_appshot_paths),
             &echo_paths,
         );
-        // Queued flow also seeds the UPLOAD ALIAS: the host rewrites the
-        // persisted ref to `{its uploads dir}/{id8}-{name}` — an absolute
-        // path the sender can't predict, but whose id8 it minted. The alias
-        // keeps the thumbnail on the already-local bytes through that
-        // rewrite instead of blanking into a reload skeleton.
-        if queued_flow {
-            for (upload_id, att) in upload_ids.iter().zip(&staged) {
-                attachments::seed_staged_alias(&device_id, upload_id, att);
-                if let Some(local) = local_device_id.as_deref()
-                    && local != device_id
-                {
-                    attachments::seed_staged_alias(local, upload_id, att);
-                }
-            }
-        }
-        for (path, att) in echo_paths.iter().zip(&staged) {
-            attachments::seed_staged(&device_id, path, att);
-            if let Some(local) = local_device_id.as_deref()
-                && local != device_id
-            {
-                attachments::seed_staged(local, path, att);
-            }
+        if wake_binding.is_none() {
+            Self::seed_send_attachments(&device_id, local_device_id.as_deref(), &staged, &upload_ids, &echo_paths, queued_flow);
         }
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
@@ -9325,39 +9344,26 @@ impl Composer {
             continuation_of: None,
             duration_ms: None,
         };
-        self.launching_new_chat = is_new;
-        if is_new {
-            cx.emit(ComposerEvent::NewThreadTransitionStarted);
-        }
-        // A queued message is not in the transcript yet — the queue panel is
-        // its echo, and it gets a real bubble when the host sends it.
-        self.state.update(cx, |s, cx| {
-            if is_new {
-                s.select_chat(Some(chat_id.clone()), cx);
-            }
-            if should_publish_optimistic_echo(queue) {
-                s.push_echo(&chat_id, echo);
-                // Working overlay until the host executes the queued command —
-                // without it a remote send flashed Completed (and could ring
-                // the done-chime) in the queue→drain→sync gap.
-                s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
-            }
-            cx.notify();
-        });
+        // A sleeping Boat host must be ready before changing the visible
+        // selection or claiming a pending turn. The immutable snapshot
+        // still travels through this same send task and command ledger.
+        let mut deferred_echo = if wake_binding.is_some() { Some(echo) } else {
+            self.publish_send(&chat_id, is_new, queue, echo, cx);
+            None
+        };
 
-        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.input.update(cx, |input, cx| {
+            if wake_binding.is_some() { input.read_only = true; cx.notify(); }
+            else { input.set_text("", cx); }
+        });
         self.drafts.remove(&self.current_key);
         self.failure = None;
         self.sending = true;
-        // A queued row is represented by the queue panel, not the transcript.
-        // Claiming an own-turn anchor for it here would replace the live
-        // turn's runway with an id that has no transcript row yet.
-        if should_publish_optimistic_echo(queue) {
-            cx.emit(ComposerEvent::Sent {
-                chat_id: chat_id.clone(),
-                message_id: message_id.clone(),
-            });
-        }
+        let wake_cancel = wake_binding.as_ref().map(|_| {
+            let (cancel, receive) = futures::channel::oneshot::channel();
+            self.boat_wake_cancel = Some((wake_binding.as_ref().unwrap().0.clone(), cancel));
+            receive
+        });
         cx.notify();
 
         let restore_text = typed;
@@ -9366,7 +9372,136 @@ impl Composer {
         let scaffold_initial = self.scaffold_session.as_deref() == Some(chat_id.as_str()) && self.scaffold_command.is_some();
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let mut admission_attempted = false;
+            let mut send_started = wake_binding.is_none();
             let result: Result<Option<String>, String> = async {
+                let mut wake_transport = None;
+                if let Some((target, boat)) = &wake_binding {
+                    let wake_executor = cx.background_executor().clone();
+                    let wake = async {
+                        let request = engine.client().call_scoped(methods::WAKE_DEVICE, serde_json::json!({ "deviceId": target }));
+                        let deadline = wake_executor.timer(Duration::from_secs(180));
+                        futures::pin_mut!(request, deadline);
+                        match futures::future::select(request, deadline).await {
+                            futures::future::Either::Left((result, _)) => result.map_err(|error| error.to_string()),
+                            futures::future::Either::Right(_) => Err("Connecting to the selected Boat host timed out. Your draft is preserved.".to_string()),
+                        }
+                    };
+                    let cancel = wake_cancel.expect("Boat wake has a cancellation receiver");
+                    futures::pin_mut!(wake, cancel);
+                    let ready = match futures::future::select(cancel.as_mut(), wake).await {
+                        futures::future::Either::Left(_) => return Err("Connection cancelled. Your draft is preserved.".into()),
+                        futures::future::Either::Right((result, _)) => result?,
+                    };
+                    if ready["ready"].as_bool() != Some(true)
+                        || ready["deviceId"].as_str() != Some(target.as_str())
+                        || ready["devboxProvider"].as_str() != Some("boat")
+                        || ready["devboxId"].as_str() != Some(boat.as_str()) {
+                        return Err("The connected device does not match the selected Boat host. Nothing was sent.".into());
+                    }
+                    let device = <zeron_proto::Device as serde::Deserialize>::deserialize(&ready["device"])
+                        .map_err(|error| format!("Could not read the connected device: {error}"))?;
+                    if device.id != *target || device.devbox_binding() != Some((zeron_proto::DeviceEnvironment::Boat, boat.as_str())) {
+                        return Err("The connected device snapshot does not match the selected Boat host. Nothing was sent.".into());
+                    }
+                    let references_supported = device.supports(capabilities::COMPOSER_REFERENCES_V1);
+                    let queue_supported = queue_capability.is_none_or(|capability| engine.engine_info().supports(capability) && device.supports(capability));
+                    wake_transport = Some((device.supports(capabilities::PROJECTLESS_SCRATCH_V1),
+                        staged.is_empty() || (engine.engine_info().supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1)
+                            && device.supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1))));
+                    let (refresh, _observe) = this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            let mut devices = state.devices.clone();
+                            let slot = devices.iter_mut().find(|row| row.id == *target)
+                                .filter(|row| row.devbox_binding() == Some((zeron_proto::DeviceEnvironment::Boat, boat.as_str())))
+                                .ok_or_else(|| "The selected host binding changed. Nothing was sent.".to_string())?;
+                            *slot = device;
+                            state.apply_devices(devices);
+                            let fresh_queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty()
+                                && local_device_id.as_deref().is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN))
+                                && (!host_is_remote || host_device_id.as_deref().is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN)));
+                            if queued_flow != fresh_queued_flow {
+                                queued_flow = fresh_queued_flow;
+                                for ((path, attachment), upload_id) in echo_paths.iter_mut().zip(&staged).zip(&upload_ids) {
+                                    *path = if queued_flow { format!("pending://{upload_id}/{}", attachment.name) }
+                                        else { format!("pending/{}/{}", attachment.id, attachment.name) };
+                                }
+                                // This transport can change only for plain attachments;
+                                // appshots always use the host-upload path.
+                                echo_text = attachments::with_attachments(&text, &echo_paths);
+                                if let MessagePart::Text { text, .. } = &mut deferred_echo.as_mut().expect("Boat echo is deferred").parts[0] {
+                                    text.clone_from(&echo_text);
+                                }
+                            }
+                            cx.notify();
+                            Ok::<(), String>(())
+                        })?;
+                        let (send, receive) = futures::channel::oneshot::channel();
+                        let mut send = Some(send);
+                        let refresh_target = target.clone();
+                        let harness = resolved.harness;
+                        let observe = cx.observe(&composer.pickers, move |composer, _, cx| {
+                            if let Some(result) = composer.pickers.read(cx).wake_refresh_result(&refresh_target, harness, cx)
+                                && let Some(send) = send.take() { let _ = send.send(result); }
+                        });
+                        composer.pickers.update(cx, |pickers, cx| pickers.refresh_after_wake(target, harness, cx));
+                        Ok::<_, String>((receive, observe))
+                    }).map_err(|error| error.to_string())??;
+                    let refresh = async { refresh.await.map_err(|_| "Connection refresh cancelled".to_string())? };
+                    let timeout = cx.background_executor().timer(Duration::from_secs(30));
+                    futures::pin_mut!(refresh, timeout);
+                    let refresh = futures::future::select(refresh, timeout);
+                    futures::pin_mut!(refresh);
+                    match futures::future::select(cancel.as_mut(), refresh).await {
+                        futures::future::Either::Left(_) => return Err("Connection cancelled. Your draft is preserved.".into()),
+                        futures::future::Either::Right((futures::future::Either::Left((result, _)), _)) => result?,
+                        futures::future::Either::Right(_) => return Err("Refreshing the connected device timed out. Your draft is preserved.".into()),
+                    }
+                    this.update(cx, |composer, cx| {
+                        let state = composer.state.read(cx);
+                        if composer.current_key != key || state.active_device_id().as_deref() != Some(target.as_str())
+                            || !state.devices.iter().any(|row| row.id == *target
+                                && row.devbox_binding() == Some((zeron_proto::DeviceEnvironment::Boat, boat.as_str())))
+                            || composer.boat_wake_cancel.is_none()
+                        {
+                            return Err("The selected host or binding changed. Your draft is preserved.".to_string());
+                        }
+                        composer.boat_wake_cancel = None;
+                        if references_require_update(&text, references_supported) {
+                            return Err("Update Crew on the selected device to send file, command, or skill references. Your draft is preserved.".to_string());
+                        }
+                        if !queue_supported {
+                            return Err("Update Crew on the chat's host to queue messages during a response.".to_string());
+                        }
+                        composer.input.update(cx, |input, cx| {
+                            input.read_only = false;
+                            if composer.current_key == key { input.set_text("", cx); }
+                        });
+                        composer.slash_cache.clear();
+                        composer.slash_task = None;
+                        composer.mention_task = None;
+                        composer.reset_slash(None, cx);
+                        composer.reset_mention(None, cx);
+                        let select_new = is_new && composer.current_key == key
+                            && composer.state.read(cx).selected_chat.is_none()
+                            && composer.state.read(cx).active_device_id().as_deref() == Some(target.as_str());
+                        Self::seed_send_attachments(&device_id, local_device_id.as_deref(), &staged, &upload_ids, &echo_paths, queued_flow);
+                        composer.publish_send(&chat_id, select_new, queue, deferred_echo.expect("Boat send defers its echo"), cx);
+                        cx.notify();
+                        Ok::<(), String>(())
+                    }).map_err(|error| error.to_string())??;
+                    send_started = true;
+                }
+                // Freeze user choices and payload, not compatibility decisions:
+                // a wake reply may upgrade or remove the host's declarations.
+                let (scratch_folders, clean_queue_attachment_text) = if let Some(transport) = wake_transport { transport }
+                else { this.update(cx, |composer, cx| {
+                    let state = composer.state.read(cx);
+                    let host = if device_id == "local" { local_device_id.as_deref() } else { Some(device_id.as_str()) };
+                    let scratch = host.is_some_and(|host| state.device_supports(host, capabilities::PROJECTLESS_SCRATCH_V1));
+                    let clean_queue = staged.is_empty() || (engine.engine_info().supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1)
+                        && state.chat_host_supports(&chat_id, capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1));
+                    (scratch, clean_queue)
+                }).map_err(|error| error.to_string())? };
                 // Attachments stage FIRST — before the chat row or anything
                 // else exists. Staging is chat-independent (keyed by
                 // uploadId), and ordering it first makes a new-chat send
@@ -9819,7 +9954,7 @@ impl Composer {
                 Ok(None)
             }
             .await;
-            if result.is_err() && is_new {
+            if result.is_err() && is_new && send_started {
                 // A failed new-chat send must not strand a just-minted empty
                 // chat in the sidebar (v0.2.12 "empty transcript" report).
                 // Staging now runs before CreateChat, so usually nothing was
@@ -9837,6 +9972,8 @@ impl Composer {
             }
             this.update(cx, |composer, cx| {
                 composer.sending = false;
+                composer.boat_wake_cancel = None;
+                if wake_binding.is_some() { composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); }); }
                 if scaffold_initial && (result.is_ok() || !admission_attempted) {
                     crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
                         if settings.crew_pending_prompts.get(&err_chat_id) == Some(&err_message_id) {
@@ -9882,18 +10019,18 @@ impl Composer {
                         }
                         cx.notify();
                     });
-                    if is_new && composer.current_key != restore_key {
-                        // A re-key swap to the canvas is pending (the
-                        // select_chat(None) above); it loads this draft into
-                        // the input on flush — setting the input directly
-                        // here would be clobbered by that same swap.
+                    if composer.current_key != restore_key {
+                        // Navigation may already have loaded another draft.
+                        // Restore only the origin slot, never that visible input.
                         composer.drafts.insert(restore_key.clone(), restore_text.clone());
                     } else {
                         // Already keyed to the restore target (either an
                         // existing chat, or the deleted row's watch event
                         // re-keyed to the canvas before this handler ran —
                         // no further swap will fire). Set the input directly.
-                        composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                        if composer.input.read(cx).text() != restore_text {
+                            composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                        }
                     }
                     if !ordinary_staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
@@ -11165,7 +11302,11 @@ impl Render for Composer {
             };
             let offline = state.connectivity.state == S::Offline;
             degraded.then(|| {
-                let text: SharedString = if offline {
+                let text: SharedString = if self.boat_wake_cancel.is_some() {
+                    "Connecting to the selected Boat host…".into()
+                } else if self.boat_wake_binding(cx).is_some() {
+                    "Send will connect to the selected Boat host first.".into()
+                } else if offline {
                     "Offline — messages will send when you're back online.".into()
                 } else {
                     "Messages will send once the connection recovers.".into()
@@ -11175,6 +11316,7 @@ impl Render for Composer {
         };
         // The shell owns the width and its route animation. A route-dependent
         // cap here would cut a wide composer before its return glide finishes.
+        let cancel_wake = cx.entity().downgrade();
         let container = div()
             .w_full()
             .max_w(px(self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH)))
@@ -11184,6 +11326,24 @@ impl Render for Composer {
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
+            .when(self.boat_wake_cancel.is_some(), |el| el.child(
+                div().mx(px(8.0)).flex().items_center().gap(px(8.0))
+                    .text_size(px(11.0)).text_color(theme.text_muted)
+                    .child("Connecting…")
+                    .child(crate::settings::widgets::text_action(&theme, crate::settings::widgets::ActionTone::Quiet, "Cancel")
+                        .id("cancel-boat-send").tab_index(0).role(gpui::Role::Button)
+                        .aria_label("Cancel connection and keep draft")
+                        .focus_visible(|style| style.border_2().border_color(theme.accent))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_boat_wake(cx)))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                cx.stop_propagation(); this.cancel_boat_wake(cx);
+                            }
+                        }))
+                        .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                            cancel_wake.update(cx, |this, cx| this.cancel_boat_wake(cx)).ok();
+                        })),
+            ))
             .when(self.host_wake_task.is_some(), |el| el.child(
                 div().id("host-wake-cancel").role(gpui::Role::Button).tab_index(0)
                     .aria_label("Cancel host connection")
@@ -12857,6 +13017,256 @@ mod tests {
     }
 
     #[gpui::test]
+    fn boat_send_waits_for_exact_peer_and_preserves_failed_or_cancelled_drafts(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        for outcome in ["failed", "new-chat-failed", "wrong-peer", "wrong-snapshot", "binding-changed", "binding-refresh-changed", "cancelled", "timeout", "cancel-refresh", "refresh-failed", "ready"] {
+            let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+            let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, _| {
+                state.local_device_id = Some("controller".into());
+                state.devices = vec![serde_json::from_value(serde_json::json!({
+                    "id": "boat-host", "name": "Anything", "platform": "linux",
+                    "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "lastSeenAt": null,
+                })).unwrap()];
+                state.chats = vec![serde_json::from_value(serde_json::json!({
+                    "id": "boat-chat", "deviceId": "boat-host", "cwd": "/workspace",
+                    "archived": false, "createdAt": chrono::Utc::now(),
+                    "config": { "harness": "codex", "model": "original-model", "sandbox": "workspace-write" },
+                })).unwrap()];
+                state.selected_chat = Some("boat-chat".into());
+                if outcome == "new-chat-failed" { state.selected_chat = None; state.selected_device = Some("boat-host".into()); }
+                state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
+            });
+            let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+            composer.update(cx, |composer, cx| {
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("Original immutable message", cx);
+                    input.selected_range = 4..12;
+                });
+                composer.pickers.update(cx, |pickers, cx| pickers.refresh_after_wake("boat-host", Some(HarnessId::Codex), cx));
+                composer.on_state_changed(cx);
+            });
+            cx.run_until_parked();
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                assert_ne!(frame.method.as_deref(), Some(methods::WAKE_DEVICE), "passive discovery must not wake");
+                assert_ne!(frame.method.as_deref(), Some(methods::QUEUE_COMMAND));
+            }
+            composer.update(cx, |composer, cx| {
+                if outcome != "ready" {
+                    composer.attachments.insert(composer.current_key.clone(), vec![attachments::stage_png_bytes("keep.png".into(), vec![1, 2, 3])]);
+                }
+                composer.on_submit(cx);
+                composer.on_submit(cx);
+            });
+            cx.run_until_parked();
+            let mut wake = None;
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                assert_ne!(frame.method.as_deref(), Some(methods::QUEUE_COMMAND));
+                assert_ne!(frame.method.as_deref(), Some(methods::MUTATE));
+                if frame.method.as_deref() == Some(methods::WAKE_DEVICE) {
+                    assert!(wake.is_none(), "double Enter must share the pending send");
+                    assert_eq!(frame.params, serde_json::json!({"deviceId": "boat-host"}));
+                    wake = Some(frame);
+                }
+            }
+            let wake = wake.expect("explicit Send must wake the bound offline host");
+            let selection = if outcome == "new-chat-failed" { None } else { Some("boat-chat") };
+            assert_eq!(state.read_with(cx, |state, _| state.selected_chat.clone()).as_deref(), selection);
+            if outcome == "binding-changed" {
+                state.update(cx, |state, cx| {
+                    state.devices[0].devbox_id = Some("bx_23456789".into());
+                    cx.notify();
+                });
+            }
+            if outcome == "ready" {
+                state.update(cx, |state, cx| {
+                    let mut config = state.selected_chat_row().unwrap().config.clone().unwrap();
+                    config.model = Some("changed-after-send".into());
+                    state.apply_chat_config("boat-chat", config);
+                    cx.notify();
+                });
+            }
+            if outcome == "timeout" {
+                cx.executor().advance_clock(Duration::from_secs(180));
+            } else if outcome == "cancelled" {
+                composer.update(cx, |composer, cx| composer.cancel_boat_wake(cx));
+            } else {
+                let frame = if matches!(outcome, "failed" | "new-chat-failed") {
+                    zeron_rpc::ServerFrame { id: wake.id, err: Some("provider refused wake".into()), ..Default::default() }
+                } else {
+                    zeron_rpc::ServerFrame { id: wake.id, ok: Some(serde_json::json!({
+                        "deviceId": if outcome == "wrong-peer" { "another-host" } else { "boat-host" },
+                        "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "ready": true,
+                        "device": { "id": if outcome == "wrong-snapshot" { "another-host" } else { "boat-host" },
+                            "name": "Authoritative Boat", "platform": "linux", "version": "0.2.113",
+                            "lastSeenAt": chrono::Utc::now(), "devboxProvider": "boat", "devboxId": "bx_jdyh7avc" },
+                    })), ..Default::default() }
+                };
+                replies.try_send(serde_json::to_string(&frame).unwrap()).unwrap();
+            }
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+            let mut commands = Vec::new();
+            let mut cancelled_wake = false;
+            for _ in 0..3 {
+                while let Ok(frame) = requests.try_recv() {
+                    let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                    if frame.cancel && frame.id == wake.id { cancelled_wake = true; }
+                    assert_ne!(frame.method.as_deref(), Some(methods::WAKE_DEVICE));
+                    if outcome != "ready" { assert_ne!(frame.method.as_deref(), Some(methods::MUTATE)); }
+                    if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) { commands.push(frame); continue; }
+                    if matches!(frame.method.as_deref(), Some(methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_REFS)) {
+                        assert_eq!(frame.params["targetDeviceId"], "boat-host");
+                        assert!(commands.is_empty(), "catalog refresh must precede command admission");
+                        if outcome == "binding-refresh-changed" {
+                            state.update(cx, |state, cx| {
+                                state.devices[0].devbox_id = Some("bx_23456789".into());
+                                cx.notify();
+                            });
+                        }
+                        if outcome == "cancel-refresh" { composer.update(cx, |composer, cx| composer.cancel_boat_wake(cx)); }
+                        else {
+                            let reply = if outcome == "refresh-failed" {
+                                zeron_rpc::ServerFrame { id: frame.id, err: Some("catalog unavailable".into()), ..Default::default() }
+                            } else {
+                                zeron_rpc::ServerFrame { id: frame.id, ok: Some(serde_json::json!([])), ..Default::default() }
+                            };
+                            replies.try_send(serde_json::to_string(&reply).unwrap()).unwrap();
+                        }
+                    }
+                }
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+            }
+            assert_eq!(cancelled_wake, matches!(outcome, "cancelled" | "timeout"));
+            if outcome == "ready" {
+                let [command] = commands.as_slice() else { panic!("expected exactly one command: {commands:?}"); };
+                assert_eq!(command.params["chatId"], "boat-chat");
+                assert_eq!(command.params["command"]["request"]["prompt"], "Original immutable message");
+                assert_eq!(command.params["command"]["request"]["model"], "original-model");
+            } else {
+                assert!(commands.is_empty());
+                composer.read_with(cx, |composer, cx| {
+                    assert!(!composer.sending);
+                    assert_eq!(composer.input.read(cx).text(), "Original immutable message");
+                    assert_eq!(composer.staged().len(), 1);
+                    assert_eq!(composer.input.read(cx).selected_range, 4..12);
+                    assert!(!composer.input.read(cx).read_only);
+                    assert!(composer.failure.is_some());
+                    if matches!(outcome, "failed" | "new-chat-failed") { assert!(composer.failure.as_deref().unwrap().contains("provider refused wake")); }
+                    if outcome == "refresh-failed" { assert!(composer.failure.as_deref().unwrap().contains("catalog unavailable")); }
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn boat_admission_uses_authoritative_transport_capabilities(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        for mode in ["scratch", "queue", "attachment"] {
+            for supported in [false, true] {
+                let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+                let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+                let caps = |current: bool| {
+                    let mut caps = vec![capabilities::MESSAGE_QUEUE_ATTACHMENTS_V1.to_string()];
+                    if current {
+                        caps.push(capabilities::PROJECTLESS_SCRATCH_V1.to_string());
+                        caps.push(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1.to_string());
+                    }
+                    caps
+                };
+                let state = cx.new(|_| AppState::new());
+                state.update(cx, |state, _| {
+                    state.local_device_id = Some("controller".into());
+                    state.selected_device = Some("boat-host".into());
+                    state.no_project = true;
+                    state.devices = serde_json::from_value(serde_json::json!([
+                        { "id": "controller", "name": "Controller", "platform": "macos", "version": "0.2.113" },
+                        { "id": "boat-host", "name": "Boat", "platform": "linux", "lastSeenAt": null,
+                          "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "capabilities": caps(!supported),
+                          "version": if supported { "0.1.0" } else { "0.2.113" } }
+                    ])).unwrap();
+                    state.chats = vec![serde_json::from_value(serde_json::json!({
+                        "id": "boat-chat", "deviceId": "boat-host", "cwd": "/workspace",
+                        "archived": false, "createdAt": chrono::Utc::now(),
+                        "config": { "harness": "codex", "model": "original-model", "sandbox": "workspace-write" },
+                    })).unwrap()];
+                    if mode != "scratch" { state.selected_chat = Some("boat-chat".into()); }
+                    let engine = crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound))
+                        .with_test_capabilities(caps(true));
+                    state.set_test_engine(engine);
+                });
+                let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+                composer.update(cx, |composer, cx| {
+                    composer.input.update(cx, |input, cx| input.set_text("Original transport message", cx));
+                    if mode != "scratch" {
+                        composer.attachments.insert(composer.current_key.clone(), vec![attachments::stage_png_bytes("keep.png".into(), vec![1, 2, 3])]);
+                    }
+                    composer.send("Original transport message".into(), mode == "queue", cx);
+                });
+                let mut admitted = Vec::new();
+                let mut created_cwd = None;
+                let mut upload_target = None;
+                let mut wake_count = 0;
+                for _ in 0..12 {
+                    cx.run_until_parked();
+                    while let Ok(frame) = requests.try_recv() {
+                        let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                        let value = match frame.method.as_deref() {
+                            Some(methods::WAKE_DEVICE) => {
+                                wake_count += 1;
+                                assert_eq!(frame.params["deviceId"], "boat-host");
+                                serde_json::json!({ "deviceId": "boat-host", "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "ready": true,
+                                    "device": { "id": "boat-host", "name": "Boat", "platform": "linux",
+                                        "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "lastSeenAt": chrono::Utc::now(),
+                                        "capabilities": caps(supported), "version": if supported { "0.2.113" } else { "0.1.0" } } })
+                            }
+                            Some(methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_REFS) => serde_json::json!([]),
+                            Some(methods::UPLOAD_CHUNK) => {
+                                upload_target = Some(frame.params["targetDeviceId"].clone());
+                                serde_json::json!({})
+                            }
+                            Some(methods::UPLOAD_COMMIT) => serde_json::json!({"path": "/boat/keep.png"}),
+                            Some(methods::MUTATE) if frame.params["op"] == "createChat" => {
+                                created_cwd = Some(frame.params["cwd"].clone());
+                                serde_json::json!({})
+                            }
+                            Some(methods::QUEUE_MESSAGE | methods::QUEUE_COMMAND) => {
+                                admitted.push(frame.clone());
+                                serde_json::json!({"id": "queued-message", "commandId": "command"})
+                            }
+                            _ => continue,
+                        };
+                        replies.try_send(serde_json::to_string(&zeron_rpc::ServerFrame {
+                            id: frame.id, ok: Some(value), ..Default::default()
+                        }).unwrap()).unwrap();
+                    }
+                    runtime.block_on(async { tokio::task::yield_now().await });
+                }
+                assert_eq!(wake_count, 1);
+                let [admitted] = admitted.as_slice() else { panic!("expected one admission: {admitted:?}"); };
+                if mode == "scratch" {
+                    let cwd = &admitted.params["command"]["request"]["cwd"];
+                    assert_eq!(created_cwd.as_ref(), Some(cwd));
+                    assert_eq!(cwd == "~", !supported);
+                } else if mode == "queue" {
+                    assert_eq!(admitted.params["text"] == "Original transport message", supported);
+                    assert_eq!(admitted.params["attachments"], serde_json::json!(["/boat/keep.png"]));
+                } else {
+                    assert_eq!(upload_target, Some(if supported { serde_json::Value::Null } else { serde_json::json!("boat-host") }));
+                    assert_eq!(admitted.params["transfers"].is_array(), supported);
+                    assert_eq!(admitted.params["command"]["request"]["prompt"].as_str().unwrap().contains("pending://"), supported);
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
     fn projectless_composer_allows_send_and_enter_submission(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -12972,7 +13382,7 @@ mod tests {
             state.selected_device = Some("remote".into());
             state.devices = vec![serde_json::from_value(serde_json::json!({
                 "id": "remote", "name": "host", "platform": "linux",
-                "devboxProvider": "boat", "devboxId": "bx_234abcxy",
+                "devboxProvider": "namespace", "devboxId": "ofpf7g22n4412",
             })).unwrap()];
         });
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));

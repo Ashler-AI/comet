@@ -229,9 +229,11 @@ fn captured_env() -> Vec<(String, String)> {
 }
 
 fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
-    let mut unit = String::from(
-        "[Unit]\nDescription=Crew headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
-    );
+    let mut unit = String::from("[Unit]\nDescription=Crew headless engine\nAfter=network-online.target\n");
+    if env.iter().any(|(key, value)| key == "COMET_DEVBOX_PROVIDER" && value == "boat") {
+        unit.push_str("ConditionEnvironment=BOAT_ID\n");
+    }
+    unit.push_str("StartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n");
     for (key, value) in env {
         // systemd unquotes the value; escape the characters it treats specially.
         let value = value.replace('\\', "\\\\").replace('"', "\\\"")
@@ -393,6 +395,7 @@ mod tests {
             let legacy = Path::new("/home/u").join(root).join("app/1/comet");
             assert_eq!(exec_path_for(&legacy, Some(Path::new("/home/u"))), legacy.display().to_string());
         }
+        assert!(!unit.contains("ConditionEnvironment=BOAT_ID"));
     }
 
     #[test]
@@ -416,6 +419,7 @@ mod tests {
         assert!(unit.contains("Environment=\"COMET_DEVBOX_PROVIDER=boat\"\n"));
         assert!(unit.contains("Environment=\"COMET_DEVBOX_ID=bx_jdyh7avc\"\n"));
         assert!(!CAPTURED_ENV.contains(&"BOAT_ID"));
+        assert!(unit.contains("ConditionEnvironment=BOAT_ID\n"));
         assert!(!unit.contains("Environment=\"BOAT_ID="));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,zeron=\\\"debug\\\"\"\n"));
