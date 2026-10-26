@@ -73,9 +73,19 @@ An occupied native root cannot be reused as fresh: use explicit `login`/`headles
 coordinates for a separate empty root instead. Profile migration requires separate
 authorization and its offline import/readback gates. Packaging never imports or
 launches a profile.
-Packaged headed startup pins these compiled coordinates; CLI, environment and
-saved runtime overrides cannot redirect it. Explicit coordinates remain available
-to the separate `login` and `headless` operator commands.
+Packaged headed startup uses the compiled coordinates by default; CLI, environment
+and ordinary saved-runtime overrides cannot redirect it. The explicit local opt-in
+is `desktop-profile.json` in that compiled native data root (`~/.crew` for
+production, `~/.crew-staging` for staging), containing one JSON absolute path string
+to an existing **native** profile directory. Its `crew-runtime.json` must supply
+Edge, Scaffold, project and nonzero IPC coordinates; deployment is optional but
+must be nonblank when supplied. Invalid or incomplete selection aborts startup,
+never falls back to a blank profile, and never follows a second profile pointer.
+Selection preserves both runtime configuration files, including unknown fields,
+and uses the existing attach-first, single-writer engine bootstrap. It does not
+copy credentials, migrate legacy stores, or make a retained profile fresh. Remove
+only the pointer to restore compiled defaults. `login` and `headless` ignore this
+pointer and retain their explicit-coordinate behavior.
 
 Credential-free release verification on macOS:
 

@@ -61,6 +61,26 @@ impl RuntimeArgs {
         let defaults = RuntimeArgs::default();
         let args = if pinned { &defaults } else { self };
         let data_dir = std::path::absolute(args.data_dir.clone().unwrap_or_else(|| crate::paths::resolve_data_dir(&mut env, pinned)))?;
+        // Only this local file can redirect a packaged desktop; never inherit a
+        // profile from its parent process or follow another profile's pointer.
+        let desktop_profile = if pinned {
+            let path = data_dir.join("desktop-profile.json");
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let target: PathBuf = serde_json::from_slice(&std::fs::read(&path)
+                        .context("cannot read desktop-profile.json")?)
+                        .context("desktop-profile.json must contain a JSON path string")?;
+                    if !target.is_absolute() || !target.is_dir() {
+                        bail!("desktop-profile.json must name an absolute existing profile directory");
+                    }
+                    Some(target)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else { None };
+        let selected_desktop_profile = desktop_profile.is_some();
+        let data_dir = desktop_profile.unwrap_or(data_dir);
         let mut setting = |name: &str, upstream: &str| {
             if pinned || isolated { return None; }
             env(name).and_then(|value| value.into_string().ok()).filter(|value| !value.trim().is_empty())
@@ -68,14 +88,22 @@ impl RuntimeArgs {
         };
         let explicit_profile = args.data_dir.is_some() || setting("COMET_DATA_DIR", "ZERON_DATA_DIR").is_some();
         let settings_path = data_dir.join("crew-runtime.json");
-        let saved = if pinned { RuntimeSettings::default() } else {
+        let saved = if pinned && !selected_desktop_profile { RuntimeSettings::default() } else {
             match std::fs::read(&settings_path) {
                 Ok(bytes) => serde_json::from_slice::<RuntimeSettings>(&bytes)
                     .context("invalid Crew runtime configuration")?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => RuntimeSettings::default(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !selected_desktop_profile => RuntimeSettings::default(),
                 Err(error) => return Err(error.into()),
             }
         };
+        if selected_desktop_profile && (
+            [&saved.edge_url, &saved.scaffold_url, &saved.project_scope]
+                .iter().any(|value| value.as_deref().is_none_or(|value| value.trim().is_empty()))
+            || saved.ipc_port.is_none_or(|port| port == 0)
+            || saved.deployment_id.as_deref().is_some_and(|value| value.trim().is_empty())
+        ) {
+            bail!("selected desktop profile requires saved Edge, Scaffold, project and nonzero IPC coordinates; deployment must be nonblank if supplied");
+        }
         let harness_setting = setting("COMET_HARNESS", "ZERON_HARNESS");
         let mock = harness_setting.as_deref() == Some("mock");
         let edge_token = if mock { None } else { setting("COMET_EDGE_TOKEN", "ZERON_EDGE_TOKEN") };
@@ -150,7 +178,9 @@ impl RuntimeArgs {
             && harness != HarnessId::Mock;
         // These are non-secret launch coordinates, retained for Finder launches
         // and device restarts. Credential storage belongs to the auth service.
-        if persist && scaffold.is_some() {
+        // A selected profile belongs to its existing runtime; preserve even
+        // fields this binary does not understand, byte for byte.
+        if persist && scaffold.is_some() && !selected_desktop_profile {
             std::fs::create_dir_all(&data_dir)?;
             let settings = RuntimeSettings {
                 edge_url: Some(edge_url.clone()), scaffold_url, project_scope,
@@ -419,6 +449,122 @@ mod tests {
         let persisted: RuntimeSettings = serde_json::from_slice(&std::fs::read(profile.join("crew-runtime.json")).unwrap()).unwrap();
         assert_eq!(persisted.ipc_port, Some(12345));
         assert_eq!(args.config_with_env(false, false, false, env).unwrap().ipc_port, 12348);
+    }
+
+    #[test]
+    fn desktop_profile_reuses_exact_authority_without_writing_or_falling_back() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join("existing-native-profile");
+        let parent = home.path().join("hostile-parent");
+        let argument = home.path().join("hostile-argument");
+        let env = |name: &str| -> Option<std::ffi::OsString> {
+            Some(match name {
+                "HOME" => home.path().as_os_str().to_owned(),
+                "COMET_LOCAL_AGENT_RUNTIME" => "1".into(),
+                "COMET_DATA_DIR" | "ZERON_DATA_DIR" => parent.as_os_str().to_owned(),
+                "COMET_IPC_PORT" | "ZERON_IPC_PORT" => "invalid-parent-port".into(),
+                "COMET_EDGE_URL" | "ZERON_EDGE_URL" => "https://parent-edge.invalid".into(),
+                "COMET_SCAFFOLD_URL" | "CREW_CONTROL_ORIGIN" => "https://parent-control.invalid".into(),
+                "COMET_PROJECT_SCOPE" | "CREW_PROJECT_SCOPE" => "parent-project".into(),
+                "COMET_DEPLOYMENT_ID" | "CREW_DEPLOYMENT_ID" => "parent-deployment".into(),
+                "COMET_EDGE_TOKEN" | "ZERON_EDGE_TOKEN" => "parent-secret".into(),
+                "COMET_INFERENCE_MODE" | "ZERON_INFERENCE_MODE" => "local".into(),
+                "COMET_HARNESS" | "ZERON_HARNESS" => "mock".into(),
+                "ZERON_ORG_ID" => "parent-org".into(),
+                _ => return None,
+            })
+        };
+        let args = RuntimeArgs {
+            data_dir: Some(argument.clone()), ipc_port: Some(0),
+            edge_url: Some("https://argument-edge.invalid".into()),
+            scaffold_url: Some("https://argument-control.invalid".into()),
+            project_scope: Some("argument-project".into()), deployment_id: Some("argument-deployment".into()),
+        };
+        let root = crate::paths::resolve_data_dir(env, true);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&profile).unwrap();
+        let pointer_path = root.join("desktop-profile.json");
+        let pointer = serde_json::to_vec(&profile).unwrap();
+        let runtime_path = profile.join("crew-runtime.json");
+        let saved = br#"{ "edgeUrl":"https://native-edge.invalid", "scaffoldUrl":"https://native-control.invalid", "projectScope":"native-project", "deploymentId":"native-deployment", "ipcPort":39019, "scaffoldRuntimeArtifact":{"unknown":"preserve-exactly"} }
+"#;
+        std::fs::write(&pointer_path, &pointer).unwrap();
+        std::fs::write(root.join("crew-runtime.json"), b"untouched-default-config").unwrap();
+        std::fs::write(&runtime_path, saved).unwrap();
+        std::fs::write(profile.join("desktop-profile.json"), b"not-followed").unwrap();
+        let assert_untouched = |expected_pointer: &[u8], expected_runtime: Option<&[u8]>| {
+            assert_eq!(std::fs::read(&pointer_path).unwrap(), expected_pointer);
+            assert_eq!(std::fs::read(root.join("crew-runtime.json")).unwrap(), b"untouched-default-config");
+            assert_eq!(std::fs::read(profile.join("desktop-profile.json")).unwrap(), b"not-followed");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+            assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 1 + usize::from(expected_runtime.is_some()));
+            if let Some(bytes) = expected_runtime {
+                assert_eq!(std::fs::read(&runtime_path).unwrap(), bytes);
+            } else {
+                assert!(!runtime_path.exists());
+            }
+            assert!(!parent.exists() && !argument.exists());
+        };
+        let config = args.config_with_env(true, true, true, env).unwrap();
+        assert_eq!(config.data_dir, profile);
+        assert_eq!(config.ipc_port, 39019);
+        assert_eq!(config.edge_url, "https://native-edge.invalid");
+        assert!(config.edge_token.is_none() && config.org_id.is_none() && config.workos_client_id.is_none());
+        assert_eq!(config.default_harness, HarnessId::Omp);
+        assert!(config.managed_inference);
+        let authority = config.scaffold.unwrap();
+        assert_eq!(authority.control_origin, "https://native-control.invalid");
+        assert_eq!(authority.project_scope, "native-project");
+        assert_eq!(authority.deployment_id.as_deref(), Some("native-deployment"));
+        assert_untouched(&pointer, Some(saved));
+        for deployment in [None, Some(serde_json::Value::Null), Some(serde_json::json!(" "))] {
+            let mut optional: serde_json::Value = serde_json::from_slice(saved).unwrap();
+            optional.as_object_mut().unwrap().remove("deploymentId");
+            if let Some(value) = &deployment {
+                optional["deploymentId"] = value.clone();
+            }
+            let bytes = serde_json::to_vec(&optional).unwrap();
+            std::fs::write(&runtime_path, &bytes).unwrap();
+            let result = args.config_with_env(true, true, true, env);
+            if deployment.as_ref().is_some_and(|value| value.is_string()) {
+                assert!(result.is_err());
+            } else {
+                let config = result.unwrap();
+                assert_eq!(config.data_dir, profile);
+                assert_eq!(config.ipc_port, 39019);
+                assert!(config.scaffold.unwrap().deployment_id.is_none());
+            }
+            assert_untouched(&pointer, Some(&bytes));
+        }
+        std::fs::write(&runtime_path, saved).unwrap();
+
+        let missing = home.path().join("missing-profile");
+        for invalid_pointer in [b"{".to_vec(), b"{}".to_vec(), b"null".to_vec(),
+            serde_json::to_vec("relative-profile").unwrap(), serde_json::to_vec(&missing).unwrap(),
+            serde_json::to_vec(&runtime_path).unwrap()]
+        {
+            std::fs::write(&pointer_path, &invalid_pointer).unwrap();
+            assert!(args.config_with_env(true, true, true, env).is_err());
+            assert_untouched(&invalid_pointer, Some(saved));
+            assert!(!missing.exists());
+        }
+        std::fs::write(&pointer_path, &pointer).unwrap();
+        std::fs::remove_file(&runtime_path).unwrap();
+        assert!(args.config_with_env(true, true, true, env).is_err());
+        assert_untouched(&pointer, None);
+        std::fs::write(&runtime_path, b"{").unwrap();
+        assert!(args.config_with_env(true, true, true, env).is_err());
+        assert_untouched(&pointer, Some(b"{"));
+        for field in ["edgeUrl", "scaffoldUrl", "projectScope", "ipcPort"] {
+            for invalid in [serde_json::Value::Null, if field == "ipcPort" { serde_json::json!(0) } else { serde_json::json!(" ") }] {
+                let mut incomplete: serde_json::Value = serde_json::from_slice(saved).unwrap();
+                incomplete[field] = invalid;
+                let bytes = serde_json::to_vec(&incomplete).unwrap();
+                std::fs::write(&runtime_path, &bytes).unwrap();
+                assert!(args.config_with_env(true, true, true, env).is_err(), "accepted incomplete {field}");
+                assert_untouched(&pointer, Some(&bytes));
+            }
+        }
     }
 
     #[test]
