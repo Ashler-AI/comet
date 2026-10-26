@@ -365,6 +365,12 @@ time a session is started from the phone (or from Settings → Notifications),
 registers its APNs token with the choices from Settings, stays quiet while
 open, and opens the session a notification is tapped for.
 
+Signed-in, non-demo clients refresh registration on foreground and network
+recovery when notification permission is already granted. Registration and
+removal share one task queue: logout or account replacement invalidates queued
+updates and removes the old target after any in-flight registration finishes.
+Queued updates recheck account identity before using the latest token and choices.
+
 Tapped notifications must carry matching `userId` and `projectScope`; new Edge
 payloads also carry matching `deploymentId`. Existing two-field legacy payloads
 remain valid only for that same verified account/project. Bare session IDs and
@@ -376,6 +382,11 @@ APNs uses the existing staging topic `ai.ashler.crew.staging` and team
 uses production APNs. Existing deployment secrets and App ID capabilities must
 already match. The release workflow does not create capabilities, tester groups,
 testers, permissions, or public App Store submissions.
+
+The sender requires `APNS_KEY_P8`, `APNS_KEY_ID`, `APNS_TEAM_ID` and `APNS_TOPIC`;
+the native staging adapter maps its `APNS_PRIVATE_KEY` secret to `APNS_KEY_P8`.
+Without the complete matching configuration, events are recorded but not sent.
+An enabled phone setting alone does not establish APNs delivery.
 
 ## Staging archive, export, upload and readback
 

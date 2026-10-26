@@ -882,6 +882,8 @@ pub struct AppState {
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    // A send's acknowledgement must remain observable after leaving its chat.
+    pending_send_tasks: HashMap<String, (Option<Task<()>>, Option<Task<()>>)>,
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
     queue_task: Option<Task<()>>,
@@ -996,6 +998,7 @@ impl AppState {
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
+            pending_send_tasks: HashMap::new(),
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
             queue_task: None,
@@ -1197,6 +1200,12 @@ impl AppState {
         sort_chats(&mut chats);
         if !self.chats_synced || self.chats != chats {
             changed = true;
+            self.pending_send_tasks.retain(|id, _| {
+                !self.chats.iter().any(|c| c.id == *id) || chats.iter().any(|c| c.id == *id)
+            });
+            self.pending_sends.retain(|id, _| {
+                !self.chats.iter().any(|c| c.id == *id) || chats.iter().any(|c| c.id == *id)
+            });
             self.chats = chats;
             self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
             self.chats_synced = true;
@@ -1793,6 +1802,7 @@ impl AppState {
             .is_some_and(|p| p.message_id == message_id)
         {
             self.pending_sends.remove(chat_id);
+            self.pending_send_tasks.remove(chat_id);
         }
     }
 
@@ -1913,6 +1923,36 @@ impl AppState {
             .map(|p| p.started)
     }
 
+    /// Delivery belongs to the sent chat/message, not whichever chat is selected.
+    fn receive_pending_send_update(&mut self, chat_id: &str, update: &zeron_doc::TranscriptUpdate) -> bool {
+        let Some(pending) = self.pending_sends.get_mut(chat_id) else { return false };
+        let adopted = match &update.frame {
+            TranscriptFrame::Reset { reset } => reset.iter().any(|e| e.id == pending.message_id),
+            TranscriptFrame::Delta { upsert, .. } => upsert.iter().any(|u| u.entry.id == pending.message_id),
+        };
+        if adopted {
+            self.pending_sends.remove(chat_id);
+            self.pending_send_tasks.remove(chat_id);
+            return true;
+        }
+        let delivery = update.command_delivery.get(&pending.message_id).cloned();
+        if matches!(delivery, Some(zeron_doc::CommandDeliveryStatus::Failed { .. })) {
+            self.pending_send_tasks.remove(chat_id);
+        }
+        if pending.delivery == delivery { return false; }
+        pending.delivery = delivery;
+        true
+    }
+
+    fn ack_pending_send_from_queue(&mut self, chat_id: &str, items: &[zeron_doc::QueuedMessage]) -> bool {
+        if self.pending_sends.get(chat_id).is_some_and(|p| items.iter().any(|q| q.id == p.message_id)) {
+            self.pending_sends.remove(chat_id);
+            self.pending_send_tasks.remove(chat_id);
+            return true;
+        }
+        false
+    }
+
     /// The host executed the queued command iff the sent message's id showed
     /// up in the transcript (it writes the message before — causally with —
     /// the Working status; sessions.rs dispatch paths).
@@ -1922,27 +1962,22 @@ impl AppState {
             && self.transcript.iter().any(|e| e.id == pending.message_id)
         {
             self.pending_sends.remove(chat_id);
+            self.pending_send_tasks.remove(chat_id);
         }
     }
 
     /// A send the host held for the next turn shows as its queue row, not
     /// as an echo: drop echoes (and the pending-send overlay) for queued ids.
     pub fn apply_queue(&mut self, items: Vec<zeron_doc::QueuedMessage>) {
-        if let Some(chat_id) = self.selected_chat.as_deref() {
-            if let Some(echoes) = self.echoes.get_mut(chat_id) {
+        if let Some(chat_id) = self.selected_chat.clone() {
+            if let Some(echoes) = self.echoes.get_mut(&chat_id) {
                 let before = echoes.len();
                 echoes.retain(|echo| !items.iter().any(|q| q.id == echo.id));
                 if echoes.len() != before {
                     self.transcript_revision = self.transcript_revision.wrapping_add(1);
                 }
             }
-            if self
-                .pending_sends
-                .get(chat_id)
-                .is_some_and(|p| items.iter().any(|q| q.id == p.message_id))
-            {
-                self.pending_sends.remove(chat_id);
-            }
+            self.ack_pending_send_from_queue(&chat_id, &items);
         }
         self.queue = items;
     }
@@ -2449,6 +2484,7 @@ impl AppState {
         self.engine = None;
         self.watch_tasks.clear();
         self.transcript_task = None;
+        self.pending_send_tasks.clear();
         self.change_request_tasks.clear();
         self.change_requests = ChangeRequestClientState::default();
         self.connection = ConnectionStatus::Connecting;
@@ -2886,10 +2922,9 @@ impl AppState {
         self.deep_link_notice.take()
     }
 
-    /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
-    /// dropping the old task drops its stream receiver, which cancels the doc
-    /// watch server-side. Selecting a chat also lands in its space and marks it
-    /// seen (a global-list click must switch the tab strip too).
+    /// Select a chat (or clear). Swaps its transcript/queue subscriptions, but
+    /// retains the previous chat's watches until an outstanding send is adopted.
+    /// Selecting also lands in its space and marks it seen.
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
         if let Some(id) = &chat_id
             && !self.is_unsaved_side_chat(id)
@@ -2916,8 +2951,15 @@ impl AppState {
             .position(|cached| Some(&cached.chat_id) == chat_id.as_ref())
             .and_then(|index| self.transcript_cache.remove(index));
         if let Some(previous) = &self.selected_chat {
-            // Cancelling this chat's watch ends our evidence of ongoing preparation.
-            if let Some(pending) = self.pending_sends.get_mut(previous)
+            if self.pending_sends.contains_key(previous)
+                && self.send_failure(previous).is_none()
+                && self.transcript_task.is_some()
+            {
+                self.pending_send_tasks.insert(
+                    previous.clone(),
+                    (self.transcript_task.take(), self.queue_task.take()),
+                );
+            } else if let Some(pending) = self.pending_sends.get_mut(previous)
                 && matches!(pending.delivery, Some(zeron_doc::CommandDeliveryStatus::Preparing))
             {
                 pending.delivery = None;
@@ -3003,6 +3045,13 @@ impl AppState {
         self.queue.clear();
         self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
+            if self.pending_send_tasks.remove(id).is_some()
+                && let Some(pending) = self.pending_sends.get_mut(id)
+                && matches!(pending.delivery, Some(zeron_doc::CommandDeliveryStatus::Preparing))
+            {
+                // The replacement watch must supply its own preparation evidence.
+                pending.delivery = None;
+            }
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) restores the pick set aside above.
             if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
@@ -3417,8 +3466,7 @@ fn spawn_transcript_watch(
     handle: EngineHandle,
     chat_id: String,
 ) -> Task<()> {
-    // The scoped subscription cancels even a silent server stream on drop;
-    // otherwise a deselected chat would retain its protected sync slot.
+    // Dropping the scoped subscription cancels even a silent server stream.
     cx.spawn(async move |this, cx| {
         // Outer loop: a delta desync (missed frame) resubscribes immediately
         // and the fresh stream's opening reset heals the copy; a subscribe
@@ -3426,8 +3474,8 @@ fn spawn_transcript_watch(
         // path re-enters the loop — a return here freezes the transcript
         // with no banner and no heal short of an app restart (this watch and
         // its engine-side room are the ONLY transcript delivery path). The
-        // task itself is dropped by select_chat/apply_chats when the chat is
-        // deselected or deleted, so retrying can't outlive relevance.
+        // task is dropped on deselection unless a send still needs acknowledgement;
+        // adoption, deletion, or account replacement then releases that watch.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
             let params = serde_json::json!({ "chatId": chat_id, "openingTail": true });
@@ -3452,12 +3500,20 @@ fn spawn_transcript_watch(
                     .get("historyPending")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let Ok(selected) = this.update(cx, |state, _| {
+                    state.selected_chat.as_deref() == Some(chat_id.as_str())
+                }) else { return };
                 let decoded = cx
                     .background_executor()
                     .spawn(async move {
                         let update: zeron_doc::TranscriptUpdate =
                             serde_json::from_value(value).map_err(|e| e.to_string())?;
-                        let prepared = preparation.prepare(&update).map_err(|e| e.to_string())?;
+                        // Background watches only need delivery evidence, not rendered rows.
+                        let prepared = if selected {
+                            Some(preparation.prepare(&update).map_err(|e| e.to_string())?)
+                        } else {
+                            None
+                        };
                         Ok::<_, String>((update, prepared, preparation))
                     })
                     .await;
@@ -3486,9 +3542,11 @@ fn spawn_transcript_watch(
                         {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
                             desync = true;
-                        } else {
+                        } else if let Some(prepared) = prepared {
                             state.prepared_transcripts.insert(chat_id.clone(), prepared);
                         }
+                    } else if state.receive_pending_send_update(&chat_id, &update) {
+                        cx.notify();
                     }
                 });
                 if alive.is_err() {
@@ -3554,6 +3612,8 @@ fn spawn_queue_watch(
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
                         state.apply_queue(frame.items);
+                        cx.notify();
+                    } else if state.ack_pending_send_from_queue(&chat_id, &frame.items) {
                         cx.notify();
                     }
                 });
@@ -4688,6 +4748,96 @@ mod tests {
     }
 
     #[gpui::test]
+    fn background_send_adoption_releases_watches_without_hiding_current_errors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = Utc::now();
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, cx| {
+            s.selected_chat = Some("c".into());
+            s.begin_pending_send("c", "m1", now);
+            s.transcript_task = Some(cx.spawn(async |_, _| std::future::pending::<()>().await));
+            s.queue_task = Some(cx.spawn(async |_, _| std::future::pending::<()>().await));
+            s.select_chat(Some("other".into()), cx);
+            assert!(s.pending_send_tasks.contains_key("c"));
+            assert!(s.send_undelivered("c", later));
+            let update = |id| zeron_doc::TranscriptUpdate {
+                frame: TranscriptFrame::reset(&[user_entry(id)]),
+                context_usage: None,
+                replay_baseline: None,
+                command_delivery: HashMap::new(),
+            };
+            assert!(!s.receive_pending_send_update("other", &update("m1")));
+            assert!(!s.receive_pending_send_update("c", &update("different-message")));
+            assert!(s.send_undelivered("c", later));
+            s.sessions = vec![session("c", SessionStatus::Working, 0, later)];
+            let mut adopted = update("m1");
+            adopted.frame = TranscriptFrame::Delta {
+                upsert: vec![zeron_doc::TranscriptUpsert { after: None, entry: user_entry("m1") }],
+                append: vec![], remove: vec![], count: 1,
+            };
+            assert!(s.receive_pending_send_update("c", &adopted));
+            assert!(!s.send_undelivered("c", later));
+            assert!(!s.pending_send_tasks.contains_key("c"));
+            assert_eq!(s.indicator_for("c", later), Indicator::Working);
+            assert_eq!(s.selected_chat.as_deref(), Some("other"));
+            assert!(s.transcript.is_empty());
+
+            s.sessions[0].status = SessionStatus::Errored;
+            assert_eq!(s.indicator_for("c", later), Indicator::Errored);
+            s.begin_pending_send("c", "m2", later);
+            assert!(!s.receive_pending_send_update("c", &update("m1")));
+            assert_eq!(s.pending_sends["c"].message_id, "m2");
+            s.pending_send_tasks.insert("c".into(), (
+                Some(cx.spawn(async |_, _| std::future::pending::<()>().await)),
+                Some(cx.spawn(async |_, _| std::future::pending::<()>().await)),
+            ));
+            let rejected = zeron_doc::TranscriptUpdate {
+                frame: TranscriptFrame::reset(&[]),
+                context_usage: None,
+                replay_baseline: None,
+                command_delivery: HashMap::from([("m2".into(), zeron_doc::CommandDeliveryStatus::Failed {
+                    reason: "worktree failed".into(),
+                })]),
+            };
+            assert!(s.receive_pending_send_update("c", &rejected));
+            assert_eq!(s.send_failure("c"), Some("worktree failed"));
+            assert!(s.send_undelivered("c", later));
+            assert!(!s.pending_send_tasks.contains_key("c"), "terminal delivery releases both observers");
+        });
+    }
+
+    #[gpui::test]
+    fn reselecting_pending_send_requires_fresh_preparation_evidence(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, cx| {
+            s.selected_chat = Some("c".into());
+            s.begin_pending_send("c", "m1", now);
+            s.pending_sends.get_mut("c").unwrap().delivery =
+                Some(zeron_doc::CommandDeliveryStatus::Preparing);
+            s.transcript_task = Some(cx.spawn(async |_, _| std::future::pending::<()>().await));
+            s.queue_task = Some(cx.spawn(async |_, _| std::future::pending::<()>().await));
+            s.select_chat(Some("other".into()), cx);
+            assert!(s.pending_send_tasks.contains_key("c"));
+            assert!(s.send_preparing("c"));
+            assert!(s.send_pending("c", later));
+
+            // No engine: the replacement watch cannot deliver a fresh frame.
+            s.select_chat(Some("c".into()), cx);
+            assert!(!s.pending_send_tasks.contains_key("c"));
+            assert_eq!(s.pending_sends["c"].message_id, "m1");
+            assert!(!s.send_preparing("c"));
+            assert!(!s.send_pending("c", later));
+            assert!(s.send_undelivered("c", later));
+        });
+    }
+
+    #[gpui::test]
     fn switching_chats_invalidates_preparation_but_preserves_failure(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -5775,6 +5925,15 @@ mod tests {
         assert_eq!(ids, vec!["sent"]);
         assert!(!state.pending_sends.contains_key("c1"));
         assert_eq!(state.queue.len(), 1);
+
+        // Queue adoption also arrives while another chat is selected.
+        state.selected_chat = Some("other".into());
+        state.begin_pending_send("c1", "background-held", Utc::now());
+        assert!(!state.ack_pending_send_from_queue("other", &[row("background-held")]));
+        assert!(!state.ack_pending_send_from_queue("c1", &[row("unrelated")]));
+        assert!(state.ack_pending_send_from_queue("c1", &[row("background-held")]));
+        assert!(!state.pending_sends.contains_key("c1"));
+        assert_eq!(state.queue[0].id, "held", "background receipts do not replace the visible queue");
     }
 
     #[test]

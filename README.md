@@ -42,6 +42,14 @@ select that same verified owner, but cannot select another account. Search uses
 the engine at `--ipc-port` (or inherited `COMET_IPC_PORT`); updating the CLI alone
 does not update an already-running engine's search behavior.
 
+### Managed model choices
+
+Crew's managed Codex picker uses the bundled shared model catalog, including
+`gpt-6.1-sol`, rather than the native CLI's offline fallback. Codex receives the
+bare model ID; Agent Auth still checks account/model access when a run starts.
+Update and restart the running Crew engine to refresh these choices; replacing
+only the frontend or CLI does not update its catalog behavior.
+
 ### Native Scaffold handoff
 
 `comet session handoff [CHAT_ID] --prompt-file FILE` forks the last completed

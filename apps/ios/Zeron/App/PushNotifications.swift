@@ -22,7 +22,9 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private weak var app: AppModel?
+    private var currentClient: () -> CoreClient?
+    private var accountGeneration: UInt64 = 0
+    private(set) var pendingRegistration: Task<Void, Never>?
     private var token: String?
     private struct Target: Sendable {
         let chatId: String
@@ -35,9 +37,15 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     /// Opens a chat once the shell is up (set by the scene).
     var openChat: ((String) -> Bool)?
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private static let enabledKey = "notifications.enabled"
     private static let askedKey = "notifications.asked"
+
+    init(defaults: UserDefaults = .standard, currentClient: @escaping () -> CoreClient? = { nil }) {
+        self.defaults = defaults
+        self.currentClient = currentClient
+        super.init()
+    }
 
     // MARK: Choices
 
@@ -47,7 +55,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
         get { defaults.object(forKey: Self.enabledKey) as? Bool ?? true }
         set {
             defaults.set(newValue, forKey: Self.enabledKey)
-            Task { await self.sync() }
+            sync()
         }
     }
 
@@ -55,7 +63,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     func set(_ kind: Kind, _ on: Bool) {
         defaults.set(on, forKey: "notifications.\(kind.rawValue)")
-        Task { await self.sync() }
+        sync()
     }
 
     private var prefs: PushPrefs { PushPrefs(done: isOn(.done), input: isOn(.input), failed: isOn(.failed)) }
@@ -64,15 +72,18 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     /// At launch: route taps; once signed in, keep the edge's registration fresh.
     func install(app: AppModel) {
-        self.app = app
+        currentClient = { [weak app] in app?.client }
         UNUserNotificationCenter.current().delegate = self
     }
 
-    /// Signed in (or launched signed in): re-register if already allowed.
+    /// Refresh on sign-in, foreground and network recovery if already allowed.
     /// Tokens can change between launches; the edge keeps the latest.
     func signedIn() {
+        guard let client = currentClient(), !client.isDemo() else { return }
+        let generation = accountGeneration
         Task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
+            guard generation == accountGeneration, currentClient() === client else { return }
             if Self.allowed(settings.authorizationStatus) {
                 UIApplication.shared.registerForRemoteNotifications()
             }
@@ -82,22 +93,30 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     /// The first time a session is started from this phone: the moment the
     /// ask makes sense ("tell me when it's done").
     func askAfterFirstSession() {
-        guard app?.isDemo == false, enabled, !defaults.bool(forKey: Self.askedKey) else { return }
+        guard let client = currentClient(), !client.isDemo(), enabled, !defaults.bool(forKey: Self.askedKey) else { return }
         defaults.set(true, forKey: Self.askedKey)
-        Task { _ = await self.requestPermission() }
+        let generation = accountGeneration
+        Task {
+            guard generation == accountGeneration, currentClient() === client else { return }
+            _ = await self.requestPermission()
+        }
     }
 
     /// Ask the system (once; later it's the Settings app's call).
     @discardableResult
     func requestPermission() async -> Bool {
+        guard let client = currentClient() else { return false }
+        let generation = accountGeneration
         let center = UNUserNotificationCenter.current()
         let status = await center.notificationSettings().authorizationStatus
+        guard generation == accountGeneration, currentClient() === client else { return false }
         let granted: Bool
         if status == .notDetermined {
             granted = (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
         } else {
             granted = Self.allowed(status)
         }
+        guard generation == accountGeneration, currentClient() === client else { return false }
         if granted { UIApplication.shared.registerForRemoteNotifications() }
         return granted
     }
@@ -112,9 +131,18 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     /// Signing out: this phone stops getting the account's notifications.
     func signingOut(client: CoreClient?) {
+        accountGeneration &+= 1
         token = nil
         pendingTarget = nil
-        if let client { Task.detached { try? await client.unregisterPushTarget() } }
+        if let client {
+            let previous = pendingRegistration
+            pendingRegistration = Task {
+                // An in-flight upsert must finish before this account's removal.
+                await previous?.value
+                do { try await client.unregisterPushTarget() }
+                catch { NSLog("push target removal failed: \(error)") }
+            }
+        }
         UIApplication.shared.unregisterForRemoteNotifications()
     }
 
@@ -122,7 +150,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     func didRegister(deviceToken: Data) {
         token = deviceToken.map { String(format: "%02x", $0) }.joined()
-        Task { await sync() }
+        sync()
     }
 
     func didFailToRegister(_ error: Error) {
@@ -130,16 +158,24 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     }
 
     /// Tell the edge what this phone wants now (or that it wants nothing).
-    private func sync() async {
-        guard let client = app?.client, app?.isDemo == false else { return }
-        do {
-            if enabled, let token {
-                try await client.registerPushTarget(token: token, environment: Self.apnsEnvironment, prefs: prefs)
-            } else if !enabled {
-                try await client.unregisterPushTarget()
+    private func sync() {
+        guard let client = currentClient(), !client.isDemo() else { return }
+        let generation = accountGeneration
+        let previous = pendingRegistration
+        pendingRegistration = Task {
+            await previous?.value
+            guard generation == accountGeneration, currentClient() === client else { return }
+            // Read choices after waiting: an older queued refresh cannot restore
+            // stale preferences, and sign-out invalidates every queued upsert.
+            do {
+                if enabled, let token {
+                    try await client.registerPushTarget(token: token, environment: Self.apnsEnvironment, prefs: prefs)
+                } else if !enabled {
+                    try await client.unregisterPushTarget()
+                }
+            } catch {
+                NSLog("push target sync failed: \(error)")
             }
-        } catch {
-            NSLog("push target sync failed: \(error)")
         }
     }
 
@@ -202,7 +238,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func open(_ target: Target) {
-        guard let client = app?.client else { pendingTarget = target; return }
+        guard let client = currentClient() else { pendingTarget = target; return }
         guard Self.matchesScope(userId: target.userId, projectScope: target.projectScope, deploymentId: target.deploymentId,
                                 currentUser: client.userId(), currentProject: client.orgId(), currentDeployment: Endpoints.deploymentId)
         else { pendingTarget = nil; return }
