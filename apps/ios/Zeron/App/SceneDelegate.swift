@@ -41,7 +41,6 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
         app.onSignOut = { [weak self] in
             guard let self else { return }
-            push.signingOut(client: self.app.client)
             self.app.signOutLocally()
             self.showRoot(animated: true)
         }
@@ -192,6 +191,6 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         requestedLink = nil
         deferredLink = nil
         attemptedHosts.removeAll()
-        drainSessionLink()
+        shellShown()
     }
 }

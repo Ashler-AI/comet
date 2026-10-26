@@ -108,7 +108,12 @@ final class AppModel {
         path.pathUpdateHandler = { [weak self] p in
             DispatchQueue.main.async {
                 self?.client?.setNetworkOnline(online: p.status == .satisfied)
-                if p.status == .satisfied { self?.restoreSavedAccount() }
+                if p.status == .satisfied {
+                    self?.restoreSavedAccount()
+                    if self?.isSignedIn == true, self?.isDemo == false {
+                        PushNotifications.shared.signedIn()
+                    }
+                }
             }
         }
         path.start(queue: DispatchQueue(label: "sh.zeron.path"))
@@ -283,6 +288,7 @@ final class AppModel {
     #endif
 
     @MainActor func signIn(account: CrewAccount) async throws {
+        if let client { PushNotifications.shared.signingOut(client: client) }
         client?.shutdown()
         client = nil
         let generation = authGeneration
@@ -315,6 +321,7 @@ final class AppModel {
     }
 
     @MainActor func signOutLocally() {
+        PushNotifications.shared.signingOut(client: client)
         authGeneration &+= 1
         voice.stop()
         endDeliveryBackgroundTask()

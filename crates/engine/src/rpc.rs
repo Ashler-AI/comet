@@ -4074,6 +4074,13 @@ mod tests {
                 assert!(models.iter().any(|model| model.id.starts_with(prefix)),
                     "{harness:?} must offer a {prefix} model without provider discovery");
             }
+            if harness == HarnessId::Codex {
+                let shared = zeron_harness::managed_models(HarnessId::Omp).unwrap();
+                assert!(models.iter().all(|model| !model.id.contains('/') && shared.iter().any(|candidate|
+                    candidate.id.strip_prefix("openai-codex/") == Some(model.id.as_str()))),
+                    "Codex must offer bare IDs from the authoritative OpenAI catalog only");
+                assert!(models.iter().any(|model| model.id == "gpt-6.1-sol"));
+            }
         }
         assert!(rpc.handle(methods::LIST_MODELS,
             serde_json::json!({"harness": "cursor"})).await.is_err());

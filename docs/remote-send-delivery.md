@@ -127,6 +127,12 @@ status or actual streamed output. The iOS composer explicitly says “Sending to
 host…” during unadopted delivery; the existing echo retains Sending/Queued/Failed.
 This does not treat a pending first Run as permission to start duplicate turns.
 
+Desktop keeps the transcript and queue watches for an outstanding send when
+another chat is selected, so its sidebar delivery state still receives updates.
+Reselecting the chat replaces those watches and requires fresh Preparing evidence.
+Acknowledgements remain tied to the exact pending message; explicit delivery
+failures are not hidden by older transcript rows or unrelated session activity.
+
 ## Provider turn protection
 
 The execution host admits local sends and remotely delivered Run/Steer commands

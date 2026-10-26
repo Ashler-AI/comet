@@ -576,7 +576,19 @@ pub fn managed_models(harness: HarnessId) -> Option<Vec<Model>> {
     match harness {
         HarnessId::Omp => Some(omp::scaffold_models()),
         HarnessId::ClaudeCode => Some(claude::catalog::static_models()),
-        HarnessId::Codex => Some(codex::catalog::static_models()),
+        // Managed Codex uses the shared provider catalog, not the native CLI's
+        // offline fallback. Only the selector prefix differs on its wire.
+        HarnessId::Codex => {
+            let mut models = omp::scaffold_models();
+            models.retain_mut(|model| {
+                if !model.id.starts_with("openai-codex/") {
+                    return false;
+                }
+                model.id.drain(.."openai-codex/".len());
+                true
+            });
+            Some(models)
+        }
         _ => None,
     }
 }
