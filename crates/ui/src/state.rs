@@ -542,6 +542,12 @@ impl EngineHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.engine_info.capabilities = capabilities;
+        self
+    }
+
     pub fn client(&self) -> &RpcClient {
         self.inner.client()
     }

@@ -1049,6 +1049,232 @@ async fn steer_into_unsteerable_live_turn_holds_instead_of_interrupting() {
     );
 }
 
+/// Relay execution can precede the original CRDT command row. Its eventual
+/// arrival must retain the real outcome, not look like a crashed execution.
+#[tokio::test]
+async fn relayed_run_settles_original_command_after_doc_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let source = SessionDoc::init(CHAT).unwrap();
+    queue_as_viewer(
+        &source,
+        "cmd-relayed",
+        SessionCommandPayload::Run {
+            request: run_request("one relayed turn"),
+            message_id: "relayed-message".into(),
+        },
+    );
+    let entry = source.read_commands().unwrap().remove(0);
+    assert_eq!(
+        core.doc_host.ingest_relayed_command(CHAT, entry.clone()).await.unwrap(),
+        "executed",
+    );
+    wait_for(
+        || entries_now(&core).iter().any(|e| {
+            e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+        }),
+        "relayed assistant completed",
+    ).await;
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    assert_eq!(
+        command_status(&core, &entry.id),
+        Some((SessionCommandStatus::Applied, None)),
+        "completed relay work must not be reported as interrupted",
+    );
+    assert_eq!(
+        core.doc_host.ingest_relayed_command(CHAT, entry).await.unwrap(),
+        "duplicate",
+    );
+    assert_eq!(entries(&core).iter().filter(|e| e.role == MessageRole::Assistant).count(), 1);
+    source.doc().import(&handle.doc().export_snapshot().unwrap()).unwrap();
+    let commands = source.read_commands().unwrap();
+    assert_eq!(commands.len(), 1, "settle the original row, not a copied command");
+    assert_eq!(commands[0].status, SessionCommandStatus::Applied);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn relayed_interrupt_settles_commands_without_deadlocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![AgentEvent::TextDelta { text: "working".into() }],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+        }),
+    );
+    let source = SessionDoc::init(CHAT).unwrap();
+    queue_as_viewer(&source, "relay-run", SessionCommandPayload::Run {
+        request: run_request("interrupt this turn"),
+        message_id: "interrupted-relay-message".into(),
+    });
+    let run = source.read_commands().unwrap().remove(0);
+    core.doc_host.ingest_relayed_command(CHAT, run).await.unwrap();
+    wait_for(
+        || entries_now(&core).iter().any(|e| e.status == Some(MessageStatus::Streaming)),
+        "relayed turn streaming",
+    ).await;
+    queue_as_viewer(&source, "relay-stop", SessionCommandPayload::Interrupt {});
+    let stop = source.read_commands().unwrap().pop().unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), core.doc_host.ingest_relayed_command(CHAT, stop))
+            .await.expect("relay controls remain interruptible").unwrap(),
+        "executed",
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    for id in ["relay-run", "relay-stop"] {
+        assert_eq!(command_status(&core, id), Some((SessionCommandStatus::Applied, None)));
+    }
+    assert!(entries(&core).iter().any(|e| e.role == MessageRole::Assistant
+        && e.status == Some(MessageStatus::Aborted)));
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().status, SessionStatus::Idle);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn relayed_expiry_and_rejection_survive_doc_sync_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
+    let source = SessionDoc::init(CHAT).unwrap();
+    for (id, expiry, expected_reply) in [
+        ("relay-expired", Some(0), "expired"),
+        ("relay-rejected", None, "executed"),
+    ] {
+        let entry = SessionCommandEntry {
+            id: id.into(),
+            payload: SessionCommandPayload::RespondInput { request_id: "missing".into(), answers: vec![] },
+            issued_by: VIEWER.into(),
+            issued_at: chrono::Utc::now().timestamp_millis(),
+            based_on: None,
+            expires_at: expiry,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+            accepted_at: None,
+        };
+        source.queue_command(&entry).unwrap();
+        assert_eq!(core.doc_host.ingest_relayed_command(CHAT, entry).await.unwrap(), expected_reply);
+    }
+    core.shutdown().await;
+    drop(core);
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    assert_eq!(command_status(&core, "relay-expired"), Some((SessionCommandStatus::Expired, None)));
+    assert_eq!(command_status(&core, "relay-rejected"), Some((
+        SessionCommandStatus::Rejected, Some("no pending input request".into()),
+    )));
+    assert!(entries(&core).is_empty(), "neither rejected command may run a turn");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn orphan_preparation_receipts_recover_durable_outcomes_without_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
+    let source = SessionDoc::init(CHAT).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    for (id, known) in [("settled-receipt", true), ("interrupted-receipt", false)] {
+        queue_as_viewer(&source, id, SessionCommandPayload::Run {
+            request: run_request("must not execute from a receipt"), message_id: id.into(),
+        });
+        let entry = source.read_commands().unwrap().into_iter().find(|entry| entry.id == id).unwrap();
+        handle.doc().accept_command(&entry, chrono::Utc::now().timestamp_millis()).unwrap();
+        assert!(store.mark_processed(id).unwrap());
+        if known {
+            store.finish_processed_command(id, br#"["applied",null]"#).unwrap();
+        }
+    }
+    assert_eq!(handle.doc().pending_command_receipt_ids().unwrap().len(), 2);
+    core.doc_host.drain_commands(&handle).await;
+    assert!(handle.doc().pending_command_receipt_ids().unwrap().is_empty());
+    assert!(handle.doc().read_commands().unwrap().is_empty(), "receipts must not become executable rows");
+    let delivery = handle.doc().command_delivery().unwrap();
+    assert!(!delivery.contains_key("settled-receipt"), "applied receipt must not become a failed send");
+    assert!(matches!(delivery.get("interrupted-receipt"), Some(zeron_doc::CommandDeliveryStatus::Failed { .. })));
+    assert_eq!(store.processed_command_outcome("settled-receipt").unwrap().as_deref(), Some(br#"["applied",null]"#.as_slice()));
+    assert!(entries(&core).is_empty(), "neither receipt may launch a turn");
+    core.shutdown().await;
+}
+
+/// Dropping a blocked relay releases in-flight ownership, not its durable
+/// processed claim. A later drain must report interruption without replay.
+#[tokio::test]
+async fn aborted_relay_releases_execution_claim_without_replaying_command() {
+    struct FullMailboxHarness(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl Harness for FullMailboxHarness {
+        fn id(&self) -> HarnessId { HarnessId::Mock }
+        fn display_name(&self) -> &str { "Full mailbox" }
+        fn supports_steering(&self) -> bool { true }
+        fn steering_mode(&self) -> SteeringMode { SteeringMode::StepBoundary }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] { &[] }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> { Ok(vec![]) }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Keep steering alive but unread until interruption.
+            Ok(futures::stream::unfold(Some(controls), |controls| async move {
+                let controls = controls?;
+                controls.interrupt.cancelled().await;
+                Some((Ok(done(DoneStatus::Interrupted)), None))
+            }).boxed())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let core = assemble(dir.path(), Arc::new(FullMailboxHarness(starts.clone())));
+    core.sessions.dispatch(CHAT, HarnessId::Mock, run_request("initial"), None).await.unwrap();
+    wait_for(|| starts.load(std::sync::atomic::Ordering::SeqCst) == 1, "runtime started").await;
+    // Fill the runtime's 32-slot mailbox; the next dispatch waits in reserve().
+    for n in 0..32 {
+        core.sessions.dispatch(CHAT, HarnessId::Mock, run_request(&format!("queued-{n}")), None)
+            .await.unwrap();
+    }
+    let source = SessionDoc::init(CHAT).unwrap();
+    queue_as_viewer(&source, "aborted-relay", SessionCommandPayload::Run {
+        request: run_request("must not replay"),
+        message_id: "aborted-message".into(),
+    });
+    let entry = source.read_commands().unwrap().remove(0);
+    let host = core.doc_host.clone();
+    let request = tokio::spawn(async move { host.ingest_relayed_command(CHAT, entry).await });
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    wait_for(
+        || store.is_processed("aborted-relay").unwrap()
+            && entries_now(&core).iter().any(|e| e.id == "aborted-message"),
+        "relay consumed with executor pending",
+    ).await;
+    assert!(!request.is_finished());
+    assert_eq!(store.processed_command_outcome("aborted-relay").unwrap(), None);
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    assert_eq!(command_status(&core, "aborted-relay"), Some((
+        SessionCommandStatus::Rejected,
+        Some("interrupted before completion — retry to send again".into()),
+    )));
+    assert!(!store.mark_processed("aborted-relay").unwrap(), "abort never unclaims durable consumption");
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1, "no replay or replacement runtime");
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn processed_commands_are_skipped_on_redelivery() {
     let dir = tempfile::tempdir().unwrap();

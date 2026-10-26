@@ -751,6 +751,7 @@ impl Engine {
         auth: &Auth,
         scope: WorkspaceScope,
     ) -> Result<Option<EngineProfile>, EngineError> {
+        devbox::host_binding().map_err(EngineError::Other)?;
         match scope {
             WorkspaceScope::Local => EngineProfile::local(&config.data_dir).map(Some),
             WorkspaceScope::Development => {
@@ -1568,6 +1569,7 @@ fn env_or(key: &str, default: &str) -> String {
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
+    devbox::host_binding().map_err(EngineError::Other)?;
     std::fs::create_dir_all(data_dir)?;
     // EngineInfo is resolved before the lifetime InstanceLock is acquired, so
     // identity creation and legacy repair need their own short critical section.

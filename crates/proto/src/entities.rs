@@ -85,8 +85,7 @@ impl DeviceEnvironment {
         match self {
             Self::Namespace => id.len() == 13
                 && id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
-            Self::Boat => id.strip_prefix("bx_").is_some_and(|suffix| suffix.len() == 8
-                && suffix.bytes().all(|byte| b"23456789abcdefghjkmnpqrstuvwxyz".contains(&byte))),
+            Self::Boat => valid_boat_sandbox_id(id),
         }
     }
 }
@@ -130,6 +129,47 @@ impl Device {
 
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
+    }
+}
+
+/// Boat's immutable sandbox ID, not a display name or another provider's ID.
+pub fn valid_boat_sandbox_id(id: &str) -> bool {
+    id.strip_prefix("bx_").is_some_and(|suffix| {
+        suffix.len() == 8
+            && suffix.bytes().all(|byte| b"23456789abcdefghjkmnpqrstuvwxyz".contains(&byte))
+    })
+}
+
+#[cfg(test)]
+mod device_binding_tests {
+    use super::*;
+
+    #[test]
+    fn boat_binding_is_optional_and_round_trips_without_name_inference() {
+        let mut device: Device = serde_json::from_value(serde_json::json!({
+            "id": "remote", "name": "bx_jdyh7avc", "platform": "linux",
+            "lastSeenAt": null, "futureMetadata": {"provider": "boat"}
+        })).unwrap();
+        assert_eq!(device.devbox_binding(), None);
+        assert!(serde_json::to_value(&device).unwrap().get("devboxId").is_none());
+        device.devbox_provider = Some(DeviceEnvironment::Boat);
+        device.devbox_id = Some("bx_jdyh7avc".into());
+        let wire = serde_json::to_value(&device).unwrap();
+        assert_eq!(wire["devboxProvider"], "boat");
+        assert_eq!(wire["devboxId"], "bx_jdyh7avc");
+        assert_eq!(serde_json::from_value::<Device>(wire).unwrap(), device);
+    }
+
+    #[test]
+    fn boat_ids_require_the_immutable_provider_alphabet_and_exact_length() {
+        for id in ["bx_jdyh7avc", "bx_23456789", "bx_abcdefgh", "bx_jkmnpqrs", "bx_tuvwxyz2"] {
+            assert!(valid_boat_sandbox_id(id), "{id}");
+        }
+        for id in ["", "jdyh7avc", "bx_jdyh7av", "bx_jdyh7avcc", "bx_jdyh7av0",
+            "bx_jdyh7av1", "bx_jdyh7avi", "bx_jdyh7avl", "bx_jdyh7avo", "bx_jdyh7avA",
+            " bx_jdyh7avc", "bx_jdyh7avc\n", "BX_jdyh7avc", "bx_jdyh7avé", "ofpf7g22n4412"] {
+            assert!(!valid_boat_sandbox_id(id), "{id:?}");
+        }
     }
 }
 

@@ -366,6 +366,29 @@ impl Drop for TransferProgressGuard<'_> {
     }
 }
 
+/// An in-process execution claim, released even when its async task is dropped.
+/// The durable processed claim is deliberately never removed.
+struct CommandExecutionGuard<'a> {
+    host: &'a DocHost,
+    command_id: &'a str,
+}
+
+impl<'a> CommandExecutionGuard<'a> {
+    fn claim(host: &'a DocHost, command_id: &'a str) -> Option<Self> {
+        if lock(&host.inner.executing).insert(command_id.to_owned()) {
+            Some(Self { host, command_id })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for CommandExecutionGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.host.inner.executing).remove(self.command_id);
+    }
+}
+
 /// How long raw degradation must persist before connectivity reports it.
 /// Room joins, idle-link wakes, and navigation dials resolve well under a
 /// second on healthy networks; real outages outlive this comfortably. Recovery
@@ -4717,6 +4740,8 @@ impl DocHost {
                 SessionCommandStatus::Pending => {
                     self.inner.store.is_processed(&c.id).unwrap_or(false)
                         && !executing.contains(&c.id)
+                        && self.command_outcome(&c.id)?.is_none_or(|(status, _)| matches!(
+                            status, SessionCommandStatus::Rejected | SessionCommandStatus::Expired))
                 }
                 _ => false,
             };
@@ -4760,12 +4785,14 @@ impl DocHost {
             if old.status == SessionCommandStatus::Pending {
                 // Terminalize the consumed-but-dead original so the doc tells
                 // the truth and the next retry pass doesn't see it again.
-                self.resolve_command(
-                    &handle,
-                    &old.id,
+                let (status, resolution) = self.command_outcome(&old.id)?.unwrap_or((
                     SessionCommandStatus::Rejected,
-                    Some("interrupted before completion — superseded by retry"),
-                );
+                    Some("interrupted before completion — superseded by retry".into()),
+                ));
+                self.resolve_command(&handle, &old.id, status, resolution.as_deref())?;
+                if !matches!(status, SessionCommandStatus::Rejected | SessionCommandStatus::Expired) {
+                    continue;
+                }
             }
             let now = now_ms();
             let reissue = SessionCommandEntry {
@@ -4846,39 +4873,33 @@ impl DocHost {
         }
         // In-flight claim first (the drain's dead-command sweep must see this
         // id as alive, not crashed, while the execute below runs).
-        if !lock(&self.inner.executing).insert(entry.id.clone()) {
+        let Some(_execution) = CommandExecutionGuard::claim(self, &entry.id) else {
+            return Ok("duplicate");
+        };
+        // Claim BEFORE executing (the drain's own mark-before-execute rule).
+        if !self.inner.store.mark_processed(&entry.id)? {
             return Ok("duplicate");
         }
-        // Claim BEFORE executing (the drain's own mark-before-execute rule).
-        let marked = self.inner.store.mark_processed(&entry.id);
-        let result = match marked {
-            Err(err) => Err(err.into()),
-            Ok(false) => Ok("duplicate"),
-            Ok(true) => match disposition {
-                CommandDisposition::Skip => Ok("duplicate"),
-                CommandDisposition::Expired => Ok("expired"),
-                CommandDisposition::Superseded => Ok("superseded"),
-                CommandDisposition::Execute => {
-                    if _prompt_guard.is_some() {
-                        self.await_earlier_controls(&handle, &entry.id).await;
-                    }
-                    let result = self.execute(&sessions, &handle, &entry).await;
-                    if commands.iter().any(|command| command.id == entry.id)
-                        || matches!(&entry.payload, SessionCommandPayload::Run { request, .. } if request.worktree.is_some())
-                    {
-                        let error = result.as_ref().err().map(ToString::to_string);
-                        let (status, resolution) = match &result {
-                            Ok((status, resolution)) => (*status, resolution.as_deref()),
-                            Err(_) => (SessionCommandStatus::Rejected, error.as_deref()),
-                        };
-                        self.resolve_command(&handle, &entry.id, status, resolution);
-                    }
-                    result.map(|_| "executed")
+        let (reply, status, resolution) = match disposition {
+            CommandDisposition::Skip => return Ok("duplicate"),
+            CommandDisposition::Expired => ("expired", SessionCommandStatus::Expired, None),
+            CommandDisposition::Superseded => ("superseded", SessionCommandStatus::Superseded, None),
+            CommandDisposition::Execute => {
+                if _prompt_guard.is_some() {
+                    self.await_earlier_controls(&handle, &entry.id).await;
                 }
-            },
+                match self.execute(&sessions, &handle, &entry).await {
+                    Ok((status, resolution)) => ("executed", status, resolution),
+                    Err(err) => {
+                        self.resolve_command(&handle, &entry.id, SessionCommandStatus::Rejected,
+                            Some(&err.to_string()))?;
+                        return Err(err);
+                    }
+                }
+            }
         };
-        lock(&self.inner.executing).remove(&entry.id);
-        result
+        self.resolve_command(&handle, &entry.id, status, resolution.as_deref())?;
+        Ok(reply)
     }
 
     /// One transfer attempt: chunked `UploadChunk` + `UploadCommit` straight
@@ -5138,10 +5159,10 @@ impl DocHost {
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
             let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            // Read Pending and in-flight ownership under the same lock. A
+            // stale Pending snapshot must not reject a command that resolved
+            // and released its execution claim while this drain was reading.
             let commands = {
-                // Retirement writes the outcome before removing its executing id.
-                // Read Pending and liveness together: otherwise a control drain
-                // can overwrite that outcome using a pre-retirement snapshot.
                 let executing = lock(&self.inner.executing);
                 let commands = match handle.doc.read_commands() {
                     Ok(commands) => commands,
@@ -5150,12 +5171,10 @@ impl DocHost {
                         return;
                     }
                 };
-                // Dead-command sweep: Pending in the doc, consumed by the ledger,
-                // and NOT mid-execution in this process — the crash window
-                // between mark-processed and the outcome write. Left alone it is
-                // a send no drain or retry can ever reach ("Sending…" forever,
-                // 2026-08-19); terminalize it so the truth lands in the doc and
-                // a user retry can mint a fresh attempt.
+                // A relay may finish before its original CRDT row arrives.
+                // Replay its durable outcome before considering crash recovery.
+                // Only a consumed id without an outcome or a live executor is
+                // an interrupted attempt; it must never execute again.
                 for c in &commands {
                     if c.status == SessionCommandStatus::Pending
                         && !skipped.contains(&c.id)
@@ -5163,29 +5182,44 @@ impl DocHost {
                         && !sessions.is_original_epoch_command(&c.id)
                         && !executing.contains(&c.id)
                     {
-                        tracing::warn!(chat = %handle.chat_id, command = %c.id,
-                            "command consumed but never resolved (crash mid-execute?); rejecting");
-                        self.resolve_command(
-                            handle,
-                            &c.id,
-                            SessionCommandStatus::Rejected,
-                            Some("interrupted before completion — retry to send again"),
-                        );
+                        let outcome = match self.command_outcome(&c.id) {
+                            Ok(Some(outcome)) => outcome,
+                            Ok(None) => {
+                                tracing::warn!(chat = %handle.chat_id, command = %c.id,
+                                    "command consumed but never resolved (crash mid-execute?); rejecting");
+                                (SessionCommandStatus::Rejected,
+                                    Some("interrupted before completion — retry to send again".into()))
+                            }
+                            Err(err) => {
+                                tracing::warn!(chat = %handle.chat_id, command = %c.id, error = %err,
+                                    "command outcome read failed; halting drain");
+                                return;
+                            }
+                        };
+                        if self.resolve_command(handle, &c.id, outcome.0, outcome.1.as_deref()).is_err() {
+                            return;
+                        }
                         skipped.insert(c.id.clone());
                     }
                 }
-                // Relay preparation can precede the sender's command row.
-                // A receipt is observational only: reject abandoned work,
-                // never turn a receipt into an executable command.
+                // A preparation receipt may precede its sender-owned row too.
+                // Reconcile it from the same durable outcome, never execute it.
                 if let Ok(receipts) = handle.doc.pending_command_receipt_ids() {
                     for id in receipts {
                         if is_processed(&id) && !sessions.is_original_epoch_command(&id) && !executing.contains(&id) {
-                            self.resolve_command(
-                                handle,
-                                &id,
-                                SessionCommandStatus::Rejected,
-                                Some("interrupted before completion — retry to send again"),
-                            );
+                            let outcome = match self.command_outcome(&id) {
+                                Ok(Some(outcome)) => outcome,
+                                Ok(None) => (SessionCommandStatus::Rejected,
+                                    Some("interrupted before completion — retry to send again".into())),
+                                Err(err) => {
+                                    tracing::warn!(chat = %handle.chat_id, command = %id, error = %err,
+                                        "receipt outcome read failed; halting drain");
+                                    return;
+                                }
+                            };
+                            if self.resolve_command(handle, &id, outcome.0, outcome.1.as_deref()).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -5232,6 +5266,7 @@ impl DocHost {
             // refs whose bytes haven't landed on this device yet waits for
             // the transfer instead of running without its images. The wait is
             // bounded; past it the command fails loudly.
+            let mut attachments_expired = false;
             if matches!(disposition, CommandDisposition::Execute) {
                 let missing = self.missing_attachments(&entry);
                 if !missing.is_empty() {
@@ -5241,61 +5276,61 @@ impl DocHost {
                         self.arm_attachment_wait(handle);
                         return; // preserve order; UploadCommit / the wait timer re-kick
                     }
-                    if let Err(err) = self.inner.store.mark_processed(&entry.id) {
-                        tracing::error!(chat = %handle.chat_id, error = %err,
-                            "processed-ledger write failed; halting drain");
-                        return;
-                    }
-                    tracing::warn!(chat = %handle.chat_id, command = %entry.id,
-                        "command rejected: attachments never arrived");
-                    self.resolve_command(
-                        handle,
-                        &entry.id,
-                        SessionCommandStatus::Rejected,
-                        Some("attachments never arrived"),
-                    );
-                    continue;
+                    attachments_expired = true;
                 }
             }
             // In-flight claim: guards the dead-command sweep (an id in
             // `executing` is alive, not crashed) and serializes racing
             // drains on the same entry.
-            if !lock(&self.inner.executing).insert(entry.id.clone()) {
+            let Some(_execution) = CommandExecutionGuard::claim(self, &entry.id) else {
                 skipped.insert(entry.id.clone());
                 continue;
-            }
+            };
             // Mark BEFORE executing: a crash mid-execution must never double-run a
             // command whose side effect may already have happened.
-            if let Err(err) = self.inner.store.mark_processed(&entry.id) {
-                tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
-                lock(&self.inner.executing).remove(&entry.id);
+            match self.inner.store.mark_processed(&entry.id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    skipped.insert(entry.id.clone());
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
+                    return;
+                }
+            }
+            let outcome = if attachments_expired {
+                tracing::warn!(chat = %handle.chat_id, command = %entry.id,
+                    "command rejected: attachments never arrived");
+                Some((SessionCommandStatus::Rejected, Some("attachments never arrived".into())))
+            } else {
+                match disposition {
+                    CommandDisposition::Skip => {
+                        skipped.insert(entry.id.clone());
+                        None
+                    }
+                    CommandDisposition::Expired => Some((SessionCommandStatus::Expired, None)),
+                    CommandDisposition::Superseded => Some((SessionCommandStatus::Superseded, None)),
+                    CommandDisposition::Execute => {
+                        if matches!(
+                            entry.payload,
+                            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+                        ) {
+                            self.await_earlier_controls(handle, &entry.id).await;
+                        }
+                        Some(match self.execute(&sessions, handle, &entry).await {
+                            Ok(outcome) => outcome,
+                            Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
+                        })
+                    }
+                }
+            };
+            let resolved = outcome.map(|(status, resolution)| {
+                self.resolve_command(handle, &entry.id, status, resolution.as_deref())
+            });
+            if resolved.is_some_and(|result| result.is_err()) {
                 return;
             }
-            match disposition {
-                CommandDisposition::Skip => {
-                    skipped.insert(entry.id.clone());
-                }
-                CommandDisposition::Expired => {
-                    self.resolve_command(handle, &entry.id, SessionCommandStatus::Expired, None);
-                }
-                CommandDisposition::Superseded => {
-                    self.resolve_command(handle, &entry.id, SessionCommandStatus::Superseded, None);
-                }
-                CommandDisposition::Execute => {
-                    if matches!(
-                        entry.payload,
-                        SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
-                    ) {
-                        self.await_earlier_controls(handle, &entry.id).await;
-                    }
-                    let (status, resolution) = match self.execute(&sessions, handle, &entry).await {
-                        Ok(outcome) => outcome,
-                        Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
-                    };
-                    self.resolve_command(handle, &entry.id, status, resolution.as_deref());
-                }
-            }
-            lock(&self.inner.executing).remove(&entry.id);
         }
     }
 
@@ -5430,26 +5465,44 @@ impl DocHost {
         out
     }
 
-    /// Host-only outcome write (ledger rule 2).
+    fn command_outcome(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<(SessionCommandStatus, Option<String>)>, EngineError> {
+        self.inner.store.processed_command_outcome(command_id)?
+            .map(|bytes| serde_json::from_slice(&bytes)
+                .map_err(|err| EngineError::Other(format!("invalid command outcome: {err}"))))
+            .transpose()
+    }
+
+    /// Host-only outcome write (ledger rule 2). Persist before publishing: a
+    /// relayed execution can finish before its original CRDT row arrives.
     fn resolve_command(
         &self,
         handle: &ChatDocHandle,
         command_id: &str,
         status: SessionCommandStatus,
         resolution: Option<&str>,
-    ) {
-        if let Err(err) = handle
-            .doc
-            .set_command_status(command_id, status, resolution)
-        {
-            tracing::warn!(
-                chat = %handle.chat_id,
-                command = %command_id,
-                error = %err,
-                "command outcome write failed"
-            );
+    ) -> Result<(), EngineError> {
+        let result = (|| {
+            let outcome = serde_json::to_vec(&(status, resolution))
+                .map_err(|err| EngineError::Other(err.to_string()))?;
+            self.inner.store.finish_processed_command(command_id, &outcome)?;
+            if let Err(err) = handle.doc.set_command_status(command_id, status, resolution) {
+                // Missing original rows are expected on the relay road. Do not
+                // hide a write failure on a row that is already present.
+                if handle.doc.read_commands()?.iter().any(|c| c.id == command_id) {
+                    return Err(err.into());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = &result {
+            tracing::warn!(chat = %handle.chat_id, command = %command_id, error = %err,
+                "command outcome write failed");
         }
         handle.publish_messages_if_watched();
+        result
     }
 
     /// `entry` is a prompt sent before the Stop that has already acted on
@@ -6174,6 +6227,17 @@ fn encode_part_segment(part_id: &str) -> String {
 mod transfer_progress_tests {
     use super::{DocHost, DocHostConfig, TransferProgressGuard};
     use std::sync::Arc;
+
+    #[test]
+    fn duplicate_execution_claim_cannot_release_its_owner() {
+        let (_dir, host) = host();
+        let owner = super::CommandExecutionGuard::claim(&host, "command").unwrap();
+        assert!(super::CommandExecutionGuard::claim(&host, "command").is_none());
+        assert!(super::lock(&host.inner.executing).contains("command"));
+        drop(owner);
+        assert!(!super::lock(&host.inner.executing).contains("command"));
+        assert!(super::CommandExecutionGuard::claim(&host, "command").is_some());
+    }
 
     fn host() -> (tempfile::TempDir, DocHost) {
         let dir = tempfile::tempdir().expect("tempdir");
