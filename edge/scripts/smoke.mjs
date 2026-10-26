@@ -1,7 +1,8 @@
 // Native registry/chat2/R2 HTTP smoke against the real Worker. Local-only:
-// wrangler dev --local --env staging --ip 127.0.0.1 --port 27640 \
+// wrangler dev --local --env local --ip 127.0.0.1 --port 27640 \
 //   --var AUTH_MODE:dev --var ENVIRONMENT:local \
 //   --var SCAFFOLD_PROJECT_SCOPE:local --var SCAFFOLD_DEPLOYMENT_ID:local \
+//   --var 'SCAFFOLD_REQUIRED_CAPABILITIES:session.read session.sync.write session.files' \
 //   --var SCAFFOLD_CONTROL_PLANE_URL:http://127.0.0.1:8788 --persist-to <fresh-dir>
 // node scripts/smoke.mjs http://127.0.0.1:27640
 import assert from "node:assert/strict";
