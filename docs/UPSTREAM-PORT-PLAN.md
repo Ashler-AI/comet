@@ -158,11 +158,13 @@ pass. The reproducible isolated commands are in [`apps/ios/README.md`](../apps/i
 The supported controller controls are `RuntimeArgs` in
 `apps/zeron/src/crew_cli.rs`, not a new “fresh-only” flag. Use a genuinely new,
 private DATA root and an unused explicit IPC port, never inherited parent routing.
-Canonical packaged staging uses `~/.crew-staging` and **27957**; headed startup
-pins these compiled coordinates and ignores overrides. If either is occupied by
-retained work, do not clear or repurpose it: a separate root/free port is supported
-by `login` and `headless`, not by the packaged headed app. An occupied canonical
-profile therefore blocks a fresh-only headed rollout at those coordinates.
+Canonical packaged staging defaults to `~/.crew-staging` and **27957**, ignoring
+CLI/environment overrides. Explicit [desktop profile selection](../dist/README.md)
+can reuse an existing native profile and its saved authority without migration;
+it does not make retained data fresh. If a root or port is occupied by retained
+work, do not clear or repurpose it. Prepare a separate empty root/free port with
+`login` and `headless`; without explicit profile selection, an occupied canonical
+profile still blocks a fresh-only headed rollout at those coordinates.
 
 After compatible canonical services are ready, run the existing login-only
 **command** in an interactive terminal (there is no `--login-only` flag):
