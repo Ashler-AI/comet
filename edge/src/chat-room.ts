@@ -54,6 +54,17 @@ const QUOTA_WINDOW_MS = 60_000;
 const QUOTA_MAX_PUSHES = 300;
 const QUOTA_MAX_BYTES = 8 * 1024 * 1024;
 
+// Match one device's existing push window; cap retained input across this
+// isolate too. The active authorization counts until it actually settles.
+let receivingBytes = 0;
+let receivingMessages = 0;
+interface ReceiveQueue {
+  messages: ArrayBuffer[];
+  bytes: number;
+  count: number;
+  closed: boolean;
+}
+
 interface SocketState {
   authority?: SocketAuthority;
   userId: string;
@@ -85,6 +96,8 @@ export class ChatRoom implements DurableObject {
   /** device → rolling push quota window. Memory-only. */
   private readonly quotas = new Map<string, QuotaWindow>();
   private wakeFlight?: Promise<void>;
+  private readonly receives = new WeakMap<WebSocket, ReceiveQueue>();
+  private readonly closedReceivers = new WeakSet<WebSocket>();
   private send(ws: WebSocket, type: (typeof FRAME)[keyof typeof FRAME], header: Record<string, unknown>, payload?: Uint8Array): void {
     sendAuthorized(this.env, this.ctx, ws, encodeFrame(type, header, payload));
   }
@@ -372,15 +385,67 @@ export class ChatRoom implements DurableObject {
   // ── WebSocket protocol (binary frames, chat-frames.ts) ───────────────────
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
-    if (!(await socketAuthorized(this.env, ws))) return;
+    if (this.closedReceivers.has(ws)) return;
     if (typeof message === "string") {
+      this.stopReceiving(ws);
       ws.close(1003, "binary frames only");
       return;
     }
     if (message.byteLength > MAX_FRAME_BYTES) {
+      this.stopReceiving(ws);
       ws.close(1009, "frame too large");
       return;
     }
+    let queue = this.receives.get(ws);
+    if ((queue?.count ?? 0) >= QUOTA_MAX_PUSHES ||
+        (queue?.bytes ?? 0) + message.byteLength > QUOTA_MAX_BYTES ||
+        receivingMessages >= 4 * QUOTA_MAX_PUSHES ||
+        receivingBytes + message.byteLength > 4 * QUOTA_MAX_BYTES) {
+      this.stopReceiving(ws);
+      ws.close(1013, "receive queue full");
+      return;
+    }
+    const draining = queue !== undefined;
+    if (!queue) {
+      queue = { messages: [], bytes: 0, count: 0, closed: false };
+      this.receives.set(ws, queue);
+    }
+    queue.messages.push(message);
+    queue.bytes += message.byteLength;
+    queue.count++;
+    receivingBytes += message.byteLength;
+    receivingMessages++;
+    if (draining) return;
+    try {
+      while (queue.messages.length > 0 && !queue.closed) {
+        // ponytail: at most 300 frames; use indexed draining if this cap grows.
+        const next = queue.messages.shift()!;
+        try {
+          // Revalidate each frame only when it reaches the head. An async
+          // authority response must not reorder causally dependent PUSHes.
+          if (!(await socketAuthorized(this.env, ws))) {
+            this.stopReceiving(ws);
+            return;
+          }
+          if (queue.closed || ws.readyState !== WebSocket.OPEN) {
+            this.stopReceiving(ws);
+            return;
+          }
+          await this.handleMessage(ws, next);
+        } finally {
+          this.releaseReceived(queue, next.byteLength, 1);
+        }
+      }
+    } catch (error) {
+      this.stopReceiving(ws);
+      ws.close(1011, "receive failed");
+      throw error;
+    } finally {
+      this.receives.delete(ws);
+    }
+  }
+
+  private async handleMessage(ws: WebSocket, message: ArrayBuffer): Promise<void> {
     const frame = decodeFrame(new Uint8Array(message));
     const state = ws.deserializeAttachment() as SocketState;
     if (!frame) {
@@ -408,12 +473,30 @@ export class ChatRoom implements DurableObject {
     }
   }
 
-  async webSocketClose(): Promise<void> {
-    /* nothing buffered; rows are written synchronously on push */
+  private releaseReceived(queue: ReceiveQueue, bytes: number, count: number): void {
+    queue.bytes -= bytes;
+    queue.count -= count;
+    receivingBytes -= bytes;
+    receivingMessages -= count;
   }
 
-  async webSocketError(): Promise<void> {
-    /* ditto */
+  private stopReceiving(ws: WebSocket): void {
+    this.closedReceivers.add(ws);
+    const queue = this.receives.get(ws);
+    if (!queue) return;
+    queue.closed = true;
+    this.releaseReceived(queue, queue.messages.reduce((sum, message) => sum + message.byteLength, 0), queue.messages.length);
+    queue.messages.length = 0;
+    // The active frame stays charged until its uncancellable auth/append
+    // settles; close churn cannot recycle that retained-memory budget.
+  }
+
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    this.stopReceiving(ws);
+  }
+
+  async webSocketError(ws: WebSocket): Promise<void> {
+    this.stopReceiving(ws);
   }
 
   private handleHello(ws: WebSocket, state: SocketState, header: Record<string, unknown>): void {

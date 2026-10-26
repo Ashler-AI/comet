@@ -130,6 +130,12 @@ publish a dependent update ahead of its predecessor. Receivers still reject
 incomplete causal history without advancing the durable cursor; historical
 out-of-order rows require ordinary catch-up or a covering checkpoint.
 
+The Edge also serializes each socket's inbound frames across asynchronous
+authorization and dispatch; different sockets remain independent. Every frame
+is reauthorized at the queue head. Active and queued input is bounded to 300
+frames/8 MiB per socket and 1,200 frames/32 MiB per isolate. Close, revocation or
+overflow discards queued input; active input stays charged until it settles.
+
 **C2. Store migration** (`crates/sync/src/store.rs` MIGRATIONS — append entry #N):
 `ALTER TABLE snapshots ADD COLUMN cursor INTEGER; ADD COLUMN epoch INTEGER` — cursor
 persisted **in the same transaction** as the snapshot bytes, so content and cursor
