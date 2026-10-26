@@ -1,3 +1,5 @@
+/// <reference types="node" />
+/// <reference lib="es2024.promise" />
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LoroDoc } from "loro-crdt";
