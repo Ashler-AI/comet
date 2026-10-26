@@ -565,9 +565,9 @@ fn import_backup(
         if count != 0 { return Err(unsafe_data("accepted pending nudges require legacy reconciliation before import")); }
     }
     let mut claims = db.prepare("SELECT command_id,processed_at FROM processed_commands")?
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, None)))?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut claimed: BTreeSet<String> = claims.iter().map(|(id, _)| id.clone()).collect();
+    let mut claimed: BTreeSet<String> = claims.iter().map(|(id, _, _)| id.clone()).collect();
     let mut scopes = BTreeMap::<String, String>::new();
     if tables.contains("document_scopes") {
         for entry in db.prepare("SELECT doc_id,scope FROM document_scopes")?
@@ -808,7 +808,7 @@ fn import_backup(
     let mut report = CrewImportReport { version: 1, source_profile_root: manifest.source_profile_root.clone(),
         chat_ids: Vec::new(), native_session_ids: BTreeMap::new(),
         native_histories: manifest.native_histories.clone(),
-        command_outcomes: claims.iter().map(|(id, _)| (id.clone(), "unknown".into())).collect(),
+        command_outcomes: claims.iter().map(|(id, _, _)| (id.clone(), "unknown".into())).collect(),
         files_sha256: manifest.files.clone(), commands_retained: claims.len(), annotations_retained: 0,
         requires_reauthentication: true, source_table_rows, recovery_snapshot_ids, execution_aliases: execution_aliases.clone(),
         destination_snapshots_sha256: BTreeMap::new(),
@@ -889,7 +889,7 @@ fn import_backup(
                     if status == "pending" && original_epoch.is_none() { "unknown" } else { status }.into());
                 staged.execute("INSERT INTO retained_records VALUES (?1,'commands',?2,?3)",
                     rusqlite::params![id, command_id, serde_json::to_vec(command)?])?;
-                if claimed.insert(command_id.into()) { claims.push((command_id.into(), 0)); }
+                if claimed.insert(command_id.into()) { claims.push((command_id.into(), 0, None)); }
             }
         }
         if let Some(proof) = original_epoch { crate::crew_import_epoch::verify_outcomes(proof, &original_outcomes)?; }
@@ -1033,14 +1033,14 @@ fn import_backup(
         if !registry_matches { return Err(unsafe_data("destination registry identity/config/native association differs")); }
         report.destination_snapshots_sha256.insert(REGISTRY_DOC_ID.into(), format!("{:x}", Sha256::digest(&registry_bytes)));
         if selected_chat.is_some() {
-            for (id, timestamp) in claims.iter().filter(|(id, _)| selected_commands.contains(id)) {
+            for (id, timestamp, _) in claims.iter().filter(|(id, _, _)| selected_commands.contains(id)) {
                 let actual_timestamp: i64 = actual.query_row("SELECT processed_at FROM processed_commands WHERE command_id=?1", [id], |row| row.get(0))?;
                 if actual_timestamp != *timestamp { return Err(unsafe_data("selected durable command claim differs")); }
             }
         } else {
             let actual_claims = actual.prepare("SELECT command_id,processed_at FROM processed_commands ORDER BY command_id")?
                 .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?.collect::<Result<BTreeMap<_, _>, _>>()?;
-            if actual_claims != claims.into_iter().collect() { return Err(unsafe_data("destination durable command claims differ")); }
+            if actual_claims != claims.into_iter().map(|(id, timestamp, _)| (id, timestamp)).collect() { return Err(unsafe_data("destination durable command claims differ")); }
         }
         let mut actual_statement = actual.prepare("SELECT doc_id,container,record_id,value FROM legacy_crew_records WHERE ?1 IS NULL OR doc_id=?1 OR doc_id LIKE ?1 || '::session::%' ORDER BY doc_id,container,record_id")?;
         let mut actual_records = actual_statement.query_map([selected_chat], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))?;

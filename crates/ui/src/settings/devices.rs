@@ -35,7 +35,7 @@ pub(crate) async fn wake_host(
     executor: &gpui::BackgroundExecutor,
     device: &zeron_proto::Device,
 ) -> Result<zeron_proto::Device, String> {
-    let request = engine.client().call(methods::WAKE_DEVICE, serde_json::json!({"deviceId": device.id}));
+    let request = engine.client().call_scoped(methods::WAKE_DEVICE, serde_json::json!({"deviceId": device.id}));
     let deadline = executor.timer(Duration::from_secs(180));
     futures::pin_mut!(request, deadline);
     let value = match futures::future::select(request, deadline).await {
@@ -144,6 +144,7 @@ impl DevicesPage {
             || state.device_online(device_id, Utc::now()) || device.devbox_binding().is_none() { return; }
         let Some(engine) = state.engine().cloned() else { return; };
         self.waking = Some(device.id.clone());
+        self.error = None;
         self.wake_task = Some(cx.spawn(async move |this, cx| {
             let result = wake_host(&engine, cx.background_executor(), &device).await;
             this.update(cx, |page, cx| {
@@ -423,10 +424,11 @@ impl Render for DevicesPage {
                         .when(can_wake, |el| el.child(
                             widgets::text_action(&theme, widgets::ActionTone::Filled, if is_waking { "Connecting…" } else { "Wake" })
                                 .id(("device-wake", ix))
-                                .tab_index(0)
+                                .tab_index(if wake_busy { -1 } else { 0 })
                                 .role(gpui::Role::Button)
                                 .aria_label(format!("Wake {}", device.name))
                                 .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                .when(wake_busy, |el| el.opacity(0.5).aria_description("Unavailable while a device is connecting"))
                                 .when(!wake_busy, |el| el.on_click(cx.listener(move |this, _, _, cx| this.wake_device(&wake_id, cx))))
                         ))
                         .child(
@@ -535,6 +537,237 @@ impl Render for DevicesPage {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+
+    #[gpui::test]
+    fn stalled_wake_times_out_and_cancels_when_hidden_or_dropped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        struct CancelSignal(Arc<tokio::sync::Notify>);
+        impl Drop for CancelSignal {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let started = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let rpc = ScriptedRpc::new({
+            let started = started.clone();
+            let cancelled = cancelled.clone();
+            move |method, params| {
+                let started = started.clone();
+                let cancelled = cancelled.clone();
+                async move {
+                    assert_eq!(method, methods::WAKE_DEVICE);
+                    assert_eq!(params, serde_json::json!({"deviceId": "remote"}));
+                    let _signal = CancelSignal(cancelled);
+                    started.fetch_add(1, Ordering::SeqCst);
+                    futures::future::pending().await
+                }
+            }
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
+            state.local_device_id = Some("local".into());
+            state.devices = vec![zeron_proto::Device {
+                id: "remote".into(),
+                name: "Boat".into(),
+                platform: "linux".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: None,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+                devbox_provider: Some(zeron_proto::DeviceEnvironment::Boat),
+                devbox_id: Some("bx_23456789".into()),
+            }];
+            state
+        });
+        let page = cx.new(|cx| DevicesPage::new(state.clone(), cx));
+        page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst) == 1);
+        cx.executor().advance_clock(Duration::from_secs(179));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| assert!(page.wake_task.is_some()));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert!(page.wake_task.is_none());
+            assert!(page.waking.is_none());
+            assert!(page.error.as_ref().unwrap().contains("timed out"));
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+        });
+
+        page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst) == 2);
+        page.update(cx, |page, _| {
+            page.on_hidden();
+            assert!(page.wake_task.is_none());
+            assert!(page.waking.is_none());
+            assert!(page.error.is_none());
+        });
+        cx.run_until_parked();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+        });
+
+        page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst) == 3);
+        let released = Arc::new(AtomicUsize::new(0));
+        page.update(cx, |_, cx| {
+            let released = released.clone();
+            cx.on_release(move |_, _| { released.fetch_add(1, Ordering::SeqCst); }).detach();
+        });
+        drop(page);
+        // Dropping Entity queues disposal; only an App update flushes the
+        // deferred entity value (and its owned wake_task). Running the task
+        // dispatcher alone leaves that task alive while waiting on Tokio.
+        cx.update(|_| {});
+        assert_eq!(released.load(Ordering::SeqCst), 1, "the page must actually be disposed before awaiting server cancellation");
+        cx.run_until_parked();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+        });
+        state.read_with(cx, |state, _| {
+            assert!(state.devices[0].last_seen_at.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn wake_is_explicit_single_flight_and_requires_exact_ready_ids(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use std::sync::{Arc, Mutex};
+
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rpc = ScriptedRpc::new({
+            let calls = calls.clone();
+            let release = release.clone();
+            move |method, params| {
+                let calls = calls.clone();
+                let release = release.clone();
+                async move {
+                    assert_eq!(method, methods::WAKE_DEVICE);
+                    assert_eq!(params, serde_json::json!({"deviceId": "remote"}));
+                    let attempt = {
+                        let mut calls = calls.lock().unwrap();
+                        calls.push(params);
+                        calls.len()
+                    };
+                    release.notified().await;
+                    let mut response = serde_json::json!({
+                        "deviceId": "remote",
+                        "devboxProvider": "boat", "devboxId": "bx_23456789", "ready": true,
+                        "device": {
+                            "id": "remote",
+                            "name": "Ready Boat",
+                            "platform": "linux",
+                            "lastSeenAt": Utc::now(),
+                            "version": "1.2.3",
+                            "capabilities": ["readFiles"],
+                            "devboxProvider": "boat", "devboxId": "bx_23456789"
+                        }
+                    });
+                    match attempt {
+                        1 => response["deviceId"] = "other".into(),
+                        2 => response["devboxId"] = "bx_abcdefgh".into(),
+                        3 => { response.as_object_mut().unwrap().remove("devboxId"); }
+                        4 => return Err(zeron_rpc::RpcError::Failed("Unavailable".into())),
+                        5 => { response.as_object_mut().unwrap().remove("device"); }
+                        6 => response["device"]["id"] = "other".into(),
+                        7 => response["device"]["devboxId"] = "bx_abcdefgh".into(),
+                        8 => {}
+                        _ => panic!("duplicate wake request"),
+                    }
+                    zeron_rpc::RpcReply::value(&response)
+                }
+            }
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
+            state.local_device_id = Some("local".into());
+            state.devices = ["remote", "local", "online", "invalid", "unbound"]
+                .into_iter()
+                .map(|id| zeron_proto::Device {
+                    id: id.into(),
+                    name: id.into(),
+                    platform: "linux".into(),
+                    last_seen_at: (id == "online").then(Utc::now),
+                    created_at: None,
+                    version: None,
+                    cursor_sdk_version: None,
+                    capabilities: Vec::new(),
+                    devbox_provider: Some(zeron_proto::DeviceEnvironment::Boat),
+                    devbox_id: match id {
+                        "invalid" => Some("display-name".into()),
+                        "unbound" => None,
+                        _ => Some("bx_23456789".into()),
+                    },
+                })
+                .collect();
+            state
+        });
+        let page = cx.new(|cx| DevicesPage::new(state.clone(), cx));
+        state.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty(), "mounting must not wake");
+        page.update(cx, |page, cx| {
+            for id in ["local", "online", "invalid", "unbound", "missing"] {
+                page.wake_device(id.into(), cx);
+            }
+            assert!(page.wake_task.is_none());
+        });
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty());
+
+        let before = state.read_with(cx, |state, _| state.devices.clone());
+        for attempt in 1..=8 {
+            page.update(cx, |page, cx| {
+                page.wake_device("remote".into(), cx);
+                page.wake_device("remote".into(), cx);
+            });
+            rpc.settle(cx, &runtime, |_| calls.lock().unwrap().len() >= attempt);
+            page.read_with(cx, |page, _| {
+                assert_eq!(page.waking.as_deref(), Some("remote"));
+                assert!(page.wake_task.is_some());
+            });
+            release.notify_one();
+            rpc.settle(cx, &runtime, |cx| {
+                page.read_with(cx, |page, _| page.wake_task.is_none())
+            });
+            page.read_with(cx, |page, _| {
+                assert!(page.waking.is_none());
+                assert_eq!(page.error.is_some(), attempt != 8);
+            });
+            assert_eq!(calls.lock().unwrap().len(), attempt);
+            state.read_with(cx, |state, _| {
+                assert_eq!(&state.devices[1..], &before[1..]);
+                if attempt != 8 {
+                    assert_eq!(state.devices, before);
+                }
+            });
+        }
+        state.read_with(cx, |state, _| {
+            let ready = &state.devices[0];
+            assert!(ready.last_seen_at.is_some());
+            assert_eq!(ready.name, "Ready Boat");
+            assert_eq!(ready.version.as_deref(), Some("1.2.3"));
+            assert_eq!(ready.capabilities, ["readFiles"]);
+        });
+    }
 
     #[test]
     fn wake_reply_requires_ready_and_the_exact_registered_binding() {

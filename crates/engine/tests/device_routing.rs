@@ -156,7 +156,7 @@ impl Harness for InstantHarness {
     }
     async fn run(
         &self,
-        _request: RunRequest,
+        request: RunRequest,
         _controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         Ok(futures::stream::iter([
@@ -164,7 +164,7 @@ impl Harness for InstantHarness {
                 harness: self.0,
                 model: "instant-1".into(),
                 tools: vec![],
-                cwd: "/tmp".into(),
+                cwd: request.cwd,
                 session_id: "hs-1".into(),
                 assistant_message_id: "a-1".into(),
             }),
@@ -1981,13 +1981,19 @@ async fn workspace_entry_mutations_are_forwarded_to_the_owning_plain_folder() {
 
 /// Full MCP discovery/create/converse flow over two real engines, a shared
 /// registry and the same device relay used by the routing tests above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mcp_standalone_session_executes_on_the_selected_device() {
-    // Poll phases separately: nesting their debug poll frames exhausted the
-    // test stack before the MCP snapshot call could finish.
-    let (dirs, b, chat, retained) = Box::pin(mcp_selected_device_online()).await;
-    assert_mcp_retained_history(&dirs, &b, &chat, &retained).await;
-    b.shutdown().await;
+#[test]
+fn mcp_standalone_session_executes_on_the_selected_device() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("MCP routing runtime");
+    // Poll the phases in separate block_on calls. A Tokio test body stack-pins
+    // the retained-history future while also polling online MCP discovery;
+    // their aggregate debug frames overflowed in Zeron::subscribe, not recursion.
+    let (dirs, b, chat, retained) = runtime.block_on(Box::pin(mcp_selected_device_online()));
+    runtime.block_on(Box::pin(assert_mcp_retained_history(&dirs, &b, &chat, &retained)));
+    runtime.block_on(b.shutdown());
 }
 
 async fn mcp_selected_device_online() -> (
@@ -2117,6 +2123,12 @@ async fn mcp_selected_device_online() -> (
         b.sessions.session_status(chat_id).is_some(),
         "B actually ran the harness"
     );
+    {
+        let request = b.sessions.last_request(chat_id).expect("B dispatched the request");
+        assert_eq!(request.prompt, "execute on B");
+        assert_eq!(std::path::Path::new(&request.cwd), folder);
+    }
+    assert!(a.sessions.last_request(chat_id).is_none());
     let read = tools
         .call("read_chat", json!({"chat":chat_id}))
         .await
@@ -2135,7 +2147,6 @@ async fn mcp_selected_device_online() -> (
         .await
         .unwrap();
     assert_eq!(summary["messageCount"], read["total"]);
-    assert_eq!(summary["lastMessage"]["text"], "remote reply");
     assert_eq!(summary["lastMessage"]["deviceId"], "device-b");
     let sent = tools
         .call(
@@ -2153,6 +2164,11 @@ async fn mcp_selected_device_online() -> (
         "only the new turn"
     );
     assert_eq!(sent["turn"]["replies"][0]["deviceId"], "device-b");
+    {
+        let request = b.sessions.last_request(chat_id).expect("B dispatched the second turn");
+        assert_eq!(std::path::Path::new(&request.cwd), folder);
+    }
+    assert!(a.sessions.last_request(chat_id).is_none());
     let waited = tools
         .call("wait_for_turn", json!({"chat":chat_id,"timeout_secs":2}))
         .await

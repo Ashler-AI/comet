@@ -485,7 +485,7 @@ fn hydrate_copies(stage: &Path, profile: &Path, files: &BTreeMap<String, Vec<u8>
     }
     report.requires_reconciliation |= report.pending_files != 0 || !report.missing_data.is_empty();
     let store = DocsStore::open(stage).map_err(storage)?;
-    let claims: Vec<_> = claims.into_iter().map(|id| (id, 0)).collect();
+    let claims: Vec<_> = claims.into_iter().map(|id| (id, 0, None)).collect();
     store.import_processed_commands(&claims).map_err(storage)?;
     for (id, bytes) in documents {
         store.save_snapshot_with_cursor(&id, &bytes, 0, 2).map_err(storage)?;

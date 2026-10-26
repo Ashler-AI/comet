@@ -356,8 +356,8 @@ impl LocalImporter {
             }
         }
 
-        // Merge the source's command ledger so imported pending commands can
-        // never re-execute under this profile (mark-before-execute carries over).
+        // Preserve at-most-once claims and known terminal outcomes, including
+        // relayed commands whose canonical doc rows have not arrived yet.
         let ledger_rows_merged = source_store
             .processed_commands()
             .and_then(|rows| self.inner.target_store.import_processed_commands(&rows))

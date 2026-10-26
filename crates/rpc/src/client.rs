@@ -27,6 +27,7 @@ enum Pending {
 
 struct Shared {
     pending: Mutex<HashMap<u64, Pending>>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Shared {
@@ -46,8 +47,12 @@ pub struct RpcClient {
 
 /// Owned stream receiver whose drop immediately cancels the server task.
 pub struct RpcSubscription {
-    id: u64,
+    _request: RequestLifetime,
     items: mpsc::Receiver<serde_json::Value>,
+}
+
+struct RequestLifetime {
+    id: u64,
     out: mpsc::Sender<String>,
     shared: Arc<Shared>,
 }
@@ -58,7 +63,7 @@ impl RpcSubscription {
     }
 }
 
-impl Drop for RpcSubscription {
+impl Drop for RequestLifetime {
     fn drop(&mut self) {
         if self.shared.lock().remove(&self.id).is_none() {
             return;
@@ -75,11 +80,9 @@ impl Drop for RpcSubscription {
             Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
             Err(mpsc::error::TrySendError::Full(frame)) => {
                 let out = self.out.clone();
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        let _ = out.send(frame).await;
-                    });
-                }
+                self.shared.runtime.spawn(async move {
+                    let _ = out.send(frame).await;
+                });
             }
         }
     }
@@ -90,6 +93,7 @@ impl RpcClient {
     pub fn new(out: mpsc::Sender<String>, mut inbound: mpsc::Receiver<String>) -> Self {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
+            runtime: tokio::runtime::Handle::current(),
         });
         let reader_shared = shared.clone();
         let reader_out = out.clone();
@@ -160,6 +164,31 @@ impl RpcClient {
         rx.await.map_err(|_| RpcError::Closed)?
     }
 
+    /// Unary request whose pending server task is cancelled when this future is dropped.
+    /// Unlike `call`, use this only when abandoning the operation should cancel its work.
+    pub async fn call_scoped(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.shared.lock().insert(id, Pending::Call(tx));
+        let _request = RequestLifetime {
+            id,
+            out: self.out.clone(),
+            shared: self.shared.clone(),
+        };
+        self.send(ClientFrame {
+            id,
+            method: Some(method.into()),
+            params,
+            cancel: false,
+        })
+        .await?;
+        rx.await.map_err(|_| RpcError::Closed)?
+    }
+
     /// Typed unary request.
     pub async fn call_as<T: serde::de::DeserializeOwned>(
         &self,
@@ -212,10 +241,12 @@ impl RpcClient {
         // Own cancellation before the send, including cancellation while the
         // outbound channel is backpressured.
         let subscription = RpcSubscription {
-            id,
             items: rx,
-            out: self.out.clone(),
-            shared: self.shared.clone(),
+            _request: RequestLifetime {
+                id,
+                out: self.out.clone(),
+                shared: self.shared.clone(),
+            },
         };
         self.send(ClientFrame {
             id,
@@ -247,10 +278,12 @@ impl RpcClient {
             },
         );
         let subscription = RpcSubscription {
-            id,
             items: items_rx,
-            out: self.out.clone(),
-            shared: self.shared.clone(),
+            _request: RequestLifetime {
+                id,
+                out: self.out.clone(),
+                shared: self.shared.clone(),
+            },
         };
         self.send(ClientFrame {
             id,

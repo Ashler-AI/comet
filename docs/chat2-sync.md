@@ -178,6 +178,22 @@ whale outputs stay viewable!), write fresh Loro doc with `meta.epoch = 2`. The
 ledger entries (dedupe via `evaluate_command` + the mark-before-execute
 `processed_commands` table protects against re-execution).
 
+Migration 10 appends `processed_commands.outcome` to the unchanged first nine
+migrations. The host saves a terminal command status/resolution before
+acknowledging execution. A relay can finish before the sender-owned command row
+arrives; the drain publishes the durable result on that row without re-executing
+or copying the command. Existing schema-10 Boat stores retain their claims and
+outcomes; older stores append the nullable column once. NULL outcomes retain
+interrupted-execution rejection, never permission to replay.
+
+In-process execution ownership follows the relay/drain future: cancellation
+releases that ownership without clearing durable consumption. Preparation
+receipts are observational, not an execution queue; under the same ownership
+lock, the drain reconciles a saved result or rejects an interrupted claim and
+publishes the watched transcript immediately. Local profile import carries
+known outcomes and fills unknown results without replacing a destination's
+known outcome. Legacy Crew imports keep their unknown-outcome semantics.
+
 **M2. Cutover signal.** The registry chat row gains a `roomGen` field (per-field HLC
 LWW like everything else): absent/1 = s2, 2 = chat2. The host flips it in the same
 breath as seeding. Devices dial the room the registry names. No dual-write: at current
