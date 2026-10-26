@@ -157,10 +157,18 @@ export const verifyScaffoldSessionResult = async (
       }
       if (!response.ok) {
         await response.body?.cancel();
+        const cfRay = response.headers.get("cf-ray");
+        const retryAfter = response.headers.get("retry-after");
+        // Fixed fields keep each event below 256 bytes; upstream strings are untrusted.
+        console.warn("scaffold auth upstream non-ok", {
+          status: response.status, attempt: attempt + 1,
+          cfRay: cfRay?.length === 20 && /^[0-9a-fA-F]{16}-[A-Z]{3}$/.test(cfRay) ? cfRay : null,
+          retryAfterSeconds: retryAfter !== null && retryAfter.length > 0 && retryAfter.length <= 6 && !/[^0-9]/.test(retryAfter)
+            ? Number(retryAfter) : null
+        });
         // Only explicit credential rejection revokes state. Preserve authority
         // Retry-After exactly, and never amplify throttling with another attempt.
         if (response.status === 401 || response.status === 403) return { status: "invalid" };
-        const retryAfter = response.headers.get("retry-after");
         if (retryAfter !== null) {
           if (retryAfter.length > SCAFFOLD_JSON_BYTES || new TextEncoder().encode(retryAfter).byteLength > SCAFFOLD_JSON_BYTES) {
             return { status: "unavailable", retryAfter: "1" };
