@@ -6286,26 +6286,17 @@ mod tests {
             assistant_message_id: "a1".into(),
         })
         .unwrap();
-        feed.send(AgentEvent::Subagent {
-            parent_tool_use_id: "tool-1".into(),
-            event: Box::new(AgentEvent::ReasoningDelta {
-                text: String::new(),
-            }),
+        // A background subagent's shape: its spawn's turn ends, and it speaks
+        // after the parent's last commit window, so its sink wakes with the
+        // parent clean, parked and past its deadline.
+        feed.send(AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: zeron_proto::ToolCall::Unknown {
+                name: "Agent: probe".into(),
+                input: None,
+            },
         })
         .unwrap();
-        // Well past several commit windows with the stream still open: the
-        // loop must idle between commits, not spin on a past deadline.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let ticks = FLUSH_TICKS.with(|t| t.get());
-        assert!(
-            (1..=8).contains(&ticks),
-            "commit branch fired {ticks} times in 1s for one empty subagent event"
-        );
-        assert_eq!(
-            core.sessions.session_status(chat).map(|s| s.status),
-            Some(SessionStatus::Working),
-            "stream still open, turn still running"
-        );
         feed.send(AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
@@ -6313,6 +6304,34 @@ mod tests {
             session_id: None,
         })
         .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3 * STREAM_COMMIT_MS)).await;
+        // Empty events trickling in inside one window: the first must arm it
+        // rather than commit, and no later one commits on its own.
+        for _ in 0..12 {
+            feed.send(AgentEvent::Subagent {
+                parent_tool_use_id: "tool-1".into(),
+                event: Box::new(AgentEvent::ReasoningDelta {
+                    text: String::new(),
+                }),
+            })
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Well past several commit windows with the stream still open: the
+        // loop must idle between commits, not spin on a past deadline.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let ticks = FLUSH_TICKS.with(|t| t.get());
+        assert!(
+            (1..=8).contains(&ticks),
+            "commit branch fired {ticks} times in 1s for 12 empty subagent events"
+        );
+        assert_eq!(
+            core.sessions
+                .session_status(chat)
+                .map(|session| (session.status, session.running_subagents)),
+            Some((SessionStatus::Idle, 1)),
+            "parked, with the subagent's sink open"
+        );
         core.sessions.shutdown().await;
     }
 
