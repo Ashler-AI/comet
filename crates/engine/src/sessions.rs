@@ -858,6 +858,20 @@ impl SessionsEngine {
         live.is_some_and(|(harness, routable)| routable && !self.steers_mid_turn(harness))
     }
 
+    /// The harness of the chat's live run, while one is in flight.
+    pub fn live_harness(&self, chat_id: &str) -> Option<HarnessId> {
+        if !self.turn_in_flight(chat_id) {
+            return None;
+        }
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| h.runtime_config.harness_id)
+    }
+
+    pub fn note_provider_switch(&self, chat_id: &str, harness_id: HarnessId, doc: &ChatDocHandle) {
+        self.inner.note_provider_switch(chat_id, harness_id, doc);
+    }
+
     /// Whether an accepted agent update gates the chat's live run, so a new
     /// prompt waits in the queue rather than joining that run's transcript.
     pub fn live_run_update_pending(&self, chat_id: &str) -> bool {

@@ -935,6 +935,27 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
     }
 
+    /// Whether the engine hosting `chat_id` can switch its provider. This
+    /// engine can; a peer advertises support on its synchronized device row.
+    fn host_switches_providers(&self, chat_id: &str) -> bool {
+        let Some(device_id) = self
+            .workspace
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .map(|chat| chat.device_id)
+        else {
+            return true;
+        };
+        device_id == self.workspace.device_id()
+            || self.workspace.read_devices().is_ok_and(|devices| {
+                devices.iter().any(|device| {
+                    device.id == device_id
+                        && device.supports(zeron_proto::capabilities::PROVIDER_SWITCH_V1)
+                })
+            })
+    }
+
     fn local_project_action_space(&self, space_id: &str) -> Result<Space, RpcError> {
         let space = self
             .workspace
@@ -1523,6 +1544,27 @@ impl EngineRpc {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)
             }
             MutateParams::SetChatConfig { chat_id, config } => {
+                // A chat may change provider between turns, never during one:
+                // the live run belongs to the old harness and would keep
+                // writing into the transcript the new one is about to read.
+                // A non-hosting controller relies on the host capability row;
+                // Crew authorization remains enforced before this mutation.
+                let switching = self
+                    .workspace
+                    .chat(&chat_id)
+                    .map_err(failed)?
+                    .and_then(|chat| chat.config)
+                    .is_some_and(|current| current.harness != config.harness);
+                if switching && self.sessions.turn_in_flight(&chat_id) {
+                    return Err(RpcError::Failed(
+                        "Wait for the current turn to finish before switching provider".into(),
+                    ));
+                }
+                if switching && !self.host_switches_providers(&chat_id) {
+                    return Err(RpcError::Failed(
+                        "This chat's computer needs a newer Zeron to switch provider".into(),
+                    ));
+                }
                 self.voice.retire_chat(&chat_id);
                 self.workspace
                     .set_chat_config(&chat_id, &config)

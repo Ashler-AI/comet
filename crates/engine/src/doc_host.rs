@@ -5640,7 +5640,14 @@ impl DocHost {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
                     }
                 }
-                if sessions.defers_to_turn_end(chat_id, Some((harness, &request))) {
+                // A run on another provider than the live turn's (a stale
+                // client, another device's switch) waits for the turn: the
+                // provider never changes by killing a turn mid-flight.
+                let other_provider = sessions
+                    .live_harness(chat_id)
+                    .is_some_and(|live| live != harness);
+                if other_provider || sessions.defers_to_turn_end(chat_id, Some((harness, &request)))
+                {
                     self.hold_until_turn_end(
                         handle,
                         message_id,
@@ -5660,6 +5667,7 @@ impl DocHost {
                 // host got around to draining a queued command. Idempotent by
                 // id, so the dispatch path's own execution-time write dedupes
                 // to a no-op.
+                sessions.note_provider_switch(chat_id, harness, handle);
                 if let Err(err) = handle.write_user_message(
                     message_id,
                     &request.prompt,
