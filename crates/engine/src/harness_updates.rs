@@ -361,9 +361,16 @@ fn manual_update_command(harness: HarnessId, executable: &Path, can_apply: bool)
     .filter(|command| !command.is_empty())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateTrigger {
+    Manual,
+    AutoWhenIdle,
+    PostAppUpdate,
+}
+
 struct ActiveUpdate {
     cancel: CancellationToken,
-    automatic: bool,
+    trigger: UpdateTrigger,
     previous_phase: HarnessUpdatePhase,
 }
 
@@ -523,12 +530,30 @@ impl HarnessUpdateCoordinator {
     }
 
     pub fn set_harness_auto_update(&self, enabled: bool) -> Result<(), String> {
+        // Share the installation boundary lock: accepting an opt-out must
+        // prevent a waiting post-app refresh from starting mutation.
+        let active = lock(&self.inner.cancellations);
         let mut prefs = lock(&self.inner.prefs);
         let previous = prefs.harness_auto_update;
         prefs.harness_auto_update = Some(enabled);
         if let Err(error) = store_preferences(&self.inner.prefs_path, &prefs) {
             prefs.harness_auto_update = previous;
             return Err(error);
+        }
+        drop(prefs);
+        if !enabled {
+            for (harness, update) in active.iter() {
+                if update.trigger == UpdateTrigger::PostAppUpdate
+                    && !matches!(
+                        self.status(*harness).phase,
+                        HarnessUpdatePhase::Installing
+                            | HarnessUpdatePhase::Verifying
+                            | HarnessUpdatePhase::Updated
+                    )
+                {
+                    update.cancel.cancel();
+                }
+            }
         }
         Ok(())
     }
@@ -538,6 +563,16 @@ impl HarnessUpdateCoordinator {
             && !std::env::var("COMET_UPDATE_HARNESSES").is_ok_and(|value| {
                 matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no")
             })
+    }
+
+    fn trigger_allowed(&self, harness: HarnessId, trigger: UpdateTrigger) -> bool {
+        match trigger {
+            UpdateTrigger::Manual => true,
+            UpdateTrigger::AutoWhenIdle => self.policy(harness) == HarnessUpdatePolicy::AutoWhenIdle,
+            UpdateTrigger::PostAppUpdate => {
+                self.post_update_enabled() && self.policy(harness) != HarnessUpdatePolicy::Off
+            }
+        }
     }
 
     /// Call once at engine boot. Manual canaries pass false: preserve the
@@ -573,7 +608,7 @@ impl HarnessUpdateCoordinator {
                 if coordinator.post_update_enabled()
                     && status.can_apply
                     && matches!(status.phase, HarnessUpdatePhase::Available | HarnessUpdatePhase::ManualActionRequired)
-                    && let Err(error) = coordinator.apply(*harness).await
+                    && let Err(error) = coordinator.apply_inner(*harness, UpdateTrigger::PostAppUpdate).await
                 {
                     tracing::warn!(?harness, %error, "post-update agent refresh failed");
                 }
@@ -692,7 +727,7 @@ impl HarnessUpdateCoordinator {
             // A policy change, disable, dismissal, or another update may have
             // won while this task waited for the provider operation slot.
             if coordinator.automatic_update_ready(harness)
-                && let Err(error) = coordinator.apply_locked(harness, true).await
+                && let Err(error) = coordinator.apply_locked(harness, UpdateTrigger::AutoWhenIdle).await
             {
                 tracing::warn!(?harness, %error, "automatic harness update failed");
             }
@@ -1050,12 +1085,12 @@ impl HarnessUpdateCoordinator {
     /// relay, or timing out a client cannot drop an updater mid-mutation.
     pub async fn apply(&self, harness: HarnessId) -> Result<String, String> {
         let coordinator = self.clone();
-        tokio::spawn(async move { coordinator.apply_inner(harness).await })
+        tokio::spawn(async move { coordinator.apply_inner(harness, UpdateTrigger::Manual).await })
             .await
             .map_err(|error| format!("agent update task failed: {error}"))?
     }
 
-    async fn apply_inner(&self, harness: HarnessId) -> Result<String, String> {
+    async fn apply_inner(&self, harness: HarnessId, trigger: UpdateTrigger) -> Result<String, String> {
         // A provider probe and mutation must never overlap: a late check
         // result could otherwise overwrite Installing/Verifying state or
         // inspect a binary while its owner is replacing it.
@@ -1064,11 +1099,11 @@ impl HarnessUpdateCoordinator {
             _ = self.inner.shutdown.cancelled() => return Err("update cancelled".into()),
             operation = self.operation_gate(harness).lock_owned() => operation,
         };
-        self.apply_locked(harness, false).await
+        self.apply_locked(harness, trigger).await
     }
 
     /// Caller holds the provider operation lock through verification.
-    async fn apply_locked(&self, harness: HarnessId, automatic: bool) -> Result<String, String> {
+    async fn apply_locked(&self, harness: HarnessId, trigger: UpdateTrigger) -> Result<String, String> {
         if self.inner.shutdown.is_cancelled() {
             return Err("update cancelled".into());
         }
@@ -1096,19 +1131,21 @@ impl HarnessUpdateCoordinator {
             if cancellations.contains_key(&harness) {
                 return Err("an update is already in progress".into());
             }
-            if automatic && self.policy(harness) != HarnessUpdatePolicy::AutoWhenIdle {
+            if !self.trigger_allowed(harness, trigger) {
                 return Err("update cancelled".into());
             }
             cancellations.insert(
                 harness,
                 ActiveUpdate {
                     cancel: cancel.clone(),
-                    automatic,
+                    trigger,
                     previous_phase: current.phase,
                 },
             );
         }
-        self.inner.registry.begin_update(harness);
+        if trigger == UpdateTrigger::Manual {
+            self.inner.registry.begin_update(harness);
+        }
         let mut intent = UpdateIntentGuard {
             coordinator: self.clone(),
             harness,
@@ -1125,8 +1162,18 @@ impl HarnessUpdateCoordinator {
                 intent.finish();
                 return Err("update cancelled".into());
             }
-            lease = self.inner.registry.update_lease(harness) => lease,
+            lease = async {
+                if trigger == UpdateTrigger::Manual {
+                    self.inner.registry.update_lease(harness).await
+                } else {
+                    self.inner.registry.idle_update_lease(harness).await
+                }
+            } => lease,
         };
+        // Only an idle, exclusively leased background update may gate new work.
+        if trigger != UpdateTrigger::Manual {
+            self.inner.registry.begin_update(harness);
+        }
         if cancel.is_cancelled() || !self.inner.registry.enabled_set().contains(&harness) {
             drop(lease);
             self.finish_cancelled(harness);
@@ -1281,8 +1328,7 @@ impl HarnessUpdateCoordinator {
         let cancellations = lock(&self.inner.cancellations);
         if cancellations
             .get(&harness)
-            .is_some_and(|update| update.automatic)
-            && self.policy(harness) != HarnessUpdatePolicy::AutoWhenIdle
+            .is_some_and(|update| !self.trigger_allowed(harness, update.trigger))
         {
             cancel.cancel();
         }
@@ -1347,7 +1393,7 @@ impl HarnessUpdateCoordinator {
             lock(&self.inner.prefs).policies.insert(harness, policy);
             if let Some(update) = active.get(&harness)
                 && (policy == HarnessUpdatePolicy::Off
-                    || (update.automatic && policy != HarnessUpdatePolicy::AutoWhenIdle))
+                    || !self.trigger_allowed(harness, update.trigger))
                 && !matches!(
                     self.status(harness).phase,
                     HarnessUpdatePhase::Installing
@@ -2471,26 +2517,45 @@ mod tests {
     #[tokio::test]
     async fn updater_timeout_stops_descendants_before_returning() {
         for leader_exits in [false, true] {
+            tokio::time::pause();
             let temp = tempfile::tempdir().unwrap();
             let marker = temp.path().join("mutated");
             let ready = temp.path().join("ready");
+            let descendant_ready = temp.path().join("descendant-ready");
+            let release = temp.path().join("release");
             let script = format!(
-                "echo $$ > \"$2\"; /bin/sh -c 'sleep 0.5; echo mutated > \"$1\"' sh \"$1\" & {}",
+                "echo $$ > \"$2\"; /bin/sh -c 'echo ready > \"$3\"; while test ! -f \"$2\"; do sleep 0.01; done; echo mutated > \"$1\"' sh \"$1\" \"$3\" \"$4\" & {}",
                 if leader_exits { "exit 0" } else { "wait" }
             );
-            let result = super::run_command_output(
+            let args = [
+                "-c",
+                &script,
+                "sh",
+                marker.to_str().unwrap(),
+                ready.to_str().unwrap(),
+                release.to_str().unwrap(),
+                descendant_ready.to_str().unwrap(),
+            ];
+            let mut command = Box::pin(super::run_command_output(
                 std::path::Path::new("/bin/sh"),
-                &[
-                    "-c",
-                    &script,
-                    "sh",
-                    marker.to_str().unwrap(),
-                    ready.to_str().unwrap(),
-                ],
+                &args,
                 Duration::from_millis(250),
-            )
-            .await;
-            assert!(result.unwrap_err().contains("timed out"));
+            ));
+            // Real subprocess startup is not the deadline under test. Keep
+            // Tokio's clock still until both leader and descendant have run.
+            let startup_deadline = std::time::Instant::now() + super::COMMAND_TIMEOUT;
+            tokio::select! {
+                result = &mut command => panic!("updater ended before readiness: {result:?}"),
+                _ = async {
+                    while !ready.exists() || !descendant_ready.exists() {
+                        assert!(std::time::Instant::now() < startup_deadline, "updater did not start");
+                        // A runnable task prevents paused time auto-advancing.
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            tokio::time::advance(Duration::from_millis(250)).await;
+            assert!(command.await.unwrap_err().contains("timed out"));
             let pid: i32 = std::fs::read_to_string(&ready)
                 .unwrap()
                 .trim()
@@ -2498,6 +2563,10 @@ mod tests {
                 .unwrap();
             // The direct child must already be reaped, not merely signalled.
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            // A surviving descendant would mutate after this release. There
+            // is no startup-versus-sleep race deciding whether it gets that far.
+            std::fs::write(&release, "").unwrap();
+            tokio::time::resume();
             tokio::time::sleep(Duration::from_millis(500)).await;
             assert!(
                 !marker.exists(),
@@ -2912,7 +2981,7 @@ esac
             coordinator.set_policy(HarnessId::Grok, HarnessUpdatePolicy::Notify);
             if automatic {
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while coordinator.inner.registry.update_pending(HarnessId::Grok) {
+                    while coordinator.is_mutating(HarnessId::Grok) {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -2940,6 +3009,46 @@ esac
                 std::fs::read_to_string(temp.path().join("version")).unwrap(),
                 if automatic { "1.0.0\n" } else { "2.0.0\n" }
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_app_opt_out_cancels_only_the_matching_background_request() {
+        use super::UpdateTrigger;
+        use zeron_proto::HarnessUpdatePolicy;
+        for (trigger, off) in [
+            (UpdateTrigger::Manual, false),
+            (UpdateTrigger::AutoWhenIdle, false),
+            (UpdateTrigger::PostAppUpdate, false),
+            (UpdateTrigger::PostAppUpdate, true),
+        ] {
+            let (temp, coordinator) = automatic_fixture();
+            coordinator.check_one(HarnessId::Grok).await.unwrap();
+            super::lock(&coordinator.inner.prefs).policies
+                .insert(HarnessId::Grok, HarnessUpdatePolicy::AutoWhenIdle);
+            let running = coordinator.inner.registry.execution_lease(HarnessId::Grok).await;
+            let update = coordinator.clone();
+            let apply = tokio::spawn(async move { update.apply_inner(HarnessId::Grok, trigger).await });
+            wait_for_phase(&coordinator, HarnessId::Grok, HarnessUpdatePhase::WaitingForIdle).await;
+            if off {
+                coordinator.set_policy(HarnessId::Grok, HarnessUpdatePolicy::Off);
+            } else {
+                coordinator.set_harness_auto_update(false).unwrap();
+            }
+            if trigger == UpdateTrigger::PostAppUpdate {
+                let result = tokio::time::timeout(Duration::from_secs(1), apply).await
+                    .expect("opting out must cancel without waiting for the active runtime")
+                    .unwrap();
+                assert_eq!(result.unwrap_err(), "update cancelled");
+                assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "1.0.0\n");
+                drop(running);
+            } else {
+                drop(running);
+                apply.await.unwrap().unwrap();
+                assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "2.0.0\n");
+            }
+            coordinator.shutdown().await;
         }
     }
 
@@ -2979,6 +3088,7 @@ esac
     #[tokio::test]
     async fn automatic_install_boundary_rechecks_policy_for_commands_and_downloads() {
         use zeron_proto::HarnessUpdatePolicy;
+        use super::UpdateTrigger;
         let temp = tempfile::tempdir().unwrap();
         let registry = Arc::new(HarnessRegistry::new());
         registry.register(Arc::new(ExecutableHarness(
@@ -2990,23 +3100,32 @@ esac
             HarnessUpdatePhase::Preparing,
             HarnessUpdatePhase::Downloading,
         ] {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            super::lock(&coordinator.inner.cancellations).insert(
-                HarnessId::Grok,
-                super::ActiveUpdate {
-                    cancel: cancel.clone(),
-                    automatic: true,
-                    previous_phase: HarnessUpdatePhase::Available,
-                },
-            );
-            coordinator.mutate(HarnessId::Grok, |status| status.phase = phase);
-            // Simulate a policy change before the final activation boundary.
-            super::lock(&coordinator.inner.prefs)
-                .policies
-                .insert(HarnessId::Grok, HarnessUpdatePolicy::Notify);
-            assert!(coordinator.begin_install(HarnessId::Grok, &cancel).is_err());
-            assert!(cancel.is_cancelled());
-            assert_eq!(coordinator.status(HarnessId::Grok).phase, phase);
+            for (trigger, policy, global_enabled) in [
+                (UpdateTrigger::AutoWhenIdle, HarnessUpdatePolicy::Notify, true),
+                (UpdateTrigger::PostAppUpdate, HarnessUpdatePolicy::Off, true),
+                (UpdateTrigger::PostAppUpdate, HarnessUpdatePolicy::Notify, false),
+            ] {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                super::lock(&coordinator.inner.cancellations).insert(
+                    HarnessId::Grok,
+                    super::ActiveUpdate {
+                        cancel: cancel.clone(),
+                        trigger,
+                        previous_phase: HarnessUpdatePhase::Available,
+                    },
+                );
+                coordinator.mutate(HarnessId::Grok, |status| status.phase = phase);
+                // Change preferences directly to exercise the final install fence,
+                // independently of the setters' eager cancellation.
+                {
+                    let mut prefs = super::lock(&coordinator.inner.prefs);
+                    prefs.policies.insert(HarnessId::Grok, policy);
+                    prefs.harness_auto_update = Some(global_enabled);
+                }
+                assert!(coordinator.begin_install(HarnessId::Grok, &cancel).is_err());
+                assert!(cancel.is_cancelled());
+                assert_eq!(coordinator.status(HarnessId::Grok).phase, phase);
+            }
         }
     }
 
@@ -3040,7 +3159,7 @@ esac
         registry.set_enabled(HarnessId::Grok, false).unwrap();
         coordinator.refresh_enabled();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while registry.update_pending(HarnessId::Grok) {
+            while coordinator.is_mutating(HarnessId::Grok) {
                 tokio::task::yield_now().await;
             }
         })
@@ -3108,19 +3227,47 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn supported_post_update_runs_the_native_updater_once() {
-        let (temp, coordinator) = automatic_fixture();
-        std::fs::write(temp.path().join("last-boot-version"), "0.0.0").unwrap();
-        coordinator.post_update_refresh(temp.path(), true);
-        let mut status = coordinator.watch();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while coordinator.status(HarnessId::Grok).phase != HarnessUpdatePhase::Updated {
-                status.changed().await.unwrap();
+    async fn background_updates_admit_new_execution_and_wait_for_all_persistent_leases() {
+        use zeron_proto::HarnessUpdatePolicy;
+        for post_app in [false, true] {
+            let (temp, coordinator) = automatic_fixture();
+            let registry = &coordinator.inner.registry;
+            // Persistent runtimes retain this lease even between turns.
+            let running = registry.execution_lease(HarnessId::Grok).await;
+            if post_app {
+                // The global post-app preference also permits Notify, as before.
+                std::fs::write(temp.path().join("last-boot-version"), "0.0.0").unwrap();
+                coordinator.post_update_refresh(temp.path(), true);
+            } else {
+                coordinator.check_one(HarnessId::Grok).await.unwrap();
+                coordinator.set_policy(HarnessId::Grok, HarnessUpdatePolicy::AutoWhenIdle);
             }
-        }).await.unwrap();
-        assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "2.0.0\n");
-        assert!(!super::version_transition(temp.path()));
-        coordinator.shutdown().await;
+            let mut status = coordinator.watch();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while coordinator.status(HarnessId::Grok).phase != HarnessUpdatePhase::WaitingForIdle {
+                    status.changed().await.unwrap();
+                }
+            }).await.unwrap();
+
+            let new_execution = tokio::time::timeout(
+                Duration::from_secs(1), registry.execution_lease(HarnessId::Grok),
+            ).await.expect("background update must not strand a new user execution");
+            assert_eq!(registry.while_update_clear(HarnessId::Grok, || 42), Some(42));
+            assert!(!registry.update_pending(HarnessId::Grok));
+            // Let another idle-admission attempt run with both leases held.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "1.0.0\n");
+            drop(running);
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "1.0.0\n");
+            drop(new_execution);
+            wait_for_phase(&coordinator, HarnessId::Grok, HarnessUpdatePhase::Updated).await;
+            assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "2.0.0\n");
+            if post_app {
+                assert!(!super::version_transition(temp.path()));
+            }
+            coordinator.shutdown().await;
+        }
     }
 
     #[test]
@@ -3403,7 +3550,7 @@ esac
                     harness,
                     super::ActiveUpdate {
                         cancel: token.clone(),
-                        automatic: false,
+                        trigger: super::UpdateTrigger::Manual,
                         previous_phase: HarnessUpdatePhase::Available,
                     },
                 );
@@ -3460,7 +3607,7 @@ esac
             HarnessId::ClaudeCode,
             super::ActiveUpdate {
                 cancel: tokio_util::sync::CancellationToken::new(),
-                automatic: false,
+                trigger: super::UpdateTrigger::Manual,
                 previous_phase: HarnessUpdatePhase::Available,
             },
         );
@@ -3551,10 +3698,14 @@ esac
         std::fs::write(
             &executable,
             r#"#!/bin/sh
-version_file="$(dirname "$0")/version"
+root="$(dirname "$0")"
+version_file="$root/version"
 case "$1" in
   --version) cat "$version_file" ;;
-  update) sleep 0.2; printf '2.0.0\n' > "$version_file" ;;
+  update)
+    touch "$root/started"
+    while test ! -f "$root/release"; do sleep 0.01; done
+    printf '2.0.0\n' > "$version_file" ;;
   *) exit 2 ;;
 esac
 "#,
@@ -3580,31 +3731,27 @@ esac
             let coordinator = coordinator.clone();
             async move { coordinator.apply(HarnessId::ClaudeCode).await }
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while coordinator.status(HarnessId::ClaudeCode).phase != HarnessUpdatePhase::Installing
-            {
-                tokio::task::yield_now().await;
+        // Installing is published before spawning the command. Wait for the
+        // actual updater, held at a handshake, before dropping its RPC caller.
+        tokio::time::timeout(super::COMMAND_TIMEOUT, async {
+            while !temp.path().join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("updater subprocess did not start");
+        assert_eq!(coordinator.status(HarnessId::ClaudeCode).phase, HarnessUpdatePhase::Installing);
         apply.abort();
+        assert!(apply.await.unwrap_err().is_cancelled());
+        std::fs::write(temp.path().join("release"), "").unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let status = coordinator.status(HarnessId::ClaudeCode);
-                if matches!(
-                    status.phase,
-                    HarnessUpdatePhase::Updated | HarnessUpdatePhase::Current
-                ) {
-                    assert_eq!(status.installed_version.as_deref(), Some("2.0.0"));
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        // The detached task owns this gate through verification and marker
+        // cleanup; completion does not depend on a two-second scheduling race.
+        let _operation = coordinator.operation_gate(HarnessId::ClaudeCode).lock_owned().await;
+        let status = coordinator.status(HarnessId::ClaudeCode);
+        assert!(matches!(status.phase, HarnessUpdatePhase::Updated | HarnessUpdatePhase::Current), "{status:?}");
+        assert_eq!(status.installed_version.as_deref(), Some("2.0.0"));
+        assert_eq!(std::fs::read_to_string(temp.path().join("version")).unwrap(), "2.0.0\n");
         assert!(!registry.update_pending(HarnessId::ClaudeCode));
     }
 

@@ -142,6 +142,11 @@ impl RpcClient {
         }
     }
 
+    /// Wait until the transport can no longer accept requests. Does not retry them.
+    pub async fn closed(&self) {
+        self.out.closed().await;
+    }
+
     /// Unary request.
     pub async fn call(
         &self,

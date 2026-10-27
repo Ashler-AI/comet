@@ -278,6 +278,8 @@ pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
     engine_info: EngineInfo,
     deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
+    replacement: Arc<tokio::sync::OnceCell<EngineHandle>>,
+    stopped: tokio_util::sync::CancellationToken,
 }
 
 impl EngineHandle {
@@ -443,6 +445,8 @@ impl EngineHandle {
             }),
             engine_info,
             deferred_state: Some(state_rx.clone()),
+            replacement: Arc::new(tokio::sync::OnceCell::new()),
+            stopped: tokio_util::sync::CancellationToken::new(),
         };
         // Local, development, and already-resolved synced profiles need no
         // authentication UI while assembling. Keep the viewport Connecting
@@ -468,57 +472,78 @@ impl EngineHandle {
         if !matches!(probe, Ok(Ok(_))) {
             return None;
         }
-        tracing::info!(%url, "engine daemon detected; connecting");
-        match connect_ws(&url).await {
-            Ok(client) => match query_engine_info(&client).await {
-                Ok(engine_info) => {
-                    let client = Arc::new(client);
-                    let (state_tx, state_rx) =
-                        tokio::sync::watch::channel(DeferredEngineState::Waiting);
-                    let lifecycle_client = client.clone();
-                    let lifecycle_task = tokio::spawn(async move {
-                        let state = match lifecycle_client
-                            .call(methods::ENGINE_READY, serde_json::json!({}))
-                            .await
-                        {
-                            Ok(_) => DeferredEngineState::Ready,
-                            // EngineReady was added after EngineInfo. An older daemon
-                            // that does not expose the barrier is already assembled.
-                            Err(RpcError::UnknownMethod(method))
-                                if method == methods::ENGINE_READY =>
-                            {
-                                DeferredEngineState::Ready
-                            }
-                            Err(err) => DeferredEngineState::Failed(err.to_string()),
-                        };
-                        state_tx.send_replace(state);
-                    });
-                    Some(EngineHandle {
-                        inner: Arc::new(RemoteEngine {
-                            client,
-                            url,
-                            lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
-                        }),
-                        engine_info,
-                        deferred_state: Some(state_rx),
-                    })
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        %url,
-                        error = %err,
-                        "listener did not provide engine identity; embedding instead"
-                    );
-                    None
-                }
-            },
-            // Something is on the port but it is not an engine (or it is
-            // wedged). Fall through and embed: a stranger holding 27654
-            // should cost other viewports, not this window.
+        match Self::connect_daemon(url, None).await {
+            Ok(handle) => Some(handle),
             Err(err) => {
-                tracing::warn!(%url, error = %err, "not an engine; embedding instead");
+                tracing::warn!(error = %err, "not an engine; embedding instead");
                 None
             }
+        }
+    }
+
+    async fn connect_daemon(url: String, expected: Option<&EngineInfo>) -> Result<Self, RpcError> {
+        let client = Arc::new(connect_ws(&url).await?);
+        let engine_info = query_engine_info(&client).await?;
+        if expected.is_some_and(|expected| {
+            engine_info.device_id != expected.device_id
+                || engine_info.workspace_scope != expected.workspace_scope
+        }) {
+            tracing::warn!(%url, "ignoring replacement daemon with a different device or workspace");
+            return Err(RpcError::Failed(
+                "replacement daemon has a different device or workspace".into(),
+            ));
+        }
+        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let lifecycle_client = client.clone();
+        let lifecycle_task = tokio::spawn(async move {
+            let state = match lifecycle_client
+                .call(methods::ENGINE_READY, serde_json::json!({}))
+                .await
+            {
+                Ok(_) => DeferredEngineState::Ready,
+                // Older daemons without the barrier are already assembled.
+                Err(RpcError::UnknownMethod(method)) if method == methods::ENGINE_READY => {
+                    DeferredEngineState::Ready
+                }
+                Err(err) => DeferredEngineState::Failed(err.to_string()),
+            };
+            state_tx.send_replace(state);
+        });
+        Ok(Self {
+            inner: Arc::new(RemoteEngine {
+                client,
+                url,
+                lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
+            }),
+            engine_info,
+            deferred_state: Some(state_rx),
+            replacement: Arc::new(tokio::sync::OnceCell::new()),
+            stopped: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    /// All viewports sharing this connection adopt one replacement. Never
+    /// bootstrap here: an unavailable daemon must not open another profile.
+    async fn reconnect(&self) -> Result<Self, RpcError> {
+        let EngineMode::Remote { url } = self.mode() else {
+            return Err(RpcError::Closed);
+        };
+        tokio::select! {
+            biased;
+            _ = self.stopped.cancelled() => Err(RpcError::Closed),
+            replacement = self.replacement.get_or_try_init(|| async {
+                loop {
+                    let attempt = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        Self::connect_daemon(url.clone(), Some(&self.engine_info)),
+                    ).await;
+                    if let Ok(Ok(mut handle)) = attempt {
+                        handle.stopped = self.stopped.clone();
+                        return Ok(handle);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }) => replacement.cloned(),
         }
     }
 
@@ -539,6 +564,8 @@ impl EngineHandle {
                 devbox_id: None,
             },
             deferred_state: None,
+            replacement: Arc::new(tokio::sync::OnceCell::new()),
+            stopped: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -569,6 +596,7 @@ impl EngineHandle {
     }
 
     pub async fn shutdown(&self) {
+        self.stopped.cancel();
         self.inner.shutdown().await;
     }
 }
@@ -2481,10 +2509,17 @@ impl AppState {
     /// stopped. The next bootstrap must never render rows from the previous
     /// account while the local profile is opening.
     pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.engine {
+            handle.stopped.cancel();
+        }
         self.engine = None;
         self.watch_tasks.clear();
         self.transcript_task = None;
         self.pending_send_tasks.clear();
+        self.queue_task = None;
+        self.queue.clear();
+        self.sub_watch_tasks.clear();
+        self.sub_transcripts.clear();
         self.change_request_tasks.clear();
         self.change_requests = ChangeRequestClientState::default();
         self.connection = ConnectionStatus::Connecting;
@@ -2633,6 +2668,9 @@ impl AppState {
         }
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
+            if let Some(handle) = &s.engine {
+                handle.stopped.cancel();
+            }
             s.connection = ConnectionStatus::Connecting;
             s.workspace_scope = None;
             s.auth = None;
@@ -2686,7 +2724,10 @@ impl AppState {
         if let Some(update) = crate::app_update::AppUpdate::global(cx) {
             update.update(cx, |update, _| update.set_engine(Some(handle.clone())));
         }
-        let mut watch_tasks = Vec::with_capacity(10);
+        let mut watch_tasks = Vec::with_capacity(12);
+        if let Some(task) = spawn_reconnect_watch(cx, handle.clone()) {
+            watch_tasks.push(task);
+        }
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
         }
@@ -2746,20 +2787,30 @@ impl AppState {
             ));
         }
         self.watch_tasks = watch_tasks;
+        self.change_request_tasks.clear();
         self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
         // data profile they reached before they are allowed to render Ready.
         self.connection = ConnectionStatus::Ready;
-        // Re-subscribe the transcript if a chat was already selected (reconnect path).
-        if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            if handle
-                .engine_info()
-                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
-            {
-                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
-            }
+        // Rebind observations only; retain local rows, drafts and command IDs.
+        self.transcript_task = None;
+        self.queue_task = None;
+        if let Some(chat_id) = self.selected_chat.clone()
+            && !self.is_unsaved_side_chat(&chat_id)
+        {
+            self.start_chat_watches(chat_id, cx);
+        }
+        let supports_queue = handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1);
+        for (chat_id, tasks) in &mut self.pending_send_tasks {
+            *tasks = (
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone())),
+                supports_queue.then(|| spawn_queue_watch(cx, handle.clone(), chat_id.clone())),
+            );
+        }
+        for (doc_id, task) in &mut self.sub_watch_tasks {
+            *task = spawn_subagent_watch(cx, handle.clone(), doc_id.clone());
         }
         cx.notify();
     }
@@ -3191,6 +3242,54 @@ impl AppState {
     }
 }
 
+/// One closure signal replaces the shared transport and all its observations.
+fn spawn_reconnect_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+) -> Option<Task<()>> {
+    if !matches!(handle.mode(), EngineMode::Remote { .. }) {
+        return None;
+    }
+    Some(cx.spawn(async move |this, cx| {
+        tokio::select! {
+            biased;
+            _ = handle.stopped.cancelled() => return,
+            _ = handle.client().closed() => {},
+        }
+        if !this.update(cx, |state, cx| {
+            if !state.engine.as_ref().is_some_and(|current| current.same_connection(&handle)) {
+                return false;
+            }
+            state.connectivity_observed = false;
+            cx.notify();
+            true
+        }).unwrap_or(false) {
+            return;
+        }
+        // Dropping the viewport's task also cancels its in-flight dial, even
+        // when the Tokio bridge outlives the entity. Other viewports may retry.
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = cancelled.clone().drop_guard();
+        let previous = handle.clone();
+        let reconnect = Tokio::spawn(cx, async move {
+            tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => Err(RpcError::Closed),
+                result = previous.reconnect() => result,
+            }
+        });
+        if let Ok(Ok(replacement)) = reconnect.await {
+            this.update(cx, |state, cx| {
+                if !handle.stopped.is_cancelled()
+                    && state.engine.as_ref().is_some_and(|current| current.same_connection(&handle))
+                {
+                    state.attach_engine(replacement, cx);
+                }
+            }).ok();
+        }
+    }))
+}
+
 /// Observe assembly after an early attach (cloud onboarding or another viewport
 /// reaching the embedded engine over IPC). Data subscriptions wait on the same
 /// result, but their individual errors are not authoritative: older engines may
@@ -3202,14 +3301,27 @@ fn spawn_deferred_engine_watch(
 ) -> Option<Task<()>> {
     let mut deferred = handle.deferred_state()?;
     Some(cx.spawn(async move |this, cx| {
-        let Err(failure) = wait_for_deferred_engine(&mut deferred).await else {
-            return;
+        let result = tokio::select! {
+            biased;
+            _ = handle.stopped.cancelled() => return,
+            _ = handle.client().closed() => return,
+            result = wait_for_deferred_engine(&mut deferred) => result,
         };
+        let Err(failure) = result else { return };
+        if !this.update(cx, |state, _| {
+            !handle.stopped.is_cancelled()
+                && state.engine.as_ref().is_some_and(|current| current.same_connection(&handle))
+        }).unwrap_or(false) {
+            return;
+        }
         tracing::error!(error = %failure, "engine assembly failed after attachment");
         // Embedded handles release their IPC listener before exposing Retry;
         // remote handles stop their completed readiness probe.
         handle.shutdown().await;
         this.update(cx, |state, cx| {
+            if !state.engine.as_ref().is_some_and(|current| current.same_connection(&handle)) {
+                return;
+            }
             state.connection = ConnectionStatus::Failed(failure);
             cx.notify();
         })
@@ -4224,6 +4336,213 @@ mod tests {
                 .await,
             Err(RpcError::UnknownMethod(method)) if method == methods::STOP_ENGINE
         ));
+    }
+
+    #[gpui::test]
+    fn daemon_restart_rebinds_watches_without_replaying_mutations(cx: &mut gpui::TestAppContext) {
+        use futures::StreamExt;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        struct Daemon {
+            device: &'static str,
+            scope: WorkspaceScope,
+            generation: u32,
+            requests: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl RpcService for Daemon {
+            async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+                self.requests.lock().unwrap().push(if method == methods::MUTATE {
+                    format!("Mutate:{}", params["op"].as_str().unwrap_or_default())
+                } else { method.into() });
+                let frame = match method {
+                    methods::ENGINE_INFO => return RpcReply::value(&EngineInfo {
+                        device_id: self.device.into(), workspace_scope: self.scope,
+                        cursor_sdk_version: None,
+                        capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+                        devbox_provider: None, devbox_id: None,
+                    }),
+                    methods::ENGINE_READY => return RpcReply::value(&true),
+                    // Received, but no acknowledgement before the daemon dies.
+                    methods::QUEUE_COMMAND => {
+                        let command: zeron_doc::SessionCommandPayload =
+                            serde_json::from_value(params["command"].clone()).unwrap();
+                        assert!(matches!(command, zeron_doc::SessionCommandPayload::Run { request, message_id }
+                            if message_id == "selected-command" && request.prompt == "send this exactly once"));
+                        return std::future::pending().await;
+                    }
+                    methods::MUTATE => return RpcReply::value(&true),
+                    methods::WATCH_CHATS => serde_json::to_value(vec![
+                        chat("selected", 0, None), chat("background", 0, None), chat("cached", 0, None),
+                    ]).unwrap(),
+                    methods::WATCH_SESSIONS => {
+                        let mut row = session("selected", SessionStatus::Working, 0, Utc::now());
+                        row.running_subagents = self.generation;
+                        serde_json::to_value(vec![row]).unwrap()
+                    }
+                    methods::WATCH_DOC_MESSAGES => {
+                        let id = params["chatId"].as_str().unwrap();
+                        serde_json::to_value(zeron_doc::TranscriptUpdate {
+                            frame: TranscriptFrame::reset(&[user_entry(&format!("{id}-{}", self.generation))]),
+                            context_usage: None, replay_baseline: None,
+                            command_delivery: if self.generation == 2 && id == "background" {
+                                HashMap::from([("background-command".into(), zeron_doc::CommandDeliveryStatus::Preparing)])
+                            } else { HashMap::new() },
+                        }).unwrap()
+                    }
+                    methods::WATCH_QUEUE => serde_json::json!({ "items": [{
+                        "id": "queued", "text": "keep queued", "attachments": [],
+                        "holdForTurnEnd": false, "issuedBy": "dev", "issuedAt": 0,
+                    }] }),
+                    other => return Err(RpcError::UnknownMethod(other.into())),
+                };
+                Ok(RpcReply::Stream(futures::stream::once(async move { frame })
+                    .chain(futures::stream::pending()).boxed()))
+            }
+        }
+        fn serve(port: u16, daemon: Arc<Daemon>) -> (tokio::runtime::Runtime, u16) {
+            // Own accepted sockets too: aborting only serve_ws_listener would
+            // leave existing clients connected and would not model process death.
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let port = runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                tokio::spawn(zeron_rpc::serve_ws_listener(listener, daemon));
+                port
+            });
+            (runtime, port)
+        }
+        fn drive_until(
+            cx: &mut gpui::TestAppContext,
+            runtime: &tokio::runtime::Runtime,
+            mut ready: impl FnMut(&mut gpui::TestAppContext) -> bool,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+                if ready(cx) { return; }
+                assert!(Instant::now() < deadline, "reconnect observation did not arrive");
+                std::thread::yield_now();
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let daemon = |device, scope, generation| Arc::new(Daemon {
+            device, scope, generation, requests: requests.clone(),
+        });
+        // Client transport and Tokio bridge completions must wake GPUI on the
+        // test thread. Only the daemon's socket side runs on worker threads.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        cx.update(|cx| gpui_tokio::init_from_handle(cx, runtime.handle().clone()));
+        let (server, port) = serve(0, daemon("dev", WorkspaceScope::Local, 1));
+        let original = runtime.block_on(EngineHandle::attach_to_daemon(port)).unwrap();
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("cached".into()), cx);
+            state.apply_transcript(vec![user_entry("cached-history")]);
+            state.select_chat(Some("background".into()), cx);
+            state.attach_engine(original.clone(), cx);
+            state.begin_pending_send("background", "background-command", Utc::now());
+            state.select_chat(Some("selected".into()), cx);
+            state.begin_pending_send("selected", "selected-command", Utc::now());
+            state.push_echo("selected", user_entry("selected-command"));
+            state.watch_subagent_doc("subagent".into(), cx);
+        });
+        drive_until(cx, &runtime, |cx| state.read_with(cx, |state, _| {
+            state.transcript.first().is_some_and(|row| row.id == "selected-1")
+                && state.sub_transcript("subagent").first().is_some_and(|row| row.id == "subagent-1")
+                && state.queue.len() == 1
+        }));
+        let command_handle = original.clone();
+        let mutation = runtime.spawn(async move {
+            let command = zeron_doc::SessionCommandPayload::Run {
+                request: zeron_proto::RunRequest {
+                    prompt: "send this exactly once".into(),
+                    harness: Some(HarnessId::Mock),
+                    model: None,
+                    reasoning: None,
+                    model_options: serde_json::Map::new(),
+                    cwd: "/tmp".into(),
+                    sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                    auto_approve: false,
+                    resume: None,
+                    attachments: Vec::new(),
+                    worktree: None,
+                    mcp: None,
+                },
+                message_id: "selected-command".into(),
+            };
+            command_handle.client().call(methods::QUEUE_COMMAND, serde_json::json!({
+                "chatId": "selected", "command": command,
+            })).await
+        });
+        drive_until(cx, &runtime, |_| requests.lock().unwrap().iter().any(|method| method == methods::QUEUE_COMMAND));
+        let mutation_count = requests.lock().unwrap().iter().filter(|method| method.starts_with("Mutate:")).count();
+        drop(server);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), original.client().closed()).await.unwrap();
+            assert!(matches!(mutation.await.unwrap(), Err(RpcError::Closed)));
+        });
+        // Neither another device nor another workspace at the same port may attach.
+        for (device, scope) in [("stranger", WorkspaceScope::Local), ("dev", WorkspaceScope::Synced)] {
+            let (stranger, _) = serve(port, daemon(device, scope, 99));
+            let rejection = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    EngineHandle::connect_daemon(format!("ws://127.0.0.1:{port}"), Some(original.engine_info())),
+                ).await.expect("identity probe must finish")
+            });
+            assert!(matches!(rejection, Err(RpcError::Failed(_))));
+            assert!(original.replacement.get().is_none());
+            drop(stranger);
+        }
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_chat.as_deref(), Some("selected"));
+            assert_eq!(state.transcript[0].id, "selected-1");
+            assert_eq!(state.queue[0].id, "queued");
+            assert_eq!(state.pending_sends["selected"].message_id, "selected-command");
+            assert_eq!(state.pending_sends["background"].message_id, "background-command");
+            assert_eq!(state.pending_echoes()[0].id, "selected-command");
+            assert_eq!(state.transcript_cache[0].entries[0].id, "cached-history");
+        });
+        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 2));
+        drive_until(cx, &runtime, |cx| state.read_with(cx, |state, _| {
+            state.engine.as_ref().is_some_and(|engine| !engine.same_connection(&original))
+                && state.transcript.first().is_some_and(|row| row.id == "selected-2")
+                && state.sub_transcript("subagent").first().is_some_and(|row| row.id == "subagent-2")
+                && state.sessions.first().is_some_and(|row| row.running_subagents == 2)
+                && state.send_preparing("background")
+        }));
+        let fresh = state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_chat.as_deref(), Some("selected"));
+            assert_eq!(state.queue[0].id, "queued");
+            assert_eq!(state.pending_sends["selected"].message_id, "selected-command");
+            assert_eq!(state.pending_sends["background"].message_id, "background-command");
+            assert_eq!(state.transcript_cache[0].entries[0].id, "cached-history");
+            state.engine.clone().unwrap()
+        });
+        assert!(runtime.block_on(original.reconnect()).unwrap().same_connection(&fresh));
+        assert_eq!(requests.lock().unwrap().iter().filter(|method| method.as_str() == methods::QUEUE_COMMAND).count(), 1);
+        assert_eq!(requests.lock().unwrap().iter().filter(|method| method.starts_with("Mutate:")).count(), mutation_count);
+        drop(server);
+        runtime.block_on(fresh.client().closed());
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 3));
+        assert!(runtime.block_on(fresh.reconnect()).is_err(), "account replacement cancels reconnect");
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(state.engine.is_none());
+            assert!(state.pending_sends.is_empty());
+            assert!(state.sub_watch_tasks.is_empty());
+        });
+        drop(server);
     }
 
     fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {

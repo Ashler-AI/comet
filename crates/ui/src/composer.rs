@@ -13947,6 +13947,9 @@ mod tests {
             .build()
             .unwrap();
         let _guard = runtime.enter();
+        // Side-chat attachment installs lifecycle watches that need the GPUI
+        // Tokio bridge as well as an entered runtime, including at teardown.
+        cx.update(|cx| gpui_tokio::init_from_handle(cx, runtime.handle().clone()));
         let directory = tempfile::tempdir().unwrap();
         cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
         let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
@@ -14115,11 +14118,20 @@ mod tests {
         let called = |method: &str| after.iter().any(|f| f.method.as_deref() == Some(method));
         assert!(called(methods::WATCH_DOC_MESSAGES), "{after:?}");
         assert!(called(methods::QUEUE_COMMAND), "{after:?}");
+        assert_eq!(
+            after
+                .iter()
+                .filter(|f| f.method.as_deref() == Some(methods::QUEUE_COMMAND))
+                .count(),
+            1,
+            "first send must queue exactly one command"
+        );
         let run = after
             .iter()
             .find(|f| f.method.as_deref() == Some(methods::QUEUE_COMMAND))
             .unwrap();
         let request = &run.params["command"]["request"];
+        assert_eq!(request["prompt"], "hello");
         for field in ["harness", "model", "reasoning", "modelOptions"] {
             assert_eq!(request[field], create.params["config"][field], "{field}");
         }

@@ -50,6 +50,18 @@ bare model ID; Agent Auth still checks account/model access when a run starts.
 Update and restart the running Crew engine to refresh these choices; replacing
 only the frontend or CLI does not update its catalog behavior.
 
+### Engine and agent update recovery
+
+Open Crew windows reconnect to a restarted engine only when its device and
+workspace match. Reconnection restores observations while retaining the selected
+session, unsent draft and message IDs; it never replays commands or mutations.
+
+Background agent updates, including post-Crew-update refreshes, wait for existing
+provider subprocesses without blocking new sessions or steering. Idle warm
+processes can defer installation until their existing cleanup (up to 30 minutes).
+Explicit **Update** requests retain priority over new runs. Existing global and
+per-agent update preferences remain independent.
+
 ### Native Scaffold handoff
 
 `comet session handoff [CHAT_ID] --prompt-file FILE` forks the last completed
