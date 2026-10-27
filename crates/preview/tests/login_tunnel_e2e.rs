@@ -16,9 +16,14 @@ use zeron_preview::{PreviewService, Scope, signaling};
 struct Token;
 #[async_trait::async_trait]
 impl signaling::TokenSource for Token {
-    async fn token(&self) -> anyhow::Result<String> {
-        Ok("token".into())
+    async fn token(&self) -> anyhow::Result<zeron_proto::AccessToken> {
+        Ok(zeron_proto::AccessToken {
+            value: "token".into(),
+            generation: 0,
+        })
     }
+
+    fn invalidate(&self, _: u64) {}
 }
 
 type Sockets = Arc<Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<String>>>>;

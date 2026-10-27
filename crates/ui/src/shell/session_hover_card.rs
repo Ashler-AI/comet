@@ -246,14 +246,7 @@ impl Shell {
                     .filter(|title| !title.is_empty())
                     .unwrap_or_else(|| "New session".to_owned()),
             );
-            (
-                title,
-                project,
-                local,
-                online,
-                branch,
-                change_request,
-            )
+            (title, project, local, online, branch, change_request)
         };
 
         let muted = theme.text_muted;

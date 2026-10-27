@@ -72,12 +72,40 @@ impl SidebarPreferencesState {
     }
 }
 
+/// Immutable host provider identity, independent of OS and peer routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceEnvironment {
+    Namespace,
+    Boat,
+}
+
+impl DeviceEnvironment {
+    pub fn valid_devbox_id(&self, id: &str) -> bool {
+        match self {
+            Self::Namespace => {
+                id.len() == 13
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            }
+            Self::Boat => valid_boat_sandbox_id(id),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
     pub id: String,
     pub name: String,
     pub platform: String,
+    /// Absent on ordinary hosts and older registry rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbox_provider: Option<DeviceEnvironment>,
+    /// Immutable provider ID; display names never authorize execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbox_id: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
     /// First registration time (zeron devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
@@ -97,8 +125,83 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn devbox_binding(&self) -> Option<(DeviceEnvironment, &str)> {
+        let provider = self.devbox_provider?;
+        let id = self.devbox_id.as_deref()?;
+        provider.valid_devbox_id(id).then_some((provider, id))
+    }
+
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
+    }
+}
+
+/// Boat's immutable sandbox ID, not a display name or another provider's ID.
+pub fn valid_boat_sandbox_id(id: &str) -> bool {
+    id.strip_prefix("bx_").is_some_and(|suffix| {
+        suffix.len() == 8
+            && suffix
+                .bytes()
+                .all(|byte| b"23456789abcdefghjkmnpqrstuvwxyz".contains(&byte))
+    })
+}
+
+#[cfg(test)]
+mod device_binding_tests {
+    use super::*;
+
+    #[test]
+    fn boat_binding_is_optional_and_round_trips_without_name_inference() {
+        let mut device: Device = serde_json::from_value(serde_json::json!({
+            "id": "remote", "name": "bx_jdyh7avc", "platform": "linux",
+            "lastSeenAt": null, "futureMetadata": {"provider": "boat"}
+        }))
+        .unwrap();
+        assert_eq!(device.devbox_binding(), None);
+        assert!(
+            serde_json::to_value(&device)
+                .unwrap()
+                .get("devboxId")
+                .is_none()
+        );
+        device.devbox_provider = Some(DeviceEnvironment::Boat);
+        device.devbox_id = Some("bx_jdyh7avc".into());
+        let wire = serde_json::to_value(&device).unwrap();
+        assert_eq!(wire["devboxProvider"], "boat");
+        assert_eq!(wire["devboxId"], "bx_jdyh7avc");
+        assert_eq!(serde_json::from_value::<Device>(wire).unwrap(), device);
+    }
+
+    #[test]
+    fn boat_ids_require_the_immutable_provider_alphabet_and_exact_length() {
+        for id in [
+            "bx_jdyh7avc",
+            "bx_23456789",
+            "bx_abcdefgh",
+            "bx_jkmnpqrs",
+            "bx_tuvwxyz2",
+        ] {
+            assert!(valid_boat_sandbox_id(id), "{id}");
+        }
+        for id in [
+            "",
+            "jdyh7avc",
+            "bx_jdyh7av",
+            "bx_jdyh7avcc",
+            "bx_jdyh7av0",
+            "bx_jdyh7av1",
+            "bx_jdyh7avi",
+            "bx_jdyh7avl",
+            "bx_jdyh7avo",
+            "bx_jdyh7avA",
+            " bx_jdyh7avc",
+            "bx_jdyh7avc\n",
+            "BX_jdyh7avc",
+            "bx_jdyh7avé",
+            "ofpf7g22n4412",
+        ] {
+            assert!(!valid_boat_sandbox_id(id), "{id:?}");
+        }
     }
 }
 
@@ -252,6 +355,10 @@ pub struct Chat {
     /// deleted) is tolerated rather than cascaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
+    /// Credential-free, host-verified Crew identity. The personal registry
+    /// remains the index; disconnected environments never delete this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew: Option<crate::CrewChatMetadata>,
 }
 
 impl Chat {

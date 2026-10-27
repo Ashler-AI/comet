@@ -1,7 +1,6 @@
 //! Settings → Devices (feature-inventory §1.5): the device registry — name,
 //! platform, last-seen, an Online/Offline badge, a "This device" badge, click-to-copy id,
-//! and a Rename dialog (Mutate renameDevice). A Cloud device reads "Cloud"
-//! and, while its sandbox sleeps, "Asleep" rather than a last-seen time.
+//! Rename and explicit wake for registered Namespace and Boat hosts.
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -27,6 +26,58 @@ pub const DEVICE_ONLINE_WINDOW_SECS: i64 = 70;
 pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     last_seen
         .is_some_and(|at| now.signed_duration_since(at).num_seconds() <= DEVICE_ONLINE_WINDOW_SECS)
+}
+
+/// Provider operations are only initiated by explicit user actions. The reply
+/// must prove the same immutable binding before its fresh capabilities are used.
+pub(crate) async fn wake_host(
+    engine: &crate::state::EngineHandle,
+    executor: &gpui::BackgroundExecutor,
+    device: &zeron_proto::Device,
+) -> Result<zeron_proto::Device, String> {
+    let request = engine.client().call_scoped(
+        methods::WAKE_DEVICE,
+        serde_json::json!({"deviceId": device.id}),
+    );
+    let deadline = executor.timer(Duration::from_secs(180));
+    futures::pin_mut!(request, deadline);
+    let value = match futures::future::select(request, deadline).await {
+        futures::future::Either::Left((result, _)) => result.map_err(|error| error.to_string())?,
+        futures::future::Either::Right(_) => {
+            return Err("Connection timed out. Your draft is preserved.".into());
+        }
+    };
+    validate_wake_reply(device, value)
+}
+
+fn validate_wake_reply(
+    expected: &zeron_proto::Device,
+    value: serde_json::Value,
+) -> Result<zeron_proto::Device, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Reply {
+        device_id: String,
+        devbox_provider: zeron_proto::DeviceEnvironment,
+        devbox_id: String,
+        device: zeron_proto::Device,
+        ready: bool,
+    }
+    let reply: Reply = serde_json::from_value(value)
+        .map_err(|error| format!("Invalid connection response: {error}"))?;
+    if !reply.ready
+        || expected.devbox_binding().is_none()
+        || reply.device_id != expected.id
+        || reply.device.id != expected.id
+        || Some(reply.devbox_provider) != expected.devbox_provider
+        || Some(reply.devbox_id.as_str()) != expected.devbox_id.as_deref()
+        || reply.device.devbox_binding() != expected.devbox_binding()
+    {
+        return Err(
+            "The connected device does not match the selected host. Nothing was sent.".into(),
+        );
+    }
+    Ok(reply.device)
 }
 
 /// Compact last-seen line. Pure.
@@ -71,31 +122,14 @@ pub struct DevicesPage {
     error: Option<SharedString>,
     task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
-    /// One CloudStatus read per visit (kept alive, never polled).
-    _cloud_task: Option<Task<()>>,
+    waking: Option<String>,
+    wake_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
 impl DevicesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
-        // Read the Cloud account once per visit: the Cloud row reads from it
-        // (on while Cloud is enabled), not from a heartbeat.
-        let cloud_task = {
-            let state_ref = state.read(cx);
-            state_ref
-                .cloud_enabled()
-                .then(|| state_ref.engine().cloned())
-                .flatten()
-        }
-        .map(|engine| {
-            let state = state.clone();
-            cx.spawn(async move |_, cx| {
-                if let Ok(status) = crate::cloud::fetch_status(engine).await {
-                    state.update(cx, |state, cx| state.set_cloud_status(status, cx));
-                }
-            })
-        });
         Self {
             state,
             scroll: widgets::PageScroll::default(),
@@ -104,9 +138,64 @@ impl DevicesPage {
             error: None,
             task: None,
             copy_task: None,
-            _cloud_task: cloud_task,
+            waking: None,
+            wake_task: None,
             _observe: observe,
         }
+    }
+
+    pub(crate) fn on_hidden(&mut self) {
+        self.wake_task = None;
+        self.waking = None;
+    }
+
+    fn wake_device(&mut self, device_id: &str, cx: &mut Context<Self>) {
+        if self.wake_task.is_some() {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(device) = state
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .cloned()
+        else {
+            return;
+        };
+        if state.local_device_id.as_deref() == Some(device_id)
+            || state.device_online(device_id, Utc::now())
+            || device.devbox_binding().is_none()
+        {
+            return;
+        }
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        self.waking = Some(device.id.clone());
+        self.error = None;
+        self.wake_task = Some(cx.spawn(async move |this, cx| {
+            let result = wake_host(&engine, cx.background_executor(), &device).await;
+            this.update(cx, |page, cx| {
+                page.waking = None;
+                page.wake_task = None;
+                match result {
+                    Ok(fresh) => page.state.update(cx, |state, cx| {
+                        let mut devices = state.devices.clone();
+                        if let Some(slot) = devices.iter_mut().find(|row| row.id == device.id)
+                            && slot.devbox_binding() == device.devbox_binding()
+                        {
+                            *slot = fresh;
+                            state.apply_devices(devices);
+                            cx.notify();
+                        }
+                    }),
+                    Err(error) => page.error = Some(format!("Could not connect: {error}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     pub(crate) fn open_rename(
@@ -273,7 +362,6 @@ pub fn platform_label(platform: &str) -> &str {
         "web" => "Web",
         "ios" => "iOS",
         "android" => "Android",
-        zeron_proto::CLOUD_PLATFORM => crate::cloud::CLOUD_LABEL,
         other => other,
     }
 }
@@ -292,45 +380,44 @@ impl Render for DevicesPage {
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();
-        // Cloud's per-session machines are not listed; the Cloud row stands
-        // for them.
         let (devices, local_id, workspace_scope) = {
             let state = self.state.read(cx);
             (
-                state
-                    .listed_devices()
-                    .map(|d| (d.clone(), state.device_presence(&d.id, now)))
-                    .collect::<Vec<_>>(),
+                state.devices.clone(),
                 state.local_device_id.clone(),
                 state.workspace_scope,
             )
         };
         let copied = self.copied.clone();
+        let waking = self.waking.clone();
+        let wake_busy = self.wake_task.is_some();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
         // Split into this device and the rest; each renders as rows in one
         // block, like every other settings page.
         let (local, others): (Vec<_>, Vec<_>) = devices
             .into_iter()
             .enumerate()
-            .partition(|(_, (device, _))| local_id.as_deref() == Some(device.id.as_str()));
-        let device_row = |ix: usize,
-                          (device, presence): (zeron_proto::Device, crate::cloud::Presence),
-                          first: bool| {
-            let is_cloud = crate::cloud::is_cloud(&device);
+            .partition(|(_, device)| local_id.as_deref() == Some(device.id.as_str()));
+        let device_row = |ix: usize, device: zeron_proto::Device, first: bool| {
+            let online = device_online(device.last_seen_at, now);
             let is_local = local_id.as_deref() == Some(device.id.as_str());
             let id_copied = copied.as_deref() == Some(device.id.as_str());
             let copy_id = device.id.clone();
             let rename_id = device.id.clone();
             let rename_name = device.name.clone();
+            let can_wake = !is_local && !online && device.devbox_binding().is_some();
+            let wake_id = device.id.clone();
+            let is_waking = waking.as_deref() == Some(device.id.as_str());
             let mut meta: Vec<AnyElement> = vec![
                 div()
-                    .child(SharedString::from(if is_cloud {
-                        crate::cloud::CLOUD_LABEL.to_string()
-                    } else {
-                        platform_label(&device.platform).to_string()
-                    }))
+                    .child(SharedString::from(
+                        platform_label(&device.platform).to_string(),
+                    ))
                     .into_any_element(),
             ];
+            if device.devbox_binding().is_some() {
+                meta.push(div().child("Devbox").into_any_element());
+            }
             if let Some(version) = device.version.as_deref().filter(|v| !v.is_empty()) {
                 meta.push(
                     div()
@@ -340,30 +427,20 @@ impl Render for DevicesPage {
             }
             // Presence only says something about other devices.
             if !is_local {
-                meta.push(
-                    if matches!(
-                        presence,
-                        crate::cloud::Presence::Online | crate::cloud::Presence::Available
-                    ) {
-                        div()
-                            .text_color(theme.success_muted)
-                            .child(SharedString::from(presence.label()))
-                            .into_any_element()
-                    } else if !presence.warns() {
-                        // A Cloud machine that is asleep or starting answers on
-                        // its own; its last heartbeat is not news.
-                        div()
-                            .child(SharedString::from(presence.label()))
-                            .into_any_element()
-                    } else {
-                        div()
-                            .child(SharedString::from(format!(
-                                "Last seen {}",
-                                format_last_seen(device.last_seen_at, now)
-                            )))
-                            .into_any_element()
-                    },
-                );
+                meta.push(if online {
+                    div()
+                        .text_color(theme.success_muted)
+                        .child(SharedString::from("Online"))
+                        .into_any_element()
+                } else {
+                    div()
+                        .child(SharedString::from(format!(
+                            "{}Last seen {}",
+                            if can_wake { "Idle · " } else { "" },
+                            format_last_seen(device.last_seen_at, now)
+                        )))
+                        .into_any_element()
+                });
             }
             widgets::card_row(&theme, first)
                 .child(
@@ -379,6 +456,30 @@ impl Render for DevicesPage {
                         .flex()
                         .items_center()
                         .gap(px(4.0))
+                        .when(can_wake, |el| {
+                            el.child(
+                                widgets::text_action(
+                                    &theme,
+                                    widgets::ActionTone::Filled,
+                                    if is_waking { "Connecting…" } else { "Wake" },
+                                )
+                                .id(("device-wake", ix))
+                                .tab_index(if wake_busy { -1 } else { 0 })
+                                .role(gpui::Role::Button)
+                                .aria_label(format!("Wake {}", device.name))
+                                .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                .when(wake_busy, |el| {
+                                    el.opacity(0.5).aria_description(
+                                        "Unavailable while a device is connecting",
+                                    )
+                                })
+                                .when(!wake_busy, |el| {
+                                    el.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.wake_device(&wake_id, cx)
+                                    }))
+                                }),
+                            )
+                        })
                         .child(
                             widgets::text_action(
                                 &theme,
@@ -486,6 +587,285 @@ mod tests {
     use super::*;
     use chrono::TimeDelta;
 
+    #[gpui::test]
+    fn stalled_wake_times_out_and_cancels_when_hidden_or_dropped(cx: &mut gpui::TestAppContext) {
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CancelSignal(Arc<tokio::sync::Notify>);
+        impl Drop for CancelSignal {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let started = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let rpc = ScriptedRpc::new({
+            let started = started.clone();
+            let cancelled = cancelled.clone();
+            move |method, params| {
+                let started = started.clone();
+                let cancelled = cancelled.clone();
+                async move {
+                    assert_eq!(method, methods::WAKE_DEVICE);
+                    assert_eq!(params, serde_json::json!({"deviceId": "remote"}));
+                    let _signal = CancelSignal(cancelled);
+                    started.fetch_add(1, Ordering::SeqCst);
+                    futures::future::pending().await
+                }
+            }
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
+            state.local_device_id = Some("local".into());
+            state.devices = vec![zeron_proto::Device {
+                id: "remote".into(),
+                name: "Boat".into(),
+                platform: "linux".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: None,
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
+                devbox_provider: Some(zeron_proto::DeviceEnvironment::Boat),
+                devbox_id: Some("bx_23456789".into()),
+            }];
+            state
+        });
+        let page = cx.new(|cx| DevicesPage::new(state.clone(), cx));
+        page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst) == 1);
+        cx.executor().advance_clock(Duration::from_secs(179));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| assert!(page.wake_task.is_some()));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert!(page.wake_task.is_none());
+            assert!(page.waking.is_none());
+            assert!(page.error.as_ref().unwrap().contains("timed out"));
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+                .await
+                .unwrap();
+        });
+
+        page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst) == 2);
+        page.update(cx, |page, _| {
+            page.on_hidden();
+            assert!(page.wake_task.is_none());
+            assert!(page.waking.is_none());
+            assert!(page.error.is_none());
+        });
+        cx.run_until_parked();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+                .await
+                .unwrap();
+        });
+
+        page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst) == 3);
+        let released = Arc::new(AtomicUsize::new(0));
+        page.update(cx, |_, cx| {
+            let released = released.clone();
+            cx.on_release(move |_, _| {
+                released.fetch_add(1, Ordering::SeqCst);
+            })
+            .detach();
+        });
+        drop(page);
+        // Dropping Entity queues disposal; only an App update flushes the
+        // deferred entity value (and its owned wake_task). Running the task
+        // dispatcher alone leaves that task alive while waiting on Tokio.
+        cx.update(|_| {});
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "the page must actually be disposed before awaiting server cancellation"
+        );
+        cx.run_until_parked();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+                .await
+                .unwrap();
+        });
+        state.read_with(cx, |state, _| {
+            assert!(state.devices[0].last_seen_at.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn wake_is_explicit_single_flight_and_requires_exact_ready_ids(cx: &mut gpui::TestAppContext) {
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use std::sync::{Arc, Mutex};
+
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rpc = ScriptedRpc::new({
+            let calls = calls.clone();
+            let release = release.clone();
+            move |method, params| {
+                let calls = calls.clone();
+                let release = release.clone();
+                async move {
+                    assert_eq!(method, methods::WAKE_DEVICE);
+                    assert_eq!(params, serde_json::json!({"deviceId": "remote"}));
+                    let attempt = {
+                        let mut calls = calls.lock().unwrap();
+                        calls.push(params);
+                        calls.len()
+                    };
+                    release.notified().await;
+                    let mut response = serde_json::json!({
+                        "deviceId": "remote",
+                        "devboxProvider": "boat", "devboxId": "bx_23456789", "ready": true,
+                        "device": {
+                            "id": "remote",
+                            "name": "Ready Boat",
+                            "platform": "linux",
+                            "lastSeenAt": Utc::now(),
+                            "version": "1.2.3",
+                            "capabilities": ["readFiles"],
+                            "devboxProvider": "boat", "devboxId": "bx_23456789"
+                        }
+                    });
+                    match attempt {
+                        1 => response["deviceId"] = "other".into(),
+                        2 => response["devboxId"] = "bx_abcdefgh".into(),
+                        3 => {
+                            response.as_object_mut().unwrap().remove("devboxId");
+                        }
+                        4 => return Err(zeron_rpc::RpcError::Failed("Unavailable".into())),
+                        5 => {
+                            response.as_object_mut().unwrap().remove("device");
+                        }
+                        6 => response["device"]["id"] = "other".into(),
+                        7 => response["device"]["devboxId"] = "bx_abcdefgh".into(),
+                        8 => {}
+                        _ => panic!("duplicate wake request"),
+                    }
+                    zeron_rpc::RpcReply::value(&response)
+                }
+            }
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
+            state.local_device_id = Some("local".into());
+            state.devices = ["remote", "local", "online", "invalid", "unbound"]
+                .into_iter()
+                .map(|id| zeron_proto::Device {
+                    id: id.into(),
+                    name: id.into(),
+                    platform: "linux".into(),
+                    last_seen_at: (id == "online").then(Utc::now),
+                    created_at: None,
+                    version: None,
+                    cursor_sdk_version: None,
+                    capabilities: Vec::new(),
+                    devbox_provider: Some(zeron_proto::DeviceEnvironment::Boat),
+                    devbox_id: match id {
+                        "invalid" => Some("display-name".into()),
+                        "unbound" => None,
+                        _ => Some("bx_23456789".into()),
+                    },
+                })
+                .collect();
+            state
+        });
+        let page = cx.new(|cx| DevicesPage::new(state.clone(), cx));
+        state.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty(), "mounting must not wake");
+        page.update(cx, |page, cx| {
+            for id in ["local", "online", "invalid", "unbound", "missing"] {
+                page.wake_device(id.into(), cx);
+            }
+            assert!(page.wake_task.is_none());
+        });
+        cx.run_until_parked();
+        assert!(calls.lock().unwrap().is_empty());
+
+        let before = state.read_with(cx, |state, _| state.devices.clone());
+        for attempt in 1..=8 {
+            page.update(cx, |page, cx| {
+                page.wake_device("remote".into(), cx);
+                page.wake_device("remote".into(), cx);
+            });
+            rpc.settle(cx, &runtime, |_| calls.lock().unwrap().len() >= attempt);
+            page.read_with(cx, |page, _| {
+                assert_eq!(page.waking.as_deref(), Some("remote"));
+                assert!(page.wake_task.is_some());
+            });
+            release.notify_one();
+            rpc.settle(cx, &runtime, |cx| {
+                page.read_with(cx, |page, _| page.wake_task.is_none())
+            });
+            page.read_with(cx, |page, _| {
+                assert!(page.waking.is_none());
+                assert_eq!(page.error.is_some(), attempt != 8);
+            });
+            assert_eq!(calls.lock().unwrap().len(), attempt);
+            state.read_with(cx, |state, _| {
+                assert_eq!(&state.devices[1..], &before[1..]);
+                if attempt != 8 {
+                    assert_eq!(state.devices, before);
+                }
+            });
+        }
+        state.read_with(cx, |state, _| {
+            let ready = &state.devices[0];
+            assert!(ready.last_seen_at.is_some());
+            assert_eq!(ready.name, "Ready Boat");
+            assert_eq!(ready.version.as_deref(), Some("1.2.3"));
+            assert_eq!(ready.capabilities, ["readFiles"]);
+        });
+    }
+
+    #[test]
+    fn wake_reply_requires_ready_and_the_exact_registered_binding() {
+        for (provider, id) in [("namespace", "ofpf7g22n4412"), ("boat", "bx_234abcxy")] {
+            let device: zeron_proto::Device = serde_json::from_value(serde_json::json!({
+                "id": "remote", "name": "host", "platform": "linux",
+                "devboxProvider": provider, "devboxId": id,
+            }))
+            .unwrap();
+            let reply = serde_json::json!({
+                "deviceId": "remote", "devboxProvider": provider, "devboxId": id,
+                "device": device, "ready": true,
+            });
+            assert!(validate_wake_reply(&device, reply.clone()).is_ok());
+            for (field, value) in [
+                ("ready", serde_json::json!(false)),
+                ("deviceId", serde_json::json!("other")),
+                ("devboxId", serde_json::json!("other")),
+                ("devboxProvider", serde_json::json!("unknown")),
+            ] {
+                let mut wrong = reply.clone();
+                wrong[field] = value;
+                assert!(validate_wake_reply(&device, wrong).is_err());
+            }
+            let mut wrong = reply.clone();
+            wrong["device"]["devboxId"] = serde_json::json!("other");
+            assert!(validate_wake_reply(&device, wrong).is_err());
+            let mut unbound = device.clone();
+            unbound.devbox_provider = None;
+            assert!(validate_wake_reply(&unbound, reply).is_err());
+        }
+    }
+
     #[test]
     fn presence_window() {
         let now = Utc::now();
@@ -517,12 +897,6 @@ mod tests {
             format_last_seen(Some(now - TimeDelta::days(2)), now),
             "2d ago"
         );
-    }
-
-    #[test]
-    fn cloud_platform_reads_cloud() {
-        assert_eq!(platform_label("cloud"), "Cloud");
-        assert_eq!(platform_label("darwin"), "macOS");
     }
 
     #[test]

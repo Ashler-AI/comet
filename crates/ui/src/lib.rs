@@ -23,7 +23,6 @@ pub mod badges;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
-pub mod cloud;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
@@ -32,7 +31,6 @@ mod composer_markdown;
 mod context_usage;
 mod dictation;
 pub mod edge_fade;
-pub mod rounded_clip;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
@@ -50,8 +48,8 @@ mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
+pub mod rounded_clip;
 pub use zeron_notify as notify;
-pub mod onboarding;
 pub mod orb;
 pub mod overscroll;
 pub mod pickers;
@@ -76,11 +74,11 @@ pub mod state;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
-mod todo_panel;
-pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
 pub mod toast;
+mod todo_panel;
+pub(crate) mod tool_images;
 pub mod transcript;
 pub mod typography;
 pub mod visuals;
@@ -112,6 +110,9 @@ pub struct UiConfig {
     /// WorkOS client id; `Some` makes the embedded headed engine require a
     /// production session before opening identity-scoped stores.
     pub workos_client_id: Option<String>,
+    /// Explicit resource-bound Crew OAuth configuration; never a WorkOS fallback.
+    pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
+    pub managed_inference: bool,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
     /// Conversation URL passed by the OS on a cold launch.
@@ -121,6 +122,8 @@ pub struct UiConfig {
 impl UiConfig {
     fn boot(&self) -> EngineBootConfig {
         EngineBootConfig {
+            managed_inference: self.managed_inference,
+            scaffold: self.scaffold.clone(),
             data_dir: self.data_dir.clone(),
             ipc_port: self.ipc_port,
             edge_url: self.edge_url.clone(),
@@ -222,7 +225,7 @@ pub fn run_app(config: UiConfig) {
         terminal::panel::init(cx);
         app_menus::init(cx);
         app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
-        cx.register_url_scheme("zeron").detach();
+        // Bundle metadata owns URL registration; never replace another client's default handler.
 
         let state = cx.new(|cx| {
             let mut state = state::AppState::new();
@@ -261,7 +264,9 @@ pub fn run_app(config: UiConfig) {
         // the choice with ZERON_EMBED_ENGINE=1. An embedded engine posts the
         // banners itself.
         zeron_engine::desktop_notify::enable();
-        if std::env::var_os("ZERON_EMBED_ENGINE").is_none_or(|value| value.is_empty() || value == "0") {
+        if std::env::var_os("ZERON_EMBED_ENGINE")
+            .is_none_or(|value| value.is_empty() || value == "0")
+        {
             state::launch_background_engine();
         }
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
@@ -453,7 +458,7 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
+                    title: cfg!(target_os = "windows").then(|| "Crew Canary".into()),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

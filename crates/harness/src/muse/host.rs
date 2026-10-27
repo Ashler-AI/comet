@@ -87,7 +87,8 @@ impl Host {
             }
         })?);
         let tail = crate::StderrTail::default();
-        let mut lines = crate::lossy_lines::LossyLines::new(child.stderr.take().expect("piped stderr"));
+        let mut lines =
+            crate::lossy_lines::LossyLines::new(child.stderr.take().expect("piped stderr"));
         let stderr = tail.clone();
         let stderr_task = tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
@@ -131,7 +132,7 @@ impl Host {
                 json!({
                     "clientInfo": {
                         "name": "zeron",
-                        "title": "Zeron",
+                        "title": "Crew",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "capabilities": {
@@ -145,7 +146,7 @@ impl Host {
             .map_err(|failure| failed("initialize", &failure))?;
         if result["schema"]["version"].as_u64() != Some(SCHEMA_VERSION) {
             return Err(HarnessError::Protocol(
-                "Muse speaks an unsupported protocol version; update Zeron or Muse Code".into(),
+                "Muse speaks an unsupported protocol version; update Crew or Muse Code".into(),
             ));
         }
         self.granted = result["grantedCapabilities"]

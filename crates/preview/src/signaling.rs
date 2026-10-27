@@ -10,10 +10,11 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 use tokio_util::sync::CancellationToken;
-use zeron_proto::PreviewService;
+use zeron_proto::{AccessToken, PreviewService};
 #[async_trait::async_trait]
 pub trait TokenSource: Send + Sync {
-    async fn token(&self) -> anyhow::Result<String>;
+    async fn token(&self) -> anyhow::Result<AccessToken>;
+    fn invalidate(&self, generation: u64);
 }
 pub struct Config {
     pub edge_url: String,
@@ -154,15 +155,21 @@ async fn connect(
     let mut request = url.as_str().into_client_request()?;
     request
         .headers_mut()
-        .insert("authorization", format!("Bearer {token}").parse()?);
+        .insert("authorization", format!("Bearer {}", token.value).parse()?);
     let mut websocket_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
     websocket_config.max_message_size = Some(1024 * 1024);
     websocket_config.max_frame_size = Some(1024 * 1024);
-    let (socket, _) = tokio::time::timeout(
+    let handshake = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_tungstenite::connect_async_with_config(request, Some(websocket_config), false),
     )
-    .await??;
+    .await?;
+    if let Err(tokio_tungstenite::tungstenite::Error::Http(response)) = &handshake
+        && response.status() == 401
+    {
+        config.tokens.invalidate(token.generation);
+    }
+    let (socket, _) = handshake?;
     let (mut write, mut read) = socket.split();
     let mut changes = catalog.subscribe();
     let mut advertised = catalog.local_services();
@@ -217,7 +224,12 @@ async fn connect(
                         }
                     }
                     Message::Ping(bytes) => write.send(Message::Pong(bytes)).await?,
-                    Message::Close(_) => anyhow::bail!("preview coordinator closed"),
+                    Message::Close(frame) => {
+                        if frame.is_some_and(|frame| u16::from(frame.code) == 4401) {
+                            config.tokens.invalidate(token.generation);
+                        }
+                        anyhow::bail!("preview coordinator closed");
+                    }
                     Message::Binary(_) => anyhow::bail!("application traffic is not allowed on preview signaling"),
                     _ => {}
                 }
@@ -233,9 +245,11 @@ mod tests {
     struct NoToken;
     #[async_trait::async_trait]
     impl TokenSource for NoToken {
-        async fn token(&self) -> anyhow::Result<String> {
+        async fn token(&self) -> anyhow::Result<AccessToken> {
             anyhow::bail!("unused")
         }
+
+        fn invalidate(&self, _: u64) {}
     }
 
     #[test]

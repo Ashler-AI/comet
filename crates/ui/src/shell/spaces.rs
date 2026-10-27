@@ -239,6 +239,8 @@ mod pinned_session_tests {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
                     data_dir: path.into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -1247,6 +1249,8 @@ mod pinned_session_tests {
                 let mut shell = Shell::new(
                     state,
                     EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
                         data_dir: dir.path().into(),
                         ipc_port: 0,
                         edge_url: "http://127.0.0.1:1".into(),
@@ -1366,15 +1370,13 @@ mod pinned_session_tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig {
-                        data_dir: dir.path().into(),
-                        ipc_port: 0,
-                        edge_url: "http://127.0.0.1:1".into(),
-                        edge_token: None,
-                        org_id: None,
-                        workos_client_id: None,
-                        default_harness: zeron_proto::HarnessId::Mock,
-                    },
+                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock, },
                     cx,
                 );
                 shell.settings.sidebar_organization = SidebarOrganization::InOneList;
@@ -1482,7 +1484,10 @@ mod pinned_session_tests {
             // The globe/archive slot is always reserved, so hovering swaps its
             // glyph in place: the title keeps its width and the status and time
             // columns never move.
-            assert_eq!(cx.debug_bounds("chat-title-older").unwrap().size.width, title.size.width);
+            assert_eq!(
+                cx.debug_bounds("chat-title-older").unwrap().size.width,
+                title.size.width
+            );
             assert_eq!(cx.debug_bounds("chat-status-older").unwrap(), status);
             assert_eq!(cx.debug_bounds("chat-time-older").unwrap(), time);
         }
@@ -1901,6 +1906,8 @@ mod pinned_session_tests {
                 let mut shell = Shell::new(
                     state,
                     EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
                         data_dir: dir.path().into(),
                         ipc_port: 0,
                         edge_url: "http://127.0.0.1:1".into(),
@@ -2443,9 +2450,6 @@ enum ProjectStep {
     Devices,
     Locations,
     Folders,
-    /// Cloud picked: the GitHub repositories Cloud reaches. A Cloud project
-    /// is a repository, not a folder on a device.
-    Repositories,
 }
 
 pub(super) struct AddSpaceFlow {
@@ -2473,8 +2477,6 @@ pub(super) struct AddSpaceFlow {
     /// Keyboard highlight within the current step’s filtered rows.
     active: usize,
     submit_busy: bool,
-    /// A clone into the open folder is running (`owner/name`).
-    cloning: Option<String>,
     error: Option<SharedString>,
     /// Tracked on the card (`track_focus`) — puts the card on the keyboard
     /// dispatch path so ↑↓/⌫/esc reach `add_space_key` while the search input
@@ -2736,64 +2738,6 @@ enum FolderRow {
     Local(zeron_proto::FolderEntry),
     /// A folder anywhere under home.
     Home(HomeFolderMatch),
-    /// Clone a repository into the open folder: a pasted git URL, or one of
-    /// the user's GitHub repositories matching the query.
-    Clone(CloneRow),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct CloneRow {
-    url: String,
-    /// `owner/name`.
-    label: String,
-    /// From the user's GitHub repositories (vs a pasted URL).
-    github: bool,
-    private: bool,
-}
-
-/// Most GitHub repositories offered for one query.
-const CLONE_MATCHES: usize = 5;
-
-/// A query that is a git remote: an `https://`/`ssh://`/`git://` URL with an
-/// owner and a name, or scp-style `git@host:owner/name`.
-fn git_url(query: &str) -> Option<String> {
-    let query = query.trim();
-    if query.contains(char::is_whitespace) {
-        return None;
-    }
-    let path = if let Some(rest) = ["https://", "http://", "ssh://", "git://"]
-        .iter()
-        .find_map(|scheme| query.strip_prefix(scheme))
-    {
-        rest.split_once('/')?.1
-    } else if let Some((user_host, path)) = query.split_once(':')
-        && user_host.contains('@')
-        && !user_host.contains('/')
-    {
-        path
-    } else {
-        return None;
-    };
-    let mut parts = path.trim_matches('/').split('/').filter(|part| !part.is_empty());
-    (parts.next().is_some() && parts.next().is_some()).then(|| query.to_owned())
-}
-
-/// `owner/name` of a git remote, for labels.
-fn git_url_label(url: &str) -> String {
-    let path = url
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .rsplit_once(['/', ':'])
-        .map(|(rest, name)| {
-            let owner = rest.rsplit(['/', ':']).next().unwrap_or_default();
-            if owner.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{owner}/{name}")
-            }
-        });
-    path.unwrap_or_else(|| url.to_owned())
 }
 
 /// `targetDeviceId` for a remote device; local calls skip the relay.
@@ -2815,13 +2759,6 @@ fn add_space_target(
 /// The title over the picker's matches from under home, with the host's
 /// search status trailing.
 fn home_folders_header(theme: &Theme, status: Option<&'static str>) -> gpui::Div {
-    home_folders_header_titled(theme, "In Home").when_some(status, |header, status| {
-        header.child(div().opacity(0.7).child(status))
-    })
-}
-
-/// A titled section of the Folders step's results ("In Home", "From GitHub").
-fn home_folders_header_titled(theme: &Theme, title: &'static str) -> gpui::Div {
     div()
         .px(px(8.0))
         .pt(px(2.0))
@@ -2831,7 +2768,10 @@ fn home_folders_header_titled(theme: &Theme, title: &'static str) -> gpui::Div {
         .gap(px(8.0))
         .text_size(crate::typography::ui_rems(11.0))
         .text_color(theme.text_muted)
-        .child(title)
+        .child("In Home")
+        .when_some(status, |header, status| {
+            header.child(div().opacity(0.7).child(status))
+        })
 }
 
 /// A folder from under home: its name (query highlighted), then where it
@@ -2889,57 +2829,6 @@ fn home_folder_row(
         )
 }
 
-/// A clone-here row: the owner's avatar (a pasted URL gets the git glyph),
-/// `owner/name`, a Private badge, and what Enter does.
-fn clone_row(
-    row: gpui::Stateful<gpui::Div>,
-    clone: &CloneRow,
-    query: &str,
-    theme: &Theme,
-    cx: &Context<Shell>,
-) -> gpui::Stateful<gpui::Div> {
-    let owner = clone.label.split('/').next().unwrap_or_default().to_owned();
-    let leading = if clone.github {
-        crate::pull_request_media::avatar(
-            &owner,
-            SharedString::from(format!("clone-avatar-{}", clone.label)),
-            16.0,
-            theme,
-        )
-    } else {
-        icon(icons::GIT_BRANCH)
-            .size(px(16.0))
-            .flex_none()
-            .text_color(theme.text_muted)
-            .into_any_element()
-    };
-    let target = clone.clone();
-    row.aria_label(SharedString::from(format!("Clone {} here", clone.label)))
-        .child(leading)
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(popover::search_highlight(
-                    SharedString::from(clone.label.clone()),
-                    Some(query),
-                    theme,
-                )),
-        )
-        .when(clone.private, |el| {
-            el.child(crate::settings::widgets::badge(theme, "Private"))
-        })
-        .child(
-            div()
-                .flex_none()
-                .text_size(crate::typography::ui_rems(11.0))
-                .text_color(theme.text_muted)
-                .child(SharedString::from("Clone here")),
-        )
-        .on_click(cx.listener(move |this, _, _, cx| this.add_space_clone(target.clone(), cx)))
-}
-
 /// Folder crumbs shown before the middle folds into `…`, and how many of the
 /// deepest stay visible once it does.
 const CRUMB_FOLDERS_MAX: usize = 3;
@@ -2972,34 +2861,8 @@ enum CrumbTarget {
     More,
 }
 
-/// Cloud as a place to keep a project: while it's on and reaches at least
-/// one GitHub repository. It has no registry row of its own (session
-/// machines do), so the row stands in for the logical Cloud device.
-fn add_space_cloud_device(state: &crate::state::AppState) -> Option<Device> {
-    if !state.cloud_enabled()
-        || state
-            .cloud_repos
-            .as_ref()
-            .is_none_or(|repos| repos.is_empty())
-    {
-        return None;
-    }
-    let id = state.cloud_status.as_ref()?.device_id.clone()?;
-    Some(Device {
-        id,
-        name: "Cloud".into(),
-        platform: zeron_proto::CLOUD_PLATFORM.into(),
-        last_seen_at: None,
-        created_at: None,
-        version: None,
-        cursor_sdk_version: None,
-        capabilities: Vec::new(),
-    })
-}
-
 fn device_glyph(platform: &str) -> &'static str {
     match platform {
-        zeron_proto::CLOUD_PLATFORM => icons::CLOUD,
         "macos" | "darwin" => icons::LAPTOP,
         "web" => icons::GLOBAL,
         "ios" | "android" => icons::SMARTPHONE,
@@ -3233,10 +3096,8 @@ impl Shell {
         self.nav.push(NavEntry::Chat(String::new()));
         self.settings.last_space_id = Some(space_id.clone());
         self.state.update(cx, |s, cx| {
-            // Leave the chat first: that restores the canvas pick set aside
-            // when it opened, which must not win over the project just added.
-            s.select_chat(None, cx);
             s.select_space(Some(space_id), cx);
+            s.select_chat(None, cx);
         });
         self.schedule_save(cx);
         cx.notify();
@@ -3795,7 +3656,10 @@ impl Shell {
                     index -= 1;
                 }
                 let shown: Vec<&String> = shown.into_iter().filter(|m| *m != chat).collect();
-                let after = index.checked_sub(1).and_then(|i| shown.get(i)).map(|m| (*m).clone());
+                let after = index
+                    .checked_sub(1)
+                    .and_then(|i| shown.get(i))
+                    .map(|m| (*m).clone());
                 let before = shown.get(index).map(|m| (*m).clone());
                 if after.is_none() && before.is_none() {
                     (others.last().cloned(), None)
@@ -4051,7 +3915,12 @@ impl Shell {
         let projects = state.projects();
         let names: Vec<String> = projects
             .iter()
-            .map(|members| state.representative_space(members[0]).display_name().to_string())
+            .map(|members| {
+                state
+                    .representative_space(members[0])
+                    .display_name()
+                    .to_string()
+            })
             .collect();
         let mut rows: Vec<SpacesMenuRow> = Vec::new();
         if query.trim().is_empty() {
@@ -5366,7 +5235,11 @@ impl Shell {
             (active, archived)
         };
         if active.is_none() && archived.is_none() {
-            self.show_notice(crate::toast::ToastKind::Error, "Clear the project filter to rename this session", cx);
+            self.show_notice(
+                crate::toast::ToastKind::Error,
+                "Clear the project filter to rename this session",
+                cx,
+            );
             return false;
         }
         if let Some(chat) = &active {
@@ -5464,15 +5337,12 @@ impl Shell {
             .device_name(&chat.device_id)
             .unwrap_or("Unknown device")
             .to_string();
-        // Unknown device → no fragment, same as the archived list; a Cloud
-        // chat's own machine isn't a device worth naming either.
-        let named = state.device_name(&chat.device_id).is_some()
-            && !zeron_proto::is_cloud_device(&chat.device_id, "");
-        let folder = match (project, named) {
-            (Some(project), true) => format!("{project} @ {device}"),
-            (Some(project), false) => project,
-            (None, true) => device.clone(),
-            (None, false) => String::new(),
+        // Unknown device → no fragment, same as the archived list.
+        let folder = match (project, state.device_name(&chat.device_id)) {
+            (Some(project), Some(_)) => format!("{project} @ {device}"),
+            (Some(project), None) => project,
+            (None, Some(_)) => device.clone(),
+            (None, None) => String::new(),
         };
         // The branch shows whenever the engine has stamped one —
         // main-checkout sessions included, not just worktrees.
@@ -5574,15 +5444,6 @@ impl Shell {
 
         let custom_sections = self.active_sidebar_sections(cx);
         let custom_count = custom_sections.len();
-        let section_order =
-            (custom_count > 1 && self.sidebar_sections_reorderable(cx)).then(|| {
-                std::sync::Arc::new(
-                    custom_sections
-                        .iter()
-                        .map(|section| section.id.clone())
-                        .collect::<Vec<_>>(),
-                )
-            });
         let mut custom_groups: Vec<_> = custom_sections
             .iter()
             .map(|section| {
@@ -5612,12 +5473,7 @@ impl Shell {
         }
         // Sections keep their placed order, as Pinned does, not activity order.
         for ((_, rows), section) in custom_groups.iter_mut().zip(&custom_sections) {
-            rows.sort_by_key(|row| {
-                section
-                    .session_ids
-                    .iter()
-                    .position(|id| id == &row.chat.id)
-            });
+            rows.sort_by_key(|row| section.session_ids.iter().position(|id| id == &row.chat.id));
         }
         if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
             let local_device_id = self.state.read(cx).local_device_id.clone();
@@ -5943,20 +5799,10 @@ impl Shell {
             };
             if let Some(id) = key.strip_prefix("section:") {
                 if let Some(section) = custom_sections.iter().find(|section| section.id == id) {
-                    let drag =
-                        section_order
-                            .clone()
-                            .zip(profile_key.clone())
-                            .map(|(ids, profile_key)| SidebarSectionDrag {
-                                section_id: section.id.clone(),
-                                profile_key,
-                                ids,
-                            });
                     rendered.push(self.render_custom_sidebar_section(
                         section.clone(),
                         rendered_rows,
                         drag_group,
-                        drag,
                         theme,
                         cx,
                     ));
@@ -6011,12 +5857,10 @@ impl Shell {
                 .then(|| {
                     let state = self.state.read(cx);
                     match projectless_device {
-                        // Only a device the composer's picker offers without a
-                        // project: not Cloud (a session's machine or the
-                        // logical device), nor one gone from the registry.
                         Some(device) => state
-                            .listed_devices()
-                            .any(|d| d.id == device && !crate::cloud::is_cloud(d))
+                            .devices
+                            .iter()
+                            .any(|d| d.id == device)
                             .then_some(NewSessionTarget::NoProject(device)),
                         None => state
                             .spaces
@@ -6071,31 +5915,30 @@ impl Shell {
                     )
                     .into_any_element()
             });
-            let header =
-                sidebar_disclosure_header(
-                    theme,
-                    group_icon,
-                    visible_label,
-                    collapsed.then_some(row_count),
-                    new_chat_button,
-                    chevron,
-                )
-                    .group(group_name)
-                .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
-                    this.begin_sidebar_disclosure_motion(
-                        &toggle_motion_key,
-                        if was_open { body_height } else { 0.0 },
-                        if was_open { 0.0 } else { body_height },
-                    );
-                    if was_open {
-                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
-                    } else {
-                        this.sidebar_collapsed_groups.remove(&toggle_key);
-                    }
-                    cx.notify();
-                }));
+            let header = sidebar_disclosure_header(
+                theme,
+                group_icon,
+                visible_label,
+                collapsed.then_some(row_count),
+                new_chat_button,
+                chevron,
+            )
+            .group(group_name)
+            .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
+                this.begin_sidebar_disclosure_motion(
+                    &toggle_motion_key,
+                    if was_open { body_height } else { 0.0 },
+                    if was_open { 0.0 } else { body_height },
+                );
+                if was_open {
+                    this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                } else {
+                    this.sidebar_collapsed_groups.remove(&toggle_key);
+                }
+                cx.notify();
+            }));
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,
@@ -6220,44 +6063,44 @@ impl Shell {
             None,
             chevron,
         )
-            .id("sessions-toggle")
-            .debug_selector(|| "sessions-toggle".into())
-            .on_drag_move::<SidebarSessionDrag>(cx.listener(
-                |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, _| {
-                    if event.bounds.contains(&event.event.position) {
-                        let top = f32::from(
-                            event.bounds.bottom()
-                                - this.sidebar_scroll.bounds().top()
-                                - this.sidebar_scroll.offset().y,
-                        ) + SIDEBAR_DISCLOSURE_BODY_INSET;
-                        if let Some(drag) = this.sidebar_session_transfer.as_mut() {
-                            drag.preview = Some(SidebarSessionGap {
-                                group: "regular".into(),
-                                index: 0,
-                                pinned: false,
-                                top,
-                            });
-                        }
+        .id("sessions-toggle")
+        .debug_selector(|| "sessions-toggle".into())
+        .on_drag_move::<SidebarSessionDrag>(cx.listener(
+            |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, _| {
+                if event.bounds.contains(&event.event.position) {
+                    let top = f32::from(
+                        event.bounds.bottom()
+                            - this.sidebar_scroll.bounds().top()
+                            - this.sidebar_scroll.offset().y,
+                    ) + SIDEBAR_DISCLOSURE_BODY_INSET;
+                    if let Some(drag) = this.sidebar_session_transfer.as_mut() {
+                        drag.preview = Some(SidebarSessionGap {
+                            group: "regular".into(),
+                            index: 0,
+                            pinned: false,
+                            top,
+                        });
                     }
-                },
-            ))
-            .on_drop::<SidebarSessionDrag>(cx.listener(|this, payload, _, cx| {
-                this.finish_sidebar_session_transfer(payload, SidebarSessionDrop::Regular, cx);
-            }))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.cancel_sidebar_session_transfer(cx);
-                let was_open = this.sessions_open;
-                this.begin_sidebar_disclosure_motion(
-                    "sessions",
-                    if was_open { body_height } else { 0.0 },
-                    if was_open { 0.0 } else { body_height },
-                );
-                this.sessions_open = !was_open;
-                this.sidebar_prev_order.clear();
-                this.sidebar_resort.clear();
-                this.sidebar_new_keys.clear();
-                cx.notify();
-            }));
+                }
+            },
+        ))
+        .on_drop::<SidebarSessionDrag>(cx.listener(|this, payload, _, cx| {
+            this.finish_sidebar_session_transfer(payload, SidebarSessionDrop::Regular, cx);
+        }))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.cancel_sidebar_session_transfer(cx);
+            let was_open = this.sessions_open;
+            this.begin_sidebar_disclosure_motion(
+                "sessions",
+                if was_open { body_height } else { 0.0 },
+                if was_open { 0.0 } else { body_height },
+            );
+            this.sessions_open = !was_open;
+            this.sidebar_prev_order.clear();
+            this.sidebar_resort.clear();
+            this.sidebar_new_keys.clear();
+            cx.notify();
+        }));
         let content = div()
             .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
             .child(content)
@@ -6363,19 +6206,19 @@ impl Shell {
             None,
             chevron,
         )
-            .id("archived-toggle")
-            .debug_selector(|| "archived-toggle".into())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let was_open = this.archived_open;
-                this.begin_sidebar_disclosure_motion(
-                    "archived",
-                    if was_open { body_height } else { 0.0 },
-                    if was_open { 0.0 } else { body_height },
-                );
-                this.archived_open = !was_open;
-                this.archived_shown = INITIAL;
-                cx.notify();
-            }));
+        .id("archived-toggle")
+        .debug_selector(|| "archived-toggle".into())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let was_open = this.archived_open;
+            this.begin_sidebar_disclosure_motion(
+                "archived",
+                if was_open { body_height } else { 0.0 },
+                if was_open { 0.0 } else { body_height },
+            );
+            this.archived_open = !was_open;
+            this.archived_shown = INITIAL;
+            cx.notify();
+        }));
         let section = div().flex().flex_col().child(header);
         let body = {
             let selected = self.state.read(cx).selected_chat.clone();
@@ -6512,7 +6355,6 @@ impl Shell {
             browser_repo: false,
             active: 0,
             submit_busy: false,
-            cloning: None,
             error: None,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
@@ -6626,22 +6468,73 @@ impl Shell {
         .detach();
     }
 
+    fn wake_add_space_device(&mut self, device: Device, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if state.local_device_id.as_deref() == Some(device.id.as_str())
+            || state.device_online(&device.id, Utc::now())
+            || device.devbox_binding().is_none()
+        {
+            return;
+        }
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        if flow.load_task.is_some() {
+            return;
+        }
+        flow.error = None;
+        flow.load_task = Some(cx.spawn(async move |this, cx| {
+            let result =
+                crate::settings::devices::wake_host(&engine, cx.background_executor(), &device)
+                    .await;
+            this.update(cx, |shell, cx| {
+                let Some(flow) = shell.add_space.as_mut() else {
+                    return;
+                };
+                flow.load_task = None;
+                match result {
+                    Ok(fresh) => {
+                        let valid = shell.state.update(cx, |state, cx| {
+                            let mut devices = state.devices.clone();
+                            let Some(slot) = devices
+                                .iter_mut()
+                                .find(|row| row.id == device.id)
+                                .filter(|row| row.devbox_binding() == device.devbox_binding())
+                            else {
+                                return false;
+                            };
+                            *slot = fresh.clone();
+                            state.apply_devices(devices);
+                            cx.notify();
+                            true
+                        });
+                        if valid {
+                            shell.add_space_pick_device(fresh, cx);
+                        } else if let Some(flow) = shell.add_space.as_mut() {
+                            flow.error = Some(
+                                "The selected host binding changed. Please select it again.".into(),
+                            );
+                        }
+                    }
+                    Err(error) => flow.error = Some(error.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     /// Selecting a device advances to its locations.
     fn add_space_pick_device(&mut self, device: Device, cx: &mut Context<Self>) {
-        let cloud = zeron_proto::is_cloud_device(&device.id, &device.platform);
-        if cloud {
-            self.state
-                .update(cx, |state, cx| state.refresh_cloud_repos(cx));
-        }
         let Some(flow) = self.add_space.as_mut() else {
             return;
         };
         flow.focus_pending = true;
-        flow.step = if cloud {
-            ProjectStep::Repositories
-        } else {
-            ProjectStep::Locations
-        };
+        flow.step = ProjectStep::Locations;
         flow.location = None;
         flow.load_task = None;
         flow.drives_task = None;
@@ -6657,19 +6550,10 @@ impl Shell {
         flow.path_edit = None;
         let search = flow.search.clone();
         search.update(cx, |input, cx| {
-            input.set_placeholder(
-                if cloud {
-                    "Search repositories…"
-                } else {
-                    "Search locations…"
-                },
-                cx,
-            );
+            input.set_placeholder("Search locations…", cx);
             input.set_text("", cx);
         });
-        if !cloud {
-            self.load_space_drives(cx);
-        }
+        self.load_space_drives(cx);
         cx.notify();
     }
 
@@ -6705,15 +6589,6 @@ impl Shell {
         let Some(flow) = self.add_space.as_mut() else {
             return;
         };
-        // Cloud has no locations: its crumb goes back to its repositories.
-        let step = match (&flow.device, step) {
-            (Some(device), ProjectStep::Locations)
-                if zeron_proto::is_cloud_device(&device.id, &device.platform) =>
-            {
-                ProjectStep::Repositories
-            }
-            (_, step) => step,
-        };
         flow.focus_pending = true;
         flow.step = step;
         flow.load_task = None;
@@ -6734,10 +6609,10 @@ impl Shell {
         let search = flow.search.clone();
         search.update(cx, |input, cx| {
             input.set_placeholder(
-                match step {
-                    ProjectStep::Devices => "Search devices…",
-                    ProjectStep::Repositories => "Search repositories…",
-                    _ => "Search locations…",
+                if step == ProjectStep::Devices {
+                    "Search devices…"
+                } else {
+                    "Search locations…"
                 },
                 cx,
             );
@@ -6750,65 +6625,12 @@ impl Shell {
         let Some(flow) = &self.add_space else {
             return Vec::new();
         };
-        let state = self.state.read(cx);
-        // Session machines are Cloud's, not devices to keep a project on.
-        let mut devices: Vec<Device> = state
-            .devices
-            .iter()
-            .filter(|device| crate::cloud::is_listed(device))
-            .cloned()
-            .collect();
-        // With GitHub connected, a project can live on Cloud alone: one of
-        // the repositories Cloud reaches, not a folder on any device.
-        if let Some(cloud) = add_space_cloud_device(state) {
-            devices.push(cloud);
-        }
+        let devices = &self.state.read(cx).devices;
         let names: Vec<_> = devices.iter().map(|d| d.name.as_str()).collect();
         popover::filter_indices(flow.search.read(cx).text(), &names)
             .into_iter()
             .map(|ix| devices[ix].clone())
             .collect()
-    }
-
-    /// The Repositories step's rows: Cloud's repositories matching the
-    /// query, most recently pushed first.
-    fn add_space_repos(&self, cx: &App) -> Vec<zeron_proto::GithubRepo> {
-        let Some(flow) = &self.add_space else {
-            return Vec::new();
-        };
-        let mut repos: Vec<zeron_proto::GithubRepo> = self
-            .state
-            .read(cx)
-            .cloud_repos
-            .iter()
-            .flatten()
-            .cloned()
-            .collect();
-        repos.sort_by(|a, b| b.pushed_at.cmp(&a.pushed_at));
-        let names: Vec<_> = repos.iter().map(|r| r.full_name.as_str()).collect();
-        popover::filter_indices(flow.search.read(cx).text(), &names)
-            .into_iter()
-            .map(|ix| repos[ix].clone())
-            .collect()
-    }
-
-    /// Make `repo` a Cloud project (or open the one Cloud already has).
-    fn add_space_create_cloud(&mut self, repo: zeron_proto::GithubRepo, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let Some(cloud) = add_space_cloud_device(self.state.read(cx)) else {
-            return;
-        };
-        let name = repo
-            .full_name
-            .rsplit('/')
-            .next()
-            .unwrap_or(&repo.full_name)
-            .to_string();
-        // Where a session machine checks the repository out.
-        let path = format!("/home/user/{name}");
-        self.add_space_create_on(engine, cloud, path, true, Some(repo.full_name), cx);
     }
 
     fn add_space_locations(&self, cx: &App) -> Vec<(String, Option<String>)> {
@@ -6919,46 +6741,6 @@ impl Shell {
         } else {
             &[]
         };
-        let query = flow.search.read(cx).text().trim().to_owned();
-        // A pasted remote is the one thing to do: clone it here.
-        if let Some(url) = git_url(&query) {
-            return vec![FolderRow::Clone(CloneRow {
-                label: git_url_label(&url),
-                url,
-                github: false,
-                private: false,
-            })];
-        }
-        // Otherwise the user's GitHub repositories matching a name-like query
-        // follow the folders (what Cloud reaches; GitHub connected).
-        let needle = query.to_lowercase();
-        let github: Vec<FolderRow> = if needle.is_empty()
-            || needle.starts_with(['/', '~', '.'])
-        {
-            Vec::new()
-        } else {
-            let mut repos: Vec<&zeron_proto::GithubRepo> = self
-                .state
-                .read(cx)
-                .cloud_repos
-                .iter()
-                .flatten()
-                .filter(|repo| repo.full_name.to_lowercase().contains(&needle))
-                .collect();
-            repos.sort_by(|a, b| b.pushed_at.cmp(&a.pushed_at));
-            repos
-                .into_iter()
-                .take(CLONE_MATCHES)
-                .map(|repo| {
-                    FolderRow::Clone(CloneRow {
-                        url: repo.clone_url.clone(),
-                        label: repo.full_name.clone(),
-                        github: true,
-                        private: repo.private,
-                    })
-                })
-                .collect()
-        };
         local
             .into_iter()
             .map(FolderRow::Local)
@@ -6968,7 +6750,6 @@ impl Shell {
                     .cloned()
                     .map(FolderRow::Home),
             )
-            .chain(github)
             .collect()
     }
 
@@ -6993,12 +6774,6 @@ impl Shell {
                 }
                 return;
             }
-            ProjectStep::Repositories => {
-                if let Some(repo) = self.add_space_repos(cx).get(flow.active).cloned() {
-                    self.add_space_create_cloud(repo, cx);
-                }
-                return;
-            }
             ProjectStep::Folders => {}
         }
         let rows = self.add_space_folder_rows(cx);
@@ -7017,11 +6792,6 @@ impl Shell {
             Some(FolderRow::Home(found)) => {
                 let (path, is_repo) = (found.path.clone(), found.is_repo);
                 self.add_space_descend(path, is_repo, cx);
-                return;
-            }
-            Some(FolderRow::Clone(clone)) => {
-                let clone = clone.clone();
-                self.add_space_clone(clone, cx);
                 return;
             }
             None => return,
@@ -7216,51 +6986,15 @@ impl Shell {
         };
         let path = listing.path.clone();
         let git_detected = flow.browser_repo;
-        self.add_space_create(engine, device, path, git_detected, cx);
-    }
-
-    /// Make `path` on `device` a project and land in it (an existing one for
-    /// the same folder is reused).
-    fn add_space_create(
-        &mut self,
-        engine: crate::state::EngineHandle,
-        device: Device,
-        path: String,
-        git_detected: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.add_space_create_on(engine, device, path, git_detected, None, cx);
-    }
-
-    /// `github_repo` only for a Cloud project, which has no device to read
-    /// its repository from.
-    fn add_space_create_on(
-        &mut self,
-        engine: crate::state::EngineHandle,
-        device: Device,
-        path: String,
-        git_detected: bool,
-        github_repo: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
         // Same (device, folder) already has a space → just switch to it. The
         // engine dedupes this case too (a createSpace for a duplicate pair
-        // no-ops), so creating would leave the minted id dangling. On Cloud,
-        // the same repository is the same project.
+        // no-ops), so creating would leave the minted id dangling.
         if let Some(existing) = self
             .state
             .read(cx)
             .spaces
             .iter()
-            .find(|s| {
-                s.device_id == device.id
-                    && (same_folder_path(&s.path, &path)
-                        || github_repo.as_deref().is_some_and(|repo| {
-                            s.github_repo
-                                .as_deref()
-                                .is_some_and(|own| own.eq_ignore_ascii_case(repo))
-                        }))
-            })
+            .find(|s| s.device_id == device.id && same_folder_path(&s.path, &path))
             .map(|s| s.id.clone())
         {
             self.close_add_space(cx);
@@ -7283,10 +7017,7 @@ impl Shell {
             git_detected,
             git_checked_at: None,
             checkout_id: None,
-            repository_id: github_repo.as_deref().map(|repo| {
-                zeron_proto::view::cloud_repository_id(&self.state.read(cx).spaces, repo)
-            }),
-            github_repo: github_repo.clone(),
+            repository_id: None,
             created_at: Utc::now(),
         };
         self.state.update(cx, |s, cx| {
@@ -7295,16 +7026,13 @@ impl Shell {
             }
             cx.notify();
         });
-        let mut params = serde_json::json!({
+        let params = serde_json::json!({
             "op": "createSpace",
             "spaceId": space_id,
             "deviceId": device.id,
             "path": path,
             "gitDetected": git_detected,
         });
-        if let Some(repo) = github_repo {
-            params["githubRepo"] = serde_json::Value::String(repo);
-        }
         let submit_id = space_id.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::MUTATE, params).await;
@@ -7322,7 +7050,6 @@ impl Shell {
                         });
                         if let Some(flow) = shell.add_space.as_mut() {
                             flow.submit_busy = false;
-                            flow.cloning = None;
                             flow.error = Some(format!("{err}").into());
                         }
                     }
@@ -7400,9 +7127,7 @@ impl Shell {
         };
         match flow.step {
             ProjectStep::Devices => return,
-            ProjectStep::Locations | ProjectStep::Repositories => {
-                self.add_space_back_to(ProjectStep::Devices, cx)
-            }
+            ProjectStep::Locations => self.add_space_back_to(ProjectStep::Devices, cx),
             ProjectStep::Folders => {
                 let listing = flow.browser.ready();
                 let root = flow
@@ -7944,7 +7669,6 @@ impl Shell {
                 let count = match self.add_space.as_ref().map(|f| f.step) {
                     Some(ProjectStep::Devices) => self.add_space_devices(cx).len(),
                     Some(ProjectStep::Locations) => self.add_space_locations(cx).len(),
-                    Some(ProjectStep::Repositories) => self.add_space_repos(cx).len(),
                     _ => self.add_space_folder_rows(cx).len(),
                 };
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
@@ -8067,7 +7791,6 @@ impl Shell {
         let load_error = flow.browser.error().map(str::to_string);
         let error = flow.error.clone();
         let busy = flow.submit_busy;
-        let cloning = flow.cloning.clone();
         let active = flow.active;
         let loading = matches!(flow.browser, Loadable::Idle | Loadable::Loading);
         let drives_loading = matches!(flow.drives, Loadable::Loading);
@@ -8136,10 +7859,34 @@ impl Shell {
                 for (ix, device) in self.add_space_devices(cx).into_iter().enumerate() {
                     let online = self.state.read(cx).device_online(&device.id, Utc::now());
                     let name = device.name.clone();
+                    let wakeable = !online && device.devbox_binding().is_some();
+                    let wake_device = device.clone();
+                    let waking = self
+                        .add_space
+                        .as_ref()
+                        .is_some_and(|flow| flow.load_task.is_some());
                     rows.push(
                         row(ix)
                             .child(glyph_el(device_glyph(&device.platform)))
                             .child(label_el(name))
+                            .when(wakeable, |el| {
+                                el.child(
+                                    div()
+                                        .id(("add-space-wake", ix))
+                                        .role(gpui::Role::Button)
+                                        .tab_index(0)
+                                        .aria_label(format!("Wake {}", device.name))
+                                        .child(if waking {
+                                            "Connecting…"
+                                        } else {
+                                            "Idle · Wake"
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.wake_add_space_device(wake_device.clone(), cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
                                     .size(px(5.0))
@@ -8177,80 +7924,12 @@ impl Shell {
                     );
                 }
             }
-            ProjectStep::Repositories => {
-                let spaces = self.state.read(cx).spaces.clone();
-                let device_names: std::collections::HashMap<String, String> = self
-                    .state
-                    .read(cx)
-                    .devices
-                    .iter()
-                    .map(|d| (d.id.clone(), d.name.clone()))
-                    .collect();
-                for (ix, repo) in self.add_space_repos(cx).into_iter().enumerate() {
-                    // Already a project somewhere: say where, so a Cloud-only
-                    // one is a deliberate pick.
-                    let elsewhere = spaces
-                        .iter()
-                        .find(|space| {
-                            space
-                                .github_repo
-                                .as_deref()
-                                .is_some_and(|own| own.eq_ignore_ascii_case(&repo.full_name))
-                                && !zeron_proto::is_cloud_device(&space.device_id, "")
-                        })
-                        .and_then(|space| device_names.get(&space.device_id).cloned());
-                    let private = repo.private;
-                    rows.push(
-                        row(ix)
-                            .child(glyph_el(icons::GITHUB_MARK))
-                            .child(label_el(repo.full_name.clone()))
-                            .when_some(elsewhere, |el, device| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(crate::typography::ui_rems(11.0))
-                                        .text_color(theme.text_muted.opacity(0.75))
-                                        .child(format!("On {device}")),
-                                )
-                            })
-                            .when(private, |el| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(crate::typography::ui_rems(11.0))
-                                        .text_color(theme.text_muted.opacity(0.75))
-                                        .child("Private"),
-                                )
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.add_space_create_cloud(repo.clone(), cx)
-                            }))
-                            .into_any_element(),
-                    );
-                }
-            }
             ProjectStep::Folders => {
                 if !loading && load_error.is_none() {
                     let base = listing.as_ref().map(|l| l.path.as_str()).unwrap_or("");
                     let mut first_home = true;
-                    let mut first_github = true;
                     for (ix, folder) in self.add_space_folder_rows(cx).into_iter().enumerate() {
                         let entry = match folder {
-                            FolderRow::Clone(clone) => {
-                                let el = clone_row(row(ix), &clone, &query, &theme, cx);
-                                rows.push(if clone.github && std::mem::take(&mut first_github) {
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .when(ix > 0, |el| el.pt(px(6.0)))
-                                        .child(home_folders_header_titled(&theme, "From GitHub"))
-                                        .child(el)
-                                        .into_any_element()
-                                } else {
-                                    el.into_any_element()
-                                });
-                                continue;
-                            }
                             FolderRow::Local(entry) => entry,
                             FolderRow::Home(found) => {
                                 let el = home_folder_row(row(ix), &found, &query, &theme, cx);
@@ -8337,11 +8016,6 @@ impl Shell {
         } else if count == 0 && !(step == ProjectStep::Locations && drives_loading) {
             let (title, hint) = match step {
                 ProjectStep::Devices => ("No devices found", "Try another device name.".into()),
-                ProjectStep::Repositories => (
-                    "No repositories found",
-                    "Cloud lists the repositories the Zeron GitHub App can reach — add more in Settings → Cloud."
-                        .into(),
-                ),
                 ProjectStep::Locations => {
                     ("No locations found", "Try Home or a drive name.".into())
                 }
@@ -8399,7 +8073,7 @@ impl Shell {
             specs.push(Crumb {
                 name: device.name.into(),
                 glyph: Some(device_glyph(&device.platform)),
-                current: matches!(step, ProjectStep::Locations | ProjectStep::Repositories),
+                current: step == ProjectStep::Locations,
                 target: CrumbTarget::Locations,
             });
         }
@@ -9157,6 +8831,8 @@ mod tests {
 
     fn chat(id: &str) -> zeron_proto::Chat {
         zeron_proto::Chat {
+            crew: None,
+            harness_session_harness: None,
             id: id.into(),
             device_id: "device".into(),
             title: None,
@@ -9171,7 +8847,6 @@ mod tests {
             created_at: Utc.timestamp_opt(5, 0).unwrap(),
             harness_session_id: None,
             harness_session_cwd: None,
-            harness_session_harness: None,
             parent_chat_id: None,
             space_id: None,
             last_seen_at: None,
@@ -9367,6 +9042,8 @@ mod project_flow_tests {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
                     data_dir: data.path().into(),
                     ipc_port: 0,
                     edge_url: String::new(),
@@ -9419,169 +9096,6 @@ mod project_flow_tests {
             // Slash navigation only applies to folders, never device search.
             search.update(cx, |input, cx| input.set_text("/projects/", cx));
             assert!(!shell.add_space_slash_descend(cx));
-        });
-    }
-
-    #[gpui::test]
-    fn a_project_added_from_an_open_chat_is_the_one_selected(cx: &mut gpui::TestAppContext) {
-        let data = tempfile::tempdir().unwrap();
-        cx.update(|cx| {
-            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
-            crate::history::init(
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                cx,
-            );
-            gpui_base::init(cx);
-            cx.set_global(Theme::default());
-            crate::app_menus::init(cx);
-        });
-        let state = cx.new(|_| {
-            let mut state = AppState::new();
-            state.spaces = serde_json::from_value(serde_json::json!([
-                {"id":"old","deviceId":"dev","path":"/old","createdAt":"2026-07-19T12:00:00Z"},
-                {"id":"new","deviceId":"cloud-acct","path":"/home/user/new",
-                 "createdAt":"2026-07-19T12:01:00Z"}
-            ]))
-            .unwrap();
-            state.chats = serde_json::from_value(serde_json::json!([
-                {"id":"chat","deviceId":"dev","spaceId":"old","archived":false,
-                 "createdAt":"2026-07-19T12:00:00Z"}
-            ]))
-            .unwrap();
-            state
-        });
-        let shell = cx.new(|cx| {
-            Shell::new(
-                state.clone(),
-                EngineBootConfig {
-                    data_dir: data.path().into(),
-                    ipc_port: 0,
-                    edge_url: String::new(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
-                cx,
-            )
-        });
-        state.update(cx, |s, cx| {
-            s.select_space(Some("old".into()), cx);
-            s.select_chat(Some("chat".into()), cx);
-        });
-        // Leaving the chat restores the canvas's earlier pick ("old"); the
-        // project just added must win over it.
-        shell.update(cx, |shell, cx| shell.land_in_space("new".into(), cx));
-        state.read_with(cx, |s, _| {
-            assert_eq!(s.selected_chat, None);
-            assert_eq!(s.selected_space.as_deref(), Some("new"));
-        });
-    }
-
-    #[gpui::test]
-    fn with_github_connected_a_project_can_live_on_cloud(cx: &mut gpui::TestAppContext) {
-        let data = tempfile::tempdir().unwrap();
-        cx.update(|cx| {
-            gpui_base::init(cx);
-            cx.set_global(Theme::default());
-            crate::app_menus::init(cx);
-        });
-        let shell = cx.new(|cx| {
-            let state = cx.new(|_| {
-                let mut state = AppState::new();
-                state.auth = Some(zeron_proto::AuthState::SignedIn {
-                    user: zeron_proto::UserProfile {
-                        id: "user-a".into(),
-                        email: "user@example.com".into(),
-                        name: None,
-                    },
-                    org_id: Some("org-a".into()),
-                });
-                state.devices = serde_json::from_value(serde_json::json!([
-                    {"id":"local","name":"Studio","platform":"macos","lastSeenAt":null},
-                    {"id":"cloud-s1","name":"Cloud session","platform":"linux",
-                     "lastSeenAt":null,"capabilities":["cloud-session"]}
-                ]))
-                .unwrap();
-                state.cloud_status = Some(zeron_proto::CloudStatus {
-                    state: zeron_proto::CloudState::Ready,
-                    device_id: Some("cloud-acct".into()),
-                    available: true,
-                    ..Default::default()
-                });
-                state.cloud_repos = Some(
-                    serde_json::from_value(serde_json::json!([
-                        {"fullName":"acme/old","cloneUrl":"","defaultBranch":"main",
-                         "private":false,"pushedAt":1},
-                        {"fullName":"acme/app","cloneUrl":"","defaultBranch":"main",
-                         "private":true,"pushedAt":2}
-                    ]))
-                    .unwrap(),
-                );
-                state
-            });
-            Shell::new(
-                state,
-                EngineBootConfig {
-                    data_dir: data.path().into(),
-                    ipc_port: 0,
-                    edge_url: String::new(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: zeron_proto::HarnessId::Mock,
-                },
-                cx,
-            )
-        });
-        shell.update(cx, |shell, cx| {
-            shell.open_add_space(cx);
-            // Session machines aren't places for a project; Cloud is.
-            let devices: Vec<String> = shell
-                .add_space_devices(cx)
-                .into_iter()
-                .map(|device| device.name)
-                .collect();
-            assert_eq!(devices, ["Studio", "Cloud"]);
-            // ⌘L on Cloud does nothing: a Cloud project is a repository.
-            shell.add_space.as_mut().unwrap().active = 1;
-            shell.add_space_edit_path(cx);
-            let flow = shell.add_space.as_ref().unwrap();
-            assert_eq!(flow.step, ProjectStep::Devices);
-            assert!(flow.path_edit.is_none());
-            shell.add_space.as_mut().unwrap().active = 0;
-            let search = shell.add_space.as_ref().unwrap().search.clone();
-            search.update(cx, |input, cx| input.set_text("cloud", cx));
-            shell.add_space_open_active(cx);
-            let flow = shell.add_space.as_ref().unwrap();
-            assert_eq!(flow.step, ProjectStep::Repositories);
-            assert!(flow.search.read(cx).is_empty());
-            // Most recently pushed first, then filtered by the query.
-            let repos: Vec<String> = shell
-                .add_space_repos(cx)
-                .into_iter()
-                .map(|repo| repo.full_name)
-                .collect();
-            assert_eq!(repos, ["acme/app", "acme/old"]);
-            search.update(cx, |input, cx| input.set_text("old", cx));
-            assert_eq!(shell.add_space_repos(cx).len(), 1);
-            // Its crumb and Back return to the repositories, then devices.
-            shell.add_space_back_to(ProjectStep::Locations, cx);
-            assert_eq!(
-                shell.add_space.as_ref().unwrap().step,
-                ProjectStep::Repositories
-            );
-            shell.add_space_go_up(cx);
-            assert_eq!(shell.add_space.as_ref().unwrap().step, ProjectStep::Devices);
-            // Without GitHub there is no Cloud row.
-            shell
-                .state
-                .update(cx, |state, _| state.cloud_repos = Some(Vec::new()));
-            search.update(cx, |input, cx| input.set_text("", cx));
-            assert_eq!(shell.add_space_devices(cx).len(), 1);
         });
     }
 }
@@ -9683,6 +9197,8 @@ mod home_folder_search_tests {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
+                    scaffold: None,
+                    managed_inference: false,
                     default_harness: zeron_proto::HarnessId::Mock,
                 },
                 cx,

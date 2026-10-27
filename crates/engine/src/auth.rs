@@ -1,29 +1,10 @@
-//! Auth — the engine owns the WorkOS session for its device (feature-inventory §3.7,
-//! ARCHITECTURE §5). Port of zeron's `apps/backend/src/auth.ts`.
-//!
-//! The engine is a public client: it builds the AuthKit authorize URL itself but
-//! delegates the secret-bearing **code exchange** and **refresh** to the edge Worker
-//! (`/auth/exchange`, `/auth/refresh` — the WorkOS API key lives only there).
-//!
-//! Three modes:
-//! - **Runner** (a Cloud device — `{data_dir}/runner.json`, see [`crate::runner`]): always
-//!   signed in as the enrolled `{userId}` in `{orgId}`; bearers are runner JWTs minted by a
-//!   signed `POST /runner/token`, cached + refreshed with the same single-flight, cooldown
-//!   and background loop as WorkOS. Never touches `session.json` or WorkOS.
-//! - **Dev** (no WorkOS client id configured, or the edge reports `auth: "dev"`): always
-//!   signed in; the bearer IS the configured user id (current M2/M3 behavior).
-//! - **WorkOS**: authorization-code flow. Headed devices use a loopback callback server
-//!   on an ephemeral port; headless devices use the paste-code flow (the redirect is the
-//!   edge's hosted `/auth/cli/callback` page, which shows `state.code` to paste back via
-//!   stdin or the `CompleteSignIn` RPC). The refresh token is persisted 0600 in the data
-//!   dir; access tokens are cached with dual-clock expiry (monotonic AND wall, whichever
-//!   aged more — see [`AccessEntry`]) and refreshed on demand plus by a background loop,
-//!   so the device-room relay and room clients always dial with a live `?token=`, even
-//!   on the first redial after a laptop wakes from sleep. Org onboarding: an org-less session is `NeedsOrganization`; `SelectOrg`
-//!   runs an org-scoped refresh and the state follows the returned token's `org_id`.
+//! Engine authentication: explicit WorkOS, resource-bound Scaffold, or opt-in dev.
+//! Scaffold OAuth and device-grant contracts live in zeron_sync::scaffold_auth
+//! so mobile and desktop share the same trust boundaries.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -35,6 +16,10 @@ use tokio::sync::watch;
 use crate::EngineError;
 use crate::http_error::describe_http_error;
 use zeron_rpc::TokenError;
+use zeron_proto::AccessToken;
+use zeron_sync::scaffold_auth::{
+    AuthError as ScaffoldError, DeviceConfig, ScaffoldAuth, ScaffoldConfig, ScaffoldSession,
+};
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 /// Refresh when the cached token has less than this much life left.
@@ -43,9 +28,6 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const REFRESH_RETRY_BASE: Duration = Duration::from_secs(1);
 /// DNS can recover without an OS path event. Keep polling even at the cap.
 const REFRESH_RETRY_CAP: Duration = Duration::from_secs(5);
-/// A runner whose key the edge rejected (device deleted/revoked) retries
-/// this slowly: it stays dark, but recovers if the rejection was transient.
-const RUNNER_REJECTED_RETRY: Duration = Duration::from_secs(60);
 
 type RefreshFlight =
     futures::future::Shared<futures::future::BoxFuture<'static, Result<Option<String>, String>>>;
@@ -62,6 +44,7 @@ struct RefreshFailure {
     at: tokio::time::Instant,
     wall: std::time::SystemTime,
     delay: Duration,
+    server_cooldown: bool,
 }
 
 impl RefreshFailure {
@@ -159,13 +142,13 @@ impl Serialize for AuthState {
 // Config + construction
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthConfig {
     /// Edge base URL (`/auth/*` routes).
     pub edge_url: String,
     /// Data dir for the persisted session (`session.json`, 0600).
     pub data_dir: PathBuf,
-    /// WorkOS client id; `None` = dev mode.
+    /// Explicit WorkOS mode; absent credentials do not opt into development.
     pub workos_client_id: Option<String>,
     /// WorkOS API base (authorize URL host).
     pub workos_api_base: String,
@@ -173,6 +156,20 @@ pub struct AuthConfig {
     pub dev_user_id: String,
     /// Loopback callback port; `None` = ephemeral.
     pub callback_port: Option<u16>,
+    /// Managed Crew authority. Missing/invalid configuration never enables dev auth.
+    pub scaffold: Option<ScaffoldConfig>,
+    pub device: Option<DeviceConfig>,
+    pub allow_dev_auth: bool,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig").field("edge_url", &self.edge_url)
+            .field("data_dir", &self.data_dir).field("scaffold", &self.scaffold)
+            .field("device", &self.device).field("workos_client_id", &self.workos_client_id)
+            .field("workos_api_base", &self.workos_api_base).field("callback_port", &self.callback_port)
+            .field("dev_user_id", &"<redacted>").field("allow_dev_auth", &self.allow_dev_auth).finish()
+    }
 }
 
 impl AuthConfig {
@@ -184,12 +181,15 @@ impl AuthConfig {
             workos_api_base: "https://api.workos.com".into(),
             dev_user_id: "dev-user".into(),
             callback_port: None,
+            scaffold: None,
+            device: None,
+            allow_dev_auth: false,
         }
     }
 }
 
 /// The persisted session (refresh token + user + last org scope).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredSession {
     refresh_token: String,
@@ -232,15 +232,6 @@ impl AccessEntry {
         }
     }
 
-    fn with_ttl(token: String, ttl: Duration) -> Self {
-        Self {
-            token,
-            ttl,
-            got_at: Instant::now(),
-            got_wall: std::time::SystemTime::now(),
-        }
-    }
-
     fn remaining(&self) -> Duration {
         let monotonic = self.got_at.elapsed();
         let wall = std::time::SystemTime::now()
@@ -252,6 +243,11 @@ impl AccessEntry {
 
 struct AuthInner {
     config: AuthConfig,
+    scaffold: Option<ScaffoldAuth>,
+    scaffold_session: Mutex<Option<ScaffoldSession>>,
+    /// Startup workspace intent only, never evidence of verified authority.
+    loaded_scaffold_session: bool,
+    device_mode: bool,
     /// `Some(client_id)` = WorkOS mode; `None` = dev mode.
     workos: Option<String>,
     /// Whether construction loaded a parseable WorkOS session. This is an
@@ -265,28 +261,26 @@ struct AuthInner {
     /// Pending OAuth states plus the cancellation generation that fences code
     /// exchanges already in flight when sign-out occurs.
     sign_in: Mutex<SignInLifecycle>,
-    /// Single-flight refresh: WorkOS refresh tokens are single-use (rotated per
-    /// exchange); two concurrent refreshes would race and could revoke the session.
+    /// Single-flight refresh/verification. Rotating credentials must finish even
+    /// if an individual HTTP/WS consumer cancels its wait.
     refresh_gate: tokio::sync::Mutex<()>,
-    refresh_flight: Mutex<Option<RefreshFlight>>,
-    /// Set at shutdown ([`Auth::quiesce_refresh`]): no refresh after.
-    refresh_quiesced: std::sync::atomic::AtomicBool,
+    /// Set during managed-engine shutdown after any rotating credential has
+    /// finished. No later consumer may start another exchange in this process.
+    refresh_quiesced: AtomicBool,
+    refresh_flight: Mutex<Option<(u64, RefreshFlight)>>,
     /// Failed refreshes are shared across every HTTP/WS token consumer, not
     /// just delayed by the background loop. Resettable without waiting on HTTP.
     refresh_retry: Mutex<RefreshRetry>,
     retry_tx: watch::Sender<u64>,
     /// Loopback callback listener port, bound lazily on the first headed sign-in.
     loopback: tokio::sync::Mutex<Option<u16>>,
-    /// `Some` = runner mode (a Cloud device's enrolled identity).
-    runner: Option<Arc<crate::runner::RunnerIdentity>>,
-    /// The edge definitively rejected the runner's signed token request
-    /// (deleted/revoked device): bearer consumers see `SignedOut`.
-    runner_rejected: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
 struct SignInLifecycle {
     generation: u64,
+    invalidated: bool,
+    device_refresh_at: i64,
     pending: HashMap<String, Instant>,
 }
 
@@ -297,11 +291,33 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Build from config: dev mode unless a WorkOS client id is configured.
-    pub fn new(config: AuthConfig) -> Self {
+    /// Construct signed out; persisted managed authority is verified asynchronously.
+    pub fn new(mut config: AuthConfig) -> Self {
+        let scaffold = config.scaffold.clone().and_then(|config| ScaffoldAuth::new(config).ok());
+        let device_file = config.data_dir.join("scaffold-device-session.json");
+        let device_mode = config.device.is_some() || device_file.exists();
+        let scaffold_session = if device_mode {
+            zeron_sync::scaffold_auth::load_session(&device_file).ok().flatten().filter(|session| {
+                session.device.as_ref().is_some_and(|saved| config.device.as_ref().is_none_or(|device| {
+                    // A new grant re-enrolls; a consumed grant restores its durable credential.
+                    device.join_grant.is_empty() || device.join_grant.strip_prefix("cg1.")
+                        .and_then(|grant| grant.split_once('.'))
+                        .is_some_and(|(id, _)| id == saved.grant_id)
+                }))
+            })
+        } else if config.scaffold.is_some() {
+            zeron_sync::scaffold_auth::load_session(&config.data_dir.join("scaffold-session.json")).ok().flatten().filter(|session| session.device.is_none())
+        } else { None };
+        if config.device.is_none() {
+            config.device = scaffold_session.as_ref().and_then(|session| session.device.as_ref()).map(|device| DeviceConfig {
+                join_grant: String::new(), device_id: device.device_id.clone(), session_id: device.session_id.clone(),
+                deployment_id: device.deployment_id.clone(), sandbox_id: device.sandbox_id.clone(), lifecycle_epoch: device.lifecycle_epoch,
+            });
+        }
         let workos = config
             .workos_client_id
             .clone()
+            .filter(|_| config.scaffold.is_none() && !device_mode)
             .filter(|s| !s.trim().is_empty());
         let session_file = config.data_dir.join("session.json");
         let stored: Option<StoredSession> = if workos.is_some() {
@@ -312,7 +328,7 @@ impl Auth {
             None
         };
         let initial = match (&workos, &stored) {
-            (None, _) => AuthState::SignedIn {
+            (None, _) if config.allow_dev_auth && config.scaffold.is_none() && !device_mode => AuthState::SignedIn {
                 user: AuthUser {
                     id: config.dev_user_id.clone(),
                     email: config.dev_user_id.clone(),
@@ -322,34 +338,10 @@ impl Auth {
             },
             (Some(_), Some(session)) => state_for(session.user.clone(), session.org_id.clone()),
             (Some(_), None) => AuthState::SignedOut,
+            (None, _) => AuthState::SignedOut,
         };
         let loaded_workos_session = workos.is_some() && stored.is_some();
-        Self::assemble(config, workos, loaded_workos_session, stored, initial, None)
-    }
-
-    /// Runner mode: a Cloud device authenticating with its enrolled key. The
-    /// identity is fixed (`SignedIn{user: userId, org: orgId}`); WorkOS and
-    /// `session.json` are never consulted.
-    pub fn new_runner(config: AuthConfig, identity: Arc<crate::runner::RunnerIdentity>) -> Self {
-        let initial = AuthState::SignedIn {
-            user: AuthUser {
-                id: identity.user_id().to_string(),
-                email: String::new(),
-                name: None,
-            },
-            org_id: Some(identity.org_id().to_string()),
-        };
-        Self::assemble(config, None, false, None, initial, Some(identity))
-    }
-
-    fn assemble(
-        config: AuthConfig,
-        workos: Option<String>,
-        loaded_workos_session: bool,
-        stored: Option<StoredSession>,
-        initial: AuthState,
-        runner: Option<Arc<crate::runner::RunnerIdentity>>,
-    ) -> Self {
+        let loaded_scaffold_session = scaffold_session.is_some();
         let (state_tx, _) = watch::channel(initial);
         let (token_tx, _) = watch::channel(0);
         let (retry_tx, _) = watch::channel(0);
@@ -359,6 +351,10 @@ impl Auth {
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             inner: Arc::new(AuthInner {
+                scaffold,
+                scaffold_session: Mutex::new(scaffold_session),
+                loaded_scaffold_session,
+                device_mode,
                 config,
                 workos,
                 loaded_workos_session,
@@ -369,66 +365,217 @@ impl Auth {
                 access: Mutex::new(None),
                 sign_in: Mutex::new(SignInLifecycle::default()),
                 refresh_gate: tokio::sync::Mutex::new(()),
+                refresh_quiesced: AtomicBool::new(false),
                 refresh_flight: Mutex::new(None),
-                refresh_quiesced: std::sync::atomic::AtomicBool::new(false),
                 refresh_retry: Mutex::new(RefreshRetry::default()),
                 retry_tx,
                 loopback: tokio::sync::Mutex::new(None),
-                runner,
-                runner_rejected: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
 
-    /// Whether this is a Cloud runner (enrolled key, no WorkOS session).
-    pub fn is_runner(&self) -> bool {
-        self.inner.runner.is_some()
-    }
-
-    /// The runner identity (signing key + ids), in runner mode.
-    pub fn runner_identity(&self) -> Option<Arc<crate::runner::RunnerIdentity>> {
-        self.inner.runner.clone()
-    }
-
-    fn runner_rejected(&self) -> bool {
-        self.inner
-            .runner_rejected
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Like [`Auth::new`], but additionally probes `{edge}/health`: an edge running in
-    /// dev auth mode forces dev mode even when a client id is configured (matching the
-    /// edge's "bearer = user id" verification).
-    pub async fn detect(mut config: AuthConfig) -> Self {
-        if config.workos_client_id.is_some() {
-            #[derive(Deserialize)]
-            struct Health {
-                auth: Option<String>,
-            }
-            let url = format!("{}/health", config.edge_url.trim_end_matches('/'));
-            let probe = async {
-                reqwest::Client::new()
-                    .get(&url)
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                    .ok()?
-                    .json::<Health>()
-                    .await
-                    .ok()
-            };
-            if let Some(health) = probe.await
-                && health.auth.as_deref() == Some("dev")
-            {
-                tracing::info!("auth: edge is in dev mode — using dev bearer");
-                config.workos_client_id = None;
+    /// Revalidate persisted credentials before a managed profile can be selected.
+    pub async fn detect(config: AuthConfig) -> Self {
+        let auth = Self::new(config);
+        if auth.scaffold_enabled()
+            && let Err(error) = auth.access_token().await
+        {
+            if auth.device_mode() {
+                tracing::error!(%error, "Crew sandbox device authentication failed; native host startup requires verified authority");
+            } else if auth.loaded_scaffold_session() {
+                match error {
+                    TokenError::TemporarilyUnavailable(_) => tracing::warn!("initial managed session verification unavailable; synced profile requires verified authority"),
+                    TokenError::SignedOut => tracing::warn!("initial managed session verification rejected; synced workspace remains unavailable"),
+                }
             }
         }
-        Self::new(config)
+        auth
+    }
+
+    /// Configured audience for authenticated edge requests, including releases.
+    pub fn edge_url(&self) -> &str {
+        &self.inner.config.edge_url
     }
 
     pub fn workos_enabled(&self) -> bool {
         self.inner.workos.is_some()
+    }
+
+    pub fn scaffold_enabled(&self) -> bool {
+        self.inner.config.scaffold.is_some() || self.inner.device_mode
+    }
+
+    pub fn device_mode(&self) -> bool { self.inner.device_mode }
+
+    pub fn dev_enabled(&self) -> bool {
+        self.inner.config.allow_dev_auth && !self.scaffold_enabled() && !self.workos_enabled()
+    }
+
+    pub fn capabilities(&self) -> Vec<String> {
+        if !self.state().is_signed_in() { return Vec::new(); }
+        lock(&self.inner.scaffold_session).as_ref().map(|session| session.identity.capabilities.clone()).unwrap_or_default()
+    }
+
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.state().is_signed_in() && lock(&self.inner.scaffold_session).as_ref()
+            .is_some_and(|session| session.identity.capabilities.iter().any(|value| value == capability))
+    }
+
+    pub fn verified_scope(&self) -> Option<zeron_proto::CollaborationScope> {
+        if !self.state().is_signed_in() { return None; }
+        let session = lock(&self.inner.scaffold_session);
+        let session = session.as_ref()?;
+        Some(zeron_proto::CollaborationScope {
+            project_id: session.identity.project_scope.clone(),
+            deployment_id: session.identity.deployment_id.clone(),
+            session_id: session.device.as_ref().map(|device| device.session_id.clone()),
+            unknown: Default::default(),
+        })
+    }
+
+    pub fn verified_profile_key(&self) -> Option<String> {
+        if !self.state().is_signed_in() { return None; }
+        lock(&self.inner.scaffold_session).as_ref().map(zeron_sync::scaffold_auth::profile_key)
+    }
+
+    pub fn device_grant_authority(&self) -> Option<DeviceGrantAuthority> {
+        if !self.state().is_signed_in() { return None; }
+        let stored = lock(&self.inner.scaffold_session);
+        let session = stored.as_ref()?;
+        let device = session.device.as_ref()?;
+        if device.expires_at <= chrono::Utc::now().timestamp_millis() { return None; }
+        Some(DeviceGrantAuthority {
+            grant_id: device.grant_id.clone(), expires_at: device.expires_at,
+            principal_subject: session.identity.user_id.clone(),
+            scope: zeron_proto::CollaborationScope { project_id: session.identity.project_scope.clone(), deployment_id: Some(device.deployment_id.clone()), session_id: Some(device.session_id.clone()), unknown: Default::default() },
+            sandbox_id: device.sandbox_id.clone(), device_id: device.device_id.clone(),
+            lifecycle_epoch: device.lifecycle_epoch, capabilities: session.identity.capabilities.clone(),
+        })
+    }
+
+    pub fn verified_scaffold_session(&self) -> Option<ScaffoldSession> {
+        let _lifecycle = lock(&self.inner.sign_in);
+        if !self.state().is_signed_in() { return None; }
+        lock(&self.inner.scaffold_session).clone()
+    }
+
+    /// A retained session reserves the synced boundary, not its unverified identity.
+    /// Like loaded_workos_session, sign-out cannot rewrite this startup fact.
+    pub fn loaded_scaffold_session(&self) -> bool {
+        self.inner.loaded_scaffold_session
+    }
+
+    /// Only retained user credentials may defer startup for background verification.
+    /// Device bootstrap stays fail closed; rejection/sign-out removes this pending state.
+    pub fn pending_scaffold_verification(&self) -> bool {
+        let _lifecycle = lock(&self.inner.sign_in);
+        !self.device_mode()
+            && self.inner.scaffold.is_some()
+            && !self.inner.state_tx.borrow().is_signed_in()
+            && lock(&self.inner.scaffold_session).is_some()
+    }
+
+    pub fn is_authenticated_mode(&self) -> bool {
+        self.scaffold_enabled() || self.workos_enabled()
+    }
+
+    pub fn verified_owner_email(&self) -> Option<String> {
+        if !self.state().is_signed_in() { return None; }
+        lock(&self.inner.scaffold_session).as_ref().map(|session| session.identity.email.clone())
+    }
+
+    fn install_scaffold_session(&self, session: ScaffoldSession, lifecycle: &mut SignInLifecycle) {
+        let state = state_for(AuthUser { id: session.identity.user_id.clone(), email: session.identity.email.clone(), name: session.identity.name.clone() }, Some(session.identity.project_scope.clone()));
+        let changed = lifecycle.invalidated || lock(&self.inner.scaffold_session).as_ref().is_none_or(|old| old.access_token != session.access_token);
+        lifecycle.invalidated = false;
+        lifecycle.device_refresh_at = session.device.as_ref().map_or(0, |device| {
+            // Short or unchanged grants must not make the background loop spin.
+            device.expires_at.saturating_sub(TOKEN_SLACK.as_millis() as i64)
+                .max(chrono::Utc::now().timestamp_millis().saturating_add(1_000))
+        });
+        *lock(&self.inner.scaffold_session) = Some(session);
+        self.inner.state_tx.send_if_modified(|old| {
+            if *old == state { false } else { *old = state; true }
+        });
+        if changed { self.inner.token_tx.send_modify(|epoch| *epoch = epoch.wrapping_add(1)); }
+    }
+
+    /// Called only under refresh_gate; commit is fenced against sign-out and
+    /// credential/profile replacement by the same lifecycle as OAuth callbacks.
+    async fn scaffold_refresh_locked(&self) -> Result<Option<String>, ScaffoldError> {
+        let helper = self.inner.scaffold.as_ref().ok_or_else(|| ScaffoldError::Unavailable {
+            message: "Scaffold auth is not configured correctly".into(), retry_after: None,
+        })?;
+        let (generation, invalidated, refresh_at, current) = {
+            let lifecycle = lock(&self.inner.sign_in);
+            (lifecycle.generation, lifecycle.invalidated, lifecycle.device_refresh_at, lock(&self.inner.scaffold_session).clone())
+        };
+        let result = match (&self.inner.config.device, current.as_ref()) {
+            (Some(device), None) if generation == 0 && !device.join_grant.is_empty() => helper.exchange_device(device).await,
+            (Some(device), Some(session)) => {
+                // Use the grant's real deadline, including wall time elapsed in suspend.
+                let now = chrono::Utc::now().timestamp_millis();
+                if !invalidated && self.state().is_signed_in() && now < refresh_at {
+                    if session.device.as_ref().is_some_and(|grant| grant.expires_at > now) {
+                        return Ok(Some(session.access_token.clone()));
+                    }
+                    return Err(ScaffoldError::Unavailable {
+                        message: "device grant expired; renewal is cooling down".into(),
+                        retry_after: Some(Duration::from_millis((refresh_at - now) as u64)),
+                    });
+                }
+                helper.refresh_device(session, device).await
+            }
+            (None, Some(session)) if !self.device_mode() => helper.verify(session).await,
+            _ => return Ok(None),
+        };
+        let mut lifecycle = lock(&self.inner.sign_in);
+        if lifecycle.generation != generation {
+            // Rejection feedback can arrive while a rotating grant is in flight.
+            // Preserve that replacement secret, but require a new verification;
+            // sign-out/profile replacement must never be resurrected here.
+            if lifecycle.invalidated && current.as_ref().is_some_and(|old| {
+                old.device.is_some() && lock(&self.inner.scaffold_session).as_ref()
+                    .is_some_and(|saved| saved.access_token == old.access_token)
+            }) {
+                match result {
+                    Ok(session) => {
+                        let persistence = zeron_sync::scaffold_auth::save_session(
+                            &self.inner.config.data_dir.join("scaffold-device-session.json"), &session,
+                        );
+                        *lock(&self.inner.scaffold_session) = Some(session);
+                        persistence?;
+                    }
+                    // Feedback against this same credential cannot erase the
+                    // authority's concurrent request to stop retrying it.
+                    Err(error @ ScaffoldError::Unavailable { .. }) => return Err(error),
+                    Err(ScaffoldError::Rejected) => {}
+                }
+            }
+            return Ok(None);
+        }
+        match result {
+            Ok(session) => {
+                let token = session.access_token.clone();
+                let persistence = if session.device.is_some() {
+                    zeron_sync::scaffold_auth::save_session(&self.inner.config.data_dir.join("scaffold-device-session.json"), &session)
+                } else { Ok(()) };
+                if let Err(error) = persistence {
+                    lifecycle.invalidated = true;
+                    // Retain the rotated token in memory, but never complete bootstrap
+                    // until its restart credential is durable.
+                    *lock(&self.inner.scaffold_session) = Some(session);
+                    return Err(error);
+                }
+                self.install_scaffold_session(session, &mut lifecycle);
+                Ok(Some(token))
+            }
+            Err(ScaffoldError::Rejected) => {
+                self.clear_session(&mut lifecycle);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// True when construction loaded a parseable persisted WorkOS session.
@@ -451,10 +598,7 @@ impl Auth {
     /// Dev mode mirrors the edge's dev-bearer parsing (`user@org` → `user`,
     /// a bare token IS the user id). `None` = signed out (WorkOS only).
     pub fn user_id(&self) -> Option<String> {
-        if let Some(runner) = &self.inner.runner {
-            return Some(runner.user_id().to_string());
-        }
-        if self.inner.workos.is_none() {
+        if self.dev_enabled() {
             let dev = &self.inner.config.dev_user_id;
             return Some(dev.split('@').next().unwrap_or(dev).to_string());
         }
@@ -466,41 +610,103 @@ impl Auth {
     /// Dev mode: the configured user id. WorkOS: cached access token, refreshed when
     /// it has under 30s left.
     pub async fn access_token(&self) -> Result<String, TokenError> {
-        if self.inner.runner.is_some() {
-            return self.runner_access_token().await;
+        self.credential().await.map(|credential| credential.value)
+    }
+
+    /// A bearer and its rejection fence are captured under the same lifecycle lock.
+    pub async fn credential(&self) -> Result<AccessToken, TokenError> {
+        if self.scaffold_enabled() {
+            let generation = lock(&self.inner.sign_in).generation;
+            let result = self.refresh(None).await;
+            let lifecycle = lock(&self.inner.sign_in);
+            // Never hand a late flight's bearer/error to a replacement profile
+            // or to consumers after an explicit rejection, even for the same token.
+            if lifecycle.generation != generation {
+                return if lock(&self.inner.scaffold_session).is_none() {
+                    Err(TokenError::SignedOut)
+                } else {
+                    Err(TokenError::TemporarilyUnavailable("session changed during verification; retry".into()))
+                };
+            }
+            if lock(&self.inner.scaffold_session).as_ref().and_then(|session| session.device.as_ref())
+                .is_some_and(|device| device.expires_at <= chrono::Utc::now().timestamp_millis())
+            {
+                return Err(TokenError::TemporarilyUnavailable("device grant expired; renewal required".into()));
+            }
+            return result.map_err(|error| TokenError::TemporarilyUnavailable(error.to_string()))?
+                .map(|value| AccessToken { value, generation: *self.inner.token_tx.borrow() })
+                .ok_or(TokenError::SignedOut);
         }
-        if self.inner.workos.is_none() {
-            return Ok(self.inner.config.dev_user_id.clone());
-        }
-        if let Some(entry) = &*lock(&self.inner.access)
-            && entry.remaining() > TOKEN_SLACK
         {
-            return Ok(entry.token.clone());
+            let _lifecycle = lock(&self.inner.sign_in);
+            if self.inner.workos.is_none() {
+                return if self.dev_enabled() && self.state().is_signed_in() {
+                    Ok(AccessToken { value: self.inner.config.dev_user_id.clone(), generation: *self.inner.token_tx.borrow() })
+                } else { Err(TokenError::SignedOut) };
+            }
+            if let Some(entry) = &*lock(&self.inner.access)
+                && entry.remaining() > TOKEN_SLACK
+            {
+                return Ok(AccessToken { value: entry.token.clone(), generation: *self.inner.token_tx.borrow() });
+            }
         }
+        let generation = lock(&self.inner.sign_in).generation;
         let result = self.refresh(None).await;
         // Sign-in/out may replace the session while a shared request is in
         // flight. Report the current credentials, never a discarded response's
         // `None` as a revocation of the replacement session.
-        let _session = lock(&self.inner.sign_in);
+        let lifecycle = lock(&self.inner.sign_in);
         if lock(&self.inner.stored).is_none() {
             return Err(TokenError::SignedOut);
         }
         if let Some(entry) = &*lock(&self.inner.access)
             && entry.remaining() > TOKEN_SLACK
         {
-            return Ok(entry.token.clone());
+            return Ok(AccessToken { value: entry.token.clone(), generation: *self.inner.token_tx.borrow() });
+        }
+        if lifecycle.generation != generation {
+            return Err(TokenError::TemporarilyUnavailable("session changed during refresh; retry".into()));
         }
         result
             .map_err(|e| TokenError::TemporarilyUnavailable(e.to_string()))?
+            .map(|value| AccessToken { value, generation: *self.inner.token_tx.borrow() })
             .ok_or_else(|| {
                 TokenError::TemporarilyUnavailable("session changed during refresh; retry".into())
             })
     }
 
+    /// Only the rejected lease may invalidate authority. Bump its fence before
+    /// waking consumers so concurrent failures cannot clear a newer verification.
+    pub fn invalidate(&self, generation: u64) {
+        let mut lifecycle = lock(&self.inner.sign_in);
+        if *self.inner.token_tx.borrow() != generation || !self.is_authenticated_mode() {
+            return;
+        }
+        // WorkOS rejection concerns the access lease, not its rotating refresh
+        // secret. Keep that flight's lifecycle valid so its replacement commits;
+        // token_tx below still fences every rejected access lease immediately.
+        if self.scaffold_enabled() {
+            lifecycle.generation = lifecycle.generation.wrapping_add(1);
+            lifecycle.invalidated = true;
+            if let Some(helper) = &self.inner.scaffold {
+                helper.invalidate(helper.generation());
+            }
+        }
+        *lock(&self.inner.access) = None;
+        self.inner.token_tx.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
     /// Allow one fresh attempt after a connectivity hint or an explicit Retry.
-    /// Consumers still serialize on the refresh gate and share its outcome.
+    /// Connectivity hints do not override a managed authority's Retry-After.
     pub fn retry_refresh(&self) {
+        self.reset_refresh_retry(false);
+    }
+
+    fn reset_refresh_retry(&self, lifecycle_change: bool) {
         let mut retry = lock(&self.inner.refresh_retry);
+        if !lifecycle_change && retry.failure.as_ref().is_some_and(|failure| failure.server_cooldown && !failure.remaining().is_zero()) {
+            return;
+        }
         retry.generation = retry.generation.wrapping_add(1);
         retry.failures = 0;
         retry.failure = None;
@@ -512,7 +718,45 @@ impl Auth {
     pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
         let auth = self.clone();
         tokio::spawn(async move {
-            if auth.inner.workos.is_none() && auth.inner.runner.is_none() {
+            if auth.scaffold_enabled() {
+                let mut wake = zeron_sync::wake::subscribe();
+                let mut online = zeron_sync::wake::subscribe_online();
+                let mut tokens = auth.inner.token_tx.subscribe();
+                let mut state = auth.watch_state();
+                let mut retries = auth.inner.retry_tx.subscribe();
+                loop {
+                    let wait = {
+                        let lifecycle = lock(&auth.inner.sign_in);
+                        let session = lock(&auth.inner.scaffold_session);
+                        let active = session.is_some() || (auth.device_mode() && lifecycle.generation == 0 && auth.inner.config.device.as_ref().is_some_and(|device| !device.join_grant.is_empty()));
+                        if !active { None }
+                        else if let Some(failure) = &lock(&auth.inner.refresh_retry).failure {
+                            Some(failure.remaining())
+                        } else if lifecycle.invalidated || !auth.state().is_signed_in() {
+                            Some(Duration::ZERO)
+                        } else {
+                            session.as_ref().and_then(|session| session.device.as_ref()).map(|_| {
+                                Duration::from_millis(lifecycle.device_refresh_at.saturating_sub(chrono::Utc::now().timestamp_millis()).max(0) as u64)
+                            })
+                        }
+                    };
+                    tokio::select! {
+                        _ = async {
+                            match wait {
+                                Some(wait) => tokio::time::sleep(wait).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {}
+                        _ = wake.recv() => { auth.retry_refresh(); }
+                        _ = online.recv() => { auth.retry_refresh(); }
+                        changed = tokens.changed() => { if changed.is_err() { return; } continue; }
+                        changed = state.changed() => { if changed.is_err() { return; } continue; }
+                        changed = retries.changed() => { if changed.is_err() { return; } continue; }
+                    }
+                    let _ = auth.access_token().await;
+                }
+            }
+            if auth.inner.workos.is_none() {
                 return;
             }
             let mut state_rx = auth.watch_state();
@@ -577,8 +821,14 @@ impl Auth {
     /// Begin a headed sign-in: returns the AuthKit authorize URL redirecting to our
     /// loopback callback server (bound lazily on an ephemeral port).
     pub async fn start_sign_in(&self) -> Result<String, EngineError> {
+        if self.scaffold_enabled() {
+            if self.device_mode() { return Err(EngineError::Other("device hosts cannot start user sign-in".into())); }
+            let helper = self.inner.scaffold.as_ref().ok_or_else(|| EngineError::Other("Scaffold auth is not configured correctly".into()))?;
+            let port = self.ensure_loopback().await?;
+            return helper.begin_sign_in(&format!("http://127.0.0.1:{port}/callback")).await.map_err(|error| EngineError::Other(error.to_string()));
+        }
         if self.inner.workos.is_none() {
-            return Ok(String::new()); // dev mode: nothing to do (TS parity)
+            return if self.dev_enabled() { Ok(String::new()) } else { Err(EngineError::Other("Crew sign-in authority is not configured".into())) };
         }
         let port = self.ensure_loopback().await?;
         Ok(self.begin_sign_in(&format!("http://127.0.0.1:{port}/callback")))
@@ -586,19 +836,32 @@ impl Auth {
 
     /// Begin a headless sign-in: the redirect is the edge's hosted paste-code page —
     /// nothing ever redirects to this machine, so the browser can be anywhere.
-    pub fn start_headless_sign_in(&self) -> String {
-        if self.inner.workos.is_none() {
-            return String::new();
-        }
+    pub async fn start_headless_sign_in(&self) -> Result<String, EngineError> {
+        if self.scaffold_enabled() { return self.start_sign_in().await; }
+        if self.inner.workos.is_none() { return self.start_sign_in().await; }
         let edge = self.inner.config.edge_url.trim_end_matches('/');
-        self.begin_sign_in(&format!("{edge}/auth/cli/callback"))
+        Ok(self.begin_sign_in(&format!("{edge}/auth/cli/callback")))
     }
 
     /// Finish a headless sign-in with the pasted `state.code` string. The state half
     /// must match a sign-in started HERE (same CSRF discipline as the loopback flow).
     pub async fn complete_sign_in(&self, pasted: &str) -> Result<(), EngineError> {
-        if self.inner.workos.is_none() {
+        if self.scaffold_enabled() {
+            if self.device_mode() { return Err(EngineError::Other("device hosts cannot complete user sign-in".into())); }
+            let generation = lock(&self.inner.sign_in).generation;
+            let helper = self.inner.scaffold.as_ref().ok_or_else(|| EngineError::Other("Scaffold auth is not configured correctly".into()))?;
+            let session = helper.complete_sign_in(pasted).await.map_err(|error| EngineError::Other(error.to_string()))?;
+            let mut lifecycle = lock(&self.inner.sign_in);
+            if lifecycle.generation != generation { return Err(EngineError::Other("sign-in was canceled".into())); }
+            zeron_sync::scaffold_auth::save_session(&self.inner.config.data_dir.join("scaffold-session.json"), &session).map_err(|error| EngineError::Other(error.to_string()))?;
+            lifecycle.generation = lifecycle.generation.wrapping_add(1);
+            lifecycle.invalidated = true;
+            self.reset_refresh_retry(true);
+            self.install_scaffold_session(session, &mut lifecycle);
             return Ok(());
+        }
+        if self.inner.workos.is_none() {
+            return if self.dev_enabled() { Ok(()) } else { Err(EngineError::Other("Crew sign-in authority is not configured".into())) };
         }
         let trimmed = pasted.trim();
         let (state, code) = trimmed.split_once('.').unwrap_or(("", ""));
@@ -619,22 +882,33 @@ impl Auth {
     }
 
     pub fn sign_out(&self) {
-        if self.is_runner() {
-            // A runner's identity is its enrolled key, not a session: there
-            // is nothing to sign out of (delete the Cloud device instead).
-            tracing::info!("auth: sign-out ignored on a Cloud runner");
-            return;
-        }
         let mut sign_in = lock(&self.inner.sign_in);
         self.clear_session(&mut sign_in);
     }
 
     fn clear_session(&self, sign_in: &mut SignInLifecycle) {
         sign_in.generation = sign_in.generation.wrapping_add(1);
+        sign_in.invalidated = false;
+        if let Some(helper) = &self.inner.scaffold { helper.cancel_sign_in(); }
+        *lock(&self.inner.scaffold_session) = None;
+        if self.device_mode() {
+            // Preserve a restrictive role tombstone across restart, never a usable secret.
+            let path = self.inner.config.data_dir.join("scaffold-device-session.json");
+            if std::fs::create_dir_all(&self.inner.config.data_dir).and_then(|()| write_private(&path, b"{}")).is_err() {
+                tracing::warn!("auth: could not clear device credential");
+            }
+        }
+        if self.scaffold_enabled() && !self.device_mode() {
+            match std::fs::remove_file(self.inner.config.data_dir.join("scaffold-session.json")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => tracing::warn!("auth: could not remove Scaffold credential"),
+            }
+        }
         sign_in.pending.clear();
         *lock(&self.inner.stored) = None;
         *lock(&self.inner.access) = None;
-        self.retry_refresh();
+        self.reset_refresh_retry(true);
         self.persist::<&StoredSession>(None);
         self.inner.state_tx.send_replace(AuthState::SignedOut);
         self.inner
@@ -661,6 +935,7 @@ impl Auth {
 
     /// Create an org (the edge makes us its first admin member) and scope to it.
     pub async fn create_org(&self, name: &str) -> Result<(), EngineError> {
+        if self.scaffold_enabled() { return Err(EngineError::Other("Scaffold project scope is authority-managed".into())); }
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -682,6 +957,7 @@ impl Auth {
     /// Scope the session to an org: one refresh with `organizationId`; the state follows
     /// the returned token's `org_id` claim.
     pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
+        if self.scaffold_enabled() { return Err(EngineError::Other("Scaffold project scope is immutable; reopen its profile".into())); }
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -816,7 +1092,7 @@ impl Auth {
         };
         self.persist(Some(&session));
         *lock(&self.inner.stored) = Some(session);
-        self.retry_refresh();
+        self.reset_refresh_retry(true);
         tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
             "auth: signed in");
         self.inner
@@ -835,9 +1111,10 @@ impl Auth {
         if organization_id.is_some() {
             return self.refresh_serialized(organization_id).await;
         }
+        let generation = lock(&self.inner.sign_in).generation;
         let flight = {
             let mut active = lock(&self.inner.refresh_flight);
-            if let Some(flight) = active.as_ref() {
+            if let Some((_, flight)) = active.as_ref().filter(|(epoch, _)| *epoch == generation) {
                 flight.clone()
             } else {
                 let auth = self.clone();
@@ -848,7 +1125,10 @@ impl Auth {
                         .refresh_serialized(None)
                         .await
                         .map_err(|e| e.to_string());
-                    *lock(&auth.inner.refresh_flight) = None;
+                    let mut active = lock(&auth.inner.refresh_flight);
+                    if active.as_ref().is_some_and(|(epoch, _)| *epoch == generation) {
+                        *active = None;
+                    }
                     result
                 });
                 let flight = async move {
@@ -857,28 +1137,20 @@ impl Auth {
                 }
                 .boxed()
                 .shared();
-                *active = Some(flight.clone());
+                *active = Some((generation, flight.clone()));
                 flight
             }
         };
         flight.await.map_err(EngineError::Other)
     }
 
-    /// Shutdown: wait (bounded) for a token refresh already in flight, then
-    /// let no other start in this process. A refresh token is single-use; a
-    /// process that quits mid-exchange lets the next engine spend the same
-    /// token, and the loser of that race deletes the shared session file.
-    pub async fn quiesce_refresh(&self, limit: std::time::Duration) {
-        // Set while holding the gate (when it's had in time): a refresh
-        // queued behind the in-flight one then sees the flag, never a window
-        // between our release and the store. Later ones answer "no token" at
-        // once, never waiting (shutdown's own flushes may ask for a bearer).
+    /// Bound shutdown on an in-flight credential rotation and prevent a new
+    /// one from starting before the successor engine takes the profile lock.
+    pub async fn quiesce_refresh(&self, limit: Duration) {
         let gate = tokio::time::timeout(limit, self.inner.refresh_gate.lock()).await;
-        self.inner
-            .refresh_quiesced
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.refresh_quiesced.store(true, Ordering::SeqCst);
         if gate.is_err() {
-            tracing::warn!("a token refresh was still running at shutdown");
+            tracing::warn!("an auth refresh was still running at shutdown");
         }
     }
 
@@ -887,15 +1159,11 @@ impl Auth {
         organization_id: Option<&str>,
     ) -> Result<Option<String>, EngineError> {
         let _gate = self.inner.refresh_gate.lock().await;
-        if self
-            .inner
-            .refresh_quiesced
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.inner.refresh_quiesced.load(Ordering::SeqCst) {
             return Ok(None);
         }
         // Re-check under the gate: the refresh we queued behind may have done the work.
-        if organization_id.is_none()
+        if !self.scaffold_enabled() && organization_id.is_none()
             && let Some(entry) = &*lock(&self.inner.access)
             && entry.remaining() > TOKEN_SLACK
         {
@@ -912,7 +1180,16 @@ impl Auth {
             }
             retry.generation
         };
-        let result = self.refresh_locked(organization_id).await;
+        let (result, retry_after) = if self.scaffold_enabled() {
+            let result = self.scaffold_refresh_locked().await;
+            let retry_after = match &result {
+                Err(ScaffoldError::Unavailable { retry_after, .. }) => *retry_after,
+                _ => None,
+            };
+            (result.map_err(|error| EngineError::Other(error.to_string())), retry_after)
+        } else {
+            (self.refresh_locked(organization_id).await, None)
+        };
         let mut retry = lock(&self.inner.refresh_retry);
         // A Retry/sign-in/sign-out during the request invalidates its cooldown.
         if retry.generation == generation {
@@ -923,11 +1200,7 @@ impl Auth {
                         REFRESH_RETRY_BASE.saturating_mul(1 << (retry.failures - 1).min(8));
                     let jitter =
                         Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]));
-                    let delay = if self.runner_rejected() {
-                        RUNNER_REJECTED_RETRY
-                    } else {
-                        (backoff + jitter).min(REFRESH_RETRY_CAP)
-                    };
+                    let delay = retry_after.unwrap_or_else(|| (backoff + jitter).min(REFRESH_RETRY_CAP)).max(REFRESH_RETRY_BASE);
                     tracing::warn!(error = %err, retry_ms = delay.as_millis() as u64,
                         "auth: refresh failed; cooling down");
                     retry.failure = Some(RefreshFailure {
@@ -935,6 +1208,7 @@ impl Auth {
                         at: tokio::time::Instant::now(),
                         wall: std::time::SystemTime::now(),
                         delay,
+                        server_cooldown: retry_after.is_some(),
                     });
                 }
                 Ok(_) => {
@@ -952,9 +1226,6 @@ impl Auth {
         &self,
         organization_id: Option<&str>,
     ) -> Result<Option<String>, EngineError> {
-        if let Some(runner) = self.inner.runner.clone() {
-            return self.refresh_runner_locked(&runner).await;
-        }
         let (generation, refresh_token) = {
             let sign_in = lock(&self.inner.sign_in);
             let Some(refresh_token) = lock(&self.inner.stored)
@@ -1069,134 +1340,6 @@ impl Auth {
         Ok(Some(tokens.access_token))
     }
 
-    /// Runner bearer: cached runner JWT, else a signed `/runner/token`
-    /// through the shared single-flight refresh. A definitive rejection
-    /// (deleted/revoked device) reads as `SignedOut`; everything else is
-    /// `TemporarilyUnavailable`.
-    async fn runner_access_token(&self) -> Result<String, TokenError> {
-        let fresh = || {
-            lock(&self.inner.access)
-                .as_ref()
-                .filter(|entry| entry.remaining() > TOKEN_SLACK)
-                .map(|entry| entry.token.clone())
-        };
-        if let Some(token) = fresh() {
-            return Ok(token);
-        }
-        let result = self.refresh(None).await;
-        if let Some(token) = fresh() {
-            return Ok(token);
-        }
-        match result {
-            Ok(Some(token)) => Ok(token),
-            _ if self.runner_rejected() => Err(TokenError::SignedOut),
-            Ok(None) => Err(TokenError::TemporarilyUnavailable(
-                "runner token unavailable".into(),
-            )),
-            Err(err) => Err(TokenError::TemporarilyUnavailable(err.to_string())),
-        }
-    }
-
-    /// `POST {edge}/runner/token {orgId, userId, deviceId, ts, sig}` →
-    /// `{accessToken, expiresAt}`. Called only under the refresh gate.
-    async fn refresh_runner_locked(
-        &self,
-        runner: &crate::runner::RunnerIdentity,
-    ) -> Result<Option<String>, EngineError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RunnerToken {
-            access_token: String,
-            #[serde(default)]
-            expires_at: Option<i64>,
-        }
-        let url = format!("{}/runner/token", runner.edge_url());
-        let mut attempt = 0;
-        let res = loop {
-            attempt += 1;
-            let res = self
-                .inner
-                .http
-                .post(&url)
-                .json(&runner.token_request())
-                .send()
-                .await
-                .map_err(|err| {
-                    EngineError::Other(format!(
-                        "could not reach the edge for a runner token: {}",
-                        describe_http_error(err)
-                    ))
-                })?;
-            let status = res.status().as_u16();
-            if res.status().is_success() {
-                break res;
-            }
-            let body = crate::runner::EdgeErrorBody::read(res).await;
-            // Replay fence: our ts lagged the last accepted one (clock
-            // stepped back across a restart). Retry once with a fresh ts.
-            if body.error == "stale" && attempt == 1 {
-                continue;
-            }
-            if (400..500).contains(&status) && !matches!(status, 408 | 429) && body.error != "stale"
-            {
-                if !self
-                    .inner
-                    .runner_rejected
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-                {
-                    tracing::error!(
-                        status,
-                        detail = %body.describe(),
-                        device = %runner.device_id(),
-                        "auth: the edge REJECTED this Cloud runner's key — the device was \
-                         deleted or revoked; it stays offline until re-provisioned"
-                    );
-                }
-                *lock(&self.inner.access) = None;
-                return Err(EngineError::Other(format!(
-                    "runner credentials rejected ({status}): {}",
-                    body.describe()
-                )));
-            }
-            return Err(EngineError::Other(format!(
-                "runner token request failed ({status}): {}",
-                body.describe()
-            )));
-        };
-        let token: RunnerToken = res.json().await.map_err(|err| {
-            EngineError::Other(format!(
-                "malformed runner token response: {}",
-                describe_http_error(err)
-            ))
-        })?;
-        if self
-            .inner
-            .runner_rejected
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            tracing::info!("auth: runner credentials accepted again");
-        }
-        // TTL: the JWT's own lifetime when it has one (skew-immune); else the
-        // edge's `expiresAt` (dev-mode bearers are not JWTs).
-        let jwt_ttl = jwt_claims(&token.access_token).and_then(|c| match (c.exp, c.iat) {
-            (Some(exp), Some(iat)) if exp > iat => Some(Duration::from_secs((exp - iat) as u64)),
-            _ => None,
-        });
-        let ttl = jwt_ttl.unwrap_or_else(|| {
-            let remaining_ms = token
-                .expires_at
-                .map(|at| at - crate::now_ms())
-                .unwrap_or(240_000);
-            Duration::from_millis(remaining_ms.max(60_000) as u64)
-        });
-        tracing::info!(ttl_s = ttl.as_secs(), "auth: runner token refreshed");
-        *lock(&self.inner.access) = Some(AccessEntry::with_ttl(token.access_token.clone(), ttl));
-        self.inner
-            .token_tx
-            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-        Ok(Some(token.access_token))
-    }
-
     fn session_file(&self) -> PathBuf {
         self.inner.config.data_dir.join("session.json")
     }
@@ -1225,13 +1368,13 @@ impl Auth {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T, EngineError> {
-        let token = self.access_token().await?;
+        let token = self.credential().await?;
         let url = format!(
             "{}{}",
             self.inner.config.edge_url.trim_end_matches('/'),
             path
         );
-        let mut req = self.inner.http.request(method, &url).bearer_auth(token);
+        let mut req = self.inner.http.request(method, &url).bearer_auth(&token.value);
         if let Some(body) = body {
             req = req.json(&body);
         }
@@ -1241,6 +1384,9 @@ impl Auth {
                 describe_http_error(e)
             ))
         })?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate(token.generation);
+        }
         if !res.status().is_success() {
             return Err(EngineError::Other(format!(
                 "workspace request failed ({})",
@@ -1276,6 +1422,20 @@ impl Auth {
     }
 }
 
+/// Verified device authority; never confers access to the personal registry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceGrantAuthority {
+    pub grant_id: String,
+    pub expires_at: i64,
+    pub principal_subject: String,
+    pub scope: zeron_proto::CollaborationScope,
+    pub sandbox_id: String,
+    pub device_id: String,
+    pub lifecycle_epoch: u64,
+    pub capabilities: Vec<String>,
+}
+
 struct SignInResult {
     user: AuthUser,
     access_token: String,
@@ -1298,12 +1458,14 @@ fn state_for(user: AuthUser, org_id: Option<String>) -> AuthState {
 /// and link cache always dial with a fresh bearer after refreshes.
 #[async_trait::async_trait]
 impl zeron_rpc::TokenSource for Auth {
-    async fn token(&self) -> Result<String, TokenError> {
+    async fn token(&self) -> Result<AccessToken, TokenError> {
         if self.inner.workos.is_some() && !self.state().is_signed_in() {
             return Err(TokenError::SignedOut);
         }
-        self.access_token().await
+        self.credential().await
     }
+
+    fn invalidate(&self, generation: u64) { Auth::invalidate(self, generation); }
 
     fn subscribe(&self) -> Option<watch::Receiver<u64>> {
         Some(self.inner.token_tx.subscribe())
@@ -1354,6 +1516,16 @@ async fn handle_loopback_conn(
 
     let (status, body) = if path != "/callback" {
         ("404 Not Found", page("Not found."))
+    } else if auth.scaffold_enabled() {
+        let callback = format!("http://127.0.0.1:{}{target}", stream.local_addr()?.port());
+        if request_line.split_whitespace().next() != Some("GET") {
+            ("405 Method Not Allowed", page("Use the sign-in callback link."))
+        } else {
+            match auth.complete_sign_in(&callback).await {
+                Ok(()) => ("200 OK", page("Signed in. You can return to Crew.")),
+                Err(_) => ("400 Bad Request", page("Sign-in failed or expired. Start again from Crew.")),
+            }
+        }
     } else {
         let params: HashMap<String, String> = query
             .split('&')
@@ -1667,7 +1839,53 @@ mod tests {
 
 #[async_trait::async_trait]
 impl zeron_preview::signaling::TokenSource for Auth {
-    async fn token(&self) -> anyhow::Result<String> {
-        Ok(self.access_token().await?)
+    async fn token(&self) -> anyhow::Result<AccessToken> {
+        Ok(self.credential().await?)
     }
+    fn invalidate(&self, generation: u64) { Auth::invalidate(self, generation); }
+}
+
+/// Network credentials pinned to one runtime's verified profile, never retargeted.
+pub struct ProfileTokens {
+    auth: Auth,
+    scaffold: bool,
+    key: Option<String>,
+}
+
+impl Auth {
+    pub fn for_profile_tokens(&self) -> Arc<ProfileTokens> {
+        Arc::new(ProfileTokens {
+            auth: self.clone(), scaffold: self.scaffold_enabled(),
+            key: self.verified_profile_key(),
+        })
+    }
+}
+
+impl ProfileTokens {
+    async fn credential(&self) -> Result<AccessToken, TokenError> {
+        let token = self.auth.credential().await?;
+        let _lifecycle = lock(&self.auth.inner.sign_in);
+        if token.generation != *self.auth.inner.token_tx.borrow() {
+            return Err(TokenError::TemporarilyUnavailable("session changed during verification; retry".into()));
+        }
+        if self.scaffold && (self.key.is_none() || self.auth.verified_profile_key() != self.key) {
+            return Err(TokenError::SignedOut);
+        }
+        Ok(token)
+    }
+}
+
+#[async_trait::async_trait]
+impl zeron_rpc::TokenSource for ProfileTokens {
+    async fn token(&self) -> Result<AccessToken, TokenError> { self.credential().await }
+    fn invalidate(&self, generation: u64) { self.auth.invalidate(generation); }
+    fn subscribe(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.auth.inner.token_tx.subscribe())
+    }
+}
+
+#[async_trait::async_trait]
+impl zeron_preview::signaling::TokenSource for ProfileTokens {
+    async fn token(&self) -> anyhow::Result<AccessToken> { Ok(self.credential().await?) }
+    fn invalidate(&self, generation: u64) { self.auth.invalidate(generation); }
 }

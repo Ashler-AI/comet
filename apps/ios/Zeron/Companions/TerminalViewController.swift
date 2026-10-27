@@ -139,7 +139,7 @@ final class TerminalViewController: UIViewController {
 
     static func describe(_ error: Error) -> String {
         if case let CoreError.Unsupported(message) = error, !message.isEmpty {
-            return "This computer needs a newer Zeron for terminals"
+            return "This computer needs a newer Crew for terminals"
         }
         if case CoreError.HostUnavailable = error { return "The computer isn't reachable right now" }
         return "Couldn't open a terminal"

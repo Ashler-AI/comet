@@ -108,8 +108,8 @@ impl Feed {
             return None;
         }
         let what = match range.status {
-            HarnessCompatibilityStatus::Broken => "doesn't work with this version of Zeron",
-            _ => "isn't supported by this version of Zeron",
+            HarnessCompatibilityStatus::Broken => "doesn't work with this version of Crew",
+            _ => "isn't supported by this version of Crew",
         };
         let mut message = format!("{version} {what}");
         if let Some(reason) = &range.reason {
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(broken.recommended_version.as_deref(), Some("2.1.309"));
         assert_eq!(
             broken.message,
-            "2.1.311 doesn't work with this version of Zeron (results lost their session id). \
+            "2.1.311 doesn't work with this version of Crew (results lost their session id). \
              Use 2.1.309"
         );
         assert_eq!(

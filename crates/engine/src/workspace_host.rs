@@ -28,7 +28,7 @@ use tokio::sync::watch;
 
 use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
 use zeron_proto::projectless;
-use zeron_proto::{Chat, ChatConfig, Device, HarnessId, Session, SidebarPreferencesState, Space};
+use zeron_proto::{Chat, ChatConfig, Device, Session, SidebarPreferencesState, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
@@ -152,17 +152,6 @@ fn new_projectless_cwd(
     }
 }
 
-/// This device's advertised capabilities: the binary's, plus
-/// `cloud-session` on a Cloud session machine (device lists hide those and
-/// show the account's one Cloud device instead).
-fn device_capabilities() -> Vec<String> {
-    let mut capabilities = zeron_proto::capabilities::current();
-    if crate::runner::session().is_some() {
-        capabilities.push(zeron_proto::CLOUD_SESSION_CAPABILITY.to_string());
-    }
-    capabilities
-}
-
 #[derive(Debug, Clone)]
 pub struct WorkspaceHostConfig {
     pub device_id: String,
@@ -174,6 +163,8 @@ pub struct WorkspaceHostConfig {
     /// The signed-in user — registries are per-user (`reg1/{orgId}/{userId}`):
     /// spaces/sessions are private to their owner, never org-visible.
     pub user_id: String,
+    /// This profile sees the owner's complete registry, not a device-scoped view.
+    pub owner_registry: bool,
     /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
     pub edge: Option<EdgeConfig>,
@@ -204,9 +195,6 @@ struct WorkspaceHostInner {
     /// device's overlay back to its boot-time row `lastSeenAt` — an instant
     /// (and false) "offline" badge for a host that beat 20s ago.
     presence_seen: Mutex<std::collections::HashMap<String, i64>>,
-    /// Chats whose row this host claimed for a command that outran their
-    /// `createChat` ([`WorkspaceHost::claim_chat`]).
-    claimed: Mutex<std::collections::HashSet<String>>,
     /// Called with a device id whenever its presence heartbeat proves it alive —
     /// wired to `LinkCache::reset_cooldown` so a peer that comes back is dialed
     /// immediately instead of waiting out the failure backoff.
@@ -226,18 +214,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A chat row's stored harness-native session (see
-/// [`WorkspaceHost::chat_harness_session`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredHarnessSession {
-    /// Empty = the "do not resume" tombstone.
-    pub session_id: String,
-    pub cwd: Option<String>,
-    /// The harness that minted `session_id`. `None` on rows that predate
-    /// the tag.
-    pub harness: Option<HarnessId>,
-}
-
 #[derive(Clone)]
 pub struct WorkspaceHost {
     inner: Arc<WorkspaceHostInner>,
@@ -247,6 +223,7 @@ impl WorkspaceHost {
     /// Load (or migrate, or init) the registry, upsert this device's row, start
     /// the change-driven task, and join the edge registry room when configured.
     pub fn open(store: Arc<DocsStore>, config: WorkspaceHostConfig) -> Result<Self, EngineError> {
+        let binding = crate::devbox::host_binding().map_err(EngineError::Other)?;
         let stored = store.load_snapshot(REGISTRY_DOC_ID)?;
         let mut doc = match stored {
             Some(bytes) => RegistryDoc::from_bytes(&bytes, &config.device_id)
@@ -312,6 +289,16 @@ impl WorkspaceHost {
             .read_devices()?
             .into_iter()
             .find(|d| d.id == config.device_id);
+        if let Some(device) = &existing {
+            if (device.devbox_provider.is_some() || device.devbox_id.is_some())
+                && (device.devbox_provider != binding.as_ref().map(|(provider, _)| *provider)
+                    || device.devbox_id.as_deref() != binding.as_ref().map(|(_, id)| id.as_str()))
+            {
+                return Err(EngineError::Other("Native host binding differs from the registered immutable provider identity".into()));
+            }
+        }
+        let (devbox_provider, devbox_id) = binding.map(|(provider, id)| (Some(provider), Some(id)))
+            .unwrap_or_default();
         doc.upsert_device(&Device {
             id: config.device_id.clone(),
             name: device_name_on_boot(
@@ -319,6 +306,8 @@ impl WorkspaceHost {
                 &config.device_name,
             ),
             platform: config.platform.clone(),
+            devbox_provider,
+            devbox_id,
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
             // (the Devices page "Added …" fragment).
@@ -327,7 +316,7 @@ impl WorkspaceHost {
             // on the Devices page; workspace version — same for every crate).
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: device_capabilities(),
+            capabilities: zeron_proto::capabilities::current(),
         })?;
 
         let state = doc.read_all()?;
@@ -363,7 +352,6 @@ impl WorkspaceHost {
                 room: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
-                claimed: Mutex::default(),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
@@ -572,16 +560,10 @@ impl WorkspaceHost {
     /// down, relay fine: the 2026-08-18 03:45 incident shape) must never
     /// park the relay. Un-park is presence-driven: heartbeats resume → the
     /// verdict flips and the peer-alive hook clears any dial cooldown.
-    /// A deleted device row is positive evidence too: nothing answers there
-    /// (a deleted Cloud session's machine was still dialed every few seconds
-    /// by everything that targets its chat).
     pub fn peer_liveness(&self, device_id: &str) -> zeron_rpc::PeerLiveness {
         use zeron_rpc::PeerLiveness::{Dark, Live, Unknown};
         if device_id == self.inner.config.device_id {
             return Live;
-        }
-        if self.read(|doc| doc.device_deleted(device_id)) {
-            return Dark;
         }
         let now = now_ms();
         let (connected, live_beat) = {
@@ -686,17 +668,6 @@ impl WorkspaceHost {
         self.inner.config.edge.is_some()
     }
 
-    /// The edge this workspace syncs through (`None` = local/offline profile)
-    /// — also where account-scoped HTTP calls (Cloud, vault) go.
-    pub fn edge(&self) -> Option<&EdgeConfig> {
-        self.inner.config.edge.as_ref()
-    }
-
-    /// The workspace org (`ws3/{orgId}/…` rooms, `/cloud/{orgId}` routes).
-    pub fn org_id(&self) -> &str {
-        &self.inner.config.org_id
-    }
-
     // ── registry access helpers ─────────────────────────────────────────────
 
     /// Run a mutation under the registry lock, then wake the publish/persist
@@ -719,12 +690,32 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.chat(chat_id))?)
     }
 
-    /// Whether `chat_id`'s parent is unknown here yet: this host claimed its
-    /// row for a command that arrived first ([`Self::claim_chat`]), and its
-    /// `createChat` hasn't landed ([`RegistryDoc::chat_parent_recorded`]).
-    pub fn parent_unknown(&self, chat_id: &str) -> bool {
-        lock(&self.inner.claimed).contains(chat_id)
-            && !self.read(|doc| doc.chat_parent_recorded(chat_id))
+    pub(crate) fn acknowledged_chat(&self, id: &str) -> Option<zeron_doc::registry::RegistryRow> {
+        self.read(|doc| doc.acknowledged_row(zeron_doc::registry::KIND_CHATS, id).cloned())
+    }
+
+    pub(crate) fn acknowledged_chats_after(&self, after: &str) -> Vec<zeron_doc::registry::RegistryRow> {
+        self.read(|doc| doc.acknowledged_rows_after(zeron_doc::registry::KIND_CHATS, after, 64))
+    }
+
+    pub(crate) fn directory_reconciliation_required(&self) -> bool {
+        self.read(|doc| doc.directory_reconciliation_required())
+    }
+
+    /// Includes server ACKs even when the optimistic sidebar did not change.
+    pub(crate) fn watch_registry(&self) -> watch::Receiver<u64> {
+        self.inner.changed_tx.subscribe()
+    }
+
+    /// Publish a verified session reference before acknowledging its lifecycle
+    /// operation. Call from a blocking worker, like explicit migration commits.
+    pub(crate) fn publish_crew_chat(&self, chat: &Chat, device: Option<&Device>) -> Result<(), EngineError> {
+        self.mutate(|doc| {
+            if let Some(device) = device { doc.upsert_device(device)?; }
+            doc.upsert_chat(chat)
+        })?;
+        self.inner.persist_snapshot()?;
+        Ok(())
     }
 
     /// The space row as currently known (overlay view).
@@ -868,7 +859,6 @@ impl WorkspaceHost {
             None => (None, None),
         };
         self.mutate(|doc| doc.claim_chat(chat_id, cwd.as_deref(), space_id.as_deref(), now));
-        lock(&self.inner.claimed).insert(chat_id.to_owned());
         Ok(())
     }
 
@@ -905,7 +895,6 @@ impl WorkspaceHost {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
-            github_repo: None,
             created_at: Utc::now(),
         };
         self.mutate(|doc| doc.upsert_space(&space))?;
@@ -929,8 +918,6 @@ impl WorkspaceHost {
     /// Sidebar freshness on message persist: preview = first 120 chars of the last
     /// message's text. Claims the row first so a pre-workspace chat gains one.
     pub fn note_message(&self, chat_id: &str, text: &str) {
-        // Annotation tokens carry their element as hex; previews read the label.
-        let text = zeron_proto::annotation::annotation_display(text);
         let preview: String = text.chars().take(120).collect();
         let result = self.claim_chat(chat_id, None).and_then(|_| {
             self.mutate(|doc| doc.set_chat_last_message(chat_id, &preview, Utc::now()))
@@ -945,18 +932,8 @@ impl WorkspaceHost {
     /// of its latest run and the cwd it was created under. An empty `session_id`
     /// tombstones the row ("do not resume" after a rejected resume). Best-effort:
     /// a missing chat row (claim happens on first command) just returns.
-    ///
-    /// `harness` names the provider that minted `session_id`: an id is only
-    /// meaningful to that harness, and resume checks the tag.
-    pub fn set_chat_harness_session(
-        &self,
-        chat_id: &str,
-        session_id: &str,
-        cwd: &str,
-        harness: Option<HarnessId>,
-    ) {
-        let slug = harness.map(HarnessId::as_str);
-        match self.mutate(|doc| doc.set_chat_harness_session(chat_id, session_id, cwd, slug)) {
+    pub fn set_chat_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
+        match self.mutate(|doc| doc.set_chat_harness_session(chat_id, session_id, cwd)) {
             Ok(_) => {}
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry harness-session write failed");
@@ -964,22 +941,15 @@ impl WorkspaceHost {
         }
     }
 
-    /// The chat row's stored harness session, if stamped. The empty-string
-    /// tombstone passes through — callers must treat it as "explicitly no
-    /// resume" (and must NOT fall back to older sources).
-    pub fn chat_harness_session(&self, chat_id: &str) -> Option<StoredHarnessSession> {
+    /// The chat row's stored harness session `(session_id, cwd)`, if stamped.
+    /// The empty-string tombstone passes through — callers must treat it as
+    /// "explicitly no resume" (and must NOT fall back to older sources).
+    pub fn chat_harness_session(&self, chat_id: &str) -> Option<(String, Option<String>)> {
         match self.read(|doc| doc.chat(chat_id)) {
             Ok(chat) => {
                 let chat = chat?;
                 let id = chat.harness_session_id?;
-                Some(StoredHarnessSession {
-                    session_id: id,
-                    cwd: chat.harness_session_cwd,
-                    harness: chat
-                        .harness_session_harness
-                        .as_deref()
-                        .and_then(HarnessId::from_slug),
-                })
+                Some((id, chat.harness_session_cwd))
             }
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
@@ -1025,33 +995,6 @@ impl WorkspaceHost {
         cwd: Option<String>,
         parent_chat_id: Option<String>,
     ) -> Result<(), EngineError> {
-        self.create_chat_hosted(
-            chat_id,
-            space_id,
-            device_id,
-            None,
-            config,
-            cwd,
-            parent_chat_id,
-        )
-    }
-
-    /// [`create_chat_with_parent`](Self::create_chat_with_parent) with an
-    /// explicit host: a chat run on Cloud is hosted by its session device,
-    /// not the device owning the project's folder, nor (for a side chat of a
-    /// Cloud chat with no project) the device that asked. `host: None` keeps
-    /// the project's owner, or the named device.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_chat_hosted(
-        &self,
-        chat_id: &str,
-        space_id: Option<&str>,
-        device_id: Option<&str>,
-        host: Option<&str>,
-        config: Option<ChatConfig>,
-        cwd: Option<String>,
-        parent_chat_id: Option<String>,
-    ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
@@ -1062,13 +1005,10 @@ impl WorkspaceHost {
             },
             None => None,
         };
-        let host_device = match (&space, device_id, host) {
-            // An explicit host always wins: a side chat of a Cloud chat runs
-            // on that machine, never on the computer that asked for it.
-            (_, _, Some(host)) => host.to_string(),
-            (Some(space), _, None) => space.device_id.clone(),
-            (None, Some(device_id), _) => device_id.to_string(),
-            (None, None, _) => {
+        let host_device = match (&space, device_id) {
+            (Some(space), _) => space.device_id.clone(),
+            (None, Some(device_id)) => device_id.to_string(),
+            (None, None) => {
                 return Err(EngineError::Other(
                     "createChat needs a spaceId or a deviceId".into(),
                 ));
@@ -1106,10 +1046,10 @@ impl WorkspaceHost {
                 // go through the seed+flip path (the host migration sweep).
                 room_gen: Some(2),
                 harness_session_cwd: None,
-                harness_session_harness: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
+                crew: None,
             })
         })?;
         Ok(())
@@ -1161,54 +1101,6 @@ impl WorkspaceHost {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
-                github_repo: None,
-                created_at: Utc::now(),
-            })
-        })?;
-        Ok(())
-    }
-
-    /// A project that lives only on Cloud: owned by the logical Cloud device
-    /// (which has no engine to stamp it), so its GitHub repository is set
-    /// here. Every session in it runs on a Cloud machine cloning that
-    /// repository. Idempotent like [`Self::create_space`]; also a no-op when
-    /// Cloud already has a project for the repository.
-    pub fn create_cloud_space(
-        &self,
-        space_id: &str,
-        device_id: &str,
-        path: &str,
-        name: Option<String>,
-        github_repo: &str,
-    ) -> Result<(), EngineError> {
-        if !device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX) {
-            return Err(EngineError::Other(
-                "Only Cloud projects name their repository.".into(),
-            ));
-        }
-        let spaces = self.read(|doc| doc.read_spaces())?;
-        if spaces.iter().any(|s| {
-            s.id == space_id
-                || (s.device_id == device_id
-                    && (s.path == path
-                        || s.github_repo
-                            .as_deref()
-                            .is_some_and(|repo| repo.eq_ignore_ascii_case(github_repo))))
-        }) {
-            return Ok(());
-        }
-        self.mutate(|doc| {
-            doc.upsert_space(&Space {
-                id: space_id.to_string(),
-                device_id: device_id.to_string(),
-                path: path.to_string(),
-                name,
-                git_detected: true,
-                git_checked_at: Some(Utc::now()),
-                checkout_id: None,
-                // Groups with the clones of the repository on other devices.
-                repository_id: Some(zeron_proto::view::cloud_repository_id(&spaces, github_repo)),
-                github_repo: Some(github_repo.to_string()),
                 created_at: Utc::now(),
             })
         })?;
@@ -1242,19 +1134,11 @@ impl WorkspaceHost {
         detected: bool,
         checkout_id: Option<&str>,
         repository_id: Option<&str>,
-        github_repo: Option<&str>,
     ) -> Result<bool, EngineError> {
         match self.read(|doc| doc.space(space_id))? {
             Some(space) if space.device_id == self.inner.config.device_id => {
                 Ok(self.mutate(|doc| {
-                    doc.set_space_git(
-                        space_id,
-                        detected,
-                        checkout_id,
-                        repository_id,
-                        github_repo,
-                        Utc::now(),
-                    )
+                    doc.set_space_git(space_id, detected, checkout_id, repository_id, Utc::now())
                 })?)
             }
             Some(space) => {
@@ -1266,55 +1150,6 @@ impl WorkspaceHost {
             }
             None => Ok(false),
         }
-    }
-
-    /// Cloud projects of `github_repo` that still carry another identity
-    /// than `repository_id` (a full clone's `commit:<root>`) take it, so they
-    /// group with this device's clone. Cloud projects have no engine of their
-    /// own to stamp them; only ever toward the commit form, so a shallow clone
-    /// elsewhere (remote form) can't flip them back. Returns how many moved.
-    pub fn align_cloud_spaces(
-        &self,
-        github_repo: &str,
-        repository_id: &str,
-    ) -> Result<usize, EngineError> {
-        if !repository_id.starts_with("commit:") || repository_id["commit:".len()..].contains(':') {
-            return Ok(0);
-        }
-        let stale: Vec<Space> = self
-            .read(|doc| doc.read_spaces())?
-            .into_iter()
-            .filter(|s| s.device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX))
-            .filter(|s| {
-                s.github_repo
-                    .as_deref()
-                    .is_some_and(|repo| repo.eq_ignore_ascii_case(github_repo))
-            })
-            .filter(|s| {
-                s.repository_id.as_deref() != Some(repository_id)
-                    && !s
-                        .repository_id
-                        .as_deref()
-                        .is_some_and(|id| id.starts_with("commit:"))
-            })
-            .collect();
-        if stale.is_empty() {
-            return Ok(0);
-        }
-        self.mutate(|doc| {
-            for space in &stale {
-                doc.set_space_git(
-                    &space.id,
-                    space.git_detected,
-                    space.checkout_id.as_deref(),
-                    Some(repository_id),
-                    space.github_repo.as_deref(),
-                    space.git_checked_at.unwrap_or_else(Utc::now),
-                )?;
-            }
-            Ok::<_, zeron_doc::DocError>(true)
-        })?;
-        Ok(stale.len())
     }
 
     pub fn read_spaces(&self) -> Result<Vec<Space>, EngineError> {
@@ -1458,13 +1293,9 @@ impl WorkspaceHostInner {
         let registry_synced = lock(&self.room)
             .as_ref()
             .is_some_and(|room| room.stats().synced);
-        // Sidebar pins are viewport state. A Cloud device has no viewport, and
-        // the edge refuses its writes to rows it doesn't own: reconciling here
-        // would rewrite the missing preferences row after every refused push.
-        let owns_sidebar = self.config.platform != zeron_proto::CLOUD_PLATFORM;
         let snapshot = {
             let mut doc = lock(&self.reg);
-            match doc.reconcile_sidebar_pins(registry_synced && owns_sidebar) {
+            match doc.reconcile_sidebar_pins(self.config.owner_registry && registry_synced) {
                 Ok(true) => {
                     // Persist and transmit cleanup just like a user mutation.
                     self.bump_changed();
@@ -1480,6 +1311,23 @@ impl WorkspaceHostInner {
         };
         match snapshot {
             Ok(mut state) => {
+                if !state.sessions.is_empty() {
+                    let owners: std::collections::HashMap<&str, &str> = state.chats.iter()
+                        .map(|chat| (chat.id.as_str(), chat.device_id.as_str())).collect();
+                    let mut seen = lock(&self.presence_seen);
+                    for session in &state.sessions {
+                        if owners.get(session.chat_id.as_str()).copied() != Some(session.device_id.as_str()) {
+                            continue;
+                        }
+                        // Replayed rows prove only their original host timestamp,
+                        // never the time this controller happens to receive them.
+                        let heartbeat = session.updated_at.timestamp_millis();
+                        match seen.get_mut(&session.device_id) {
+                            Some(previous) => *previous = (*previous).max(heartbeat),
+                            None => { seen.insert(session.device_id.clone(), heartbeat); }
+                        }
+                    }
+                }
                 self.overlay_presence(&mut state.devices);
                 // Retain the latest value even with no subscribers, but don't
                 // wake every list for unrelated registry/presence changes.
@@ -1514,7 +1362,7 @@ impl WorkspaceHostInner {
         self.sidebar_preferences_tx.send_if_modified(|current| {
             // Readiness is sticky for this host. A caller that sampled stats
             // before another publisher acquired the lock must not regress it.
-            let synced = synced || current.synced;
+            let synced = self.config.owner_registry && (synced || current.synced);
             if current.synced == synced
                 && current.initialized == initialized
                 && current.pinned_session_ids == pins
@@ -1759,11 +1607,8 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
                 edge.url.trim_end_matches('/'),
                 device_id
             );
-            let response = client
-                .get(&url)
-                .bearer_auth(&bearer)
-                .timeout(RELAY_PROBE_TIMEOUT)
-                .send()
+            let response = edge
+                .send(client.get(&url).timeout(RELAY_PROBE_TIMEOUT), &bearer)
                 .await;
             let Ok(response) = response else { continue };
             if !response.status().is_success() {
@@ -1877,9 +1722,9 @@ impl WsDerivedRegistryTransport {
     async fn leaf_url(
         provider: &Arc<dyn zeron_sync::UrlProvider>,
         leaf: &str,
-    ) -> Result<(reqwest::Url, Option<String>), zeron_sync::SyncError> {
+    ) -> Result<(reqwest::Url, Option<String>, Option<u64>), zeron_sync::SyncError> {
         let ws = provider.url().await?;
-        let mut u = reqwest::Url::parse(&ws)
+        let mut u = reqwest::Url::parse(&ws.url)
             .map_err(|e| zeron_sync::SyncError::Protocol(format!("bad ws url: {e}")))?;
         let scheme = if u.scheme() == "wss" { "https" } else { "http" };
         let _ = u.set_scheme(scheme);
@@ -1907,7 +1752,7 @@ impl WsDerivedRegistryTransport {
         for (k, v) in kept {
             u.query_pairs_mut().append_pair(&k, &v);
         }
-        Ok((u, token))
+        Ok((u, token, ws.generation))
     }
 }
 
@@ -1919,7 +1764,7 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         let provider = self.url.clone();
         let client = self.client.clone();
         Box::pin(async move {
-            let (mut u, token) = Self::leaf_url(&provider, "rows").await?;
+            let (mut u, token, generation) = Self::leaf_url(&provider, "rows").await?;
             u.query_pairs_mut()
                 .append_pair("since", &since.to_string())
                 .append_pair("beat", "1");
@@ -1931,6 +1776,11 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
                 .send()
                 .await
                 .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(generation) = generation
+            {
+                provider.invalidate(generation);
+            }
             if !resp.status().is_success() {
                 return Err(zeron_sync::SyncError::Protocol(format!(
                     "registry pull http {}",
@@ -1950,7 +1800,7 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
         let provider = self.url.clone();
         let client = self.client.clone();
         Box::pin(async move {
-            let (u, token) = Self::leaf_url(&provider, "push").await?;
+            let (u, token, generation) = Self::leaf_url(&provider, "push").await?;
             let mut req = client
                 .post(u)
                 .header("content-type", "application/json")
@@ -1962,6 +1812,11 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
                 .send()
                 .await
                 .map_err(|e| zeron_sync::SyncError::WebSocket(describe_http_error(e)))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(generation) = generation
+            {
+                provider.invalidate(generation);
+            }
             if !resp.status().is_success() {
                 return Err(zeron_sync::SyncError::Protocol(format!(
                     "registry push http {}",
@@ -1978,6 +1833,109 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
 #[cfg(test)]
 mod tests {
     use super::{device_name_on_boot, linked_worktree_root};
+
+    #[tokio::test]
+    async fn edge_http_rejection_invalidates_only_the_generation_sent() {
+        use super::*;
+        use crate::chat2_host::{EdgeChatTransport, EdgeCheckpointFetcher, post_checkpoint};
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeron_sync::RegistryTransport;
+        use zeron_sync::chat_client::{ChatTransport, CheckpointFetcher};
+
+        struct Tokens {
+            generation: AtomicU64,
+            rejected: Mutex<Vec<u64>>,
+        }
+        #[async_trait::async_trait]
+        impl zeron_rpc::TokenSource for Tokens {
+            async fn token(&self) -> Result<zeron_proto::AccessToken, zeron_rpc::TokenError> {
+                let generation = self.generation.load(Ordering::SeqCst);
+                Ok(zeron_proto::AccessToken {
+                    value: format!("token-{generation}"),
+                    generation,
+                })
+            }
+
+            fn invalidate(&self, generation: u64) {
+                self.rejected.lock().push(generation);
+            }
+        }
+
+        let tokens = Arc::new(Tokens {
+            generation: AtomicU64::new(1),
+            rejected: Mutex::new(Vec::new()),
+        });
+        let status = Arc::new(AtomicU16::new(200));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server_tokens = tokens.clone();
+        let server_status = status.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..24 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                // Rotate in flight: a late rejection belongs to the sent lease.
+                let sent = server_tokens.generation.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.contains(&format!("authorization: bearer token-{sent}\r\n")));
+                assert!(!request.lines().next().unwrap().contains("token="));
+                let code = server_status.load(Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {code} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build().unwrap();
+        let edge = EdgeConfig::new(origin, tokens.clone()).with_device("device");
+        let room = edge.room_url("/registry/org/ws");
+        let lease = room.url().await.unwrap();
+        assert_eq!(lease.generation, Some(1));
+        assert!(lease.url.contains("token=token-1&device=device"));
+        let chat = EdgeChatTransport::new(client.clone(), edge.clone(), "chat", "device");
+        let checkpoint = EdgeCheckpointFetcher::new(client.clone(), edge.clone(), "chat");
+        let registry = WsDerivedRegistryTransport { url: room, client: client.clone() };
+        let mut expected = Vec::new();
+        for code in [200, 401, 403, 503] {
+            status.store(code, Ordering::SeqCst);
+            for operation in 0..6 {
+                let generation = tokens.generation.load(Ordering::SeqCst);
+                let result = match operation {
+                    0 => chat.fetch_rows(0).await.map(|_| ()),
+                    1 => chat.push("batch".into(), vec![]).await.map(|_| ()),
+                    2 => checkpoint.fetch().await.map(|_| ()),
+                    3 => registry.fetch(0).await.map(|_| ()),
+                    4 => registry.push(String::new()).await.map(|_| ()),
+                    _ => post_checkpoint(&client, &edge, "history", 0, &[], vec![])
+                        .await.map_err(zeron_sync::SyncError::Protocol),
+                };
+                assert_eq!(result.is_ok(), code == 200, "{code}: {result:?}");
+                if code == 401 {
+                    expected.push(generation);
+                }
+                assert_eq!(*tokens.rejected.lock(), expected);
+                assert_eq!(tokens.generation.load(Ordering::SeqCst), generation + 1);
+            }
+        }
+        server.await.unwrap();
+
+        let dns = Arc::new(crate::http_error::test_support::FailingDns::default());
+        let edge = EdgeConfig::new("https://edge.invalid", tokens.clone());
+        let bearer = edge.bearer().await.unwrap();
+        assert!(edge.send(dns.client().get(&edge.url), &bearer).await.is_err());
+        assert_eq!(*tokens.rejected.lock(), expected);
+    }
 
     #[tokio::test]
     async fn registry_http_sync_retains_dns_cause() {
@@ -2016,6 +1974,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2059,77 +2018,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_deleted_device_is_never_dialed() {
+    async fn sidebar_preferences_require_owner_complete_registry() {
         use super::*;
+        use zeron_sync::registry::mock_server::MockRegistryServer;
 
-        let dir = tempfile::tempdir().unwrap();
-        let host = WorkspaceHost::open(
-            Arc::new(DocsStore::open(dir.path()).unwrap()),
-            WorkspaceHostConfig {
-                device_id: "laptop".into(),
-                device_name: "Laptop".into(),
-                platform: "macos".into(),
-                org_id: "test-org".into(),
-                user_id: "test-user".into(),
-                edge: None,
-                local_only: false,
-            },
-        )
-        .unwrap();
-        // Unknown and room-less: ambiguous, never parked.
-        assert_eq!(
-            host.peer_liveness("cloud-1"),
-            zeron_rpc::PeerLiveness::Unknown
-        );
-        // The edge tombstones a deleted Cloud session's device: positive
-        // evidence that nothing answers, whatever the room's state.
-        let _ = lock(&host.inner.reg).apply_rows(
-            1,
-            vec![zeron_doc::RegistryRow {
-                kind: zeron_doc::KIND_DEVICES.into(),
-                id: "cloud-1".into(),
-                seq: 1,
-                deleted: true,
-                del_hlc: Some("0000000005000-000000-cloud-edge".into()),
-                fields: Default::default(),
-                clocks: Default::default(),
-            }],
-        );
-        assert_eq!(host.peer_liveness("cloud-1"), zeron_rpc::PeerLiveness::Dark);
-        assert_eq!(host.peer_liveness("laptop"), zeron_rpc::PeerLiveness::Live);
-    }
-
-    /// A claimed row doesn't know its parent until the chat's `createChat`
-    /// lands, which records `parentChatId` even when it has none; a row this
-    /// host never claimed always knows it.
-    #[tokio::test]
-    async fn a_claimed_chat_knows_its_parent_once_its_create_lands() {
-        use super::*;
-
-        let dir = tempfile::tempdir().unwrap();
-        let host = WorkspaceHost::open(
-            Arc::new(DocsStore::open(dir.path()).unwrap()),
-            WorkspaceHostConfig {
-                device_id: "test-device".into(),
-                device_name: "Test device".into(),
-                platform: "macos".into(),
-                org_id: "test-org".into(),
-                user_id: "test-user".into(),
-                edge: None,
-                local_only: false,
-            },
-        )
-        .unwrap();
-        host.create_chat("created", None, Some("test-device"), None, None)
+        for owner_registry in [false, true] {
+            let server = MockRegistryServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let host = WorkspaceHost::open(
+                Arc::new(DocsStore::open(dir.path()).unwrap()),
+                WorkspaceHostConfig {
+                    device_id: "test-device".into(),
+                    device_name: "Test device".into(),
+                    platform: "test".into(),
+                    org_id: "test-org".into(),
+                    user_id: "test-user".into(),
+                    edge: None,
+                    local_only: false,
+                    owner_registry,
+                },
+            )
             .unwrap();
-        assert!(!host.parent_unknown("created"));
+            host.create_chat("chat-1", None, Some("test-device"), None, None)
+                .unwrap();
+            host.record_session(&running_session(Utc::now()));
+            let preferences = host.watch_sidebar_preferences();
+            assert!(!preferences.borrow().initialized);
+            assert!(!preferences.borrow().synced);
+            host.connect_registry_url(&server.url());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !host.sync_status().is_some_and(|status| status.synced)
+                    || host.read(|doc| doc.pending_len()) != 0
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("registry delivery and boot writes settle");
 
-        host.claim_chat("claimed", Some("/tmp")).unwrap();
-        assert!(host.parent_unknown("claimed"));
-        let mut chat = host.chat("claimed").unwrap().expect("the claimed row");
-        chat.parent_chat_id = None;
-        host.mutate(|doc| doc.upsert_chat(&chat)).unwrap();
-        assert!(!host.parent_unknown("claimed"));
+            // Delivery is complete for device/session lists, but only an owner
+            // has the complete registry needed to initialize global preferences.
+            host.inner.publish();
+            assert!(host.registry_synced());
+            assert_eq!(host.watch_devices().borrow()[0].id, "test-device");
+            assert_eq!(host.watch_chats().borrow()[0].id, "chat-1");
+            assert_eq!(host.watch_session_rows().borrow()[0].chat_id, "chat-1");
+            assert!(server.row("devices", "test-device").is_some());
+            assert!(server.row("chats", "chat-1").is_some());
+            assert!(server.row("sessions", "chat-1").is_some());
+            assert_eq!(preferences.borrow().synced, owner_registry);
+            assert_eq!(preferences.borrow().initialized, owner_registry);
+            // Snapshot acknowledgements must not bypass the watch's authority gate.
+            let snapshot = host.sidebar_preferences_snapshot();
+            assert_eq!(snapshot.synced, owner_registry);
+            assert_eq!(snapshot.initialized, owner_registry);
+
+            if !owner_registry {
+                assert!(host.read(|doc| doc.sidebar_preferences()).is_none());
+                assert_eq!(host.read(|doc| doc.pending_len()), 0);
+                assert!(server.row("preferences", "sidebarPins").is_none());
+                continue;
+            }
+
+            host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Pin {
+                session_id: "chat-1".into(),
+                after: None,
+                before: None,
+            })
+            .unwrap();
+            assert_eq!(host.sidebar_preferences_snapshot().pinned_session_ids, ["chat-1"]);
+            host.delete_chat("chat-1").unwrap();
+            host.inner.publish();
+            assert!(preferences.borrow().synced);
+            assert!(preferences.borrow().initialized);
+            assert!(preferences.borrow().pinned_session_ids.is_empty());
+            assert!(host.read(|doc| doc.sidebar_preferences()).unwrap().pinned_session_ids.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -2147,6 +2111,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2234,10 +2199,39 @@ mod tests {
             last_completed_turn: None,
             started_at: None,
             updated_at: at,
-            last_turn_outcome: None,
-            terminal_activity: None,
             running_subagents: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn owner_session_heartbeat_projects_monotonic_device_presence() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(), device_name: "Host".into(),
+                platform: "test".into(), org_id: "org".into(), user_id: "owner".into(),
+                edge: None, local_only: true,
+                owner_registry: true,
+            },
+        ).unwrap();
+        host.create_chat("chat-1", None, Some("test-device"), None, None).unwrap();
+        let original = host.read(|doc| doc.read_devices()).unwrap().remove(0);
+        let heartbeat = original.last_seen_at.unwrap() + chrono::Duration::seconds(10);
+        host.record_session(&running_session(heartbeat));
+        host.inner.publish();
+        assert_eq!(host.watch_devices().borrow()[0].last_seen_at, Some(heartbeat));
+        host.record_session(&running_session(heartbeat - chrono::Duration::seconds(5)));
+        host.inner.publish();
+        assert_eq!(host.watch_devices().borrow()[0].last_seen_at, Some(heartbeat));
+        let mut impostor = running_session(heartbeat + chrono::Duration::seconds(20));
+        impostor.device_id = "other-device".into();
+        host.record_session(&impostor);
+        host.inner.publish();
+        assert!(!lock(&host.inner.presence_seen).contains_key("other-device"));
+        assert_eq!(host.read(|doc| doc.read_devices()).unwrap(), vec![original],
+            "session presence must not rewrite durable device rows");
     }
 
     #[tokio::test]
@@ -2257,6 +2251,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: true,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2297,6 +2292,7 @@ mod tests {
                 // Unreachable edge: writes queue (and retry) without acks.
                 edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
                 local_only: false,
+                owner_registry: true,
             },
         )
         .unwrap();
@@ -2364,6 +2360,7 @@ mod tests {
                 user_id: "test-user".into(),
                 edge: None,
                 local_only: true,
+                owner_registry: true,
             },
         )
         .unwrap();

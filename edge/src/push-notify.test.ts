@@ -82,7 +82,9 @@ describe("prefs and payload", () => {
     expect(parsePrefs({ done: false })).toEqual({ done: false, input: true, failed: true });
   });
   it("carries the desktop's words and the chat to open", () => {
-    const p = apnsPayload("c1", "Fix login", "input");
+    const scope = { userId: "owner@example.com", projectScope: "ashler-staging", deploymentId: "ashler-staging" };
+    const p = apnsPayload("c1", "Fix login", "input", scope);
+    expect(p).toMatchObject(scope);
     expect(p.aps.alert).toEqual({ title: "Fix login", body: "Waiting on your input" });
     expect(p.chatId).toBe("c1");
     expect(p.aps["thread-id"]).toBe("c1");

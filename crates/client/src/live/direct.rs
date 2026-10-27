@@ -12,8 +12,12 @@ use crate::client::ClientInner;
 
 #[async_trait::async_trait]
 impl zeron_preview::signaling::TokenSource for Bearer {
-    async fn token(&self) -> anyhow::Result<String> {
+    async fn token(&self) -> anyhow::Result<zeron_proto::AccessToken> {
         self.get().await.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn invalidate(&self, generation: u64) {
+        Bearer::invalidate(self, generation);
     }
 }
 

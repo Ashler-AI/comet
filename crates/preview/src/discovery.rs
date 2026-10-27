@@ -322,7 +322,7 @@ pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
         let Ok(stat) = fs::read_to_string(path.join("stat")) else {
             continue;
         };
-        let Some((_, tail)) = stat.rsplit_once(") ") else {
+        let Some((process_name, tail)) = stat.rsplit_once(") ") else {
             continue;
         };
         let fields: Vec<_> = tail.split_whitespace().collect();
@@ -331,6 +331,14 @@ pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
         };
         let started_at = linux_started_at(&fields, boot, ticks);
         processes.insert(pid, Process { parent, started_at });
+        // Other Crew profiles can share this project's cwd. Their listeners
+        // are control-plane sockets, not development servers to HTTP-probe.
+        if matches!(
+            process_name.split_once('(').map(|(_, name)| name),
+            Some("comet" | "zeron")
+        ) {
+            continue;
+        }
         // Sockets first: most processes listen on nothing, and need neither
         // their cwd nor their arguments read.
         let Ok(fds) = fs::read_dir(path.join("fd")) else {
@@ -553,24 +561,31 @@ pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
     let fields = |arguments: &[&str]| -> Option<Vec<(u32, String)>> {
         let output = command_output("/usr/sbin/lsof", arguments, TIMEOUT)?;
         let mut pid = 0;
+        let mut control_plane = false;
         let mut values = Vec::new();
         for field in output.split(|b| *b == 0) {
             let field = String::from_utf8_lossy(field);
             let field = field.trim_start_matches('\n');
             if let Some(value) = field.strip_prefix('p') {
                 pid = value.parse().unwrap_or(0);
+                control_plane = false;
             }
-            if let Some(value) = field.strip_prefix('n') {
+            // lsof's command field is the process name, even when the
+            // executable's installation path contains spaces.
+            if let Some(name) = field.strip_prefix('c') {
+                control_plane = matches!(name, "comet" | "zeron");
+            }
+            if let Some(value) = field.strip_prefix('n').filter(|_| !control_plane) {
                 values.push((pid, value.to_owned()));
             }
         }
         Some(values)
     };
-    let sockets = fields(&["-nP", "-a", "-u", &uid, "-iTCP", "-sTCP:LISTEN", "-F0pn"])?;
+    let sockets = fields(&["-nP", "-a", "-u", &uid, "-iTCP", "-sTCP:LISTEN", "-F0pcn"])?;
     if sockets.is_empty() {
         return Some(Vec::new());
     }
-    let cwds: HashMap<_, _> = fields(&["-nP", "-a", "-u", &uid, "-d", "cwd", "-F0pn"])?
+    let cwds: HashMap<_, _> = fields(&["-nP", "-a", "-u", &uid, "-d", "cwd", "-F0pcn"])?
         .into_iter()
         .collect();
     let mut processes = HashMap::new();

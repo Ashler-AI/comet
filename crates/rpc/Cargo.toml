@@ -20,6 +20,7 @@ tracing.workspace = true
 uuid.workspace = true
 # OS CSPRNG for the localhost IPC bearer (already in the tree via uuid).
 getrandom = "0.4"
+url = "2"
 
 [dev-dependencies]
 zeron-doc.workspace = true

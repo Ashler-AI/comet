@@ -4,9 +4,9 @@
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.zeron/worktrees/<repoName>/<worktreeName>` (NOT the data
-//! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `zeron/<name>` branch. Device preferences can choose another root;
+//! created under `{data_dir}/worktrees/<repoName>/<worktreeName>` so an isolated
+//! Crew installation never writes into another client's default worktree root.
+//! Names and matching `zeron/<name>` branches are generated; device preferences can choose another root.
 //! `ZERON_WORKTREES_DIR` takes precedence over those preferences.
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
@@ -184,13 +184,13 @@ impl Repos {
     }
 
     /// Device preferences live in `data_dir`. New worktrees use the custom
-    /// location or `~/.zeron/worktrees`; a nonempty `$ZERON_WORKTREES_DIR`
+    /// location or `{data_dir}/worktrees`; a nonempty `$ZERON_WORKTREES_DIR`
     /// overrides both (including test isolation).
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
         Self::with_worktree_preferences(
             data_dir,
             device_id,
-            home_dir().join(".zeron").join("worktrees"),
+            data_dir.join("worktrees"),
             std::env::var_os("ZERON_WORKTREES_DIR")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
@@ -3451,7 +3451,12 @@ tmpfs /run tmpfs rw 0 0
         query: &str,
         featured_paths: &[String],
     ) -> Result<Vec<FileSearchMatch>, EngineError> {
-        super::search_files_blocking(&WorkspaceSearch::new(), root, query, featured_paths)
+        let root = canonical_search_root(root)?;
+        let search = WorkspaceSearch::new();
+        search.warm(&root).unwrap();
+        // Assert search contents only after the scan, not its interactive wait budget.
+        assert!(search.wait_until_indexed(&root, Duration::from_secs(20)));
+        super::search_files_blocking(&search, &root, query, featured_paths)
     }
 
     #[test]

@@ -86,14 +86,18 @@ export const parsePrefs = (raw: unknown): PushPrefs => {
   };
 };
 
-/** The APNs body: alert + the chat to open on tap. One thread per chat, and a
- * newer notification for the same chat replaces the older one. */
-export const apnsPayload = (chatId: string, title: string, category: Category) => ({
+/** APNs tap routing is account/project/deployment bound; scope comes only from
+ * the registry's verified authority, never chat rows or phone registration. */
+export const apnsPayload = (chatId: string, title: string, category: Category,
+  scope: { userId: string; projectScope: string; deploymentId: string }) => ({
   aps: {
     alert: { title, body: bodyFor(category) },
     sound: "default",
     "thread-id": chatId
   },
   chatId,
-  category
+  category,
+  userId: scope.userId,
+  projectScope: scope.projectScope,
+  deploymentId: scope.deploymentId,
 });

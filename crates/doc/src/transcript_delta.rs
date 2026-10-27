@@ -24,6 +24,8 @@ pub struct TranscriptUpdate {
     pub frame: TranscriptFrame,
     #[serde(default)]
     pub context_usage: Option<zeron_proto::ContextUsage>,
+    #[serde(default)]
+    pub command_delivery: HashMap<String, crate::CommandDeliveryStatus>,
     /// Historical content included in this update, independent of reset/delta
     /// encoding. Omitted on ordinary live updates and by older engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -510,9 +512,14 @@ mod context_update_tests {
         let update: TranscriptUpdate = serde_json::from_value(old).unwrap();
         assert_eq!(update.context_usage, None);
         assert!(update.replay_baseline.is_none());
+        assert!(update.command_delivery.is_empty());
         let value = serde_json::to_value(TranscriptUpdate {
             frame: TranscriptFrame::reset(&[]),
             replay_baseline: Some(TranscriptBaseline::default()),
+            command_delivery: HashMap::from([
+                ("preparing".into(), crate::CommandDeliveryStatus::Preparing),
+                ("failed".into(), crate::CommandDeliveryStatus::Failed { reason: "Retry sending.".into() }),
+            ]),
             context_usage: Some(zeron_proto::ContextUsage {
                 tokens: Some(0),
                 window: Some(200000),
@@ -521,6 +528,10 @@ mod context_update_tests {
         .unwrap();
         assert_eq!(value["contextUsage"]["tokens"], 0);
         let roundtrip: TranscriptUpdate = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(roundtrip.command_delivery["preparing"], crate::CommandDeliveryStatus::Preparing);
+        assert_eq!(roundtrip.command_delivery["failed"], crate::CommandDeliveryStatus::Failed {
+            reason: "Retry sending.".into(),
+        });
         assert_eq!(
             roundtrip.replay_baseline,
             Some(TranscriptBaseline::default())

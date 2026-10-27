@@ -171,7 +171,7 @@ impl Zeron {
             .await
             .map_err(|e| {
                 anyhow!(
-                    "no Zeron engine reachable at ws://127.0.0.1:{port} ({e}) — is Zeron running?"
+                    "no Crew engine reachable at ws://127.0.0.1:{port} ({e}) — is Crew running?"
                 )
             })?;
         let client = Arc::new(client);
@@ -836,6 +836,7 @@ mod tests {
     fn chat(id: &str, title: Option<&str>) -> Chat {
         Chat {
             id: id.into(),
+            crew: None,
             device_id: "dev".into(),
             title: title.map(str::to_owned),
             archived: false,

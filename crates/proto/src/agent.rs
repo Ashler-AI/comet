@@ -16,6 +16,8 @@ pub enum HarnessId {
     Hermes,
     /// The Pi coding agent (pi.dev), driven over its native JSONL RPC protocol.
     Pi,
+    /// Oh My Pi, driven over its own native OMP RPC protocol and session journal.
+    Omp,
     /// SST's opencode agent, driven natively over its own HTTP/SSE server
     /// protocol (`opencode serve` — the same wire the opencode desktop app
     /// speaks).
@@ -578,7 +580,8 @@ pub const VISUAL_MAX_TOTAL_ASSET_BYTES: usize = 10 * 1024 * 1024;
 // assets base64-encoded; that message must fit the engine's 16 MiB frame
 // (tungstenite's default), with room for the script escaped as JSON.
 const _: () = assert!(
-    VISUAL_MAX_TOTAL_ASSET_BYTES.div_ceil(3) * 4 + VISUAL_MAX_BYTES * 6 + 64 * 1024 < 16 * 1024 * 1024
+    VISUAL_MAX_TOTAL_ASSET_BYTES.div_ceil(3) * 4 + VISUAL_MAX_BYTES * 6 + 64 * 1024
+        < 16 * 1024 * 1024
 );
 
 /// Largest image file an agent may show with `show_image` (it rides one
@@ -1191,4 +1194,27 @@ mod todo_item_tests {
         assert_eq!(TodoStatus::parse("cancelled"), TodoStatus::Pending);
         assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
     }
+}
+
+/// Split the existing attachment transport trailer without interpreting paths.
+pub fn attachment_trailer(content: &str) -> Option<(&str, &str)> {
+    let mut offset = 0;
+    let mut previous_start = 0;
+    let mut previous_blank = false;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim();
+        if offset > 0
+            && previous_blank
+            && text
+                .to_lowercase()
+                .starts_with("attached images (local files")
+            && text.ends_with("):")
+        {
+            return Some((&content[..previous_start], &content[offset + line.len()..]));
+        }
+        previous_start = offset;
+        previous_blank = text.is_empty();
+        offset += line.len();
+    }
+    None
 }

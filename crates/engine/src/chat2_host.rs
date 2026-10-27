@@ -22,6 +22,26 @@ use crate::http_error::describe_http_error;
 /// thin docs are lineage epoch 2; M3 readers discard-and-adopt below it).
 pub const CHAT2_DOC_EPOCH: u32 = 2;
 
+/// Shared checkpoint transport: callers supply the exact durable snapshot bytes.
+pub(crate) async fn post_checkpoint(
+    http: &reqwest::Client, edge: &EdgeConfig, chat_id: &str,
+    seq_covered: u64, frontier: &[u8], snapshot: Vec<u8>,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let bearer = edge.bearer().await.map_err(|e| e.to_string())?;
+    let _permit = zeron_sync::budget::shared().http(zeron_sync::budget::Priority::Background)
+        .await.map_err(|e| e.to_string())?;
+    let response = edge.send(
+        http.post(format!("{}/chat2/{chat_id}/checkpoint?seqCovered={seq_covered}", edge.url.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(300))
+            .header("x-chat2-frontier", base64::engine::general_purpose::STANDARD.encode(frontier))
+            .body(snapshot),
+        &bearer,
+    ).await.map_err(describe_http_error)?;
+    if !response.status().is_success() { return Err(format!("checkpoint HTTP {}", response.status())); }
+    Ok(())
+}
+
 /// [`ChatDocSink`] over a live [`SessionDoc`] + the cursor-bearing store.
 ///
 /// Loro import of a remote row/checkpoint fires the doc's root subscription,
@@ -280,12 +300,11 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                 let bearer = edge.bearer().await.map_err(SyncError::from)?;
                 let mut req = http
                     .get(&url)
-                    .bearer_auth(&bearer)
                     .timeout(std::time::Duration::from_secs(300));
                 if !got.is_empty() {
                     req = req.header("range", format!("bytes={}-", got.len()));
                 }
-                let res = match req.send().await {
+                let res = match edge.send(req, &bearer).await {
                     Ok(res) => res,
                     Err(err) => {
                         let err = describe_http_error(err);
@@ -406,11 +425,12 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         Box::pin(async move {
             let _permit = zeron_sync::budget::shared().http(priority).await?;
             let bearer = edge.bearer().await.map_err(SyncError::from)?;
-            let res = http
-                .get(&url)
-                .query(&[("after", after.to_string()), ("device", device)])
-                .bearer_auth(&bearer)
-                .send()
+            let res = edge
+                .send(
+                    http.get(&url)
+                        .query(&[("after", after.to_string()), ("device", device)]),
+                    &bearer,
+                )
                 .await
                 .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {
@@ -444,13 +464,12 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
             let mut request = http
                 .post(&url)
                 .query(&[("batchId", batch_id), ("device", device)])
-                .bearer_auth(&bearer)
                 .body(bytes);
             if let Some(host) = host {
                 request = request.query(&[("hostDevice", host)]);
             }
-            let res = request
-                .send()
+            let res = edge
+                .send(request, &bearer)
                 .await
                 .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {
@@ -470,6 +489,46 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
 mod frontier_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn imported_checkpoint_posts_exact_bytes_and_rejects_advanced_floor() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let doc = loro::LoroDoc::new();
+        doc.get_map("meta").insert("epoch", 2i64).unwrap();
+        let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+        let frontier = loro::LoroDoc::decode_import_blob_meta(&snapshot, true).unwrap().partial_end_vv.encode();
+        for (status, success) in [("200 OK", true), ("409 Conflict", false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let edge = EdgeConfig::with_static_token(format!("http://{}", listener.local_addr().unwrap()), "owner-token");
+            let expected = snapshot.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let boundary = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") { break end + 4; }
+                };
+                while request.len() < boundary + expected.len() {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let headers = String::from_utf8_lossy(&request[..boundary]).to_lowercase();
+                assert!(headers.starts_with("post /chat2/history/checkpoint?seqcovered=0 "));
+                assert!(headers.contains("authorization: bearer owner-token\r\n"));
+                assert!(headers.contains("x-chat2-frontier:"));
+                assert_eq!(&request[boundary..], expected.as_slice());
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let result = post_checkpoint(&reqwest::Client::new(), &edge, "history", 0, &frontier, snapshot.clone()).await;
+            assert_eq!(result.is_ok(), success);
+            server.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn http_sync_and_exhausted_checkpoint_retries_retain_dns_cause() {
@@ -539,6 +598,120 @@ mod frontier_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_publication_is_causal_before_observers_and_queued_commits() {
+        for commit_from_observer in [true, false] {
+            let source = Arc::new(loro::LoroDoc::new());
+            let rows = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let nested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let weak = Arc::downgrade(&source);
+            let did_commit = nested.clone();
+            let observer = source.subscribe_root(Arc::new(move |_| {
+                if commit_from_observer
+                    && !did_commit.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let doc = weak.upgrade().unwrap();
+                    doc.get_map("meta").insert("child", 1).unwrap();
+                    doc.commit();
+                }
+            }));
+            let weak = Arc::downgrade(&source);
+            let captured = rows.clone();
+            let publisher = source.subscribe_local_update(Box::new(move |bytes| {
+                captured.lock().push(bytes.clone());
+                if !commit_from_observer
+                    && !nested.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let doc = weak.upgrade().unwrap();
+                    for value in [1, 2] {
+                        doc.get_map("meta").insert("child", value).unwrap();
+                        doc.commit();
+                    }
+                }
+                true
+            }));
+            source.get_map("meta").insert("parent", true).unwrap();
+            source.commit();
+
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+            let target = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+            let sink = EngineChatSink::new(&target, store.clone(), "publication-order");
+            let rows = rows.lock();
+            assert_eq!(rows.len(), if commit_from_observer { 2 } else { 3 });
+            for (index, bytes) in rows.iter().enumerate() {
+                let cursor = index as u64 + 1;
+                assert_eq!(sink.apply_row(bytes, cursor), RowImportOutcome::Applied,
+                    "row {cursor} needs its unpublished predecessor (observer={commit_from_observer})");
+                assert_eq!(store.snapshot_cursor("publication-order").unwrap(), cursor);
+            }
+            assert_eq!(target.doc().oplog_vv(), source.oplog_vv());
+            assert_eq!(target.doc().get_deep_value(), source.get_deep_value());
+            drop((publisher, observer));
+        }
+    }
+
+    #[test]
+    fn local_publication_is_causal_with_competing_thread_drains() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let source = Arc::new(loro::LoroDoc::new());
+        let target = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let sink = EngineChatSink::new(&target, store.clone(), "concurrent-publication");
+        let received = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel(1);
+        let root_events = AtomicUsize::new(0);
+        let _observer = source.subscribe_root(Arc::new(move |_| {
+            if root_events.fetch_add(1, Ordering::SeqCst) == 1 {
+                committed_tx.send(()).unwrap();
+            }
+        }));
+        let count = received.clone();
+        let parked = pending.clone();
+        let _publisher = source.subscribe_local_update(Box::new(move |bytes| {
+            let cursor = count.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            if sink.apply_row(bytes, cursor) != RowImportOutcome::Applied {
+                parked.fetch_add(1, Ordering::SeqCst);
+            }
+            if cursor == 1 {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            true
+        }));
+
+        let first = source.clone();
+        let first = std::thread::spawn(move || {
+            first.get_text("body").insert(0, "parent").unwrap();
+            first.commit();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let second = source.clone();
+        let second = std::thread::spawn(move || {
+            second.get_text("body").insert(6, " child").unwrap();
+            second.commit();
+        });
+        // B's root event proves its commit has staged the binary update while
+        // A still owns the publisher callback. Both drains then compete.
+        committed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+        assert_eq!(store.snapshot_cursor("concurrent-publication").unwrap(), 2);
+        assert_eq!(target.doc().oplog_vv(), source.oplog_vv());
+        assert_eq!(target.doc().get_deep_value(), source.get_deep_value());
+    }
 
     #[test]
     fn parked_rows_do_not_persist_a_cursor_until_their_history_arrives() {

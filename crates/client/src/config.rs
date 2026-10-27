@@ -52,8 +52,15 @@ pub struct AuthTokens {
 }
 
 /// How this client authenticates against the edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credentials {
+    /// Resource-bound Crew user session. Never a sandbox/device grant.
+    Scaffold {
+        user_id: String,
+        org_id: String,
+        control_origin: String,
+        session_json: String,
+    },
     /// WorkOS session scoped to `org_id` (the token carries the `org_id`
     /// claim the registry room requires).
     WorkOs {
@@ -74,16 +81,25 @@ impl Credentials {
 
     pub fn org_id(&self) -> &str {
         match self {
-            Credentials::WorkOs { org_id, .. } | Credentials::Dev { org_id, .. } => org_id,
+            Credentials::WorkOs { org_id, .. } | Credentials::Dev { org_id, .. }
+            | Credentials::Scaffold { org_id, .. } => org_id,
             Credentials::Demo(_) => "demo",
         }
     }
 
     pub fn user_id(&self) -> &str {
         match self {
-            Credentials::WorkOs { user_id, .. } | Credentials::Dev { user_id, .. } => user_id,
+            Credentials::WorkOs { user_id, .. } | Credentials::Dev { user_id, .. }
+            | Credentials::Scaffold { user_id, .. } => user_id,
             Credentials::Demo(_) => "demo",
         }
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials").field("user_id", &self.user_id())
+            .field("org_id", &self.org_id()).field("secrets", &"<redacted>").finish()
     }
 }
 

@@ -446,6 +446,8 @@ mod tests {
 
     fn chat(id: &str, device: &str, cwd: Option<&str>, checkout: Option<&str>) -> Chat {
         Chat {
+            crew: None,
+            harness_session_harness: None,
             id: id.into(),
             device_id: device.into(),
             title: None,
@@ -460,7 +462,6 @@ mod tests {
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             harness_session_id: None,
             harness_session_cwd: None,
-            harness_session_harness: None,
             parent_chat_id: None,
             space_id: Some("space".into()),
             last_seen_at: None,
@@ -478,7 +479,6 @@ mod tests {
             git_checked_at: None,
             checkout_id: Some("checkout".into()),
             repository_id: None,
-            github_repo: None,
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
         }
     }

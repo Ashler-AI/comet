@@ -1,8 +1,22 @@
 import UIKit
 
+extension Notification.Name {
+    static let crewOpenSessionLink = Notification.Name("crew.openSessionLink")
+}
+
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
     private let app = AppModel()
+    private var linkObserver: AnyObject?
+    private var pastedLinkObserver: NSObjectProtocol?
+    private var deferredLink: String?
+    private var resolvingLink = false
+    private var requestedLink: String?
+    private var attemptedHosts: Set<String> = []
+    private var pendingLink: String? {
+        get { UserDefaults.standard.string(forKey: "crew.pendingSessionLink") }
+        set { UserDefaults.standard.set(newValue, forKey: "crew.pendingSessionLink") }
+    }
 
     func scene(
         _ scene: UIScene,
@@ -24,12 +38,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         app.onSignedIn = { [weak self] in
             self?.showRoot(animated: true)
             self?.shellShown()
-            // Straight on from the sign-in steps: no sheet sliding up.
-            self?.showOnboardingIfNeeded(animated: false)
         }
         app.onSignOut = { [weak self] in
             guard let self else { return }
-            push.signingOut(client: self.app.client)
             self.app.signOutLocally()
             self.showRoot(animated: true)
         }
@@ -53,6 +64,12 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             showRoot(animated: false)
         }
         window.makeKeyAndVisible()
+        linkObserver = app.observe { [weak self] in self?.drainSessionLink() }
+        pastedLinkObserver = NotificationCenter.default.addObserver(forName: .crewOpenSessionLink, object: nil, queue: .main) { [weak self] note in
+            guard let text = note.object as? String, let url = URL(string: text) else { return }
+            self?.acceptURL(url)
+        }
+        for context in connectionOptions.urlContexts { acceptURL(context.url) }
         if !args.contains("-lab") { shellShown() }
 
         #if DEBUG
@@ -62,9 +79,6 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
                 DispatchQueue.main.async { [app] in window.rootViewController?.presentVoiceStage(app: app, source: nil) }
             }
         }
-        #endif
-        showOnboardingIfNeeded()
-        #if DEBUG
         TerminalProbe.runIfAsked(app: app, router: window.rootViewController as? AppRouter)
         #endif
         if let router = window.rootViewController as? AppRouter, let i = args.firstIndex(of: "-route"), i + 1 < args.count {
@@ -74,82 +88,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
                 if route == "new" { router.presentNewSession(prompt: nil) }
                 if route == "more" { router.showSettings() }
                 if route == "search" { router.showSearch() }
-                #if DEBUG
-                // Cloud screens straight away (screenshots, tests).
-                if route.hasPrefix("cloud") || route.hasPrefix("providers") || route.hasPrefix("accounts") || route == "billing" || route == "welcome" { self.openCloudRoute(route) }
-                #endif
             }
         }
     }
-
-    /// First run after signing in (or `-onboarding <step>`: appearance, sync,
-    /// github, agents, notifications, done): the steps after logging in, over
-    /// the shell.
-    @MainActor private func showOnboardingIfNeeded(animated: Bool = true) {
-        let args = ProcessInfo.processInfo.arguments
-        let forced = args.firstIndex(of: "-onboarding")
-        guard app.isSignedIn, forced != nil || OnboardingViewController.shouldShow(for: app) else { return }
-        var step = OnboardingViewController.Step.github
-        if let i = forced, i + 1 < args.count {
-            step = OnboardingViewController.Step(name: args[i + 1]) ?? .github
-        }
-        let onboarding = OnboardingViewController(app: app, step: step)
-        onboarding.onFinish = { [weak self] startSession in
-            guard startSession, let router = self?.window?.rootViewController as? AppRouter else { return }
-            router.presentNewSession(prompt: nil)
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.window?.rootViewController?.present(onboarding, animated: animated && !args.contains("-onboarding"))
-        }
-    }
-
-    #if DEBUG
-    /// `-route cloud` · `cloud:billing` · `cloud:agent:<harness>` · `cloud:repos`
-    /// · `cloud:github` · `billing` · `providers[:cloud|:<device id>]` · `welcome`.
-    @MainActor private func openCloudRoute(_ route: String) {
-        guard let root = window?.rootViewController else { return }
-        let parts = route.split(separator: ":").map(String.init)
-        if parts.first == "providers" {
-            return root.present(UINavigationController(rootViewController: ProvidersViewController(app: app, target: parts.dropFirst().first)), animated: false)
-        }
-        if parts.first == "accounts", let harness = parts.dropFirst().first, let host = app.hostOptions.first {
-            // A computer's accounts for one agent (the first computer),
-            // reached the way the app does: pushed from Providers.
-            let nav = UINavigationController(rootViewController: ProvidersViewController(app: app, target: host.id))
-            nav.pushViewController(
-                AgentAccountsViewController(app: app, target: .device(id: host.id, name: host.name, harness: harness, label: harness)),
-                animated: false
-            )
-            return root.present(nav, animated: false)
-        }
-        if parts.first == "welcome" {
-            // The signed-out welcome page, without signing out.
-            let welcome = SignInViewController(app: app)
-            welcome.modalPresentationStyle = .fullScreen
-            return root.present(welcome, animated: false)
-        }
-        if parts.first == "billing" {
-            return root.present(UINavigationController(rootViewController: BillingViewController(app: app)), animated: false)
-        }
-        let settings = CloudSettingsViewController(app: app)
-        let nav = UINavigationController(rootViewController: settings)
-        switch parts.dropFirst().first {
-        case "billing": nav.pushViewController(BillingViewController(app: app), animated: false)
-        case "agent":
-            if let h = parts.dropFirst(2).first, let agent = CloudStore.agents.first(where: { $0.harness == h }) {
-                nav.pushViewController(AgentAccountsViewController(app: app, target: .cloud(agent)), animated: false)
-            }
-        case "repos":
-            root.present(UINavigationController(rootViewController: CloudRepoPickerViewController(app: app)), animated: false)
-            return
-        case "github":
-            root.present(GitHubConnectViewController.sheet(app: app), animated: false)
-            return
-        default: break
-        }
-        root.present(nav, animated: false)
-    }
-    #endif
 
     /// The signed-in shell is up: refresh this phone's notification
     /// registration and open a session a notification was tapped for.
@@ -157,15 +98,16 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         guard app.isSignedIn else { return }
         if !app.isDemo { PushNotifications.shared.signedIn() }
         PushNotifications.shared.shellReady()
+        drainSessionLink()
     }
 
     private func showRoot(animated: Bool) {
         guard let window else { return }
-        // The split shell everywhere: it shows the sidebar when the window
-        // is regular in both directions (iPad, an unfolded iPhone Duo) and
-        // collapses to the tab shell otherwise, live as the window changes —
-        // folding or unfolding carries the open session across.
-        let root: UIViewController = !app.isSignedIn ? SignInViewController(app: app) : SplitRootController(app: app)
+        // The split shell adapts live between compact phones and regular
+        // iPad or unfolded layouts while preserving the active session.
+        let root: UIViewController = !app.isSignedIn
+            ? SignInViewController(app: app)
+            : SplitRootController(app: app)
         // Sheets (new session, Settings) belong to the old root: they'd
         // stay on top of the new one.
         if let old = window.rootViewController, old.presentedViewController != nil {
@@ -180,12 +122,65 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
     }
 
-    /// `zeron://voice` (the call's Live Activity) returns to the stage.
-    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
-        guard URLContexts.contains(where: { $0.url.scheme == "zeron" && $0.url.host == "voice" }),
-              app.voice.live, let root = window?.rootViewController
-        else { return }
-        root.presentVoiceStage(app: app, source: nil)
+    func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) {
+        for context in contexts { acceptURL(context.url) }
+    }
+
+    private func acceptURL(_ url: URL) {
+        if url.scheme == Endpoints.callbackScheme, url.host == "voice" {
+            if app.voice.live { window?.rootViewController?.presentVoiceStage(app: app, source: nil) }
+        } else if crewIsSessionLink(url: url.absoluteString) {
+            pendingLink = url.absoluteString
+            requestedLink = nil
+            deferredLink = nil
+            attemptedHosts.removeAll()
+            drainSessionLink()
+        }
+    }
+
+    private func drainSessionLink() {
+        guard !resolvingLink, let url = pendingLink, deferredLink != url, let client = app.client,
+              let deployment = Endpoints.deploymentId,
+              let router = window?.rootViewController as? AppRouter else { return }
+        do {
+            if let id = try client.crewCachedLink(url: url, deployment: deployment) {
+                pendingLink = nil
+                requestedLink = nil
+                router.openSession(id)
+                return
+            }
+        } catch {
+            showLinkError(error.localizedDescription)
+            return
+        }
+        guard requestedLink != url,
+              let host = app.hostOptions.first(where: { $0.online && !attemptedHosts.contains($0.id) }) else { return }
+        attemptedHosts.insert(host.id)
+        resolvingLink = true
+        Task { @MainActor in
+            defer { resolvingLink = false }
+            do {
+                _ = try await client.crewResolveLink(deviceId: host.id, url: url, deployment: deployment)
+                guard pendingLink == url else { return }
+                requestedLink = url
+            } catch {
+                // Other online devices may be sandboxes; only a local controller may resolve.
+                if !app.hostOptions.contains(where: { $0.online && !attemptedHosts.contains($0.id) }) {
+                    showLinkError("Connect a desktop Crew controller to discover this session. \(error.localizedDescription)")
+                }
+            }
+            DispatchQueue.main.async { [weak self] in self?.drainSessionLink() }
+        }
+    }
+
+    private func showLinkError(_ message: String) {
+        guard let root = window?.rootViewController, root.presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "Crew session", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Keep for later", style: .cancel) { [weak self] _ in
+            self?.deferredLink = self?.pendingLink
+        })
+        alert.addAction(UIAlertAction(title: "Dismiss link", style: .default) { [weak self] _ in self?.pendingLink = nil })
+        root.present(alert, animated: true)
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
@@ -194,5 +189,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func sceneWillEnterForeground(_ scene: UIScene) {
         app.willEnterForeground()
+        requestedLink = nil
+        deferredLink = nil
+        attemptedHosts.removeAll()
+        shellShown()
     }
 }

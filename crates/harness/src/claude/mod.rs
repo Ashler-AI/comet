@@ -272,7 +272,7 @@ impl ClaudeHarness {
     /// The configuration arguments a run launches with — everything the
     /// process bakes in at spawn except the session to resume. Two requests
     /// with equal arguments (and cwd) are the same runtime.
-    fn launch_args(request: &RunRequest) -> Vec<String> {
+    fn launch_args(request: &RunRequest, managed: bool) -> Vec<String> {
         let mut args: Vec<String> = [
             "--print",
             "--input-format",
@@ -315,6 +315,10 @@ impl ClaudeHarness {
             args.extend(["--permission-mode".into(), "default".into()]);
         }
         let mut settings = serde_json::Map::new();
+        if managed {
+            settings.insert("apiKeyHelper".into(), Value::String(String::new()));
+            settings.insert("forceLoginMethod".into(), Value::String("console".into()));
+        }
         if option_is_on(&request.model_options, "fastMode") {
             settings.insert("fastMode".into(), Value::Bool(true));
         }
@@ -331,7 +335,12 @@ impl ClaudeHarness {
         args
     }
 
-    fn build_command(exe: &std::path::Path, request: &RunRequest, title_only: bool) -> Command {
+    fn build_command(
+        exe: &std::path::Path,
+        request: &RunRequest,
+        title_only: bool,
+        context: Option<&crate::RunContext>,
+    ) -> Command {
         let mut cmd = Command::new(exe);
         // Its own process group, so teardown reaches the MCP servers and
         // tools it started; and no inherited Claude Code session markers.
@@ -353,9 +362,17 @@ impl ClaudeHarness {
         // from the user's own key, `GH_TOKEN`, …). Never a Claude.ai
         // subscription token: those stay inside the CLI's own login.
         crate::apply_run_env(&mut cmd, &request.env);
-        cmd.args(Self::launch_args(request));
+        crate::apply_run_context(&mut cmd, context);
+        cmd.args(Self::launch_args(
+            request,
+            context.is_some_and(|c| c.inference.is_some()),
+        ));
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
+        }
+        if let Some(source) = context.and_then(|context| context.fork_from.as_deref()) {
+            debug_assert_eq!(request.resume.as_deref(), Some(source));
+            cmd.arg("--fork-session");
         }
         if title_only {
             cmd.args([
@@ -403,8 +420,9 @@ impl ClaudeHarness {
         exe: &std::path::Path,
         request: &RunRequest,
         title_only: bool,
+        context: Option<&crate::RunContext>,
     ) -> Result<Runtime, HarnessError> {
-        let mut child = Self::build_command(exe, request, title_only)
+        let mut child = Self::build_command(exe, request, title_only, context)
             .spawn()
             .map_err(|e| {
                 let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
@@ -795,6 +813,31 @@ impl ClaudeHarness {
         controls: RunControls,
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
+        if let Some(source) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.fork_from.as_deref())
+            && (request.resume.as_deref() != Some(source) || title_only)
+        {
+            return Err(HarnessError::Protocol(
+                "Crew fork source does not match Claude resume".into(),
+            ));
+        }
+        if let Some(route) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+        {
+            request.model = Some(
+                route
+                    .model
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&route.model)
+                    .to_owned(),
+            );
+        }
         let exe = self.resolve_executable()?;
         // A session whose transcript holds no conversation cannot be
         // resumed: the CLI says so and exits, every time. Start fresh
@@ -806,7 +849,12 @@ impl ClaudeHarness {
             Some(session_id) => {
                 let (normalizer, transcript) =
                     Normalizer::for_resume(&config_root(&request.env), &session_id).await;
-                if transcript == Transcript::Empty {
+                if transcript == Transcript::Empty
+                    && controls
+                        .context
+                        .as_ref()
+                        .is_none_or(|context| context.fork_from.is_none())
+                {
                     tracing::info!(
                         target: "zeron_harness::claude",
                         %session_id,
@@ -824,7 +872,7 @@ impl ClaudeHarness {
             stdout_lines,
             mut stdin,
             stderr_tail,
-        } = Self::launch(&exe, &request, title_only)?;
+        } = Self::launch(&exe, &request, title_only, controls.context.as_ref())?;
 
         let lock_dir = refresh_lock::config_dir_for(&request.env);
         if !title_only {
@@ -1098,6 +1146,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
+        context: _,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -2007,7 +2056,8 @@ mod tests {
             resume: None,
             env: Default::default(),
         };
-        let mut cmd = ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false);
+        let mut cmd =
+            ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false, None);
         let value = cmd
             .as_std_mut()
             .get_envs()

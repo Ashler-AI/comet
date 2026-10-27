@@ -64,9 +64,6 @@ pub const TEXTAREA_MIN: f32 = 76.0;
 pub const TEXTAREA_MAX: f32 = 260.0;
 /// Expanded actions row: 2px top + 32px picker + 8px bottom.
 const ACTIONS_BOTTOM_PAD: f32 = 8.0;
-/// How long after a send that brings a Cloud machine up its first setup step
-/// appears (the message and the working line land first).
-const CLOUD_SETUP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
 pub const ACTIONS_ROW_HEIGHT: f32 = 2.0 + 32.0 + ACTIONS_BOTTOM_PAD;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
@@ -605,62 +602,6 @@ fn should_publish_optimistic_echo(queue: bool) -> bool {
     !queue
 }
 
-/// The composer's one caption line about the chat's path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LinkNotice {
-    text: SharedString,
-    glyph: NoticeGlyph,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NoticeGlyph {
-    /// The connection is working on it.
-    Spinner,
-    Dot,
-    /// Hard offline: the only amber caption.
-    WarningDot,
-}
-
-/// What the caption says, if anything. Only `intent` — a draft, a send in
-/// flight or queued messages — earns a send clause: an empty composer never
-/// claims a message is waiting. While the transcript's loader speaks for
-/// the chat, only a send clause adds anything. This device's own connection
-/// outranks the host's presence, which goes dark with it.
-fn link_notice(
-    link: crate::state::ChatLink,
-    host: Option<&str>,
-    intent: bool,
-    loader_shown: bool,
-) -> Option<LinkNotice> {
-    use crate::state::LinkSync;
-    let notice = |text: SharedString, glyph| Some(LinkNotice { text, glyph });
-    match link.sync {
-        LinkSync::Offline if intent => notice(
-            "Offline — messages will send when you're back online.".into(),
-            NoticeGlyph::WarningDot,
-        ),
-        LinkSync::Stalled | LinkSync::Reconnecting if intent => notice(
-            "Reconnecting — messages will send once the connection recovers.".into(),
-            NoticeGlyph::Spinner,
-        ),
-        _ if link.host_unreachable && intent => notice(
-            format!(
-                "Can't reach {} — messages will send when it's reachable.",
-                host.unwrap_or("the host")
-            )
-            .into(),
-            NoticeGlyph::Dot,
-        ),
-        _ if loader_shown => None,
-        LinkSync::Offline => notice("Offline".into(), NoticeGlyph::WarningDot),
-        LinkSync::Stalled | LinkSync::Reconnecting => {
-            notice("Reconnecting…".into(), NoticeGlyph::Spinner)
-        }
-        LinkSync::Syncing { shown: true } => notice("Syncing…".into(), NoticeGlyph::Spinner),
-        LinkSync::Syncing { shown: false } | LinkSync::Live => None,
-    }
-}
-
 fn begin_interrupt(pending: &mut HashSet<String>, chat_id: &str) -> bool {
     pending.insert(chat_id.to_string())
 }
@@ -1075,9 +1016,6 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         .collect()
 }
 
-/// What a masked input shows in place of each character.
-const MASK_GLYPH: char = '•';
-
 #[derive(Debug, Clone, Default)]
 struct TextProjection {
     display: String,
@@ -1311,21 +1249,6 @@ impl TextProjection {
     /// a dangling reference and shows as its plain label.
     fn rich(raw: &str, active: Option<Range<usize>>, live: Option<&HashSet<u32>>) -> Self {
         Self::project(raw, active, true, live)
-    }
-
-    /// Secret fields: every character shown as one bullet. A mapping per
-    /// character keeps the caret, selection and hit-testing exact.
-    fn masked(raw: &str) -> Self {
-        let mut projection = Self::default();
-        for (start, ch) in raw.char_indices() {
-            let display_start = projection.display.len();
-            projection.display.push(MASK_GLYPH);
-            projection.mappings.push((
-                start..start + ch.len_utf8(),
-                display_start..projection.display.len(),
-            ));
-        }
-        projection
     }
 
     fn project(
@@ -2128,8 +2051,6 @@ pub struct ComposerInput {
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
-    /// Secret entry (API keys): shown as bullets and never copied or cut.
-    masked: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -2242,7 +2163,6 @@ impl ComposerInput {
             syntax_task: None,
             ghost: None,
             mentions_enabled: false,
-            masked: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -2296,15 +2216,6 @@ impl ComposerInput {
     /// Join the window's Tab order, for a field the keyboard must reach.
     pub(crate) fn with_tab_stop(mut self) -> Self {
         self.focus_handle = self.focus_handle.tab_stop(true);
-        self
-    }
-
-    /// Secret entry: characters render as bullets, copy and cut do nothing,
-    /// and assistive tech is told it is a password field.
-    pub fn with_masked(mut self) -> Self {
-        self.masked = true;
-        self.accessibility_role = Role::PasswordInput;
-        self.refresh_projection();
         self
     }
 
@@ -2385,9 +2296,7 @@ impl ComposerInput {
     }
 
     fn refresh_projection(&mut self) {
-        self.projection = if self.masked {
-            TextProjection::masked(&self.content)
-        } else if self.mentions_enabled {
+        self.projection = if self.mentions_enabled {
             let live: Option<HashSet<u32>> = self
                 .attachment_chips
                 .as_ref()
@@ -3335,10 +3244,6 @@ impl ComposerInput {
     }
 
     fn previous_word_boundary(&self, offset: usize) -> usize {
-        // Word stops would reveal where a secret's punctuation sits.
-        if self.masked {
-            return 0;
-        }
         if let Some(boundary) = self.projection.previous_boundary(offset) {
             return boundary;
         }
@@ -3350,9 +3255,6 @@ impl ComposerInput {
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
-        if self.masked {
-            return self.content.len();
-        }
         if let Some(boundary) = self.projection.next_boundary(offset) {
             return boundary;
         }
@@ -3618,8 +3520,7 @@ impl ComposerInput {
     }
 
     fn clipboard_selection(&self) -> Option<(String, String)> {
-        // A masked field's text never leaves it through the clipboard.
-        if self.selected_range.is_empty() || self.masked {
+        if self.selected_range.is_empty() {
             return None;
         }
         let selected = self.projection.normalize_range(self.selected_range.clone());
@@ -6376,6 +6277,18 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// Only the existing send task owns the pending message. This signal can
+    /// cancel its pre-admission wake without dropping send recovery cleanup.
+    boat_wake_cancel: Option<(String, futures::channel::oneshot::Sender<()>)>,
+    /// Pre-admission only: dropping this task cannot discard an accepted send.
+    host_wake_task: Option<Task<()>>,
+    host_wake_target: Option<String>,
+    scaffold_command: Option<String>,
+    scaffold_recovery_key: Option<String>,
+    scaffold_admission: Option<String>,
+    scaffold_config: Option<crate::pickers::ResolvedRunConfig>,
+    scaffold_session: Option<String>,
+    scaffold_database: Option<zeron_proto::ScaffoldDatabaseEnvironment>,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -6674,6 +6587,12 @@ impl Composer {
             popup_bar: crate::popover::MenuScrollbarState::default(),
             current_key,
             sending: false,
+            scaffold_command: None,
+            scaffold_recovery_key: None,
+            scaffold_admission: None,
+            scaffold_config: None,
+            scaffold_session: None,
+            scaffold_database: None,
             launching_new_chat: false,
             failure: None,
             wizard: None,
@@ -6683,6 +6602,9 @@ impl Composer {
             action_task: None,
             advance_task: None,
             send_task: None,
+            boat_wake_cancel: None,
+            host_wake_task: None,
+            host_wake_target: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
@@ -6931,40 +6853,6 @@ impl Composer {
     pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
         self.side_chat = true;
         cx.notify();
-    }
-
-    /// Composer honesty: how the chat's path stands — and, when there is
-    /// something to send, UP FRONT that a send will queue (a durable local
-    /// write delivered on reconnect) instead of letting the button imply
-    /// instant delivery. Opening a slow remote chat is syncing, not an outage.
-    fn current_link_notice(&self, cx: &App) -> Option<LinkNotice> {
-        // A new session on Cloud never waits on the project's device.
-        let runs_on_cloud = self.pickers.read(cx).runs_on_cloud(cx);
-        let draft = self.has_draft(cx);
-        let state = self.state.read(cx);
-        let now = crate::state::clock_now();
-        let (link, host) = match state.selected_chat.as_deref() {
-            Some(id) => (
-                state.chat_link_at(id, now),
-                state
-                    .chats
-                    .iter()
-                    .find(|chat| chat.id == id)
-                    .and_then(|chat| state.device_name(&chat.device_id)),
-            ),
-            // New-chat canvas: judge by the picked target device.
-            None => match state.effective_device_id().filter(|_| !runs_on_cloud) {
-                Some(id) => (state.device_link_at(&id, now), state.device_name(&id)),
-                None => (crate::state::ChatLink::LIVE, None),
-            },
-        };
-        let intent = draft
-            || !state.queue.is_empty()
-            || state
-                .selected_chat
-                .as_deref()
-                .is_some_and(|id| state.send_pending(id, now));
-        link_notice(link, host, intent, state.transcript_loading(now).is_some())
     }
 
     /// Whether the draft holds anything a close would lose: text, staged
@@ -7845,7 +7733,7 @@ impl Composer {
     fn catalog_params(&self, cx: &App) -> serde_json::Value {
         let mut params = self.completion_workspace_params(cx).unwrap_or_else(|| {
             let mut params = serde_json::json!({});
-            if let Some(device) = self.state.read(cx).effective_device_id() {
+            if let Some(device) = self.state.read(cx).active_device_id() {
                 params["targetDeviceId"] = device.into();
             }
             params
@@ -7861,15 +7749,7 @@ impl Composer {
         let engine = state
             .engine()
             .map(|engine| engine.client() as *const _ as usize);
-        let target = state
-            .selected_chat_row()
-            .map(|chat| chat.device_id.clone())
-            .or_else(|| {
-                state
-                    .selected_space_row()
-                    .map(|space| space.device_id.clone())
-            })
-            .or_else(|| state.effective_device_id());
+        let target = state.active_device_id();
         let online = target
             .as_deref()
             .is_none_or(|device| state.device_online(device, chrono::Utc::now()));
@@ -8828,6 +8708,46 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        if self.host_wake_target.as_ref().is_some_and(|target| {
+            let state = self.state.read(cx);
+            state.active_device_id().as_ref() != Some(target)
+                || state.selected_chat.as_deref().unwrap_or_default() != self.current_key
+        }) {
+            self.cancel_host_wake(cx);
+        }
+        let wake_target_changed = self.boat_wake_cancel.as_ref().is_some_and(|(target, _)| {
+            let state = self.state.read(cx);
+            let current = state
+                .selected_chat_row()
+                .map(|chat| chat.device_id.clone())
+                .or_else(|| state.effective_device_id());
+            current.as_deref() != Some(target.as_str())
+                || state.selected_chat.as_deref().unwrap_or_default() != self.current_key
+        });
+        if wake_target_changed {
+            self.cancel_boat_wake(cx);
+        }
+        let delivered = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat
+                .as_ref()
+                .filter(|chat| {
+                    crate::settings::current(cx)
+                        .crew_pending_prompts
+                        .get(*chat)
+                        .is_some_and(|id| state.transcript.iter().any(|entry| &entry.id == id))
+                })
+                .cloned()
+        };
+        if let Some(chat) = delivered {
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                settings.crew_pending_prompts.remove(&chat);
+            });
+            if self.scaffold_session.as_ref() == Some(&chat) {
+                self.finish_scaffold_provisioning(cx);
+            }
+        }
         {
             let state = self.state.read(cx);
             // AppState also notifies at clock-only transitions, so a run that
@@ -9045,12 +8965,92 @@ impl Composer {
         )
     }
 
+    fn boat_wake_binding(&self, cx: &App) -> Option<(String, String)> {
+        let state = self.state.read(cx);
+        let target = state.active_device_id()?;
+        if state.local_device_id.as_deref() == Some(target.as_str())
+            || state.device_online(&target, chrono::Utc::now())
+        {
+            return None;
+        }
+        let device = state.devices.iter().find(|device| device.id == target)?;
+        let (provider, boat) = device.devbox_binding()?;
+        if provider != zeron_proto::DeviceEnvironment::Boat {
+            return None;
+        }
+        Some((target, boat.to_owned()))
+    }
+
+    fn cancel_boat_wake(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, cancel)) = self.boat_wake_cancel.take() {
+            let _ = cancel.send(());
+        }
+        cx.notify();
+    }
+
+    fn publish_send(
+        &mut self,
+        chat_id: &str,
+        select_new: bool,
+        queue: bool,
+        echo: SessionMessageEntry,
+        cx: &mut Context<Self>,
+    ) {
+        self.launching_new_chat = select_new;
+        if select_new {
+            cx.emit(ComposerEvent::NewThreadTransitionStarted);
+        }
+        let message_id = echo.id.clone();
+        self.state.update(cx, |state, cx| {
+            if select_new {
+                state.select_chat(Some(chat_id.to_owned()), cx);
+            }
+            if should_publish_optimistic_echo(queue) {
+                state.push_echo(chat_id, echo);
+                state.begin_pending_send(chat_id, &message_id, chrono::Utc::now());
+            }
+            cx.notify();
+        });
+        if should_publish_optimistic_echo(queue) {
+            cx.emit(ComposerEvent::Sent {
+                chat_id: chat_id.to_owned(),
+                message_id,
+            });
+        }
+    }
+
+    fn seed_send_attachments(
+        device_id: &str,
+        local_device_id: Option<&str>,
+        staged: &[StagedAttachment],
+        upload_ids: &[String],
+        echo_paths: &[String],
+        queued_flow: bool,
+    ) {
+        // Pending upload aliases survive the host's eventual path rewrite.
+        if queued_flow {
+            for (upload_id, attachment) in upload_ids.iter().zip(staged) {
+                attachments::seed_staged_alias(device_id, upload_id, attachment);
+                if let Some(local) = local_device_id
+                    && local != device_id
+                {
+                    attachments::seed_staged_alias(local, upload_id, attachment);
+                }
+            }
+        }
+        for (path, attachment) in echo_paths.iter().zip(staged) {
+            attachments::seed_staged(device_id, path, attachment);
+            if let Some(local) = local_device_id
+                && local != device_id
+            {
+                attachments::seed_staged(local, path, attachment);
+            }
+        }
+    }
+
     fn reference_delivery_supported(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
-        let target = state
-            .selected_chat_row()
-            .map(|chat| chat.device_id.clone())
-            .or_else(|| state.effective_device_id());
+        let target = state.active_device_id();
         target.is_some_and(|device| {
             state.device_supports(&device, capabilities::COMPOSER_REFERENCES_V1)
         })
@@ -9067,37 +9067,13 @@ impl Composer {
         true
     }
 
-    /// The send would run on Cloud (a new session there, or a chat whose
-    /// machine is Cloud's) and Cloud is out of credits: it can't start or
-    /// wake a machine.
-    fn out_of_cloud_credits(&self, cx: &App) -> bool {
-        let state = self.state.read(cx);
-        if !state
-            .cloud_status
-            .as_ref()
-            .is_some_and(crate::cloud::out_of_credits)
-        {
-            return false;
-        }
-        match state.selected_chat.as_deref() {
-            // A chat hosted on a Cloud session machine — known from its host
-            // device even before the session list has been read.
-            Some(chat) => {
-                state.chat_cloud_session(chat).is_some()
-                    || state
-                        .chats
-                        .iter()
-                        .find(|c| c.id == chat)
-                        .is_some_and(|c| state.is_cloud_session_device(&c.device_id))
-            }
-            None => self.pickers.read(cx).runs_on_cloud(cx),
-        }
-    }
-
     /// New chats need a runnable agent, but may target the device's home
     /// directory without a project. Existing chats carry their own run config.
     fn send_blocked(&self, cx: &App) -> bool {
-        if self.queue_edit_finishing || self.out_of_cloud_credits(cx) {
+        if self.sending {
+            return true;
+        }
+        if self.queue_edit_finishing {
             return true;
         }
         let state = self.state.read(cx);
@@ -9187,12 +9163,6 @@ impl Composer {
             // escape_stops_active_agent is enabled.
             SendButtonMode::Stop => {}
             _ if no_content => {}
-            // Out of credits, a Cloud send can't start or wake its machine:
-            // say so instead of a button that silently does nothing.
-            _ if self.out_of_cloud_credits(cx) => crate::cloud::show_out_of_credits(
-                "You're out of Cloud credits. Add credits to send.",
-                cx,
-            ),
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
             // Busy: keep the message queued until the current turn ends.
@@ -9224,13 +9194,386 @@ impl Composer {
         }
     }
 
+    fn finish_scaffold_provisioning(&mut self, cx: &mut Context<Self>) {
+        if let (Some(key), Some(command)) = (&self.scaffold_recovery_key, &self.scaffold_command) {
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                if settings.crew_recovery_commands.get(key) == Some(command) {
+                    settings.crew_recovery_commands.remove(key);
+                }
+            });
+        }
+        self.scaffold_recovery_key = None;
+        self.scaffold_command = None;
+        self.scaffold_config = None;
+        self.scaffold_session = None;
+        self.scaffold_database = None;
+        self.scaffold_admission = None;
+    }
+
+    fn retire_rejected_scaffold_create(
+        &mut self,
+        outcome: &crate::settings::crew::Outcome,
+        cx: &mut Context<Self>,
+    ) {
+        if outcome.status == "rejected"
+            && outcome.command_id.ends_with(":create")
+            && self.scaffold_command.as_ref() == Some(&outcome.command_id)
+        {
+            self.finish_scaffold_provisioning(cx);
+        }
+    }
+
+    fn provision_scaffold(&mut self, cx: &mut Context<Self>) {
+        if self.sending {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.show_error("Engine not connected", cx);
+            return;
+        };
+        let database = self
+            .pickers
+            .read(cx)
+            .draft()
+            .scaffold_database
+            .expect("Scaffold destination");
+        if self
+            .scaffold_database
+            .is_some_and(|pending| pending != database)
+        {
+            self.show_error("A sandbox is already pending for another database choice. Restore that destination and reconcile it before creating another sandbox.", cx);
+            return;
+        }
+        let resolved = self
+            .scaffold_config
+            .clone()
+            .unwrap_or_else(|| self.pickers.read(cx).resolved(cx));
+        let Some(mut route) = resolved
+            .model
+            .as_deref()
+            .and_then(zeron_proto::AgentRoute::from_omp_model)
+        else {
+            self.show_error("Choose a managed Crew model before creating a sandbox.", cx);
+            return;
+        };
+        if let Some(account) = resolved
+            .model_options
+            .get("crewAccountId")
+            .and_then(serde_json::Value::as_str)
+        {
+            route =
+                zeron_proto::AgentRoute::pinned(route.provider, route.model, account.to_string());
+        }
+        if references_require_update(self.input.read(cx).text(), false)
+            || !self.staged_appshots().is_empty()
+            || !self.staged_comments(cx).is_empty()
+        {
+            self.show_error("Local file/skill references, app captures and review comments cannot be sent to a new sandbox. Attach file bytes instead; your draft is preserved.", cx);
+            return;
+        }
+        let submitted_text = self.input.read(cx).text().to_string();
+        let submitted_attachments: Vec<String> = self
+            .staged()
+            .iter()
+            .map(|attachment| attachment.id.clone())
+            .collect();
+        self.sending = true;
+        self.failure = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let status: crate::settings::crew::CrewStatus = serde_json::from_value(engine.client().call("crew.status", serde_json::json!({})).await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                if status.role != "local_controller" { return Err("Scaffold provisioning requires your Crew controller.".to_string()); }
+                let recovery_key = serde_json::json!([status.principal_id, status.scope]).to_string();
+                let (mut command_id, mut control) = this.update(cx, |composer, cx| {
+                    if let Some(command_id) = &composer.scaffold_command {
+                        if composer.scaffold_recovery_key.as_ref() != Some(&recovery_key) { return Err("Crew account or deployment changed; reconcile the original command first.".to_string()); }
+                        return Ok((command_id.clone(), None));
+                    }
+                    if crate::settings::current(cx).crew_recovery_commands.contains_key(&recovery_key) {
+                        return Err("A previous Crew operation needs reconciliation in Sandboxes. Your draft is preserved; no new sandbox was created.".to_string());
+                    }
+                    let command_id = format!("{}:create", uuid::Uuid::new_v4());
+                    let mut scope = status.scope.clone();
+                    scope.session_id = Some(uuid::Uuid::new_v4().to_string());
+                    composer.scaffold_session = scope.session_id.clone();
+                    let control = zeron_proto::ScaffoldEnvironmentControl::Create { scope, name: None, source_ref: None, region: None, database_environment: database, agent_route: route };
+                    composer.scaffold_database = Some(database);
+                    composer.scaffold_command = Some(command_id.clone());
+                    composer.scaffold_recovery_key = Some(recovery_key.clone());
+                    composer.scaffold_config = Some(resolved.clone());
+                    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| { settings.crew_recovery_commands.insert(recovery_key.clone(), command_id.clone()); });
+                    Ok((command_id, Some(control)))
+                }).map_err(|e| e.to_string())??;
+                loop {
+                    let (method, params) = match control.take() {
+                        Some(control) => ("scaffold.control", serde_json::json!({"commandId": command_id, "control": control})),
+                        None => ("scaffold.reconcile", serde_json::json!({"commandId": command_id})),
+                    };
+                    let value = attachments::call_with_timeout(&engine, cx.background_executor(), method, params, std::time::Duration::from_secs(120)).await?;
+                    let outcome: crate::settings::crew::Outcome = serde_json::from_value(value).map_err(|e| e.to_string())?;
+                    if outcome.command_id != command_id { return Err("Crew returned another command identity; reconcile in Sandboxes.".into()); }
+                    if outcome.status == "rejected" {
+                        this.update(cx, |composer, cx| composer.retire_rejected_scaffold_create(&outcome, cx)).map_err(|e| e.to_string())?;
+                        let recovery = if command_id.ends_with(":create") {
+                            "Your draft is preserved. Change the destination or settings and submit again."
+                        } else {
+                            "Your draft and existing sandbox are preserved. Manage its rejected attachment in Sandboxes; no replacement will be created."
+                        };
+                        return Err(format!("{} {recovery}", outcome.error.unwrap_or_else(|| "Crew operation was rejected.".into())));
+                    }
+                    if let Some((id, next)) = crate::settings::crew::attachment_after_create(&outcome) {
+                        this.update(cx, |composer, cx| {
+                            composer.scaffold_command = Some(id.clone());
+                            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| { settings.crew_recovery_commands.insert(recovery_key.clone(), id.clone()); });
+                        }).map_err(|e| e.to_string())?;
+                        command_id = id;
+                        control = Some(next);
+                        continue;
+                    }
+                    let Some((session, device)) = crate::settings::crew::attached_session(&outcome) else {
+                        return Err(format!("{} Your draft is preserved. Submit again to check this same operation; no create or attach will be replayed.", outcome.error.unwrap_or_else(|| format!("Crew operation is {}.", outcome.status))));
+                    };
+                    let (session, device) = (session.to_string(), device.to_string());
+                    for _ in 0..60 {
+                        let ready = this.update(cx, |composer, cx| {
+                            let state = composer.state.read(cx);
+                            state.chats.iter().any(|chat| chat.id == session && chat.device_id == device && chat.cwd.is_some()) && state.device_online(&device, chrono::Utc::now())
+                        }).map_err(|e| e.to_string())?;
+                        if ready {
+                            let mut config = resolved.chat_config().ok_or_else(|| "Crew model configuration is unavailable.".to_string())?;
+                            this.update(cx, |composer, cx| {
+                                if let Some(existing) = composer.state.read(cx).chats.iter()
+                                    .find(|chat| chat.id == session).and_then(|chat| chat.config.as_ref()) {
+                                    config.sandbox = existing.sandbox;
+                                }
+                            }).map_err(|e| e.to_string())?;
+                            attachments::call_with_timeout(&engine, cx.background_executor(), methods::MUTATE,
+                                serde_json::json!({"op": "setChatConfig", "chatId": session, "config": config}),
+                                std::time::Duration::from_secs(30)).await?;
+                            return Ok((session, config));
+                        }
+                        cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                    }
+                    return Err("Crew is attached but its session host is not online yet. Your draft is preserved; submit again to check the same sandbox.".into());
+                }
+            }.await;
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                match result {
+                    Ok((session, config)) => {
+                        if composer.state.read(cx).selected_chat.is_some() || composer.pickers.read(cx).draft().scaffold_database != Some(database) {
+                            composer.show_error("Crew sandbox is attached. Return to the original Scaffold draft to submit; no prompt was sent.", cx);
+                            return;
+                        }
+                        if composer.input.read(cx).text() != submitted_text
+                            || !composer.staged().iter().map(|attachment| &attachment.id).eq(submitted_attachments.iter())
+                            || !composer.staged_appshots().is_empty() || !composer.staged_comments(cx).is_empty() {
+                            composer.show_error("Your draft changed while Crew started. Submit again to use this same attached sandbox; nothing was sent.", cx);
+                            return;
+                        }
+                        composer.state.update(cx, |state, cx| { state.apply_chat_config(&session, config); state.select_chat(Some(session.clone()), cx); });
+                        composer.send(submitted_text, false, cx);
+                        if composer.sending { composer.scaffold_admission = Some(session); }
+                    }
+                    Err(error) => composer.show_error(error, cx),
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
+    fn wakeable_host(&self, cx: &App) -> Option<zeron_proto::Device> {
+        let state = self.state.read(cx);
+        let target = state.active_device_id()?;
+        if state.local_device_id.as_deref() == Some(target.as_str())
+            || state.device_online(&target, chrono::Utc::now())
+        {
+            return None;
+        }
+        state
+            .devices
+            .iter()
+            .find(|device| {
+                device.id == target
+                    && device.devbox_binding().is_some_and(|(provider, _)| {
+                        provider == zeron_proto::DeviceEnvironment::Namespace
+                    })
+            })
+            .cloned()
+    }
+
+    fn cancel_host_wake(&mut self, cx: &mut Context<Self>) {
+        self.host_wake_task = None;
+        self.host_wake_target = None;
+        self.input.update(cx, |input, cx| {
+            input.read_only = false;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn wake_before_send(
+        &mut self,
+        device: zeron_proto::Device,
+        text: String,
+        queue: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.show_error("Engine not connected", cx);
+            return;
+        };
+        let key = self.current_key.clone();
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        self.host_wake_target = Some(device.id.clone());
+        self.input.update(cx, |input, cx| {
+            input.read_only = true;
+            cx.notify();
+        });
+        self.host_wake_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                let fresh =
+                    crate::settings::devices::wake_host(&engine, cx.background_executor(), &device)
+                        .await?;
+                let (refresh, _observe) = this
+                    .update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            let mut devices = state.devices.clone();
+                            let slot = devices
+                                .iter_mut()
+                                .find(|row| row.id == device.id)
+                                .filter(|row| row.devbox_binding() == device.devbox_binding())
+                                .ok_or_else(|| {
+                                    "The selected host binding changed. Nothing was sent."
+                                        .to_string()
+                                })?;
+                            *slot = fresh;
+                            state.apply_devices(devices);
+                            cx.notify();
+                            Ok::<(), String>(())
+                        })?;
+                        let (send, receive) = futures::channel::oneshot::channel();
+                        let mut send = Some(send);
+                        let target = device.id.clone();
+                        let observe = cx.observe(&composer.pickers, move |composer, _, cx| {
+                            if let Some(result) = composer
+                                .pickers
+                                .read(cx)
+                                .wake_refresh_result(&target, harness, cx)
+                                && let Some(send) = send.take()
+                            {
+                                let _ = send.send(result);
+                            }
+                        });
+                        composer.pickers.update(cx, |pickers, cx| {
+                            pickers.refresh_after_wake(&device.id, harness, cx)
+                        });
+                        Ok::<_, String>((receive, observe))
+                    })
+                    .map_err(|error| error.to_string())??;
+                let deadline = cx.background_executor().timer(Duration::from_secs(30));
+                futures::pin_mut!(refresh, deadline);
+                match futures::future::select(refresh, deadline).await {
+                    futures::future::Either::Left((result, _)) => {
+                        result.map_err(|_| "Connection refresh cancelled".to_string())?
+                    }
+                    futures::future::Either::Right(_) => Err(
+                        "Refreshing the connected host timed out. Your draft is preserved.".into(),
+                    ),
+                }
+            }
+            .await;
+            this.update(cx, |composer, cx| {
+                composer.host_wake_target = None;
+                composer.host_wake_task = None;
+                composer.input.update(cx, |input, cx| {
+                    input.read_only = false;
+                    cx.notify();
+                });
+                match result {
+                    Ok(())
+                        if composer.current_key == key
+                            && composer.state.read(cx).active_device_id().as_deref()
+                                == Some(device.id.as_str()) =>
+                    {
+                        composer.slash_cache.clear();
+                        composer.slash_task = None;
+                        composer.mention_task = None;
+                        composer.reset_slash(None, cx);
+                        composer.reset_mention(None, cx);
+                        composer.send_ready(text, queue, cx);
+                    }
+                    Ok(()) => {}
+                    Err(error) => composer.show_error(error, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        if self.sending || self.host_wake_task.is_some() {
+            return;
+        }
+        if self.pickers.read(cx).draft().scaffold_database.is_some()
+            || self.scaffold_admission.is_some()
+            || self
+                .state
+                .read(cx)
+                .selected_chat
+                .as_ref()
+                .is_some_and(|chat| {
+                    crate::settings::current(cx)
+                        .crew_pending_prompts
+                        .contains_key(chat)
+                })
+        {
+            self.send_ready(text, queue, cx);
+            return;
+        }
+        if let Some(device) = self.wakeable_host(cx) {
+            self.wake_before_send(device, text, queue, cx);
+        } else {
+            self.send_ready(text, queue, cx);
+        }
+    }
+
     /// Queue a Run doc command with an optimistic echo — or, with the agent
     /// busy, park the message on the chat's pending queue instead. New chats
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
-        if !self.check_reference_delivery(&text, cx) {
+    fn send_ready(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        if (self.scaffold_admission.as_ref() == self.state.read(cx).selected_chat.as_ref()
+            && self.scaffold_admission.is_some())
+            || self
+                .state
+                .read(cx)
+                .selected_chat
+                .as_ref()
+                .is_some_and(|chat| {
+                    crate::settings::current(cx)
+                        .crew_pending_prompts
+                        .contains_key(chat)
+                })
+        {
+            self.show_error("The initial Crew command has an uncertain outcome. Check session history and delivery status; it will not be replayed.", cx);
+            return;
+        }
+        if self.state.read(cx).selected_chat.is_none()
+            && self.pickers.read(cx).draft().scaffold_database.is_some()
+        {
+            self.provision_scaffold(cx);
+            return;
+        }
+        if self.sending {
+            return;
+        }
+        let wake_binding = self.boat_wake_binding(cx);
+        if wake_binding.is_none() && !self.check_reference_delivery(&text, cx) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -9248,10 +9591,31 @@ impl Composer {
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
-        let plan = self.pickers.read(cx).session_checkout_plan(cx);
+        let plan = self.pickers.read(cx).checkout_plan();
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
-        let resolved = self.pickers.read(cx).resolved(cx);
+        let resolved = self
+            .scaffold_config
+            .as_ref()
+            .filter(|_| self.scaffold_session.as_deref() == Some(chat_id.as_str()))
+            .cloned()
+            .unwrap_or_else(|| self.pickers.read(cx).resolved(cx));
+        if self.state.read(cx).managed_inference {
+            if !matches!(
+                self.state.read(cx).auth,
+                Some(zeron_proto::AuthState::SignedIn { .. })
+            ) {
+                self.show_error("Sign in to Crew before sending in managed mode. Local provider fallback is disabled.", cx);
+                return;
+            }
+            if !matches!(
+                resolved.harness,
+                Some(HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex)
+            ) {
+                self.show_error("This harness is unavailable in Crew managed mode. Select OMP, Claude Code or Codex; existing history remains readable.", cx);
+                return;
+            }
+        }
         let existing_cwd = self
             .state
             .read(cx)
@@ -9263,7 +9627,7 @@ impl Composer {
         // the host and the session runs from `~` there.
         let space = self.state.read(cx).selected_space_row().cloned();
         let local_device_id = self.state.read(cx).local_device_id.clone();
-        let target_device_id = self.state.read(cx).effective_device_id();
+        let target_device_id = self.state.read(cx).active_device_id();
         let device_id = if is_new {
             target_device_id
                 .clone()
@@ -9273,7 +9637,7 @@ impl Composer {
                 .read(cx)
                 .selected_chat_row()
                 .map(|c| c.device_id.clone())
-                .or_else(|| local_device_id.clone())
+                .or_else(|| target_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
         };
         // Uploads/read-backs target the chat's HOST device (forwardable RPCs);
@@ -9287,21 +9651,10 @@ impl Composer {
                 .read(cx)
                 .selected_chat_row()
                 .map(|c| c.device_id.clone())
+                .or_else(|| target_device_id.clone())
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
-        // A host that predates scratch folders runs a projectless chat in `~`.
-        let scratch_folders = {
-            let state = self.state.read(cx);
-            let host = if device_id == "local" {
-                local_device_id.as_deref()
-            } else {
-                Some(device_id.as_str())
-            };
-            host.is_some_and(|host| {
-                state.device_supports(host, zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
-            })
-        };
         let create_side_chat = self.state.update(cx, |state, _| {
             if state.side_chat_unsaved()
                 && let Some(mut config) = resolved.chat_config()
@@ -9315,20 +9668,22 @@ impl Composer {
             }
             state.unsaved_side_chat_create(&chat_id)
         });
-        if queue && !is_new {
-            let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
+        let queue_capability = (queue && !is_new).then(|| {
+            if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
             } else {
                 capabilities::MESSAGE_QUEUE_ATTACHMENTS_V1
-            };
-            if !engine.engine_info().supports(capability)
-                || !self.state.read(cx).chat_host_supports(&chat_id, capability)
-            {
-                self.failure =
-                    Some("Update the chat's engine to queue messages during a response.".into());
-                cx.notify();
-                return;
             }
+        });
+        if wake_binding.is_none()
+            && let Some(capability) = queue_capability
+            && (!engine.engine_info().supports(capability)
+                || !self.state.read(cx).chat_host_supports(&chat_id, capability))
+        {
+            self.failure =
+                Some("Update the chat's engine to queue messages during a response.".into());
+            cx.notify();
+            return;
         }
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
@@ -9370,14 +9725,6 @@ impl Composer {
         // Existing busy chats always queue; compatibility was checked before
         // taking the draft, attachments, or review comments.
         let queue = queue && !is_new;
-        let clean_queue_attachment_text = staged.is_empty()
-            || (engine
-                .engine_info()
-                .supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1)
-                && self.state.read(cx).chat_host_supports(
-                    &chat_id,
-                    capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
-                ));
 
         // Queued-attachment flow (durable-by-design): stage the bytes on the
         // LOCAL engine, queue the command immediately with `pending://` refs,
@@ -9396,7 +9743,7 @@ impl Composer {
         // Appshot XML attributes require escaped final paths. The engine's plain
         // string replacement of pending refs cannot safely rewrite those, so
         // rich captures use the existing upload-before-send path.
-        let queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty() && {
+        let mut queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty() && {
             let state = self.state.read(cx);
             let local_ok = local_device_id
                 .as_deref()
@@ -9421,7 +9768,7 @@ impl Composer {
         // refresh replaces with the host's absolute paths. Either way the
         // staged bytes are seeded into the transcript cache under every
         // device key the transcript consults.
-        let echo_paths: Vec<String> = if queued_flow {
+        let mut echo_paths: Vec<String> = if queued_flow {
             staged
                 .iter()
                 .zip(&upload_ids)
@@ -9438,32 +9785,19 @@ impl Composer {
             .zip(&echo_paths)
             .map(|(attachment, path)| (attachment.id.clone(), path.clone()))
             .collect();
-        let echo_text = attachments::with_attachments(
+        let mut echo_text = attachments::with_attachments(
             &appshots::with_appshots(&text, &staged_appshots, &echo_appshot_paths),
             &echo_paths,
         );
-        // Queued flow also seeds the UPLOAD ALIAS: the host rewrites the
-        // persisted ref to `{its uploads dir}/{id8}-{name}` — an absolute
-        // path the sender can't predict, but whose id8 it minted. The alias
-        // keeps the thumbnail on the already-local bytes through that
-        // rewrite instead of blanking into a reload skeleton.
-        if queued_flow {
-            for (upload_id, att) in upload_ids.iter().zip(&staged) {
-                attachments::seed_staged_alias(&device_id, upload_id, att);
-                if let Some(local) = local_device_id.as_deref()
-                    && local != device_id
-                {
-                    attachments::seed_staged_alias(local, upload_id, att);
-                }
-            }
-        }
-        for (path, att) in echo_paths.iter().zip(&staged) {
-            attachments::seed_staged(&device_id, path, att);
-            if let Some(local) = local_device_id.as_deref()
-                && local != device_id
-            {
-                attachments::seed_staged(local, path, att);
-            }
+        if wake_binding.is_none() {
+            Self::seed_send_attachments(
+                &device_id,
+                local_device_id.as_deref(),
+                &staged,
+                &upload_ids,
+                &echo_paths,
+                queued_flow,
+            );
         }
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
@@ -9481,86 +9815,171 @@ impl Composer {
             continuation_of: None,
             duration_ms: None,
         };
-        self.launching_new_chat = is_new;
-        if is_new {
-            cx.emit(ComposerEvent::NewThreadTransitionStarted);
-        }
-        // A queued message is not in the transcript yet — the queue panel is
-        // its echo, and it gets a real bubble when the host sends it.
-        let creates_chat = is_new || create_side_chat.is_some();
-        let cloud_boot = self.state.update(cx, |s, cx| {
-            if is_new {
-                s.select_chat(Some(chat_id.clone()), cx);
-            }
-            let mut boot = None;
-            if should_publish_optimistic_echo(queue) {
-                s.push_echo(&chat_id, echo);
-                // A send that brings a Cloud machine up shows its first setup
-                // step (below); the machine adds the rest as it gets there.
-                boot = if is_new {
-                    matches!(plan, crate::pickers::CheckoutPlan::Cloud { .. }).then_some(false)
-                } else {
-                    s.cloud_machine_booting(&chat_id)
-                        .map(|state| state != zeron_proto::CloudState::Provisioning)
-                };
-                // Working overlay until the host executes the queued command —
-                // without it a remote send flashed Completed (and could ring
-                // the done-chime) in the queue→drain→sync gap.
-                if creates_chat {
-                    s.begin_first_send(&chat_id, &message_id, chrono::Utc::now());
-                } else {
-                    s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
-                }
-                // A Cloud chat's machine may be starting or asleep: read
-                // where it stands (and follow it until it is up) — and
-                // whether credits allow it to, which can have changed since
-                // the status was last read.
-                if s.cloud_enabled() {
-                    s.refresh_cloud_sessions(cx);
-                    if boot.is_some() {
-                        s.recheck_cloud_credits(cx);
-                    }
-                }
-            }
-            cx.notify();
-            boot
-        });
-        // The setup step arrives a beat after the message, like a turn's
-        // first tool call: the message lands with the working line under
-        // it, then the step reveals above that line.
-        if let Some(waking) = cloud_boot {
-            let state = self.state.clone();
-            let (chat_id, message_id) = (chat_id.clone(), message_id.clone());
-            cx.spawn(async move |_, cx| {
-                cx.background_executor().timer(CLOUD_SETUP_STEP_DELAY).await;
-                state.update(cx, |s, cx| {
-                    s.push_cloud_setup_echo(&chat_id, &message_id, created_at, waking);
-                    cx.notify();
-                });
-            })
-            .detach();
-        }
+        // A sleeping Boat host must be ready before changing the visible
+        // selection or claiming a pending turn. The immutable snapshot
+        // still travels through this same send task and command ledger.
+        let mut deferred_echo = if wake_binding.is_some() {
+            Some(echo)
+        } else {
+            self.publish_send(&chat_id, is_new, queue, echo, cx);
+            None
+        };
 
-        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.input.update(cx, |input, cx| {
+            if wake_binding.is_some() {
+                input.read_only = true;
+                cx.notify();
+            } else {
+                input.set_text("", cx);
+            }
+        });
         self.drafts.remove(&self.current_key);
         self.failure = None;
         self.sending = true;
-        // A queued row is represented by the queue panel, not the transcript.
-        // Claiming an own-turn anchor for it here would replace the live
-        // turn's runway with an id that has no transcript row yet.
-        if should_publish_optimistic_echo(queue) {
-            cx.emit(ComposerEvent::Sent {
-                chat_id: chat_id.clone(),
-                message_id: message_id.clone(),
-            });
-        }
+        let wake_cancel = wake_binding.as_ref().map(|_| {
+            let (cancel, receive) = futures::channel::oneshot::channel();
+            self.boat_wake_cancel = Some((wake_binding.as_ref().unwrap().0.clone(), cancel));
+            receive
+        });
         cx.notify();
 
         let restore_text = typed;
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
+        let scaffold_initial = self.scaffold_session.as_deref() == Some(chat_id.as_str())
+            && self.scaffold_command.is_some();
         self.send_task = Some(cx.spawn(async move |this, cx| {
+            let mut admission_attempted = false;
+            let mut send_started = wake_binding.is_none();
             let result: Result<Option<String>, String> = async {
+                let mut wake_transport = None;
+                if let Some((target, boat)) = &wake_binding {
+                    let wake_executor = cx.background_executor().clone();
+                    let wake = async {
+                        let request = engine.client().call_scoped(methods::WAKE_DEVICE, serde_json::json!({ "deviceId": target }));
+                        let deadline = wake_executor.timer(Duration::from_secs(180));
+                        futures::pin_mut!(request, deadline);
+                        match futures::future::select(request, deadline).await {
+                            futures::future::Either::Left((result, _)) => result.map_err(|error| error.to_string()),
+                            futures::future::Either::Right(_) => Err("Connecting to the selected Boat host timed out. Your draft is preserved.".to_string()),
+                        }
+                    };
+                    let cancel = wake_cancel.expect("Boat wake has a cancellation receiver");
+                    futures::pin_mut!(wake, cancel);
+                    let ready = match futures::future::select(cancel.as_mut(), wake).await {
+                        futures::future::Either::Left(_) => return Err("Connection cancelled. Your draft is preserved.".into()),
+                        futures::future::Either::Right((result, _)) => result?,
+                    };
+                    if ready["ready"].as_bool() != Some(true)
+                        || ready["deviceId"].as_str() != Some(target.as_str())
+                        || ready["devboxProvider"].as_str() != Some("boat")
+                        || ready["devboxId"].as_str() != Some(boat.as_str()) {
+                        return Err("The connected device does not match the selected Boat host. Nothing was sent.".into());
+                    }
+                    let device = <zeron_proto::Device as serde::Deserialize>::deserialize(&ready["device"])
+                        .map_err(|error| format!("Could not read the connected device: {error}"))?;
+                    if device.id != *target || device.devbox_binding() != Some((zeron_proto::DeviceEnvironment::Boat, boat.as_str())) {
+                        return Err("The connected device snapshot does not match the selected Boat host. Nothing was sent.".into());
+                    }
+                    let references_supported = device.supports(capabilities::COMPOSER_REFERENCES_V1);
+                    let queue_supported = queue_capability.is_none_or(|capability| engine.engine_info().supports(capability) && device.supports(capability));
+                    wake_transport = Some((device.supports(capabilities::PROJECTLESS_SCRATCH_V1),
+                        staged.is_empty() || (engine.engine_info().supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1)
+                            && device.supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1))));
+                    let (refresh, _observe) = this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |state, cx| {
+                            let mut devices = state.devices.clone();
+                            let slot = devices.iter_mut().find(|row| row.id == *target)
+                                .filter(|row| row.devbox_binding() == Some((zeron_proto::DeviceEnvironment::Boat, boat.as_str())))
+                                .ok_or_else(|| "The selected host binding changed. Nothing was sent.".to_string())?;
+                            *slot = device;
+                            state.apply_devices(devices);
+                            let fresh_queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty()
+                                && local_device_id.as_deref().is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN))
+                                && (!host_is_remote || host_device_id.as_deref().is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN)));
+                            if queued_flow != fresh_queued_flow {
+                                queued_flow = fresh_queued_flow;
+                                for ((path, attachment), upload_id) in echo_paths.iter_mut().zip(&staged).zip(&upload_ids) {
+                                    *path = if queued_flow { format!("pending://{upload_id}/{}", attachment.name) }
+                                        else { format!("pending/{}/{}", attachment.id, attachment.name) };
+                                }
+                                // This transport can change only for plain attachments;
+                                // appshots always use the host-upload path.
+                                echo_text = attachments::with_attachments(&text, &echo_paths);
+                                if let MessagePart::Text { text, .. } = &mut deferred_echo.as_mut().expect("Boat echo is deferred").parts[0] {
+                                    text.clone_from(&echo_text);
+                                }
+                            }
+                            cx.notify();
+                            Ok::<(), String>(())
+                        })?;
+                        let (send, receive) = futures::channel::oneshot::channel();
+                        let mut send = Some(send);
+                        let refresh_target = target.clone();
+                        let harness = resolved.harness;
+                        let observe = cx.observe(&composer.pickers, move |composer, _, cx| {
+                            if let Some(result) = composer.pickers.read(cx).wake_refresh_result(&refresh_target, harness, cx)
+                                && let Some(send) = send.take() { let _ = send.send(result); }
+                        });
+                        composer.pickers.update(cx, |pickers, cx| pickers.refresh_after_wake(target, harness, cx));
+                        Ok::<_, String>((receive, observe))
+                    }).map_err(|error| error.to_string())??;
+                    let refresh = async { refresh.await.map_err(|_| "Connection refresh cancelled".to_string())? };
+                    let timeout = cx.background_executor().timer(Duration::from_secs(30));
+                    futures::pin_mut!(refresh, timeout);
+                    let refresh = futures::future::select(refresh, timeout);
+                    futures::pin_mut!(refresh);
+                    match futures::future::select(cancel.as_mut(), refresh).await {
+                        futures::future::Either::Left(_) => return Err("Connection cancelled. Your draft is preserved.".into()),
+                        futures::future::Either::Right((futures::future::Either::Left((result, _)), _)) => result?,
+                        futures::future::Either::Right(_) => return Err("Refreshing the connected device timed out. Your draft is preserved.".into()),
+                    }
+                    this.update(cx, |composer, cx| {
+                        let state = composer.state.read(cx);
+                        if composer.current_key != key || state.active_device_id().as_deref() != Some(target.as_str())
+                            || !state.devices.iter().any(|row| row.id == *target
+                                && row.devbox_binding() == Some((zeron_proto::DeviceEnvironment::Boat, boat.as_str())))
+                            || composer.boat_wake_cancel.is_none()
+                        {
+                            return Err("The selected host or binding changed. Your draft is preserved.".to_string());
+                        }
+                        composer.boat_wake_cancel = None;
+                        if references_require_update(&text, references_supported) {
+                            return Err("Update Crew on the selected device to send file, command, or skill references. Your draft is preserved.".to_string());
+                        }
+                        if !queue_supported {
+                            return Err("Update Crew on the chat's host to queue messages during a response.".to_string());
+                        }
+                        composer.input.update(cx, |input, cx| {
+                            input.read_only = false;
+                            if composer.current_key == key { input.set_text("", cx); }
+                        });
+                        composer.slash_cache.clear();
+                        composer.slash_task = None;
+                        composer.mention_task = None;
+                        composer.reset_slash(None, cx);
+                        composer.reset_mention(None, cx);
+                        let select_new = is_new && composer.current_key == key
+                            && composer.state.read(cx).selected_chat.is_none()
+                            && composer.state.read(cx).active_device_id().as_deref() == Some(target.as_str());
+                        Self::seed_send_attachments(&device_id, local_device_id.as_deref(), &staged, &upload_ids, &echo_paths, queued_flow);
+                        composer.publish_send(&chat_id, select_new, queue, deferred_echo.expect("Boat send defers its echo"), cx);
+                        cx.notify();
+                        Ok::<(), String>(())
+                    }).map_err(|error| error.to_string())??;
+                    send_started = true;
+                }
+                // Freeze user choices and payload, not compatibility decisions:
+                // a wake reply may upgrade or remove the host's declarations.
+                let (scratch_folders, clean_queue_attachment_text) = if let Some(transport) = wake_transport { transport }
+                else { this.update(cx, |composer, cx| {
+                    let state = composer.state.read(cx);
+                    let host = if device_id == "local" { local_device_id.as_deref() } else { Some(device_id.as_str()) };
+                    let scratch = host.is_some_and(|host| state.device_supports(host, capabilities::PROJECTLESS_SCRATCH_V1));
+                    let clean_queue = staged.is_empty() || (engine.engine_info().supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1)
+                        && state.chat_host_supports(&chat_id, capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1));
+                    (scratch, clean_queue)
+                }).map_err(|error| error.to_string())? };
                 // Attachments stage FIRST — before the chat row or anything
                 // else exists. Staging is chat-independent (keyed by
                 // uploadId), and ordering it first makes a new-chat send
@@ -9599,6 +10018,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             None,
+                            &chat_id,
                             upload_id,
                             att,
                             Some(progress.clone()),
@@ -9634,6 +10054,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &chat_id,
                             upload_id,
                             att,
                             Some(progress.clone()),
@@ -9732,17 +10153,10 @@ impl Composer {
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
                 let mut chat_branch: Option<String> = None;
-                // Cloud: the chat gets its own Cloud machine; its host and
-                // cwd come back from createChat.
-                let mut on_cloud = false;
                 if is_new && space_path.is_some() {
                     match &plan {
                         crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();
-                        }
-                        crate::pickers::CheckoutPlan::Cloud { branch } => {
-                            chat_branch = branch.clone();
-                            on_cloud = true;
                         }
                         crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
                             cwd = path.clone();
@@ -9823,11 +10237,8 @@ impl Composer {
                         {
                             object.insert("config".into(), config);
                         }
-                        if on_cloud {
-                            object.insert("cloud".into(), serde_json::Value::Bool(true));
-                        }
                     }
-                    match attachments::call_with_timeout(
+                    if let Err(err) = attachments::call_with_timeout(
                         &engine,
                         cx.background_executor(),
                         methods::MUTATE,
@@ -9836,20 +10247,7 @@ impl Composer {
                     )
                     .await
                     {
-                        // A Cloud chat runs in its machine's checkout.
-                        Ok(reply) if on_cloud => {
-                            if let Some(machine_cwd) = reply.get("cwd").and_then(|v| v.as_str()) {
-                                cwd = machine_cwd.to_string();
-                            }
-                        }
-                        Ok(_) => {}
-                        // No machine, no session: say why (Cloud can't
-                        // reach the repository, Cloud is off, …) instead of
-                        // queueing a run nobody will pick up.
-                        Err(err) if on_cloud => return Err(err),
-                        Err(err) => {
-                            tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
-                        }
+                        tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
                     }
                 }
                 // A hand-started side chat is minted by its first send. Unlike
@@ -9895,6 +10293,7 @@ impl Composer {
                         "chatId": chat_id,
                         "text": queue_text,
                         "attachments": attachment_paths,
+                        "targetDeviceId": host_device_id,
                         "holdForTurnEnd": true,
                     });
                     let reply = engine
@@ -9928,18 +10327,28 @@ impl Composer {
                         resume: None,
                         attachments: attachment_paths,
                         worktree: run_worktree,
-                        env: Default::default(),
                     },
                     message_id: message_id.clone(),
                 };
                 let command = serde_json::to_value(&command)
                     .map_err(|e| format!("Send failed: {e}"))?;
                 let mut params = serde_json::json!({ "chatId": chat_id, "command": command });
+                if let Some(target) = &host_device_id {
+                    params["targetDeviceId"] = target.clone().into();
+                }
                 if !transfers.is_empty() {
                     params["transfers"] = serde_json::Value::Array(transfers);
                 }
                 // Deadline-bounded: QueueCommand is a local write (in-process
                 // or IPC), but a deferred engine handle can park forever.
+                if scaffold_initial {
+                    this.update(cx, |_, cx| {
+                        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                            settings.crew_pending_prompts.insert(chat_id.clone(), message_id.clone());
+                        });
+                    }).map_err(|e| e.to_string())?;
+                    admission_attempted = true;
+                }
                 let queued = attachments::call_with_timeout(
                     &engine,
                     cx.background_executor(),
@@ -10023,7 +10432,7 @@ impl Composer {
                 Ok(None)
             }
             .await;
-            if result.is_err() && is_new {
+            if result.is_err() && is_new && send_started {
                 // A failed new-chat send must not strand a just-minted empty
                 // chat in the sidebar (v0.2.12 "empty transcript" report).
                 // Staging now runs before CreateChat, so usually nothing was
@@ -10041,6 +10450,18 @@ impl Composer {
             }
             this.update(cx, |composer, cx| {
                 composer.sending = false;
+                composer.boat_wake_cancel = None;
+                if wake_binding.is_some() { composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); }); }
+                if scaffold_initial && (result.is_ok() || !admission_attempted) {
+                    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                        if settings.crew_pending_prompts.get(&err_chat_id) == Some(&err_message_id) {
+                            settings.crew_pending_prompts.remove(&err_chat_id);
+                        }
+                    });
+                    if composer.scaffold_session.as_deref() == Some(err_chat_id.as_str()) {
+                        composer.finish_scaffold_provisioning(cx);
+                    }
+                }
                 composer
                     .state
                     .update(cx, |s, _| s.end_upload_progress());
@@ -10065,10 +10486,6 @@ impl Composer {
                     composer.failure_key = Some(restore_key.clone());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
-                        s.remove_echo(
-                            &err_chat_id,
-                            &zeron_proto::cloud_setup_entry_id(&err_message_id),
-                        );
                         s.end_pending_send(&err_chat_id, &err_message_id);
                         if is_new && s.selected_chat.as_deref() == Some(err_chat_id.as_str()) {
                             // Back to the canvas; the navigation draft-swap
@@ -10080,18 +10497,18 @@ impl Composer {
                         }
                         cx.notify();
                     });
-                    if is_new && composer.current_key != restore_key {
-                        // A re-key swap to the canvas is pending (the
-                        // select_chat(None) above); it loads this draft into
-                        // the input on flush — setting the input directly
-                        // here would be clobbered by that same swap.
+                    if composer.current_key != restore_key {
+                        // Navigation may already have loaded another draft.
+                        // Restore only the origin slot, never that visible input.
                         composer.drafts.insert(restore_key.clone(), restore_text.clone());
                     } else {
                         // Already keyed to the restore target (either an
                         // existing chat, or the deleted row's watch event
                         // re-keyed to the canvas before this handler ran —
                         // no further swap will fire). Set the input directly.
-                        composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                        if composer.input.read(cx).text() != restore_text {
+                            composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                        }
                     }
                     if !ordinary_staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
@@ -11161,16 +11578,12 @@ impl Composer {
                 // Share the submission guard with Enter, including pending
                 // edits and the new-session runnable-agent check.
                 let blocked = self.send_blocked(cx);
-                // Dimmed when out of Cloud credits, but a click still says why.
-                let explains = self.out_of_cloud_credits(cx);
                 send_circle("composer-send", blocked, theme)
-                    .when(!blocked || explains, |el| {
+                    .when(!blocked, |el| {
                         el.on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
                     .tooltip(crate::settings::widgets::text_tooltip(
-                        if self.out_of_cloud_credits(cx) {
-                            "Out of Cloud credits"
-                        } else if mode == SendButtonMode::Queue {
+                        if mode == SendButtonMode::Queue {
                             "Queue message"
                         } else {
                             "Send message"
@@ -11419,28 +11832,43 @@ impl Render for Composer {
         let expanded = self.expanded_mode;
 
         let failure = self.visible_failure();
-        let queue_notice = self.current_link_notice(cx);
-        let queue_notice_glyph = queue_notice.as_ref().map(|notice| match notice.glyph {
-            NoticeGlyph::Spinner => crate::loaders::mini_mono_spinner(
-                "composer-link-spinner",
-                2.0,
-                theme.text_muted,
-                cx.entity_id(),
-                cx,
-            )
-            .into_any_element(),
-            NoticeGlyph::Dot | NoticeGlyph::WarningDot => div()
-                .size(px(5.0))
-                .rounded_full()
-                .bg(if notice.glyph == NoticeGlyph::WarningDot {
-                    theme.warning
+        // Composer honesty: when the target's delivery path is degraded, say
+        // UP FRONT that a send will queue (a durable local write delivered on
+        // reconnect) instead of letting the button imply instant delivery.
+        let queue_notice: Option<(SharedString, bool)> = {
+            use zeron_proto::ConnectivityState as S;
+            let state = self.state.read(cx);
+            let degraded = match state.selected_chat.as_deref() {
+                Some(id) => state.chat_delivery_degraded(id),
+                None => {
+                    // New-chat canvas: judge by the picked target device.
+                    let remote_target = state
+                        .effective_device_id()
+                        .is_some_and(|id| state.local_device_id.as_deref() != Some(id.as_str()));
+                    remote_target
+                        && (matches!(state.connectivity.state, S::Offline | S::Reconnecting)
+                            || state
+                                .effective_device_id()
+                                .is_some_and(|id| !state.device_online(&id, chrono::Utc::now())))
+                }
+            };
+            let offline = state.connectivity.state == S::Offline;
+            degraded.then(|| {
+                let text: SharedString = if self.boat_wake_cancel.is_some() {
+                    "Connecting to the selected Boat host…".into()
+                } else if self.boat_wake_binding(cx).is_some() {
+                    "Send will connect to the selected Boat host first.".into()
+                } else if offline {
+                    "Offline — messages will send when you're back online.".into()
                 } else {
-                    theme.text_faint
-                })
-                .into_any_element(),
-        });
+                    "Messages will send once the connection recovers.".into()
+                };
+                (text, offline)
+            })
+        };
         // The shell owns the width and its route animation. A route-dependent
         // cap here would cut a wide composer before its return glide finishes.
+        let cancel_wake = cx.entity().downgrade();
         let container = div()
             .w_full()
             .max_w(px(self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH)))
@@ -11450,6 +11878,57 @@ impl Render for Composer {
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
+            .when(self.boat_wake_cancel.is_some(), |el| {
+                el.child(
+                    div()
+                        .mx(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Connecting…")
+                        .child(
+                            crate::settings::widgets::text_action(
+                                &theme,
+                                crate::settings::widgets::ActionTone::Quiet,
+                                "Cancel",
+                            )
+                            .id("cancel-boat-send")
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label("Cancel connection and keep draft")
+                            .focus_visible(|style| style.border_2().border_color(theme.accent))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_boat_wake(cx)))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    cx.stop_propagation();
+                                    this.cancel_boat_wake(cx);
+                                }
+                            }))
+                            .on_a11y_action(
+                                gpui::AccessibleAction::Click,
+                                move |_, _, cx| {
+                                    cancel_wake
+                                        .update(cx, |this, cx| this.cancel_boat_wake(cx))
+                                        .ok();
+                                },
+                            ),
+                        ),
+                )
+            })
+            .when(self.host_wake_task.is_some(), |el| {
+                el.child(
+                    div()
+                        .id("host-wake-cancel")
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .aria_label("Cancel host connection")
+                        .child("Connecting to host… Cancel")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_host_wake(cx))),
+                )
+            })
             .when_some(failure, |el, message| {
                 // Amber with "Warning" for the offline-ish case (engine not
                 // connected), red with "Error" for send/run failures. Click
@@ -11474,30 +11953,32 @@ impl Render for Composer {
                     })),
                 )
             })
-            .when_some(
-                queue_notice.zip(queue_notice_glyph),
-                |el, (notice, glyph)| {
-                    // Not a warning box (v0.2.12 feedback: the amber Notice read
-                    // as an error and flashed on every blip — pre-grace). One
-                    // quiet caption line, amber dot only for hard offline; it
-                    // clears itself the moment the path heals.
-                    el.child(crate::motion::fade_in(
-                        "composer-queue-notice",
-                        div()
-                            .id("composer-queue-notice")
-                            .mx(px(8.0))
-                            .mt(px(6.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .text_color(theme.text_faint)
-                            .child(glyph)
-                            .child(div().min_w_0().truncate().child(notice.text)),
-                    ))
-                },
-            );
+            .when_some(queue_notice, |el, (notice, offline)| {
+                // Not a warning box (v0.2.12 feedback: the amber Notice read
+                // as an error and flashed on every blip — pre-grace). One
+                // quiet caption line, amber dot only for hard offline; it
+                // clears itself the moment the path heals.
+                let dot = if offline {
+                    theme.warning
+                } else {
+                    theme.text_faint
+                };
+                el.child(crate::motion::fade_in(
+                    "composer-queue-notice",
+                    div()
+                        .id("composer-queue-notice")
+                        .mx(px(8.0))
+                        .mt(px(6.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(11.0))
+                        .line_height(px(14.0))
+                        .text_color(theme.text_faint)
+                        .child(div().size(px(5.0)).rounded_full().bg(dot))
+                        .child(div().min_w_0().truncate().child(notice)),
+                ))
+            });
 
         if wizard_active {
             let wizard = self.render_wizard(cx);
@@ -11840,6 +12321,36 @@ impl Render for Composer {
         let strip = self.render_attachment_strip(&theme, cx);
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
+        let quote_selection = crate::settings::widgets::ghost_action(&theme)
+            .id("comment-on-selection")
+            .role(gpui::Role::Button)
+            .aria_label("Comment on selected transcript text")
+            .tab_index(0)
+            .focus_visible(|style| style.border_2().border_color(theme.accent))
+            .tooltip(crate::settings::widgets::text_tooltip(
+                "Add selected text to your next message, then write a note",
+            ))
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                let Some(selected) = crate::markdown::selection::selected_text() else {
+                    this.show_error("Select transcript text first, then choose Comment.", cx);
+                    return;
+                };
+                let draft = this.input.read(cx).text().to_owned();
+                let quoted = selected
+                    .lines()
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                this.input.update(cx, |input, cx| {
+                    input.set_text(format!("{draft}\n\nSelected context:\n{quoted}\n\n"), cx)
+                });
+                window.focus(&this.input.focus_handle(cx), cx);
+            }))
+            .child(crate::icons::icon(crate::icons::CHAT_ROUND_LINE).size(px(15.0)));
 
         let pill_border = theme.composer_surface_border();
         // Compensate for the transcript canvas beneath the frosted surface.
@@ -11976,7 +12487,8 @@ impl Render for Composer {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(attach),
+                                .child(attach)
+                                .child(quote_selection),
                         )
                         .child(model_picker)
                         .child(
@@ -12030,7 +12542,8 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(attach),
+                                .child(attach)
+                                .child(quote_selection),
                         )
                         .child(
                             div()
@@ -12362,80 +12875,6 @@ mod tests {
                     .unwrap(),
                 ""
             );
-        }
-    }
-
-    #[gpui::test]
-    fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (_dir, handle) = composer_focus_window(cx);
-        let input = handle
-            .read_with(cx, |composer, _| composer.input.clone())
-            .unwrap();
-        // The trigger stays beside Send whichever picker the chip opens.
-        for compact_picker in [false, true] {
-            cx.update(|cx| {
-                crate::settings::update(crate::settings::SavePolicy::Debounced, cx, |settings| {
-                    settings.compact_model_picker = compact_picker;
-                });
-            });
-            for thread_width in [436.0, 592.0, 768.0, 1232.0] {
-                for docked in [true, false] {
-                    let amounts = if docked {
-                        [0.0, 0.2, 0.6, 0.98, 1.0]
-                    } else {
-                        [1.0, 0.98, 0.6, 0.2, 0.0]
-                    };
-                    for amount in amounts {
-                        let outer_width = motion::lerp(COMPOSER_MAX_WIDTH, thread_width, amount);
-                        cx.update(|cx| {
-                        handle
-                            .update(cx, |composer, window, cx| {
-                                window.resize(size(px(outer_width), px(800.0)));
-                                composer.set_available_width(outer_width, cx);
-                                composer.state.update(cx, |state, _| {
-                                    state.selected_chat = docked.then(|| "chat".into());
-                                });
-                                composer.on_state_changed(cx);
-                                composer
-                                    .input
-                                    .update(cx, |input, cx| input.set_text("Hi", cx));
-                                composer.expanded_mode = false;
-                                let mut frame = crate::composer_dock::DockFrame::settled(docked);
-                                frame.amount = amount;
-                                frame.active = amount != if docked { 1.0 } else { 0.0 };
-                                composer.set_dock_frame(frame, cx);
-                            })
-                            .unwrap();
-                        cx.update_window(handle.into(), |_, window, cx| {
-                            window.refresh();
-                            window.draw(cx).clear();
-                        })
-                        .unwrap();
-                        // Inspect the first painted frame before TestAppContext
-                        // flushes effects and automatically draws dirty views.
-                        handle.read_with(cx, |composer, cx| {
-                        assert_eq!(composer.input, input);
-                        let surface = composer.surface_bounds.get().unwrap();
-                        assert!((f32::from(surface.size.width) - (outer_width - 2.0 * Theme::SPACE_LG)).abs() <= 1.0,
-                            "surface width clipped: docked={docked}, amount={amount}, outer={outer_width}, surface={surface:?}");
-                        let origin = input.read(cx).last_bounds.unwrap().origin;
-                        assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
-                            "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
-                        let model = composer.model_bounds.get().unwrap();
-                        let inset = motion::lerp(12.0, 8.0, amount);
-                        let expected_right = surface.right() - px(1.0 + inset + 28.0 + ACTION_PRIMARY_GAP);
-                        assert!((f32::from(model.right() - expected_right)).abs() <= 1.0,
-                            "model must stay right aligned: compact_picker={compact_picker}, docked={docked}, amount={amount}, actual={model:?}, expected={expected_right:?}");
-                        let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
-                        assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
-                        assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
-                            }).unwrap();
-                        });
-                    }
-                }
-            }
         }
     }
 
@@ -12975,6 +13414,134 @@ mod tests {
     }
 
     #[gpui::test]
+    fn rejected_scaffold_create_releases_database_choice_but_unknown_and_attach_do_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("keep my prompt", cx));
+            composer.attachments.insert(
+                composer.current_key.clone(),
+                vec![attachments::stage_png_bytes("draft.png".into(), Vec::new())],
+            );
+            for (command, status, released) in [
+                ("one:create", "unknown", false),
+                ("one:create:attach", "rejected", false),
+                ("one:create", "rejected", true),
+            ] {
+                composer.scaffold_command = Some(command.into());
+                composer.scaffold_recovery_key = Some("scope".into());
+                composer.scaffold_session = Some("session".into());
+                composer.scaffold_config = Some(Default::default());
+                composer.scaffold_database =
+                    Some(zeron_proto::ScaffoldDatabaseEnvironment::StagingSnapshot);
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings
+                        .crew_recovery_commands
+                        .insert("scope".into(), command.into());
+                });
+                composer.retire_rejected_scaffold_create(
+                    &crate::settings::crew::Outcome {
+                        command_id: command.into(),
+                        status: status.into(),
+                        result: None,
+                        error: Some("Unsupported database".into()),
+                    },
+                    cx,
+                );
+                assert_eq!(composer.scaffold_command.is_none(), released);
+                assert_eq!(composer.scaffold_recovery_key.is_none(), released);
+                assert_eq!(composer.scaffold_session.is_none(), released);
+                assert_eq!(composer.scaffold_config.is_none(), released);
+                // The same guard used before submission now permits changing to Local.
+                assert_eq!(
+                    !composer.scaffold_database.is_some_and(
+                        |database| database != zeron_proto::ScaffoldDatabaseEnvironment::Local
+                    ),
+                    released
+                );
+                assert_eq!(
+                    !crate::settings::current(cx)
+                        .crew_recovery_commands
+                        .contains_key("scope"),
+                    released
+                );
+                assert_eq!(composer.input.read(cx).text(), "keep my prompt");
+                assert_eq!(composer.staged().len(), 1);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn observed_scaffold_prompt_clears_completed_provisioning_without_clearing_another_command(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        for newer_command in [false, true] {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("session".into());
+                state.transcript = vec![SessionMessageEntry {
+                    id: "initial-message".into(),
+                    role: MessageRole::User,
+                    parts: vec![],
+                    created_at: 0,
+                    device_id: "remote".into(),
+                    status: None,
+                    continuation_of: None,
+                    duration_ms: None,
+                }];
+                state
+            });
+            let composer = cx.new(|cx| Composer::new(state, cx));
+            composer.update(cx, |composer, cx| {
+                composer.scaffold_command = Some("one:create:attach".into());
+                composer.scaffold_recovery_key = Some("scope".into());
+                composer.scaffold_session = Some("session".into());
+                composer.scaffold_config = Some(Default::default());
+                composer.scaffold_database = Some(zeron_proto::ScaffoldDatabaseEnvironment::Local);
+                composer.scaffold_admission = Some("session".into());
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings
+                        .crew_pending_prompts
+                        .insert("session".into(), "initial-message".into());
+                    settings.crew_recovery_commands.insert(
+                        "scope".into(),
+                        if newer_command {
+                            "another-command"
+                        } else {
+                            "one:create:attach"
+                        }
+                        .into(),
+                    );
+                });
+                composer.on_state_changed(cx);
+                assert!(composer.scaffold_command.is_none());
+                assert!(composer.scaffold_recovery_key.is_none());
+                assert!(composer.scaffold_session.is_none());
+                assert!(composer.scaffold_config.is_none());
+                assert!(composer.scaffold_database.is_none());
+                assert!(composer.scaffold_admission.is_none());
+                let settings = crate::settings::current(cx);
+                assert!(!settings.crew_pending_prompts.contains_key("session"));
+                assert_eq!(
+                    settings
+                        .crew_recovery_commands
+                        .get("scope")
+                        .map(String::as_str),
+                    newer_command.then_some("another-command")
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
     fn workspace_command_submission_is_local_and_preserves_drafts(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         let composer = cx.new(|cx| Composer::new(state, cx));
@@ -13093,6 +13660,395 @@ mod tests {
     }
 
     #[gpui::test]
+    fn boat_send_waits_for_exact_peer_and_preserves_failed_or_cancelled_drafts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        for outcome in [
+            "failed",
+            "new-chat-failed",
+            "wrong-peer",
+            "wrong-snapshot",
+            "binding-changed",
+            "binding-refresh-changed",
+            "cancelled",
+            "timeout",
+            "cancel-refresh",
+            "refresh-failed",
+            "ready",
+        ] {
+            let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+            let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, _| {
+                state.local_device_id = Some("controller".into());
+                state.devices = vec![serde_json::from_value(serde_json::json!({
+                    "id": "boat-host", "name": "Anything", "platform": "linux",
+                    "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "lastSeenAt": null,
+                })).unwrap()];
+                state.chats = vec![serde_json::from_value(serde_json::json!({
+                    "id": "boat-chat", "deviceId": "boat-host", "cwd": "/workspace",
+                    "archived": false, "createdAt": chrono::Utc::now(),
+                    "config": { "harness": "codex", "model": "original-model", "sandbox": "workspace-write" },
+                })).unwrap()];
+                state.selected_chat = Some("boat-chat".into());
+                if outcome == "new-chat-failed" { state.selected_chat = None; state.selected_device = Some("boat-host".into()); }
+                state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
+            });
+            let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+            composer.update(cx, |composer, cx| {
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("Original immutable message", cx);
+                    input.selected_range = 4..12;
+                });
+                composer.pickers.update(cx, |pickers, cx| {
+                    pickers.refresh_after_wake("boat-host", Some(HarnessId::Codex), cx)
+                });
+                composer.on_state_changed(cx);
+            });
+            cx.run_until_parked();
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                assert_ne!(
+                    frame.method.as_deref(),
+                    Some(methods::WAKE_DEVICE),
+                    "passive discovery must not wake"
+                );
+                assert_ne!(frame.method.as_deref(), Some(methods::QUEUE_COMMAND));
+            }
+            composer.update(cx, |composer, cx| {
+                if outcome != "ready" {
+                    composer.attachments.insert(
+                        composer.current_key.clone(),
+                        vec![attachments::stage_png_bytes(
+                            "keep.png".into(),
+                            vec![1, 2, 3],
+                        )],
+                    );
+                }
+                composer.on_submit(cx);
+                composer.on_submit(cx);
+            });
+            cx.run_until_parked();
+            let mut wake = None;
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                assert_ne!(frame.method.as_deref(), Some(methods::QUEUE_COMMAND));
+                assert_ne!(frame.method.as_deref(), Some(methods::MUTATE));
+                if frame.method.as_deref() == Some(methods::WAKE_DEVICE) {
+                    assert!(wake.is_none(), "double Enter must share the pending send");
+                    assert_eq!(frame.params, serde_json::json!({"deviceId": "boat-host"}));
+                    wake = Some(frame);
+                }
+            }
+            let wake = wake.expect("explicit Send must wake the bound offline host");
+            let selection = if outcome == "new-chat-failed" {
+                None
+            } else {
+                Some("boat-chat")
+            };
+            assert_eq!(
+                state
+                    .read_with(cx, |state, _| state.selected_chat.clone())
+                    .as_deref(),
+                selection
+            );
+            if outcome == "binding-changed" {
+                state.update(cx, |state, cx| {
+                    state.devices[0].devbox_id = Some("bx_23456789".into());
+                    cx.notify();
+                });
+            }
+            if outcome == "ready" {
+                state.update(cx, |state, cx| {
+                    let mut config = state.selected_chat_row().unwrap().config.clone().unwrap();
+                    config.model = Some("changed-after-send".into());
+                    state.apply_chat_config("boat-chat", config);
+                    cx.notify();
+                });
+            }
+            if outcome == "timeout" {
+                cx.executor().advance_clock(Duration::from_secs(180));
+            } else if outcome == "cancelled" {
+                composer.update(cx, |composer, cx| composer.cancel_boat_wake(cx));
+            } else {
+                let frame = if matches!(outcome, "failed" | "new-chat-failed") {
+                    zeron_rpc::ServerFrame {
+                        id: wake.id,
+                        err: Some("provider refused wake".into()),
+                        ..Default::default()
+                    }
+                } else {
+                    zeron_rpc::ServerFrame {
+                        id: wake.id,
+                        ok: Some(serde_json::json!({
+                            "deviceId": if outcome == "wrong-peer" { "another-host" } else { "boat-host" },
+                            "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "ready": true,
+                            "device": { "id": if outcome == "wrong-snapshot" { "another-host" } else { "boat-host" },
+                                "name": "Authoritative Boat", "platform": "linux", "version": "0.2.113",
+                                "lastSeenAt": chrono::Utc::now(), "devboxProvider": "boat", "devboxId": "bx_jdyh7avc" },
+                        })),
+                        ..Default::default()
+                    }
+                };
+                replies
+                    .try_send(serde_json::to_string(&frame).unwrap())
+                    .unwrap();
+            }
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+            let mut commands = Vec::new();
+            let mut cancelled_wake = false;
+            for _ in 0..3 {
+                while let Ok(frame) = requests.try_recv() {
+                    let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                    if frame.cancel && frame.id == wake.id {
+                        cancelled_wake = true;
+                    }
+                    assert_ne!(frame.method.as_deref(), Some(methods::WAKE_DEVICE));
+                    if outcome != "ready" {
+                        assert_ne!(frame.method.as_deref(), Some(methods::MUTATE));
+                    }
+                    if frame.method.as_deref() == Some(methods::QUEUE_COMMAND) {
+                        commands.push(frame);
+                        continue;
+                    }
+                    if matches!(
+                        frame.method.as_deref(),
+                        Some(methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_REFS)
+                    ) {
+                        assert_eq!(frame.params["targetDeviceId"], "boat-host");
+                        assert!(
+                            commands.is_empty(),
+                            "catalog refresh must precede command admission"
+                        );
+                        if outcome == "binding-refresh-changed" {
+                            state.update(cx, |state, cx| {
+                                state.devices[0].devbox_id = Some("bx_23456789".into());
+                                cx.notify();
+                            });
+                        }
+                        if outcome == "cancel-refresh" {
+                            composer.update(cx, |composer, cx| composer.cancel_boat_wake(cx));
+                        } else {
+                            let reply = if outcome == "refresh-failed" {
+                                zeron_rpc::ServerFrame {
+                                    id: frame.id,
+                                    err: Some("catalog unavailable".into()),
+                                    ..Default::default()
+                                }
+                            } else {
+                                zeron_rpc::ServerFrame {
+                                    id: frame.id,
+                                    ok: Some(serde_json::json!([])),
+                                    ..Default::default()
+                                }
+                            };
+                            replies
+                                .try_send(serde_json::to_string(&reply).unwrap())
+                                .unwrap();
+                        }
+                    }
+                }
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+            }
+            assert_eq!(cancelled_wake, matches!(outcome, "cancelled" | "timeout"));
+            if outcome == "ready" {
+                let [command] = commands.as_slice() else {
+                    panic!("expected exactly one command: {commands:?}");
+                };
+                assert_eq!(command.params["chatId"], "boat-chat");
+                assert_eq!(
+                    command.params["command"]["request"]["prompt"],
+                    "Original immutable message"
+                );
+                assert_eq!(
+                    command.params["command"]["request"]["model"],
+                    "original-model"
+                );
+            } else {
+                assert!(commands.is_empty());
+                composer.read_with(cx, |composer, cx| {
+                    assert!(!composer.sending);
+                    assert_eq!(composer.input.read(cx).text(), "Original immutable message");
+                    assert_eq!(composer.staged().len(), 1);
+                    assert_eq!(composer.input.read(cx).selected_range, 4..12);
+                    assert!(!composer.input.read(cx).read_only);
+                    assert!(composer.failure.is_some());
+                    if matches!(outcome, "failed" | "new-chat-failed") {
+                        assert!(
+                            composer
+                                .failure
+                                .as_deref()
+                                .unwrap()
+                                .contains("provider refused wake")
+                        );
+                    }
+                    if outcome == "refresh-failed" {
+                        assert!(
+                            composer
+                                .failure
+                                .as_deref()
+                                .unwrap()
+                                .contains("catalog unavailable")
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn boat_admission_uses_authoritative_transport_capabilities(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        for mode in ["scratch", "queue", "attachment"] {
+            for supported in [false, true] {
+                let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+                let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+                let caps = |current: bool| {
+                    let mut caps = vec![capabilities::MESSAGE_QUEUE_ATTACHMENTS_V1.to_string()];
+                    if current {
+                        caps.push(capabilities::PROJECTLESS_SCRATCH_V1.to_string());
+                        caps.push(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1.to_string());
+                    }
+                    caps
+                };
+                let state = cx.new(|_| AppState::new());
+                state.update(cx, |state, _| {
+                    state.local_device_id = Some("controller".into());
+                    state.selected_device = Some("boat-host".into());
+                    state.no_project = true;
+                    state.devices = serde_json::from_value(serde_json::json!([
+                        { "id": "controller", "name": "Controller", "platform": "macos", "version": "0.2.113" },
+                        { "id": "boat-host", "name": "Boat", "platform": "linux", "lastSeenAt": null,
+                          "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "capabilities": caps(!supported),
+                          "version": if supported { "0.1.0" } else { "0.2.113" } }
+                    ])).unwrap();
+                    state.chats = vec![serde_json::from_value(serde_json::json!({
+                        "id": "boat-chat", "deviceId": "boat-host", "cwd": "/workspace",
+                        "archived": false, "createdAt": chrono::Utc::now(),
+                        "config": { "harness": "codex", "model": "original-model", "sandbox": "workspace-write" },
+                    })).unwrap()];
+                    if mode != "scratch" { state.selected_chat = Some("boat-chat".into()); }
+                    let engine = crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound))
+                        .with_test_capabilities(caps(true));
+                    state.set_test_engine(engine);
+                });
+                let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+                composer.update(cx, |composer, cx| {
+                    composer.input.update(cx, |input, cx| {
+                        input.set_text("Original transport message", cx)
+                    });
+                    if mode != "scratch" {
+                        composer.attachments.insert(
+                            composer.current_key.clone(),
+                            vec![attachments::stage_png_bytes(
+                                "keep.png".into(),
+                                vec![1, 2, 3],
+                            )],
+                        );
+                    }
+                    composer.send("Original transport message".into(), mode == "queue", cx);
+                });
+                let mut admitted = Vec::new();
+                let mut created_cwd = None;
+                let mut upload_target = None;
+                let mut wake_count = 0;
+                for _ in 0..12 {
+                    cx.run_until_parked();
+                    while let Ok(frame) = requests.try_recv() {
+                        let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                        let value = match frame.method.as_deref() {
+                            Some(methods::WAKE_DEVICE) => {
+                                wake_count += 1;
+                                assert_eq!(frame.params["deviceId"], "boat-host");
+                                serde_json::json!({ "deviceId": "boat-host", "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "ready": true,
+                                    "device": { "id": "boat-host", "name": "Boat", "platform": "linux",
+                                        "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "lastSeenAt": chrono::Utc::now(),
+                                        "capabilities": caps(supported), "version": if supported { "0.2.113" } else { "0.1.0" } } })
+                            }
+                            Some(
+                                methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_REFS,
+                            ) => serde_json::json!([]),
+                            Some(methods::UPLOAD_CHUNK) => {
+                                upload_target = Some(frame.params["targetDeviceId"].clone());
+                                serde_json::json!({})
+                            }
+                            Some(methods::UPLOAD_COMMIT) => {
+                                serde_json::json!({"path": "/boat/keep.png"})
+                            }
+                            Some(methods::MUTATE) if frame.params["op"] == "createChat" => {
+                                created_cwd = Some(frame.params["cwd"].clone());
+                                serde_json::json!({})
+                            }
+                            Some(methods::QUEUE_MESSAGE | methods::QUEUE_COMMAND) => {
+                                admitted.push(frame.clone());
+                                serde_json::json!({"id": "queued-message", "commandId": "command"})
+                            }
+                            _ => continue,
+                        };
+                        replies
+                            .try_send(
+                                serde_json::to_string(&zeron_rpc::ServerFrame {
+                                    id: frame.id,
+                                    ok: Some(value),
+                                    ..Default::default()
+                                })
+                                .unwrap(),
+                            )
+                            .unwrap();
+                    }
+                    runtime.block_on(async { tokio::task::yield_now().await });
+                }
+                assert_eq!(wake_count, 1);
+                let [admitted] = admitted.as_slice() else {
+                    panic!("expected one admission: {admitted:?}");
+                };
+                if mode == "scratch" {
+                    let cwd = &admitted.params["command"]["request"]["cwd"];
+                    assert_eq!(created_cwd.as_ref(), Some(cwd));
+                    assert_eq!(cwd == "~", !supported);
+                } else if mode == "queue" {
+                    assert_eq!(
+                        admitted.params["text"] == "Original transport message",
+                        supported
+                    );
+                    assert_eq!(
+                        admitted.params["attachments"],
+                        serde_json::json!(["/boat/keep.png"])
+                    );
+                } else {
+                    assert_eq!(
+                        upload_target,
+                        Some(if supported {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::json!("boat-host")
+                        })
+                    );
+                    assert_eq!(admitted.params["transfers"].is_array(), supported);
+                    assert_eq!(
+                        admitted.params["command"]["request"]["prompt"]
+                            .as_str()
+                            .unwrap()
+                            .contains("pending://"),
+                        supported
+                    );
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
     fn projectless_composer_allows_send_and_enter_submission(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -13118,85 +14074,6 @@ mod tests {
                 "Pending edits must still block submission"
             );
         });
-    }
-
-    /// The target the sidebar's "No project" `+` leaves: a project-less new
-    /// chat names its host outright, so it lands in that device's group.
-    #[gpui::test]
-    fn projectless_new_chat_is_created_on_the_picked_device(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let _guard = runtime.enter();
-        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
-        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
-        let state = cx.new(|_| AppState::new());
-        state.update(cx, |state, cx| {
-            state.set_test_engine(crate::state::EngineHandle::from_test_client(
-                zeron_rpc::RpcClient::new(out, inbound),
-            ));
-            state.local_device_id = Some("local".into());
-            state.select_space(None, cx);
-            state.select_device("remote".into(), cx);
-        });
-        let composer = cx.new(|cx| Composer::new(state, cx));
-        composer.update(cx, |composer, cx| {
-            composer
-                .input
-                .update(cx, |input, cx| input.set_text("hello", cx));
-            composer.on_submit(cx);
-        });
-        cx.run_until_parked();
-        let create = std::iter::from_fn(|| requests.try_recv().ok())
-            .map(|frame| serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap())
-            .find(|frame| frame.params["op"] == "createChat")
-            .expect("the send creates the chat");
-        assert_eq!(create.params["deviceId"], "remote");
-        assert!(create.params.get("spaceId").is_none());
-    }
-
-    /// Out of credits, a send that would run on Cloud is held at the button:
-    /// Cloud can't start or wake its machine. Other chats are untouched.
-    #[gpui::test]
-    fn cloud_sends_wait_for_credits(cx: &mut gpui::TestAppContext) {
-        let state = cx.new(|_| {
-            let mut state = AppState::new();
-            state.cloud_status = Some(zeron_proto::CloudStatus {
-                state: zeron_proto::CloudState::Ready,
-                device_id: Some("cloud-1".into()),
-                available: true,
-                credits: Some(0.0),
-                ..Default::default()
-            });
-            state.cloud_sessions = Some(zeron_proto::CloudSessions {
-                sessions: vec![zeron_proto::CloudSession {
-                    chat_id: "on-cloud".into(),
-                    device_id: "cloud-s1".into(),
-                    state: zeron_proto::CloudState::Sleeping,
-                    ..Default::default()
-                }],
-                available: true,
-            });
-            state
-        });
-        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-        state.update(cx, |state, _| state.selected_chat = Some("on-cloud".into()));
-        composer.update(cx, |composer, cx| {
-            assert!(composer.out_of_cloud_credits(cx));
-            assert!(composer.send_blocked(cx));
-        });
-        state.update(cx, |state, _| {
-            state.selected_chat = Some("on-laptop".into())
-        });
-        composer.update(cx, |composer, cx| assert!(!composer.send_blocked(cx)));
-        state.update(cx, |state, _| {
-            state.selected_chat = Some("on-cloud".into());
-            if let Some(status) = state.cloud_status.as_mut() {
-                status.credits = Some(30.0);
-            }
-        });
-        composer.update(cx, |composer, cx| assert!(!composer.send_blocked(cx)));
     }
 
     #[gpui::test]
@@ -13274,6 +14151,48 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn cancelling_host_wake_preserves_draft_and_remote_target(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel::<String>(16);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(16);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.local_device_id = Some("local".into());
+            state.selected_device = Some("remote".into());
+            state.devices = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "remote", "name": "host", "platform": "linux",
+                    "devboxProvider": "namespace", "devboxId": "ofpf7g22n4412",
+                }))
+                .unwrap(),
+            ];
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("keep this draft", cx));
+            composer.send("keep this draft".into(), false, cx);
+            assert!(composer.host_wake_task.is_some());
+            assert!(!composer.sending);
+            assert!(composer.state.read(cx).selected_chat.is_none());
+            assert_eq!(composer.input.read(cx).text(), "keep this draft");
+            composer.cancel_host_wake(cx);
+            assert!(composer.host_wake_task.is_none());
+            assert!(!composer.input.read(cx).read_only);
+            assert_eq!(composer.input.read(cx).text(), "keep this draft");
+            assert_eq!(
+                composer.state.read(cx).active_device_id().as_deref(),
+                Some("remote")
+            );
+        });
+    }
+
     /// Issue #406: Enter submits — it must never stop a run. Stop mode only
     /// exists on a live run with an EMPTY composer, so a habitual
     /// double-Enter after sending interrupted the just-dispatched prompt
@@ -13329,8 +14248,6 @@ mod tests {
                 status: zeron_proto::SessionStatus::Working,
                 started_at: Some(updated),
                 updated_at: updated,
-                last_turn_outcome: None,
-                terminal_activity: None,
                 running_subagents: 0,
             }];
             state.selected_chat = Some("c".into());
@@ -13822,6 +14739,9 @@ mod tests {
             .build()
             .unwrap();
         let _guard = runtime.enter();
+        // Side-chat attachment installs lifecycle watches that need the GPUI
+        // Tokio bridge as well as an entered runtime, including at teardown.
+        cx.update(|cx| gpui_tokio::init_from_handle(cx, runtime.handle().clone()));
         let directory = tempfile::tempdir().unwrap();
         cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
         let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
@@ -13990,11 +14910,20 @@ mod tests {
         let called = |method: &str| after.iter().any(|f| f.method.as_deref() == Some(method));
         assert!(called(methods::WATCH_DOC_MESSAGES), "{after:?}");
         assert!(called(methods::QUEUE_COMMAND), "{after:?}");
+        assert_eq!(
+            after
+                .iter()
+                .filter(|f| f.method.as_deref() == Some(methods::QUEUE_COMMAND))
+                .count(),
+            1,
+            "first send must queue exactly one command"
+        );
         let run = after
             .iter()
             .find(|f| f.method.as_deref() == Some(methods::QUEUE_COMMAND))
             .unwrap();
         let request = &run.params["command"]["request"];
+        assert_eq!(request["prompt"], "hello");
         for field in ["harness", "model", "reasoning", "modelOptions"] {
             assert_eq!(request[field], create.params["config"][field], "{field}");
         }
@@ -15050,33 +15979,6 @@ mod tests {
                     );
                 }
             }
-        });
-    }
-
-    #[gpui::test]
-    fn masked_input_shows_bullets_and_keeps_its_text_off_the_clipboard(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let input = cx.new(|cx| ComposerInput::new("API key", cx).with_masked());
-        input.update(cx, |input, cx| {
-            input.set_text("sk-é9", cx);
-            input.refresh_projection();
-            assert_eq!(input.projection.display, MASK_GLYPH.to_string().repeat(5));
-            // Every raw character boundary maps onto a bullet boundary and back.
-            for (bullet, (raw, _)) in input.content.char_indices().enumerate() {
-                let display = input.projection.raw_to_display(raw);
-                assert_eq!(display, bullet * MASK_GLYPH.len_utf8());
-                assert_eq!(input.projection.display_to_raw(display), raw);
-            }
-            assert_eq!(
-                input.projection.raw_to_display(input.content.len()),
-                input.projection.display.len()
-            );
-            input.selected_range = 0..input.content.len();
-            assert_eq!(input.clipboard_selection(), None);
-            assert_eq!(input.previous_word_boundary(4), 0);
-            assert_eq!(input.next_word_boundary(1), input.content.len());
-            assert_eq!(input.text(), "sk-é9");
         });
     }
 
@@ -17039,198 +17941,6 @@ mod tests {
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
     }
-
-    #[test]
-    fn link_notice_needs_intent_for_the_send_clause() {
-        use crate::state::{ChatLink, LinkSync};
-        let link = |sync, host_unreachable| ChatLink {
-            sync,
-            host_unreachable,
-        };
-        let text = |link, intent, loader| {
-            link_notice(link, Some("omarchy"), intent, loader).map(|notice| notice.text.to_string())
-        };
-        let unreachable = "Can't reach omarchy — messages will send when it's reachable.";
-        let reconnecting = "Reconnecting — messages will send once the connection recovers.";
-        // (link, empty composer, something to send)
-        let cases = [
-            (link(LinkSync::Live, false), None, None),
-            (link(LinkSync::Syncing { shown: false }, false), None, None),
-            (
-                link(LinkSync::Syncing { shown: true }, false),
-                Some("Syncing…"),
-                Some("Syncing…"),
-            ),
-            (link(LinkSync::Live, true), None, Some(unreachable)),
-            (
-                link(LinkSync::Syncing { shown: true }, true),
-                Some("Syncing…"),
-                Some(unreachable),
-            ),
-            (
-                link(LinkSync::Stalled, false),
-                Some("Reconnecting…"),
-                Some(reconnecting),
-            ),
-            // This device's own connection outranks the host's presence,
-            // which goes dark with it.
-            (
-                link(LinkSync::Reconnecting, true),
-                Some("Reconnecting…"),
-                Some(reconnecting),
-            ),
-            (
-                link(LinkSync::Offline, true),
-                Some("Offline"),
-                Some("Offline — messages will send when you're back online."),
-            ),
-        ];
-        for (link, idle, intent) in cases {
-            assert_eq!(text(link, false, false).as_deref(), idle, "{link:?}");
-            assert_eq!(
-                text(link, true, false).as_deref(),
-                intent,
-                "{link:?} with intent"
-            );
-            // The transcript's loader speaks for the chat: only a send
-            // clause adds anything.
-            assert_eq!(text(link, false, true), None, "{link:?} under the loader");
-            let clause = intent.filter(|text| text.contains("will send"));
-            assert_eq!(
-                text(link, true, true).as_deref(),
-                clause,
-                "{link:?} with intent under the loader"
-            );
-        }
-        // Only hard offline is amber; the connection's own work spins.
-        let glyph = |link, intent| link_notice(link, None, intent, false).unwrap().glyph;
-        assert_eq!(
-            glyph(link(LinkSync::Offline, false), false),
-            NoticeGlyph::WarningDot
-        );
-        assert_eq!(
-            glyph(link(LinkSync::Stalled, false), true),
-            NoticeGlyph::Spinner
-        );
-        assert_eq!(
-            glyph(link(LinkSync::Syncing { shown: true }, false), false),
-            NoticeGlyph::Spinner
-        );
-        assert_eq!(glyph(link(LinkSync::Live, true), true), NoticeGlyph::Dot);
-        assert_eq!(
-            link_notice(link(LinkSync::Live, true), None, true, false)
-                .unwrap()
-                .text
-                .as_ref(),
-            "Can't reach the host — messages will send when it's reachable."
-        );
-    }
-
-    fn syncing_remote_chat(chat_id: &str, connected: bool) -> AppState {
-        let mut state = AppState::new();
-        state.local_device_id = Some("local".into());
-        state.chats = vec![
-            serde_json::from_value(serde_json::json!({
-                "id": chat_id, "deviceId": "omarchy", "archived": false,
-                "createdAt": chrono::Utc::now(),
-            }))
-            .unwrap(),
-        ];
-        state.selected_chat = Some(chat_id.into());
-        state.apply_connectivity(zeron_proto::Connectivity {
-            state: zeron_proto::ConnectivityState::Connected,
-            chats: vec![zeron_proto::ChatConnectivity {
-                chat_id: chat_id.into(),
-                sync_state: zeron_proto::ChatSyncState::Connecting,
-                connected,
-                delivery_live: false,
-                pending_pushes: 0,
-            }],
-            ..Default::default()
-        });
-        state
-    }
-
-    /// The reported screenshot: an empty composer on a remote chat still
-    /// opening over a slow link said "Messages will send once the
-    /// connection recovers." Nothing had been sent; the chat was syncing.
-    #[gpui::test]
-    fn empty_composer_on_a_syncing_remote_chat_never_claims_an_outage(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let now = chrono::Utc::now();
-        let clock = crate::state::TestClock::start(now);
-        // The engine's room grace has already lapsed: `connected` is false.
-        let state = cx.new(|_| syncing_remote_chat("remote", false));
-        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-        let notice = |cx: &mut gpui::TestAppContext| {
-            composer.read_with(cx, |composer, cx| {
-                composer
-                    .current_link_notice(cx)
-                    .map(|notice| notice.text.to_string())
-            })
-        };
-        assert_eq!(notice(cx), None, "a quick open never flashes a caption");
-        clock.set(now + chrono::TimeDelta::seconds(10));
-        assert_eq!(notice(cx).as_deref(), Some("Syncing…"));
-        // A draft earns no send clause: a syncing chat still delivers.
-        composer.update(cx, |composer, cx| {
-            composer
-                .input
-                .update(cx, |input, cx| input.set_text("hello", cx))
-        });
-        assert_eq!(notice(cx).as_deref(), Some("Syncing…"));
-        // Past a whole first dial the room has stalled: now a send queues.
-        clock.set(now + chrono::TimeDelta::seconds(40));
-        assert_eq!(
-            notice(cx).as_deref(),
-            Some("Reconnecting — messages will send once the connection recovers.")
-        );
-        composer.update(cx, |composer, cx| {
-            composer
-                .input
-                .update(cx, |input, cx| input.set_text("", cx))
-        });
-        assert_eq!(notice(cx).as_deref(), Some("Reconnecting…"));
-    }
-
-    /// A side chat tab has its own state: its composer reads its own chat's
-    /// link, never the conversation's beside it.
-    #[gpui::test]
-    fn side_chat_composer_reads_its_own_link(cx: &mut gpui::TestAppContext) {
-        let now = chrono::Utc::now();
-        let clock = crate::state::TestClock::start(now);
-        let parent = cx.new(|_| {
-            let mut state = syncing_remote_chat("main", true);
-            // The conversation itself is live.
-            state.apply_connectivity(zeron_proto::Connectivity {
-                state: zeron_proto::ConnectivityState::Connected,
-                ..Default::default()
-            });
-            state
-        });
-        let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
-            "id": "side", "parentChatId": "main", "deviceId": "omarchy",
-            "archived": false, "createdAt": now,
-        }))
-        .unwrap();
-        let side = cx.new(|cx| AppState::side_chat_state(&parent, chat, false, cx));
-        side.update(cx, |state, _| {
-            state.apply_connectivity(syncing_remote_chat("side", false).connectivity)
-        });
-        let main_composer = cx.new(|cx| Composer::new(parent.clone(), cx));
-        let side_composer = cx.new(|cx| Composer::new(side.clone(), cx));
-        clock.set(now + chrono::TimeDelta::seconds(10));
-        let notice = |composer: &Entity<Composer>, cx: &mut gpui::TestAppContext| {
-            composer.read_with(cx, |composer, cx| {
-                composer
-                    .current_link_notice(cx)
-                    .map(|notice| notice.text.to_string())
-            })
-        };
-        assert_eq!(notice(&side_composer, cx).as_deref(), Some("Syncing…"));
-        assert_eq!(notice(&main_composer, cx), None);
-    }
 }
 
 #[cfg(test)]
@@ -17311,11 +18021,6 @@ mod appshot_rebase_tests {
 impl Composer {
     pub fn fixture_clear_appshots(&mut self, cx: &mut Context<Self>) {
         self.appshots.clear();
-        cx.notify();
-    }
-    /// A typed draft, as the input holds it.
-    pub fn fixture_draft(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| input.set_text(text, cx));
         cx.notify();
     }
 }

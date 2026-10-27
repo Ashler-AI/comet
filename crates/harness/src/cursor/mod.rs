@@ -379,6 +379,7 @@ impl Harness for CursorHarness {
         mut request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         // Plus requires explicit defaults, but catalog outages must not block
         // existing SDK runs. The same snapshot fills mid-session model switches.
         let catalog = self.catalog_for_defaults().await;
@@ -401,6 +402,7 @@ impl Harness for CursorHarness {
         }
         crate::compose_child_path(&mut cmd, &exe);
         crate::apply_run_env(&mut cmd, &request.env);
+        crate::apply_run_context(&mut cmd, controls.context.as_ref());
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -674,6 +676,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
+        context: _,
     } = controls;
 
     let mut assistant_message_id = new_message_id();

@@ -19,18 +19,15 @@ async fn turn(
 ) -> (String, String) {
     let (tx, steering) = mpsc::channel(8);
     let token = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: token.clone(),
-        request_input: Box::new(|_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(vec![]);
-            rx
-        }),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: token.clone(),
+    request_input: Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(vec![]);
+        rx
+    }),
+    turn: Default::default(), };
     let request = RunRequest {
         mcp: None,
         prompt,
@@ -141,18 +138,15 @@ async fn parked(harness: &CursorHarness, count: usize) {
     let workspace = tempfile::tempdir().unwrap();
     let nonce = format!("PARKED-STABILITY-{}", uuid::Uuid::new_v4());
     let (tx, steering) = mpsc::channel(8);
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: CancellationToken::new(),
-        request_input: Box::new(|_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(vec![]);
-            rx
-        }),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: CancellationToken::new(),
+    request_input: Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(vec![]);
+        rx
+    }),
+    turn: Default::default(), };
     let request = RunRequest {
         mcp: None,
         prompt: format!(
@@ -255,18 +249,15 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
     };
     let (tx, steering) = mpsc::channel(8);
     let token = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: token.clone(),
-        request_input: Box::new(|_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(vec![]);
-            rx
-        }),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: token.clone(),
+    request_input: Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(vec![]);
+        rx
+    }),
+    turn: Default::default(), };
     let request = RunRequest {
         mcp: None,
         prompt: if cancel {
@@ -397,18 +388,15 @@ async fn history(harness: &CursorHarness, count: usize) {
         .map(|i| format!("MEMORY-{i}-{}", uuid::Uuid::new_v4()))
         .collect();
     let (tx, steering) = mpsc::channel(8);
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: CancellationToken::new(),
-        request_input: Box::new(|_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(vec![]);
-            rx
-        }),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: CancellationToken::new(),
+    request_input: Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(vec![]);
+        rx
+    }),
+    turn: Default::default(), };
     let request = RunRequest {
         mcp: None,
         prompt: format!(

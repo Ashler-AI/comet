@@ -19,11 +19,11 @@ use serde::{Deserialize, Serialize};
 use zeron_proto::{AuthState, WorkspaceScope};
 
 pub mod accounts;
+pub mod annotations;
 pub mod appearance;
 pub mod archived;
-pub mod billing;
-pub mod cloud;
 pub mod composer;
+pub mod crew;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
@@ -164,8 +164,7 @@ impl NewThreadBackgroundEffect {
     }
 }
 
-/// The face Markdown math is set in. Every face is bundled, so the choice
-/// never depends on what the device has installed.
+/// Bundled face used for Markdown math.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MathFont {
     #[default]
@@ -187,7 +186,6 @@ impl MathFont {
         Self::Euler,
     ];
 
-    /// The name stored in the settings file.
     const fn key(self) -> &'static str {
         match self {
             Self::Fira => "fira",
@@ -210,7 +208,6 @@ impl MathFont {
         }
     }
 
-    /// The short note beside the label in the menu.
     pub const fn style(self) -> &'static str {
         match self {
             Self::Fira => "Sans",
@@ -249,8 +246,6 @@ impl Serialize for MathFont {
     }
 }
 
-/// A face this build doesn't know (written by a newer one) reads as the
-/// default rather than failing the whole settings file.
 impl<'de> Deserialize<'de> for MathFont {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let stored = serde_json::Value::deserialize(deserializer)?;
@@ -261,14 +256,10 @@ impl<'de> Deserialize<'de> for MathFont {
     }
 }
 
-/// Markdown math size as a percent of the text around it.
 pub const MATH_SIZE_DEFAULT: u16 = 100;
 pub const MATH_SIZE_MIN: u16 = 75;
 pub const MATH_SIZE_MAX: u16 = 200;
 
-/// A stored math size: any number rounds and clamps into range; anything
-/// else (`"big"`, `null`, an object) reads as the default. Like an unknown
-/// [`MathFont`], a bad value never fails the rest of the settings file.
 fn deserialize_math_size<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u16, D::Error> {
@@ -277,7 +268,6 @@ fn deserialize_math_size<'de, D: serde::Deserializer<'de>>(
         .as_f64()
         .filter(|size| size.is_finite())
         .map_or(MATH_SIZE_DEFAULT, |size| {
-            // In range, the cast is exact.
             size.round()
                 .clamp(f64::from(MATH_SIZE_MIN), f64::from(MATH_SIZE_MAX)) as u16
         }))
@@ -461,7 +451,7 @@ impl PullRequestDestination {
     pub fn description(self) -> &'static str {
         match self {
             Self::Native => {
-                "Inspect them in Zeron, beside the conversation or the Pull requests board."
+                "Inspect them in Crew, beside the conversation or the Pull requests board."
             }
             Self::Browser => {
                 "Open them in a Browser tab beside the conversation, or in the default browser when none is shown."
@@ -503,8 +493,7 @@ pub struct SettingsStore {
     /// the persisted revision, this advances only when the global Fit choice
     /// changes, including a change back to its previous value.
     code_fences_generation: u64,
-    /// The same token for how Markdown math renders (on or off, face and
-    /// size).
+    /// In-process invalidation token for Markdown math style changes.
     math_generation: u64,
     save_task: Option<Task<()>>,
 }
@@ -569,8 +558,7 @@ pub fn compact_model_picker(cx: &App) -> bool {
         .is_some_and(|store| store.current.compact_model_picker)
 }
 
-/// Read on every wheel notch, so without cloning the settings. Without a
-/// store (not the app) wheel input is left alone.
+/// Read on every wheel notch without cloning the complete settings value.
 pub fn smooth_scrolling(cx: &App) -> bool {
     cx.try_global::<SettingsStore>()
         .is_some_and(|store| store.current.smooth_scrolling)
@@ -606,7 +594,7 @@ fn install_staged_background(
     let data_dir = cx
         .try_global::<SettingsStore>()
         .map(|store| store.data_dir.clone())
-        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+        .ok_or_else(|| "Unable to save the image. Restart Crew and try again.".to_string())?;
     let prepared = prepare_background_file(staged, &data_dir)?;
     commit_background(source, prepared, color, cx)
 }
@@ -675,7 +663,7 @@ fn commit_background(
     let data_dir = cx
         .try_global::<SettingsStore>()
         .map(|store| store.data_dir.clone())
-        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+        .ok_or_else(|| "Unable to save the image. Restart Crew and try again.".to_string())?;
     let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
     let replacement = prepared.0.as_ref().unwrap().clone();
     let mut next = current(cx);
@@ -710,7 +698,7 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
     let data_dir = cx
         .try_global::<SettingsStore>()
         .map(|store| store.data_dir.clone())
-        .ok_or_else(|| "Unable to remove the image. Restart Zeron and try again.".to_string())?;
+        .ok_or_else(|| "Unable to remove the image. Restart Crew and try again.".to_string())?;
     let mut next = current(cx);
     let previous = next.new_thread_composer_background.take();
     next.wallpaper_source = None;
@@ -798,8 +786,6 @@ pub fn set_transcript_compact_mode(enabled: bool, cx: &mut App) {
     }
 }
 
-/// How Markdown surfaces set math, read each render without cloning the
-/// settings.
 pub fn math_style(cx: &App) -> crate::markdown::math::MathStyle {
     cx.try_global::<SettingsStore>()
         .map(|store| crate::markdown::math::MathStyle {
@@ -810,8 +796,6 @@ pub fn math_style(cx: &App) -> crate::markdown::math::MathStyle {
         .unwrap_or_default()
 }
 
-/// Monotonic id of [`math_style`]: Markdown surfaces that keep measured row
-/// heights compare it during render and remeasure when it moves.
 pub fn math_generation(cx: &App) -> u64 {
     cx.try_global::<SettingsStore>()
         .map(|store| store.math_generation)
@@ -1042,7 +1026,7 @@ impl SkillCompletionSettings {
     }
 }
 
-pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
+pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 10] = [
     (zeron_proto::HarnessId::Antigravity, "Antigravity"),
     (zeron_proto::HarnessId::ClaudeCode, "Claude Code"),
     (zeron_proto::HarnessId::Codex, "Codex"),
@@ -1050,13 +1034,26 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
     (zeron_proto::HarnessId::Devin, "Devin"),
     (zeron_proto::HarnessId::Grok, "Grok"),
     (zeron_proto::HarnessId::Hermes, "Hermes"),
+    (zeron_proto::HarnessId::Muse, "Muse Code"),
     (zeron_proto::HarnessId::Pi, "Pi"),
     (zeron_proto::HarnessId::Opencode, "OpenCode"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingCrewLink {
+    pub url: String,
+    pub owner: Option<String>,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    pub pending_crew_link: Option<PendingCrewLink>,
+    pub crew_annotation_commands: Vec<annotations::PendingAnnotation>,
+    pub crew_recovery_commands: HashMap<String, String>,
+    pub crew_pending_prompts: HashMap<String, String>,
     pub dictation_enabled: bool,
     /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
     /// follows the system default.
@@ -1175,9 +1172,8 @@ pub struct UiSettings {
     pub settings_section: crate::shell::SettingsSection,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
-    /// First-run setup was finished or skipped. A file written before this
-    /// field existed reads as done (existing users never see it); only a
-    /// fresh install, with no settings file yet, starts it.
+    /// First-run onboarding state. Existing settings files default to complete;
+    /// only a genuinely fresh profile begins incomplete.
     pub onboarding_completed: bool,
     /// Optional columns shown in every Git History pane.
     pub git_history_columns: GitHistoryColumns,
@@ -1207,12 +1203,9 @@ pub struct UiSettings {
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
-    /// Typeset LaTeX math in Markdown. Off shows its source as code.
+    /// Render LaTeX blocks and spans in Markdown surfaces.
     pub render_math: bool,
-    /// The bundled face typeset math is set in.
     pub math_font: MathFont,
-    /// Typeset math size, as a percent of the text around it. Read
-    /// tolerantly ([`deserialize_math_size`]).
     #[serde(deserialize_with = "deserialize_math_size")]
     pub math_size: u16,
     /// Maximum message and docked composer surface width in logical pixels.
@@ -1269,8 +1262,7 @@ pub struct UiSettings {
     pub reduce_motion: crate::motion::ReduceMotion,
     /// Also snap animations while the main window is not focused.
     pub pause_animations_in_background: bool,
-    /// Mouse-wheel notches glide instead of jumping (`smooth_scroll`).
-    /// Trackpads already scroll smoothly; reduced motion overrides.
+    /// Animate discrete mouse-wheel input while preserving trackpad input.
     pub smooth_scrolling: bool,
     /// Stable native Codex voice id only; devices and microphone state are never persisted.
     #[serde(default)]
@@ -1287,6 +1279,10 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            pending_crew_link: None,
+            crew_annotation_commands: Vec::new(),
+            crew_recovery_commands: HashMap::new(),
+            crew_pending_prompts: HashMap::new(),
             dictation_enabled: false,
             dictation_input: None,
             window_geometry: None,
@@ -2129,6 +2125,10 @@ impl UiSettings {
             }};
         }
         merge!(
+            pending_crew_link,
+            crew_annotation_commands,
+            crew_recovery_commands,
+            crew_pending_prompts,
             dictation_enabled,
             dictation_input,
             window_geometry,
@@ -2260,7 +2260,6 @@ impl UiSettings {
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
-        self.math_size = self.math_size.clamp(MATH_SIZE_MIN, MATH_SIZE_MAX);
         self.terminal_font_size = clamp_or(
             self.terminal_font_size,
             crate::typography::FONT_SIZE_MIN,
@@ -2276,6 +2275,7 @@ impl UiSettings {
         self.git_history_column_widths = self.git_history_column_widths.clamped();
         self.git_history_column_order = self.git_history_column_order.normalized();
         self.ui_font_size = self.ui_font_size.normalized();
+        self.math_size = self.math_size.clamp(MATH_SIZE_MIN, MATH_SIZE_MAX);
         if let Some(background) = self.new_thread_composer_background.as_mut() {
             background.adjustment = background.adjustment.normalized();
         }
@@ -2392,13 +2392,6 @@ impl UiSettings {
                     }
                 }
             }
-            // No settings file yet: a fresh install, so first-run setup runs,
-            // on frosted glass whatever the theme recommends.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Self {
-                onboarding_completed: false,
-                surface: zeron_theme::SurfacePreference::Frosted,
-                ..Self::default()
-            },
             Err(_) => Self::default(),
         }
     }
@@ -2650,7 +2643,6 @@ mod tests {
         );
         assert_eq!(loaded.reduce_motion, crate::motion::ReduceMotion::System);
         assert!(!loaded.pause_animations_in_background);
-        assert!(loaded.smooth_scrolling);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
         for sound in [
@@ -2745,7 +2737,7 @@ mod tests {
         assert_eq!(legacy.sidebar_width, 300.0);
         // Unknown names and malformed values read as General without
         // defaulting the rest of the file.
-        for raw in [r#""payments""#, "42", "null", r#"{"section":"devices"}"#] {
+        for raw in [r#""billing""#, "42", "null", r#"{"section":"devices"}"#] {
             std::fs::write(
                 UiSettings::path(dir.path()),
                 format!(r#"{{"sidebarWidth": 300, "settingsSection": {raw}}}"#),
@@ -2755,13 +2747,10 @@ mod tests {
             assert_eq!(loaded.settings_section, SettingsSection::General, "{raw}");
             assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
         }
-        // The legacy Accounts alias still reads, and reopens as Providers.
+        // Accounts remains a distinct shared-pool page.
         let alias: UiSettings = serde_json::from_str(r#"{"settingsSection":"agents"}"#).unwrap();
         assert_eq!(alias.settings_section, SettingsSection::Agents);
-        assert_eq!(
-            alias.settings_section.reopenable(),
-            SettingsSection::Harnesses
-        );
+        assert_eq!(alias.settings_section.reopenable(), SettingsSection::Agents);
     }
 
     #[test]
@@ -2940,9 +2929,6 @@ mod tests {
             loaded.code_font_size,
             crate::typography::CODE_FONT_SIZE_DEFAULT
         );
-        assert!(loaded.render_math);
-        assert_eq!(loaded.math_font, MathFont::Fira);
-        assert_eq!(loaded.math_size, MATH_SIZE_DEFAULT);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -3280,191 +3266,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_fresh_install_starts_first_run_setup() {
-        let fresh = tempfile::tempdir().unwrap();
-        let fresh = UiSettings::load(fresh.path());
-        assert!(!fresh.onboarding_completed);
-        assert_eq!(fresh.surface, zeron_theme::SurfacePreference::Frosted);
-        // A settings file from before setup existed: that user is past it.
-        let existing = tempfile::tempdir().unwrap();
-        std::fs::write(
-            UiSettings::path(existing.path()),
-            r#"{"sidebarWidth": 280}"#,
-        )
-        .unwrap();
-        assert!(UiSettings::load(existing.path()).onboarding_completed);
-    }
-
-    #[test]
-    fn round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = UiSettings {
-            dictation_enabled: false,
-            dictation_input: Some("coreaudio:usb-mic".into()),
-            window_geometry: None,
-            codex_voice: Some("ember".into()),
-            codex_voice_device: Some("fedora".into()),
-            sidebar_width: 300.0,
-            sidebar_collapsed: true,
-            sidebar_grouped: true,
-            sidebar_organization: SidebarOrganization::ByDevice,
-            sidebar_sort: SidebarSort::Created,
-            sidebar_compact: true,
-            sidebar_show_project_icon: false,
-            sidebar_show_project_label: false,
-            sidebar_show_harness: false,
-            sidebar_show_branch: false,
-            sidebar_show_pull_request: false,
-            sidebar_show_project_filter: false,
-            sidebar_show_archived: false,
-            github_star_banner_dismissed: true,
-            last_space_id: Some("space-1".into()),
-            last_project_action_by_space_id: std::collections::HashMap::from([(
-                "space-1".into(),
-                "dev".into(),
-            )]),
-            open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
-            space_filter: Some("space-1".into()),
-            sidebar_sections_by_profile: HashMap::new(),
-            sidebar_pinned_session_ids_by_profile: HashMap::from([
-                (
-                    "local".to_string(),
-                    vec!["local-2".to_string(), "local-1".to_string()],
-                ),
-                (
-                    "synced:org-1:user-1".to_string(),
-                    vec!["synced-1".to_string()],
-                ),
-            ]),
-            tab_order: std::collections::HashMap::from([(
-                "space-1".to_string(),
-                vec!["b".to_string(), "a".to_string()],
-            )]),
-            space_order: vec!["space-2".to_string(), "space-1".to_string()],
-            sound_enabled: false,
-            sound_completion_enabled: false,
-            sound_input_enabled: true,
-            sound_attention_enabled: false,
-            notifications_enabled: false,
-            notifications_background_only: false,
-            files_panel_width: 310.0,
-            agent_update_notifications: false,
-            right_pane_width: 700.0,
-            pull_request_pane_width: 820.0,
-            right_pane_open: true,
-            terminal_height: 320.0,
-            terminal_open: true,
-            keymap: KeymapConfig {
-                toggle_sidebar: "mod-shift-s".into(),
-                ..KeymapConfig::default()
-            },
-            escape_stops_active_agent: true,
-            settings_section: crate::shell::SettingsSection::Shortcuts,
-            composer_send_behavior: ComposerSendBehavior::ModEnter,
-            skills_in_slash_menu: true,
-            skill_completion_by_harness: Default::default(),
-            compact_model_picker: true,
-            appshots_enabled: false,
-            appshot_sound_enabled: true,
-            // The destination is only persisted where Appshots exist (macOS and
-            // Linux); elsewhere the field is `serde(skip)` and reloads as the
-            // default, so the round trip must expect exactly that.
-            appshot_destination: if cfg!(any(target_os = "macos", target_os = "linux")) {
-                crate::appshots::AppshotDestination::NewSession
-            } else {
-                crate::appshots::AppshotDestination::Automatic
-            },
-            appearance: crate::appearance::AppearanceMode::Light,
-            git_history_columns: GitHistoryColumns {
-                author: false,
-                date: true,
-                sha: false,
-            },
-            git_history_column_widths: GitHistoryColumnWidths {
-                author: 132.0,
-                date: 104.0,
-                sha: 82.0,
-            },
-            git_history_column_order: GitHistoryColumnOrder(vec![
-                GitHistoryColumn::Sha,
-                GitHistoryColumn::Author,
-                GitHistoryColumn::Date,
-            ]),
-            git_history_author_display: GitHistoryAuthorDisplay::Name,
-            ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
-            ui_font_size: crate::typography::UiFontSize::ALL[5],
-            theme_selection: zeron_theme::ThemeSelection {
-                light: "catppuccin-latte".into(),
-                dark: "catppuccin-mocha".into(),
-            },
-            diff_split: true,
-            diff_wrap: true,
-            code_fences_fit_content: true,
-            render_math: false,
-            math_font: MathFont::StixTwo,
-            math_size: 135,
-            transcript_width: 960.0,
-            open_web_links_in_zeron: false,
-            transcript_compact_mode: true,
-            pull_request_destination: PullRequestDestination::External,
-            last_pull_request_repository: Some("acme/zeron".into()),
-            last_pull_request_device: Some("remote-device".into()),
-            pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
-            files_autosave_enabled: true,
-            files_autosave_delay_ms: 1_500,
-            files_word_wrap: true,
-            terminal_font_family: crate::typography::UiFontFamily::Installed("Menlo".into()),
-            terminal_font_size: 15.0,
-            code_font_family: crate::typography::UiFontFamily::Geist,
-            code_font_size: 11.0,
-            files_show_all: true,
-            session_info_hidden: true,
-            accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
-            surface: zeron_theme::SurfacePreference::Frosted,
-            new_thread_composer_background: Some(NewThreadComposerBackground {
-                path: "/tmp/zeron/new-thread-background.png".into(),
-                name: "background.png".into(),
-                adjustment: NewThreadBackgroundAdjustment {
-                    focal_x: 0.25,
-                    focal_y: 0.75,
-                    zoom: 1.8,
-                },
-            }),
-            wallpaper_folder: Some("/tmp/wallpapers".into()),
-            wallpaper_source: Some("/tmp/wallpapers/background.png".into()),
-            wallpaper_history: vec!["/tmp/wallpapers/background.png".into()],
-            wallpaper_theme_colors: false,
-            wallpaper_color: None,
-            new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
-            reduce_motion: crate::motion::ReduceMotion::On,
-            pause_animations_in_background: true,
-            smooth_scrolling: false,
-            legacy_accent_color: None,
-            onboarding_completed: false,
-        };
-        settings.save(dir.path()).unwrap();
-        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
-        assert!(json.contains(r#""diffWrap": true"#));
-        assert_eq!(UiSettings::load(dir.path()), settings);
-        assert!(json.contains(r#""codeFencesFitContent": true"#));
-        assert!(json.contains(r#""renderMath": false"#));
-        assert!(json.contains(r#""mathFont": "stixTwo""#));
-        assert!(json.contains(r#""mathSize": 135"#));
-        assert!(json.contains(r#""openWebLinksInZeron": false"#));
-        assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
-        assert!(json.contains(r#""focalX": 0.25"#));
-        assert!(json.contains(r#""focalY": 0.75"#));
-        assert!(json.contains(r#""zoom": 1.8"#));
-        assert!(json.contains(r#""reduceMotion": "on""#));
-        assert!(json.contains(r#""pauseAnimationsInBackground": true"#));
-        assert!(json.contains(r#""smoothScrolling": false"#));
-        assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
-        assert!(json.contains(r#""terminalFontSize": 15.0"#));
-        assert!(json.contains(r#""codeFontFamily": "geist""#));
-        assert!(json.contains(r#""codeFontSize": 11.0"#));
-    }
-
-    #[test]
     fn stale_revision_cannot_be_considered_the_latest_save() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = SettingsStore {
@@ -3546,163 +3347,6 @@ mod tests {
 
         assert!(!store.update_current(|settings| settings.code_fences_fit_content = false));
         assert_eq!(store.code_fences_generation, 2);
-    }
-
-    #[test]
-    fn math_generation_tracks_every_math_change_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = SettingsStore {
-            current: UiSettings::default(),
-            data_dir: dir.path().to_path_buf(),
-            revision: 0,
-            saved_revision: 0,
-            code_fences_generation: 0,
-            math_generation: 0,
-            save_task: None,
-        };
-
-        assert!(store.update_current(|settings| settings.code_fences_fit_content = true));
-        assert_eq!(store.math_generation, 0);
-
-        assert!(store.update_current(|settings| settings.render_math = false));
-        assert_eq!(store.math_generation, 1);
-        assert!(store.update_current(|settings| settings.math_font = MathFont::StixTwo));
-        assert_eq!(store.math_generation, 2);
-        assert!(store.update_current(|settings| settings.render_math = true));
-        assert_eq!(store.math_generation, 3);
-
-        assert!(!store.update_current(|settings| settings.math_font = MathFont::StixTwo));
-        assert_eq!(store.math_generation, 3);
-
-        assert!(store.update_current(|settings| settings.math_size = 120));
-        assert_eq!(store.math_generation, 4);
-        assert!(!store.update_current(|settings| settings.math_size = 120));
-        assert_eq!(store.math_generation, 4);
-        // A value the clamp heals back to the current size changes nothing.
-        assert!(store.update_current(|settings| settings.math_size = MATH_SIZE_MAX));
-        assert_eq!(store.math_generation, 5);
-        assert!(!store.update_current(|settings| settings.math_size = 500));
-        assert_eq!(store.math_generation, 5);
-    }
-
-    #[test]
-    fn math_settings_default_to_typeset_fira() {
-        let settings = UiSettings::default();
-        assert!(settings.render_math);
-        assert_eq!(settings.math_font, MathFont::Fira);
-        assert_eq!(settings.math_font.face(), zatex::bundled::Face::Fira);
-        assert_eq!(MathFont::StixTwo.face(), zatex::bundled::Face::StixTwo);
-        let json = serde_json::to_value(&settings).unwrap();
-        assert_eq!(json["renderMath"], true);
-        assert_eq!(json["mathFont"], "fira");
-        assert_eq!(settings.math_size, 100);
-        assert_eq!(json["mathSize"], 100);
-    }
-
-    #[test]
-    fn every_math_font_round_trips_through_the_settings_file() {
-        let stored = [
-            "fira",
-            "stixTwo",
-            "computerModern",
-            "libertinus",
-            "pagella",
-            "euler",
-        ];
-        assert_eq!(MathFont::ALL.len(), zatex::bundled::Face::ALL.len());
-        for ((font, key), face) in MathFont::ALL
-            .into_iter()
-            .zip(stored)
-            .zip(zatex::bundled::Face::ALL)
-        {
-            assert_eq!(font.face(), face);
-            let settings = UiSettings {
-                math_font: font,
-                ..Default::default()
-            };
-            let json = serde_json::to_value(&settings).unwrap();
-            assert_eq!(json["mathFont"], key);
-            let decoded: UiSettings = serde_json::from_value(json).unwrap();
-            assert_eq!(decoded.math_font, font);
-        }
-    }
-
-    #[test]
-    fn an_unknown_math_font_reads_as_the_default() {
-        let dir = tempfile::tempdir().unwrap();
-        for stored in [r#""someFutureFace""#, "3", "null"] {
-            std::fs::write(
-                UiSettings::path(dir.path()),
-                format!(r#"{{"sidebarWidth":300.0,"mathFont":{stored},"mathSize":150}}"#),
-            )
-            .unwrap();
-            let loaded = UiSettings::load(dir.path());
-            assert_eq!(loaded.math_font, MathFont::Fira, "{stored}");
-            // The rest of the file survives.
-            assert_eq!(loaded.sidebar_width, 300.0);
-            assert_eq!(loaded.math_size, 150);
-        }
-    }
-
-    #[test]
-    fn math_size_heals_out_of_range_values() {
-        for (value, expected) in [
-            (10, MATH_SIZE_MIN),
-            (0, MATH_SIZE_MIN),
-            (500, MATH_SIZE_MAX),
-            (75, 75),
-            (135, 135),
-            (200, 200),
-        ] {
-            let settings = UiSettings {
-                math_size: value,
-                ..Default::default()
-            }
-            .clamped();
-            assert_eq!(settings.math_size, expected, "{value}");
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(UiSettings::path(dir.path()), r#"{"mathSize":10}"#).unwrap();
-        assert_eq!(UiSettings::load(dir.path()).math_size, MATH_SIZE_MIN);
-    }
-
-    #[test]
-    fn a_malformed_math_size_never_fails_the_settings_file() {
-        let dir = tempfile::tempdir().unwrap();
-        for (stored, expected) in [
-            // Numbers round, then clamp.
-            ("1.5", MATH_SIZE_MIN),
-            ("134.6", 135),
-            ("134.4", 134),
-            ("-1", MATH_SIZE_MIN),
-            ("1e300", MATH_SIZE_MAX),
-            ("99999999999999999999999", MATH_SIZE_MAX),
-            ("150", 150),
-            // Anything else is the default.
-            (r#""big""#, MATH_SIZE_DEFAULT),
-            (r#""150""#, MATH_SIZE_DEFAULT),
-            ("null", MATH_SIZE_DEFAULT),
-            ("true", MATH_SIZE_DEFAULT),
-            ("[150]", MATH_SIZE_DEFAULT),
-            (r#"{"size":150}"#, MATH_SIZE_DEFAULT),
-        ] {
-            std::fs::write(
-                UiSettings::path(dir.path()),
-                format!(
-                    r#"{{"sidebarWidth":300.0,"mathSize":{stored},"mathFont":"stixTwo","renderMath":false}}"#
-                ),
-            )
-            .unwrap();
-            let loaded = UiSettings::load(dir.path());
-            assert_eq!(loaded.math_size, expected, "{stored}");
-            // The rest of the file survives.
-            assert_eq!(loaded.sidebar_width, 300.0, "{stored}");
-            assert_eq!(loaded.math_font, MathFont::StixTwo, "{stored}");
-            assert!(!loaded.render_math, "{stored}");
-        }
-        // Absent, it's the default.
-        let settings: UiSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(settings.math_size, MATH_SIZE_DEFAULT);
     }
 
     #[test]
@@ -3904,16 +3548,7 @@ mod tests {
     #[test]
     fn missing_and_corrupt_files_yield_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        // Defaults, except that a fresh install still has setup ahead of it,
-        // on frosted glass.
-        assert_eq!(
-            UiSettings::load(dir.path()),
-            UiSettings {
-                onboarding_completed: false,
-                surface: zeron_theme::SurfacePreference::Frosted,
-                ..UiSettings::default()
-            }
-        );
+        assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
         std::fs::write(UiSettings::path(dir.path()), "{not json").unwrap();
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
     }

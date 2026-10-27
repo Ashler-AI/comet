@@ -130,6 +130,8 @@ async fn delayed_registry_survives_blackout_and_reset_without_losing_writes() {
                 id: format!("offline-{i}"),
                 name: format!("queued-{i}"),
                 platform: "test".into(),
+                devbox_provider: None,
+                devbox_id: None,
                 last_seen_at: None,
                 created_at: None,
                 version: None,

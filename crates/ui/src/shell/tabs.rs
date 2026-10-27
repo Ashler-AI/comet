@@ -427,6 +427,17 @@ impl Shell {
                 None => (SharedString::from(""), None, true),
             }
         };
+        let environment_label = self.state.read(cx).selected_chat_row().map(|chat| {
+            match chat
+                .crew
+                .as_ref()
+                .and_then(|crew| crew.environment.as_ref())
+                .map(|environment| &environment.source)
+            {
+                Some(zeron_proto::SessionEnvironmentSource::Scaffold { .. }) => "Scaffold",
+                _ => "Local host",
+            }
+        });
 
         // The new-session `+` renders in the WINDOW-CONTROL CLUSTER whenever a
         // session is selected (`render_titlebar_cluster`) — this row budgets
@@ -674,7 +685,18 @@ impl Shell {
                                     theme.text.opacity(0.85)
                                 })
                                 .child(title),
-                        ),
+                        )
+                        .when_some(environment_label, |el, label| {
+                            el.child(
+                                div()
+                                    .id("session-environment")
+                                    .flex_none()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted)
+                                    .aria_label(format!("Session environment: {label}"))
+                                    .child(label),
+                            )
+                        }),
                 )
             })
             .child(div().flex_1())

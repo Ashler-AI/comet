@@ -1,8 +1,7 @@
 import UIKit
 import UserNotifications
 
-/// Settings & utilities: account, providers, Cloud and billing, devices,
-/// appearance, archive.
+/// Settings & utilities: account, devices, appearance, archive, diagnostics.
 final class MoreViewController: UIViewController, UICollectionViewDelegate {
     private let app: AppModel
     private var collectionView: UICollectionView!
@@ -97,8 +96,6 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         wallpaperObserver = NotificationCenter.default.addObserver(forName: WallpaperStore.didChange, object: nil, queue: .main) { [weak self] _ in self?.reload() }
         // Devices go on/offline and the org name backfills after opening.
         appToken = app.observe { [weak self] in self?.reload() }
-        cloudToken = app.cloud.observe { [weak self] in self?.reload() }
-        app.cloud.refresh()
         // Back from iOS Settings (notifications may have been allowed there).
         foregroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
             self?.refreshNotificationStatus()
@@ -151,10 +148,6 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             app.groupByProject = on
             return
         }
-        if id == "math:render" {
-            MathSettings.render = on
-            return reload()
-        }
         let push = PushNotifications.shared
         if id == "notify:enabled" {
             guard on else {
@@ -163,7 +156,7 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             }
             if notificationStatus == .denied {
                 // Only the Settings app can turn them back on.
-                let alert = UIAlertController(title: "Notifications are off", message: "Allow notifications for Zeron in iOS Settings.", preferredStyle: .alert)
+                let alert = UIAlertController(title: "Notifications are off", message: "Allow notifications for Crew Staging in iOS Settings.", preferredStyle: .alert)
                 alert.addAction(UIAlertAction(title: "Not Now", style: .cancel) { [weak self] _ in self?.reload() })
                 alert.addAction(UIAlertAction(title: "Open Settings", style: .default) { [weak self] _ in
                     if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
@@ -186,7 +179,6 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
 
     private var wallpaperObserver: NSObjectProtocol?
     private var appToken: AnyObject?
-    private var cloudToken: AnyObject?
 
     private func reload() {
         var s = NSDiffableDataSourceSnapshot<String, Row>()
@@ -194,20 +186,15 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         s.appendItems([
             Row(id: "account", title: app.accountName, subtitle: app.accountDetail, symbol: "person.crop.circle", accessory: .none),
         ])
-        // Agents and where they run, as the desktop groups them: Providers,
-        // then Cloud and Billing when this account is offered Cloud.
-        s.appendSections(["Agents"])
-        var agents = [Row(id: "providers", title: "Providers", subtitle: "Agents and their accounts on each device", symbol: "cpu")]
-        let demoCloud = app.isDemo && ProcessInfo.processInfo.arguments.contains("-cloud")
-        if (!app.isDemo && app.cloud.available) || demoCloud {
-            let cloud = app.cloud
-            let github = cloud.githubAccount.map { "GitHub @\($0)" } ?? "Connect GitHub"
-            agents.append(Row(id: "cloud", title: "Cloud", subtitle: cloud.problem?.title ?? github, symbol: "cloud"))
-            let credits = cloud.credits.map { "\(CloudUI.credits($0)) credits" }
-            let plan = cloud.billing?.plan.map { "\($0.name) plan" }
-            agents.append(Row(id: "billing", title: "Billing", subtitle: [plan, credits].compactMap { $0 }.joined(separator: " · ").nonEmpty ?? "Plans and credits", symbol: "creditcard"))
+        if !app.isDemo {
+            s.appendSections(["Crew"])
+            s.appendItems([
+                Row(id: "crew-controls", title: "Scaffold sandboxes", subtitle: "Scoped operations through your desktop controller", symbol: "server.rack"),
+                Row(id: "crew-migration", title: "Legacy iOS migration", subtitle: "Native history import receipt and retained pending work", symbol: "archivebox"),
+                Row(id: "crew-voice-unavailable", title: "Managed voice unavailable", subtitle: "Requires a compatible host Agent Auth voice adapter", symbol: "waveform", accessory: .none),
+                Row(id: "crew-link", title: "Open existing Crew link", subtitle: "Browse only; never creates or resumes execution", symbol: "link"),
+            ])
         }
-        s.appendItems(agents)
         s.appendSections(["Devices"])
         s.appendItems(app.hostOptions.map { Row(id: "device:\($0.id)", title: $0.name, subtitle: $0.online ? "Online" : "Offline", symbol: "desktopcomputer", accessory: .dot($0.online)) })
         if app.voice.available {
@@ -231,14 +218,6 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             wall.append(Row(id: "wallpaper:remove", title: "Remove Wallpaper", symbol: "trash", accessory: .none, destructive: true))
         }
         s.appendItems(wall)
-        s.appendSections(["Math"])
-        var math = [Row(id: "math:render", title: "Render Math", subtitle: "Off shows LaTeX as its source", symbol: "function", accessory: .toggle(MathSettings.render))]
-        if MathSettings.render {
-            let face = MathSettings.face
-            math.append(Row(id: "math:font", title: "Math Font", subtitle: "\(MathSettings.label(face)) — \(MathSettings.detail(face))", symbol: "textformat"))
-            math.append(Row(id: "math:size", title: "Math Size", subtitle: "\(MathSettings.size)% of the text around it", symbol: "textformat.size"))
-        }
-        s.appendItems(math)
         s.appendSections(["Sessions"])
         s.appendItems([
             Row(id: "groupByProject", title: "Group by Project", subtitle: "Sessions outside your sections, under their project", symbol: "square.stack.3d.up", accessory: .toggle(app.groupByProject)),
@@ -253,13 +232,19 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         collectionView.deselectItem(at: path, animated: true)
         guard let row = dataSource.itemIdentifier(for: path) else { return }
         switch row.id {
+        case "crew-controls": navigationController?.pushViewController(CrewControlsViewController(app: app), animated: true)
+        case "crew-migration": navigationController?.pushViewController(CrewMigrationViewController(app: app), animated: true)
+        case "crew-link":
+            let alert = UIAlertController(title: "Open in Crew", message: "Paste an existing Continue/Open in Crew session link. Its authenticated scope must match Crew Staging.", preferredStyle: .alert)
+            alert.addTextField { $0.placeholder = "comet-staging://session/…" }
+            alert.addAction(UIAlertAction(title: "Open", style: .default) { [weak self, weak alert] _ in
+                guard let text = alert?.textFields?.first?.text, crewIsSessionLink(url: text) else { return }
+                NotificationCenter.default.post(name: .crewOpenSessionLink, object: text)
+                self?.navigationController?.popToRootViewController(animated: true)
+            })
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            present(alert, animated: true)
         case "voice": navigationController?.pushViewController(VoiceViewController(app: app), animated: true)
-        case "providers":
-            navigationController?.pushViewController(ProvidersViewController(app: app), animated: true)
-        case "cloud":
-            navigationController?.pushViewController(CloudSettingsViewController(app: app), animated: true)
-        case "billing":
-            navigationController?.pushViewController(BillingViewController(app: app), animated: true)
         case let id where id.hasPrefix("appearance:"):
             let style = Int(id.dropFirst(11)) ?? 0
             UserDefaults.standard.set(style, forKey: "appearance")
@@ -272,32 +257,6 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             for e in WallpaperStore.allEffects {
                 let action = UIAlertAction(title: WallpaperStore.label(e), style: .default) { _ in WallpaperStore.effect = e }
                 action.setValue(e == WallpaperStore.effect, forKey: "checked")
-                sheet.addAction(action)
-            }
-            sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-            sheet.popoverPresentationController?.sourceView = collectionView.cellForItem(at: path)
-            present(sheet, animated: true)
-        case "math:font":
-            let sheet = UIAlertController(title: "Math Font", message: nil, preferredStyle: .actionSheet)
-            for f in MathSettings.allFaces {
-                let action = UIAlertAction(title: MathSettings.label(f), style: .default) { [weak self] _ in
-                    MathSettings.face = f
-                    self?.reload()
-                }
-                action.setValue(f == MathSettings.face, forKey: "checked")
-                sheet.addAction(action)
-            }
-            sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-            sheet.popoverPresentationController?.sourceView = collectionView.cellForItem(at: path)
-            present(sheet, animated: true)
-        case "math:size":
-            let sheet = UIAlertController(title: "Math Size", message: nil, preferredStyle: .actionSheet)
-            for size in MathSettings.allSizes {
-                let action = UIAlertAction(title: "\(size)%", style: .default) { [weak self] _ in
-                    MathSettings.size = size
-                    self?.reload()
-                }
-                action.setValue(size == MathSettings.size, forKey: "checked")
                 sheet.addAction(action)
             }
             sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))

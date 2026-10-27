@@ -112,7 +112,11 @@ impl Shell {
             true
         } else {
             if !self.state.read(cx).sidebar_preferences.can_edit() {
-                self.show_notice(crate::toast::ToastKind::Error, "Sidebar is still syncing. Try again shortly.", cx);
+                self.show_notice(
+                    crate::toast::ToastKind::Error,
+                    "Sidebar is still syncing. Try again shortly.",
+                    cx,
+                );
                 cx.notify();
                 return false;
             }
@@ -943,6 +947,8 @@ mod tests {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
                     data_dir: path.into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),

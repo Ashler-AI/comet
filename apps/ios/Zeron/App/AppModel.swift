@@ -1,6 +1,10 @@
 import Network
+import CryptoKit
 import Security
 import UIKit
+#if DEBUG && targetEnvironment(simulator)
+import Darwin
+#endif
 
 /// App-wide state owner: holds the Rust `CoreClient`, maps its snapshots
 /// into view models, and fans change notifications out to screens. All
@@ -40,7 +44,8 @@ final class AppModel {
     @MainActor lazy var voice = RemoteVoiceController(app: self)
     /// Every chat's terminals (shells on their hosts).
     @MainActor lazy var terminals = TerminalStore(app: self)
-    /// Cloud for this account (status, GitHub, agent logins, billing).
+    /// Retained for the shared upstream ABI. Crew does not expose Cloud,
+    /// billing, or WorkOS product surfaces.
     @MainActor lazy var cloud = CloudStore(app: self)
     private(set) var client: CoreClient?
     private(set) var frontPage = FrontPage()
@@ -61,21 +66,27 @@ final class AppModel {
     /// The network path's shape last seen (interfaces in order), so only a
     /// real change re-pairs direct connections.
     private var pathShape: String?
+    private var profileKey: String?
+    private(set) var restoreError: String?
+    private var restoreInFlight = false
+    private var authGeneration: UInt64 = 0
+    private var restoreSuppressed = false
+    var crewStorageKey: String? { profileKey }
 
     var onSignedIn: (() -> Void)?
     var onSignOut: (() -> Void)?
     /// The new-session page's options (project, host, branch, model,
     /// effort), kept across launches.
     var lastDraft: NewSessionDraft = {
-        var d = !AppModel.persistsNewSession ? NewSessionDraft() : UserDefaults.standard.data(forKey: "newSessionDraft").flatMap { try? JSONDecoder().decode(NewSessionDraft.self, from: $0) } ?? NewSessionDraft()
+        var d = NewSessionDraft()
         // `-harness mock`: live-stack tests must never start a real agent.
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-harness"), i + 1 < args.count { d.harness = args[i + 1] }
         return d
     }() {
         didSet {
-            guard Self.persistsNewSession else { return }
-            UserDefaults.standard.set(try? JSONEncoder().encode(lastDraft), forKey: "newSessionDraft")
+            guard Self.persistsNewSession, let profileKey else { return }
+            UserDefaults.standard.set(try? JSONEncoder().encode(lastDraft), forKey: "newSessionDraft.\(profileKey)")
         }
     }
 
@@ -117,6 +128,12 @@ final class AppModel {
                     self.client?.networkPathChanged()
                 }
                 self.pathShape = shape
+                if p.status == .satisfied {
+                    self.restoreSavedAccount()
+                    if self.isSignedIn, !self.isDemo {
+                        PushNotifications.shared.signedIn()
+                    }
+                }
             }
         }
         path.start(queue: DispatchQueue(label: "sh.zeron.path"))
@@ -134,8 +151,8 @@ final class AppModel {
         #endif
         if args.contains("-demo") || args.contains("-route") && Credentials.stored() == nil {
             start(.demo(options: Self.demoOptions()))
-        } else if let stored = Credentials.stored() {
-            start(stored)
+        } else {
+            Task { @MainActor in restoreSavedAccount() }
         }
     }
 
@@ -152,31 +169,26 @@ final class AppModel {
 
     // MARK: Lifecycle
 
-    private static var coreDir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("core", isDirectory: true)
-    }
-
-    /// Local docs belong to one identity: another account/org starts from an
-    /// empty store (it must never see — or sync — the last one's cache).
-    private static func claimCoreDir(for credentials: Credentials) {
-        let owner: String
-        switch credentials {
-        case let .workOs(userId, orgId, _), let .dev(userId, orgId): owner = "\(userId)/\(orgId)"
-        case .demo: return
-        }
-        let marker = coreDir.appendingPathComponent(".owner")
-        if (try? String(contentsOf: marker, encoding: .utf8)) != owner {
-            try? FileManager.default.removeItem(at: coreDir)
-        }
-        try? FileManager.default.createDirectory(at: coreDir, withIntermediateDirectories: true)
-        try? owner.write(to: marker, atomically: true, encoding: .utf8)
+    static var profilesDir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("profiles/scaffold", isDirectory: true)
     }
 
     @discardableResult
     private func start(_ credentials: Credentials) -> Bool {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = credentials.isDemo ? support.appendingPathComponent("demo", isDirectory: true) : Self.coreDir
-        if !credentials.isDemo { Self.claimCoreDir(for: credentials) }
+        let dir: URL
+        if credentials.isDemo {
+            dir = support.appendingPathComponent("demo", isDirectory: true)
+        } else if let profileKey {
+            dir = Self.profilesDir.appendingPathComponent(profileKey, isDirectory: true)
+        } else if case let .dev(userId, orgId) = credentials {
+            let identity = SHA256.hash(data: Data("\(Self.edgeURL)/\(userId)/\(orgId)".utf8))
+                .map { String(format: "%02x", $0) }.joined()
+            dir = Self.profilesDir.appendingPathComponent(identity, isDirectory: true)
+        } else {
+            return false
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let config = CoreConfig(
             edgeUrl: Self.edgeURL,
@@ -190,65 +202,147 @@ final class AppModel {
             client = try CoreClient(config: config, credentials: credentials, listener: bridge)
             // Only real accounts persist; dev bearers come from launch args
             // (and would be rejected by the production edge next launch).
-            if case .workOs = credentials { Credentials.store(credentials) }
+            if case .scaffold = credentials, !Credentials.store(credentials) {
+                throw CoreError.Storage(message: "Could not save Crew credentials to Keychain.")
+            }
             refreshWorkspace()
             client?.preloadSessions()
-            backfillProfile()
+            Drafts.profile = profileKey ?? (credentials.isDemo ? "demo" : dir.lastPathComponent)
+            if let profileKey {
+                lastDraft = UserDefaults.standard.data(forKey: "newSessionDraft.\(profileKey)")
+                    .flatMap { try? JSONDecoder().decode(NewSessionDraft.self, from: $0) } ?? NewSessionDraft()
+            }
             clock?.invalidate()
             // Relative times ("4m") and 45s staleness age without events.
             clock = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refreshWorkspace() }
             return true
         } catch {
             NSLog("core start failed: \(error)")
+            client?.shutdown()
             client = nil
             return false
         }
     }
 
-    /// `-edge <url>` points at a local `wrangler dev` edge; otherwise production.
+    /// `-edge <url>` points at a local development edge; otherwise Crew Staging.
     static var edgeURL: String {
         #if DEBUG
-        if let edge = Endpoints.debugOverride("-edge", key: "debugEdgeURL") { return edge }
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-edge"), i + 1 < args.count { return args[i + 1] }
         #endif
-        return Endpoints.edgeURL.absoluteString
+        return Endpoints.edgeURL?.absoluteString ?? ""
     }
 
     static var deviceId: String {
-        if let id = UserDefaults.standard.string(forKey: "deviceId") { return id }
+        if let id = UserDefaults.standard.string(forKey: "deviceId"), !id.isEmpty { return id }
         let id = "ios-" + UUID().uuidString.lowercased().prefix(8)
         UserDefaults.standard.set(id, forKey: "deviceId")
         return id
     }
 
-    /// WorkOS code → tokens → org (the first, or the only one) → client.
-    func signIn(code: String, chooseOrg: @escaping ([AuthOrg]) async -> AuthOrg?) async throws {
-        let edge = Self.edgeURL
-        let exchange = try await authExchangeCode(edgeUrl: edge, code: code)
-        let orgs = try await authListOrgs(edgeUrl: edge, accessToken: exchange.tokens.accessToken)
-        guard !orgs.isEmpty else { throw CoreError.Auth(message: "This account isn't in an organization yet.") }
-        guard let org = orgs.count == 1 ? orgs[0] : await chooseOrg(orgs) else { return }
-        let tokens = try await authRefresh(edgeUrl: edge, refreshToken: exchange.tokens.refreshToken, organizationId: org.organizationId)
-        let user = exchange.user
-        let name = [user.firstName, user.lastName].compactMap { $0?.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
-        AccountProfile(name: name.nonEmpty, email: user.email, orgName: org.name).save()
-        let started = await MainActor.run { start(.workOs(userId: exchange.user.id, orgId: org.organizationId, tokens: tokens)) }
-        guard started else { throw CoreError.Auth(message: "Couldn't open your workspace. Try signing in again.") }
-        await MainActor.run { onSignedIn?() }
+    @MainActor func cancelPendingRestore() {
+        authGeneration &+= 1
+        restoreSuppressed = true
     }
 
-    /// The user signing out: this device forgets the account's local docs.
+    @MainActor private func restoreSavedAccount() {
+        guard client == nil, !restoreInFlight, !restoreSuppressed else { return }
+        var sessionJson: String?
+        if case let .scaffold(_, _, _, saved)? = Credentials.stored() { sessionJson = saved }
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("-import-staging-session") {
+            // Consume once; path changes must not retry or fall back to another account.
+            restoreSuppressed = true
+            do {
+                sessionJson = try Self.consumeSimulatorSession(at: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("crew-scaffold-session.json"))
+            } catch {
+                restoreError = error.localizedDescription
+                observers.values.forEach { $0() }
+                return
+            }
+        }
+        #endif
+        guard let sessionJson else { return }
+        let discardRejectedCredential = !restoreSuppressed
+        restoreInFlight = true
+        let generation = authGeneration
+        Task { @MainActor in
+            defer { restoreInFlight = false }
+            do {
+                let account = try await Endpoints.login().restore(sessionJson: sessionJson)
+                guard generation == authGeneration, client == nil else { return }
+                try await signIn(account: account)
+            } catch {
+                guard generation == authGeneration else { return }
+                restoreError = error.localizedDescription
+                // Rejecting an import must not discard a previously saved account.
+                if case CoreError.Auth = error, discardRejectedCredential { Credentials.clearStored() }
+                observers.values.forEach { $0() }
+            }
+        }
+    }
+
+    #if DEBUG && targetEnvironment(simulator)
+    static func consumeSimulatorSession(at url: URL) throws -> String {
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw CoreError.Storage(message: "Cannot open the private simulator session file.") }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? file.close() }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+            throw CoreError.Storage(message: "Simulator session import requires a regular file.")
+        }
+        // Remove the transfer file before parsing, network access or Keychain storage.
+        guard unlink(url.path) == 0 else { throw CoreError.Storage(message: "Cannot remove the simulator session transfer file.") }
+        guard info.st_uid == getuid(), info.st_nlink == 1, info.st_mode & 0o777 == 0o600,
+              info.st_size > 0, info.st_size <= 65_536 else {
+            throw CoreError.Storage(message: "Simulator session file must be private (0600), owned, unlinked and at most 64 KB.")
+        }
+        guard let data = try file.read(upToCount: 65_537), data.count == info.st_size,
+              let session = String(data: data, encoding: .utf8) else {
+            throw CoreError.Storage(message: "Simulator session file is incomplete or not UTF-8.")
+        }
+        return session
+    }
+    #endif
+
+    @MainActor func signIn(account: CrewAccount) async throws {
+        if let client { PushNotifications.shared.signingOut(client: client) }
+        client?.shutdown()
+        client = nil
+        let generation = authGeneration
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let legacy = support.appendingPathComponent("CometDocs", isDirectory: true)
+        if FileManager.default.fileExists(atPath: legacy.path) {
+            let config = CoreConfig(edgeUrl: Self.edgeURL,
+                                    dataDir: Self.profilesDir.appendingPathComponent(account.profileKey, isDirectory: true).path,
+                                    deviceId: Self.deviceId, deviceName: UIDevice.current.name, platform: "ios",
+                                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0")
+            _ = try await crewPrepareLegacyBackup(config: config, credentials: account.credentials, sourcePath: legacy.path)
+        }
+        guard generation == authGeneration, client == nil else {
+            throw CoreError.Auth(message: "Sign-in changed while preserving the old profile. No live client was opened.")
+        }
+        profileKey = account.profileKey
+        AccountProfile(name: account.name, email: account.email, orgName: account.projectScope).save()
+        guard start(account.credentials) else {
+            throw CoreError.Storage(message: "Could not open this Crew profile. Its local data was retained.")
+        }
+        authGeneration &+= 1
+        restoreError = nil
+        onSignedIn?()
+    }
+
+    /// Signing out forgets credentials, never cached-only history or an outbox.
     @MainActor func signOut() {
         voice.stop()
-        forgetOnSignOut = true
         onSignOut?()
     }
 
-    /// Set only by a sign-out the user asked for. An expired session keeps its
-    /// store (the outbox may hold unsent messages); the `.owner` marker still
-    /// keeps a different account out of it.
-    private var forgetOnSignOut = false
-
     @MainActor func signOutLocally() {
+        PushNotifications.shared.signingOut(client: client)
+        authGeneration &+= 1
         voice.stop()
         terminals.signOut()
         endDeliveryBackgroundTask()
@@ -258,9 +352,8 @@ final class AppModel {
         Credentials.clearStored()
         AccountProfile.clear()
         clock?.invalidate()
-        if forgetOnSignOut { try? FileManager.default.removeItem(at: Self.coreDir) }
-        cloud.reset()
-        forgetOnSignOut = false
+        profileKey = nil
+        Drafts.profile = "signed-out"
         // Nothing of the account stays in memory.
         frontPage = FrontPage()
         archived = []
@@ -309,6 +402,7 @@ final class AppModel {
         endDeliveryBackgroundTask()
         client?.onForeground()
         refreshWorkspace()
+        Task { @MainActor in restoreSavedAccount() }
     }
 
     /// Pull to refresh: redial the registry and rooms and re-probe health (the
@@ -386,10 +480,6 @@ final class AppModel {
         }
     }
 
-    /// Something outside the registry stream changed the workspace (a Cloud
-    /// project written here): rebuild now rather than on the next frame.
-    func workspaceDidChange() { refreshWorkspace() }
-
     private func refreshWorkspace() {
         guard let client else { return }
         let ws = client.workspace()
@@ -424,16 +514,12 @@ final class AppModel {
             if row.status == .working { counts.working += 1 }
             if row.status == .awaiting { counts.awaiting += 1 }
         }
-        // A row's own content (its model, say) counts even when the lists
-        // don't show it: open sessions read their chips from it.
-        let rowsChanged = all.count != rows.count || all.contains { rows[$0.key]?.revision != $0.value.revision }
         rows = all
         // Devices coming and going (Settings, host pickers) count as changes.
         let hosts = hostOptions
-        let changed = rowsChanged || page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
+        let changed = page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
         lastHosts = hosts
         live = counts
-        if !freshSideChats.isEmpty { sweepFreshSideChats() }
         frontPage = page
         archived = archivedVMs
         if changed { observers.values.forEach { $0() } }
@@ -538,19 +624,9 @@ final class AppModel {
         Toast.show("Archived", action: "Undo", in: window) { [weak self] in self?.unarchive(id) }
     }
     func unarchive(_ id: String) { attempt("unarchive") { try client?.unarchiveSession(chatId: id) } }
-    /// Permanently: the row on every device (a Cloud chat's machine too).
-    func delete(_ id: String) { attempt("delete") { try client?.deleteSession(chatId: id) } }
     func move(_ id: String, toSection section: String?) { attempt("assign") { try client?.assignSection(chatId: id, sectionId: section) } }
     func movePin(_ id: String, after: String?, before: String?) {
         attempt("move pin") { try client?.movePin(chatId: id, after: after, before: before) }
-    }
-    /// Pin between neighbours (`nil` at either end), as a drop into Pinned does.
-    func pin(_ id: String, after: String?, before: String?) {
-        attempt("pin") { try client?.pinSessionAt(chatId: id, after: after, before: before) }
-    }
-    /// Move into a section between its members (`nil` at either end).
-    func place(_ id: String, inSection section: String, after: String?, before: String?) {
-        attempt("assign") { try client?.placeSession(chatId: id, sectionId: section, after: after, before: before) }
     }
     func renameSection(_ id: String, _ name: String) { attempt("rename section") { try client?.renameSection(sectionId: id, name: name) } }
     func deleteSection(_ id: String) { attempt("delete section") { try client?.deleteSection(sectionId: id) } }
@@ -571,67 +647,6 @@ final class AppModel {
         }
     }
 
-    // MARK: Companions (side chats, subagents)
-
-    /// A session's side chats, newest first.
-    func sideChats(of chatId: String) -> [SessionRowVM] {
-        (client?.childSessions(parentId: chatId) ?? []).filter { !$0.archived }.map(Self.vm)
-    }
-
-    /// The subagents a session's agent spawned (its open transcript).
-    func sessionSubagents(_ chatId: String) -> [SubagentRow] {
-        guard let client, !chatId.contains("--sub--") else { return [] }
-        return (client.session(chatId: chatId) ?? (try? client.openSession(chatId: chatId)))?.subagents() ?? []
-    }
-
-    /// Side chats started here that nothing has been sent in yet: closed
-    /// unused, they go (the desktop only writes one at its first send).
-    /// Kept across launches, so one left open when the app was killed goes
-    /// too.
-    private(set) var freshSideChats = Set(UserDefaults.standard.stringArray(forKey: "freshSideChats") ?? []) {
-        didSet { UserDefaults.standard.set(Array(freshSideChats), forKey: "freshSideChats") }
-    }
-
-    func forgetFreshSideChat(_ id: String) {
-        freshSideChats.remove(id)
-    }
-
-    /// Fresh side chats nobody has open: empty a minute on, they go; one
-    /// that got a message (from any device) is just a side chat now.
-    private func sweepFreshSideChats() {
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
-        for id in freshSideChats {
-            guard let row = rows[id] ?? client?.sessionRow(chatId: id) else { continue }
-            if row.preview != nil {
-                freshSideChats.remove(id)
-            } else if SessionViewController.live(id) == nil, now - row.createdAtMs > 60_000 {
-                freshSideChats.remove(id)
-                delete(id)
-            }
-        }
-    }
-
-    /// A fresh side chat under `parentId`; nil when it couldn't be made.
-    func createSideChat(parentId: String) -> String? {
-        do {
-            let id = try client?.createSideChat(parentId: parentId)
-            if let id { freshSideChats.insert(id) }
-            refreshWorkspace()
-            return id
-        } catch {
-            NSLog("side chat failed: \(error)")
-            return nil
-        }
-    }
-
-    /// Fork `sourceId` into a side chat (its host copies the conversation).
-    func forkSideChat(sourceId: String) async throws -> String {
-        guard let client else { throw CoreError.Closed }
-        let id = try await client.forkSideChat(sourceId: sourceId)
-        await MainActor.run { refreshWorkspace() }
-        return id
-    }
-
     // MARK: New session
 
     /// Who's signed in, by name (never the WorkOS user / org ids).
@@ -645,29 +660,12 @@ final class AppModel {
     var accountDetail: String {
         if isDemo { return "Offline demo workspace" }
         let p = AccountProfile.load()
-        return [p.name != nil ? p.email : nil, p.orgName].compactMap { $0 }.joined(separator: " · ").nonEmpty ?? "Zeron account"
+        return [p.name != nil ? p.email : nil, p.orgName].compactMap { $0 }.joined(separator: " · ").nonEmpty ?? "Crew account"
     }
 
-    /// Logins from before profiles were saved: recover the org name (the
-    /// user's name comes back at the next sign-in).
-    private func backfillProfile() {
-        guard case let .workOs(_, orgId, tokens)? = Credentials.stored(), AccountProfile.load().orgName == nil else { return }
-        let edge = Self.edgeURL
-        Task { @MainActor [weak self] in
-            guard let orgs = try? await authListOrgs(edgeUrl: edge, accessToken: tokens.accessToken),
-                  let org = orgs.first(where: { $0.organizationId == orgId })
-            else { return }
-            var p = AccountProfile.load()
-            p.orgName = org.name
-            p.save()
-            self?.observers.values.forEach { $0() }
-        }
-    }
 
-    @MainActor var projectOptions: [ProjectOption] {
-        // A Cloud project runs only on Cloud: hidden when this account isn't
-        // offered Cloud (or no longer is).
-        rawProjects.filter { !$0.isCloud || isDemo || cloud.available }.map { ProjectOption(id: $0.id, name: $0.name, path: $0.path, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, groupKey: $0.groupKey, groupName: $0.groupName, colorIndex: Int($0.colorIndex), isCloud: $0.isCloud, githubRepo: $0.githubRepo) }
+    var projectOptions: [ProjectOption] {
+        rawProjects.map { ProjectOption(id: $0.id, name: $0.name, path: $0.path, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, groupKey: $0.groupKey, groupName: $0.groupName, colorIndex: Int($0.colorIndex)) }
     }
 
     var hostOptions: [HostOption] {
@@ -685,25 +683,7 @@ final class AppModel {
         var out: [ModelChoice] = []
         for h in harnesses where h.offered {
             let models = (try? await client.listModels(deviceId: deviceId, harness: h.id)) ?? fallbackModels(harness: h.id)
-            out += models.map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels, detail: $0.description) }
-        }
-        return out
-    }
-
-    /// A Cloud chat created whose first message didn't go out yet.
-    private var unsentCloudChat: (key: String, chatId: String)?
-
-    /// The agents Cloud runs.
-    static let cloudHarnesses = ["claude-code", "codex"]
-
-    /// Cloud's models, as the edge lists them (no computer or Cloud machine
-    /// is asked).
-    func cloudModels() async -> [ModelChoice] {
-        guard let client else { return [] }
-        var out: [ModelChoice] = []
-        for h in Self.cloudHarnesses {
-            let label = HarnessNames.label(h)
-            out += await client.cloudModels(harness: h).map { ModelChoice(harness: h, harnessLabel: label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels, detail: $0.description) }
+            out += models.map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels) }
         }
         return out
     }
@@ -734,39 +714,6 @@ final class AppModel {
         guard let client, let p = rawProjects.first(where: { $0.id == projectId }) else { return [] }
         let refs = (try? await client.listRefs(deviceId: p.deviceId, repoPath: p.path)) ?? []
         return refs.sorted { $0.current && !$1.current }.map(\.name)
-    }
-
-    /// A session on its own Cloud machine in `draft.projectId` (a Cloud
-    /// project, or any project whose repository Cloud reaches): the edge
-    /// mints the machine, then the first message is sent as usual — it
-    /// waits in the chat until the machine is up.
-    @MainActor
-    func createCloudSession(draft: NewSessionDraft, text: String, images: [StagedImage]) async throws -> String {
-        guard let client, let spaceId = draft.projectId else { throw CoreError.Closed }
-        let config = ChatConfig(harness: draft.harness, model: draft.model, reasoning: draft.effort, modelOptions: [:], sandbox: .workspaceWrite)
-        // A retry after a failed first send reuses that chat (and machine)
-        // instead of starting a second one.
-        let chatId: String
-        // Only while nothing the chat was made with changed (its project,
-        // branch, provider, model): otherwise that's a different chat.
-        let key = "\(spaceId)|\(draft.branch ?? "")|\(draft.harness)|\(draft.model ?? "")"
-        if let unsent = unsentCloudChat, unsent.key == key, client.sessionRow(chatId: unsent.chatId) != nil {
-            chatId = unsent.chatId
-        } else {
-            chatId = try await client.createCloudSession(spaceId: spaceId, config: config, branch: draft.branch, title: nil)
-            unsentCloudChat = (key, chatId)
-        }
-        let handle = try client.openSession(chatId: chatId)
-        _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: nil, busy: .queue))
-        unsentCloudChat = nil
-        noteDeliveryActivity()
-        refreshWorkspace()
-        return chatId
-    }
-
-    /// Branches of a Cloud project's repository (GitHub's, through Cloud).
-    func cloudBranches(repo: String) async -> [String] {
-        (try? await client?.githubBranches(repo: repo)) ?? []
     }
 
     /// Create the chat, open it, and send the first message.
@@ -820,14 +767,18 @@ extension Credentials {
         return false
     }
 
-    private static let service = "sh.zeron.ios"
-    private static let account = "credentials"
+    private static let service = "ai.ashler.crew.staging"
+    private static var account: String { "credentials.\(Endpoints.storageScope)" }
 
     static func stored() -> Credentials? {
         guard let data = Keychain.load(service: service, account: account),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
         else { return nil }
         switch dict["kind"] {
+        case "scaffold":
+            guard let u = dict["userId"], let o = dict["orgId"],
+                  let origin = dict["controlOrigin"], let session = dict["session"] else { return nil }
+            return .scaffold(userId: u, orgId: o, controlOrigin: origin, sessionJson: session)
         case "workos":
             guard let u = dict["userId"], let o = dict["orgId"], let a = dict["access"], let r = dict["refresh"] else { return nil }
             return .workOs(userId: u, orgId: o, tokens: AuthTokens(accessToken: a, refreshToken: r))
@@ -839,23 +790,25 @@ extension Credentials {
         }
     }
 
-    static func store(_ c: Credentials) {
+    @discardableResult static func store(_ c: Credentials) -> Bool {
         var dict: [String: String] = [:]
         switch c {
+        case let .scaffold(userId, orgId, controlOrigin, sessionJson):
+            dict = ["kind": "scaffold", "userId": userId, "orgId": orgId,
+                    "controlOrigin": controlOrigin, "session": sessionJson]
         case let .workOs(userId, orgId, tokens):
             dict = ["kind": "workos", "userId": userId, "orgId": orgId, "access": tokens.accessToken, "refresh": tokens.refreshToken]
         case let .dev(userId, orgId):
             dict = ["kind": "dev", "userId": userId, "orgId": orgId]
         case .demo:
-            return
+            return true
         }
-        if let data = try? JSONSerialization.data(withJSONObject: dict) {
-            Keychain.save(data, service: service, account: account)
-        }
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return false }
+        return Keychain.save(data, service: service, account: account)
     }
 
     static func updateTokens(_ tokens: AuthTokens) {
-        guard case let .workOs(userId, orgId, _) = stored() else { return }
+        guard case let .workOs(userId, orgId, _)? = stored() else { return }
         store(.workOs(userId: userId, orgId: orgId, tokens: tokens))
     }
 
@@ -865,16 +818,21 @@ extension Credentials {
 }
 
 enum Keychain {
-    static func save(_ data: Data, service: String, account: String) {
-        delete(service: service, account: account)
-        let q: [String: Any] = [
+    @discardableResult static func save(_ data: Data, service: String, account: String) -> Bool {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
         ]
-        SecItemAdd(q as CFDictionary, nil)
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let result = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if result == errSecSuccess { return true }
+        guard result == errSecItemNotFound else { return false }
+        query.merge(attributes) { _, value in value }
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
     }
 
     static func load(service: String, account: String) -> Data? {
@@ -906,8 +864,8 @@ struct AccountProfile: Codable {
     var email: String?
     var orgName: String?
 
-    private static let service = "sh.zeron.ios"
-    private static let account = "profile"
+    private static let service = "ai.ashler.crew.staging"
+    private static var account: String { "profile.\(Endpoints.storageScope)" }
 
     static func load() -> AccountProfile {
         Keychain.load(service: service, account: account).flatMap { try? JSONDecoder().decode(AccountProfile.self, from: $0) } ?? AccountProfile()

@@ -56,18 +56,15 @@ async fn main() -> anyhow::Result<()> {
         resume: None,
         env: Default::default(),
     };
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        steering,
-        interrupt: interrupt.clone(),
-        request_input: Box::new(|_| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(vec![]);
-            rx
-        }),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    steering,
+    interrupt: interrupt.clone(),
+    request_input: Box::new(|_| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(vec![]);
+        rx
+    }),
+    turn: Default::default(), };
     let mut stream =
         tokio::time::timeout(Duration::from_secs(90), harness.run(request, controls)).await??;
     let mut injected = false;

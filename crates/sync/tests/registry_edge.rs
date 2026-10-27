@@ -23,27 +23,23 @@ fn ts(ms: i64) -> DateTime<Utc> {
 }
 
 fn chat(id: &str, device_id: &str) -> Chat {
-    Chat {
-        id: id.into(),
-        device_id: device_id.into(),
-        title: Some("live chat".into()),
-        archived: false,
-        cwd: Some("/tmp".into()),
-        branch: None,
-        checkout_id: None,
-        source_context: None,
-        config: None,
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: ts(2_000),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        harness_session_harness: None,
-        parent_chat_id: None,
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None,
-    }
+    Chat { id: id.into(), crew: None, device_id: device_id.into(),
+    title: Some("live chat".into()),
+    archived: false,
+    cwd: Some("/tmp".into()),
+    branch: None,
+    checkout_id: None,
+    source_context: None,
+    config: None,
+    last_message_preview: None,
+    last_message_at: None,
+    created_at: ts(2_000),
+    harness_session_id: None,
+    harness_session_cwd: None,
+    parent_chat_id: None,
+    space_id: None,
+    last_seen_at: None,
+    room_gen: None, }
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -81,8 +77,6 @@ async fn two_rust_clients_converge_through_a_real_registry_do() {
         doc.upsert_chat(&chat("chat-live", "dev-live-a")).unwrap();
         doc.upsert_session(&Session {
             last_completed_turn: None,
-            last_turn_outcome: None,
-            terminal_activity: None,
             running_subagents: 0,
             chat_id: "chat-live".into(),
             device_id: "dev-live-a".into(),
@@ -201,8 +195,6 @@ async fn cursor_delta_and_churn_stay_bounded_on_a_real_do() {
             let mut d = doc.lock().unwrap();
             d.upsert_session(&Session {
                 last_completed_turn: None,
-                last_turn_outcome: None,
-                terminal_activity: None,
                 running_subagents: 0,
                 chat_id: "chat-churn".into(),
                 device_id: "dev-churn".into(),

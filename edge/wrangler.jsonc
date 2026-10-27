@@ -1,188 +1,21 @@
 {
-  // Zeron edge: per-session + per-workspace Loro sync DOs, per-device
-  // relay DOs, R2 blobs, the absorbed WorkOS auth routes, and the Cloud
-  // control plane (CloudAccount/CloudIndex DOs, per-session lifecycle Workflows,
-  // usage metering; docs/design/cloud-device.md) in front of the vault.
-  // Design: loro-sessions §2 (topology), §3 (persistence), §6.1 (diff
-  // sidecar), §8 (device-room streams), §1.2 (R2 attachments), §3.3 (R2
-  // backups); ARCHITECTURE.md §6.
-  // NOTE: the worker name and R2 bucket names keep the historical "comet"
-  // prefix on purpose — Durable Object storage is bound to the script name,
-  // so renaming the worker would orphan every session/registry/chat room.
   "$schema": "node_modules/wrangler/config-schema.json",
-  // Deployed by .github/workflows/deploy.yml on pushes to main that touch
-  // edge/ (CLOUDFLARE_API_TOKEN repo secret).
-  "name": "comet-native-edge",
+  // Root deployment stays disabled. Canonical staging retains the captured
+  // account/domain/bucket and original v1/v2 DO lineage; production is absent.
+  "name": "ashler-comet-edge-local-only",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
-  "workers_dev": true,
-  // Public hostname on the zeron.sh zone, plus the install surface carved out
-  // of the landing host: path routes beat the landing worker's custom
-  // domain, so `curl -fsSL https://zeron.sh/install.sh | sh` installs Zeron
-  // while the rest of zeron.sh serves the landing page.
-  "routes": [
-    { "pattern": "edge.zeron.sh", "custom_domain": true },
-    { "pattern": "zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "zeron.sh/releases/*", "zone_name": "zeron.sh" },
-    // Legacy comet hostnames — keep until 0.1.x clients are gone.
-    { "pattern": "edge.comet.zeron.sh", "custom_domain": true },
-    { "pattern": "comet.zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
-  ],
-  // Serve src/install.sh as a string (the /install.sh route).
-  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
-  // loro-crdt's default entry loads its WASM via URL fetch, which workerd
-  // cannot do at runtime; the base64 entry inlines the module instead.
-  "alias": {
-    "loro-crdt": "loro-crdt/base64"
-  },
-  "durable_objects": {
-    "bindings": [
-      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
-      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
-      { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
-      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
-      { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
-      // Cloud control plane (docs/design/cloud-device.md):
-      // cloud1/{orgId}/{userId} — the account, its projects, and every
-      // session's machine (own sandbox, runner key, lifecycle), usage meter.
-      { "name": "CLOUD_ACCOUNTS", "class_name": "CloudAccount" },
-      // index1 — every user who ever had Cloud (billing walk list).
-      { "name": "CLOUD_INDEX", "class_name": "CloudIndex" }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["SessionRoom", "DeviceRoom"]
-    },
-    {
-      // Workspace registry (docs/registry-sync.md) — the row-table sidebar
-      // sync that replaces the Loro workspace doc rooms.
-      "tag": "v2",
-      "new_sqlite_classes": ["RegistryRoom"]
-    },
-    {
-      // chat2 session rooms (docs/chat2-sync.md) — dumb log relays that
-      // replace SessionRoom's loro-aware s2 rooms.
-      "tag": "v3",
-      "new_sqlite_classes": ["ChatRoom"]
-    },
-    { "tag": "v4", "new_sqlite_classes": ["PreviewRoom"] },
-    { "tag": "v5", "new_sqlite_classes": ["CloudAccount", "CloudIndex"] }
-  ],
-  // Cloud device lifecycle (src/cloud/workflows.ts). Workflow names are
-  // account-wide: the dev/test wrangler configs must never reuse them.
-  "workflows": [
-    { "name": "zeron-cloud-provision", "binding": "CLOUD_PROVISION", "class_name": "ProvisionWorkflow" },
-    { "name": "zeron-cloud-wake", "binding": "CLOUD_WAKE", "class_name": "WakeWorkflow" },
-    { "name": "zeron-cloud-sleep", "binding": "CLOUD_SLEEP", "class_name": "SleepWorkflow" },
-    // Explicit delete: stop → final usage read → DELETE (billing-exact).
-    { "name": "zeron-cloud-delete", "binding": "CLOUD_DELETE", "class_name": "DeleteWorkflow" }
-  ],
-  // The credential vault (edge/vault, deployed by its own job BEFORE this
-  // worker: a service binding to a missing worker fails the deploy). It has
-  // no routes; this binding is the only way in.
-  "services": [{ "binding": "VAULT", "service": "zeron-vault", "entrypoint": "VaultApi" }],
-  // Hourly: Cloud usage reconcile backstop + daily orphan scan (00:17 UTC) +
-  // closed-month exports to R2 usage/{YYYY-MM}.json (src/cloud/billing.ts).
-  "triggers": { "crons": ["17 * * * *"] },
-  "r2_buckets": [
-    {
-      "binding": "BLOBS",
-      "bucket_name": "comet-native-blobs"
-    },
-    {
-      // Release artifacts for /releases/* (curl-install + dmg downloads).
-      "binding": "RELEASES",
-      "bucket_name": "comet-native-releases"
-    }
-  ],
-  "vars": {
-    // WorkOS AuthKit client id — JWTs verified against its JWKS. Placeholder;
-    // set the real client id before deploying. Set AUTH_MODE=dev locally to
-    // accept bearer==userId. WORKOS_API_KEY is a wrangler secret
-    // (`wrangler secret put WORKOS_API_KEY`) powering the /auth/* routes.
-    // Session push notifications (registry-room.ts) need two more secrets:
-    // `wrangler secret put APNS_KEY_P8` (the AuthKey_XXXX.p8 file's contents)
-    // and `wrangler secret put APNS_KEY_ID`. Unset ⇒ decided and logged on
-    // /registry/:org/stats, not sent.
-    //
-    // Cloud device secrets (unset ⇒ /cloud answers `available: false`):
-    //   BOAT_API_KEY            Boat provider API key. A scoped key needs:
-    //                           sandbox.create, sandbox.read, sandbox.update,
-    //                           sandbox.stop, sandbox.resume, sandbox.delete,
-    //                           exec, and usage read (GET /sandboxes/{id}/usage,
-    //                           also list for the orphan scan); account.read is
-    //                           not needed. A missing action surfaces as
-    //                           "Cloud isn't configured to … sandboxes".
-    //   RUNNER_JWT_PRIVATE_KEY  ES256 private JWK (JSON) that signs runner JWTs
-    //   RUNNER_JWT_PUBLIC_KEY   the matching public JWK (JSON); add a "kid" to
-    //                           rotate later
-    //   CLOUD_ACCESS            who Cloud is offered to: "everyone", or WorkOS
-    //                           user/org ids (comma or space separated). Unset ⇒
-    //                           nobody. A secret so it changes without a deploy.
-    //   ADMIN_TOKEN             operator bearer for GET /admin/cloud/usage
-    //                           (unset ⇒ that route 404s)
-    //   STRIPE_SECRET_KEY       Stripe API key (billing; src/cloud/stripe.ts)
-    //   STRIPE_WEBHOOK_SECRET   signing secret of the webhook endpoint
-    //                           https://<edge>/stripe/webhook, subscribed to
-    //                           checkout.session.completed,
-    //                           checkout.session.async_payment_succeeded,
-    //                           customer.subscription.created/updated/deleted,
-    //                           invoice.paid
-    // Billing vars (Stripe Price ids): STRIPE_PRICE_BASE ($20/mo),
-    // STRIPE_PRICE_PRO ($50/mo), STRIPE_PRICE_MAX ($200/mo) — recurring
-    // monthly — and STRIPE_PRICE_CREDITS ($10, one-off: one 12,000-credit
-    // pack). Enable plan switching and cancellation in the Stripe customer
-    // portal settings. Billing reads as unavailable until all are set.
-    // CLOUD_CREDIT_SECONDS: provider billable seconds per credit (default
-    // 60) — what the provider bills for one minute of CLOUD_MACHINE.
-    // Optional var CLOUD_EDGE_URL overrides the origin session engines are
-    // pointed at (default: the origin of the request that created the session).
-    // Optional CLOUD_TEMPLATE names a provider snapshot (engine pre-installed,
-    // no identity) that session sandboxes start from; needs the key's
-    // snapshot.read. Unset ⇒ every session installs the engine (~30–60 s).
-    "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
-    "AUTH_MODE": "workos",
-    // Sandbox provider for NEW Cloud devices (src/cloud/providers): "boat".
-    // Existing sandboxes keep the provider they were created on.
-    "SANDBOX_PROVIDER": "boat",
-    // Sandbox auto-stop, seconds. Required while the Boat account is on trial
-    // (max 7200; auto-stop cannot be disabled there, so the DO re-extends it
-    // while the device is busy). Remove on a paid plan: idle sleep
-    // (CLOUD_IDLE_MINUTES) is ours.
-    "CLOUD_TTL_SECONDS": "7200",
-    "CLOUD_IDLE_MINUTES": "10",
-    // Most sessions per user whose machines may run at once; waking another
-    // first sleeps the least recently active idle one.
-    "CLOUD_MAX_AWAKE": "5",
-    // Session machine size: small · default · large.
-    "CLOUD_MACHINE": "default",
-    "BOAT_API_BASE": "https://boat.dev/api/v1",
-    // New accounts start with no free credits (for now).
-    "CLOUD_STARTING_CREDITS": "0",
-    // Where session engines reach the edge when no request names it (a wake
-    // that re-provisions a session whose first provision failed).
-    "CLOUD_EDGE_URL": "https://edge.zeron.sh",
-    // Live-mode Stripe (USD). Cloud has its own Billing Portal configuration:
-    // the account's default portal serves an older product's customers.
-    "STRIPE_PRICE_BASE": "price_1UTEAyLcv6c1lAsKCaWynvev",
-    "STRIPE_PRICE_PRO": "price_1UTEAzLcv6c1lAsKwK4KUdxY",
-    "STRIPE_PRICE_MAX": "price_1UTEB0Lcv6c1lAsKNJngPvEw",
-    "STRIPE_PRICE_CREDITS": "price_1UTEB0Lcv6c1lAsKOlv3Zvoy",
-    "STRIPE_PORTAL_CONFIGURATION": "bpc_1UTEB0Lcv6c1lAsK2f8WaFig"
-  },
-  // Staging: the whole stack beside production on this account — its own
-  // Workers, Durable Objects, R2 buckets and Workflows (Workflow names are
-  // account-wide, hence the prefix), WorkOS's test environment (its own
-  // users and orgs), Stripe in test mode and Boat. Deploy: `npx wrangler deploy --env staging` (vault first).
-  // Secrets: as production's Cloud list above, set with `--env staging`.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "alias": { "loro-crdt": "loro-crdt/base64" },
+  "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" },
   "env": {
-    "staging": {
-      "name": "zeron-edge-staging",
-      "workers_dev": true,
+    // Local simulation of the same native entry, never a second deployed product.
+    "local": {
+      "name": "ashler-comet-edge-local-only",
+      "workers_dev": false,
+      "preview_urls": false,
       "routes": [],
       "durable_objects": {
         "bindings": [
@@ -191,45 +24,56 @@
           { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
           { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
           { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
-          { "name": "CLOUD_ACCOUNTS", "class_name": "CloudAccount" },
-          { "name": "CLOUD_INDEX", "class_name": "CloudIndex" }
+          { "name": "AUTH_GRANTS", "class_name": "AuthGrant" }
         ]
       },
-      "workflows": [
-        { "name": "zeron-staging-cloud-provision", "binding": "CLOUD_PROVISION", "class_name": "ProvisionWorkflow" },
-        { "name": "zeron-staging-cloud-wake", "binding": "CLOUD_WAKE", "class_name": "WakeWorkflow" },
-        { "name": "zeron-staging-cloud-sleep", "binding": "CLOUD_SLEEP", "class_name": "SleepWorkflow" },
-        { "name": "zeron-staging-cloud-delete", "binding": "CLOUD_DELETE", "class_name": "DeleteWorkflow" }
+      "migrations": [{
+        "tag": "local-v1",
+        "new_sqlite_classes": ["SessionRoom", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom", "AuthGrant"]
+      }],
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "crew-local-blobs" }],
+      "vars": { "AUTH_MODE": "disabled", "ENVIRONMENT": "disabled" }
+    },
+    "staging": {
+      "name": "ashler-comet-edge-staging",
+      "account_id": "dd15bb23eb5c14365fe2621acc049e01",
+      "main": "src/staging.ts",
+      "compatibility_date": "2026-08-04",
+      "compatibility_flags": ["nodejs_compat"],
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [{ "pattern": "comet-staging.internal.ashler.com", "custom_domain": true }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
+          { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+          { "name": "AUTH_GRANTS", "class_name": "AuthGrant" },
+          { "name": "NATIVE_AUTH_GRANTS", "class_name": "NativeAuthGrant" },
+          { "name": "NATIVE_DEVICE_ROOMS", "class_name": "NativeDeviceRoom" },
+          { "name": "NATIVE_PREVIEW_ROOMS", "class_name": "NativePreviewRoom" },
+          { "name": "NATIVE_REGISTRY_ROOMS", "class_name": "NativeRegistryRoom" },
+          { "name": "NATIVE_CHAT_ROOMS", "class_name": "NativeChatRoom" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["SessionRoom", "DeviceRoom"] },
+        { "tag": "v2", "new_sqlite_classes": ["AuthGrant"] },
+        { "tag": "native-v2", "new_sqlite_classes": ["NativeAuthGrant", "NativeDeviceRoom", "NativePreviewRoom", "NativeRegistryRoom", "NativeChatRoom"] }
       ],
-      "services": [{ "binding": "VAULT", "service": "zeron-vault-staging", "entrypoint": "VaultApi" }],
-      "triggers": { "crons": ["17 * * * *"] },
-      "r2_buckets": [
-        { "binding": "BLOBS", "bucket_name": "zeron-staging-blobs" },
-        { "binding": "RELEASES", "bucket_name": "zeron-staging-releases" }
-      ],
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "ashler-comet-staging-blobs" }],
+      // ORIGINAL legacy values; native-only v2 scope/capabilities live in the adapter.
+      // Existing GCS/APNs secrets remain in place; no new release R2 binding.
       "vars": {
-        "WORKOS_CLIENT_ID": "client_01KWD0E9SYPV2WE4QN9TP9DP0W",
-        "AUTH_MODE": "workos",
-        "SANDBOX_PROVIDER": "boat",
-        "CLOUD_TTL_SECONDS": "7200",
-        "CLOUD_IDLE_MINUTES": "10",
-        "CLOUD_MAX_AWAKE": "5",
-        "CLOUD_MACHINE": "default",
-        "CLOUD_TEMPLATE": "zeron-cloud-dev",
-        "CLOUD_STARTING_CREDITS": "600",
-        // Staging's Cloud shares production's Boat account: only Wing's
-        // staging account (production's list is a secret).
-        "CLOUD_ACCESS": "user_01KWD6G6ZPW9HT4SW6D89HB5FB",
-        "CLOUD_EDGE_URL": "https://zeron-edge-staging.sylasincorporated.workers.dev",
-        "BOAT_API_BASE": "https://boat.dev/api/v1",
-        "STRIPE_PRICE_BASE": "price_1URyT5Ld6XnizwPIilL1dIYa",
-        "STRIPE_PRICE_PRO": "price_1URyT5Ld6XnizwPIBzZSBN6b",
-        "STRIPE_PRICE_MAX": "price_1URyT5Ld6XnizwPILYWMVbKZ",
-        "STRIPE_PRICE_CREDITS": "price_1URyT5Ld6XnizwPI2nNPHhkH"
+        "AUTH_MODE": "scaffold",
+        "ENVIRONMENT": "staging",
+        "APNS_TOPIC": "ai.ashler.crew.staging",
+        "APNS_TEAM_ID": "825LYXGJR6",
+        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
+        "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
+        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
       }
     }
   },
-  "observability": {
-    "enabled": true
-  }
+  // Tokens can appear in WebSocket query strings; do not enable request logging.
+  "observability": { "enabled": false }
 }

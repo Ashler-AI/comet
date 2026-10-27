@@ -11,6 +11,7 @@
 # and refreshes apps/ios/Zeron/Core/Generated/zeron_core.swift — committed so
 # Xcode's synchronized folder always sees it; CI fails if it drifts.
 set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PLATFORM="${1:-${PLATFORM_NAME:-iphonesimulator}}"
@@ -45,6 +46,7 @@ run_cargo() {
   env -i HOME="$HOME" USER="${USER:-}" TERM="${TERM:-dumb}" \
     ${KEEP[@]+"${KEEP[@]}"} \
     PATH="$CARGO_DIRS:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    ASHLER_INCREMENTAL_TSC_CHECKS=false \
     IPHONEOS_DEPLOYMENT_TARGET=26.0 \
     CARGO_TARGET_DIR="$ROOT/target" \
     cargo "$@"

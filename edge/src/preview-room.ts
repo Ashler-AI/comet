@@ -1,38 +1,24 @@
 import { AUTH_USER_HEADER, type Env } from "./env";
+import { requestAuthority, socketAuthorized, sendAuthorized, type SocketAuthority } from "./authority";
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.localhost$/;
 const MAX_MESSAGE = 1024 * 1024;
-type Attachment = {
-  device: string;
-  connection: string;
-  connected: number;
-  lastSeen: number;
-  budgetAt: number;
-  messages: number;
-  /** A Cloud machine: publishes its own services, answers who contacted it. */
-  publisher?: boolean;
-  /** Publisher only: the devices that signaled it (the only ones it may answer). */
-  peers?: string[];
-};
+type Attachment = { device: string; connection: string; connected: number; lastSeen: number; budgetAt: number; messages: number; authority?: SocketAuthority };
+type Service = Record<string, string | number | boolean>;
 
-/** Set by the Worker for runner bearers (stripped from every request first). */
-export const PREVIEW_PUBLISHER_HEADER = "x-zeron-preview-publisher";
-/** Set by the Worker when a user's device joins to finish a provider sign-in. */
+/** Set only by the authenticated Worker route when a device is completing a
+ * provider sign-in. Direct callers cannot opt themselves into the higher cap. */
 export const PREVIEW_SIGN_IN_HEADER = "x-zeron-preview-sign-in";
-/** Devices one user keeps in the room at once. */
 const DEVICE_LIMIT = 16;
-/** A sign-in's callback rides this room, so it gets in past
- * DEVICE_LIMIT (a user's idle Cloud machines and phones fill it) up to
- * this ceiling, which only bounds the object's resources. */
+/** Provider callbacks have no relay fallback, so allow a bounded temporary
+ * signaling seat even when ordinary device presence filled the room. */
 const SIGN_IN_DEVICE_LIMIT = 64;
 
-/** Whether a device may join a room holding `connected` sockets. Its own
- * reconnect replaces its old socket and always gets in. */
+/** A reconnect replaces its existing socket and never consumes another seat. */
 export function previewAdmits(connected: number, reconnecting: boolean, signIn: boolean): boolean {
   return reconnecting || connected < (signIn ? SIGN_IN_DEVICE_LIMIT : DEVICE_LIMIT);
 }
-type Service = Record<string, string | number | boolean>;
 
 export function previewCatalog(value: unknown, device: string): Service[] | undefined {
   if (!Array.isArray(value) || value.length > 256) return;
@@ -68,7 +54,7 @@ export function previewSignal(value: unknown): object | undefined {
 /** One authenticated user's devices in one organization. Only presence, service
  * metadata and SDP/ICE coordination live here; binary preview frames are rejected. */
 export class PreviewRoom {
-  constructor(private state: DurableObjectState, _env: Env) {
+  constructor(private state: DurableObjectState, private env: Env) {
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS preview_catalog (device TEXT PRIMARY KEY, services TEXT NOT NULL)");
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -86,19 +72,9 @@ export class PreviewRoom {
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
     const now = Date.now();
-    const publisher = request.headers.get(PREVIEW_PUBLISHER_HEADER) === "1";
-    server.serializeAttachment({
-      device,
-      connection: crypto.randomUUID(),
-      connected: now,
-      lastSeen: now,
-      budgetAt: now,
-      messages: 0,
-      ...(publisher ? { publisher, peers: [] } : {})
-    } satisfies Attachment);
+    server.serializeAttachment({ device, authority: requestAuthority(request), connection: crypto.randomUUID(), connected: now, lastSeen: now, budgetAt: now, messages: 0 } satisfies Attachment);
     this.broadcast({ type: "catalog", device, services: [] }, server);
-    // A publisher never receives the other devices' services.
-    for (const other of publisher ? [] : this.sockets()) {
+    for (const other of this.sockets()) {
       const peer = this.info(other).device;
       if (peer && peer !== device) this.send(server, { type: "catalog", device: peer, services: this.catalog(peer) });
     }
@@ -106,6 +82,7 @@ export class PreviewRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (!(await socketAuthorized(this.env, ws))) return;
     const info = this.info(ws);
     if (!info.device) return;
     if (typeof message !== "string" || new TextEncoder().encode(message).byteLength > MAX_MESSAGE) { ws.close(1008, "Signaling messages only"); return; }
@@ -122,23 +99,11 @@ export class PreviewRoom {
       this.state.storage.sql.exec("INSERT OR REPLACE INTO preview_catalog(device, services) VALUES (?, ?)", info.device, JSON.stringify(services));
       this.broadcast({ type: "catalog", device: info.device, services }, ws);
     } else if (value.type === "signal" && typeof value.to === "string" && ID.test(value.to) && value.to !== info.device) {
-      const signal = previewSignal(value.signal) as { kind?: string } | undefined;
+      const signal = previewSignal(value.signal);
       if (!signal) { ws.close(1008, "Invalid preview signaling"); return; }
-      // A publisher only responds to a device that contacted it (an offer or
-      // answer, whichever the pairing order asks of it); it never starts a
-      // pairing (a user's computer proxies its localhost services).
-      if (info.publisher && (signal.kind === "connect" || !(info.peers ?? []).includes(value.to))) {
-        ws.close(1008, "A Cloud machine only answers preview requests");
-        return;
-      }
       const target = this.sockets().find(peer => this.info(peer).device === value.to);
-      if (target) {
-        const peer = this.info(target);
-        if (peer.publisher && !(peer.peers ?? []).includes(info.device)) {
-          target.serializeAttachment({ ...peer, peers: [...(peer.peers ?? []), info.device].slice(-32) });
-        }
-        this.send(target, { type: "signal", from: info.device, signal });
-      } else this.send(ws, { type: "gone", device: value.to });
+      if (target) this.send(target, { type: "signal", from: info.device, signal });
+      else this.send(ws, { type: "gone", device: value.to });
     } else { ws.close(1008, "Unsupported preview message"); }
   }
   async webSocketClose(ws: WebSocket): Promise<void> { await this.remove(ws); }
@@ -162,11 +127,8 @@ export class PreviewRoom {
   }
   private sockets(): WebSocket[] { return this.state.getWebSockets().filter(ws => this.info(ws)?.device); }
   private info(ws: WebSocket): Attachment { return ws.deserializeAttachment() as Attachment; }
-  private send(ws: WebSocket, value: object): void { try { ws.send(JSON.stringify(value)); } catch { ws.close(1011, "Signaling disconnected"); } }
-  /** To every device but `except`, never to a publisher (it sees no one's services or presence). */
-  private broadcast(value: object, except: WebSocket): void {
-    for (const ws of this.sockets()) if (ws !== except && !this.info(ws).publisher) this.send(ws, value);
-  }
+  private send(ws: WebSocket, value: object): void { sendAuthorized(this.env, this.state, ws, JSON.stringify(value)); }
+  private broadcast(value: object, except: WebSocket): void { for (const ws of this.sockets()) if (ws !== except) this.send(ws, value); }
   private async remove(ws: WebSocket): Promise<void> {
     const info = this.info(ws);
     if (!info?.device) return;

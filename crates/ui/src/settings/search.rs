@@ -79,7 +79,7 @@ settings_index! {
         "titles rename sessions model"),
     (WorktreeLocation, General, Some("Git"), "Custom worktree location",
         "folder directory path checkout branches"),
-    (CommitCredit, General, Some("Git"), "Credit Zeron in commits",
+    (CommitCredit, General, Some("Git"), "Credit Crew in commits",
         "co-author coauthor attribution bot commit message"),
     (ColorScheme, Appearance, None, "Color scheme",
         "system light dark mode"),
@@ -153,16 +153,6 @@ settings_index! {
         "subagent delegate side chats tasks spawn"),
     (UpdatePolicy, Harnesses, Some("Updates"), "Update policy",
         "automatic upgrade version cli"),
-    (CloudUsage, Cloud, None, "Usage",
-        "hours consumption range"),
-    (CloudGitHub, Cloud, None, "GitHub",
-        "connect repositories account"),
-    (Credits, Billing, None, "Credits",
-        "balance"),
-    (Plan, Billing, None, "Plan",
-        "subscription upgrade manage stripe"),
-    (ExtraCredits, Billing, None, "Extra credits",
-        "buy packs top up"),
     (Autosave, Files, None, "Autosave",
         "save automatically"),
     (AutosaveDelay, Files, None, "Autosave delay",
@@ -371,9 +361,9 @@ fn page_terms(section: SettingsSection) -> &'static str {
             "harnesses agents cli claude code codex cursor devin grok hermes pi opencode \
              antigravity muse install enable disable update policy accounts sign in login"
         }
+        SettingsSection::Sandboxes => "scaffold namespace boat environments database hosts",
+        SettingsSection::Annotations => "annotations comments accounts review",
         SettingsSection::Devices => "machines computers remote this device other devices rename",
-        SettingsSection::Cloud => "machine remote github repositories usage",
-        SettingsSection::Billing => "plan credits subscription payment stripe",
         SettingsSection::Files => "editor autosave wrap hidden",
         SettingsSection::Appshots => "screenshots capture permissions",
         SettingsSection::Archived => "archive unarchive restore delete sessions threads",
@@ -789,22 +779,6 @@ mod tests {
     }
 
     #[test]
-    fn hidden_pages_are_not_searched() {
-        let signed_out = |section: SettingsSection| {
-            !matches!(section, SettingsSection::Cloud | SettingsSection::Billing)
-        };
-        assert_eq!(top("credits"), Target::Setting(SettingId::Credits));
-        // Signed out, Billing's credits are gone: only General's near
-        // spelling ("Credit Zeron in commits") is left.
-        let hits = search("credits", signed_out);
-        assert!(!hits.is_empty() && hits.iter().all(|hit| signed_out(hit.entry.section)));
-        assert_eq!(
-            hits[0].entry.target,
-            Target::Setting(SettingId::CommitCredit)
-        );
-    }
-
-    #[test]
     fn highlights_mark_the_query_in_the_title() {
         assert_eq!(marked(&search("wrap", |_| true)[0]), ["wrap"]);
         // Each word marks its own place.
@@ -815,6 +789,18 @@ mod tests {
         assert_eq!(marked(&search("wor word", |_| true)[0]), ["Word"]);
         // A match only in the terms marks nothing.
         assert!(search("frosted", |_| true)[0].ranges.is_empty());
+    }
+
+    #[test]
+    fn crew_pages_are_indexed_by_their_workflows() {
+        assert_eq!(
+            top("scaffold namespace"),
+            Target::Page(SettingsSection::Sandboxes)
+        );
+        assert_eq!(
+            top("annotations review"),
+            Target::Page(SettingsSection::Annotations)
+        );
     }
 
     #[test]

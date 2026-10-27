@@ -358,10 +358,11 @@ impl Shell {
         // then icon buttons on the heading so the branches lead. A fork in
         // flight shows in its own tab and never blocks another.
         let compact = !side_chats.is_empty();
-        let mut heading = div()
-            .flex()
-            .items_center()
-            .child(div().flex_1().child(popover::menu_heading(theme, "Side chats")));
+        let mut heading = div().flex().items_center().child(
+            div()
+                .flex_1()
+                .child(popover::menu_heading(theme, "Side chats")),
+        );
         let mut starters: Vec<AnyElement> = Vec::new();
         for (id, path, label, fork) in [
             (

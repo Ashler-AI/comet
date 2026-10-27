@@ -1,6 +1,6 @@
 import { env, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { expect, it } from "vitest";
-import { ensureNudges, enqueueNudge, pendingNudges, acknowledgeNudge, NUDGE_CAP } from "../../src/device-nudges";
+import { ensureNudges, enqueueNudge, pendingNudges, acknowledgeNudge, NUDGE_CAP, NUDGE_PAGE } from "../../src/device-nudges";
 import { decodeDeviceFrame, encodeDeviceFrame } from "../../src/device-room";
 
 it("migrates legacy receipts, keeps more than 256 wakes, and fences stale acknowledgments", async () => {
@@ -48,26 +48,53 @@ it("replays unacknowledged frames and retires only the matching token", async ()
   ws.close();
 });
 
+// This exercises 300 durable ACKs under concurrent workerd load, not a latency SLA.
 it("drains 300 queued wakes through a bounded acknowledgment window", async () => {
   const room = env.DEVICE_ROOMS.get(env.DEVICE_ROOMS.idFromName(crypto.randomUUID()));
+  await runInDurableObject(room, (_i, state) => {
+    for (let i = 0; i < 300; i++) expect(enqueueNudge(state.storage.sql, `chat-${i}`)).toBe(true);
+  });
   const response = await room.fetch("https://test/ws?role=host&nudgeAck=1", { headers: { "x-zeron-auth-user": "owner", upgrade: "websocket" } });
-  const ws = response.webSocket!; ws.accept(); ws.binaryType = "arraybuffer";
+  expect(response.status).toBe(101);
+  const ws = response.webSocket!;
   const seen = new Set<string>();
+  let receipts: Array<{ chatId: string; token: string }> = [];
+  let windowSize = NUDGE_PAGE;
+  let windowReady = Promise.withResolvers<void>();
+  ws.binaryType = "arraybuffer";
   ws.addEventListener("message", e => {
     const frame = decodeDeviceFrame(new Uint8Array(e.data as ArrayBuffer));
     const receipt = JSON.parse(new TextDecoder().decode(frame.payload));
     seen.add(receipt.chatId);
-    ws.send(encodeDeviceFrame({s:receipt.chatId,k:"nudgeAck"},frame.payload));
+    receipts.push(receipt);
+    if (receipts.length === windowSize) windowReady.resolve();
   });
-  await runInDurableObject(room, async (_i, state) => {
-    for (let i=0;i<300;i++) enqueueNudge(state.storage.sql, `chat-${i}`);
-    await state.storage.setAlarm(Date.now()+5000);
-  });
-  await runDurableObjectAlarm(room);
-  await expect.poll(() => seen.size, {timeout:5000}).toBe(300);
-  await expect.poll(() => runInDurableObject(room, (_i, state) => pendingNudges(state.storage.sql).length)).toBe(0);
-  ws.close();
-});
+  ws.accept();
+  try {
+    for (let acknowledged = 0; acknowledged < 300; acknowledged += NUDGE_PAGE) {
+      // Hold ACKs until the entire window arrives; observe the durable queue
+      // before releasing the next batch instead of racing each receipt's ACK.
+      await windowReady.promise;
+      await expect.poll(() => runInDurableObject(room, (_i, state) => ({
+        inflight: state.getWebSockets()[0].deserializeAttachment().nudgeInflight.length,
+        pending: [...state.storage.sql.exec("SELECT count(*) AS n FROM pending_nudges")][0].n,
+      }))).toEqual({ inflight: windowSize, pending: 300 - acknowledged });
+      expect(receipts).toHaveLength(windowSize);
+      expect(seen.size).toBe(Math.min(acknowledged + NUDGE_PAGE, 300));
+      const batch = receipts;
+      receipts = [];
+      windowSize = Math.min(NUDGE_PAGE, 300 - acknowledged - batch.length);
+      windowReady = Promise.withResolvers<void>();
+      for (const receipt of batch) {
+        ws.send(encodeDeviceFrame({ s: receipt.chatId, k: "nudgeAck" }, new TextEncoder().encode(JSON.stringify(receipt))));
+      }
+    }
+    await expect.poll(() => runInDurableObject(room, (_i, state) => pendingNudges(state.storage.sql).length)).toBe(0);
+    expect(seen).toEqual(new Set(Array.from({ length: 300 }, (_, i) => `chat-${i}`)));
+  } finally {
+    ws.close();
+  }
+}, 10_000);
 
 it("keeps legacy hosts usable without acknowledgment support", async () => {
   const room = env.DEVICE_ROOMS.get(env.DEVICE_ROOMS.idFromName(crypto.randomUUID()));

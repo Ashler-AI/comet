@@ -3,12 +3,12 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub fn data_dir() -> PathBuf {
-    resolve_data_dir(|name| std::env::var_os(name))
-}
 
-fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
-    if let Some(dir) = env("ZERON_DATA_DIR") {
+pub fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>, pinned: bool) -> PathBuf {
+    if let Some(dir) = (!pinned).then(|| env("COMET_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env("ZERON_DATA_DIR").filter(|value| !value.is_empty()))).flatten()
+    {
         return PathBuf::from(dir);
     }
     #[cfg(windows)]
@@ -24,21 +24,15 @@ fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
                     .filter(|value| !value.is_empty())
                     .map(|home| PathBuf::from(home).join("AppData").join("Local"))
             })
-            .expect("LOCALAPPDATA and USERPROFILE not set; set ZERON_DATA_DIR");
-        local.join("Zeron")
+            .expect("LOCALAPPDATA and USERPROFILE not set; set COMET_DATA_DIR");
+        local.join(crate::environment::DEFAULTS.windows_data_dir)
     }
     #[cfg(not(windows))]
     {
         let home = PathBuf::from(env("HOME").expect("HOME not set"));
-        let dir = home.join(".zeron");
-        // One-shot 0.2.0 migration: adopt the pre-rename data dir.
-        if !dir.exists() {
-            let old = home.join(".comet-native");
-            if old.exists() && std::fs::rename(&old, &dir).is_ok() {
-                eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
-            }
-        }
-        dir
+        // Never migrate or adopt an installed profile when selecting a flavor.
+        // Importing an existing profile is a separate, explicit operation.
+        home.join(crate::environment::DEFAULTS.data_dir)
     }
 }
 
@@ -51,7 +45,7 @@ mod tests {
             vars.iter()
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.into())
-        })
+        }, false)
     }
 
     #[test]
@@ -62,30 +56,42 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn explorer_launch_without_home_uses_local_app_data() {
+    fn native_runtime_data_dir_takes_precedence() {
         assert_eq!(
-            resolve(&[("LOCALAPPDATA", r"C:\Users\Test User\AppData\Local")]),
-            PathBuf::from(r"C:\Users\Test User\AppData\Local\Zeron"),
+            resolve(&[("COMET_DATA_DIR", "explicit"), ("ZERON_DATA_DIR", "upstream")]),
+            PathBuf::from("explicit")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn starting_selected_flavor_does_not_adopt_an_installed_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let installed = [".comet-native", ".comet-native-staging", ".zeron"];
+        for name in installed {
+            let profile = home.path().join(name);
+            std::fs::create_dir(&profile).unwrap();
+            std::fs::write(profile.join("sentinel"), b"retained-session").unwrap();
+        }
+        let selected = resolve(&[("HOME", home.path().to_str().unwrap())]);
+        assert_eq!(selected, home.path().join(crate::environment::DEFAULTS.data_dir));
+        assert!(!selected.exists());
+        for name in installed {
+            assert_eq!(
+                std::fs::read(home.path().join(name).join("sentinel")).unwrap(),
+                b"retained-session"
+            );
+        }
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_profile_fallback_handles_unicode_and_apostrophes() {
+    fn selected_flavor_uses_native_local_app_data() {
         assert_eq!(
-            resolve(&[("USERPROFILE", r"C:\Users\O'Brien 日本語")]),
-            PathBuf::from(r"C:\Users\O'Brien 日本語\AppData\Local\Zeron"),
+            resolve(&[("LOCALAPPDATA", "local"), ("HOME", "ignored")]),
+            PathBuf::from("local").join(crate::environment::DEFAULTS.windows_data_dir)
         );
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_default_does_not_depend_on_shell_home() {
-        assert_eq!(
-            resolve(&[("HOME", r"D:\msys-home"), ("LOCALAPPDATA", r"C:\Local")]),
-            PathBuf::from(r"C:\Local\Zeron"),
-        );
-    }
 }

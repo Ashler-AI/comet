@@ -16,7 +16,7 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": false,
-    "rootDir": ".",
+    "rootDir": "./src",
     "noEmit": true
   },
   "include": ["src/**/*.ts"]

@@ -57,9 +57,10 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&output)?;
     let temp = tempfile::tempdir()?;
     let runtime = tokio::runtime::Runtime::new()?;
+    let engine_data = temp.path().join("engine");
     let core = runtime.block_on(async {
         zeron_engine::EngineCore::assemble(
-            &temp.path().join("engine"),
+            &engine_data,
             Arc::new(zeron_engine::default_registry()),
             zeron_proto::HarnessId::ClaudeCode,
             None,
@@ -70,11 +71,20 @@ fn main() -> anyhow::Result<()> {
     core.workspace
         .rename_chat("appshots-fixture", "Review the workspace design")?;
     let ipc_port = port();
+    let _ipc = runtime.block_on(zeron_engine::serve_ipc(
+        ipc_port,
+        &engine_data,
+        core.rpc_service(),
+    ))?;
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
-    // Publish the IPC bearer where the attaching viewport looks for it.
-    let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, &data, core.rpc_service()))?;
+    std::fs::copy(
+        zeron_rpc::ipc_auth::token_path(&engine_data),
+        zeron_rpc::ipc_auth::token_path(&data),
+    )?;
     let boot = EngineBootConfig {
+        managed_inference: false,
+        scaffold: None,
         data_dir: data.clone(),
         ipc_port,
         edge_url: String::new(),

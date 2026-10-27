@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use zeron_doc::SessionDoc;
 use zeron_sync::chat_client::{ChatTransport, RowImportOutcome};
 use zeron_sync::{
-    ChatClient, ChatDocSink, ChatEvent, CheckpointFetcher, DocsStore, SyncError, UrlProvider,
+    ChatClient, ChatDocSink, ChatEvent, CheckpointFetcher, DocsStore, SyncError, UrlLease, UrlProvider,
 };
 
 use super::{Bearer, JOIN_RETRY_BASE, JOIN_RETRY_CAP, urls};
@@ -310,7 +310,7 @@ pub(crate) struct ChatUrl {
 }
 
 impl UrlProvider for ChatUrl {
-    fn url(&self) -> BoxFuture<'static, Result<String, SyncError>> {
+    fn url(&self) -> BoxFuture<'static, Result<UrlLease, SyncError>> {
         let bearer = self.bearer.clone();
         let host = self.host_device_id.clone();
         let (edge, chat, device) = (
@@ -320,12 +320,19 @@ impl UrlProvider for ChatUrl {
         );
         Box::pin(async move {
             let token = bearer.get().await?;
-            Ok(format!(
-                "{}&hostDevice={}",
-                urls::chat_ws(&edge, &chat, &token, &device),
-                urls::encode(&host)
-            ))
+            Ok(UrlLease {
+                url: format!(
+                    "{}&hostDevice={}",
+                    urls::chat_ws(&edge, &chat, &token.value, &device),
+                    urls::encode(&host)
+                ),
+                generation: Some(token.generation),
+            })
         })
+    }
+
+    fn invalidate(&self, generation: u64) {
+        self.bearer.invalidate(generation);
     }
 }
 
@@ -358,7 +365,7 @@ impl CheckpointFetcher for ChatHttp {
                 let token = bearer.get().await?;
                 let mut request = crate::auth::http()
                     .get(&url)
-                    .bearer_auth(&token)
+                    .bearer_auth(&token.value)
                     .timeout(Duration::from_secs(300));
                 if !got.is_empty() {
                     request = request.header("range", format!("bytes={}-", got.len()));
@@ -370,6 +377,7 @@ impl CheckpointFetcher for ChatHttp {
                         continue;
                     }
                 };
+                bearer.check_auth(response.status(), token.generation)?;
                 let seq = response
                     .headers()
                     .get("x-chat2-checkpoint-seq")
@@ -421,11 +429,12 @@ impl ChatTransport for ChatHttp {
             let token = bearer.get().await?;
             let response = crate::auth::http()
                 .get(url)
-                .bearer_auth(token)
+                .bearer_auth(&token.value)
                 .timeout(Duration::from_secs(120))
                 .send()
                 .await
                 .map_err(http_err)?;
+            bearer.check_auth(response.status(), token.generation)?;
             if !response.status().is_success() {
                 return Err(SyncError::Protocol(format!(
                     "chat pull http {}",
@@ -454,11 +463,12 @@ impl ChatTransport for ChatHttp {
             let token = bearer.get().await?;
             let response = crate::auth::http()
                 .post(url)
-                .bearer_auth(token)
+                .bearer_auth(&token.value)
                 .body(bytes)
                 .send()
                 .await
                 .map_err(http_err)?;
+            bearer.check_auth(response.status(), token.generation)?;
             if !response.status().is_success() {
                 return Err(SyncError::Protocol(format!(
                     "chat push http {}",

@@ -34,6 +34,10 @@ impl Shell {
     /// on this device. The chat's model follows the composer when it already
     /// targets Codex; otherwise Codex's own default model runs the delegations.
     pub(super) fn start_voice(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).managed_inference {
+            self.show_notice(crate::toast::ToastKind::Error, "Realtime voice is unavailable in Crew managed mode; there is no Agent Auth adapter.", cx);
+            return;
+        }
         let state = self.state.read(cx);
         let (Some(engine), Some(device)) = (state.engine().cloned(), state.local_device_id.clone())
         else {
@@ -126,6 +130,21 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if self.state.read(cx).managed_inference {
+            return Some(
+                div()
+                    .id("crew-voice-unavailable")
+                    .role(gpui::Role::Image)
+                    .aria_label("Realtime voice unavailable in Crew managed mode")
+                    .opacity(0.4)
+                    .size(px(SIDEBAR_FOOTER_BUTTON_SIZE))
+                    .tooltip(crate::settings::widgets::text_tooltip(
+                        "Realtime voice unavailable: no Agent Auth adapter",
+                    ))
+                    .child(icon(icons::MICROPHONE).size(px(16.0)))
+                    .into_any_element(),
+            );
+        }
         self.check_voice_codex(false, cx);
         let voice = self.voice.read(cx);
         // Without Codex on this device a call could only fail.
@@ -809,6 +828,8 @@ mod tests {
                 let mut shell = Shell::new(
                     state,
                     EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
                         data_dir: dir.path().into(),
                         ipc_port: 0,
                         edge_url: "http://127.0.0.1:1".into(),
@@ -877,6 +898,8 @@ mod tests {
                 let mut shell = Shell::new(
                     state,
                     EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
                         data_dir: dir.path().into(),
                         ipc_port: 0,
                         edge_url: "http://127.0.0.1:1".into(),
@@ -984,6 +1007,8 @@ mod tests {
                 let mut shell = Shell::new(
                     state,
                     EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
                         data_dir: dir.path().into(),
                         ipc_port: 0,
                         edge_url: "http://127.0.0.1:1".into(),
@@ -1073,6 +1098,8 @@ mod tests {
                 let shell = Shell::new(
                     state,
                     EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
                         data_dir: dir.path().into(),
                         ipc_port: 0,
                         edge_url: "http://127.0.0.1:1".into(),

@@ -1,6 +1,6 @@
 //! The desktop app's background engine: started by the app when nothing
 //! serves its port, it outlives the app's window — close or quit the app and
-//! sessions keep running — and shows up as its own process ("Zeron Engine"
+//! sessions keep running — and shows up as its own process ("Crew Engine"
 //! in Activity Monitor, `zeron-engine` elsewhere).
 //!
 //! It is started as a detached child of the app rather than through a
@@ -31,7 +31,7 @@ pub const ENGINE_SUBCOMMAND: &str = "engine";
 
 /// The separate engine executable's name next to the app's.
 #[cfg(target_os = "macos")]
-const ENGINE_EXECUTABLES: &[&str] = &["Zeron Engine", "zeron-engine"];
+const ENGINE_EXECUTABLES: &[&str] = &["Crew Engine", "zeron-engine"];
 #[cfg(windows)]
 const ENGINE_EXECUTABLES: &[&str] = &["zeron-engine.exe"];
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -81,21 +81,55 @@ pub fn app_path(app_exe: &Path) -> PathBuf {
 /// exiting (or its terminal closing) leaves it running.
 pub fn launch(config: &EngineConfig, app_exe: &Path) -> std::io::Result<Child> {
     let mut command = engine_command(app_exe);
+    let harness = serde_json::to_value(config.default_harness)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "claude-code".into());
     command
         .env(MANAGED_ENV, "1")
         .env(APP_ENV, app_path(app_exe))
+        // The dedicated engine resolves the same explicit Crew profile and
+        // authority as the app. Keep the upstream aliases for compatibility
+        // with the shared binary while making Crew's coordinates canonical.
+        .env("COMET_DATA_DIR", &config.data_dir)
         .env("ZERON_DATA_DIR", &config.data_dir)
+        .env("COMET_IPC_PORT", config.ipc_port.to_string())
         .env("ZERON_IPC_PORT", config.ipc_port.to_string())
+        .env("COMET_EDGE_URL", &config.edge_url)
         .env("ZERON_EDGE_URL", &config.edge_url)
+        .env("COMET_HARNESS", &harness)
+        .env("ZERON_HARNESS", &harness)
+        .env(
+            "COMET_INFERENCE_MODE",
+            if config.managed_inference { "managed" } else { "local" },
+        )
+        .env(
+            "ZERON_INFERENCE_MODE",
+            if config.managed_inference { "managed" } else { "local" },
+        )
         // Empty selects development auth, exactly as `None` does in-process.
         .env(
             "ZERON_WORKOS_CLIENT_ID",
             config.workos_client_id.as_deref().unwrap_or(""),
         );
     match &config.edge_token {
-        Some(token) => command.env("ZERON_EDGE_TOKEN", token),
-        None => command.env_remove("ZERON_EDGE_TOKEN"),
+        Some(token) => {
+            command.env("COMET_EDGE_TOKEN", token).env("ZERON_EDGE_TOKEN", token)
+        }
+        None => command.env_remove("COMET_EDGE_TOKEN").env_remove("ZERON_EDGE_TOKEN"),
     };
+    if let Some(scaffold) = &config.scaffold {
+        command
+            .env("COMET_SCAFFOLD_URL", &scaffold.control_origin)
+            .env("CREW_CONTROL_ORIGIN", &scaffold.control_origin)
+            .env("COMET_PROJECT_SCOPE", &scaffold.project_scope)
+            .env("CREW_PROJECT_SCOPE", &scaffold.project_scope);
+        if let Some(deployment) = &scaffold.deployment_id {
+            command
+                .env("COMET_DEPLOYMENT_ID", deployment)
+                .env("CREW_DEPLOYMENT_ID", deployment);
+        }
+    }
     if let Some(org) = &config.org_id {
         command.env("ZERON_ORG_ID", org);
     }
@@ -435,12 +469,12 @@ mod tests {
         );
         assert_eq!(
             installed_executable(
-                Path::new("/Applications/Zeron.app/Contents/MacOS/Zeron Engine"),
+                Path::new("/Applications/Crew.app/Contents/MacOS/Crew Engine"),
                 &zeron_update::InstallKind::MacApp {
-                    bundle: PathBuf::from("/Applications/Zeron.app"),
+                    bundle: PathBuf::from("/Applications/Crew.app"),
                 }
             ),
-            PathBuf::from("/Applications/Zeron.app/Contents/MacOS/Zeron Engine")
+            PathBuf::from("/Applications/Crew.app/Contents/MacOS/Crew Engine")
         );
         assert_eq!(
             installed_executable(exe, &zeron_update::InstallKind::Unmanaged),
@@ -451,8 +485,8 @@ mod tests {
     #[test]
     fn app_path_is_the_bundle_on_macos_layouts() {
         assert_eq!(
-            app_path(Path::new("/Applications/Zeron.app/Contents/MacOS/zeron")),
-            PathBuf::from("/Applications/Zeron.app")
+            app_path(Path::new("/Applications/Crew.app/Contents/MacOS/comet")),
+            PathBuf::from("/Applications/Crew.app")
         );
         assert_eq!(
             app_path(Path::new("/home/me/.zeron/app/current/zeron")),
@@ -492,7 +526,7 @@ mod tests {
             std::process::Command::new(&exe).spawn().unwrap()
         };
         assert!(!app_running(&macos), "nothing runs from the bundle yet");
-        let mut engine = start("Zeron Engine");
+        let mut engine = start("Crew Engine");
         std::thread::sleep(Duration::from_millis(200));
         assert!(!app_running(&macos), "the engine isn't the app");
         let mut app = start("zeron");

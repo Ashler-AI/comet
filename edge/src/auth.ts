@@ -1,94 +1,277 @@
 /**
- * Edge auth: verify WorkOS AuthKit access-token JWTs (jose against the WorkOS
- * JWKS) before any DO forwarding or R2 access. WebSocket upgrades carry the
- * token as `?token=` (WS clients cannot always set headers); plain requests
- * use `Authorization: Bearer`.
- *
- * Workspace rooms (`ws/{orgId}`) authorize on the token's WorkOS organization
- * claim (`org_id`, present when the session was refreshed scoped to an org):
- * membership = claim equals the room's orgId.
- *
- * Runner JWTs (the Cloud device's bearer, runner-token.ts) are accepted
- * alongside WorkOS JWTs and come back as `kind: "runner"` with the device id
- * they were minted for; runner-policy.ts decides what a runner may not do.
+ * Authenticates Scaffold control-plane bearers without handling Google/IAP
+ * assertions in Comet. Scaffold's IAP-protected OAuth authorize route binds a
+ * bearer to an internal principal. HTTP and socket authorization rendezvous in
+ * an AUTH_GRANTS coordinator before fresh `/api/code-sandboxes/auth/session`
+ * checks, sharing pending work across isolates but never completed authorization.
  */
-import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { Env } from "./env";
-import { claimsRunnerIssuer, parseDevRunnerBearer, verifyRunnerJwt } from "./runner-token";
+import { authenticateDeviceToken, verifyScaffoldThroughCoordinator } from "./auth-routes";
+import { boundedAuthJson, scaffoldTokenFits, SCAFFOLD_JSON_BYTES } from "./auth-envelope";
+
+export type ScaffoldAuthEnv = Omit<
+  Pick<
+    Env,
+    | "AUTH_MODE"
+    | "ENVIRONMENT"
+    | "SCAFFOLD_CONTROL_PLANE_URL"
+    | "SCAFFOLD_PROJECT_SCOPE"
+    | "SCAFFOLD_REQUIRED_CAPABILITIES"
+    | "AUTH_GRANTS"
+    | "SCAFFOLD_DEPLOYMENT_ID"
+  >,
+  "SCAFFOLD_REQUIRED_CAPABILITIES"
+> & {
+  readonly SCAFFOLD_REQUIRED_CAPABILITIES: string;
+};
 
 export interface Verified {
   readonly userId: string;
-  readonly sessionId?: string;
-  /** WorkOS `org_id` claim — the org the caller's session is scoped to. */
+  readonly email: string;
+  readonly projectScope: string;
   readonly orgId?: string;
-  /** `user` = a WorkOS session; `runner` = a Cloud device's runner JWT. */
-  readonly kind: "user" | "runner";
-  /** Runners only: the device the token was minted for (`dev` claim) —
-   * a Cloud session device. */
-  readonly deviceId?: string;
-  /** Runners only: the account's logical Cloud device (`cld` claim). */
-  readonly accountDeviceId?: string;
+  readonly deploymentId?: string;
+  readonly sessionId?: string;
+  readonly targetDeviceId?: string;
+  readonly grantId?: string;
+  readonly expiresAt?: number;
+  readonly lifecycleEpoch?: number;
+  readonly sandboxId?: string;
+  readonly capabilities: readonly string[];
+  readonly credential: "scaffold" | "device" | "dev";
 }
 
-const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+export type ScaffoldAuthenticationResult =
+  | { status: "authenticated"; identity: Verified }
+  | { status: "invalid" }
+  | { status: "unavailable"; retryAfter?: string };
 
-const getJwks = (url: string) => {
-  let jwks = jwksCache.get(url);
-  if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(url));
-    jwksCache.set(url, jwks);
-  }
-  return jwks;
+interface ScaffoldSession {
+  readonly ok?: unknown;
+  readonly resource?: unknown;
+  readonly actor?: {
+    readonly sub?: unknown;
+    readonly auth?: unknown;
+  };
+  readonly scopes?: unknown;
+}
+
+const REMOTE_CODE_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
+  "remote_code:create": ["session.invite"],
+  "remote_code:read": ["session.read"],
+  "remote_code:write": ["session.chat", "session.annotate", "session.files"],
+  "remote_code:exec": ["session.control", "session.environment", "session.sync.write"],
+  "remote_code:lifecycle": ["session.control", "session.environment"]
 };
 
-export const bearerFromRequest = (request: Request): string | undefined => {
-  const header = request.headers.get("authorization");
-  if (header?.toLowerCase().startsWith("bearer ")) return header.slice(7).trim();
-  const url = new URL(request.url);
-  return url.searchParams.get("token") ?? undefined;
+const capabilitiesFromRemoteCodeScopes = (scopes: readonly string[]): readonly string[] => [
+  ...new Set(
+    scopes.flatMap((scope) =>
+      Object.hasOwn(REMOTE_CODE_CAPABILITIES, scope) ? REMOTE_CODE_CAPABILITIES[scope] : []
+    )
+  )
+];
+
+const LOOPBACK_HOSTS: Record<string, true> = {
+  localhost: true,
+  "127.0.0.1": true,
+  "::1": true,
+  "[::1]": true
 };
 
-export const verifyToken = async (env: Env, token: string): Promise<Verified | undefined> => {
-  if (!token) return undefined;
-  // Runner JWTs are checked first and exclusively against our own key: a
-  // token claiming our issuer never falls through to the WorkOS path (or to
-  // dev mode's "the bearer is the user id").
-  if (env.RUNNER_JWT_PUBLIC_KEY && claimsRunnerIssuer(token)) {
-    const runner = await verifyRunnerJwt(env.RUNNER_JWT_PUBLIC_KEY, token);
-    return runner && { ...runner, kind: "runner" };
-  }
-  if (env.AUTH_MODE === "dev") {
-    // Dev mode mirrors the old apps/server: the bearer string IS the user id.
-    // `userId@orgId` additionally carries a fake org claim so workspace-room
-    // membership is exercisable locally (smoke tests), and
-    // `runner:{userId}@{orgId}:{deviceId}` acts as that user's Cloud runner.
-    if (token.startsWith("runner:")) {
-      const runner = parseDevRunnerBearer(token);
-      return runner && { ...runner, kind: "runner" };
-    }
-    const at = token.indexOf("@");
-    if (at > 0) return { userId: token.slice(0, at), orgId: token.slice(at + 1), kind: "user" };
-    return { userId: token, kind: "user" };
-  }
-  const issuer =
-    env.WORKOS_ISSUER ?? `https://api.workos.com/user_management/${env.WORKOS_CLIENT_ID}`;
-  const jwksUrl = env.WORKOS_JWKS_URL ?? `https://api.workos.com/sso/jwks/${env.WORKOS_CLIENT_ID}`;
+/** Credential-bearing traffic is encrypted except for explicit loopback development. */
+export const credentialTransportAllowed = (value: string | URL): boolean => {
   try {
-    const { payload } = await jwtVerify(token, getJwks(jwksUrl), { issuer });
-    if (typeof payload.sub !== "string" || payload.sub.length === 0) return undefined;
-    return {
-      userId: payload.sub,
-      sessionId: typeof payload.sid === "string" ? payload.sid : undefined,
-      orgId: typeof payload.org_id === "string" ? payload.org_id : undefined,
-      kind: "user"
-    };
+    const url = typeof value === "string" ? new URL(value) : value;
+    if (url.username || url.password) return false;
+    if (url.protocol === "https:" || url.protocol === "wss:") return true;
+    return LOOPBACK_HOSTS[url.hostname] === true && (url.protocol === "http:" || url.protocol === "ws:");
+  } catch {
+    return false;
+  }
+};
+
+const normalizedOrigin = (value: string): string | undefined => {
+  try {
+    const url = new URL(value);
+    if (
+      !credentialTransportAllowed(url) ||
+      !["http:", "https:"].includes(url.protocol) ||
+      !["", "/"].includes(url.pathname) ||
+      url.search ||
+      url.hash
+    ) {
+      return undefined;
+    }
+    return url.origin;
   } catch {
     return undefined;
   }
 };
 
-export const authenticate = async (env: Env, request: Request): Promise<Verified | undefined> => {
+export const requiredCapabilities = (env: ScaffoldAuthEnv): readonly string[] =>
+  [...new Set(env.SCAFFOLD_REQUIRED_CAPABILITIES.split(/\s+/).map((value) => value.trim()).filter(Boolean))];
+
+export const bearerFromRequest = (request: Request): string | undefined => {
+  const header = request.headers.get("authorization");
+  if (header?.toLowerCase().startsWith("bearer ")) return header.slice(7).trim() || undefined;
+  const url = new URL(request.url);
+  return url.searchParams.get("token")?.trim() || undefined;
+};
+
+// ponytail: retain the measured 2,918 ms attempt budget; the shared 8-second
+// envelope also bounds coordinator dispatch, queueing and response decoding.
+const SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS = 2_918;
+const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string, signal?: AbortSignal): Promise<ScaffoldAuthenticationResult> => {
+  if (!token.startsWith("sc_rc_")) return { status: "invalid" };
+  return verifyScaffoldThroughCoordinator(env, token, signal);
+};
+
+/** Called only by the internal grant coordinator with its own trusted bindings. */
+export const verifyScaffoldSessionResult = async (
+  env: ScaffoldAuthEnv, token: string, signal: AbortSignal
+): Promise<ScaffoldAuthenticationResult> => {
+  if (!scaffoldTokenFits(token)) return { status: "unavailable", retryAfter: "1" };
+  if (!token.startsWith("sc_rc_")) return { status: "invalid" };
+  const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
+  const projectScope = env.SCAFFOLD_PROJECT_SCOPE.trim();
+  const required = requiredCapabilities(env);
+  if (!resource || !projectScope || required.length === 0) return { status: "unavailable" };
+
+  let session: ScaffoldSession | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (signal.aborted) return { status: "unavailable", retryAfter: "1" };
+    const controller = new AbortController();
+    const abort = () => { controller.abort(); };
+    signal.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(abort, SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${resource}/api/code-sandboxes/auth/session`, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+        redirect: "manual",
+        signal: controller.signal
+      });
+      if (controller.signal.aborted) {
+        await response.body?.cancel();
+        controller.signal.throwIfAborted();
+      }
+      if (!response.ok) {
+        await response.body?.cancel();
+        const cfRay = response.headers.get("cf-ray");
+        const retryAfter = response.headers.get("retry-after");
+        // Fixed fields keep each event below 256 bytes; upstream strings are untrusted.
+        console.warn("scaffold auth upstream non-ok", {
+          status: response.status, attempt: attempt + 1,
+          cfRay: cfRay?.length === 20 && /^[0-9a-fA-F]{16}-[A-Z]{3}$/.test(cfRay) ? cfRay : null,
+          retryAfterSeconds: retryAfter !== null && retryAfter.length > 0 && retryAfter.length <= 6 && !/[^0-9]/.test(retryAfter)
+            ? Number(retryAfter) : null
+        });
+        // Only explicit credential rejection revokes state. Preserve authority
+        // Retry-After exactly, and never amplify throttling with another attempt.
+        if (response.status === 401 || response.status === 403) return { status: "invalid" };
+        if (retryAfter !== null) {
+          if (retryAfter.length > SCAFFOLD_JSON_BYTES || new TextEncoder().encode(retryAfter).byteLength > SCAFFOLD_JSON_BYTES) {
+            return { status: "unavailable", retryAfter: "1" };
+          }
+          return { status: "unavailable", retryAfter };
+        }
+        if (attempt === 0 && (response.status === 408 || response.status >= 500)) continue;
+        return { status: "unavailable" };
+      }
+      try {
+        session = await boundedAuthJson<ScaffoldSession>(response, controller.signal);
+      } catch {
+        return controller.signal.aborted ? { status: "unavailable", retryAfter: "1" } : { status: "unavailable" };
+      }
+      break;
+    } catch {
+      if (signal.aborted) return { status: "unavailable", retryAfter: "1" };
+      if (attempt === 1) return controller.signal.aborted ? { status: "unavailable", retryAfter: "1" } : { status: "unavailable" };
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+    }
+  }
+  if (!session || typeof session !== "object") return { status: "unavailable" };
+  const subject = typeof session.actor?.sub === "string" ? session.actor.sub.trim().toLowerCase() : "";
+  const scopes = Array.isArray(session.scopes)
+    ? [...new Set(session.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0))]
+    : [];
+  const capabilities = capabilitiesFromRemoteCodeScopes(scopes);
+  if (
+    session.ok !== true ||
+    session.actor?.auth !== "iap" ||
+    !subject ||
+    normalizedOrigin(typeof session.resource === "string" ? session.resource : "") !== resource ||
+    !required.every((capability) => capabilities.includes(capability))
+  ) {
+    return { status: "unavailable" };
+  }
+  return {
+    status: "authenticated",
+    identity: {
+      userId: subject,
+      email: subject,
+      projectScope,
+      orgId: projectScope,
+      capabilities,
+      credential: "scaffold"
+    }
+  };
+};
+
+export const verifyScaffoldToken = async (env: ScaffoldAuthEnv, token: string): Promise<Verified | undefined> => {
+  const result = await verifyScaffoldTokenResult(env, token);
+  return result.status === "authenticated" ? result.identity : undefined;
+};
+
+export const authenticateScaffoldResult = async (env: ScaffoldAuthEnv, request: Request): Promise<ScaffoldAuthenticationResult> => {
+  if (!credentialTransportAllowed(request.url)) return { status: "invalid" };
   const token = bearerFromRequest(request);
-  if (!token) return undefined;
-  return verifyToken(env, token);
+  if (!token) return { status: "invalid" };
+  if (env.AUTH_MODE === "dev") {
+    if (env.ENVIRONMENT !== "local") return { status: "unavailable" };
+    const [userId, requestedProject] = token.split("@", 2);
+    if (!userId || (requestedProject && requestedProject !== env.SCAFFOLD_PROJECT_SCOPE)) return { status: "invalid" };
+    const capabilities = requiredCapabilities(env);
+    if (capabilities.length === 0) return { status: "unavailable" };
+    return {
+      status: "authenticated",
+      identity: {
+        userId,
+        email: `${userId}@dev.local`,
+        projectScope: env.SCAFFOLD_PROJECT_SCOPE,
+        orgId: env.SCAFFOLD_PROJECT_SCOPE,
+        capabilities,
+        credential: "dev"
+      }
+    };
+  }
+  return verifyScaffoldTokenResult(env, token, request.signal);
+};
+
+export const authenticateScaffold = async (env: ScaffoldAuthEnv, request: Request): Promise<Verified | undefined> => {
+  const result = await authenticateScaffoldResult(env, request);
+  return result.status === "authenticated" ? result.identity : undefined;
+};
+
+export const authenticateResult = async (env: Env, request: Request): Promise<ScaffoldAuthenticationResult> => {
+  if (!credentialTransportAllowed(request.url)) return { status: "invalid" };
+  if (!env.SCAFFOLD_DEPLOYMENT_ID || !env.SCAFFOLD_PROJECT_SCOPE || !env.SCAFFOLD_CONTROL_PLANE_URL) {
+    return { status: "unavailable" };
+  }
+  const token = bearerFromRequest(request);
+  if (token?.startsWith("cs1.")) {
+    try {
+      const identity = await authenticateDeviceToken(env, token);
+      return identity ? { status: "authenticated", identity } : { status: "invalid" };
+    } catch {
+      return { status: "unavailable" };
+    }
+  }
+  const result = await authenticateScaffoldResult(env, request);
+  if (result.status === "authenticated") {
+    return { status: "authenticated", identity: { ...result.identity, deploymentId: env.SCAFFOLD_DEPLOYMENT_ID } };
+  }
+  return result;
 };

@@ -1,206 +1,198 @@
 name: deploy
 
-# Autodeploy the edge Worker + Durable Objects (session/device rooms, R2,
-# WorkOS auth routes, Cloud control plane) on every push to main that touches
-# edge/, and the credential vault (edge/vault) — behind its own approval —
-# when edge/vault/ changes. Skips gracefully until the CLOUDFLARE_API_TOKEN
-# secret is configured (until then: `npm -C edge run deploy` from a
-# wrangler-authenticated machine).
-#
-# The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
-# Workers R2 Storage (edit), Workflows (edit). Account id is pinned in
-# edge/wrangler.jsonc. One-time setup: create the `vault-production`
-# environment (Settings → Environments) with required reviewers.
-
+# Canonical staging candidates only. Deployment uses the comet-staging environment
+# and retains existing release-reader secrets in place. Retained legacy state and
+# rollback are sealed with the native candidate; production has no path here.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Reviewed full 40-character commit SHA; must match the dispatched ref"
+        required: true
+        type: string
+      target:
+        description: "Build a candidate only, or deploy that exact candidate to native staging"
+        required: true
+        default: candidate
+        type: choice
+        options: [candidate, staging]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: deploy-main
+  group: comet-edge-native-staging
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  # ── credential vault (edge/vault) ───────────────────────────────────────
-  # Its own deploy with its own approval: the `vault-production` GitHub
-  # environment carries required reviewers (and may hold its own
-  # CLOUDFLARE_API_TOKEN). Change detection lives in a separate, ungated job
-  # because an environment gate applies before a job's first step — folding
-  # detection into the gated job would ask for approval on every push.
-  vault-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.changed.outputs.changed }}
+  # Refuse unauthorized targets before checkout, tooling or protected secrets.
+  staging-scope:
+    if: github.repository_owner == 'Ashler-AI'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: detect vault changes
-        id: changed
-        shell: bash
+      - id: target
+        name: Reject targets outside this staging-only authorization
+        env:
+          REQUESTED_TARGET: ${{ inputs.target }}
         run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^edge/vault/"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+          case "$REQUESTED_TARGET" in
+            candidate|staging) ;;
+            *) echo "::error::This native/retained-rollback candidate is staging-only. Production requires independent qualification and authorization."; exit 1 ;;
+          esac
 
-  vault:
-    needs: vault-changes
-    if: needs.vault-changes.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-    environment: vault-production
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    defaults:
-      run:
-        working-directory: edge/vault
+  candidate:
+    if: github.repository_owner == 'Ashler-AI'
+    needs: staging-scope
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      digest: ${{ steps.candidate.outputs.digest }}
+      rollback_digest: ${{ steps.candidate.outputs.rollback_digest }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: edge/vault/package-lock.json
-      - name: install
-        run: npm ci
-      - name: typecheck
-        run: npm run typecheck
-      - name: test
-        run: npm test
-      - name: deploy
-        if: env.CLOUDFLARE_API_TOKEN != ''
-        run: npx wrangler deploy
-
-  edge:
-    # The edge's VAULT service binding needs the vault worker to exist, so a
-    # vault change deploys (and is approved) first. A skipped vault job (no
-    # vault change) must not block the edge: `!cancelled()` replaces the
-    # implicit success() gate, then we allow exactly success or skipped — a
-    # failed or rejected vault deploy, or failed change detection, stops the
-    # edge too.
-    needs: [vault-changes, vault]
-    if: >-
-      !cancelled()
-      && needs.vault-changes.result == 'success'
-      && (needs.vault.result == 'success' || needs.vault.result == 'skipped')
-    runs-on: ubuntu-latest
-    env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    steps:
+      - id: source_request
+        name: Require reviewed immutable source and staging-only target
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::source_sha must be a full lowercase 40-character commit SHA'; exit 1; }
+          [[ "$SOURCE_SHA" = "$GITHUB_SHA" ]] || { echo '::error::source_sha must match the dispatched ref; select that reviewed source with --ref'; exit 1; }
+          case "$TARGET" in candidate|staging) ;; *) echo '::error::unsupported deployment target'; exit 1 ;; esac
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          # `github.event.before` may precede several commits in a batched push.
-          fetch-depth: 0
-      - name: detect edge changes
-        id: changed
-        shell: bash
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: source
+        name: Verify reviewed checkout
         run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(edge/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: edge/package-lock.json
-      - name: install
-        if: steps.changed.outputs.changed == 'true'
+      - name: Install locked edge dependencies
         working-directory: edge
         run: npm ci
-      - name: typecheck
-        if: steps.changed.outputs.changed == 'true'
+      - name: Verify native browser contracts
+        run: node --test apps/web/server.test.mjs
+      - name: Test staging artifact sealing
+        run: node --test edge/scripts/staging-artifacts.test.mjs
+      - name: Generate Worker binding types
+        working-directory: edge
+        run: npm run types
+      - name: Require current Worker binding declarations
+        run: |
+          git ls-files --error-unmatch -- edge/worker-configuration.d.ts
+          git diff --exit-code -- edge/worker-configuration.d.ts
+      - name: Typecheck
         working-directory: edge
         run: npm run typecheck
-      - name: test
-        if: steps.changed.outputs.changed == 'true'
+      - name: Test edge units and native workerd behavior
         working-directory: edge
         run: npm test
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
+      - name: Test release contracts and retained secret binding validation
+        run: node --test scripts/release-workflow.test.mjs
+      - name: Test retained canonical staging boundaries
         working-directory: edge
-        run: npx wrangler deploy
+        run: npx vitest run -c vitest.staging.config.ts
+      - name: Build canonical candidate and forward-retained rollback once
+        run: node edge/scripts/staging-artifacts.mjs build "$RUNNER_TEMP/comet-edge-pair"
+      - id: candidate
+        name: Seal candidate and forward-retained rollback digests
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          for kind in candidate rollback; do
+            tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -czf "comet-edge-$kind.tar.gz" -C "$RUNNER_TEMP/comet-edge-pair/$kind" .
+            sha256sum "comet-edge-$kind.tar.gz" > "comet-edge-$kind.tar.gz.sha256"
+          done
+          digest="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          rollback_digest="$(sha256sum comet-edge-rollback.tar.gz | cut -d' ' -f1)"
+          jq -n --arg digest "$digest" --arg rollbackDigest "$rollback_digest" --arg commit "$SOURCE_SHA" \
+            --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{schemaVersion:2,sha256:$digest,rollbackSha256:$rollbackDigest,sourceCommit:$commit,workflowRun:$workflowRun,proof:"staging-proof.json"}' \
+            > comet-edge-candidate.provenance.json
+          echo "rollback_digest=$rollback_digest" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: comet-edge-candidate-${{ steps.source.outputs.sha }}
+          path: |
+            comet-edge-candidate.tar.gz
+            comet-edge-candidate.tar.gz.sha256
+            comet-edge-candidate.provenance.json
+            comet-edge-rollback.tar.gz
+            comet-edge-rollback.tar.gz.sha256
+          if-no-files-found: error
 
-  # Static landing page (zeron.sh) — assets-only worker, no build step.
-  landing:
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  staging:
+    if: inputs.target == 'staging'
+    needs: candidate
+    runs-on: ubuntu-24.04
+    environment: comet-staging
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0
-      - name: detect landing changes
-        id: changed
-        shell: bash
-        run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(apps/landing/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: steps.changed.outputs.changed == 'true'
         with:
           node-version: 22
-      - name: test
-        if: steps.changed.outputs.changed == 'true'
-        working-directory: apps/landing
-        run: node --test *.test.mjs
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
-        working-directory: apps/landing
-        run: npx wrangler@4 deploy
-
-  # www.zeron.sh → zeron.sh 301 (see apps/www-redirect/wrangler.jsonc).
-  www-redirect:
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: Install locked deploy tooling
+        working-directory: edge
+        run: npm ci
+      - uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-      - name: detect www-redirect changes
-        id: changed
-        shell: bash
+          name: comet-edge-candidate-${{ needs.candidate.outputs.sha }}
+      - id: verify
+        name: Verify both candidate bytes and retained rollback against reviewed source
+        env:
+          SOURCE_SHA: ${{ needs.candidate.outputs.sha }}
+          EXPECTED_DIGEST: ${{ needs.candidate.outputs.digest }}
+          EXPECTED_ROLLBACK_DIGEST: ${{ needs.candidate.outputs.rollback_digest }}
         run: |
-          before="${{ github.event.before }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-            || [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$before" "$GITHUB_SHA" | grep -qE "^(apps/www-redirect/|\.github/workflows/deploy\.yml)"; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: steps.changed.outputs.changed == 'true'
-        with:
-          node-version: 22
-      - name: deploy
-        if: steps.changed.outputs.changed == 'true' && env.CLOUDFLARE_API_TOKEN != ''
-        working-directory: apps/www-redirect
-        run: npx wrangler@4 deploy
+          set -euo pipefail
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          sha256sum --check comet-edge-candidate.tar.gz.sha256 comet-edge-rollback.tar.gz.sha256
+          actual="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
+          rollback_actual="$(sha256sum comet-edge-rollback.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_DIGEST"
+          test "$rollback_actual" = "$EXPECTED_ROLLBACK_DIGEST"
+          jq -e --arg digest "$actual" --arg rollbackDigest "$rollback_actual" --arg commit "$SOURCE_SHA" \
+            --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '.schemaVersion == 2 and .sha256 == $digest and .rollbackSha256 == $rollbackDigest and .sourceCommit == $commit and .workflowRun == $workflowRun and .proof == "staging-proof.json"' \
+            comet-edge-candidate.provenance.json > /dev/null
+          mkdir -p "$RUNNER_TEMP/verified-edge/candidate" "$RUNNER_TEMP/verified-edge/rollback"
+          tar -xzf comet-edge-candidate.tar.gz -C "$RUNNER_TEMP/verified-edge/candidate"
+          tar -xzf comet-edge-rollback.tar.gz -C "$RUNNER_TEMP/verified-edge/rollback"
+          node edge/scripts/staging-artifacts.mjs verify "$RUNNER_TEMP/verified-edge"
+          echo "entry=$RUNNER_TEMP/verified-edge/candidate/staging.js" >> "$GITHUB_OUTPUT"
+      - name: Verify retained canonical staging release-reader bindings
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/verify-staging-release-feed-secrets.mjs
+      - name: Deploy exact candidate to native staging only
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CANDIDATE_ENTRY: ${{ steps.verify.outputs.entry }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          npx wrangler deploy "$CANDIDATE_ENTRY" --no-bundle --config wrangler.jsonc --env staging

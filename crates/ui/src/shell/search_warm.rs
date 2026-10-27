@@ -90,6 +90,8 @@ mod tests {
                     edge_token: None,
                     org_id: None,
                     workos_client_id: None,
+                    scaffold: None,
+                    managed_inference: false,
                     default_harness: zeron_proto::HarnessId::Mock,
                 },
                 cx,

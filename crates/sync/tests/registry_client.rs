@@ -21,6 +21,8 @@ fn device(id: &str) -> Device {
         id: id.into(),
         name: format!("{id}-name"),
         platform: "linux".into(),
+        devbox_provider: None,
+        devbox_id: None,
         last_seen_at: Some(ts(1_000)),
         created_at: Some(ts(500)),
         version: Some("0.1.0".into()),
@@ -30,27 +32,23 @@ fn device(id: &str) -> Device {
 }
 
 fn chat(id: &str, device_id: &str) -> Chat {
-    Chat {
-        id: id.into(),
-        device_id: device_id.into(),
-        title: Some("chat".into()),
-        archived: false,
-        cwd: Some("/tmp".into()),
-        branch: None,
-        checkout_id: None,
-        source_context: None,
-        config: None,
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: ts(2_000),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        harness_session_harness: None,
-        parent_chat_id: None,
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None,
-    }
+    Chat { id: id.into(), crew: None, device_id: device_id.into(),
+    title: Some("chat".into()),
+    archived: false,
+    cwd: Some("/tmp".into()),
+    branch: None,
+    checkout_id: None,
+    source_context: None,
+    config: None,
+    last_message_preview: None,
+    last_message_at: None,
+    created_at: ts(2_000),
+    harness_session_id: None,
+    harness_session_cwd: None,
+    parent_chat_id: None,
+    space_id: None,
+    last_seen_at: None,
+    room_gen: None, }
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -118,8 +116,6 @@ async fn two_clients_converge_and_stream_live_updates() {
         let mut doc = doc_a.lock().unwrap();
         doc.upsert_session(&Session {
             last_completed_turn: None,
-            last_turn_outcome: None,
-            terminal_activity: None,
             running_subagents: 0,
             chat_id: "chat-1".into(),
             device_id: "dev-a".into(),
@@ -230,6 +226,101 @@ async fn unacked_writes_replay_idempotently_after_reconnect() {
             .and_then(|v| v.as_str()),
         Some("replayed")
     );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn queued_write_survives_auth_close_and_temporary_credential_outage() {
+    use futures::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use tokio_tungstenite::tungstenite::{Message, protocol::CloseFrame};
+    use zeron_sync::{SyncError, UrlLease, UrlProvider};
+
+    struct RecoveringUrl {
+        rejected_url: String,
+        recovered_url: String,
+        generation: AtomicU64,
+        unavailable_dials: AtomicUsize,
+    }
+
+    impl UrlProvider for RecoveringUrl {
+        fn url(&self) -> futures::future::BoxFuture<'static, Result<UrlLease, SyncError>> {
+            let generation = self.generation.load(Ordering::SeqCst);
+            let result = match generation {
+                7 => Ok(UrlLease { url: self.rejected_url.clone(), generation: Some(7) }),
+                8 => {
+                    self.unavailable_dials.fetch_add(1, Ordering::SeqCst);
+                    Err(SyncError::TemporarilyUnavailable("credential verification unavailable".into()))
+                }
+                9 => Ok(UrlLease { url: self.recovered_url.clone(), generation: Some(9) }),
+                _ => unreachable!(),
+            };
+            Box::pin(async move { result })
+        }
+
+        fn invalidate(&self, generation: u64) {
+            // A close from generation 7 cannot revoke the replacement at 9.
+            let _ = self.generation.compare_exchange(generation, 8, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    let server = MockRegistryServer::start().await;
+    let rejected_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = Arc::new(RecoveringUrl {
+        rejected_url: format!("ws://{}", rejected_listener.local_addr().unwrap()),
+        recovered_url: server.url(),
+        generation: AtomicU64::new(7),
+        unavailable_dials: AtomicUsize::new(0),
+    });
+    let rejecting_server = tokio::spawn(async move {
+        let (stream, _) = rejected_listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(frame) = socket.next().await {
+            let Message::Text(text) = frame.unwrap() else { continue };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            match frame["t"].as_str() {
+                Some("hello") => socket.send(Message::Text(
+                    r#"{"t":"state","seq":0,"full":true,"gcFloor":0,"rows":[],"presence":{}}"#.into(),
+                )).await.unwrap(),
+                Some("push") => {
+                    // Receive the real pending batch, but reject its credential without ACKing it.
+                    socket.send(Message::Close(Some(CloseFrame {
+                        code: 4401.into(), reason: "credential rejected".into(),
+                    }))).await.unwrap();
+                    return serde_json::from_value::<Vec<zeron_doc::registry::RowOp>>(frame["ops"].clone()).unwrap();
+                }
+                _ => {}
+            }
+        }
+        panic!("socket ended before receiving the queued write");
+    });
+
+    let doc = new_doc("auth-recovery-device");
+    doc.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .upsert_chat(&chat("auth-recovery-chat", "auth-recovery-device")).unwrap();
+    let pending = || doc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pending_len();
+    assert_eq!(pending(), 1);
+    let client = RegistryClient::connect_via(provider.clone(), doc.clone(), "auth-recovery-device")
+        .await.expect("initial registry hello succeeds");
+    let rejected_ops = tokio::time::timeout(Duration::from_secs(10), rejecting_server)
+        .await.expect("queued write reaches rejecting socket").unwrap();
+    assert_eq!(rejected_ops.len(), 1);
+    wait_until(|| provider.unavailable_dials.load(Ordering::SeqCst) > 0).await;
+    assert_eq!(provider.generation.load(Ordering::SeqCst), 8);
+    assert_eq!(pending(), 1, "4401 and failed revalidation must retain the unacked write");
+    assert_eq!(server.row_count(), 0);
+
+    // Release only this provider; normal reconnect backoff drives recovery, not a global wake.
+    provider.generation.store(9, Ordering::SeqCst);
+    wait_until(|| pending() == 0).await;
+    let (expected, applied) = zeron_doc::registry::apply_op(None, &rejected_ops[0]);
+    assert!(applied);
+    let mut expected = expected.unwrap();
+    expected.seq = 1;
+    assert_eq!(server.row("chats", "auth-recovery-chat"), Some(expected),
+        "the exact original fields and clocks must reach the recovered server");
+    assert_eq!(server.row_count(), 1);
+    assert_eq!(server.seq(), 1, "the pending write is applied exactly once");
     client.shutdown().await;
 }
 
@@ -430,8 +521,6 @@ async fn churn_stays_bounded_no_history_growth() {
             let mut d = doc.lock().unwrap();
             d.upsert_session(&Session {
                 last_completed_turn: None,
-                last_turn_outcome: None,
-                terminal_activity: None,
                 running_subagents: 0,
                 chat_id: "chat-1".into(),
                 device_id: "dev-a".into(),

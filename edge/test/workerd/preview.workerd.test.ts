@@ -15,6 +15,28 @@ describe("authenticated preview coordination on workerd", () => {
     expect((await SELF.fetch("https://test/preview/foreign/ws?device=a", { headers: { authorization: "Bearer user@org", upgrade: "websocket" } })).status).toBe(403);
     expect((await SELF.fetch("https://test/preview/org/ws?device=a", { headers: { upgrade: "websocket" } })).status).toBe(401);
   });
+  it("admits provider callbacks past the device cap only through the trusted query", async () => {
+    const user = crypto.randomUUID();
+    const sockets: WebSocket[] = [];
+    for (let index = 0; index < 16; index++) sockets.push(await connect(user, `device-${index}`));
+
+    const spoofed = await SELF.fetch(`https://test/preview/org/ws?device=spoofed`, {
+      headers: {
+        authorization: `Bearer ${user}@org`,
+        upgrade: "websocket",
+        "x-zeron-preview-sign-in": "1"
+      }
+    });
+    expect(spoofed.status).toBe(429);
+
+    const admitted = await SELF.fetch(`https://test/preview/org/ws?device=callback&signIn=1`, {
+      headers: { authorization: `Bearer ${user}@org`, upgrade: "websocket" }
+    });
+    expect(admitted.status).toBe(101);
+    admitted.webSocket!.accept();
+    admitted.webSocket!.close();
+    for (const socket of sockets) socket.close();
+  });
   it("stamps sender identity, isolates users, removes departed devices and rejects bytes", async () => {
     const user = crypto.randomUUID(); const a = await connect(user, "a");
     const aCatalog = next(a); const b = await connect(user, "b"); const bCatalog = next(b);

@@ -26,18 +26,15 @@ async fn main() -> anyhow::Result<()> {
     let mut stream = CursorHarness::new()
         .run(
             request,
-            RunControls {
-                realtime: None,
-                execution_lease: None,
-                steering,
-                interrupt: interrupt.clone(),
-                request_input: Box::new(|_| {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = tx.send(vec![]);
-                    rx
-                }),
-                turn: Default::default(),
-            },
+            RunControls { context: None, realtime: None, execution_lease: None,
+            steering,
+            interrupt: interrupt.clone(),
+            request_input: Box::new(|_| {
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(vec![]);
+                rx
+            }),
+            turn: Default::default(), },
         )
         .await?;
     let mut injected = false;

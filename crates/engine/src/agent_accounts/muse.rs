@@ -98,7 +98,7 @@ fn mirror_config(real: &Path, root: &Path) -> std::io::Result<()> {
 fn mirror_config(_real: &Path, _root: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "Muse accounts kept by Zeron need macOS or Linux",
+        "Muse accounts kept by Crew need macOS or Linux",
     ))
 }
 

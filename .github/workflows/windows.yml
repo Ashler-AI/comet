@@ -117,39 +117,46 @@ jobs:
         run: ./scripts/test-windows-startup.ps1
       - name: CLI startup without HOME
         run: |
-          # Exercise real path resolution without touching the runner's account.
-          # Port zero cannot connect to another running engine.
-          $env:HOME = $null
-          $env:ZERON_DATA_DIR = $null
-          $env:ZERON_EDGE_TOKEN = $null
-          $env:ZERON_IPC_PORT = '0'
-          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "zeron smoke O'Brien 日本語"
-          $expected = Join-Path $env:LOCALAPPDATA 'Zeron'
-          $probe = [Diagnostics.ProcessStartInfo]::new()
-          $probe.FileName = (Resolve-Path -LiteralPath './target/release/zeron.exe').Path
-          $probe.Arguments = 'status'
-          $probe.UseShellExecute = $false
-          $probe.CreateNoWindow = $true
-          $probe.RedirectStandardOutput = $true
-          $probe.RedirectStandardError = $true
-          $process = [Diagnostics.Process]::Start($probe)
+          # Exercise real HOME-absent path resolution with no inherited profile or credentials.
+          $localAppData = Join-Path $env:RUNNER_TEMP ("zeron smoke O'Brien 日本語 " + [guid]::NewGuid())
+          $ipc = [Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Stream, [Net.Sockets.ProtocolType]::Tcp)
           try {
-            $stdout = $process.StandardOutput.ReadToEndAsync()
-            $stderr = $process.StandardError.ReadToEndAsync()
-            if (-not $process.WaitForExit(10000)) {
-              $process.Kill()
-              throw 'Isolated status probe timed out'
+            # Reserve a valid port exclusively without listening or admitting engine RPCs.
+            $ipc.ExclusiveAddressUse = $true
+            $ipc.Bind([Net.IPEndPoint]::new([Net.IPAddress]::Loopback, 0))
+            $probe = [Diagnostics.ProcessStartInfo]::new()
+            $probe.FileName = (Resolve-Path -LiteralPath './target/release/zeron.exe').Path
+            $probe.Arguments = 'status'
+            $probe.UseShellExecute = $false
+            $probe.CreateNoWindow = $true
+            $probe.RedirectStandardOutput = $true
+            $probe.RedirectStandardError = $true
+            $probe.Environment.Clear()
+            foreach ($name in @('SystemRoot', 'WINDIR', 'TEMP', 'TMP')) {
+              $value = [Environment]::GetEnvironmentVariable($name)
+              if ($null -ne $value) { $probe.Environment[$name] = $value }
             }
-            if ($process.ExitCode -ne 0) { throw "Status failed: $($stderr.Result)" }
-            $output = $stdout.Result -split '\r?\n'
-          } finally { $process.Dispose() }
-          $output
-          if (-not ($output -contains "Data dir: $expected")) {
-            throw 'Windows startup did not select LOCALAPPDATA/Zeron'
-          }
-          if (-not ($output -match '^Mode:\s+local only$')) {
-            throw 'An isolated Windows startup must select local-only mode'
-          }
+            $probe.Environment['LOCALAPPDATA'] = $localAppData
+            $probe.Environment['COMET_IPC_PORT'] = [string]$ipc.LocalEndPoint.Port
+            $process = [Diagnostics.Process]::Start($probe)
+            try {
+              $stdout = $process.StandardOutput.ReadToEndAsync()
+              $stderr = $process.StandardError.ReadToEndAsync()
+              if (-not $process.WaitForExit(10000)) {
+                $process.Kill()
+                throw 'Isolated status probe timed out'
+              }
+              if ($process.ExitCode -ne 0) { throw "Status failed: $($stderr.Result)" }
+              $output = $stdout.Result -split '\r?\n'
+            } finally { $process.Dispose() }
+            $output
+            $dataDirs = @($output | Where-Object { $_.StartsWith('Data dir: ') })
+            if ($dataDirs.Count -ne 1) { throw 'Status did not report one data directory' }
+            $selected = [IO.Path]::GetFullPath($dataDirs[0].Substring('Data dir: '.Length))
+            if ([IO.Path]::GetDirectoryName($selected) -ne $localAppData) {
+              throw 'Windows startup did not select a profile under isolated LOCALAPPDATA'
+            }
+          } finally { $ipc.Dispose() }
       - name: Build rendering fixture
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
         run: cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture

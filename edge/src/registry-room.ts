@@ -16,16 +16,13 @@
  * - `meta` — seq counter, gcFloor, per-device push attribution, backup marks.
  * - presence — memory-only by construction (15s client beats, rebroadcast).
  *
- * Cloud runners (the Worker stamps RUNNER_DEVICE_HEADER for runner bearers)
- * act as their device, not the user: every row delivery to them is filtered
- * and every op they push must be on a row they host (registry-runner.ts).
- *
  * Hibernation discipline: ZERO wall-clock timers; ping/pong rides the
  * auto-response pair; the daily alarm does tombstone GC + the R2 backup.
  */
 import { applyOp, validateOp, type Op, type Row } from "./registry-core";
-import { chatHost, parentOf, runnerCanSee, runnerOpRefusal, type RunnerScope } from "./registry-runner";
-import { AUTH_USER_HEADER, RUNNER_ACCOUNT_HEADER, RUNNER_DEVICE_HEADER, apnsConfig, type Env } from "./env";
+import { AUTH_USER_HEADER, apnsConfig, type Env } from "./env";
+import { requestAuthority, socketAuthorized, sendAuthorized, type SocketAuthority } from "./authority";
+import { bindingMatches, registryHost, scopedOps, visibleRow } from "./registry-scope";
 import { isDeadToken, sendApns, type ApnsEnvironment } from "./apns";
 import {
   apnsPayload,
@@ -47,22 +44,11 @@ const MAX_BATCH_OPS = 500;
 const MAX_FRAME_BYTES = 1_000_000;
 
 interface SocketState {
+  authority?: SocketAuthority;
   userId: string;
   device: string;
   /** Set once a valid hello established the session. */
   ready?: boolean;
-  /** Cloud runner socket: its verified device id. Rows are filtered and
-   * pushes ownership-checked for it. */
-  runner?: string;
-  /** The runner's account (logical Cloud device; JWT `cld`). */
-  runnerAccount?: string;
-}
-
-/** An op a runner pushed that it does not own — skipped, not fatal. */
-interface RejectedOp {
-  kind: string;
-  id: string;
-  error: string;
 }
 
 interface WireOp extends Op {}
@@ -105,6 +91,17 @@ export class RegistryRoom implements DurableObject {
   private readonly env: Env;
   /** device → last presence beat (epoch ms). Memory-only. */
   private readonly presence = new Map<string, number>();
+  private send(ws: WebSocket, frame: Record<string, unknown>): void {
+    const authority = (ws.deserializeAttachment() as SocketState | null)?.authority;
+    if (authority?.credential === "device") {
+      if (!this.hostAuthorized(authority)) { ws.close(4403, "registry binding changed"); return; }
+      if (frame.t === "presence" && frame.device !== authority.deviceId) return;
+      frame = { ...frame };
+      if (Array.isArray(frame.rows)) frame.rows = this.filterRows(frame.rows as Row[], authority);
+      if (frame.presence) frame.presence = this.visiblePresence(authority);
+    }
+    sendAuthorized(this.env, this.ctx, ws, JSON.stringify(frame));
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -150,6 +147,28 @@ export class RegistryRoom implements DurableObject {
     return Number(this.getMeta("gcFloor") ?? "0");
   }
 
+  private hostAuthorized(authority: SocketAuthority): boolean {
+    if (!registryHost(authority) || authority.projectId !== this.env.SCAFFOLD_PROJECT_SCOPE ||
+        authority.deploymentId !== this.env.SCAFFOLD_DEPLOYMENT_ID ||
+        !bindingMatches(this.loadRow("chats", authority.sessionId!), authority)) return false;
+    const stored = this.getMeta(`hostBinding/${authority.sessionId}`);
+    if (!stored) return true;
+    const binding = JSON.parse(stored) as { device: string; epoch: number };
+    return authority.lifecycleEpoch! > binding.epoch ||
+      authority.lifecycleEpoch === binding.epoch && authority.deviceId === binding.device;
+  }
+
+  private filterRows(rows: Row[], authority?: SocketAuthority): Row[] {
+    if (authority?.credential !== "device") return rows;
+    return rows.filter(row => visibleRow(row, authority));
+  }
+
+  private visiblePresence(authority?: SocketAuthority): Record<string, number> {
+    if (authority?.credential !== "device") return Object.fromEntries(this.presence);
+    const at = this.presence.get(authority.deviceId!);
+    return at === undefined ? {} : { [authority.deviceId!]: at };
+  }
+
   // ── row storage ───────────────────────────────────────────────────────────
 
   private loadRow(kind: string, id: string): Row | undefined {
@@ -186,58 +205,6 @@ export class RegistryRoom implements DurableObject {
     );
   }
 
-  /** What one reader may receive: everything for user callers, owned rows
-   * (plus all devices, and the projects of the chats it hosts) for a runner. */
-  private visible(rows: Row[], runner: string | undefined, _account: string | undefined): Row[] {
-    if (runner === undefined) return rows;
-    const scope = this.runnerScope(runner);
-    return rows.filter((row) => runnerCanSee(runner, row, scope));
-  }
-
-  /** What `device` reaches beyond its own rows: the projects of the live
-   * chats it hosts, and the live chats whose parent it hosts (delegates it
-   * started on other machines). */
-  private runnerScope(device: string): RunnerScope {
-    const spaces = new Set<string>();
-    const hosted = new Set<string>();
-    const parents: [string, string][] = [];
-    for (const raw of this.ctx.storage.sql.exec<{ id: string; fields: string }>(
-      "SELECT id, fields FROM rows WHERE kind = 'chats' AND deleted = 0"
-    )) {
-      try {
-        const fields = JSON.parse(raw.fields) as Record<string, unknown>;
-        if (fields.deviceId === device) {
-          hosted.add(raw.id);
-          if (typeof fields.spaceId === "string") spaces.add(fields.spaceId);
-        }
-        if (typeof fields.parentChatId === "string") parents.push([raw.id, fields.parentChatId]);
-      } catch {
-        /* a malformed row names no project and no parent */
-      }
-    }
-    const children = new Set(parents.filter(([, parent]) => hosted.has(parent)).map(([id]) => id));
-    return { spaces, children };
-  }
-
-  /** The hosts of the parents of the live chats `device` hosts: the runners
-   * that delegated work to it (the Worker's device-room gate). */
-  private parentHosts(device: string): string[] {
-    const hosts = new Set<string>();
-    for (const raw of this.ctx.storage.sql.exec<{ fields: string }>(
-      "SELECT fields FROM rows WHERE kind = 'chats' AND deleted = 0"
-    )) {
-      try {
-        const fields = JSON.parse(raw.fields) as Record<string, unknown>;
-        if (fields.deviceId !== device || typeof fields.parentChatId !== "string") continue;
-        const host = chatHost(this.loadRow("chats", fields.parentChatId));
-        if (host) hosts.add(host);
-      } catch {
-        /* a malformed row delegates nothing */
-      }
-    }
-    return [...hosts];
-  }
-
   private rowsSince(cursor: number): Row[] {
     const out: Row[] = [];
     for (const raw of this.ctx.storage.sql.exec(
@@ -264,26 +231,39 @@ export class RegistryRoom implements DurableObject {
     const url = new URL(request.url);
     const userId = request.headers.get(AUTH_USER_HEADER);
     if (!userId) return json({ error: "unauthenticated" }, 401);
-    const runner = request.headers.get(RUNNER_DEVICE_HEADER) || undefined;
-    const runnerAccount = runner === undefined ? undefined : request.headers.get(RUNNER_ACCOUNT_HEADER) || undefined;
-    // Defense in depth (the Worker refuses these too): a runner syncs rows
-    // and nothing else — no stats (push targets, push log), no APNs target
-    // registration (notification titles of every chat), no operator wipe.
-    if (runner !== undefined && !["/ws", "/rows", "/push"].includes(url.pathname)) {
-      return json({ error: "forbidden" }, 403);
+    const authority = requestAuthority(request);
+    if (url.pathname === "/peer-target" && request.method === "GET") {
+      const authority = requestAuthority(request);
+      const sessionId = url.searchParams.get("sessionId") ?? "";
+      if (!authority || authority.userId !== userId || !authority.capabilities.includes("session.chat") ||
+          authority.projectId !== this.env.SCAFFOLD_PROJECT_SCOPE ||
+          authority.deploymentId !== this.env.SCAFFOLD_DEPLOYMENT_ID) return json({ error: "forbidden" }, 403);
+      const row = this.loadRow("chats", sessionId);
+      const crew = row?.fields.crew;
+      if (!row || row.deleted || !crew || typeof crew !== "object" || Array.isArray(crew)) return json({ error: "not_found" }, 404);
+      const scope = crew.scope;
+      if (crew.ownerSubject !== userId || crew.sessionId !== sessionId ||
+          !scope || typeof scope !== "object" || Array.isArray(scope) ||
+          scope.projectId !== authority.projectId || scope.deploymentId !== authority.deploymentId || scope.sessionId !== sessionId ||
+          typeof row.fields.deviceId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(row.fields.deviceId)) {
+        return json({ error: "not_found" }, 404);
+      }
+      return json({ deviceId: row.fields.deviceId });
+    }
+    if (authority?.credential === "device") {
+      if (authority.userId !== userId || !this.hostAuthorized(authority) ||
+          !((request.method === "GET" && ["/ws", "/rows"].includes(url.pathname)) ||
+            (request.method === "POST" && url.pathname === "/push")) ||
+          (url.searchParams.has("device") && url.searchParams.get("device") !== authority.deviceId)) {
+        return json({ error: "forbidden" }, 403);
+      }
     }
 
     if (url.pathname === "/ws") {
-      // A runner's device identity is the verified one, never self-declared.
-      const device = runner ?? url.searchParams.get("device") ?? "";
+      const device = authority?.credential === "device" ? authority.deviceId! : url.searchParams.get("device") ?? "";
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      const state: SocketState = {
-        userId,
-        device,
-        ...(runner ? { runner } : {}),
-        ...(runnerAccount ? { runnerAccount } : {})
-      };
+      const state: SocketState = { userId, device, authority: requestAuthority(request) };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -352,14 +332,14 @@ export class RegistryRoom implements DurableObject {
       const sinceRaw = url.searchParams.get("since");
       const sinceNum = sinceRaw === null ? NaN : Number(sinceRaw);
       const cursor = Number.isInteger(sinceNum) && sinceNum >= 0 ? sinceNum : null;
-      const device = runner ?? url.searchParams.get("device") ?? "";
+      const device = authority?.credential === "device" ? authority.deviceId! : url.searchParams.get("device") ?? "";
       if (device !== "" && url.searchParams.get("beat") === "1") {
         const at = Date.now();
         this.presence.set(device, at);
         for (const socket of this.ctx.getWebSockets()) {
           const socketState = socket.deserializeAttachment() as SocketState | null;
           if (!socketState?.ready) continue;
-          send(socket, { t: "presence", device, at });
+          this.send(socket, { t: "presence", device, at });
         }
       }
       const seq = this.seq();
@@ -369,32 +349,9 @@ export class RegistryRoom implements DurableObject {
         seq,
         full,
         gcFloor,
-        rows: this.visible(full ? this.rowsSince(0) : this.rowsSince(cursor), runner, runnerAccount),
-        presence: Object.fromEntries(this.presence)
+        rows: this.filterRows(full ? this.rowsSince(0) : this.rowsSince(cursor), authority),
+        presence: this.visiblePresence(authority)
       });
-    }
-
-    // The Worker's chat2/blob gate for runners: who hosts this chat? Only
-    // reachable through the Worker, which asks the caller's own room.
-    if (url.pathname === "/chat-host" && request.method === "GET") {
-      const chat = url.searchParams.get("chat") ?? "";
-      const row = this.loadRow("chats", chat);
-      const parent = parentOf(row);
-      return json({
-        deviceId: chatHost(row) ?? null,
-        // A delegate's parent host may reach it too (its runner started it).
-        parentHost: (parent && chatHost(this.loadRow("chats", parent))) ?? null,
-        // Whether the id was ever used, tombstones included: a new delegate
-        // must take a fresh id, never an existing (or deleted) chat's.
-        known: row !== undefined
-      });
-    }
-
-    // The Worker's device-room gate for runners: which runners delegated
-    // work to this device (host the parents of the chats it hosts)?
-    if (url.pathname === "/device-parents" && request.method === "GET") {
-      const device = url.searchParams.get("device") ?? "";
-      return json({ hosts: this.parentHosts(device) });
     }
 
     if (url.pathname === "/push" && request.method === "POST") {
@@ -403,7 +360,7 @@ export class RegistryRoom implements DurableObject {
       // apply, same rows broadcast to live sockets; the ack is the response
       // body. LWW clocks make replayed batches apply zero ops, so
       // at-least-once delivery (including 0-RTT/early-data replays) is safe.
-      const device = runner ?? url.searchParams.get("device") ?? "";
+      const device = authority?.credential === "device" ? authority.deviceId! : url.searchParams.get("device") ?? "";
       // Pre-read cap (the WS path gets this for free from MAX_FRAME_BYTES):
       // a legitimate batch is bounded well under this by MAX_BATCH_OPS ×
       // MAX_OP_BYTES; anything larger only burns this room's own CPU.
@@ -415,14 +372,9 @@ export class RegistryRoom implements DurableObject {
       } catch {
         return json({ error: "bad_push", message: "malformed body" }, 400);
       }
-      const outcome = this.applyPushBatch(device, frame, runner);
+      const outcome = this.applyPushBatch(device, frame, authority);
       if (!outcome.ok) return json({ error: outcome.code, message: outcome.message }, 400);
-      return json({
-        batch: outcome.batch,
-        seq: outcome.seq,
-        applied: outcome.applied,
-        ...(outcome.rejected.length > 0 ? { rejected: outcome.rejected } : {})
-      });
+      return json({ batch: outcome.batch, seq: outcome.seq, applied: outcome.applied });
     }
 
     if (url.pathname === "/reset" && request.method === "POST") {
@@ -448,6 +400,7 @@ export class RegistryRoom implements DurableObject {
   // ── WebSocket protocol ────────────────────────────────────────────────────
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (!(await socketAuthorized(this.env, ws))) return;
     if (typeof message !== "string") {
       ws.close(1003, "text frames only");
       return;
@@ -463,7 +416,13 @@ export class RegistryRoom implements DurableObject {
       ws.close(1002, "bad json");
       return;
     }
+    if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+      ws.close(1002, "bad frame"); return;
+    }
     const state = ws.deserializeAttachment() as SocketState;
+    if (state.authority?.credential === "device" && !this.hostAuthorized(state.authority)) {
+      ws.close(4403, "registry binding changed"); return;
+    }
     switch (frame.t) {
       case "hello":
         this.handleHello(ws, state, frame);
@@ -475,10 +434,10 @@ export class RegistryRoom implements DurableObject {
         this.handlePresence(ws, state, frame);
         return;
       case "probe":
-        send(ws, { t: "probe-ok", seq: this.seq() });
+        this.send(ws, { t: "probe-ok", seq: this.seq() });
         return;
       default:
-        send(ws, { t: "error", code: "bad_frame", message: `unknown frame: ${String(frame.t)}` });
+        this.send(ws, { t: "error", code: "bad_frame", message: `unknown frame: ${String(frame.t)}` });
     }
   }
 
@@ -492,7 +451,12 @@ export class RegistryRoom implements DurableObject {
 
   private handleHello(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {
     const cursor = typeof frame.cursor === "number" && frame.cursor >= 0 ? frame.cursor : null;
-    if (state.runner === undefined && typeof frame.device === "string" && frame.device.length > 0) {
+    if (state.authority?.credential === "device") {
+      if (frame.device !== undefined && frame.device !== state.authority.deviceId) {
+        ws.close(4403, "device mismatch"); return;
+      }
+      state.device = state.authority.deviceId!;
+    } else if (typeof frame.device === "string" && frame.device.length > 0) {
       state.device = frame.device;
     }
     state.ready = true;
@@ -504,8 +468,8 @@ export class RegistryRoom implements DurableObject {
     // reset/wipe) — both force `full`, and the client reacts by replacing
     // (former) or re-seeding the server (latter; see registry.rs).
     const full = cursor === null || cursor < gcFloor || cursor > seq;
-    const rows = this.visible(full ? this.rowsSince(0) : this.rowsSince(cursor), state.runner, state.runnerAccount);
-    send(ws, {
+    const rows = full ? this.rowsSince(0) : this.rowsSince(cursor);
+    this.send(ws, {
       t: "state",
       seq,
       full,
@@ -518,51 +482,44 @@ export class RegistryRoom implements DurableObject {
   private handlePush(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {
     if (!state.ready) {
       this.recordPush(state.device, false);
-      send(ws, { t: "error", code: "bad_push", message: "hello first / malformed push" });
+      this.send(ws, { t: "error", code: "bad_push", message: "hello first / malformed push" });
       return;
     }
-    const outcome = this.applyPushBatch(state.device, frame, state.runner);
+    const outcome = this.applyPushBatch(state.device, frame, state.authority);
     if (!outcome.ok) {
-      send(ws, { t: "error", code: outcome.code, message: outcome.message });
+      this.send(ws, { t: "error", code: outcome.code, message: outcome.message });
       return;
     }
-    // Skipped runner ops are reported like invalid ones (error frames the
-    // client logs and counts); the ack still retires the batch.
-    for (const rejected of outcome.rejected.slice(0, 20)) {
-      send(ws, { t: "error", code: "not_owner", message: `${rejected.kind}/${rejected.id}: ${rejected.error}` });
-    }
-    send(ws, {
-      t: "ack",
-      batch: outcome.batch,
-      seq: outcome.seq,
-      applied: outcome.applied,
-      ...(outcome.rejected.length > 0 ? { rejected: outcome.rejected } : {})
-    });
+    this.send(ws, { t: "ack", batch: outcome.batch, seq: outcome.seq, applied: outcome.applied });
   }
 
   /** Validate + atomically apply one op batch and broadcast merged rows to
    * every ready socket -- shared by the WS push and the HTTP `POST /push`
-   * fallback. The caller delivers the ack/error on its own transport.
-   * `runner` (a Cloud device) may only touch rows it hosts: its other ops
-   * are skipped and reported in `rejected`, the rest of the batch applies. */
+   * fallback. The caller delivers the ack/error on its own transport. */
   private applyPushBatch(
     device: string,
     frame: Record<string, unknown>,
-    runner?: string
+    authority?: SocketAuthority
   ):
     | { ok: false; code: string; message: string }
-    | { ok: true; batch: string; seq: number; applied: number; rejected: RejectedOp[] } {
+    | { ok: true; batch: string; seq: number; applied: number } {
+    if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+      return { ok: false, code: "bad_push", message: "malformed push" };
+    }
     const batch = typeof frame.batch === "string" ? frame.batch : "";
     if (batch === "" || !Array.isArray(frame.ops)) {
       this.recordPush(device, false);
       return { ok: false, code: "bad_push", message: "malformed push" };
     }
-    const ops = frame.ops as WireOp[];
+    let ops = frame.ops as WireOp[];
     if (ops.length === 0 || ops.length > MAX_BATCH_OPS) {
       this.recordPush(device, false);
       return { ok: false, code: "bad_push", message: `batch of ${ops.length} ops` };
     }
     for (const op of ops) {
+      if (!op || typeof op !== "object" || op.set === null || op.clocks === null) {
+        return { ok: false, code: "invalid_op", message: "malformed op" };
+      }
       const invalid = validateOp(op);
       if (invalid) {
         // Reject the WHOLE batch: batches are transactional (cascade deletes)
@@ -572,6 +529,15 @@ export class RegistryRoom implements DurableObject {
         return { ok: false, code: "invalid_op", message: `${op.kind}/${op.id}: ${invalid}` };
       }
     }
+    if (authority?.credential === "device") {
+      if (!this.hostAuthorized(authority)) return { ok: false, code: "forbidden", message: "registry binding changed" };
+      const allowed = scopedOps(ops, authority, (kind, id) => this.loadRow(kind, id));
+      if (!allowed) return { ok: false, code: "forbidden", message: "outside typed host registry scope" };
+      ops = allowed;
+      this.setMeta(`hostBinding/${authority.sessionId}`, JSON.stringify({
+        device: authority.deviceId, epoch: authority.lifecycleEpoch,
+      }));
+    }
 
     // Apply atomically: DO events are single-threaded and SQLite writes in an
     // event commit together, so a mid-batch crash never persists half a batch.
@@ -580,19 +546,9 @@ export class RegistryRoom implements DurableObject {
     /** Each touched session row as it was before this batch. */
     const sessionsBefore = new Map<string, Row | undefined>();
     let applied = 0;
-    const rejected: RejectedOp[] = [];
-    // Children as the batch starts: a delegate the runner may manage.
-    const children = runner === undefined ? undefined : this.runnerScope(runner).children;
     for (const op of ops) {
       const key = `${op.kind} ${op.id}`;
       const before = touched.get(key) ?? this.loadRow(op.kind, op.id);
-      if (runner !== undefined) {
-        const refusal = runnerOpRefusal(runner, before, op, children);
-        if (refusal !== null) {
-          rejected.push({ kind: op.kind, id: op.id, error: refusal });
-          continue;
-        }
-      }
       if (op.kind === "sessions" && !sessionsBefore.has(op.id)) sessionsBefore.set(op.id, before);
       const { row, changed } = applyOp(before, op);
       if (!changed || row === undefined) continue;
@@ -606,7 +562,6 @@ export class RegistryRoom implements DurableObject {
       this.markBackupDirty();
     }
     this.recordPush(device, true);
-    if (rejected.length > 0) this.recordPush(device, false);
     const seq = applied > 0 ? nextSeq : this.seq();
     if (applied > 0) {
       // Merged full rows to EVERY ready socket (sender included -- its op may
@@ -618,13 +573,11 @@ export class RegistryRoom implements DurableObject {
       for (const socket of this.ctx.getWebSockets()) {
         const socketState = socket.deserializeAttachment() as SocketState | null;
         if (!socketState?.ready) continue;
-        // A runner still gets the frame (possibly empty) so its cursor
-        // advances with the room's seq.
-        send(socket, { t: "rows", seq, rows: this.visible(rows, socketState.runner, socketState.runnerAccount) });
+        this.send(socket, { t: "rows", seq, rows });
       }
-      this.notifySessions(sessionsBefore, touched);
+      this.notifySessions(sessionsBefore, touched, authority);
     }
-    return { ok: true, batch, seq, applied, rejected };
+    return { ok: true, batch, seq, applied };
   }
 
   // ── push notifications ───────────────────────────────────────────────────
@@ -641,8 +594,11 @@ export class RegistryRoom implements DurableObject {
   /** Session rows that changed in a batch → the desktop's notifications
    * (done / needs input / failed), sent to every registered phone after the
    * batch commits. Best effort: a failed delivery is logged, never retried. */
-  private notifySessions(before: Map<string, Row | undefined>, touched: Map<string, Row>): void {
-    if (before.size === 0) return;
+  private notifySessions(before: Map<string, Row | undefined>, touched: Map<string, Row>, authority?: SocketAuthority): void {
+    if (before.size === 0 || !authority?.userId ||
+        !authority.projectId || authority.projectId !== this.env.SCAFFOLD_PROJECT_SCOPE ||
+        !authority.deploymentId || authority.deploymentId !== this.env.SCAFFOLD_DEPLOYMENT_ID) return;
+    const scope = { userId: authority.userId, projectScope: authority.projectId, deploymentId: authority.deploymentId };
     const now = Date.now();
     const notes: Notification[] = [];
     for (const [chatId, prev] of before) {
@@ -670,7 +626,7 @@ export class RegistryRoom implements DurableObject {
         }
         sends.push(async () => {
           try {
-            const r = await sendApns(config, target.environment, target.token, apnsPayload(note.chatId, note.title, note.category), note.chatId);
+            const r = await sendApns(config, target.environment, target.token, apnsPayload(note.chatId, note.title, note.category, scope), note.chatId);
             entry.result = r.reason ? `${r.status} ${r.reason}` : String(r.status);
             if (isDeadToken(r)) {
               this.ctx.storage.sql.exec("DELETE FROM push_targets WHERE device = ? AND token = ?", target.device, target.token);
@@ -706,13 +662,16 @@ export class RegistryRoom implements DurableObject {
 
   private handlePresence(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {
     if (!state.ready || state.device === "") return;
-    const at = typeof frame.at === "number" ? frame.at : Date.now();
+    if (state.authority?.credential === "device" && frame.device !== undefined && frame.device !== state.authority.deviceId) {
+      ws.close(4403, "device mismatch"); return;
+    }
+    const at = state.authority?.credential === "device" ? Date.now() : typeof frame.at === "number" ? frame.at : Date.now();
     this.presence.set(state.device, at);
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === ws) continue;
       const socketState = socket.deserializeAttachment() as SocketState | null;
       if (!socketState?.ready) continue;
-      send(socket, { t: "presence", device: state.device, at });
+      this.send(socket, { t: "presence", device: state.device, at });
     }
   }
 
@@ -773,13 +732,6 @@ export class RegistryRoom implements DurableObject {
   }
 }
 
-const send = (ws: WebSocket, frame: Record<string, unknown>): void => {
-  try {
-    ws.send(JSON.stringify(frame));
-  } catch {
-    /* socket already gone; hibernation API cleans it up */
-  }
-};
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {

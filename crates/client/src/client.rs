@@ -567,6 +567,9 @@ impl Client {
         &self,
         device_id: &str,
     ) -> Result<Arc<zeron_voice_session::RpcTransport>> {
+        if matches!(&self.inner.credentials, Credentials::Scaffold { .. }) {
+            return Err(ClientError::Unsupported("Voice is unavailable in managed Crew until the host supports Agent Auth voice routing".into()));
+        }
         let live = self.inner.live().ok_or_else(|| {
             ClientError::Unsupported("remote voice requires a connected account".into())
         })?;
@@ -588,7 +591,7 @@ impl Client {
             return Err(ClientError::InvalidArgument("device_id is required".into()));
         }
         let events = EventPump::new(listener);
-        let tokens = TokenProvider::new(&credentials, config.edge_base(), events.clone());
+        let tokens = TokenProvider::new(&credentials, config.edge_base(), events.clone())?;
         // Live: restore the registry replica + open the docs store first, so
         // the very first snapshot renders the cached workspace (instant).
         let (registry, store) = if credentials.is_demo() {
@@ -783,6 +786,7 @@ impl Client {
             }
         };
         let chat = Chat {
+            crew: None,
             id,
             device_id,
             title: new.title.filter(|t| !t.trim().is_empty()),
@@ -818,7 +822,10 @@ impl Client {
             .chat(parent_id)
             .ok_or_else(|| ClientError::NotFound(parent_id.to_owned()))?;
         // One level deep: a side chat's own side chat hangs off the root.
-        let root = parent.parent_chat_id.clone().unwrap_or_else(|| parent.id.clone());
+        let root = parent
+            .parent_chat_id
+            .clone()
+            .unwrap_or_else(|| parent.id.clone());
         let mut chat = parent;
         chat.id = crate::new_id();
         chat.parent_chat_id = Some(root);
@@ -846,7 +853,10 @@ impl Client {
             .workspace
             .chat(source_id)
             .ok_or_else(|| ClientError::NotFound(source_id.to_owned()))?;
-        let parent = source.parent_chat_id.clone().unwrap_or_else(|| source.id.clone());
+        let parent = source
+            .parent_chat_id
+            .clone()
+            .unwrap_or_else(|| source.id.clone());
         let chat_id = crate::new_id();
         let reply = self
             .inner
@@ -916,7 +926,7 @@ impl Client {
                 .provider_switch
         {
             return Err(ClientError::Unsupported(
-                "This chat's computer needs a newer Zeron to switch provider.".into(),
+                "This chat's computer needs a newer Crew to switch provider.".into(),
             ));
         }
         self.chat_write(chat_id, |doc| doc.set_chat_config(chat_id, config))
@@ -954,7 +964,11 @@ impl Client {
             self.forget_local_session(child);
         }
         if on_cloud {
-            self.delete_cloud_machines(std::iter::once(chat_id.to_owned()).chain(children).collect());
+            self.delete_cloud_machines(
+                std::iter::once(chat_id.to_owned())
+                    .chain(children)
+                    .collect(),
+            );
         }
         self.forget_local_session(chat_id);
         Ok(())
@@ -1405,7 +1419,7 @@ impl Client {
             self.inner.credentials.org_id(),
             &self.inner.config.device_id,
         );
-        let token_value = self.inner.tokens.bearer().await?;
+        let token_value = self.inner.tokens.access_token().await?;
         let body = serde_json::json!({
             "token": token,
             "environment": environment,
@@ -1413,11 +1427,14 @@ impl Client {
         });
         let response = crate::auth::http()
             .post(url)
-            .bearer_auth(token_value)
+            .bearer_auth(&token_value.value)
             .json(&body)
             .send()
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.inner.tokens.invalidate(token_value.generation);
+        }
         if !response.status().is_success() {
             return Err(ClientError::HostError(format!(
                 "push registration http {}",
@@ -1437,13 +1454,16 @@ impl Client {
             self.inner.credentials.org_id(),
             &self.inner.config.device_id,
         );
-        let token_value = self.inner.tokens.bearer().await?;
+        let token_value = self.inner.tokens.access_token().await?;
         let response = crate::auth::http()
             .delete(url)
-            .bearer_auth(token_value)
+            .bearer_auth(&token_value.value)
             .send()
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.inner.tokens.invalidate(token_value.generation);
+        }
         if !response.status().is_success() {
             return Err(ClientError::HostError(format!(
                 "push removal http {}",
@@ -1606,7 +1626,7 @@ impl Client {
                 let file_name = attachments::upload_file_name(name);
                 let path = live
                     .relay
-                    .upload(device_id, &upload_id, &file_name, &data, progress)
+                    .upload(device_id, None, &upload_id, &file_name, &data, progress)
                     .await?;
                 self.inner
                     .attachment_cache

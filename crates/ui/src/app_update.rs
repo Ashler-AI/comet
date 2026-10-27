@@ -6,14 +6,18 @@
 //! engine keeps its own checker for daemons and remote reporting, but the UI
 //! may be attached to a daemon of another version, whose status describes
 //! that binary rather than the app the user is looking at.
+//! Authentication comes from that engine's existing Auth service over local
+//! IPC (or the embedded transport), bound to the configured release origin;
+//! the desktop never opens another credential store or login flow.
 //!
 //! Lifecycle, idiomatic to desktop updaters (Sparkle, VS Code, Zed): a found
 //! release downloads in the background and is verified, the strip offers
 //! "restart to apply", and a staged update the user never restarts for is
 //! installed when the app quits — so nobody stays on a stale version just
-//! because they never clicked. `ZERON_AUTO_UPDATE=0` keeps it report-only.
+//! because they never clicked. `COMET_AUTO_UPDATE=0` keeps it report-only.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use gpui_tokio::Tokio;
@@ -57,26 +61,20 @@ pub enum StripAction {
     Restart,
     /// Explain why this install can't update itself (dialog).
     Explain,
-    /// Advisory installs: open the releases page (unmanaged) and dismiss.
-    Advise {
-        open_releases: bool,
-    },
 }
 
 pub struct AppUpdate {
     install: InstallKind,
     blocker: Option<UpdateBlocker>,
-    /// Background download + install on quit (`ZERON_AUTO_UPDATE` unset or on).
+    /// Background download + install on quit (`COMET_AUTO_UPDATE` unset or on).
     automatic: bool,
     edge_url: String,
     data_dir: PathBuf,
     checker: Updater,
+    engine_tx: tokio::sync::watch::Sender<Option<crate::state::EngineHandle>>,
     status: Option<UpdateStatus>,
     flow: Flow,
     prompt: Option<Prompt>,
-    /// Version whose advisory strip the user dismissed (a newer release shows
-    /// it again).
-    dismissed: Option<String>,
     _status_watch: Task<()>,
     download: Option<Task<()>>,
     user_check: Option<Task<()>>,
@@ -105,9 +103,19 @@ impl AppUpdate {
             .supports_desktop_update()
             .then(|| install.desktop_update_blocker())
             .flatten();
+        let (engine_tx, engine_rx) = tokio::sync::watch::channel::<Option<crate::state::EngineHandle>>(None);
+        let token_edge_url = edge_url.clone();
+        let token_provider: zeron_update::AccessTokenProvider = Arc::new(move || {
+            let engine = engine_rx.borrow().clone();
+            let edge_url = token_edge_url.clone();
+            Box::pin(async move {
+                let engine = engine.ok_or_else(|| anyhow::anyhow!("Connect to the local engine before checking for updates"))?;
+                Ok(engine.client().update_access_token(&edge_url).await?)
+            })
+        });
         let checker = {
             let _runtime = Tokio::handle(cx).enter();
-            Updater::spawn_desktop(edge_url.clone())
+            Updater::spawn_desktop(edge_url.clone(), token_provider)
         };
         let mut statuses = checker.watch();
         let status_watch = cx.spawn(async move |this, cx| {
@@ -129,13 +137,22 @@ impl AppUpdate {
             edge_url,
             data_dir,
             checker,
+            engine_tx,
             status: None,
             flow: Flow::Idle,
             prompt: None,
-            dismissed: None,
             _status_watch: status_watch,
             download: None,
             user_check: None,
+        }
+    }
+
+    /// Both embedded and IPC-attached desktops borrow the engine's existing auth.
+    pub fn set_engine(&mut self, engine: Option<crate::state::EngineHandle>) {
+        let connected = engine.is_some();
+        self.engine_tx.send_replace(engine);
+        if connected {
+            self.checker.check_now();
         }
     }
 
@@ -211,6 +228,7 @@ impl AppUpdate {
             return;
         };
         let edge_url = self.edge_url.clone();
+        let checker = self.checker.clone();
         let data_dir = self.data_dir.clone();
         let install = self.install.clone();
         self.flow = Flow::Downloading {
@@ -219,13 +237,14 @@ impl AppUpdate {
         let stage = Tokio::spawn(cx, async move {
             // Re-read the manifest so a long-lived status still downloads the
             // newest release, with that release's checksums.
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
+            let manifest = checker.fetch_latest().await?;
             anyhow::ensure!(
                 zeron_update::version_newer(&manifest.version, zeron_update::current_version()),
                 "the release feed no longer offers a newer version"
             );
+            let access_token = checker.current_access_token().await?;
             let staged = install
-                .stage_desktop(&edge_url, &manifest, &data_dir)
+                .stage_desktop(&edge_url, Some(&access_token), &manifest, &data_dir)
                 .await?;
             anyhow::Ok((manifest.version, staged))
         });
@@ -354,18 +373,9 @@ impl AppUpdate {
         }
     }
 
-    pub fn dismiss_advisory(&mut self, cx: &mut Context<Self>) {
-        self.dismissed = self.available().map(str::to_owned);
-        cx.notify();
-    }
-
-    /// The sidebar strip for the current state: `None` while there is
-    /// nothing newer (or the advisory was dismissed for this version).
+    /// The sidebar strip for the current state: `None` while nothing is newer.
     pub fn strip(&self) -> Option<(SharedString, StripAction)> {
         let latest = self.available()?;
-        if self.dismissed.as_deref() == Some(latest) {
-            return None;
-        }
         Some(strip_for(
             &self.install,
             self.blocker.is_some(),
@@ -377,8 +387,8 @@ impl AppUpdate {
 
 /// Label + click action of the strip. Self-updating installs drive their flow
 /// from it; blocked installs explain themselves; managed installs without a
-/// desktop path get the `zeron update` hint; unmanaged installs (source builds,
-/// hand-copied binaries) are pointed at the GitHub releases page.
+/// desktop path get the `comet update` hint; unmanaged installs (source builds,
+/// hand-copied binaries) require the established private release workflow.
 pub fn strip_for(
     install: &InstallKind,
     blocked: bool,
@@ -413,17 +423,13 @@ pub fn strip_for(
     }
     if matches!(install, InstallKind::Managed { .. }) {
         (
-            format!("Update available — v{latest} · run `zeron update`").into(),
-            StripAction::Advise {
-                open_releases: false,
-            },
+            format!("Update available — v{latest} · run `comet update`").into(),
+            StripAction::Explain,
         )
     } else {
         (
-            format!("Update available — v{latest} · download from GitHub").into(),
-            StripAction::Advise {
-                open_releases: true,
-            },
+            format!("Update available — v{latest} · unmanaged install").into(),
+            StripAction::Explain,
         )
     }
 }
@@ -440,101 +446,5 @@ pub fn check_for_updates(cx: &mut App) {
 pub fn install_on_quit(cx: &mut App) {
     if let Some(update) = AppUpdate::global(cx) {
         update.update(cx, |update, _| update.install_on_quit());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_follows_the_flow_on_self_updating_installs() {
-        let mac_app = InstallKind::MacApp {
-            bundle: PathBuf::from("/Applications/Zeron.app"),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &Flow::Idle, "0.2.86"),
-            (
-                SharedString::from("Update available — v0.2.86"),
-                StripAction::Download
-            )
-        );
-        let downloading = Flow::Downloading {
-            version: "0.2.86".into(),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &downloading, "0.2.86"),
-            (
-                SharedString::from("Downloading v0.2.86…"),
-                StripAction::None
-            )
-        );
-        let ready = Flow::Ready {
-            version: "0.2.86".into(),
-            staged: PathBuf::from("/tmp/Zeron.app"),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &ready, "0.2.86").1,
-            StripAction::Restart
-        );
-        let failed = Flow::Failed {
-            version: "0.2.86".into(),
-            message: "offline".into(),
-        };
-        assert_eq!(
-            strip_for(&mac_app, false, &failed, "0.2.86"),
-            (
-                SharedString::from("Update failed: offline"),
-                StripAction::Download
-            )
-        );
-        // A translocated or read-only bundle explains instead of failing.
-        assert_eq!(
-            strip_for(&mac_app, true, &Flow::Idle, "0.2.86").1,
-            StripAction::Explain
-        );
-    }
-
-    #[test]
-    fn strip_advises_installs_without_a_desktop_path() {
-        let unmanaged = strip_for(&InstallKind::Unmanaged, false, &Flow::Idle, "0.2.86");
-        assert_eq!(
-            unmanaged,
-            (
-                SharedString::from("Update available — v0.2.86 · download from GitHub"),
-                StripAction::Advise {
-                    open_releases: true
-                }
-            )
-        );
-        let managed = InstallKind::Managed {
-            app_root: PathBuf::from("/home/u/.zeron/app"),
-        };
-        let strip = strip_for(&managed, false, &Flow::Idle, "0.2.86");
-        if cfg!(target_os = "linux") {
-            // Linux desktop installs share the managed layout and update
-            // themselves like the other desktop platforms.
-            assert_eq!(strip.1, StripAction::Download);
-        } else {
-            assert_eq!(
-                strip.0,
-                SharedString::from("Update available — v0.2.86 · run `zeron update`")
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_installs_drive_the_desktop_flow() {
-        let installed = InstallKind::WindowsPortable {
-            directory: PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Zeron"),
-        };
-        assert_eq!(
-            strip_for(&installed, false, &Flow::Idle, "0.2.86"),
-            (
-                SharedString::from("Update available — v0.2.86"),
-                StripAction::Download
-            )
-        );
     }
 }

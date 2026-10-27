@@ -15,7 +15,7 @@ describe("preview coordinator admission", () => {
     expect(previewSignal({ kind: "connect", session: "pair" })).toEqual({ kind: "connect", session: "pair" });
     for (const value of [{ kind: "DATA", session: "pair" }, { kind: "offer", session: "pair", sdp: { type: "answer", sdp } }, { kind: "offer", session: "pair", sdp: { type: "offer", sdp: "HTTP/1.1 200 OK" } }]) expect(previewSignal(value)).toBeUndefined();
   });
-  it("admits a device finishing a provider sign-in past the device limit", () => {
+  it("admits a device completing provider sign-in past the ordinary limit", () => {
     expect(previewAdmits(15, false, false)).toBe(true);
     expect(previewAdmits(16, false, false)).toBe(false);
     expect(previewAdmits(16, true, false)).toBe(true);

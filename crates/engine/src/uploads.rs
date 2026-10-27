@@ -107,6 +107,13 @@ struct UploadsInner {
     /// them. RwLock: a local-profile import adds its source root at runtime so
     /// imported transcripts resolve without an engine restart.
     read_only_roots: std::sync::RwLock<Vec<PathBuf>>,
+    /// Exact legacy absolute paths; never an extra readable directory.
+    crew_imports: std::sync::RwLock<std::collections::HashMap<PathBuf, ImportedUpload>>,
+}
+
+struct ImportedUpload {
+    path: PathBuf,
+    metadata: std::fs::Metadata,
 }
 
 #[derive(Clone)]
@@ -131,6 +138,7 @@ impl Uploads {
             inner: Arc::new(UploadsInner {
                 tmp: dir.join("tmp"),
                 dir: dir.to_path_buf(),
+                crew_imports: Default::default(),
                 read_only_roots: std::sync::RwLock::new(
                     legacy_read_root
                         .into_iter()
@@ -158,6 +166,24 @@ impl Uploads {
         if !roots.iter().any(|r| r == root) {
             roots.push(root.to_path_buf());
         }
+    }
+
+    /// Called once after selecting a profile. Hashes and the canonical
+    /// destination jail are verified before any aliases become readable.
+    pub fn load_crew_import(&self, profile: &Path) -> Result<(), EngineError> {
+        let paths = zeron_sync::crew_import::imported_attachment_paths(profile)
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let mut aliases = std::collections::HashMap::with_capacity(paths.len());
+        let root = self.inner.dir.canonicalize().ok();
+        for (source, path) in paths {
+            if !root.as_ref().is_some_and(|root| path.starts_with(root)) {
+                return Err(EngineError::Other("Crew import belongs to another upload profile".into()));
+            }
+            let metadata = std::fs::metadata(&path)?;
+            aliases.insert(source, ImportedUpload { path, metadata });
+        }
+        *self.inner.crew_imports.write().unwrap_or_else(std::sync::PoisonError::into_inner) = aliases;
+        Ok(())
     }
 
     /// Stage one base64 chunk. Positional (`seq`) writes are IDEMPOTENT: a client
@@ -332,6 +358,15 @@ impl Uploads {
         let path = if is_pending_ref(path) {
             resolved_ref = self.resolve_pending(path).ok_or_else(outside)?;
             resolved_ref.as_str()
+        } else {
+            path
+        };
+        let imported = self.inner.crew_imports.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = if let Some(file) = imported.get(Path::new(path)) {
+            if !same_generated_file(&file.metadata, &std::fs::metadata(&file.path)?) {
+                return Err(EngineError::Other("Imported attachment changed; restore the verified backup copy".into()));
+            }
+            file.path.to_str().ok_or_else(outside)?
         } else {
             path
         };
@@ -650,6 +685,38 @@ fn mime_by_ext(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crew_import_reads_only_verified_copies_and_rejects_missing_or_changed_assets() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        // A Unix-rooted path is not absolute on Windows; keep both profiles owned.
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir(source.path().join("uploads")).unwrap();
+        let original = source.path().join("uploads/asset.png");
+        let unlisted = source.path().join("uploads/not-in-inventory.png");
+        std::fs::write(&original, b"live-original-not-the-copy").unwrap();
+        std::fs::write(&unlisted, b"live-unlisted").unwrap();
+        std::fs::create_dir(dir.path().join("uploads")).unwrap();
+        let copy = dir.path().join("uploads/asset.png");
+        std::fs::write(&copy, b"retained").unwrap();
+        let report = serde_json::json!({
+            "version":1, "sourceProfileRoot":source.path(), "chatIds":[],
+            "nativeSessionIds":{}, "commandsRetained":0, "annotationsRetained":0,
+            "requiresReauthentication":true,
+            "filesSha256":{"uploads/asset.png":format!("{:x}", Sha256::digest(b"retained"))},
+        });
+        std::fs::write(dir.path().join("crew-import-report.json"), serde_json::to_vec(&report).unwrap()).unwrap();
+        let uploads = Uploads::new(dir.path());
+        uploads.load_crew_import(dir.path()).unwrap();
+        assert_eq!(uploads.read_chunk(original.to_str().unwrap(), 0, &[]).unwrap().data, BASE64.encode(b"retained"));
+        assert!(uploads.read_chunk(unlisted.to_str().unwrap(), 0, &[]).is_err());
+        std::fs::write(&copy, b"tampered-longer").unwrap();
+        assert!(uploads.read_chunk(original.to_str().unwrap(), 0, &[]).is_err());
+        assert!(Uploads::new(dir.path()).load_crew_import(dir.path()).is_err());
+        std::fs::remove_file(&copy).unwrap();
+        assert!(Uploads::new(dir.path()).load_crew_import(dir.path()).is_err());
+    }
 
     #[test]
     fn visual_assets_sit_beside_the_script_and_leave_with_it() {

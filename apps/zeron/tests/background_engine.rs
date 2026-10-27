@@ -18,13 +18,12 @@ fn background_engine_serves_its_port_and_stops_on_request() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
     let mut child = Command::new(env!("CARGO_BIN_EXE_zeron-engine"))
-        .env("ZERON_DATA_DIR", dir.path())
-        .env("ZERON_IPC_PORT", port.to_string())
-        // Development auth with no bearer: an offline runtime.
-        .env("ZERON_WORKOS_CLIENT_ID", "")
-        .env_remove("ZERON_EDGE_TOKEN")
-        .env("ZERON_EDGE_URL", "http://127.0.0.1:1")
-        .env("ZERON_DISABLE_NOTIFICATIONS", "1")
+        .env("COMET_DATA_DIR", dir.path())
+        .env("COMET_IPC_PORT", port.to_string())
+        // The mock Crew profile is isolated and carries no remote authority.
+        .env("COMET_HARNESS", "mock")
+        .env_remove("COMET_EDGE_TOKEN")
+        .env("COMET_DISABLE_NOTIFICATIONS", "1")
         .env("ZERON_AUTO_UPDATE", "0")
         .spawn()
         .expect("start the background engine");
