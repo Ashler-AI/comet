@@ -4881,6 +4881,7 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: base + TimeDelta::minutes(created_min),
         }
     }
@@ -4892,6 +4893,8 @@ mod tests {
         now: DateTime<Utc>,
     ) -> Session {
         Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             last_completed_turn: None,
             running_subagents: 0,
             chat_id: chat_id.into(),
@@ -5153,6 +5156,8 @@ mod tests {
         let now = Utc::now();
         let mut state = AppState::new();
         state.sessions = vec![zeron_proto::Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             chat_id: "rowless".into(),
             device_id: "remote".into(),
             status: zeron_proto::SessionStatus::Working,
@@ -5171,6 +5176,8 @@ mod tests {
         let mut state = AppState::new();
         let now = Utc::now();
         let mut row = Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             last_completed_turn: None,
             running_subagents: 0,
             chat_id: "chat".into(),
@@ -5203,6 +5210,8 @@ mod tests {
         let mut state = AppState::new();
         let now = Utc::now();
         state.sessions = vec![Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             last_completed_turn: None,
             running_subagents: 0,
             chat_id: "chat".into(),
@@ -6370,6 +6379,8 @@ mod tests {
             error: None,
             can_apply: true,
             manual_command: None,
+            compatibility: None,
+            held_back: None,
         };
         assert!(!state.apply_harness_updates(vec![]));
         assert!(state.apply_harness_updates(vec![status(HarnessUpdatePhase::Available)]));

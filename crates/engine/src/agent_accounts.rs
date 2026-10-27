@@ -94,6 +94,16 @@ use zeron_proto::{
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
 
+/// What a relayed sign-in callback answered: the device that caught the
+/// browser redirect returns the same status and redirect target to its browser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayedCallback {
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
 mod oauth;
 mod muse;
 #[cfg(test)]
@@ -2448,6 +2458,75 @@ impl AgentAccounts {
     }
 
     /// Drop a flow's bookkeeping, and with it any callback route it published.
+    /// Replay a sign-in browser callback that another device caught on its
+    /// loopback listener. Only a live login registered for `requester` can be
+    /// reached, and only a plain HTTP path is forwarded.
+    pub async fn relay_callback(
+        &self,
+        login_id: &str,
+        requester: &str,
+        path: &str,
+    ) -> Result<RelayedCallback, EngineError> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let port = self
+            .inner
+            .callback_routes
+            .port_for(login_id, requester)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        if !path.starts_with('/')
+            || path.len() > 8 * 1024
+            || path.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(EngineError::Other("not a sign-in callback path".into()));
+        }
+        let connect = async {
+            match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                Ok(socket) => Ok(socket),
+                Err(v4) => tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
+                    .await
+                    .map_err(|_| v4),
+            }
+        };
+        let exchange = async {
+            let mut socket = connect.await?;
+            let request = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            let mut buf = [0u8; 4096];
+            while response.len() < 64 * 1024 {
+                let read = socket.read(&mut buf).await?;
+                if read == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buf[..read]);
+                if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok::<_, std::io::Error>(response)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(20), exchange)
+            .await
+            .map_err(|_| EngineError::Other("the sign-in didn't answer its callback".into()))?
+            .map_err(|e| EngineError::Other(format!("couldn't reach the sign-in: {e}")))?;
+        let head = String::from_utf8_lossy(&response);
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let location = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("location")
+                .then(|| value.trim().to_owned())
+        });
+        Ok(RelayedCallback { status, location })
+    }
+
     fn remove_flow(&self, login_id: &str) -> Option<LoginFlow> {
         self.inner.callback_routes.remove(login_id);
         lock(&self.inner.shared_logins).remove(login_id);
@@ -2846,6 +2925,11 @@ impl AgentAccounts {
         usage.retain(|key, _| live.contains(key));
         // Persist under the lock: overlapping lists must not interleave
         // writes of the same file.
+        self.persist_usage(&usage);
+    }
+
+    /// Write the usage cache; the caller holds [`Inner::usage`].
+    fn persist_usage(&self, usage: &HashMap<String, UsageEntry>) {
         let file = UsageCacheFile {
             entries: usage.clone(),
         };

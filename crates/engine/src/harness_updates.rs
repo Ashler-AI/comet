@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use zeron_harness::process::{Command, Stdio};
 
 use zeron_proto::{
-    HarnessId, HarnessInstallSource, HarnessUpdateFailure, HarnessUpdatePhase, HarnessUpdatePolicy,
-    HarnessUpdateProgress, HarnessUpdateStatus,
+    HarnessId, HarnessInstallSource, HarnessUpdateFailure, HarnessUpdateFailureKind,
+    HarnessUpdatePhase, HarnessUpdatePolicy, HarnessUpdateProgress, HarnessUpdateStatus,
 };
 
 use crate::now_ms;
@@ -27,6 +27,10 @@ use crate::registry::HarnessRegistry;
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_JITTER: u64 = 30 * 60;
 const FIRST_RETRY: Duration = Duration::from_secs(5 * 60);
+mod compatibility;
+
+const COMPATIBILITY_REFRESH: Duration = Duration::from_secs(60 * 60);
+const COMPATIBILITY_CACHE: &str = "harness-compatibility.json";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -132,6 +136,26 @@ enum UpdatePlan {
     AntigravityArchive,
     CodexStandalone(CodexStandaloneInstall),
     Homebrew(HomebrewPackage),
+}
+
+/// Identity of an installed CLI: its real path, size and modification time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryFingerprint {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl BinaryFingerprint {
+    fn of(executable: &Path) -> Option<Self> {
+        let path = std::fs::canonicalize(executable).ok()?;
+        let metadata = path.metadata().ok()?;
+        Some(Self {
+            path,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
 }
 
 struct ReleaseAsset {
@@ -380,6 +404,27 @@ struct ActiveUpdate {
     previous_phase: HarnessUpdatePhase,
 }
 
+/// The compatibility policy in force: the last published one (fetched or
+/// cached), followed by the list built into this application release.
+struct CompatibilityState {
+    published: compatibility::Feed,
+    built_in: compatibility::Feed,
+    url: Option<String>,
+    fetched_at: Option<std::time::Instant>,
+}
+
+impl CompatibilityState {
+    fn verdict(
+        &self,
+        harness: HarnessId,
+        version: &str,
+    ) -> Option<zeron_proto::HarnessCompatibility> {
+        self.published
+            .verdict(harness, version)
+            .or_else(|| self.built_in.verdict(harness, version))
+    }
+}
+
 struct Inner {
     registry: Arc<HarnessRegistry>,
     order: Vec<HarnessId>,
@@ -389,6 +434,10 @@ struct Inner {
     status_tx: watch::Sender<Vec<HarnessUpdateStatus>>,
     cancellations: Mutex<HashMap<HarnessId, ActiveUpdate>>,
     operation_gates: Mutex<HashMap<HarnessId, Arc<tokio::sync::Mutex<()>>>>,
+    checked_binaries: Mutex<HashMap<HarnessId, BinaryFingerprint>>,
+    compatibility: Mutex<CompatibilityState>,
+    compatibility_refresh: tokio::sync::Mutex<()>,
+    data_dir: PathBuf,
     check_slots: tokio::sync::Semaphore,
     shutdown: CancellationToken,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -438,6 +487,7 @@ impl Drop for UpdateIntentGuard {
                     message: "update ended before verification; inspect the CLI installation"
                         .into(),
                     retryable: true,
+                    kind: HarnessUpdateFailureKind::Install,
                 });
             } else {
                 status.phase = if status.policy == HarnessUpdatePolicy::Off {
@@ -501,6 +551,8 @@ impl HarnessUpdateCoordinator {
                         can_apply: provider(harness).update_args.is_some(),
                         manual_command: Some(provider(harness).manual_command.to_string())
                             .filter(|command| !command.is_empty()),
+                        compatibility: None,
+                        held_back: None,
                     },
                 )
             })
@@ -517,6 +569,18 @@ impl HarnessUpdateCoordinator {
                 status_tx,
                 cancellations: Mutex::new(HashMap::new()),
                 operation_gates: Mutex::new(HashMap::new()),
+                checked_binaries: Mutex::new(HashMap::new()),
+                compatibility: Mutex::new(CompatibilityState {
+                    published: std::fs::read_to_string(data_dir.join(COMPATIBILITY_CACHE))
+                        .ok()
+                        .and_then(|json| compatibility::Feed::parse(&json).ok())
+                        .unwrap_or_default(),
+                    built_in: compatibility::Feed::built_in(),
+                    url: None,
+                    fetched_at: None,
+                }),
+                compatibility_refresh: tokio::sync::Mutex::new(()),
+                data_dir: data_dir.to_path_buf(),
                 check_slots: tokio::sync::Semaphore::new(2),
                 shutdown: CancellationToken::new(),
                 worker: Mutex::new(None),
@@ -670,6 +734,144 @@ impl HarnessUpdateCoordinator {
         ordered_snapshot(&self.inner.order, &lock(&self.inner.statuses))
     }
 
+    /// Where the published compatibility policy lives.
+    pub fn set_compatibility_feed(&self, url: String) {
+        let mut state = lock(&self.inner.compatibility);
+        if state.url.as_deref() != Some(url.as_str()) {
+            state.url = Some(url);
+            state.fetched_at = None;
+        }
+    }
+
+    /// Refresh the published policy when due. Any failure keeps the last
+    /// known-good cached policy; a missing file explicitly clears it.
+    async fn refresh_compatibility(&self) {
+        let _refreshing = self.inner.compatibility_refresh.lock().await;
+        let url = {
+            let state = lock(&self.inner.compatibility);
+            match (&state.url, state.fetched_at) {
+                (Some(url), at) if at.is_none_or(|at| at.elapsed() >= COMPATIBILITY_REFRESH) => {
+                    url.clone()
+                }
+                _ => return,
+            }
+        };
+        let feed = match self.inner.client.get(&url).send().await {
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                Ok((compatibility::Feed::default(), None))
+            }
+            Ok(response) if response.status().is_success() => match response.text().await {
+                Ok(json) => compatibility::Feed::parse(&json).map(|feed| (feed, Some(json))),
+                Err(error) => Err(error.to_string()),
+            },
+            Ok(response) => Err(format!("HTTP {}", response.status())),
+            Err(error) => Err(error.to_string()),
+        };
+        let mut state = lock(&self.inner.compatibility);
+        match feed {
+            Ok((feed, json)) => {
+                state.published = feed;
+                state.fetched_at = Some(std::time::Instant::now());
+                let cache = self.inner.data_dir.join(COMPATIBILITY_CACHE);
+                let written = match json {
+                    Some(json) => std::fs::write(&cache, json),
+                    None => std::fs::remove_file(&cache).or_else(|error| {
+                        (error.kind() == std::io::ErrorKind::NotFound)
+                            .then_some(())
+                            .ok_or(error)
+                    }),
+                };
+                if let Err(error) = written {
+                    tracing::warn!(%error, "harness compatibility cache write failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, %url, "harness compatibility policy unavailable; keeping the last one");
+            }
+        }
+    }
+
+    /// Apply compatibility policy to both the installed release and a newer
+    /// release. Held releases are removed from the installable status.
+    fn apply_compatibility(&self, harness: HarnessId) {
+        let status = self.status(harness);
+        let state = lock(&self.inner.compatibility);
+        let installed = status
+            .installed_version
+            .as_deref()
+            .and_then(|version| state.verdict(harness, version));
+        let held_back = status
+            .latest_version
+            .as_deref()
+            .and_then(|version| state.verdict(harness, version));
+        drop(state);
+        self.mutate(harness, |status| {
+            status.compatibility = installed;
+            if let Some(held) = held_back {
+                status.latest_version = None;
+                if matches!(
+                    status.phase,
+                    HarnessUpdatePhase::Available | HarnessUpdatePhase::ManualActionRequired
+                ) {
+                    status.phase = HarnessUpdatePhase::Current;
+                }
+                status.held_back = Some(held);
+            } else if status.latest_version.is_some()
+                || status.held_back.as_ref().is_some_and(|held| {
+                    status
+                        .installed_version
+                        .as_deref()
+                        .is_some_and(|installed| !version_is_newer(&held.version, installed))
+                })
+            {
+                status.held_back = None;
+            }
+        });
+    }
+
+    /// Re-check changed CLI binaries when the status view opens.
+    pub fn recheck_changed_binaries_soon(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let coordinator = self.clone();
+        tokio::spawn(async move { coordinator.recheck_changed_binaries().await });
+    }
+
+    pub async fn recheck_changed_binaries(&self) {
+        let coordinator = self.clone();
+        let changed = tokio::task::spawn_blocking(move || coordinator.changed_binaries())
+            .await
+            .unwrap_or_default();
+        for harness in changed {
+            tracing::info!(?harness, "agent CLI changed on disk; checking for updates");
+            let _ = self.check_one(harness).await;
+        }
+    }
+
+    fn changed_binaries(&self) -> Vec<HarnessId> {
+        self.inner
+            .registry
+            .enabled_set()
+            .into_iter()
+            .filter(|harness| {
+                self.inner.order.contains(harness)
+                    && self.policy(*harness) != HarnessUpdatePolicy::Off
+                    && !self.is_mutating(*harness)
+                    && self.status(*harness).phase != HarnessUpdatePhase::Checking
+            })
+            .filter(|harness| {
+                let Some(last) = lock(&self.inner.checked_binaries).get(harness).cloned() else {
+                    return false;
+                };
+                self.executable(*harness)
+                    .ok()
+                    .and_then(|executable| BinaryFingerprint::of(&executable))
+                    .is_some_and(|now| now != last)
+            })
+            .collect()
+    }
+
     pub async fn check_all(&self) -> Vec<HarnessUpdateStatus> {
         let enabled = self.inner.registry.enabled_set();
         // Disabled rows remain visible in Settings but never spawn a probe.
@@ -699,7 +901,10 @@ impl HarnessUpdateCoordinator {
     }
 
     pub async fn check_one(&self, harness: HarnessId) -> Result<(), String> {
-        self.check_one_inner(harness).await?;
+        self.refresh_compatibility().await;
+        let checked = self.check_one_inner(harness).await;
+        self.apply_compatibility(harness);
+        checked?;
         // Every successful discovery, including policy changes and single-row
         // retries, gets the same automatic-install behavior. The check's
         // operation lock has been released before scheduling the mutation.
@@ -791,6 +996,9 @@ impl HarnessUpdateCoordinator {
                 return self.fail_check(harness, error);
             }
         };
+        if let Some(fingerprint) = BinaryFingerprint::of(&executable) {
+            lock(&self.inner.checked_binaries).insert(harness, fingerprint);
+        }
         let source = classify_source(&executable);
         let can_apply = can_apply_update(harness, &executable);
         if self.settle_if_unmonitored(harness) {
@@ -1118,14 +1326,26 @@ impl HarnessUpdateCoordinator {
             .into_iter()
             .find(|status| status.harness == harness)
             .ok_or_else(|| "unknown harness".to_string())?;
-        if !matches!(
-            current.phase,
-            HarnessUpdatePhase::Available | HarnessUpdatePhase::ManualActionRequired
-        ) {
+        let retry = current.phase == HarnessUpdatePhase::Failed
+            && current
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == HarnessUpdateFailureKind::Install);
+        if !retry
+            && !matches!(
+                current.phase,
+                HarnessUpdatePhase::Available | HarnessUpdatePhase::ManualActionRequired
+            )
+        {
             return Err("no applicable harness update".into());
         }
         if !current.can_apply {
             return Err("this provider requires a manual update".into());
+        }
+        if let Some(latest) = current.latest_version.as_deref()
+            && let Some(held) = lock(&self.inner.compatibility).verdict(harness, latest)
+        {
+            return Err(held.message);
         }
         let executable = self.executable(harness)?;
         let plan = update_plan(harness, &executable)?;
@@ -1308,7 +1528,7 @@ impl HarnessUpdateCoordinator {
         // Wake shutdown even if it already consumed that final status frame.
         self.inner.status_tx.send_modify(|_| {});
         if let Err(error) = &result {
-            self.fail(harness, error.clone()).ok();
+            self.fail_install(harness, error.clone()).ok();
         } else {
             let coordinator = self.clone();
             tokio::spawn(async move {
@@ -1520,6 +1740,8 @@ impl HarnessUpdateCoordinator {
                 error: None,
                 can_apply: provider(harness).update_args.is_some(),
                 manual_command: None,
+                compatibility: None,
+                held_back: None,
             })
     }
 
@@ -1542,6 +1764,8 @@ impl HarnessUpdateCoordinator {
                     error: None,
                     can_apply: provider(harness).update_args.is_some(),
                     manual_command: None,
+                    compatibility: None,
+                    held_back: None,
                 });
             // Preferences are the durable authority. Refresh the copy while
             // holding the status lock so a check result and a policy change
@@ -1854,13 +2078,14 @@ impl HarnessUpdateCoordinator {
         lock(&self.inner.cancellations).contains_key(&harness)
     }
 
-    fn fail(&self, harness: HarnessId, error: String) -> Result<(), String> {
+    fn fail_install(&self, harness: HarnessId, error: String) -> Result<(), String> {
         self.mutate(harness, |status| {
             status.phase = HarnessUpdatePhase::Failed;
             status.checked_at = Some(now_ms());
             status.error = Some(HarnessUpdateFailure {
                 message: error.clone(),
                 retryable: true,
+                kind: HarnessUpdateFailureKind::Install,
             });
         });
         Err(error)
@@ -1880,6 +2105,7 @@ impl HarnessUpdateCoordinator {
                 status.error = Some(HarnessUpdateFailure {
                     message: error.clone(),
                     retryable: true,
+                    kind: HarnessUpdateFailureKind::Check,
                 });
             }
         });
@@ -1921,7 +2147,7 @@ impl HarnessUpdateCoordinator {
     fn finish_failed_update(&self, harness: HarnessId, error: String) {
         lock(&self.inner.cancellations).remove(&harness);
         self.inner.registry.end_update(harness);
-        self.fail(harness, error).ok();
+        self.fail_install(harness, error).ok();
     }
 
     fn persist_preferences(&self) {

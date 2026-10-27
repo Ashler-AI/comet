@@ -15286,6 +15286,8 @@ mod tests {
                     this.rail_enabled = false;
                     this.state.update(cx, |state, _| {
                         state.sessions.push(zeron_proto::Session {
+                            last_turn_outcome: None,
+                            terminal_activity: None,
                             last_completed_turn: None,
                             running_subagents: 0,
                             chat_id: "chat".into(),

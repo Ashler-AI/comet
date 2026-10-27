@@ -45,6 +45,7 @@ mod model_catalogs;
 pub mod profile;
 pub mod project_actions;
 pub mod registry;
+pub mod remote_terminals;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
@@ -160,6 +161,8 @@ pub struct EngineCore {
     pub repos: Repos,
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    /// I/O routing for terminals on other devices (direct link or relay).
+    pub remote_terminals: remote_terminals::RemoteTerminals,
     pub project_actions: ProjectActionsStore,
     pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
@@ -169,6 +172,8 @@ pub struct EngineCore {
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
     pub device_id: String,
+    /// Which app windows are focused (desktop banners hold back while one is).
+    pub viewport_focus: desktop_notify::ViewportFocus,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
@@ -307,6 +312,7 @@ impl EngineCore {
         let workspace_files =
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
+        sessions.track_terminal_activity(terminals.clone(), workspace.clone());
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let previews = zeron_preview::PreviewService::new(
@@ -391,6 +397,7 @@ impl EngineCore {
             repos,
             workspace_files,
             terminals,
+            remote_terminals: Default::default(),
             project_actions,
             previews,
             change_requests,
@@ -400,6 +407,7 @@ impl EngineCore {
             agent_accounts,
             harness_updates,
             device_id,
+            viewport_focus: desktop_notify::ViewportFocus::default(),
             local_import,
             workspace_scope: profile.scope(),
             crew,
@@ -535,7 +543,9 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
-        .with_harness_updates(self.harness_updates.clone());
+        .with_remote_terminals(self.remote_terminals.clone())
+        .with_harness_updates(self.harness_updates.clone())
+        .with_viewport_focus(self.viewport_focus.clone());
         if let Some(crew) = &self.crew {
             rpc = rpc.with_crew(crew.clone());
         }
@@ -580,8 +590,17 @@ impl EngineCore {
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if auth.is_some_and(|auth| forgoes_revival(self.workspace_scope, &auth.state())) {
+            self.sessions.forgo_revival();
+        }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
+        self.sessions.stop_activity_projection().await;
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();
         // Cancel + await every worker that can reach Edge before flushing: a
@@ -967,14 +986,17 @@ impl Engine {
         core.set_auth(auth.clone());
         let preview_workspace = core.workspace.clone();
         let preview_device = core.device_id.clone();
-        let projects = Arc::new(move || {
-            preview_workspace
+        let preview_terminals = core.terminals.clone();
+        let projects = Arc::new(move || zeron_preview::Scope {
+            chats: preview_workspace
                 .read_chats()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|chat| chat.device_id == preview_device)
-                .filter_map(|chat| chat.cwd.map(std::path::PathBuf::from))
-                .collect()
+                .filter_map(|chat| Some((chat.id, std::path::PathBuf::from(chat.cwd?))))
+                .collect(),
+            terminals: preview_terminals.chats(),
+            reserved_ports: zeron_harness::agent_ports::reserved(),
         });
         let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
             edge_url: config.edge_url.clone(),
@@ -996,6 +1018,10 @@ impl Engine {
                 Box::pin(async move { tokens.token().await.map(|credential| credential.value).map_err(anyhow::Error::from) })
             })
         };
+        core.harness_updates.set_compatibility_feed(format!(
+            "{}/releases/harness-compatibility.json",
+            config.edge_url.trim_end_matches('/')
+        ));
         let updater = zeron_update::Updater::spawn(config.edge_url.clone(), update_tokens, Some(quiescent));
         if let Some(mut token_changes) = tokens.subscribe() {
             let updater_for_tokens = updater.clone();
@@ -1139,6 +1165,12 @@ impl Engine {
         runtime.shutdown().await;
         Ok(())
     }
+}
+
+/// Signed-out synced sessions are explicitly ended; local sessions remain
+/// eligible for crash/shutdown revival because local auth is normally absent.
+pub(crate) fn forgoes_revival(scope: WorkspaceScope, auth: &AuthState) -> bool {
+    scope == WorkspaceScope::Synced && matches!(auth, AuthState::SignedOut)
 }
 
 async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>) {

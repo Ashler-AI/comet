@@ -245,9 +245,11 @@ fn native_handoff_target(host: &crate::DocHost, workspace: &crate::WorkspaceHost
         if entry.role != saved.role || entry.created_at != saved.created_at || entry.device_id != saved.device_id
             || entry.status != saved.status || entry.continuation_of != saved.continuation_of || entry.duration_ms != saved.duration_ms
             || entry.parts.len() != saved.parts.len() || !entry.parts.iter().zip(&saved.parts).all(|(known, original)| match (known, original) {
-                (zeron_doc::MessagePart::Input { id, request_id, questions, resolved: true },
-                    zeron_doc::MessagePart::Input { id: original_id, request_id: original_request, questions: original_questions, .. }) =>
-                    id == original_id && request_id == original_request && questions == original_questions,
+                (zeron_doc::MessagePart::Input { id, request_id, questions, resolved: true, answers },
+                    zeron_doc::MessagePart::Input { id: original_id, request_id: original_request,
+                        questions: original_questions, answers: original_answers, .. }) =>
+                    id == original_id && request_id == original_request && questions == original_questions
+                        && answers == original_answers,
                 (zeron_doc::MessagePart::Input { .. }, _) => false,
                 _ => known == original,
             })
@@ -853,7 +855,7 @@ mod tests {
                 source_doc.doc().push_message(&zeron_doc::SessionMessageEntry {
                     id: id.into(), role: zeron_doc::MessageRole::Assistant,
                     parts: vec![zeron_doc::MessagePart::Input { id: format!("part-{id}"), request_id: format!("input-{id}"),
-                        questions: vec![], resolved: false }],
+                        questions: vec![], resolved: false, answers: None }],
                     created_at: 1, device_id: "controller".into(), status: Some(zeron_doc::MessageStatus::Complete),
                     continuation_of: None, duration_ms: None,
                 }).unwrap();
