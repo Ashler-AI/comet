@@ -378,7 +378,7 @@ impl Shell {
 
     /// Dismiss the card floating over the transcript; one shown beside it
     /// stays put.
-    fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
         if self.session_info_overlay {
             self.session_info_overlay = false;
             cx.notify();

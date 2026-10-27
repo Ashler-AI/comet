@@ -3671,22 +3671,29 @@ mod image_tests {
                 user_id: "user".into(),
                 edge: None,
                 local_only: true,
+                owner_registry: true,
             },
         )
         .unwrap();
         host.create_space("space", "laptop", "/Users/me/app", None, true)
             .unwrap();
         // Hosted on the session machine, like a chat sent to Cloud.
-        host.create_chat_hosted(
+        host.create_chat(
             "chat",
             Some("space"),
             None,
-            Some("cloud-session"),
             None,
             Some(checkout.to_string_lossy().into_owned()),
-            None,
         )
         .unwrap();
+        let mut chat = host
+            .read_chats()
+            .unwrap()
+            .into_iter()
+            .find(|chat| chat.id == "chat")
+            .unwrap();
+        chat.device_id = "cloud-session".into();
+        host.import_chat_row(&chat).unwrap();
         let repos = Repos::new(&dir.path().join("data"), "cloud-session");
         let target = WorkspaceTarget {
             chat_id: Some("chat".into()),

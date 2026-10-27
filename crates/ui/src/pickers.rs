@@ -1140,12 +1140,7 @@ impl Pickers {
             let device_changed = device != this.device_owner;
             if space != this.space_owner || device_changed {
                 if let Some(left) = this.space_owner.take() {
-                    // Cloud is a device-menu pick that re-targets the agent
-                    // catalogs (`switch_cloud`): never put back silently.
-                    match this.config.checkout {
-                        CheckoutKind::Cloud => this.checkout_by_space.remove(&left),
-                        kind => this.checkout_by_space.insert(left, kind),
-                    };
+                    this.checkout_by_space.insert(left, this.config.checkout);
                 }
                 this.space_owner = space;
                 this.device_owner = device;
@@ -8038,37 +8033,6 @@ mod tests {
         pickers.read_with(cx, |pickers, cx| {
             assert_eq!(pickers.state.read(cx).selected_space.as_deref(), Some("a"));
             assert_eq!(pickers.config.checkout, CheckoutKind::NewWorktree);
-        });
-    }
-
-    #[gpui::test]
-    fn a_cloud_pick_is_not_put_back_on_return(cx: &mut gpui::TestAppContext) {
-        let state = cx.new(|_| {
-            let mut state = AppState::new();
-            state.local_device_id = Some("local".into());
-            state.apply_spaces(vec![git_space("a", "local"), git_space("b", "local")]);
-            state.selected_space = Some("a".into());
-            state
-        });
-        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
-        let round_trip = |cx: &mut gpui::TestAppContext| {
-            state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
-            cx.run_until_parked();
-            state.update(cx, |state, cx| state.select_space(Some("a".into()), cx));
-            cx.run_until_parked();
-        };
-        pickers.update(cx, |pickers, cx| {
-            pickers.pick_checkout(CheckoutKind::NewWorktree, cx);
-        });
-        round_trip(cx);
-        // Cloud then replaces that pick (where `switch_cloud` lands).
-        pickers.update(cx, |pickers, _| {
-            pickers.config.checkout = CheckoutKind::Cloud
-        });
-        round_trip(cx);
-        // Neither the Cloud pick nor the older "New worktree" comes back.
-        pickers.read_with(cx, |pickers, _| {
-            assert_eq!(pickers.config.checkout, CheckoutKind::Local);
         });
     }
 

@@ -2479,6 +2479,8 @@ pub(super) struct AddSpaceFlow {
     /// Keyboard highlight within the current step’s filtered rows.
     active: usize,
     submit_busy: bool,
+    /// A clone into the open folder is running (`owner/name`).
+    cloning: Option<String>,
     error: Option<SharedString>,
     /// Tracked on the card (`track_focus`) — puts the card on the keyboard
     /// dispatch path so ↑↓/⌫/esc reach `add_space_key` while the search input
@@ -2740,6 +2742,60 @@ enum FolderRow {
     Local(zeron_proto::FolderEntry),
     /// A folder anywhere under home.
     Home(HomeFolderMatch),
+    /// Clone a repository into the open folder from a pasted remote URL.
+    Clone(CloneRow),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CloneRow {
+    url: String,
+    /// `owner/name`.
+    label: String,
+}
+
+/// A query that is a git remote: an `https://`/`ssh://`/`git://` URL with an
+/// owner and a name, or scp-style `git@host:owner/name`.
+fn git_url(query: &str) -> Option<String> {
+    let query = query.trim();
+    if query.contains(char::is_whitespace) {
+        return None;
+    }
+    let path = if let Some(rest) = ["https://", "http://", "ssh://", "git://"]
+        .iter()
+        .find_map(|scheme| query.strip_prefix(scheme))
+    {
+        rest.split_once('/')?.1
+    } else if let Some((user_host, path)) = query.split_once(':')
+        && user_host.contains('@')
+        && !user_host.contains('/')
+    {
+        path
+    } else {
+        return None;
+    };
+    let mut parts = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty());
+    (parts.next().is_some() && parts.next().is_some()).then(|| query.to_owned())
+}
+
+/// `owner/name` of a git remote, for labels.
+fn git_url_label(url: &str) -> String {
+    let path = url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit_once(['/', ':'])
+        .map(|(rest, name)| {
+            let owner = rest.rsplit(['/', ':']).next().unwrap_or_default();
+            if owner.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{owner}/{name}")
+            }
+        });
+    path.unwrap_or_else(|| url.to_owned())
 }
 
 /// `targetDeviceId` for a remote device; local calls skip the relay.
@@ -5446,6 +5502,15 @@ impl Shell {
 
         let custom_sections = self.active_sidebar_sections(cx);
         let custom_count = custom_sections.len();
+        let section_order =
+            (custom_count > 1 && self.sidebar_sections_reorderable(cx)).then(|| {
+                std::sync::Arc::new(
+                    custom_sections
+                        .iter()
+                        .map(|section| section.id.clone())
+                        .collect::<Vec<_>>(),
+                )
+            });
         let mut custom_groups: Vec<_> = custom_sections
             .iter()
             .map(|section| {
@@ -5801,10 +5866,20 @@ impl Shell {
             };
             if let Some(id) = key.strip_prefix("section:") {
                 if let Some(section) = custom_sections.iter().find(|section| section.id == id) {
+                    let drag =
+                        section_order
+                            .clone()
+                            .zip(profile_key.clone())
+                            .map(|(ids, profile_key)| SidebarSectionDrag {
+                                section_id: section.id.clone(),
+                                profile_key,
+                                ids,
+                            });
                     rendered.push(self.render_custom_sidebar_section(
                         section.clone(),
                         rendered_rows,
                         drag_group,
+                        drag,
                         theme,
                         cx,
                     ));
@@ -6357,6 +6432,7 @@ impl Shell {
             browser_repo: false,
             active: 0,
             submit_busy: false,
+            cloning: None,
             error: None,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
@@ -6743,6 +6819,13 @@ impl Shell {
         } else {
             &[]
         };
+        let query = flow.search.read(cx).text().to_string();
+        if let Some(url) = git_url(&query) {
+            return vec![FolderRow::Clone(CloneRow {
+                label: git_url_label(&url),
+                url,
+            })];
+        }
         local
             .into_iter()
             .map(FolderRow::Local)
@@ -6790,6 +6873,10 @@ impl Shell {
             return;
         }
         let entry = match rows.get(flow.active) {
+            Some(FolderRow::Clone(clone)) => {
+                self.add_space_clone(clone.clone(), cx);
+                return;
+            }
             Some(FolderRow::Local(entry)) => entry,
             Some(FolderRow::Home(found)) => {
                 let (path, is_repo) = (found.path.clone(), found.is_repo);
@@ -6988,6 +7075,19 @@ impl Shell {
         };
         let path = listing.path.clone();
         let git_detected = flow.browser_repo;
+        self.add_space_create(engine, device, path, git_detected, cx);
+    }
+
+    /// Make `path` on `device` a project and land in it (an existing one for
+    /// the same folder is reused).
+    fn add_space_create(
+        &mut self,
+        engine: crate::state::EngineHandle,
+        device: Device,
+        path: String,
+        git_detected: bool,
+        cx: &mut Context<Self>,
+    ) {
         // Same (device, folder) already has a space → just switch to it. The
         // engine dedupes this case too (a createSpace for a duplicate pair
         // no-ops), so creating would leave the minted id dangling.
@@ -7794,6 +7894,7 @@ impl Shell {
         let load_error = flow.browser.error().map(str::to_string);
         let error = flow.error.clone();
         let busy = flow.submit_busy;
+        let cloning = flow.cloning.clone();
         let active = flow.active;
         let loading = matches!(flow.browser, Loadable::Idle | Loadable::Loading);
         let drives_loading = matches!(flow.drives, Loadable::Loading);
@@ -7933,6 +8034,30 @@ impl Shell {
                     let mut first_home = true;
                     for (ix, folder) in self.add_space_folder_rows(cx).into_iter().enumerate() {
                         let entry = match folder {
+                            FolderRow::Clone(clone) => {
+                                let label = clone.label.clone();
+                                let target = clone.clone();
+                                rows.push(
+                                    row(ix)
+                                        .aria_label(SharedString::from(format!(
+                                            "Clone {label} here"
+                                        )))
+                                        .child(glyph_el(icons::GIT_BRANCH))
+                                        .child(label_el(label))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(crate::typography::ui_rems(11.0))
+                                                .text_color(theme.text_muted)
+                                                .child("Clone here"),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.add_space_clone(target.clone(), cx)
+                                        }))
+                                        .into_any_element(),
+                                );
+                                continue;
+                            }
                             FolderRow::Local(entry) => entry,
                             FolderRow::Home(found) => {
                                 let el = home_folder_row(row(ix), &found, &query, &theme, cx);
@@ -8492,7 +8617,6 @@ impl Shell {
                     "↵",
                     match step {
                         ProjectStep::Folders => "Open",
-                        ProjectStep::Repositories => "Add",
                         _ => "Select",
                     },
                 ))

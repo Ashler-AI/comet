@@ -1348,6 +1348,35 @@ struct PinnedSessionDragState {
     autoscroll_active: bool,
 }
 
+/// Drag payload for reordering custom sections by their header.
+#[derive(Clone)]
+struct SidebarSectionDrag {
+    section_id: String,
+    profile_key: String,
+    /// The section order the drag started from.
+    ids: std::sync::Arc<Vec<String>>,
+}
+
+/// Live reorder of the custom sections. The lifted section rides under the
+/// pointer while its siblings slide between slots, as pinned rows do.
+struct SidebarSectionDragState {
+    payload: SidebarSectionDrag,
+    from: usize,
+    over: usize,
+    /// Natural slot heights at lift, shared by hit testing and displacement.
+    heights: Vec<f32>,
+    /// The first slot's top in the list's content coordinates.
+    top: f32,
+    /// The slots' left edge within the list, and their width.
+    left: f32,
+    width: f32,
+    /// The pointer's offset below the lifted section's top.
+    grab_y: f32,
+    pointer: Point<Pixels>,
+    siblings: std::collections::HashMap<String, SidebarSessionSlide>,
+    generation: u64,
+}
+
 type SidebarKeyedRow = (String, f32, AnyElement);
 
 struct SidebarSessionRows {
@@ -1567,7 +1596,7 @@ const CHAT_RENAME_REVEAL_GRACE: std::time::Duration = std::time::Duration::from_
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatRenameSurface {
     Sidebar,
-    Explorer,
+    SessionCard,
 }
 
 /// A chat title edited in place on its row (double-click, or Rename in the
@@ -2248,6 +2277,9 @@ pub struct Shell {
     pinned_session_drag_generation: u64,
     sidebar_session_transfer: Option<SidebarSessionTransfer>,
     sidebar_session_return: Option<SidebarSessionReturn>,
+    sidebar_section_drag: Option<SidebarSectionDragState>,
+    /// Each custom section's painted bounds, measured every frame.
+    sidebar_section_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
     /// Pending pin intents are scoped to the active profile and engine attachment.
     sidebar_pin_write: Option<sidebar_pins::PendingSidebarPins>,
     sidebar_pin_write_generation: u64,
@@ -2779,6 +2811,8 @@ impl Shell {
             pinned_session_drag_generation: 0,
             sidebar_session_transfer: None,
             sidebar_session_return: None,
+            sidebar_section_drag: None,
+            sidebar_section_bounds: Default::default(),
             sidebar_pin_write: None,
             sidebar_pin_write_generation: 0,
             sidebar_pin_write_notice: None,
@@ -3097,13 +3131,18 @@ impl Shell {
             // focused app still stays a chime — you're already looking at
             // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
+            // The engine posts the banners when it can (with the window
+            // closed too); the app then only chimes.
+            let engine_posts = state.read(cx).engine_posts_banners();
             for (chat_id, status, send_pending, title, notify) in sessions {
                 let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
                 // Keep side-chat baselines current, but never emit their
                 // completion, input-request, or failure sounds/banners.
                 if notify
                     && let Some(prev) = prev
-                    && let Some(sound) = status.sound_since(&prev, send_pending)
+                    && let Some(sound) = status
+                        .ping_since(&prev, send_pending)
+                        .map(crate::sound::Sound::from)
                 {
                     if self.settings.session_sound_enabled(sound) {
                         let should_play = sound != crate::sound::Sound::Attention
@@ -3114,7 +3153,8 @@ impl Shell {
                             crate::sound::play(sound);
                         }
                     }
-                    if self.settings.notifications_enabled
+                    if !engine_posts
+                        && self.settings.notifications_enabled
                         && !(self.settings.notifications_background_only && app_focused)
                     {
                         let title = title.unwrap_or_else(|| "New session".into());
@@ -3127,11 +3167,15 @@ impl Shell {
                     }
                 }
             }
-            if let Some(sound) = self.connectivity_notifications.update(
-                connectivity,
-                connectivity_observed,
-                std::time::Instant::now(),
-            ) {
+            if let Some(sound) = self
+                .connectivity_notifications
+                .update(
+                    connectivity,
+                    connectivity_observed,
+                    std::time::Instant::now(),
+                )
+                .map(crate::sound::Sound::from)
+            {
                 if self.settings.session_sound_enabled(sound)
                     && self
                         .attention_sound_gate
@@ -3139,7 +3183,8 @@ impl Shell {
                 {
                     crate::sound::play(sound);
                 }
-                if self.settings.notifications_enabled
+                if !engine_posts
+                    && self.settings.notifications_enabled
                     && !(self.settings.notifications_background_only && app_focused)
                 {
                     let body = match connectivity {
@@ -3197,7 +3242,8 @@ impl Shell {
                         this.harness_update_seen.insert(key.clone());
                     }
                     let focused = cx.active_window().is_some();
-                    if this.settings.notifications_enabled
+                    if !this.state.read(cx).engine_posts_banners()
+                        && this.settings.notifications_enabled
                         && this.settings.agent_update_notifications
                         && !(this.settings.notifications_background_only && focused)
                     {
@@ -4293,12 +4339,6 @@ impl Shell {
                     }
                     // Footer rows exist on the explorer only; an editor
                     // surface never emits them.
-                    FilesEvent::OpenSubagent { .. }
-                    | FilesEvent::OpenChildChat(_)
-                    | FilesEvent::RenameChildChat(_)
-                    | FilesEvent::ChildChatContextMenu { .. }
-                    | FilesEvent::NewChildChat
-                    | FilesEvent::ForkChat => {}
                     FilesEvent::CloseCancelled => {
                         this.cancel_file_close(RightSurface::File(id), cx)
                     }
@@ -4512,6 +4552,7 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::OpenChat { chat_id } => self.open_chat(chat_id.clone(), cx),
         }
     }
 
@@ -6138,28 +6179,27 @@ impl Shell {
         else {
             return;
         };
-        // The sidebar lists only top-level chats; side chats live in the
-        // explorer's Chats footer. Either way the row must be on screen
+        // The sidebar lists only top-level chats; side chats ride the
+        // session card's lanes. Either way the row must be on screen
         // first: a field on a hidden row would take keystrokes unseen.
         let surface = if parent.is_some() {
-            ChatRenameSurface::Explorer
+            ChatRenameSurface::SessionCard
         } else {
             ChatRenameSurface::Sidebar
         };
         let revealed = match surface {
             ChatRenameSurface::Sidebar => self.reveal_sidebar_chat(&chat_id, cx),
-            // The footer lists the open chat's live side chats; it reveals
-            // the row itself once handed the rename.
-            ChatRenameSurface::Explorer => {
+            // The lanes list the open chat's live side chats: show the card
+            // and page its lane to the branch.
+            ChatRenameSurface::SessionCard => {
                 !archived
                     && parent.as_deref() == Some(self.active_chat.as_str())
-                    && self.files_panel_open(cx)
-                    && self.files.contains_key(&self.panel_key(cx))
+                    && self.reveal_session_lane_chat(&chat_id, cx)
             }
         };
         if !revealed {
             // The sidebar explains its own refusals.
-            if surface == ChatRenameSurface::Explorer {
+            if surface == ChatRenameSurface::SessionCard {
                 self.show_notice(
                     crate::toast::ToastKind::Error,
                     "Open this side chat's parent to rename it",
@@ -6203,7 +6243,6 @@ impl Shell {
             _events: events,
             _blur: None,
         });
-        self.sync_explorer_chat_rename(cx);
         cx.notify();
     }
 
@@ -6228,7 +6267,6 @@ impl Shell {
         let Some(rename) = self.chat_rename.take() else {
             return;
         };
-        self.sync_explorer_chat_rename(cx);
         let title = rename.input.read(cx).text().trim().to_string();
         let unchanged = self
             .state
@@ -6244,18 +6282,6 @@ impl Shell {
             );
         }
         cx.notify();
-    }
-
-    /// Hand the explorer footers the side-chat rename to draw (or clear it).
-    fn sync_explorer_chat_rename(&mut self, cx: &mut Context<Self>) {
-        let rename = self
-            .chat_rename
-            .as_ref()
-            .filter(|rename| rename.surface == ChatRenameSurface::Explorer)
-            .map(|rename| (rename.chat_id.clone(), rename.input.clone()));
-        for files in self.files.values() {
-            files.update(cx, |files, cx| files.set_chat_rename(rename.clone(), cx));
-        }
     }
 
     /// Scroll the sidebar so the renamed row (painted at `row`) clears the
@@ -9365,6 +9391,11 @@ impl Shell {
         {
             self.cancel_pinned_session_drag(cx);
         }
+        if self.sidebar_section_drag.is_some()
+            && (!cx.has_active_drag() || !self.sidebar_section_drag_is_valid(cx))
+        {
+            self.cancel_sidebar_section_drag(cx);
+        }
 
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
@@ -9450,6 +9481,7 @@ impl Shell {
         }
         if self.pinned_session_drag.is_none()
             && self.sidebar_session_transfer.is_none()
+            && self.sidebar_section_drag.is_none()
             && self.sidebar_prev_order != order
         {
             let key_order_changed = sidebar_key_order_changed(&self.sidebar_prev_order, &order);
@@ -9491,10 +9523,32 @@ impl Shell {
                     .is_none_or(|drag| drag.preview.as_ref().is_none_or(|gap| gap.pinned))
             })
             .map(|drag| (drag.from, drag.over, drag.prev_over, drag.epoch));
+        // A lifted custom section leaves an empty slot behind and paints in
+        // the list's movement layer; its siblings slide around the gap.
+        let section_offsets = self
+            .sidebar_section_drag_offsets()
+            .filter(|(_, offsets)| offsets.len() == custom_count);
+        let lifted_section = section_offsets.as_ref().and_then(|(from, _)| {
+            let height = self.sidebar_section_drag.as_ref()?.heights[*from];
+            let (_, _, slot) = keyed.get_mut(pinned_count + from)?;
+            let placeholder = div().flex_none().h(px(height)).into_any_element();
+            let section = std::mem::replace(slot, placeholder);
+            self.render_lifted_sidebar_section(section, theme)
+        });
         let list_items: Vec<AnyElement> = keyed
             .into_iter()
             .enumerate()
             .map(|(ix, (key, _, element))| {
+                if let Some((_, offsets)) = &section_offsets
+                    && let Some(offset) =
+                        ix.checked_sub(pinned_count).and_then(|ix| offsets.get(ix))
+                {
+                    return div()
+                        .relative()
+                        .top(px(*offset))
+                        .child(element)
+                        .into_any_element();
+                }
                 if ix < pinned_count
                     && let Some((from, over, prev_over, drag_epoch)) = pinned_drag
                 {
@@ -9586,6 +9640,7 @@ impl Shell {
             let regular_empty = regular_items.is_empty();
             let pinned_group = show_pinned_section
                 .then(|| self.render_pinned_section(pinned_items, pinned_body_height, theme, cx));
+            let section_bounds = self.sidebar_section_bounds.clone();
             div()
                 .id("sidebar-active-sessions")
                 .flex()
@@ -9593,7 +9648,20 @@ impl Shell {
                 .gap(px(SIDEBAR_LIST_GAP))
                 .pb(px(Theme::SPACE_SM))
                 .when_some(pinned_group, |el, group| el.child(group))
-                .children(custom_items)
+                // Each section's painted slot measures the reorder's hit
+                // testing and displacement.
+                .when(!custom_items.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(SIDEBAR_LIST_GAP))
+                            .on_children_prepainted(move |bounds, _, _| {
+                                *section_bounds.borrow_mut() = bounds;
+                            })
+                            .children(custom_items),
+                    )
+                })
                 .when(
                     !regular_items.is_empty() || self.sidebar_session_transfer.is_some(),
                     |el| {
@@ -9734,6 +9802,17 @@ impl Shell {
                                 this.cancel_sidebar_session_transfer(cx);
                             },
                         ))
+                        // A section reorder lands wherever it is released in the list.
+                        .on_drag_move::<SidebarSectionDrag>(cx.listener(
+                            |this, event: &gpui::DragMoveEvent<SidebarSectionDrag>, _, cx| {
+                                this.track_sidebar_section_drag(event.event.position, cx);
+                            },
+                        ))
+                        .on_drop::<SidebarSectionDrag>(cx.listener(
+                            |this, payload: &SidebarSectionDrag, _, cx| {
+                                this.finish_sidebar_section_drag(payload, cx);
+                            },
+                        ))
                         .px(px(Theme::SPACE_SM))
                         .flex()
                         .flex_col()
@@ -9742,7 +9821,8 @@ impl Shell {
                         .pt(px(SIDEBAR_LIST_PAD_TOP))
                         .child(active_list)
                         .children(archived_section)
-                        .children(moving_row),
+                        .children(moving_row)
+                        .children(lifted_section),
                 )),
         )
         .fade_overflow_y(&self.sidebar_scroll);
@@ -13784,10 +13864,17 @@ impl Render for Shell {
         }
 
         if self.activation_sub.is_none() {
+            // The window's focus as it opens; changes follow below.
+            let active = window.is_window_active();
+            self.state
+                .update(cx, |state, cx| state.set_viewport_focused(active, cx));
             self.activation_sub = Some(cx.observe_window_activation(
                 window,
                 |this: &mut Shell, window, cx| {
                     motion::window_activation_changed(window.is_window_active(), cx);
+                    let active = window.is_window_active();
+                    this.state
+                        .update(cx, |state, cx| state.set_viewport_focused(active, cx));
                     if window.is_window_active()
                         && let Some(update) = crate::app_update::AppUpdate::global(cx)
                     {

@@ -44,6 +44,9 @@ fn app_engine_fallback_honors_explicit_runtime_coordinates() {
 
 fn assert_background_engine(mut command: Command, data_dir: &std::path::Path, port: u16) {
     let mut child = command
+        // Resolve explicit test coordinates even in a packaged build.
+        .env("ZERON_MANAGED_ENGINE", "1")
+        .env_remove("COMET_LOCAL_AGENT_RUNTIME")
         // The mock Crew profile is isolated and carries no remote authority.
         .env("COMET_HARNESS", "mock")
         .env_remove("COMET_EDGE_TOKEN")

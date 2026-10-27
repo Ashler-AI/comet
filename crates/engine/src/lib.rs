@@ -33,6 +33,7 @@ mod change_request_store;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
+pub mod commit_credit;
 pub mod diff_sync;
 pub mod doc_host;
 mod fs_watch;
@@ -919,6 +920,11 @@ impl Engine {
         let registry = Arc::new(default_registry().with_execution_policy(
             config.managed_inference, auth.device_mode(),
         ));
+        // Commit credit is a per-device opt-in on this non-Cloud engine.
+        registry.set_commit_credit(Arc::new(commit_credit::CommitCredit::open(
+            profile.device_root(),
+            false,
+        )));
         let omp = if auth.device_mode() {
             zeron_harness::omp::OmpHarness::scaffold_host()
         } else {

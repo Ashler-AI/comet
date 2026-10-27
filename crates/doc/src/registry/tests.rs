@@ -647,6 +647,7 @@ fn spaces_round_trip_and_mutate() {
             true,
             Some("checkout-abc"),
             Some("github.com/owner/project"),
+            Some("owner/project"),
             ts(4_000),
         )
         .unwrap()
@@ -658,10 +659,11 @@ fn spaces_round_trip_and_mutate() {
         row.repository_id.as_deref(),
         Some("github.com/owner/project")
     );
+    assert_eq!(row.github_repo.as_deref(), Some("owner/project"));
     assert_eq!(row.git_checked_at, Some(ts(4_000)));
 
     assert!(!ws.rename_space("nope", Some("x")).unwrap());
-    assert!(!ws.set_space_git("nope", true, None, None, ts(1)).unwrap());
+    assert!(!ws.set_space_git("nope", true, None, None, None, ts(1)).unwrap());
 }
 
 #[test]

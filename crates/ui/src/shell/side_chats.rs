@@ -919,6 +919,8 @@ mod tests {
                 shell.state.update(cx, |state, _| {
                     state.local_device_id = Some("local".into());
                     state.devices = vec![zeron_proto::Device {
+                        devbox_id: None,
+                        devbox_provider: None,
                         id: "omarchy".into(),
                         name: "omarchy".into(),
                         platform: "linux".into(),
