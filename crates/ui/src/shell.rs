@@ -14846,6 +14846,8 @@ mod tests {
         updated_at: DateTime<Utc>,
     ) -> zeron_proto::Session {
         zeron_proto::Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             last_completed_turn: None,
             chat_id: chat_id.into(),
             device_id: "remote".into(),
@@ -17393,6 +17395,7 @@ mod exit_regressions {
                     git_checked_at: None,
                     checkout_id: None,
                     repository_id: None,
+                    github_repo: None,
                     created_at: Utc::now(),
                 };
                 shell.state.update(cx, |state, cx| {
@@ -17667,6 +17670,7 @@ mod exit_regressions {
                         git_checked_at: None,
                         checkout_id: None,
                         repository_id: None,
+                        github_repo: None,
                         created_at: Utc::now(),
                     }]);
                     // Boot opened an existing project session after loading defaults.
@@ -17738,6 +17742,7 @@ mod exit_regressions {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: Utc::now(),
         };
         window
@@ -17826,6 +17831,7 @@ mod exit_regressions {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: Utc::now(),
         };
         window
@@ -18265,6 +18271,7 @@ mod exit_regressions {
                         git_checked_at: None,
                         checkout_id: None,
                         repository_id: None,
+                        github_repo: None,
                         created_at: Utc::now(),
                     }]);
                 });

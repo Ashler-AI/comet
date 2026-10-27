@@ -554,7 +554,12 @@ mod tests {
             reasoning: None, model_options: Default::default(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         }), Some("/original/repo".into())).unwrap();
-        workspace.set_chat_harness_session(local_id, "original-native", "/original/repo");
+        workspace.set_chat_harness_session(
+            local_id,
+            "original-native",
+            "/original/repo",
+            Some(zeron_proto::HarnessId::Omp),
+        );
         let local = services.adopt_chat(&workspace, local_id).unwrap();
         assert_eq!(local.id, local_id);
         assert_eq!(local.harness_session_id.as_deref(), Some("original-native"));

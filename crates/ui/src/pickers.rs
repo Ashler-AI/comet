@@ -7766,6 +7766,7 @@ mod tests {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
+                github_repo: None,
                 created_at: chrono::Utc::now(),
             }]);
             state
@@ -7809,6 +7810,7 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -8114,6 +8116,7 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: repository.map(str::to_string),
+            github_repo: None,
             created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
                 + chrono::TimeDelta::minutes(minutes),
         };

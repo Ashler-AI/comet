@@ -7020,6 +7020,7 @@ impl Shell {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: Utc::now(),
         };
         self.state.update(cx, |s, cx| {

@@ -323,6 +323,7 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
         git_checked_at: None,
         checkout_id: None,
         repository_id: None,
+        github_repo: None,
         created_at: ts(1_500),
     }
 }
@@ -330,6 +331,8 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
         last_completed_turn: None,
+        last_turn_outcome: None,
+        terminal_activity: None,
         running_subagents: 0,
         chat_id: chat_id.into(),
         device_id: device_id.into(),

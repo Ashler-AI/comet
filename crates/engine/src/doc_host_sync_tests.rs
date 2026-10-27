@@ -18,7 +18,12 @@ async fn local_history_preserves_transcript_and_continuation_without_cloud_work(
             harness: HarnessId::Omp, model: Some("original-model".into()), reasoning: None,
             model_options: Default::default(), sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         }), Some("/original/repo".into())).unwrap();
-        workspace.set_chat_harness_session(id, "original-native", "/original/repo");
+        workspace.set_chat_harness_session(
+            id,
+            "original-native",
+            "/original/repo",
+            Some(HarnessId::Omp),
+        );
         let source = SessionDoc::init(id).unwrap();
         source.push_message(&zeron_doc::SessionMessageEntry {
             id: "original-message".into(), role: zeron_doc::MessageRole::User,
@@ -36,7 +41,10 @@ async fn local_history_preserves_transcript_and_continuation_without_cloud_work(
         let request = host.request_from_chat_row(id, "continue").unwrap();
         assert_eq!(request.cwd, "/original/repo");
         assert_eq!(request.model.as_deref(), Some("original-model"));
-        assert_eq!(workspace.chat_harness_session(id).unwrap().0, "original-native");
+        assert_eq!(
+            workspace.chat_harness_session(id).unwrap().session_id,
+            "original-native"
+        );
         assert!(workspace.chat(id).unwrap().unwrap().crew.is_none());
         handle.write_user_message("continued", "continue", 2).unwrap();
         host.save_snapshot(&handle);
