@@ -12,8 +12,8 @@ inputs:
     required: true
   save-rust-cache:
     description: >-
-      Whether this job may save the cache when it runs on main. Give it to
-      exactly one job per key. Pull requests never save.
+      Whether this job may save the cache on main or a manual verification
+      branch. Give it to exactly one job per key. Pull requests never save.
     default: 'false'
   apt-packages:
     description: apt packages to install (space separated). Nothing is installed when empty.
@@ -70,7 +70,7 @@ runs:
         prefix-key: ci-linux-v1
         shared-key: ${{ inputs.rust-cache }}
         add-job-id-key: false
-        save-if: ${{ inputs.save-rust-cache == 'true' && github.ref == 'refs/heads/main' }}
+        save-if: ${{ inputs.save-rust-cache == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
         cache-on-failure: true
 
     # After the cache restore, so the checksum-verified binary is the one that

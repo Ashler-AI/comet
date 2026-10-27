@@ -101,11 +101,19 @@ pub fn launch(config: &EngineConfig, app_exe: &Path) -> std::io::Result<Child> {
         .env("ZERON_HARNESS", &harness)
         .env(
             "COMET_INFERENCE_MODE",
-            if config.managed_inference { "managed" } else { "local" },
+            if config.managed_inference {
+                "managed"
+            } else {
+                "local"
+            },
         )
         .env(
             "ZERON_INFERENCE_MODE",
-            if config.managed_inference { "managed" } else { "local" },
+            if config.managed_inference {
+                "managed"
+            } else {
+                "local"
+            },
         )
         // Empty selects development auth, exactly as `None` does in-process.
         .env(
@@ -113,27 +121,68 @@ pub fn launch(config: &EngineConfig, app_exe: &Path) -> std::io::Result<Child> {
             config.workos_client_id.as_deref().unwrap_or(""),
         );
     match &config.edge_token {
-        Some(token) => {
-            command.env("COMET_EDGE_TOKEN", token).env("ZERON_EDGE_TOKEN", token)
-        }
-        None => command.env_remove("COMET_EDGE_TOKEN").env_remove("ZERON_EDGE_TOKEN"),
+        Some(token) => command
+            .env("COMET_EDGE_TOKEN", token)
+            .env("ZERON_EDGE_TOKEN", token),
+        None => command
+            .env_remove("COMET_EDGE_TOKEN")
+            .env_remove("ZERON_EDGE_TOKEN"),
     };
-    if let Some(scaffold) = &config.scaffold {
-        command
-            .env("COMET_SCAFFOLD_URL", &scaffold.control_origin)
-            .env("CREW_CONTROL_ORIGIN", &scaffold.control_origin)
-            .env("COMET_PROJECT_SCOPE", &scaffold.project_scope)
-            .env("CREW_PROJECT_SCOPE", &scaffold.project_scope);
-        if let Some(deployment) = &scaffold.deployment_id {
+    configure_authority_environment(
+        &mut command,
+        config.scaffold.as_ref(),
+        config.org_id.as_deref(),
+    );
+    spawn_detached(&mut command)
+}
+
+fn configure_authority_environment(
+    command: &mut Command,
+    scaffold: Option<&zeron_sync::scaffold_auth::ScaffoldConfig>,
+    org_id: Option<&str>,
+) {
+    match scaffold {
+        Some(scaffold) => {
             command
-                .env("COMET_DEPLOYMENT_ID", deployment)
-                .env("CREW_DEPLOYMENT_ID", deployment);
+                .env("COMET_SCAFFOLD_URL", &scaffold.control_origin)
+                .env("CREW_CONTROL_ORIGIN", &scaffold.control_origin)
+                .env("COMET_PROJECT_SCOPE", &scaffold.project_scope)
+                .env("CREW_PROJECT_SCOPE", &scaffold.project_scope);
+            match &scaffold.deployment_id {
+                Some(deployment) => {
+                    command
+                        .env("COMET_DEPLOYMENT_ID", deployment)
+                        .env("CREW_DEPLOYMENT_ID", deployment);
+                }
+                None => {
+                    command
+                        .env_remove("COMET_DEPLOYMENT_ID")
+                        .env_remove("CREW_DEPLOYMENT_ID");
+                }
+            }
+        }
+        None => {
+            command
+                .env_remove("COMET_SCAFFOLD_URL")
+                .env_remove("CREW_CONTROL_ORIGIN")
+                .env_remove("COMET_PROJECT_SCOPE")
+                .env_remove("CREW_PROJECT_SCOPE")
+                .env_remove("COMET_DEPLOYMENT_ID")
+                .env_remove("CREW_DEPLOYMENT_ID");
         }
     }
-    if let Some(org) = &config.org_id {
-        command.env("ZERON_ORG_ID", org);
+    match org_id {
+        Some(org_id) => {
+            command
+                .env("COMET_ORG_ID", org_id)
+                .env("ZERON_ORG_ID", org_id);
+        }
+        None => {
+            command
+                .env_remove("COMET_ORG_ID")
+                .env_remove("ZERON_ORG_ID");
+        }
     }
-    spawn_detached(&mut command)
 }
 
 /// Spawn `command` so it survives its parent.
@@ -434,6 +483,64 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command_environment(
+        command: &Command,
+    ) -> std::collections::HashMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> {
+        command.get_envs().collect()
+    }
+
+    #[test]
+    fn managed_authority_environment_does_not_inherit_absent_values() {
+        let mut command = Command::new("zeron-engine");
+        configure_authority_environment(&mut command, None, None);
+        let environment = command_environment(&command);
+        for key in [
+            "COMET_SCAFFOLD_URL",
+            "CREW_CONTROL_ORIGIN",
+            "COMET_PROJECT_SCOPE",
+            "CREW_PROJECT_SCOPE",
+            "COMET_DEPLOYMENT_ID",
+            "CREW_DEPLOYMENT_ID",
+            "COMET_ORG_ID",
+            "ZERON_ORG_ID",
+        ] {
+            assert_eq!(environment.get(std::ffi::OsStr::new(key)), Some(&None));
+        }
+
+        let scaffold = zeron_sync::scaffold_auth::ScaffoldConfig::new(
+            "https://control.example",
+            "https://edge.example",
+            "project-a",
+        );
+        let mut command = Command::new("zeron-engine");
+        configure_authority_environment(&mut command, Some(&scaffold), Some("org-a"));
+        let environment = command_environment(&command);
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("COMET_SCAFFOLD_URL")),
+            Some(&Some(std::ffi::OsStr::new("https://control.example")))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CREW_PROJECT_SCOPE")),
+            Some(&Some(std::ffi::OsStr::new("project-a")))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("COMET_DEPLOYMENT_ID")),
+            Some(&None)
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CREW_DEPLOYMENT_ID")),
+            Some(&None)
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("COMET_ORG_ID")),
+            Some(&Some(std::ffi::OsStr::new("org-a")))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("ZERON_ORG_ID")),
+            Some(&Some(std::ffi::OsStr::new("org-a")))
+        );
+    }
 
     #[test]
     fn engine_command_prefers_the_engine_beside_the_app() {
