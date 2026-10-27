@@ -629,7 +629,7 @@ fn provider_switch_needs_a_host_that_switches() {
     let before = client.session_config("chat-blog").unwrap();
     let (result, _) = switched("chat-blog");
     let error = result.expect_err("an older host refuses").to_string();
-    assert!(error.contains("newer Zeron"), "{error}");
+    assert!(error.contains("newer Crew"), "{error}");
     assert_eq!(client.session_config("chat-blog").unwrap(), before);
     // A model change on the same provider is not a switch.
     let mut model = before.clone();

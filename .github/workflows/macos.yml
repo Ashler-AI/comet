@@ -214,9 +214,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
-      - name: Rust mobile core tests
-        run: cargo test --locked -p zeron-text -p zeron-markdown -p zeron-client -p zeron-mobile
-      - name: Generated Swift bindings are current
+      - name: Generate Swift bindings
         run: |
           cargo build --locked -p zeron-mobile --lib
           cargo build --locked -p zeron-mobile --bin uniffi-bindgen --features bindgen
@@ -228,6 +226,8 @@ jobs:
           name: ios-generated-bindings
           path: ${{ runner.temp }}/gen
           retention-days: 1
+      - name: Rust mobile core tests
+        run: cargo test --locked -p zeron-text -p zeron-markdown -p zeron-client -p zeron-mobile
       - name: Verify committed bindings and prepare headers
         run: |
           diff -u apps/ios/Zeron/Core/Generated/zeron_core.swift "$RUNNER_TEMP/gen/zeron_core.swift"
