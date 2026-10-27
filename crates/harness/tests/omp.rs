@@ -80,6 +80,7 @@ fn controls() -> RunControls {
 
 fn request(resume: Option<&str>) -> RunRequest {
     RunRequest {
+        env: Default::default(),
         prompt: "hello".into(),
         model: None,
         harness: None,
