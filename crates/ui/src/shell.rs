@@ -9407,7 +9407,7 @@ impl Shell {
         let pinned_count = session_rows.pinned_count;
         let custom_count = session_rows.custom_count;
         let regular_start = pinned_count + custom_count;
-        let keyed = session_rows.rows;
+        let mut keyed = session_rows.rows;
         let regular_count = session_rows.regular_count;
         let ungrouped = self.settings.sidebar_organization == SidebarOrganization::InOneList;
         let regular_body_height = spaces::SIDEBAR_DISCLOSURE_BODY_INSET

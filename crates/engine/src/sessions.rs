@@ -2706,15 +2706,20 @@ impl Inner {
             .is_some_and(|handle| handle.continues_with_sent_message())
     }
 
-    /// Whether this run delegates only through side chats. Side chats
-    /// themselves keep native subagents so delegation remains one level deep.
+    /// Whether a run of `chat_id` launches without its provider's own
+    /// subagents (Settings → Providers), delegating through side chats
+    /// instead. Never for a chat that has a parent: delegation is one level
+    /// deep, so a side chat can't create chats and keeps its provider's own.
+    /// Nor while its parent is unknown here (its run outran its row).
     fn side_chats_only(&self, chat_id: &str, harness_id: HarnessId) -> bool {
         !self.registry.native_subagents(harness_id)
             && self.workspace().is_none_or(|ws| {
-                ws.chat(chat_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|chat| chat.parent_chat_id.is_none())
+                !ws.parent_unknown(chat_id)
+                    && !ws
+                        .chat(chat_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|chat| chat.parent_chat_id.is_some())
             })
     }
 
@@ -3053,6 +3058,23 @@ fn session_cwd_matches(session_cwd: &str, cwd: &str) -> bool {
             .is_ok_and(|a| std::fs::canonicalize(cwd).is_ok_and(|b| a == b))
 }
 
+/// Ceiling on the prior conversation replayed into a provider session that
+/// lacks it. Characters of serialized history, not tokens: roughly 20k
+/// tokens, small enough to leave every supported model room to work.
+const HISTORY_REPLAY_CHARS: usize = 80_000;
+/// One message's replayed text is cut past this, keeping its head.
+const HISTORY_MESSAGE_CHARS: usize = 8_000;
+/// A replayed tool call keeps only this much of its output.
+const HISTORY_TOOL_OUTPUT_CHARS: usize = 600;
+
+/// `text` cut to `max` characters on a char boundary, with a marker when cut.
+fn clip_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}… [truncated]", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
 impl Inner {
     /// Record the seam when a chat moves to another provider and preserve the
     /// outgoing provider's resumable session for a later switch back.
@@ -3061,17 +3083,22 @@ impl Inner {
         if entries.is_empty() {
             return;
         }
-        let latest = entries.iter().rev().find_map(|entry| {
-            entry.parts.iter().find_map(|part| match part {
-                MessagePart::Switch { to_harness, .. } => Some(
-                    to_harness
-                        .as_deref()
-                        .and_then(HarnessId::from_slug),
-                ),
-                MessagePart::Fork { .. } => Some(None),
-                _ => None,
-            })
-        });
+        let latest = 'entries: {
+            for entry in entries.iter().rev() {
+                for part in &entry.parts {
+                    match part {
+                        MessagePart::Switch { to_harness, .. } => {
+                            break 'entries Some(
+                                to_harness.as_deref().and_then(HarnessId::from_slug),
+                            );
+                        }
+                        MessagePart::Fork { .. } => break 'entries None,
+                        _ => {}
+                    }
+                }
+            }
+            None
+        };
         let owned = || self.owned_session(chat_id);
         let previous = match latest {
             Some(to) => to,
@@ -3206,24 +3233,56 @@ impl Inner {
                         zeron_doc::MessagePart::Tool { call, output, .. } => Some(format!(
                             "Tool: {}\n{}",
                             serde_json::to_string(call).unwrap_or_default(),
-                            output.clone().unwrap_or_default()
+                            clip_chars(
+                                output.as_deref().unwrap_or_default(),
+                                HISTORY_TOOL_OUTPUT_CHARS
+                            )
                         )),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                (entry.role, text)
+                (entry.role, clip_chars(&text, HISTORY_MESSAGE_CHARS))
             })
             .filter(|(_, text)| !text.is_empty())
             .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
             .collect();
-        (!history.is_empty()).then(|| {
-            format!(
-                "Continue this side conversation using the following prior conversation as context.\n<conversation>\n{}\n</conversation>\n\n{}",
-                serde_json::to_string(&history).unwrap_or_default(),
-                prompt
-            )
-        })
+        // Newest messages win the budget: what was just said matters most.
+        let mut budget = HISTORY_REPLAY_CHARS;
+        let mut kept = history
+            .iter()
+            .rev()
+            .take_while(|message| {
+                let cost = message.to_string().len();
+                let fits = cost <= budget;
+                budget = budget.saturating_sub(cost);
+                fits
+            })
+            .count();
+        // A single message over the whole budget still goes out (clipped).
+        kept = kept.max(1.min(history.len()));
+        let omitted = history.len() - kept;
+        let history = &history[omitted..];
+        if history.is_empty() {
+            return None;
+        }
+        let intro = if watermark.is_some() {
+            "While you were away, this conversation continued with a different AI provider. The messages you missed are below; answer the final request as the continuation of the whole conversation. Tool calls listed below ran on the other provider — do not assume their state is still live."
+        } else if switched {
+            "This conversation was started with a different AI provider and you are now taking over. The earlier messages are below as context; answer the final request as the continuation of that conversation. Tool calls listed below ran on the previous provider — do not assume their state is still live."
+        } else {
+            "Continue this side conversation using the following prior conversation as context."
+        };
+        let omitted_note = if omitted > 0 {
+            format!("({omitted} earlier messages omitted for length.)\n")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{intro}\n{omitted_note}<conversation>\n{}\n</conversation>\n\n{}",
+            serde_json::to_string(history).unwrap_or_default(),
+            prompt
+        ))
     }
 }
 
@@ -3361,6 +3420,19 @@ pub(crate) fn subagent_doc_id(chat_id: &str, tool_use_id: &str) -> String {
         let _ = write!(hex, "{b:02x}");
     }
     format!("{chat_id}--sub--{hex}")
+}
+
+/// Spawn gate: whether tagged traffic for `id` gets a subagent doc, and with
+/// it a unit on the badge. Only a spawn chip of THIS chat does, one this run
+/// folded or one already in the doc: those are the rows the lanes card lists.
+/// Claude also tags the agents a subagent starts with their own call ids,
+/// chips of that subagent's doc; sinks for them badged chats over an empty
+/// card (#999). Traffic for any other id stays in the run journal.
+fn is_chat_spawn(id: &str, folded: &[MessagePart], doc: &SessionDoc) -> bool {
+    folded.iter().any(|part| {
+        matches!(part, MessagePart::Tool { id: part_id, call, .. }
+            if part_id == id && call.is_subagent_spawn())
+    }) || doc.has_subagent_spawn(id)
 }
 
 /// Test-only instrumentation: how often `drive_run`'s coalesced commit branch
@@ -4043,6 +4115,9 @@ async fn drive_run(
     // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
     // settled subagent: it announces more work is coming.
     let mut settled_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Tagged ids that failed the spawn gate ([`is_chat_spawn`]): not looked
+    // up again until a call with that id folds.
+    let mut foreign_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
@@ -4373,6 +4448,14 @@ async fn drive_run(
             // would link the chip to that never-created doc (an empty tab
             // on click).
             let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            let opens_sink =
+                !sink_known && !done_only && !foreign_subagents.contains(parent_tool_use_id) && {
+                    let spawn = is_chat_spawn(parent_tool_use_id, &folded, doc_ref);
+                    if !spawn {
+                        foreign_subagents.insert(parent_tool_use_id.clone());
+                    }
+                    spawn
+                };
             if chip_streaming {
                 if !sink_known && !done_only {
                     for p in folded.iter_mut() {
@@ -4401,7 +4484,7 @@ async fn drive_run(
                 }
             }
             // Open the sink lazily; an open failure degrades to chip-only.
-            if !sink_known && !done_only {
+            if opens_sink {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
                     Ok(handle) => Some(handle.writer()),
                     Err(err) => {
@@ -4693,6 +4776,8 @@ async fn drive_run(
                     continue;
                 }
                 seen_tools.insert(id.clone());
+                // This call may be (or become) a spawn: look again.
+                foreign_subagents.remove(id);
             }
             AgentEvent::ToolResult { id, .. }
                 if !in_segment(&folded, id) && seen_tools.contains(id) =>
@@ -5412,7 +5497,7 @@ mod tests {
         std::io::Write::write_all(&mut f, b"{\"seq\":3,\"event\":{\"type\":\"done\"").unwrap();
         assert_eq!(
             sessions.inner.journal_harness_session("started-only"),
-            Some(("s1".into(), "/a".into(), Some(HarnessId::Mock)))
+            Some(("s1".into(), "/a".into(), Some(HarnessId::ClaudeCode)))
         );
     }
 
