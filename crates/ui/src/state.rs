@@ -7285,7 +7285,11 @@ impl AppState {
     }
 }
 
-#[cfg(any(feature = "project-palette-fixture", feature = "pull-request-fixture"))]
+#[cfg(any(
+    test,
+    feature = "project-palette-fixture",
+    feature = "pull-request-fixture"
+))]
 impl AppState {
     /// Seed provider metadata for the isolated native sidebar review fixture.
     pub fn fixture_sidebar_change_request(

@@ -54,7 +54,6 @@ impl FilesSurface {
                             .update(cx, |surface, cx| {
                                 surface.watch_error =
                                     Some("File updates interrupted — retrying".into());
-                                surface.recheck_host(cx);
                                 cx.notify();
                             })
                             .is_err()
@@ -66,7 +65,6 @@ impl FilesSurface {
                         if this
                             .update(cx, |surface, cx| {
                                 surface.watch_error = Some(error.to_string().into());
-                                surface.recheck_host(cx);
                                 cx.notify();
                             })
                             .is_err()

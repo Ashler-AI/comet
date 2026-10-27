@@ -195,6 +195,9 @@ struct WorkspaceHostInner {
     /// device's overlay back to its boot-time row `lastSeenAt` — an instant
     /// (and false) "offline" badge for a host that beat 20s ago.
     presence_seen: Mutex<std::collections::HashMap<String, i64>>,
+    /// Chats whose row this host claimed for a command that outran their
+    /// `createChat` ([`WorkspaceHost::claim_chat`]).
+    claimed: Mutex<std::collections::HashSet<String>>,
     /// Called with a device id whenever its presence heartbeat proves it alive —
     /// wired to `LinkCache::reset_cooldown` so a peer that comes back is dialed
     /// immediately instead of waiting out the failure backoff.
@@ -364,6 +367,7 @@ impl WorkspaceHost {
                 room: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
+                claimed: Mutex::default(),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
@@ -702,6 +706,14 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.chat(chat_id))?)
     }
 
+    /// Whether `chat_id`'s parent is unknown here yet: this host claimed its
+    /// row for a command that arrived first ([`Self::claim_chat`]), and its
+    /// `createChat` hasn't landed ([`RegistryDoc::chat_parent_recorded`]).
+    pub fn parent_unknown(&self, chat_id: &str) -> bool {
+        lock(&self.inner.claimed).contains(chat_id)
+            && !self.read(|doc| doc.chat_parent_recorded(chat_id))
+    }
+
     pub(crate) fn acknowledged_chat(&self, id: &str) -> Option<zeron_doc::registry::RegistryRow> {
         self.read(|doc| doc.acknowledged_row(zeron_doc::registry::KIND_CHATS, id).cloned())
     }
@@ -871,6 +883,7 @@ impl WorkspaceHost {
             None => (None, None),
         };
         self.mutate(|doc| doc.claim_chat(chat_id, cwd.as_deref(), space_id.as_deref(), now));
+        lock(&self.inner.claimed).insert(chat_id.to_owned());
         Ok(())
     }
 
