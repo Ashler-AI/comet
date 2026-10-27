@@ -1133,7 +1133,13 @@ impl Tools {
         let (spaces, sessions, harnesses) = tokio::try_join!(
             self.zeron.spaces(),
             self.zeron.sessions(),
-            self.zeron.harnesses_on(Some(&chat.device_id))
+            async {
+                if chat.config.is_some() {
+                    Ok(Vec::new())
+                } else {
+                    self.zeron.harnesses_on(Some(&chat.device_id)).await
+                }
+            }
         )?;
         let space = chat
             .space_id
@@ -2292,6 +2298,53 @@ mod tests {
             );
             assert!(broken.writes.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn configured_remote_send_skips_forbidden_catalog() {
+        let world = Arc::new(World {
+            catalog_error: Some(methods::LIST_HARNESSES),
+            extra_chats: vec![json!({
+                "id": "chat-configured-remote", "deviceId": "dev-remote",
+                "title": "Configured remote", "archived": false,
+                "spaceId": "space-remote",
+                "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "sandbox": "workspace-write" },
+                "createdAt": "2026-09-01T00:00:00Z"
+            })],
+            ..Default::default()
+        });
+        let tools = tools(world.clone(), Origin::default());
+        let result = tools
+            .call(
+                "send_message",
+                json!({"chat":"chat-configured-remote", "text":"go"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["sent"]["delivery"], "run");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1["command"]["request"]["harness"], "claude-code");
+        assert_eq!(writes[0].1["command"]["request"]["model"], "opus");
+    }
+
+    #[tokio::test]
+    async fn unconfigured_remote_send_preserves_catalog_failure_without_dispatch() {
+        let world = Arc::new(World {
+            beta_remote: true,
+            catalog_error: Some(methods::LIST_HARNESSES),
+            ..Default::default()
+        });
+        let tools = tools(world.clone(), Origin::default());
+        let error = tools
+            .call("send_message", json!({"chat":"Beta", "text":"go"}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("dev-remote") && error.contains("catalog unavailable"),
+            "{error}"
+        );
+        assert!(world.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
