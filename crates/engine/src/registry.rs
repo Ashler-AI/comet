@@ -132,9 +132,8 @@ pub struct HarnessRegistry {
     /// Where the prefs persist; `None` (tests, bare registries) skips writes.
     prefs_path: Mutex<Option<PathBuf>>,
     /// Fair per-harness execution gates. Runs and title generation hold a
-    /// shared lease; an accepted update queues an exclusive lease. Tokio's
-    /// write-preferring FIFO policy prevents a stream of new runs from
-    /// starving an update that is already waiting.
+    /// shared lease; explicit updates queue an exclusive lease. Background
+    /// updates only acquire an idle gate, never queue ahead of new runs.
     gates: Mutex<HashMap<HarnessId, Arc<tokio::sync::RwLock<()>>>>,
     pending_updates: Mutex<std::collections::HashSet<HarnessId>>,
     update_generation: tokio::sync::watch::Sender<u64>,
@@ -287,6 +286,23 @@ impl HarnessRegistry {
     /// post-install verification.
     pub async fn update_lease(&self, id: HarnessId) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         self.gate(id).write_owned().await
+    }
+
+    /// Background updates must not queue a writer: Tokio's writer preference
+    /// would block new runs behind any long-lived execution lease.
+    pub(crate) async fn idle_update_lease(
+        &self,
+        id: HarnessId,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        let gate = self.gate(id);
+        loop {
+            if let Ok(lease) = gate.clone().try_write_owned() {
+                return lease;
+            }
+            // ponytail: warm runtimes can defer this to their existing 30-minute
+            // idle reaper; add retirement-only signaling if faster cleanup is needed.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 
     /// Mark an accepted update before queueing its writer. Existing persistent
