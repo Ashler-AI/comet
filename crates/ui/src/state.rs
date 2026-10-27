@@ -5825,12 +5825,9 @@ mod tests {
             display_status(&c, Some(&idle), now),
             ChatIndicator::Completed
         );
-        // Stale working session falls back to the seen check.
+        // A lost host is not a successful completion, even with unread text.
         let stale = session("c", SessionStatus::Working, 300, now);
-        assert_eq!(
-            display_status(&c, Some(&stale), now),
-            ChatIndicator::Completed
-        );
+        assert_eq!(display_status(&c, Some(&stale), now), ChatIndicator::Idle);
         // Seen after the last message = Idle.
         c.last_seen_at = c.last_message_at.map(|t| t + TimeDelta::minutes(1));
         assert_eq!(display_status(&c, Some(&idle), now), ChatIndicator::Idle);

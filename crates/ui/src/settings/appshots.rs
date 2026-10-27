@@ -2,6 +2,7 @@
 //! keyboard settings, while keeping capture setup on its own route.
 use super::*;
 use crate::appshots::{AppshotPlatform, CapabilityState};
+use crate::settings::search::Target;
 use crate::settings::widgets;
 
 fn process_diagnostics() -> &'static str {
@@ -17,13 +18,15 @@ fn process_diagnostics() -> &'static str {
     DETAILS.as_str()
 }
 
+/// One Appshots row, anchored for the settings search at `target`.
 fn row(
     theme: &Theme,
     first: bool,
     title: &str,
     description: &str,
     control: gpui::AnyElement,
-) -> gpui::Div {
+    target: impl Into<Target>,
+) -> impl IntoElement {
     widgets::card_row(theme, first)
         .flex_wrap()
         .child(
@@ -43,6 +46,7 @@ fn row(
                 ),
         )
         .child(control)
+        .search_anchor(target)
 }
 
 impl ShortcutsPage {
@@ -209,6 +213,7 @@ impl ShortcutsPage {
                 "Capture Appshots",
                 "Captures are staged for review and never sent automatically.",
                 capture.into_any_element(),
+                SettingId::CaptureAppshots,
             ))
             .child(row(
                 &theme,
@@ -216,6 +221,7 @@ impl ShortcutsPage {
                 "Capture sound",
                 "Play a sound when an Appshot is ready.",
                 sound.into_any_element(),
+                SettingId::AppshotSound,
             ))
             .child(row(
                 &theme,
@@ -227,6 +233,7 @@ impl ShortcutsPage {
                 },
                 capabilities.shortcut_description(),
                 shortcut.into_any_element(),
+                ShortcutId::CaptureAppshot,
             ))
             .child(row(
                 &theme,
@@ -234,6 +241,7 @@ impl ShortcutsPage {
                 "Destination",
                 destination_description,
                 destination.into_any_element(),
+                SettingId::AppshotDestination,
             ))
             .child(row(
                 &theme,
@@ -241,6 +249,7 @@ impl ShortcutsPage {
                 "Window capture",
                 capabilities.capture_description(),
                 window_access.into_any_element(),
+                SettingId::WindowCapture,
             ))
             .child(row(
                 &theme,
@@ -248,6 +257,7 @@ impl ShortcutsPage {
                 "Application text",
                 capabilities.semantic_description(),
                 text_access.into_any_element(),
+                SettingId::ApplicationText,
             ));
         let helper: SharedString = if self.recording.is_some() {
             "Press Escape to cancel.".into()
@@ -331,6 +341,7 @@ impl ShortcutsPage {
                             ),
                     )).fade_overflow_y(&self.scroll.scroll),
             )
+            .child(widgets::page_reveal(&self.scroll.scroll))
             .children(scrollbar)
             .into_any_element()
     }

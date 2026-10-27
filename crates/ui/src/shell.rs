@@ -11141,13 +11141,8 @@ impl Shell {
                 let rename =
                     popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
                         .id("chat-menu-rename")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            // A side chat's title is edited on its row under the
-                            // file tree: dock the explorer when the menu came
-                            // from its tab.
-                            if is_side_chat && !this.files_panel_open(cx) {
-                                this.add_files_surface(window, cx);
-                            }
+                        .debug_selector(|| "chat-menu-rename".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_rename_chat(rename_id.clone(), cx)
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
