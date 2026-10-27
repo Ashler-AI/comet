@@ -690,6 +690,7 @@ impl Client {
             last_seen_at: None,
             room_gen: Some(2),
             parent_chat_id: None,
+            crew: None,
         };
         self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
         Ok(chat_id)
@@ -783,8 +784,15 @@ impl Client {
             url.query_pairs_mut().extend_pairs(query);
         }
         let is_read = method == reqwest::Method::GET;
-        let token = self.inner.tokens.bearer().await.map_err(Failure::Error)?;
-        let mut request = crate::auth::http().request(method, url).bearer_auth(token);
+        let token = self
+            .inner
+            .tokens
+            .access_token()
+            .await
+            .map_err(Failure::Error)?;
+        let mut request = crate::auth::http()
+            .request(method, url)
+            .bearer_auth(token.value);
         if let Some(body) = body {
             request = request.json(&body);
         }

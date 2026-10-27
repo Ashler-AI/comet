@@ -692,7 +692,10 @@ impl Harness for ClaudeHarness {
     /// Same launch arguments and cwd. The CLI ignores the sandbox level, and
     /// option spellings that launch the same flags are the same runtime.
     fn same_runtime(&self, live: &RunRequest, next: &RunRequest) -> bool {
-        live.cwd == next.cwd && Self::launch_args(live) == Self::launch_args(next)
+        // Managed mode is host-owned run context, not request configuration;
+        // it contributes the same fixed settings to both sides of this
+        // comparison and is applied with the actual context at launch.
+        live.cwd == next.cwd && Self::launch_args(live, false) == Self::launch_args(next, false)
     }
     /// Model, context window, effort, fast mode, thinking and ultracode all
     /// change on the live process (`set_model`, `apply_flag_settings`). Only
@@ -1146,7 +1149,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
-        context: _,
+        context,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -1163,7 +1166,10 @@ async fn run_session(session: Session) {
     let mut turn_open = true;
     // A resumed session the CLI turns out to have no conversation for is
     // relaunched fresh, once (see [`no_conversation`]).
-    let mut restore_fallback = launched.resume.is_some();
+    let mut restore_fallback = launched.resume.is_some()
+        && context
+            .as_ref()
+            .is_none_or(|context| context.fork_from.is_none());
     let mut relaunch = false;
     // Our configuration requests the CLI has not answered yet (`set_model`,
     // `apply_flag_settings`): what each asked for, and when we stop waiting.
@@ -1233,7 +1239,7 @@ async fn run_session(session: Session) {
             child.shutdown(kill_grace).await;
             let mut fresh = launched.clone();
             fresh.resume = None;
-            match ClaudeHarness::launch(&exe, &fresh, title_only) {
+            match ClaudeHarness::launch(&exe, &fresh, title_only, context.as_ref()) {
                 Ok(runtime) => {
                     child = runtime.child;
                     stdout_lines = runtime.stdout_lines;

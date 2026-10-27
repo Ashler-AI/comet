@@ -1686,6 +1686,7 @@ async fn run_session(session: Session) {
             executable,
             voice_context,
             controls,
+            managed,
         )
     });
     if !idle {

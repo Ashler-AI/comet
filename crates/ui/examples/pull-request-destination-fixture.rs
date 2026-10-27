@@ -420,6 +420,8 @@ fn main() -> anyhow::Result<()> {
     // The viewport reads the IPC bearer from its own data directory.
     let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, &data, core.rpc_service()))?;
     let boot = EngineBootConfig {
+        managed_inference: false,
+        scaffold: None,
         data_dir: data.clone(),
         ipc_port,
         edge_url: String::new(),

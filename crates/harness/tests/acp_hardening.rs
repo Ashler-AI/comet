@@ -98,6 +98,7 @@ async fn start(harness: &AcpHarness, req: RunRequest) -> Run {
     let interrupt = CancellationToken::new();
     let turn = TurnControl::default();
     let controls = RunControls {
+        context: None,
         realtime: None,
         execution_lease: None,
         request_input: Box::new(move |_questions| {

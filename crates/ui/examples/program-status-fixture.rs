@@ -276,7 +276,7 @@ fn main() -> anyhow::Result<()> {
             state.auto_selected = true; state.chats_synced = true; state.spaces_synced = true;
             state
         });
-        let boot = EngineBootConfig { data_dir: data, ipc_port: 0, edge_url: String::new(),
+        let boot = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: data, ipc_port: 0, edge_url: String::new(),
             edge_token: None, org_id: None, workos_client_id: None, default_harness: HarnessId::Mock };
         let window = cx.open_window(WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(gpui::point(px(20.), px(40.)), size(px(1200.), px(820.))))),

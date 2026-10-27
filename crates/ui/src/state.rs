@@ -4690,6 +4690,7 @@ mod tests {
                     attachments: Vec::new(),
                     worktree: None,
                     mcp: None,
+                    env: Default::default(),
                 },
                 message_id: "selected-command".into(),
             };
