@@ -73,6 +73,14 @@ runs:
         save-if: ${{ inputs.save-rust-cache == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
         cache-on-failure: true
 
+    # ort-sys emits a link path into ~/.cache/ort.pyke.io, outside the Rust
+    # target cache. Re-run its small build script so a fresh runner downloads
+    # and verifies that native archive instead of reusing a dangling link path.
+    - name: Refresh ONNX Runtime native linkage
+      if: inputs.rust-cache == 'ui'
+      shell: bash
+      run: cargo clean --package ort-sys
+
     # After the cache restore, so the checksum-verified binary is the one that
     # runs (rust-cache restores ~/.cargo/bin).
     - name: Install cargo-nextest
