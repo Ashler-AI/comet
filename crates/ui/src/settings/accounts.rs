@@ -925,6 +925,13 @@ impl AccountsPage {
         cx.notify();
     }
 
+    pub(crate) fn start_first_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let provider = login_options(harness)
+            .first()
+            .and_then(|option| option.provider);
+        self.start_login(harness, provider, cx);
+    }
+
     /// Fold a StartAgentLogin reply into the flow `attempt` (if still open).
     fn apply_start(
         &mut self,
@@ -1134,7 +1141,7 @@ impl AccountsPage {
 
     /// Whether a dialog [`Self::dismiss_on_escape`] would close is open.
     pub(crate) fn has_escape_surface(&self) -> bool {
-        self.api_key.is_some() || self.login.is_some()
+        self.login.is_some()
     }
 
     /// Escape that reached Settings unclaimed cancels an open login first,

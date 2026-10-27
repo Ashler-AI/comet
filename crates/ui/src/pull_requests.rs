@@ -363,6 +363,18 @@ pub struct PullRequestsPage {
 }
 
 impl PullRequestsPage {
+    #[cfg(test)]
+    pub(crate) fn show_test_items(
+        &mut self,
+        items: Vec<ChangeRequestListItem>,
+        cx: &mut Context<Self>,
+    ) {
+        self.items = items;
+        self.view_items = None;
+        self.load_state = PullRequestsLoadState::Ready;
+        cx.notify();
+    }
+
     pub(crate) fn preview(&self, url: &str) -> Option<ChangeRequestListItem> {
         self.items.iter().find(|item| item.url == url).cloned()
     }

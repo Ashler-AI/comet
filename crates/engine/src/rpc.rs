@@ -1745,6 +1745,8 @@ fn forwardable(method: &str) -> bool {
             | methods::CANCEL_INSTALL
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
+            | methods::GET_COMMIT_CREDIT
+            | methods::SET_COMMIT_CREDIT
             | methods::GET_NATIVE_SUBAGENTS
             | methods::SET_NATIVE_SUBAGENTS
             | methods::SET_HARNESS_ENABLED
@@ -2289,6 +2291,26 @@ impl RpcService for EngineRpc {
                     .set_title_settings(p)
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&self.registry.title_settings())
+            }
+            methods::GET_COMMIT_CREDIT => match self.registry.commit_credit() {
+                Some(credit) => RpcReply::value(&credit.status()),
+                None => Err(RpcError::Failed(
+                    "Commit credit isn't available on this engine.".into(),
+                )),
+            },
+            methods::SET_COMMIT_CREDIT => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    enabled: bool,
+                }
+                let p: Params = parse_params(params)?;
+                let credit = self.registry.commit_credit().ok_or_else(|| {
+                    RpcError::Failed("Commit credit isn't available on this engine.".into())
+                })?;
+                let status = credit
+                    .set(p.enabled)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&status)
             }
             methods::GET_NATIVE_SUBAGENTS => {
                 RpcReply::value(&self.registry.native_subagent_settings())

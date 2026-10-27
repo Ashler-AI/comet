@@ -599,7 +599,8 @@ fn thought_block_lines(block: &Block, indent: usize, out: &mut Vec<Vec<InlineRun
                 .collect();
             wrap_styled_runs(&bold, indent, out);
         }
-        Block::CodeBlock { code, .. } => {
+        // Interim: display math shows its TeX source like a code block.
+        Block::CodeBlock { code, .. } | Block::Math { tex: code } => {
             let style = InlineStyle {
                 code: true,
                 ..InlineStyle::default()
@@ -1058,8 +1059,21 @@ pub enum RowKind {
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
         /// Context the prompt folded in as text, lifted back out by `badges`.
         badges: Arc<Vec<crate::badges::MessageBadge>>,
+        /// The chat that sent this message through Zeron's `send_message`,
+        /// lifted out of the routing header the receiving agent still reads.
+        sender: Option<AgentSender>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
+    },
+    /// A message this chat's agent sent another chat through Zeron's
+    /// `send_message`: one `Message to [logo] Chat` line, not the tool call.
+    SentMessage {
+        /// The recipient as the call named it (id, id prefix, or title),
+        /// resolved against the chat list at render.
+        to: SharedString,
+        /// The call hasn't returned yet.
+        pending: bool,
+        failed: bool,
     },
     /// One top-level markdown block of a completed message.
     Markdown {
@@ -1103,6 +1117,13 @@ pub enum RowKind {
     ForkMarker {
         source_chat_id: SharedString,
         source_title: SharedString,
+    },
+    /// The provider-switch seam: a labeled divider over `[logo] From → [logo] To`.
+    SwitchMarker {
+        from: SharedString,
+        to: SharedString,
+        from_harness: Option<HarnessId>,
+        to_harness: Option<HarnessId>,
     },
 }
 
@@ -1358,7 +1379,10 @@ pub fn rows_for_entry(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
-        let body = agent_message_display(&body);
+        let (sender, body) = match agent_message_sender(&body) {
+            Some((sender, body)) => (Some(sender), body.to_owned()),
+            None => (None, body),
+        };
         // Chips stand in for their attachments: those leave the strip, and a
         // chip carries its upload's path for its progress and, for an image,
         // a click opening it.
@@ -1406,6 +1430,7 @@ pub fn rows_for_entry(
                 markdown,
                 attachments: Arc::new(attachments),
                 badges: Arc::new(badges),
+                sender,
                 pending,
             },
             entry_id,
@@ -1776,6 +1801,34 @@ pub fn rows_for_entry(
                             compact_fold: None,
                         });
                     }
+                    MessagePart::Switch {
+                        id: part_id,
+                        from,
+                        to,
+                        from_harness,
+                        to_harness,
+                    } => {
+                        let from_harness = from_harness.as_deref().and_then(HarnessId::from_slug);
+                        let to_harness = to_harness.as_deref().and_then(HarnessId::from_slug);
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(
+                                format!("{from}\u{1}{to}\u{1}{from_harness:?}\u{1}{to_harness:?}")
+                                    .as_bytes(),
+                            ),
+                            turn_start: false,
+                            kind: RowKind::SwitchMarker {
+                                from: single_line(from).into(),
+                                to: single_line(to).into(),
+                                from_harness,
+                                to_harness,
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                        });
+                    }
                     // Tools and thoughts are grouped by the outer arms;
                     // nothing reaches here.
                     MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
@@ -1860,7 +1913,10 @@ pub fn rows_for_entry(
     // change when streaming flips off (chips).
     if !streaming
         && let Some(last) = rows.last_mut()
-        && !matches!(last.kind, RowKind::ForkMarker { .. })
+        && !matches!(
+            last.kind,
+            RowKind::ForkMarker { .. } | RowKind::SwitchMarker { .. }
+        )
     {
         last.timestamp = Some(entry.created_at);
         last.copy_text = assistant_copy_text(entry);
@@ -2030,6 +2086,11 @@ fn part_prefix(id: &str) -> &str {
 /// live→split handoff cannot shift a pixel. Tool groups get one larger global
 /// step on either boundary so their dense chip stack has room to breathe.
 pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
+    if matches!(row.kind, RowKind::User { .. })
+        && prev.is_some_and(|prev| matches!(prev.kind, RowKind::SwitchMarker { .. }))
+    {
+        return USER_CAPTION_GAP;
+    }
     if row.turn_start {
         return Theme::SPACE_LG;
     }
@@ -2538,6 +2599,7 @@ impl HighlightStore {
                             Lang::Php => "php",
                             Lang::Sql => "sql",
                             Lang::Lua => "lua",
+                            Lang::Luau => "luau",
                             Lang::Dockerfile => "dockerfile",
                             Lang::Nix => "nix",
                             Lang::Make => "make",
@@ -3498,6 +3560,8 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// An agent message's sender caption: open the chat that sent it.
+    OpenChat { chat_id: String },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -4365,7 +4429,7 @@ impl Transcript {
     /// carries the titlebar chrome inside its own box (the first row's
     /// top gap), so the hold adds nothing — adding the inset on top parked
     /// a new chat's first prompt a double-chrome ~66px low (user report).
-    fn own_send_inset(anchor_ix: usize) -> f32 {
+    pub(crate) fn own_send_inset(anchor_ix: usize) -> f32 {
         if anchor_ix == 0 {
             0.0
         } else {
@@ -7792,6 +7856,7 @@ impl Transcript {
                 markdown,
                 attachments,
                 badges,
+                sender,
                 pending,
             } => {
                 let attachments = attachments.clone();
@@ -7804,6 +7869,9 @@ impl Transcript {
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
                 // HStack); image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
+                if let Some(sender) = sender {
+                    column = column.child(self.render_agent_sender(&row.id, sender, &theme, cx));
+                }
                 if !attachments.is_empty() {
                     column = column.child(self.render_user_attachments(
                         &row.id,
@@ -7911,6 +7979,7 @@ impl Transcript {
                     link,
                     workspace_root: workspace_root.clone(),
                     code,
+                    math: crate::settings::math_style(cx),
                 };
                 let highlight = self.code_highlight_for(&row.id, &tree, Some(*block_ix), cx);
                 render::render_block(
@@ -7981,6 +8050,7 @@ impl Transcript {
                     link,
                     workspace_root: workspace_root.clone(),
                     code,
+                    math: crate::settings::math_style(cx),
                 };
                 if seed_history && let Some(veil) = &veil {
                     let historical = &self.historical_markdown[&row.id];
@@ -8061,6 +8131,12 @@ impl Transcript {
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::SwitchMarker {
+                from,
+                to,
+                from_harness,
+                to_harness,
+            } => switch_marker(from.clone(), to.clone(), *from_harness, *to_harness, &theme),
         };
         // Diagram fences and images this row just requested start loading.
         self.ensure_diagram_worker(cx);
@@ -9796,14 +9872,54 @@ pub(crate) fn caption_label(
         })
         .child(
             div()
-                .w_full()
                 .min_w_0()
                 .truncate()
-                .text_center()
-                .text_size(crate::typography::ui_rems(13.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text_muted)
-                .child(source_title),
+                .child(name),
+        )
+}
+
+/// A muted one-line caption riding right-aligned over a user bubble: the
+/// provider-switch seam and an agent message's sender.
+fn user_caption(theme: &Theme) -> gpui::Div {
+    div()
+        .min_w_0()
+        .max_w_full()
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .text_size(crate::typography::ui_rems(13.0))
+        .text_color(theme.text_muted)
+}
+
+/// The provider-switch seam: `[logo] From → [logo] To`, each side in its
+/// provider's brand mark, right-aligned over the message that switched. A
+/// side without a known harness (a seam from a build that didn't record one)
+/// shows its name alone.
+fn switch_marker(
+    from: SharedString,
+    to: SharedString,
+    from_harness: Option<HarnessId>,
+    to_harness: Option<HarnessId>,
+    theme: &Theme,
+) -> AnyElement {
+    let mark = |harness: Option<HarnessId>| harness.map(crate::pickers::harness_brand_icon);
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .justify_end()
+        .child(
+            user_caption(theme)
+                .child(caption_label(from, mark(from_harness), theme.text_muted))
+                .child(
+                    crate::icons::icon(crate::icons::ARROW_RIGHT)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(caption_label(to, mark(to_harness), theme.text_muted)),
         )
         .into_any_element()
 }

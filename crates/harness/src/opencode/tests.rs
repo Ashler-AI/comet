@@ -281,6 +281,7 @@ impl TurnWire {
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_millis(50),
+            bus_timeouts: BusTimeouts::default(),
             known_commands: Some(vec![SlashCommand {
                 name: if native_command_reply.is_some() {
                     "project-review"
@@ -1065,6 +1066,7 @@ fn prompt_body_carries_model_variant_and_attachments() {
         Some(("anthropic", "claude-opus-5")),
         Some("high"),
         &["/tmp/shot.png".to_owned()],
+        None,
     );
     assert_eq!(body["model"]["providerID"], "anthropic");
     assert_eq!(body["model"]["modelID"], "claude-opus-5");
@@ -1127,7 +1129,7 @@ fn reasoning_ahead_of_its_message_role_is_held_and_replayed() {
     assert_eq!(feed.pending_parts.len(), 1);
     // The role lands; replay drains the held part.
     feed.assistant_messages.insert("msg_a".into(), true);
-    let mut turn = TurnState::begin(None);
+    let mut turn = TurnState::begin(None, false);
     let events = replay_pending(&mut feed, "msg_a", true, &mut turn);
     assert!(matches!(
         events.as_slice(),
@@ -1729,7 +1731,7 @@ fn v2_model_list_folds_into_provider_catalog() {
 
 #[test]
 fn prompt_body_v2_carries_text_and_files_only() {
-    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()]);
+    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()], None);
     assert_eq!(body["text"], "hello");
     assert_eq!(body["files"][0]["uri"], "file:///tmp/shot.png");
     assert_eq!(body["files"][0]["name"], "shot.png");
@@ -2199,7 +2201,7 @@ fn v2_command_bodies_follow_server_version() {
         let attachments = vec!["/workspace/image.png".into()];
         assert_eq!(
             command_body_v2(Some(&version), "test", "args", &attachments)["files"],
-            prompt_body_v2("args", &attachments)["files"]
+            prompt_body_v2("args", &attachments, None)["files"]
         );
     }
 }

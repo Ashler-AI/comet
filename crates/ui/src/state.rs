@@ -18,7 +18,7 @@
 //! unit tests; rendering reads them.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,6 +39,15 @@ use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_cl
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
 };
+
+/// Start a separate engine process when the app owns startup; tests and
+/// fixtures leave this false and keep the in-process fallback.
+static LAUNCH_BACKGROUND_ENGINE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn launch_background_engine() {
+    LAUNCH_BACKGROUND_ENGINE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
 // Recently viewed transcripts stay renderable while a fresh watch opens. Move
 // ownership on navigation; never clone whale payloads or retain live watches.
@@ -324,6 +333,12 @@ impl EngineHandle {
             device_bootstrap_file: None,
             managed_inference: config.managed_inference,
         };
+        let launching = LAUNCH_BACKGROUND_ENGINE.load(std::sync::atomic::Ordering::SeqCst);
+        if Self::should_launch_background(launching, engine_config.ipc_port).await
+            && let Some(handle) = Self::launch_background(&engine_config).await
+        {
+            return Ok(handle);
+        }
 
         // Own the data dir before opening anything under it or binding IPC —
         // the lock, not the port bind, is the ownership decision. A failed
@@ -473,6 +488,56 @@ impl EngineHandle {
             return Err(anyhow::anyhow!(message));
         }
         Ok(handle)
+    }
+
+    async fn should_launch_background(launching: bool, ipc_port: u16) -> bool {
+        if !launching || ipc_port == 0 {
+            return false;
+        }
+        let taken = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+        )
+        .await
+        .is_ok_and(|connected| connected.is_ok());
+        if taken {
+            tracing::warn!(
+                port = ipc_port,
+                "the engine port is held by something else; embedding"
+            );
+        }
+        !taken
+    }
+
+    async fn launch_background(config: &EngineConfig) -> Option<EngineHandle> {
+        const STARTUP: std::time::Duration = std::time::Duration::from_secs(20);
+        let app = std::env::current_exe().ok()?;
+        let mut child = match zeron_engine::managed::launch(config, &app) {
+            Ok(child) => child,
+            Err(err) => {
+                tracing::warn!(error = %err, "couldn't start the background engine; embedding one");
+                return None;
+            }
+        };
+        tracing::info!(pid = child.id(), "background engine started");
+        let deadline = std::time::Instant::now() + STARTUP;
+        loop {
+            if let Some(handle) = Self::attach_to_daemon(config.ipc_port, &config.data_dir).await {
+                zeron_engine::managed::reap(child);
+                return Some(handle);
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                tracing::warn!(%status, "background engine exited during startup; embedding one");
+                return None;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("background engine didn't come up in time; embedding one");
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
     }
 
     /// Probe the IPC port and, if a live engine answers, attach as a remote
@@ -943,6 +1008,11 @@ pub struct AppState {
     clock: ClockTransitions,
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
+    /// This window's identity and focus report for engine-owned desktop
+    /// notifications.
+    viewport_id: String,
+    viewport_focused: bool,
+    focus_task: Option<Task<()>>,
     transcript_task: Option<Task<()>>,
     // A send's acknowledgement must remain observable after leaving its chat.
     pending_send_tasks: HashMap<String, (Option<Task<()>>, Option<Task<()>>)>,
@@ -1059,6 +1129,9 @@ impl AppState {
             clock: ClockTransitions::default(),
             engine: None,
             watch_tasks: Vec::new(),
+            viewport_id: uuid::Uuid::new_v4().to_string(),
+            viewport_focused: false,
+            focus_task: None,
             transcript_task: None,
             pending_send_tasks: HashMap::new(),
             change_requests: ChangeRequestClientState::default(),
@@ -2578,6 +2651,7 @@ impl AppState {
         }
         self.engine = None;
         self.watch_tasks.clear();
+        self.focus_task = None;
         self.transcript_task = None;
         self.pending_send_tasks.clear();
         self.queue_task = None;
@@ -2767,6 +2841,67 @@ impl AppState {
         .detach();
     }
 
+    pub fn set_viewport_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.viewport_focused == focused && self.focus_task.is_some() {
+            return;
+        }
+        self.viewport_focused = focused;
+        self.report_focus(cx);
+    }
+
+    fn report_focus(&mut self, cx: &mut Context<Self>) {
+        const REPEAT: std::time::Duration = std::time::Duration::from_secs(20);
+        let Some(engine) = self.engine.clone().filter(|engine| {
+            engine
+                .engine_info()
+                .supports(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1)
+        }) else {
+            self.focus_task = None;
+            return;
+        };
+        let viewport_id = self.viewport_id.clone();
+        let focused = self.viewport_focused;
+        self.focus_task = Some(cx.spawn(async move |_, cx| {
+            loop {
+                let params = serde_json::json!({ "viewportId": viewport_id, "focused": focused });
+                if let Err(error) = engine
+                    .client()
+                    .call(methods::SET_VIEWPORT_FOCUS, params)
+                    .await
+                {
+                    tracing::debug!(%error, "viewport focus report failed");
+                }
+                if !focused {
+                    return;
+                }
+                cx.background_executor().timer(REPEAT).await;
+            }
+        }));
+    }
+
+    pub fn viewport_closing(&self) -> Option<impl std::future::Future<Output = ()> + use<>> {
+        let engine = self.engine.clone().filter(|engine| {
+            engine
+                .engine_info()
+                .supports(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1)
+        })?;
+        let params = serde_json::json!({ "viewportId": self.viewport_id, "focused": false });
+        Some(async move {
+            let _ = engine
+                .client()
+                .call(methods::SET_VIEWPORT_FOCUS, params)
+                .await;
+        })
+    }
+
+    pub fn engine_posts_banners(&self) -> bool {
+        self.engine.as_ref().is_some_and(|engine| {
+            engine
+                .engine_info()
+                .supports(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1)
+        })
+    }
+
     /// Wire the connected engine: mark Ready and start the standing watches.
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
@@ -2785,6 +2920,7 @@ impl AppState {
             self.harness_updates.clear();
         }
         self.engine = Some(handle.clone());
+        self.report_focus(cx);
         if let Some(update) = crate::app_update::AppUpdate::global(cx) {
             update.update(cx, |update, _| update.set_engine(Some(handle.clone())));
         }
@@ -4036,11 +4172,13 @@ mod tests {
     async fn remote_viewport_treats_legacy_daemon_as_ready() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let token = zeron_rpc::ipc_auth::issue_token(dir.path()).unwrap();
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
             listener,
             Arc::new(LegacyIdentityRpc),
+            token,
         ));
-        let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             managed_inference: false,
             scaffold: None,
@@ -4157,6 +4295,8 @@ mod tests {
     async fn remote_viewport_observes_deferred_engine_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let token = zeron_rpc::ipc_auth::issue_token(dir.path()).unwrap();
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
             listener,
@@ -4171,9 +4311,9 @@ mod tests {
                 },
                 state: state_rx,
             }),
+            token,
         ));
 
-        let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             managed_inference: false,
             scaffold: None,
@@ -4459,9 +4599,14 @@ mod tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
-
         let ui_dir = tempfile::tempdir().unwrap();
+        let token = zeron_rpc::ipc_auth::issue_token(ui_dir.path()).unwrap();
+        tokio::spawn(zeron_rpc::serve_ws_listener(
+            listener,
+            core.rpc_service(),
+            token,
+        ));
+
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             managed_inference: false,
             scaffold: None,
@@ -4594,7 +4739,7 @@ mod tests {
                 ))
             }
         }
-        fn serve(port: u16, daemon: Arc<Daemon>) -> (tokio::runtime::Runtime, u16) {
+        fn serve(port: u16, daemon: Arc<Daemon>, token: &str) -> (tokio::runtime::Runtime, u16) {
             // Own accepted sockets too: aborting only serve_ws_listener would
             // leave existing clients connected and would not model process death.
             let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -4603,7 +4748,11 @@ mod tests {
                     .await
                     .unwrap();
                 let port = listener.local_addr().unwrap().port();
-                tokio::spawn(zeron_rpc::serve_ws_listener(listener, daemon));
+                tokio::spawn(zeron_rpc::serve_ws_listener(
+                    listener,
+                    daemon,
+                    token.to_owned(),
+                ));
                 port
             });
             (runtime, port)
@@ -4645,9 +4794,11 @@ mod tests {
             .unwrap();
         let _guard = runtime.enter();
         cx.update(|cx| gpui_tokio::init_from_handle(cx, runtime.handle().clone()));
-        let (server, port) = serve(0, daemon("dev", WorkspaceScope::Local, 1));
+        let ipc_dir = tempfile::tempdir().unwrap();
+        let ipc_token = zeron_rpc::ipc_auth::issue_token(ipc_dir.path()).unwrap();
+        let (server, port) = serve(0, daemon("dev", WorkspaceScope::Local, 1), &ipc_token);
         let original = runtime
-            .block_on(EngineHandle::attach_to_daemon(port, Path::new("")))
+            .block_on(EngineHandle::attach_to_daemon(port, ipc_dir.path()))
             .unwrap();
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, cx| {
@@ -4729,14 +4880,14 @@ mod tests {
             ("stranger", WorkspaceScope::Local),
             ("dev", WorkspaceScope::Synced),
         ] {
-            let (stranger, _) = serve(port, daemon(device, scope, 99));
+            let (stranger, _) = serve(port, daemon(device, scope, 99), &ipc_token);
             let rejection = runtime.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(2),
                     EngineHandle::connect_daemon(
                         format!("ws://127.0.0.1:{port}"),
                         port,
-                        PathBuf::new(),
+                        ipc_dir.path().to_path_buf(),
                         Some(original.engine_info()),
                     ),
                 )
@@ -4762,7 +4913,7 @@ mod tests {
             assert_eq!(state.pending_echoes()[0].id, "selected-command");
             assert_eq!(state.transcript_cache[0].entries[0].id, "cached-history");
         });
-        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 2));
+        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 2), &ipc_token);
         drive_until(cx, &runtime, |cx| {
             state.read_with(cx, |state, _| {
                 state
@@ -4826,7 +4977,7 @@ mod tests {
         runtime.block_on(fresh.client().closed());
         cx.run_until_parked();
         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
-        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 3));
+        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 3), &ipc_token);
         assert!(
             runtime.block_on(fresh.reconnect()).is_err(),
             "account replacement cancels reconnect"
@@ -7130,7 +7281,7 @@ impl AppState {
     }
 }
 
-#[cfg(feature = "project-palette-fixture")]
+#[cfg(any(feature = "project-palette-fixture", feature = "pull-request-fixture"))]
 impl AppState {
     /// Seed provider metadata for the isolated native sidebar review fixture.
     pub fn fixture_sidebar_change_request(

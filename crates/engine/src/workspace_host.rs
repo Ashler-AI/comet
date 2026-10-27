@@ -2230,6 +2230,8 @@ mod tests {
 
     fn running_session(at: chrono::DateTime<chrono::Utc>) -> zeron_proto::Session {
         zeron_proto::Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             chat_id: "chat-1".into(),
             device_id: "test-device".into(),
             status: zeron_proto::SessionStatus::Working,
