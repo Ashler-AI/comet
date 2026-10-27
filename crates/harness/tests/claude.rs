@@ -38,6 +38,7 @@ fn harness() -> ClaudeHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        env: Default::default(),
         mcp: None,
         prompt: prompt.into(),
         harness: None,
