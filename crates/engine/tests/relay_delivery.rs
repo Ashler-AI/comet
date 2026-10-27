@@ -125,7 +125,7 @@ async fn fake_device_room() -> (String, tokio::task::JoinHandle<()>) {
     (url, task)
 }
 
-struct InstantHarness;
+struct InstantHarness(Arc<Mutex<Vec<RunRequest>>>);
 
 #[async_trait]
 impl Harness for InstantHarness {
@@ -149,15 +149,17 @@ impl Harness for InstantHarness {
     }
     async fn run(
         &self,
-        _request: RunRequest,
+        request: RunRequest,
         _controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let cwd = request.cwd.clone();
+        self.0.lock().expect("record harness request").push(request);
         Ok(futures::stream::iter([
             Ok(AgentEvent::SessionStarted {
                 harness: HarnessId::Mock,
                 model: "instant-1".into(),
                 tools: vec![],
-                cwd: "/tmp".into(),
+                cwd,
                 session_id: "hs-relay".into(),
                 assistant_message_id: "a-1".into(),
             }),
@@ -175,16 +177,27 @@ impl Harness for InstantHarness {
     }
 }
 
-fn registry() -> Arc<HarnessRegistry> {
+fn registry(requests: Arc<Mutex<Vec<RunRequest>>>) -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
-    registry.register(Arc::new(InstantHarness));
+    registry.register(Arc::new(InstantHarness(requests)));
     Arc::new(registry)
 }
 
-fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
+fn assemble(
+    dir: &std::path::Path,
+    device_id: &str,
+    requests: Arc<Mutex<Vec<RunRequest>>>,
+) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
+    let core = EngineCore::assemble(dir, registry(requests), HarnessId::Mock, None)
+        .expect("engine assembles");
+    // The fake room still needs an explicit token source; production auth
+    // correctly stays signed out when no credentials have been configured.
+    let mut auth = zeron_engine::AuthConfig::new("http://localhost:27640", dir);
+    auth.allow_dev_auth = true;
+    core.set_auth(zeron_engine::Auth::new(auth));
+    core
 }
 
 fn complete_assistant_count(core: &EngineCore) -> usize {
@@ -202,14 +215,18 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
     let (relay_url, _relay) = fake_device_room().await;
     let dirs = tempfile::tempdir().expect("tempdir");
+    let runs_a = Arc::new(Mutex::new(Vec::new()));
+    let runs_b = Arc::new(Mutex::new(Vec::new()));
+    let cwd_b = dirs.path().join("project-on-b");
+    std::fs::create_dir(&cwd_b).expect("B project directory");
 
     // Engine B hosts its device room on the fake relay.
-    let core_b = assemble(&dirs.path().join("b"), "device-b");
+    let core_b = assemble(&dirs.path().join("b"), "device-b", runs_b.clone());
     let _host = core_b.start_host_relay(&relay_url);
 
     // Engine A dials peers through the same relay — and has NO edge, so its
     // chat2 rows can never flush (the rows-dark half of the incident shape).
-    let core_a = assemble(&dirs.path().join("a"), "device-a");
+    let core_a = assemble(&dirs.path().join("a"), "device-a", runs_a.clone());
     let mut link_config =
         LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
     link_config.probe_timeout = Duration::from_secs(5);
@@ -221,6 +238,8 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
         id: "device-b".into(),
         name: "b".into(),
         platform: "linux".into(),
+        devbox_provider: None,
+        devbox_id: None,
         last_seen_at: Some(chrono::Utc::now()),
         created_at: None,
         version: Some("0.2.12".into()),
@@ -250,7 +269,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
             model: None,
             reasoning: None,
             model_options: Default::default(),
-            cwd: "~".into(),
+            cwd: cwd_b.to_str().expect("UTF-8 B cwd").into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
             access: Default::default(),
@@ -296,6 +315,12 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
             .any(|e| e.id == "msg-relay-1" && e.role == MessageRole::User),
         "B persisted the user message under the client-minted id"
     );
+    assert!(runs_a.lock().expect("A requests").is_empty(), "A must not execute");
+    {
+        let requests = runs_b.lock().expect("B requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(std::path::Path::new(&requests[0].cwd), cwd_b);
+    }
 
     // Exactly-once: the doc row "arrives" later over chat2 sync — simulate by
     // writing A's exact entry into B's doc, which kicks B's drain. The
@@ -322,7 +347,11 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
         .await
         .expect("duplicate relay accepted");
     assert_eq!(dup, "duplicate");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // The duplicate relay acquires the same prompt lock as the doc drain;
+    // explicitly drain again instead of guessing when its watcher ran.
+    core_b.doc_host.drain_commands(&handle_b).await;
+    assert_eq!(runs_b.lock().expect("B requests after replay").len(), 1);
+    assert!(runs_a.lock().expect("A requests after replay").is_empty());
     assert_eq!(
         complete_assistant_count(&core_b),
         1,

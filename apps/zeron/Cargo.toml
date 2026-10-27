@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Shared by both binaries; the UI is referenced only by `zeron`, so the
-# background engine links without it.
+# Shared Crew runtime/profile resolution for both the headed app and the
+# background engine binary. The UI remains linked only by `comet`.
 [lib]
 name = "zeron_app"
 path = "src/lib.rs"
@@ -26,6 +26,13 @@ zeron-ui.workspace = true
 zeron-update.workspace = true
 zeron-mcp.workspace = true
 zeron-notify.workspace = true
+zeron-harness.workspace = true
+zeron-sync.workspace = true
+zeron-proto.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+sha2.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
@@ -41,9 +48,6 @@ mimalloc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [build-dependencies]
 embed-resource = "3.0.11"

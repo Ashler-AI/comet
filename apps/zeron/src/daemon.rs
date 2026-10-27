@@ -1,43 +1,47 @@
-//! `zeron daemon …` — install/manage `zeron headless` as a background service:
-//! a systemd **user** unit on Linux (the VPS deployment target), a launchd
-//! LaunchAgent on macOS. The unit runs the current executable with the
-//! `ZERON_*` environment captured at install time, so
-//! `ZERON_EDGE_URL=… zeron daemon install` bakes that override in.
-//!
-//! Auth is decoupled: without a saved session the service remains up on the
-//! local-only profile. `zeron login` and a service restart opt into sync.
+//! Build-flavor-isolated Crew service management. Runtime coordinates are
+//! captured at installation; credentials remain in the profile auth store.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
 
-const LAUNCHD_LABEL: &str = "sh.zeron.app";
-/// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
-/// `zeron daemon …` manages that installation rather than a competing copy.
-const SYSTEMD_UNIT: &str = "zeron.service";
+const LAUNCHD_LABEL: &str = crate::environment::DEFAULTS.launchd_label;
+const SYSTEMD_UNIT: &str = crate::environment::DEFAULTS.systemd_unit;
 
-/// Environment captured into the unit file. `PATH` is always included (the
-/// engine spawns harness CLIs like `claude`, which service managers' minimal
-/// default PATH won't find); the `ZERON_*`/logging vars only when set.
+/// Capture executable discovery and configured provider binding. Native BOAT_ID
+/// must come from the live service-manager environment, never a copied unit.
+/// Runtime coordinates below come from the resolved CLI configuration.
 const CAPTURED_ENV: &[&str] = &[
     "PATH",
-    "ZERON_DATA_DIR",
-    "ZERON_EDGE_URL",
-    "ZERON_EDGE_TOKEN",
-    "ZERON_ORG_ID",
-    "ZERON_WORKOS_CLIENT_ID",
-    "ZERON_WORKOS_API_BASE",
-    "ZERON_IPC_PORT",
-    "ZERON_CALLBACK_PORT",
-    "ZERON_HARNESS",
-    "ZERON_DEVICE_NAME",
+    "OMP_EXECUTABLE",
+    "PI_CODING_AGENT_DIR",
     "RUST_LOG",
+    "COMET_DEVBOX_PROVIDER",
+    "COMET_DEVBOX_ID",
 ];
 
-pub fn install(data_dir: &Path) -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context("resolving the zeron executable path")?;
-    let env = captured_env();
+pub fn install(config: &zeron_engine::EngineConfig) -> anyhow::Result<()> {
+    zeron_engine::devbox::host_binding().map_err(anyhow::Error::msg)?;
+    let data_dir = &config.data_dir;
+    let exe = std::env::current_exe().context("resolving the Crew executable path")?;
+    let mut env = captured_env();
+    env.extend([
+        ("COMET_DATA_DIR".into(), data_dir.to_string_lossy().into_owned()),
+        ("COMET_IPC_PORT".into(), config.ipc_port.to_string()),
+        ("COMET_EDGE_URL".into(), config.edge_url.clone()),
+        ("COMET_HARNESS".into(), serde_json::to_value(config.default_harness)?
+            .as_str().context("invalid default harness")?.to_owned()),
+        ("COMET_INFERENCE_MODE".into(), if config.managed_inference { "managed" } else { "local" }.into()),
+        ("ASHLER_INCREMENTAL_TSC_CHECKS".into(), "false".into()),
+    ]);
+    if let Some(authority) = &config.scaffold {
+        env.push(("COMET_SCAFFOLD_URL".into(), authority.control_origin.clone()));
+        env.push(("COMET_PROJECT_SCOPE".into(), authority.project_scope.clone()));
+        if let Some(deployment) = &authority.deployment_id {
+            env.push(("COMET_DEPLOYMENT_ID".into(), deployment.clone()));
+        }
+    }
     if cfg!(target_os = "macos") {
         let plist = launchd_plist_path()?;
         std::fs::create_dir_all(plist.parent().expect("LaunchAgents parent"))?;
@@ -53,8 +57,8 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
             &["bootstrap", &launchd_domain()?, &plist.to_string_lossy()],
         )?;
         println!(
-            "Installed and started {LAUNCHD_LABEL} ({}).",
-            plist.display()
+            "Installed and started {} ({}).",
+            LAUNCHD_LABEL, plist.display()
         );
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
@@ -67,7 +71,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
             "For start-at-boot without an active login session (VPS): loginctl enable-linger $USER"
         );
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("Crew daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
     println!(
         "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
@@ -108,7 +112,7 @@ pub fn uninstall() -> anyhow::Result<()> {
             Err(err) => return Err(err.into()),
         }
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("Crew daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
     Ok(())
 }
@@ -117,7 +121,7 @@ pub fn start() -> anyhow::Result<()> {
     if cfg!(target_os = "macos") {
         let plist = launchd_plist_path()?;
         if !plist.exists() {
-            bail!("not installed — run `zeron daemon install` first");
+            bail!("not installed — run `comet daemon install` first");
         }
         // `stop` boots the job out of the domain, so start = bootstrap; already
         // loaded is fine, then kickstart guarantees a running process either way.
@@ -129,7 +133,7 @@ pub fn start() -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "start", SYSTEMD_UNIT])?;
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("Crew daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
     println!("Started.");
     Ok(())
@@ -142,7 +146,7 @@ pub fn stop() -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "stop", SYSTEMD_UNIT])?;
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("Crew daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
     println!("Stopped.");
     Ok(())
@@ -166,7 +170,7 @@ pub fn restart() -> anyhow::Result<()> {
         println!("Restarted.");
         Ok(())
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("Crew daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
 }
 
@@ -178,11 +182,11 @@ pub fn status() -> anyhow::Result<()> {
             .context("running launchctl")?;
         if !output.status.success() {
             println!(
-                "{LAUNCHD_LABEL}: not loaded{}",
+                "{}: not loaded{}", LAUNCHD_LABEL,
                 if launchd_plist_path()?.exists() {
-                    " (installed — `zeron daemon start`)"
+                    " (installed — `comet daemon start`)"
                 } else {
-                    " (not installed — `zeron daemon install`)"
+                    " (not installed — `comet daemon install`)"
                 }
             );
             return Ok(());
@@ -209,7 +213,7 @@ pub fn status() -> anyhow::Result<()> {
             .context("running systemctl")?;
         Ok(())
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("Crew daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
 }
 
@@ -225,22 +229,25 @@ fn captured_env() -> Vec<(String, String)> {
 }
 
 fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
-    let mut unit = String::from(
-        "[Unit]\nDescription=Zeron headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
-    );
+    let mut unit = String::from("[Unit]\nDescription=Crew headless engine\nAfter=network-online.target\n");
+    if env.iter().any(|(key, value)| key == "COMET_DEVBOX_PROVIDER" && value == "boat") {
+        unit.push_str("ConditionEnvironment=BOAT_ID\n");
+    }
+    unit.push_str("StartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n");
     for (key, value) in env {
         // systemd unquotes the value; escape the characters it treats specially.
-        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        let value = value.replace('\\', "\\\\").replace('"', "\\\"")
+            .replace('\n', "\\n").replace('\r', "\\r").replace('%', "%%");
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.zeron/env\n\n[Install]\nWantedBy=default.target\n",
-        systemd_exec_path(exe)
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/{}/env\n\n[Install]\nWantedBy=default.target\n",
+        systemd_exec_path(exe), crate::environment::DEFAULTS.data_dir
     ));
     unit
 }
 
-/// The ExecStart binary path. An exe under `~/.zeron/app/` came from the
+/// The ExecStart binary path. An exe under the selected flavor's `app/` came from the
 /// curl|sh installer, whose upgrades relink `app/current` — point the unit at
 /// the symlink (as the installer's own unit does) so it never pins one version.
 /// (`current_exe` resolves symlinks, so the versioned dir is what we see here.)
@@ -250,12 +257,12 @@ fn systemd_exec_path(exe: &Path) -> String {
 
 fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
     let installed = home
-        .map(|home| home.join(".zeron/app"))
+        .map(|home| home.join(crate::environment::DEFAULTS.data_dir).join("app"))
         .is_some_and(|app_root| exe.starts_with(app_root));
     if installed {
-        "%h/.zeron/app/current/zeron".to_string()
+        format!("%h/{}/app/current/comet", crate::environment::DEFAULTS.data_dir)
     } else {
-        format!("{}", exe.display())
+        exe.display().to_string()
     }
 }
 
@@ -378,6 +385,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selected_service_does_not_address_legacy_installations() {
+        assert!(!["ai.ashler.comet", "ai.ashler.comet.staging"].contains(&LAUNCHD_LABEL));
+        assert!(!["comet-native.service", "comet-native-staging.service"].contains(&SYSTEMD_UNIT));
+        let unit = render_systemd_unit(Path::new("/source/comet"), &[]);
+        assert!(unit.contains(&format!("EnvironmentFile=-%h/{}/env", crate::environment::DEFAULTS.data_dir)));
+        for root in [".comet-native", ".comet-native-staging", ".zeron"] {
+            assert!(!unit.contains(&format!("EnvironmentFile=-%h/{root}/env")));
+            let legacy = Path::new("/home/u").join(root).join("app/1/comet");
+            assert_eq!(exec_path_for(&legacy, Some(Path::new("/home/u"))), legacy.display().to_string());
+        }
+        assert!(!unit.contains("ConditionEnvironment=BOAT_ID"));
+    }
+
+    #[test]
     fn systemd_unit_shape() {
         let unit = render_systemd_unit(
             Path::new("/usr/local/bin/zeron"),
@@ -385,11 +406,21 @@ mod tests {
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("ZERON_EDGE_URL".into(), "https://edge.example".into()),
                 ("RUST_LOG".into(), "info,zeron=\"debug\"".into()),
+                ("COMET_DEVBOX_PROVIDER".into(), "boat".into()),
+                ("COMET_DEVBOX_ID".into(), "bx_jdyh7avc".into()),
             ],
         );
         assert!(unit.contains("ExecStart=/usr/local/bin/zeron headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
         assert!(unit.contains("Environment=\"ZERON_EDGE_URL=https://edge.example\"\n"));
+        for key in ["COMET_DEVBOX_PROVIDER", "COMET_DEVBOX_ID"] {
+            assert!(CAPTURED_ENV.contains(&key));
+        }
+        assert!(unit.contains("Environment=\"COMET_DEVBOX_PROVIDER=boat\"\n"));
+        assert!(unit.contains("Environment=\"COMET_DEVBOX_ID=bx_jdyh7avc\"\n"));
+        assert!(!CAPTURED_ENV.contains(&"BOAT_ID"));
+        assert!(unit.contains("ConditionEnvironment=BOAT_ID\n"));
+        assert!(!unit.contains("Environment=\"BOAT_ID="));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,zeron=\\\"debug\\\"\"\n"));
         assert!(unit.contains("StartLimitIntervalSec=60\n"));
@@ -397,21 +428,26 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains("session.json"));
         assert!(!unit.contains("ConditionPathExists"));
-        assert!(unit.contains("EnvironmentFile=-%h/.zeron/env"));
+        assert!(unit.contains(&format!("EnvironmentFile=-%h/{}/env", crate::environment::DEFAULTS.data_dir)));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
     #[test]
-    fn curl_installer_always_starts_the_local_capable_service() {
-        // Git for Windows can check out this source fixture with CRLF. These
-        // assertions cover the installer directives, not checkout line endings.
-        let installer = include_str!("../../../edge/src/install.sh").replace("\r\n", "\n");
-        assert!(!installer.contains("session.json"));
-        assert!(installer.contains("StartLimitIntervalSec=60\n"));
-        assert!(installer.contains("StartLimitBurst=5\n"));
-        assert!(installer.contains("systemctl --user enable zeron"));
-        assert!(installer.contains("systemctl --user restart zeron"));
+    fn systemd_environment_preserves_literals_without_directive_injection() {
+        let unit = render_systemd_unit(
+            Path::new("/usr/local/bin/comet"),
+            &[("COMET_EDGE_URL".into(), "https://edge.test/%2F\nExecStart=/bad\r".into())],
+        );
+        assert!(unit.contains("Environment=\"COMET_EDGE_URL=https://edge.test/%%2F\\nExecStart=/bad\\r\"\n"));
+        assert!(!unit.contains("\nExecStart=/bad"));
     }
+
+    #[test]
+    fn legacy_profile_executable_is_not_retargeted() {
+        assert_eq!(exec_path_for(Path::new("/home/u/.zeron/app/0.3.0/zeron"), Some(Path::new("/home/u"))),
+            "/home/u/.zeron/app/0.3.0/zeron");
+    }
+
 
     #[test]
     fn installed_exe_uses_the_current_symlink() {
@@ -419,10 +455,10 @@ mod tests {
         // the versioned dir): the unit must point back at the symlink.
         assert_eq!(
             exec_path_for(
-                Path::new("/home/u/.zeron/app/0.3.0/zeron"),
+                &Path::new("/home/u").join(crate::environment::DEFAULTS.data_dir).join("app/0.3.0/comet"),
                 Some(Path::new("/home/u")),
             ),
-            "%h/.zeron/app/current/zeron"
+            format!("%h/{}/app/current/comet", crate::environment::DEFAULTS.data_dir)
         );
         // Source build: literal path.
         assert_eq!(
@@ -441,7 +477,7 @@ mod tests {
             &[("ZERON_EDGE_URL".into(), "https://e?a=1&b=2".into())],
             Path::new("/Users/x/.zeron/daemon.log"),
         );
-        assert!(plist.contains("<key>Label</key><string>sh.zeron.app</string>"));
+        assert!(plist.contains(&format!("<key>Label</key><string>{LAUNCHD_LABEL}</string>")));
         // XML-escaped exe path and env value.
         assert!(plist.contains("<string>/Users/x/zeron &amp; co/zeron</string>"));
         assert!(plist.contains("<string>https://e?a=1&amp;b=2</string>"));

@@ -1,52 +1,40 @@
 import AuthenticationServices
+import CryptoKit
 import UIKit
 
 enum Endpoints {
-    static let edgeURL = URL(string: "https://edge.zeron.sh")!
-    static var workosClientId: String {
-        #if DEBUG
-        if let id = debugOverride("-workos", key: "debugWorkosClientId") { return id }
-        #endif
-        return "client_01KWD0EAKZKD50YCQJNYSRE4BY"
-    }
-    static let callbackScheme = "zeron"
-
-    #if DEBUG
-    /// A launch argument that sticks: `-edge <url>` / `-workos <client>` point
-    /// the app at another stack (staging) and are remembered, so reopening it
-    /// from the home screen stays there. `-edge prod` goes back.
-    static func debugOverride(_ flag: String, key: String) -> String? {
-        let args = ProcessInfo.processInfo.arguments
-        if let i = args.firstIndex(of: flag), i + 1 < args.count {
-            let value = args[i + 1]
-            if value == "prod" {
-                UserDefaults.standard.removeObject(forKey: key)
-                return nil
-            }
-            UserDefaults.standard.set(value, forKey: key)
-            return value
+    static let callbackScheme = "comet-staging"
+    static func setting(_ key: String) throws -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+              !value.isEmpty, !value.contains("$(") else {
+            throw CoreError.Auth(message: "Configure \(key) for the Crew Staging build.")
         }
-        return UserDefaults.standard.string(forKey: key)
+        return value
     }
-    #endif
-
-    static func authorizeURL(state: String) -> URL {
-        var c = URLComponents(string: "https://api.workos.com/user_management/authorize")!
-        c.queryItems = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: workosClientId),
-            URLQueryItem(name: "redirect_uri", value: "\(callbackScheme)://callback"),
-            URLQueryItem(name: "provider", value: "authkit"),
-            URLQueryItem(name: "state", value: state),
-        ]
-        return c.url!
+    static var edgeURL: URL? { (try? setting("CrewEdgeOrigin")).flatMap(URL.init(string:)) }
+    static var deploymentId: String? { try? setting("CrewDeploymentId") }
+    static var storageScope: String {
+        let fields = ["CrewControlOrigin", "CrewEdgeOrigin", "CrewProjectScope", "CrewDeploymentId"]
+            .map { (try? setting($0)) ?? "unconfigured" }
+        let encoded = (try? JSONEncoder().encode(fields)) ?? Data()
+        return SHA256.hash(data: encoded).map { String(format: "%02x", $0) }.joined()
+    }
+    static func login() throws -> CrewLogin {
+        try CrewLogin(controlOrigin: setting("CrewControlOrigin"),
+                      edgeOrigin: setting("CrewEdgeOrigin"),
+                      projectScope: setting("CrewProjectScope"),
+                      deploymentId: setting("CrewDeploymentId"))
     }
 }
 
-/// Signed out: the welcome page, as on the desktop — the mark, a line, and
-/// "Get started" into the first steps (a look, then logging in).
-final class SignInViewController: UIViewController {
+/// Resource-bound Scaffold OAuth, shared with the host through the Rust core.
+final class SignInViewController: UIViewController, ASWebAuthenticationPresentationContextProviding {
     private let app: AppModel
+    private let status = UILabel()
+    private let signIn = UIButton(type: .system)
+    private var session: ASWebAuthenticationSession?
+    private var login: CrewLogin?
+    private var appToken: AnyObject?
 
     init(app: AppModel) {
         self.app = app
@@ -58,114 +46,104 @@ final class SignInViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = Palette.background
-        let wallpaper = WallpaperView()
-        wallpaper.frame = view.bounds
-        wallpaper.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.addSubview(wallpaper)
-        let mark = UIImageView(image: CloudUI.zeronMark)
+        let mark = UIImageView(image: UIImage(systemName: "sparkle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 44, weight: .light)))
         mark.tintColor = Palette.text
-        mark.contentMode = .scaleAspectFit
-        mark.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            mark.widthAnchor.constraint(equalToConstant: 46),
-            mark.heightAnchor.constraint(equalToConstant: 53),
-        ])
         let title = UILabel()
-        title.text = "Welcome to Zeron"
-        title.font = Fonts.ui(.sansSemibold, 30)
+        title.text = "Crew Staging"
+        title.font = Fonts.ui(.sansSemibold, 34)
         title.textColor = Palette.text
-        title.textAlignment = .center
-        title.numberOfLines = 0
         let tagline = UILabel()
         tagline.text = "Your coding agents, from anywhere."
         tagline.font = Fonts.ui(.sans, 17)
         tagline.textColor = Palette.secondary
-        tagline.textAlignment = .center
-        tagline.numberOfLines = 0
-        let start = CloudUI.primaryButton("Get started") { [weak self] in self?.getStarted() }
-        start.accessibilityIdentifier = "sign-in"
+
+        var primary = UIButton.Configuration.filled()
+        primary.title = "Sign In"
+        primary.baseBackgroundColor = Palette.text
+        primary.baseForegroundColor = Palette.background
+        primary.cornerStyle = .capsule
+        primary.contentInsets = NSDirectionalEdgeInsets(top: 15, leading: 20, bottom: 15, trailing: 20)
+        primary.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { a in
+            var a = a
+            a.font = Fonts.ui(.sansSemibold, 17)
+            a.foregroundColor = Palette.background
+            return a
+        }
+        signIn.configuration = primary
+        signIn.accessibilityIdentifier = "sign-in"
+        signIn.addAction(UIAction { [weak self] _ in self?.startCrewLogin() }, for: .touchUpInside)
+
+        status.font = Fonts.ui(.sans, 14)
+        status.textColor = Palette.danger
+        status.numberOfLines = 0
+        status.textAlignment = .center
+        status.text = app.restoreError
+        appToken = app.observe { [weak self] in self?.status.text = self?.app.restoreError }
 
         let top = UIStackView(arrangedSubviews: [mark, title, tagline])
         top.axis = .vertical
         top.alignment = .center
         top.spacing = 12
-        top.setCustomSpacing(26, after: mark)
-        for v in [top, start] {
+        let buttons = UIStackView(arrangedSubviews: [status, signIn])
+        buttons.axis = .vertical
+        buttons.spacing = 12
+        for v in [top, buttons] {
             v.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(v)
         }
-        let guide = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            top.centerXAnchor.constraint(equalTo: guide.centerXAnchor),
-            top.centerYAnchor.constraint(equalTo: guide.centerYAnchor, constant: -40),
-            top.leadingAnchor.constraint(greaterThanOrEqualTo: guide.leadingAnchor, constant: 32),
-            start.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 24),
-            start.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -24),
-            start.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -16),
+            top.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            top.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -80),
+            buttons.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            buttons.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            buttons.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
         ])
     }
 
-    private func getStarted() {
-        // The look is this phone's: picked once, then straight to logging in.
-        let seen = UserDefaults.standard.bool(forKey: OnboardingViewController.appearanceSeenKey)
-        let onboarding = OnboardingViewController(app: app, step: seen ? .sync : .appearance)
-        onboarding.modalTransitionStyle = .crossDissolve
-        present(onboarding, animated: true)
-    }
-}
-
-/// Sign in with WorkOS (system web auth sheet), then pick an organization
-/// when there are several.
-@MainActor
-final class WorkOSSignIn: NSObject, ASWebAuthenticationPresentationContextProviding {
-    private var session: ASWebAuthenticationSession?
-    private weak var host: UIViewController?
-
-    /// Signs in; returns why it didn't (nil on success or cancel).
-    func run(app: AppModel, from host: UIViewController) async -> String? {
-        self.host = host
-        let state = UUID().uuidString
-        let url: URL? = await withCheckedContinuation { cont in
-            let s = ASWebAuthenticationSession(url: Endpoints.authorizeURL(state: state), callback: .customScheme(Endpoints.callbackScheme)) { url, error in
-                if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin {
-                    return cont.resume(returning: nil)
+    private func startCrewLogin() {
+        app.cancelPendingRestore()
+        signIn.isEnabled = false
+        signIn.configuration?.showsActivityIndicator = true
+        status.text = nil
+        Task { @MainActor in
+            do {
+                let login = try Endpoints.login()
+                self.login = login
+                let authorize = try await login.begin(redirectUri: "\(Endpoints.callbackScheme)://callback")
+                guard let url = URL(string: authorize) else { throw CoreError.Auth(message: "Invalid authorization URL") }
+                let session = ASWebAuthenticationSession(url: url, callback: .customScheme(Endpoints.callbackScheme)) { [weak self] callback, error in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        defer {
+                            self.signIn.isEnabled = true
+                            self.signIn.configuration?.showsActivityIndicator = false
+                            self.login = nil
+                        }
+                        guard let callback else {
+                            login.cancel()
+                            if (error as? ASWebAuthenticationSessionError)?.code != .canceledLogin {
+                                self.status.text = error?.localizedDescription ?? "Sign-in did not complete."
+                            }
+                            return
+                        }
+                        do { try await self.app.signIn(account: login.complete(callback: callback.absoluteString)) }
+                        catch { self.status.text = error.localizedDescription }
+                    }
                 }
-                cont.resume(returning: url ?? URL(string: "zeron://callback?failed=1"))
+                session.presentationContextProvider = self
+                session.prefersEphemeralWebBrowserSession = false
+                self.session = session
+                if !session.start() { throw CoreError.Auth(message: "Could not open the sign-in sheet.") }
+            } catch {
+                login?.cancel()
+                status.text = error.localizedDescription
+                signIn.isEnabled = true
+                signIn.configuration?.showsActivityIndicator = false
             }
-            s.presentationContextProvider = self
-            s.prefersEphemeralWebBrowserSession = false
-            session = s
-            if !s.start() { cont.resume(returning: nil) }
-        }
-        session = nil
-        guard let url else { return nil }
-        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
-              let code = items.first(where: { $0.name == "code" })?.value,
-              items.first(where: { $0.name == "state" })?.value == state
-        else { return "Sign-in didn't complete. Try again." }
-        do {
-            try await app.signIn(code: code) { [weak self] orgs in await self?.pickOrg(orgs) }
-            return nil
-        } catch {
-            return error.localizedDescription
-        }
-    }
-
-    /// Several organizations: let the user pick (nil = cancelled).
-    private func pickOrg(_ orgs: [AuthOrg]) async -> AuthOrg? {
-        guard let host else { return nil }
-        return await withCheckedContinuation { cont in
-            let sheet = UIAlertController(title: "Choose an organization", message: nil, preferredStyle: .actionSheet)
-            for org in orgs {
-                sheet.addAction(UIAlertAction(title: org.name, style: .default) { _ in cont.resume(returning: org) })
-            }
-            sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in cont.resume(returning: nil) })
-            sheet.popoverPresentationController?.sourceView = host.view
-            host.present(sheet, animated: true)
         }
     }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        host?.view.window ?? ASPresentationAnchor()
+        view.window ?? ASPresentationAnchor()
     }
 }

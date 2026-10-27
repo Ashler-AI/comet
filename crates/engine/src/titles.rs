@@ -27,6 +27,7 @@ struct Inner {
     registry: Arc<HarnessRegistry>,
     repos: Repos,
     in_flight: Mutex<HashSet<String>>,
+    crew: std::sync::OnceLock<crate::crew::CrewServices>,
 }
 
 #[derive(Clone)]
@@ -42,8 +43,13 @@ impl TitleGenerator {
                 registry,
                 repos,
                 in_flight: Mutex::new(HashSet::new()),
+                crew: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    pub(crate) fn set_crew(&self, crew: crate::crew::CrewServices) {
+        let _ = self.inner.crew.set(crew);
     }
 
     /// Fire-and-forget: title `chat_id` if it's still untitled. Called by the run
@@ -90,7 +96,14 @@ impl TitleGenerator {
             return Ok(()); // already named
         }
 
-        let generated = self.run_title_model(harness_id, prompt, cwd).await;
+        let generated = if self.inner.registry.managed_inference() {
+            let crew = self.inner.crew.get().ok_or_else(|| EngineError::Other(
+                "Crew-managed title generation requires verified sign-in".into(),
+            ))?;
+            Some(crew.generate_title(chat_id, prompt).await?)
+        } else {
+            self.run_title_model(harness_id, prompt, cwd).await
+        };
         // Fallback so a chat is always named even if the model run produced nothing.
         let fallback: String = prompt
             .split_whitespace()
@@ -287,6 +300,7 @@ async fn collect_text(
     let interrupt = CancellationToken::new();
     let _cancel_on_drop = interrupt.clone().drop_guard();
     let controls = RunControls {
+        context: None,
         realtime: None,
         execution_lease,
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {

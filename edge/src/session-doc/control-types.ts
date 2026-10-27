@@ -99,8 +99,8 @@ export type MessagePart =
       readonly requestId: string;
       readonly questions: ReadonlyArray<UserInputQuestion>;
       readonly resolved?: boolean;
-      /** What the run received once resolved: empty ⇒ closed unanswered;
-       * absent ⇒ pending, or resolved before answers were recorded. */
+      /** What the run received once resolved: empty means closed unanswered;
+       * absent means pending, or resolved before answers were recorded. */
       readonly answers?: ReadonlyArray<UserInputAnswer>;
     }
   | {

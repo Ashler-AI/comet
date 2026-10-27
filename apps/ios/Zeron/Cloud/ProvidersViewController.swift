@@ -193,7 +193,7 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
         if !targetOnline {
             return "\(targetName) is offline — showing what it last reported."
         }
-        return "Agents run with the logins on \(targetName). Switch accounts here; to add one, sign in from Zeron on that computer."
+        return "Agents run with the logins on \(targetName). Switch accounts here; to add one, sign in from Crew on that computer."
     }
 
     // MARK: Loading
@@ -290,7 +290,7 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
                 return [Row(id: "loading", title: "Loading…", symbol: "ellipsis")]
             }
             // Landed on Cloud (no computers yet) without being offered it.
-            return [Row(id: "no-computers", title: "No computers yet", subtitle: "Install Zeron on a computer to run agents and manage their accounts here.", symbol: "desktopcomputer")]
+            return [Row(id: "no-computers", title: "No computers yet", subtitle: "Install Crew on a computer to run agents and manage their accounts here.", symbol: "desktopcomputer")]
         }
         return CloudStore.agents.map { agent in
             let count = (cloud.accounts[agent.login] ?? []).count + (cloud.accounts[agent.key] ?? []).count

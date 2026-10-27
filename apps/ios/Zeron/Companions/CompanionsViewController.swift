@@ -319,7 +319,7 @@ final class CompanionsViewController: UIViewController, UICollectionViewDelegate
 
     static func forkError(_ error: Error) -> String {
         if case CoreError.HostUnavailable = error { return "Its computer isn't reachable right now" }
-        if case CoreError.Unsupported = error { return "Its computer needs a newer Zeron to fork" }
+        if case CoreError.Unsupported = error { return "Its computer needs a newer Crew to fork" }
         return "Couldn't fork this chat"
     }
 

@@ -274,7 +274,7 @@ const SHOW_IMAGE: &str = "show_image";
 const SHOW_IMAGE_DESCRIPTION: &str = "\
 Show an image file (a screenshot, a rendered chart or diagram, a photo) inline in this chat, above \
 your final text reply; call it before writing that reply, once per image, in the order they should \
-appear. PNG, JPEG, WebP, or GIF, at most 10 MB and 4096 pixels on a side. Zeron copies the file \
+appear. PNG, JPEG, WebP, or GIF, at most 10 MB and 4096 pixels on a side. Crew copies the file \
 into the chat, so it stays visible after the file changes or is deleted. The reader \
 already sees the image, so the reply should not announce or describe it: add only what the image \
 doesn't show.";
@@ -961,7 +961,7 @@ impl Tools {
         let (spaces, sessions, entries) = tokio::try_join!(
             self.zeron.spaces(),
             self.zeron.sessions(),
-            self.zeron.transcript_on(&chat.id, Some(&chat.device_id))
+            self.zeron.transcript(&chat.id)
         )?;
         let rendered = render_entries(&entries, RenderOptions::default());
         let mut summary = summarize_chat(&chat, &spaces, &sessions);
@@ -1211,6 +1211,7 @@ impl Tools {
             // chat locally from what we just wrote rather than re-reading.
             let chat = Chat {
                 id: chat_id.clone(),
+                crew: None,
                 device_id: device_id.clone(),
                 title: args.title.clone(),
                 archived: false,
@@ -1254,10 +1255,7 @@ impl Tools {
 
     async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
         let chat = self.zeron.resolve_chat(&args.chat).await?;
-        let entries = self
-            .zeron
-            .transcript_on(&chat.id, Some(&chat.device_id))
-            .await?;
+        let entries = self.zeron.transcript(&chat.id).await?;
         let rendered = render_entries(
             &entries,
             RenderOptions {
@@ -1373,7 +1371,7 @@ impl Tools {
             .origin()
             .chat_id
             .clone()
-            .context("show_visual only works from an agent Zeron launched in a chat")?;
+            .context("show_visual only works from an agent Crew launched in a chat")?;
         let assets = read_visual_assets(&args.assets).await?;
         let shown = self
             .zeron
@@ -1400,7 +1398,7 @@ impl Tools {
             .origin()
             .chat_id
             .clone()
-            .context("show_image only works from an agent Zeron launched in a chat")?;
+            .context("show_image only works from an agent Crew launched in a chat")?;
         let bytes = read_image(&args.path).await?;
         let name = std::path::Path::new(&args.path)
             .file_name()

@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use zeron_proto::AccessToken;
 
 use crate::{RpcClient, RpcError, RpcService, serve_connection};
 
@@ -233,6 +234,66 @@ pub fn device_room_ws_url(
     format!("{ws_base}/device/{device_id}/ws?role={role}{conn}&token={token}")
 }
 
+fn directional_peer_url(
+    edge_url: &str,
+    device_id: Option<&str>,
+    session_id: &str,
+    deployment_id: Option<&str>,
+    token: &str,
+    params: &serde_json::Value,
+) -> Result<String, RpcError> {
+    let source = params["command"]["sourceChatId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| RpcError::BadParams("Missing peer source session".into()))?;
+    let source_device = params["command"]["sourceDeviceId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| RpcError::BadParams("Missing peer source device".into()))?;
+    let mut url = url::Url::parse(edge_url)
+        .map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+    let scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => return Err(RpcError::BadParams("Invalid Crew Edge scheme".into())),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+    url.set_query(None);
+    url.set_fragment(None);
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| RpcError::BadParams("Invalid Crew Edge origin".into()))?;
+        path.clear();
+        if let Some(device) = device_id {
+            path.extend(["device", device, "ws"]);
+        } else {
+            path.extend(["session", session_id, "peer", "ws"]);
+        }
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("connId", &uuid::Uuid::new_v4().to_string())
+            .append_pair("token", token)
+            .append_pair("sourceSessionId", source)
+            .append_pair("sourceDeviceId", source_device);
+        if device_id.is_some() {
+            query
+                .append_pair("role", "client")
+                .append_pair("purpose", "peer-reply")
+                .append_pair("peerSessionId", session_id);
+            if let Some(deployment) = deployment_id {
+                query.append_pair("peerDeploymentId", deployment);
+            }
+        } else if let Some(deployment) = deployment_id {
+            query.append_pair("deploymentId", deployment);
+        }
+    }
+    Ok(url.into())
+}
+
 // ---------------------------------------------------------------------------
 // Token source — the auth seam
 // ---------------------------------------------------------------------------
@@ -259,7 +320,10 @@ impl From<TokenError> for zeron_sync::SyncError {
 /// down authenticated sockets; temporary failures keep their supervisors alive.
 #[async_trait]
 pub trait TokenSource: Send + Sync + 'static {
-    async fn token(&self) -> Result<String, TokenError>;
+    async fn token(&self) -> Result<AccessToken, TokenError>;
+
+    /// Reject only the credential generation used by the failed connection.
+    fn invalidate(&self, generation: u64);
 
     /// Changes whenever credentials become available or are replaced. Long-lived
     /// supervisors use this to retry immediately instead of waiting for backoff.
@@ -282,9 +346,29 @@ pub struct StaticToken(pub String);
 
 #[async_trait]
 impl TokenSource for StaticToken {
-    async fn token(&self) -> Result<String, TokenError> {
-        Ok(self.0.clone())
+    async fn token(&self) -> Result<AccessToken, TokenError> {
+        Ok(AccessToken {
+            value: self.0.clone(),
+            generation: 0,
+        })
     }
+
+    fn invalidate(&self, _generation: u64) {}
+}
+
+async fn connect_authenticated(
+    url: &str,
+    token: &dyn TokenSource,
+    generation: u64,
+) -> Result<zeron_sync::dial::WsStream, RpcError> {
+    zeron_sync::dial::connect_ws(url).await.map_err(|error| {
+        if matches!(&error, tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status().as_u16() == 401)
+        {
+            token.invalidate(generation);
+        }
+        RpcError::Transport(format!("device room unreachable: {error}"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -353,12 +437,18 @@ impl HostRelay {
                             &config.device_id,
                             "host",
                             None,
-                            &token,
+                            &token.value,
                         );
                         let url = format!("{url}&nudgeAck=1");
                         let started = tokio::time::Instant::now();
                         let outcome = {
-                            let session = host_session(&url, &service, &on_nudge);
+                            let session = host_session(
+                                &url,
+                                &service,
+                                &on_nudge,
+                                config.token.as_ref(),
+                                token.generation,
+                            );
                             tokio::pin!(session);
                             loop {
                                 tokio::select! {
@@ -485,10 +575,10 @@ async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
+    token: &dyn TokenSource,
+    generation: u64,
 ) -> Result<(), RpcError> {
-    let ws = zeron_sync::dial::connect_ws(url)
-        .await
-        .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
+    let ws = connect_authenticated(url, token, generation).await?;
     tracing::info!("device-room: host connected");
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(1);
@@ -510,7 +600,12 @@ async fn host_session(
     // Poll the transport even when a virtual RPC connection is backpressured.
     // Ending either side drops the socket and all per-client dispatch inputs.
     tokio::select! {
-        _ = transport => {},
+        biased;
+        rejected = transport => {
+            if rejected {
+                token.invalidate(generation);
+            }
+        },
         _ = dispatch => {},
     }
     Ok(())
@@ -617,14 +712,20 @@ pub struct DeviceLink {
 }
 
 impl DeviceLink {
-    pub async fn connect(url: &str) -> Result<Self, RpcError> {
-        let ws = zeron_sync::dial::connect_ws(url)
-            .await
-            .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
-        Ok(Self::from_socket(ws))
+    pub async fn connect(
+        url: &str,
+        token: Arc<dyn TokenSource>,
+        generation: u64,
+    ) -> Result<Self, RpcError> {
+        let ws = connect_authenticated(url, token.as_ref(), generation).await?;
+        Ok(Self::from_socket(ws, token, generation))
     }
 
-    fn from_socket<S>(ws: zeron_sync::socket::Connection<S>) -> Self
+    fn from_socket<S>(
+        ws: zeron_sync::socket::Connection<S>,
+        token: Arc<dyn TokenSource>,
+        generation: u64,
+    ) -> Self
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -729,7 +830,13 @@ impl DeviceLink {
                 }
             };
             let reason = tokio::select! {
-                _ = transport => "connection lost".to_string(),
+                biased;
+                rejected = transport => {
+                    if rejected {
+                        token.invalidate(generation);
+                    }
+                    "connection lost".to_string()
+                },
                 reason = protocol => reason,
             };
             // Dropping in_tx ends the RpcClient reader → pending calls fail Closed.
@@ -788,7 +895,7 @@ pub struct LinkCacheConfig {
     pub cooldown_base: Duration,
     pub cooldown_max: Duration,
     /// Readiness probe budget: the relay accepts client joins even when the host is
-    /// offline, so a `ListHarnesses` round-trip proves the path before caching.
+    /// offline, so a `LocalDevice` round-trip proves the path before caching.
     pub probe_timeout: Duration,
     /// Optional dial gate: a `Dark` verdict fails the call fast with NO dial.
     /// Without it, retrying callers hot-dialed devices that had been offline
@@ -907,6 +1014,84 @@ impl LinkCache {
             });
         }
         cache
+    }
+
+    /// A one-command directional link. Never cache it as a general device client
+    /// and never retry an ambiguous admission under a fresh command identity.
+    pub async fn peer_call(
+        &self,
+        session_id: &str,
+        deployment_id: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        self.directional_peer_call(None, session_id, deployment_id, method, params)
+            .await
+    }
+
+    pub async fn peer_device_call(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        deployment_id: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        self.directional_peer_call(Some(device_id), session_id, deployment_id, method, params)
+            .await
+    }
+
+    async fn directional_peer_call(
+        &self,
+        device_id: Option<&str>,
+        session_id: &str,
+        deployment_id: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(RpcError::Failed("not signed in".into()));
+        }
+        if method != "DeliverPeerMessage" || params["chatId"].as_str() != Some(session_id) {
+            return Err(RpcError::BadParams(
+                "Directional peers admit only one message to their bound session".into(),
+            ));
+        }
+        let token = self
+            .config
+            .token
+            .token()
+            .await
+            .map_err(|error| RpcError::Transport(error.to_string()))?;
+        let url = directional_peer_url(
+            &self.config.edge_url,
+            device_id,
+            session_id,
+            deployment_id,
+            &token.value,
+            &params,
+        )?;
+        let link = DeviceLink::connect(&url, self.config.token.clone(), token.generation).await?;
+        let client = link.client();
+        tokio::time::timeout(
+            self.config.probe_timeout,
+            client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({})),
+        )
+        .await
+        .map_err(|_| RpcError::Transport("Directional peer readiness timed out".into()))??;
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(RpcError::Failed("not signed in".into()));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            client.call(method, params),
+        )
+        .await
+        .map_err(|_| {
+            RpcError::Transport(
+                "Peer admission outcome unknown; retain and retry the same command ID".into(),
+            )
+        })?
     }
 
     /// A live `RpcClient` to `device_id`'s engine (dialed + cached on first use).
@@ -1064,16 +1249,19 @@ impl LinkCache {
             device_id,
             "client",
             Some(&conn_id),
-            &token,
+            &token.value,
         );
         tracing::info!(device = %device_id, "peer: dialing via device room");
         // Bounded connect: `DeviceLink::connect` was the one unbounded await
         // under `forward()` — a wedged edge socket hung callers indefinitely
         // and only the UI's own per-call timers saved them (silently).
         const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-        let link = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, DeviceLink::connect(&url))
-            .await
-            .map_err(|_| RpcError::Transport(format!("peer {device_id}: connect timed out")))?;
+        let link = tokio::time::timeout(
+            DIAL_CONNECT_TIMEOUT,
+            DeviceLink::connect(&url, self.config.token.clone(), token.generation),
+        )
+        .await
+        .map_err(|_| RpcError::Transport(format!("peer {device_id}: connect timed out")))?;
         let link = Arc::new(link?);
         // Readiness probe: prove the host answers before caching (an offline host bounces
         // host_offline, which closes the link and fails this call fast).
@@ -1126,6 +1314,26 @@ impl LinkCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn directional_url_keeps_source_target_and_token_separate() {
+        let params = serde_json::json!({"command":{"sourceChatId":"source","sourceDeviceId":"device-source"}});
+        let url = super::directional_peer_url(
+            "https://edge.example",
+            Some("target-device"),
+            "target",
+            Some("canary"),
+            "opaque+&token",
+            &params,
+        )
+        .unwrap();
+        let url = url::Url::parse(&url).unwrap();
+        assert_eq!(url.path(), "/device/target-device/ws");
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs["token"], "opaque+&token");
+        assert_eq!(pairs["sourceSessionId"], "source");
+        assert_eq!(pairs["peerSessionId"], "target");
+        assert_eq!(pairs["purpose"], "peer-reply");
+    }
     #[tokio::test(start_paused = true)]
     async fn blocked_relay_upload_closes_link_and_fails_pending_rpc() {
         use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
@@ -1135,7 +1343,7 @@ mod tests {
             socket: WebSocketStream::from_raw_socket(client, Role::Client, None).await,
             progress,
         };
-        let link = DeviceLink::from_socket(socket);
+        let link = DeviceLink::from_socket(socket, Arc::new(StaticToken("test".into())), 0);
         let client = link.client();
         let request = client.call(
             "test.upload",
@@ -1158,7 +1366,7 @@ mod tests {
             socket: WebSocketStream::from_raw_socket(client, Role::Client, None).await,
             progress,
         };
-        let link = DeviceLink::from_socket(socket);
+        let link = DeviceLink::from_socket(socket, Arc::new(StaticToken("test".into())), 0);
         tokio::task::yield_now().await; // initial echo fills the uplink
         drop(link);
         let mut received = Vec::new();

@@ -404,7 +404,11 @@ fn scroll_child_index(sections: &[PaletteSection], row_ix: usize) -> usize {
     for (section_ix, section) in sections.iter().enumerate() {
         if row_ix < rows_before + section.rows.len() {
             let child = row_ix + section_ix + 1;
-            return if row_ix == rows_before { child - 1 } else { child };
+            return if row_ix == rows_before {
+                child - 1
+            } else {
+                child
+            };
         }
         rows_before += section.rows.len();
     }
@@ -518,8 +522,8 @@ impl Shell {
         let query = palette.search.read(cx).text().trim().to_owned();
         // An empty query lists the workspace's recent files (the default
         // Files list); a single character is too broad to search.
-        let Some(client) =
-            workspace.filter(|_| query.is_empty() || query.chars().count() >= MIN_WORKSPACE_QUERY_CHARS)
+        let Some(client) = workspace
+            .filter(|_| query.is_empty() || query.chars().count() >= MIN_WORKSPACE_QUERY_CHARS)
         else {
             palette.files.clear();
             palette.content.clear();
@@ -668,7 +672,9 @@ impl Shell {
         // files (the host's empty-query list), each path once.
         let recent_files = |limit| {
             let mut seen = std::collections::HashSet::new();
-            let opened = self.recent_files(&self.active_chat).map(|path| (path.clone(), false));
+            let opened = self
+                .recent_files(&self.active_chat)
+                .map(|path| (path.clone(), false));
             let changed = palette
                 .files
                 .results
@@ -1212,7 +1218,10 @@ impl Shell {
                         "No recent files",
                         "Files you open or change in this workspace show up here.",
                     ),
-                    _ => ("No results", "Try a command, chat title, project, or device."),
+                    _ => (
+                        "No results",
+                        "Try a command, chat title, project, or device.",
+                    ),
                 };
                 el.child(palette_empty(&theme, title, hint))
             });
@@ -1482,17 +1491,12 @@ pub(super) fn command_key_hint(theme: &Theme, keys: &str, label: &'static str) -
             .text_color(theme.text_muted)
             .child(SharedString::from(keys.to_string())),
     };
-    div()
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .child(cap)
-        .child(
-            div()
-                .text_size(crate::typography::ui_rems(10.0))
-                .text_color(theme.text_muted)
-                .child(label),
-        )
+    div().flex().items_center().gap(px(5.0)).child(cap).child(
+        div()
+            .text_size(crate::typography::ui_rems(10.0))
+            .text_color(theme.text_muted)
+            .child(label),
+    )
 }
 
 #[cfg(test)]
@@ -1513,6 +1517,8 @@ mod tests {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -1998,7 +2004,11 @@ mod tests {
             .collect();
         // Files only; no content search runs without a query.
         assert_eq!(paths, ["src/recent.rs", "README.md"]);
-        assert!(engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx).is_empty());
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
     }
 
     #[gpui::test]

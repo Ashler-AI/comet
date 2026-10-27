@@ -64,6 +64,7 @@ pub mod methods {
     pub const LIST_SKILLS: &str = "ListSkills";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    pub const READ_COMMAND: &str = "ReadCommand";
     pub const TAKE_PROJECT_ACTION_SETUP: &str = "TakeProjectActionSetup";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
     /// command entry (client-minted id and all) straight over the device-room
@@ -77,6 +78,8 @@ pub mod methods {
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
+    /// IPC-only exact-run capability; retained until this subscription closes.
+    pub const RETAIN_SESSION_SUPERVISION: &str = "RetainSessionSupervision";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
     /// connection; automatic subscriptions and retries must not call it.
@@ -139,6 +142,8 @@ pub mod methods {
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// This engine runtime's fixed device and workspace identity.
     pub const ENGINE_INFO: &str = "EngineInfo";
+    /// Explicit local-controller wake of a registered immutable provider binding.
+    pub const WAKE_DEVICE: &str = "WakeDevice";
     /// Readiness barrier for the engine runtime. The call completes once stores
     /// and journals are assembled, or fails with the assembly error.
     pub const ENGINE_READY: &str = "EngineReady";
@@ -151,6 +156,9 @@ pub mod methods {
     /// `{"quiesced":true}` or `{"quiesced":false,"busy":"<why>"}`.
     pub const QUIESCE_FOR_SLEEP: &str = "QuiesceForSleep";
     pub const AUTH_STATUS: &str = "AuthStatus";
+    /// Local desktop updater bearer for the engine's configured edge URL.
+    /// Never relay-forwarded or available to scoped sandbox hosts.
+    pub const UPDATE_ACCESS_TOKEN: &str = "UpdateAccessToken";
     // AuthRpc mutations (feature-inventory §2 AuthRpc; IPC-only).
     pub const SIGN_IN: &str = "SignIn";
     pub const SIGN_IN_HEADLESS: &str = "SignInHeadless";
@@ -457,6 +465,13 @@ pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainSessionSupervisionParams {
+    pub chat_id: String,
+    pub token: String,
+}
+
 /// Deserialize typed params out of the envelope's `params` value.
 pub fn parse_params<T: serde::de::DeserializeOwned>(
     params: serde_json::Value,
@@ -503,13 +518,21 @@ mod tests {
             method: &str,
             _params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
+            if method == "Ping" {
+                return RpcReply::value(&"ready");
+            }
             if !matches!(
                 method,
-                methods::WATCH_CHECKOUT_CHANGE_REQUEST | methods::WATCH_HARNESS_UPDATES | "Silent"
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST | methods::WATCH_HARNESS_UPDATES | "Silent" | "PendingUnary"
             ) {
                 return Err(RpcError::UnknownMethod(method.into()));
             }
             let guard = DropSignal(self.dropped.lock().unwrap().take());
+            if method == "PendingUnary" {
+                std::future::pending::<()>().await;
+                drop(guard);
+                return RpcReply::value(&());
+            }
             let stream = futures::stream::unfold(guard, |guard| async move {
                 let item = std::future::pending::<Option<(serde_json::Value, DropSignal)>>().await;
                 drop(guard);
@@ -616,6 +639,101 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, RpcError::UnknownMethod(method) if method == "FutureStream"));
+    }
+
+    #[tokio::test]
+    async fn dropping_scoped_call_cancels_pending_service_without_closing_connection() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let service = Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let client = memory_client(service.clone());
+        let mut request = Box::pin(client.call_scoped("PendingUnary", serde_json::Value::Null));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while service.dropped.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unary service future started and owns its drop guard");
+
+        drop(request);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("pending unary service future cancelled promptly")
+            .expect("the exact service guard was dropped");
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.call("Ping", serde_json::Value::Null),
+        )
+        .await
+        .expect("connection remains usable after cancelling one request")
+        .unwrap();
+        assert_eq!(reply, serde_json::json!("ready"));
+    }
+
+    #[tokio::test]
+    async fn scoped_call_cancellation_survives_backpressure_outside_tokio() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let service = Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(1);
+        let (server_in, server_requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (server_out, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        tokio::spawn(serve_connection(service.clone(), server_out, server_requests));
+        let client = RpcClient::new(out.clone(), inbound);
+        let mut request = Box::pin(client.call_scoped("PendingUnary", serde_json::Value::Null));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        server_in.send(requests.recv().await.unwrap()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while service.dropped.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unary service future started and owns its drop guard");
+
+        // Stop forwarding the transport so unrelated traffic fills its outgoing slot.
+        let mut traffic = Box::pin(client.call("Ping", serde_json::Value::Null));
+        assert!(futures::poll!(traffic.as_mut()).is_pending());
+        assert_eq!(out.capacity(), 0);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    assert!(tokio::runtime::Handle::try_current().is_err());
+                    drop(request);
+                })
+                .join()
+                .expect("request dropped outside a Tokio runtime context");
+        });
+
+        // Resume the same connection; the queued cancellation must follow the traffic.
+        tokio::spawn(async move {
+            while let Some(frame) = requests.recv().await {
+                if server_in.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("backpressured cancellation reached the pending service future")
+            .expect("the exact service guard was dropped");
+        tokio::time::timeout(std::time::Duration::from_secs(1), traffic)
+            .await
+            .expect("unrelated request survives the cancellation")
+            .unwrap();
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.call_scoped("Ping", serde_json::Value::Null),
+        )
+        .await
+        .expect("shared connection remains usable after cancellation")
+        .unwrap();
+        assert_eq!(reply, serde_json::json!("ready"));
     }
 
     #[tokio::test]

@@ -486,6 +486,7 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
         issued_at: now,
         based_on,
         expires_at: None,
+        accepted_at: None,
         status: SessionCommandStatus::Pending,
         resolution: None,
     })
@@ -1083,6 +1084,232 @@ async fn steer_into_unsteerable_live_turn_holds_instead_of_interrupting() {
     );
 }
 
+/// Relay execution can precede the original CRDT command row. Its eventual
+/// arrival must retain the real outcome, not look like a crashed execution.
+#[tokio::test]
+async fn relayed_run_settles_original_command_after_doc_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let source = SessionDoc::init(CHAT).unwrap();
+    queue_as_viewer(
+        &source,
+        "cmd-relayed",
+        SessionCommandPayload::Run {
+            request: run_request("one relayed turn"),
+            message_id: "relayed-message".into(),
+        },
+    );
+    let entry = source.read_commands().unwrap().remove(0);
+    assert_eq!(
+        core.doc_host.ingest_relayed_command(CHAT, entry.clone()).await.unwrap(),
+        "executed",
+    );
+    wait_for(
+        || entries_now(&core).iter().any(|e| {
+            e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+        }),
+        "relayed assistant completed",
+    ).await;
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    assert_eq!(
+        command_status(&core, &entry.id),
+        Some((SessionCommandStatus::Applied, None)),
+        "completed relay work must not be reported as interrupted",
+    );
+    assert_eq!(
+        core.doc_host.ingest_relayed_command(CHAT, entry).await.unwrap(),
+        "duplicate",
+    );
+    assert_eq!(entries(&core).iter().filter(|e| e.role == MessageRole::Assistant).count(), 1);
+    source.doc().import(&handle.doc().export_snapshot().unwrap()).unwrap();
+    let commands = source.read_commands().unwrap();
+    assert_eq!(commands.len(), 1, "settle the original row, not a copied command");
+    assert_eq!(commands[0].status, SessionCommandStatus::Applied);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn relayed_interrupt_settles_commands_without_deadlocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![AgentEvent::TextDelta { text: "working".into() }],
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+        }),
+    );
+    let source = SessionDoc::init(CHAT).unwrap();
+    queue_as_viewer(&source, "relay-run", SessionCommandPayload::Run {
+        request: run_request("interrupt this turn"),
+        message_id: "interrupted-relay-message".into(),
+    });
+    let run = source.read_commands().unwrap().remove(0);
+    core.doc_host.ingest_relayed_command(CHAT, run).await.unwrap();
+    wait_for(
+        || entries_now(&core).iter().any(|e| e.status == Some(MessageStatus::Streaming)),
+        "relayed turn streaming",
+    ).await;
+    queue_as_viewer(&source, "relay-stop", SessionCommandPayload::Interrupt {});
+    let stop = source.read_commands().unwrap().pop().unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), core.doc_host.ingest_relayed_command(CHAT, stop))
+            .await.expect("relay controls remain interruptible").unwrap(),
+        "executed",
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    for id in ["relay-run", "relay-stop"] {
+        assert_eq!(command_status(&core, id), Some((SessionCommandStatus::Applied, None)));
+    }
+    assert!(entries(&core).iter().any(|e| e.role == MessageRole::Assistant
+        && e.status == Some(MessageStatus::Aborted)));
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().status, SessionStatus::Idle);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn relayed_expiry_and_rejection_survive_doc_sync_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
+    let source = SessionDoc::init(CHAT).unwrap();
+    for (id, expiry, expected_reply) in [
+        ("relay-expired", Some(0), "expired"),
+        ("relay-rejected", None, "executed"),
+    ] {
+        let entry = SessionCommandEntry {
+            id: id.into(),
+            payload: SessionCommandPayload::RespondInput { request_id: "missing".into(), answers: vec![] },
+            issued_by: VIEWER.into(),
+            issued_at: chrono::Utc::now().timestamp_millis(),
+            based_on: None,
+            expires_at: expiry,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+            accepted_at: None,
+        };
+        source.queue_command(&entry).unwrap();
+        assert_eq!(core.doc_host.ingest_relayed_command(CHAT, entry).await.unwrap(), expected_reply);
+    }
+    core.shutdown().await;
+    drop(core);
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    assert_eq!(command_status(&core, "relay-expired"), Some((SessionCommandStatus::Expired, None)));
+    assert_eq!(command_status(&core, "relay-rejected"), Some((
+        SessionCommandStatus::Rejected, Some("no pending input request".into()),
+    )));
+    assert!(entries(&core).is_empty(), "neither rejected command may run a turn");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn orphan_preparation_receipts_recover_durable_outcomes_without_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script: mock_script() }));
+    let source = SessionDoc::init(CHAT).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    for (id, known) in [("settled-receipt", true), ("interrupted-receipt", false)] {
+        queue_as_viewer(&source, id, SessionCommandPayload::Run {
+            request: run_request("must not execute from a receipt"), message_id: id.into(),
+        });
+        let entry = source.read_commands().unwrap().into_iter().find(|entry| entry.id == id).unwrap();
+        handle.doc().accept_command(&entry, chrono::Utc::now().timestamp_millis()).unwrap();
+        assert!(store.mark_processed(id).unwrap());
+        if known {
+            store.finish_processed_command(id, br#"["applied",null]"#).unwrap();
+        }
+    }
+    assert_eq!(handle.doc().pending_command_receipt_ids().unwrap().len(), 2);
+    core.doc_host.drain_commands(&handle).await;
+    assert!(handle.doc().pending_command_receipt_ids().unwrap().is_empty());
+    assert!(handle.doc().read_commands().unwrap().is_empty(), "receipts must not become executable rows");
+    let delivery = handle.doc().command_delivery().unwrap();
+    assert!(!delivery.contains_key("settled-receipt"), "applied receipt must not become a failed send");
+    assert!(matches!(delivery.get("interrupted-receipt"), Some(zeron_doc::CommandDeliveryStatus::Failed { .. })));
+    assert_eq!(store.processed_command_outcome("settled-receipt").unwrap().as_deref(), Some(br#"["applied",null]"#.as_slice()));
+    assert!(entries(&core).is_empty(), "neither receipt may launch a turn");
+    core.shutdown().await;
+}
+
+/// Dropping a blocked relay releases in-flight ownership, not its durable
+/// processed claim. A later drain must report interruption without replay.
+#[tokio::test]
+async fn aborted_relay_releases_execution_claim_without_replaying_command() {
+    struct FullMailboxHarness(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl Harness for FullMailboxHarness {
+        fn id(&self) -> HarnessId { HarnessId::Mock }
+        fn display_name(&self) -> &str { "Full mailbox" }
+        fn supports_steering(&self) -> bool { true }
+        fn steering_mode(&self) -> SteeringMode { SteeringMode::StepBoundary }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] { &[] }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> { Ok(vec![]) }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Keep steering alive but unread until interruption.
+            Ok(futures::stream::unfold(Some(controls), |controls| async move {
+                let controls = controls?;
+                controls.interrupt.cancelled().await;
+                Some((Ok(done(DoneStatus::Interrupted)), None))
+            }).boxed())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let core = assemble(dir.path(), Arc::new(FullMailboxHarness(starts.clone())));
+    core.sessions.dispatch(CHAT, HarnessId::Mock, run_request("initial"), None).await.unwrap();
+    wait_for(|| starts.load(std::sync::atomic::Ordering::SeqCst) == 1, "runtime started").await;
+    // Fill the runtime's 32-slot mailbox; the next dispatch waits in reserve().
+    for n in 0..32 {
+        core.sessions.dispatch(CHAT, HarnessId::Mock, run_request(&format!("queued-{n}")), None)
+            .await.unwrap();
+    }
+    let source = SessionDoc::init(CHAT).unwrap();
+    queue_as_viewer(&source, "aborted-relay", SessionCommandPayload::Run {
+        request: run_request("must not replay"),
+        message_id: "aborted-message".into(),
+    });
+    let entry = source.read_commands().unwrap().remove(0);
+    let host = core.doc_host.clone();
+    let request = tokio::spawn(async move { host.ingest_relayed_command(CHAT, entry).await });
+    let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+    wait_for(
+        || store.is_processed("aborted-relay").unwrap()
+            && entries_now(&core).iter().any(|e| e.id == "aborted-message"),
+        "relay consumed with executor pending",
+    ).await;
+    assert!(!request.is_finished());
+    assert_eq!(store.processed_command_outcome("aborted-relay").unwrap(), None);
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    let handle = core.doc_host.open(CHAT).unwrap();
+    handle.doc().doc().import(&source.export_snapshot().unwrap()).unwrap();
+    core.doc_host.drain_commands(&handle).await;
+    assert_eq!(command_status(&core, "aborted-relay"), Some((
+        SessionCommandStatus::Rejected,
+        Some("interrupted before completion — retry to send again".into()),
+    )));
+    assert!(!store.mark_processed("aborted-relay").unwrap(), "abort never unclaims durable consumption");
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1, "no replay or replacement runtime");
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn processed_commands_are_skipped_on_redelivery() {
     let dir = tempfile::tempdir().unwrap();
@@ -1230,6 +1457,245 @@ async fn retry_reissues_a_swallowed_send() {
         run_attempts(&handle.doc().read_commands().unwrap()),
         2,
         "retry after delivery must not duplicate the send"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_worktree_preparation_accepts_once_before_dispatch() {
+    check_slow_worktree_preparation(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_worktree_preparation_rejects_with_reason_and_allows_retry() {
+    check_slow_worktree_preparation(true).await;
+}
+
+#[cfg(unix)]
+async fn check_slow_worktree_preparation(fail_first: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    let hooks = repo.join(".git/hooks");
+    git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    std::fs::write(repo.join("README.md"), "real checkout\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "init"]);
+
+    let gate = hooks.join("gate");
+    std::fs::create_dir(&gate).unwrap();
+    let hook = hooks.join("post-checkout");
+    // The release file, not elapsed time, decides when preparation finishes.
+    // Removing the temp directory on panic also releases the hook process.
+    std::fs::write(
+        &hook,
+        r#"#!/bin/sh
+set -eu
+gate="$(dirname "$0")/gate"
+printf 'entered\n' >> "$gate/invocations"
+: > "$gate/entered"
+while [ ! -f "$gate/release" ]; do
+    [ -d "$gate" ] || exit 99
+    sleep 0.05
+done
+code=$(cat "$gate/release")
+if [ "$code" != 0 ]; then
+    printf 'slow-worktree-hook: checkout refused\n' >&2
+fi
+exit "$code"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let seen: Arc<std::sync::Mutex<Vec<RunRequest>>> = Default::default();
+    let core = assemble(
+        &root.join("engine"),
+        Arc::new(CapturingHarness {
+            script: mock_script(),
+            seen: seen.clone(),
+        }),
+    );
+    core.repos
+        .set_worktree_settings(zeron_proto::WorktreeSettings {
+            use_custom_directory: true,
+            custom_directory: Some(root.join("worktrees").to_string_lossy().into_owned()),
+        })
+        .await
+        .unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let mut request = run_request("gated real worktree");
+    request.cwd = repo.to_string_lossy().into_owned();
+    request.worktree = Some(zeron_proto::WorktreeSpec {
+        repo_path: request.cwd.clone(),
+        base: "main".into(),
+        space_id: None,
+    });
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-slow-worktree",
+        SessionCommandPayload::Run {
+            request,
+            message_id: "m-slow-worktree".into(),
+        },
+    );
+    let attempts = || {
+        handle
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .filter(|command| {
+                matches!(&command.payload, SessionCommandPayload::Run { message_id, .. }
+                    if message_id == "m-slow-worktree")
+            })
+            .collect::<Vec<_>>()
+    };
+    let assert_blocked = |id: &str, count: usize| {
+        let commands = attempts();
+        assert_eq!(commands.len(), count, "retry must not mint a live attempt");
+        let command = commands.iter().find(|command| command.id == id).unwrap();
+        assert_eq!(command.status, SessionCommandStatus::Pending);
+        assert!(
+            command.accepted_at.is_some(),
+            "host accepted before checkout finished"
+        );
+        assert!(command.is_accepted());
+        assert!(entries(&core).iter().all(|entry| entry.role != MessageRole::User));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no dispatch before materialization"
+        );
+    };
+    let mut active_id = "cmd-slow-worktree".to_owned();
+    for attempt in 0..=usize::from(fail_first) {
+        wait_for(|| gate.join("entered").exists(), "post-checkout entered").await;
+        assert_blocked(&active_id, attempt + 1);
+        core.doc_host.retry_delivery(CHAT).unwrap();
+        assert_blocked(&active_id, attempt + 1);
+        assert_eq!(
+            std::fs::read_to_string(gate.join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            attempt + 1,
+            "one real checkout per explicit attempt"
+        );
+        std::fs::write(
+            gate.join("release-next"),
+            if fail_first && attempt == 0 { "42\n" } else { "0\n" },
+        )
+        .unwrap();
+        // Publish a complete result atomically; the hook must never read an empty file.
+        std::fs::rename(gate.join("release-next"), gate.join("release")).unwrap();
+        if fail_first && attempt == 0 {
+            wait_for(
+                || matches!(
+                    command_status(&core, &active_id),
+                    Some((SessionCommandStatus::Rejected, _))
+                ),
+                "failed checkout rejected",
+            )
+            .await;
+            let failed = attempts()
+                .into_iter()
+                .find(|command| command.id == active_id)
+                .unwrap();
+            assert!(!failed.is_accepted(), "rejection ends preparation");
+            assert!(
+                failed.resolution.as_deref().unwrap()
+                    .contains("slow-worktree-hook: checkout refused"),
+                "retain the hook's actual failure: {:?}",
+                failed.resolution
+            );
+            assert!(entries(&core).iter().all(|entry| entry.role != MessageRole::User));
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "failed checkout never dispatches"
+            );
+            std::fs::remove_file(gate.join("entered")).unwrap();
+            std::fs::remove_file(gate.join("release")).unwrap();
+            core.doc_host.retry_delivery(CHAT).unwrap();
+            let commands = attempts();
+            assert_eq!(commands.len(), 2, "explicit retry mints one fresh attempt");
+            active_id = commands
+                .into_iter()
+                .find(|command| command.id != active_id)
+                .unwrap()
+                .id;
+        }
+    }
+    wait_for(
+        || {
+            command_status(&core, &active_id)
+                .is_some_and(|(status, _)| status == SessionCommandStatus::Applied)
+                && entries_now(&core).iter().any(|entry| {
+                    entry.role == MessageRole::Assistant
+                        && entry.status == Some(MessageStatus::Complete)
+                })
+        },
+        "released checkout dispatches and completes",
+    )
+    .await;
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    core.shutdown().await;
+    assert_eq!(attempts().len(), 1 + usize::from(fail_first));
+    assert_eq!(
+        entries(&core)
+            .iter()
+            .filter(|entry| entry.role == MessageRole::User)
+            .count(),
+        1,
+        "exactly one landed user entry"
+    );
+    assert!(entries(&core).iter().any(|entry| entry.id == "m-slow-worktree"));
+    let requests = seen.lock().unwrap();
+    let dispatched: Vec<_> = requests
+        .iter()
+        .filter(|request| request.prompt == "gated real worktree")
+        .collect();
+    assert_eq!(
+        dispatched.len(),
+        1,
+        "exactly one prompt dispatch (excluding auto-title)"
+    );
+    let cwd = std::path::Path::new(&dispatched[0].cwd);
+    assert!(cwd.starts_with(root.join("worktrees")));
+    assert!(cwd.join(".git").is_file(), "dispatch uses a real linked worktree");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("README.md")).unwrap(),
+        "real checkout\n"
+    );
+    assert!(
+        dispatched[0].worktree.is_none(),
+        "materialization consumes the directive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gate.join("invocations"))
+            .unwrap()
+            .lines()
+            .count(),
+        1 + usize::from(fail_first)
     );
 }
 
@@ -3429,6 +3895,51 @@ async fn real_image_generation_profile_smoke() {
             .unwrap()
             .contains("generated_images/")
     );
+    core.sessions.shutdown().await;
+}
+
+/// Admission failures precede drive_run, but must still explain the saved
+/// prompt. An explicit new attempt reuses its message identity, never its text
+/// as a second user turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_failure_is_visible_and_recovers_with_same_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(HarnessRegistry::new());
+    let core = EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None).unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let payload = SessionCommandPayload::Run {
+        request: run_request("saved prompt"),
+        message_id: "original-message".into(),
+    };
+    // No harness is available yet: rejection happens before a runtime starts.
+    queue_as_viewer(handle.doc(), "admission-failed", payload.clone());
+    wait_for(
+        || matches!(command_status(&core, "admission-failed"), Some((SessionCommandStatus::Rejected, _))),
+        "admission rejected",
+    ).await;
+    let reason = command_status(&core, "admission-failed").unwrap().1.unwrap();
+    let failed = entries(&core);
+    assert_eq!(failed.iter().filter(|e| e.role == MessageRole::User).count(), 1);
+    assert!(failed.iter().any(|e| e.role == MessageRole::Assistant
+        && e.status == Some(MessageStatus::Complete)
+        && matches!(e.parts.as_slice(), [MessagePart::Error { message, .. }] if message == &reason)),
+        "admission reason {reason:?} must match the completed error entry: {failed:?}");
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().status, SessionStatus::Errored);
+    assert_eq!(handle.doc().read_commands().unwrap().len(), 1);
+
+    registry.register(Arc::new(MockHarness { script: mock_script() }));
+    queue_as_viewer(handle.doc(), "explicit-recovery", payload);
+    wait_for(
+        || matches!(command_status(&core, "explicit-recovery"), Some((SessionCommandStatus::Applied, _)))
+            && core.sessions.session_status(CHAT).is_some_and(|s| s.status == SessionStatus::Idle),
+        "explicit recovery completed",
+    ).await;
+    let recovered = entries(&core);
+    let users: Vec<_> = recovered.iter().filter(|e| e.role == MessageRole::User).collect();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, "original-message");
+    assert_eq!(recovered.iter().filter(|e| e.role == MessageRole::Assistant).count(), 2);
+    assert_eq!(command_status(&core, "admission-failed").unwrap().0, SessionCommandStatus::Rejected);
     core.sessions.shutdown().await;
 }
 

@@ -163,6 +163,7 @@ pub fn harness_label(id: &str) -> String {
         "grok" => "Grok",
         "hermes" => "Hermes",
         "pi" => "Pi",
+        "omp" => "OMP",
         "cursor" => "Cursor",
         "opencode" => "OpenCode",
         "antigravity" => "Antigravity",
@@ -184,6 +185,8 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
         )]
     };
     match harness {
+        // OMP provider-qualified choices must come from the execution host.
+        "omp" => Vec::new(),
         "grok" => vec![model(
             "grok-4.5",
             "Grok 4.5",

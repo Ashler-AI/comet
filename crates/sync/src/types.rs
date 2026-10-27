@@ -26,23 +26,38 @@ pub enum SyncError {
     Closed,
 }
 
+/// A dial URL and the credential generation embedded in it, if managed.
+pub struct UrlLease {
+    pub url: String,
+    pub generation: Option<u64>,
+}
+
 /// Per-dial WebSocket URL provider — consulted before EVERY connection attempt,
 /// including background reconnects, so a short-lived auth token embedded in the
 /// URL (`?token=…`) is re-read fresh rather than frozen at first connect.
 /// Return [`SyncError::Auth`] when no valid credential is available (signed
 /// out); the reconnect loop backs off and retries.
 pub trait UrlProvider: Send + Sync + 'static {
-    fn url(&self) -> BoxFuture<'static, Result<String, SyncError>>;
+    fn url(&self) -> BoxFuture<'static, Result<UrlLease, SyncError>>;
+    /// Reject only the generation used by the failed connection.
+    fn invalidate(&self, generation: u64);
 }
 
 /// Fixed URL (dev bearers and tests — tokens that never expire).
 pub struct StaticUrl(pub String);
 
 impl UrlProvider for StaticUrl {
-    fn url(&self) -> BoxFuture<'static, Result<String, SyncError>> {
+    fn url(&self) -> BoxFuture<'static, Result<UrlLease, SyncError>> {
         let url = self.0.clone();
-        Box::pin(async move { Ok(url) })
+        Box::pin(async move {
+            Ok(UrlLease {
+                url,
+                generation: None,
+            })
+        })
     }
+
+    fn invalidate(&self, _generation: u64) {}
 }
 
 /// Live sync introspection for one room — the data behind the engine's

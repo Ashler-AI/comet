@@ -686,7 +686,7 @@ pub async fn install_antigravity_release(
     }
     if !crate::code_signature::SUPPORTED {
         return Err(HarnessError::Install(format!(
-            "Antigravity {} is not pinned by this build of Zeron; update Zeron to install it",
+            "Antigravity {} is not pinned by this build of Crew; update Crew to install it",
             release.version
         )));
     }
@@ -2459,6 +2459,7 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let (scratch, mut child, stderr_tail, sign_in_prompted) = self
             .spawn_agent(
                 Some(&request.cwd),
@@ -4226,6 +4227,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn: turn_control,
+        context: _,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
     let rules = ConfigRules {

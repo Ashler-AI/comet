@@ -122,6 +122,20 @@ comparison for checkpoint skip, reconnect/backoff/wake plumbing reused from the
 existing supervisor machinery. The layered liveness model (ping lease, join deadline,
 probe clock) carries over — those lessons are transport-level, not CRDT-level.
 
+Native local-update publication preserves commit order before rows enter the
+durable chat outbox. The vendored Loro emitter stages each update while holding
+the commit/oplog lock, then drains a serialized FIFO after releasing that lock.
+Observer-triggered edits, reentrant callbacks and competing commit threads cannot
+publish a dependent update ahead of its predecessor. Receivers still reject
+incomplete causal history without advancing the durable cursor; historical
+out-of-order rows require ordinary catch-up or a covering checkpoint.
+
+The Edge also serializes each socket's inbound frames across asynchronous
+authorization and dispatch; different sockets remain independent. Every frame
+is reauthorized at the queue head. Active and queued input is bounded to 300
+frames/8 MiB per socket and 1,200 frames/32 MiB per isolate. Close, revocation or
+overflow discards queued input; active input stays charged until it settles.
+
 **C2. Store migration** (`crates/sync/src/store.rs` MIGRATIONS — append entry #N):
 `ALTER TABLE snapshots ADD COLUMN cursor INTEGER; ADD COLUMN epoch INTEGER` — cursor
 persisted **in the same transaction** as the snapshot bytes, so content and cursor
@@ -167,6 +181,22 @@ whale outputs stay viewable!), write fresh Loro doc with `meta.epoch = 2`. The
 1 MB whale becomes ~160 KB with zero information loss. Commands: copy only unresolved
 ledger entries (dedupe via `evaluate_command` + the mark-before-execute
 `processed_commands` table protects against re-execution).
+
+Migration 10 appends `processed_commands.outcome` to the unchanged first nine
+migrations. The host saves a terminal command status/resolution before
+acknowledging execution. A relay can finish before the sender-owned command row
+arrives; the drain publishes the durable result on that row without re-executing
+or copying the command. Existing schema-10 Boat stores retain their claims and
+outcomes; older stores append the nullable column once. NULL outcomes retain
+interrupted-execution rejection, never permission to replay.
+
+In-process execution ownership follows the relay/drain future: cancellation
+releases that ownership without clearing durable consumption. Preparation
+receipts are observational, not an execution queue; under the same ownership
+lock, the drain reconciles a saved result or rejects an interrupted claim and
+publishes the watched transcript immediately. Local profile import carries
+known outcomes and fills unknown results without replacing a destination's
+known outcome. Legacy Crew imports keep their unknown-outcome semantics.
 
 **M2. Cutover signal.** The registry chat row gains a `roomGen` field (per-field HLC
 LWW like everything else): absent/1 = s2, 2 = chat2. The host flips it in the same
@@ -223,6 +253,44 @@ explicit request; the real healing is M1.
 - Exit criterion mirroring the registry migration: `churn_stays_bounded` equivalent —
   N days of streaming on a chat2 room, rows never exceed the checkpoint threshold ×2.
 
+### Current staging-native Edge smoke
+
+`edge/scripts/smoke.mjs` exercises the actual Worker over loopback HTTP and
+WebSockets, not the retired session/workspace protocol. It refuses remote hosts
+and requires `AUTH_MODE=dev`, `ENVIRONMENT=local`, and project/deployment `local`.
+It does not contact Scaffold or use real grants, release credentials, or cloud
+storage. From `edge/`, install the locked dependencies with `npm ci`, then run:
+
+```sh
+npx wrangler dev --local --env staging \
+  --ip 127.0.0.1 --port 27640 \
+  --var AUTH_MODE:dev --var ENVIRONMENT:local \
+  --var SCAFFOLD_PROJECT_SCOPE:local \
+  --var SCAFFOLD_DEPLOYMENT_ID:local \
+  --var SCAFFOLD_CONTROL_PLANE_URL:http://127.0.0.1:8788 \
+  --persist-to "$(mktemp -d /tmp/crew-native-edge-smoke.XXXXXX)"
+```
+
+In another terminal, also from `edge/`:
+
+```sh
+node scripts/smoke.mjs http://127.0.0.1:27640
+npx vitest run src/staging-routes.test.ts
+```
+
+The smoke checks two-peer registry backfill and bidirectional row convergence,
+private-user isolation, two-peer chat2 opaque-byte backfill/live relay, ownership,
+checkpoint and Range reads, and private R2 tool-blob round trips through
+`/blob/:chatId/:partId`. It also checks missing/wrong-scope credentials, traversal,
+and retired session/workspace routes. Native `/attachments/*` returns HTTP 410
+(`legacy_attachments_retired`) after authentication: it never acknowledges and
+discards an upload. Legacy migration attachment reads belong only to the separate
+retirement adapter, not this native service.
+
+Use fresh temporary persistence for each run; stop the local Worker and remove
+only that owned temporary directory afterward. This is a synthetic transport
+smoke, not a staging deployment, live migration, or inference verification.
+
 ## Sequencing summary
 
 | Step | What | Size |
@@ -235,3 +303,56 @@ explicit request; the real healing is M1.
 
 Roughly three weeks end-to-end with bake time, front-loaded so the bleeding (new
 whales) stops in the first release.
+
+## Imported original-epoch history publication
+
+An offline Crew import queues ordinary registry upserts, but its retained chat
+host is the absent original guest. Startup registry sync therefore publishes the
+rows; the host-only checkpoint bootstrap cannot publish those cold snapshots.
+Do not adopt the chats or start/recover their old executions to work around this.
+
+After the offline export/import has finished into the fresh **owner controller's
+selected Scaffold profile store**, start that existing native controller with its
+isolated data root, current owner login, project/deployment, and native Edge:
+
+```sh
+comet --data-dir "$OWNER_DATA" --ipc-port "$PORT" \
+  --edge-url "$NATIVE_EDGE" --scaffold-url "$CONTROL" \
+  --project-scope "$PROJECT" --deployment-id "$DEPLOYMENT" headless
+```
+
+In another terminal, publish every explicitly selected terminal session:
+
+```sh
+comet --data-dir "$OWNER_DATA" --ipc-port "$PORT" \
+  session publish-imported "$SESSION1" "$SESSION2"
+```
+
+`OWNER_DATA` is the installation root used for the fresh owner import, not the
+`docs.sqlite3` store directory. This command uses that controller's local IPC;
+it neither creates a guest grant nor reconnects the original physical sandbox.
+Each selected ID invokes `PublishImportedCrewSession {logicalSessionId}`.
+Authenticated DeviceRoom forwarding may additionally supply `targetDeviceId`.
+No caller path, snapshot, proof, or report is accepted. Owner controller authority
+is required locally and on the relay; sandbox/peer capabilities cannot publish.
+
+The RPC first performs the same current-profile verification as
+`VerifyImportedCrewSession`, requires an original-epoch marker, checks the exact
+stored snapshot digest again, and sends those bytes through the native checkpoint
+transport with `seqCovered=0`. It never opens, rebuilds, adopts, or executes the
+session. An advanced room floor fails closed. It then waits up to 120 seconds
+for the ordinary registry sync to acknowledge the original guest device ID,
+session scope, and original-epoch marker. A timeout/error is not publication proof;
+earlier successful uploads remain and the explicit command can be retried.
+Imported source evidence and attachment copies/aliases remain in the owner profile.
+
+The response is `{report, originalEpochHistoryProofJson}`. It is **not** the
+control-plane activation receipt: the control plane independently invokes
+`VerifyImportedCrewSession`, fetches native Edge `GET /chat2/:id/checkpoint`,
+compares the raw body SHA-256 with `report.destinationSnapshotsSha256[id]`, and
+fetches `GET /registry/:project/rows` to verify the original identity/scope/marker
+before its generation-CAS. Never replace those reads with a caller report POST.
+
+Focused checks (not part of the operator procedure):
+`cargo test -p zeron-engine imported_checkpoint_posts_exact_bytes_and_rejects_advanced_floor`
+and `cargo test -p zeron-engine imported_profile_verification`.

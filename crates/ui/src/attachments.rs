@@ -522,6 +522,7 @@ pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
+    chat_id: &str,
     upload_id: &str,
     attachment: &StagedAttachment,
     progress: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -538,6 +539,7 @@ pub async fn upload_attachment(
                 async move {
                     let params = with_target(
                         serde_json::json!({
+                            "chatId": chat_id,
                             "uploadId": upload_id,
                             "seq": seq,
                             "data": &b64[range.clone()],
@@ -595,7 +597,7 @@ pub async fn upload_attachment(
             })
             .await?;
         let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
+            serde_json::json!({ "chatId": chat_id, "uploadId": upload_id, "fileName": attachment.name }),
             target_device_id,
         );
         let reply = call_with_timeout(

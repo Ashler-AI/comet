@@ -454,6 +454,8 @@ struct PersistedState {
     /// to `false`.
     #[serde(default)]
     local_writes: bool,
+    #[serde(default)]
+    sequence_reset: bool,
     rows: Vec<RegistryRow>,
     pending: Vec<PendingBatch>,
 }
@@ -477,6 +479,9 @@ pub struct RegistryDoc {
     /// an edge ever attaches to this replica, every row re-seeds once (see
     /// [`Self::set_local_only`]). Persisted.
     local_writes: bool,
+    /// Directory fences cannot be reused after server rollback, even if the
+    /// generic registry successfully re-seeds its rows with historical HLCs.
+    sequence_reset: bool,
     /// Bumped on every mutation (local or applied) — the engine host converts
     /// this into watch-channel publishes and snapshot debounces.
     generation: u64,
@@ -493,6 +498,7 @@ impl RegistryDoc {
             pending: Vec::new(),
             local_only: false,
             local_writes: false,
+            sequence_reset: false,
             generation: 0,
         }
     }
@@ -504,6 +510,32 @@ impl RegistryDoc {
     /// Sync cursor: the last server seq this replica has fully applied.
     pub fn cursor(&self) -> u64 {
         self.server_seq
+    }
+
+    pub fn directory_reconciliation_required(&self) -> bool {
+        self.sequence_reset
+    }
+
+    /// Server-acknowledged state only. Pending local fields must never acquire
+    /// the server sequence of an older row when used as a projection fence.
+    pub fn acknowledged_row(&self, kind: &str, id: &str) -> Option<&RegistryRow> {
+        self.authoritative.get(kind)?.get(id)
+    }
+
+    /// Bounded inventory, including tombstones; does not materialize the overlay.
+    pub fn acknowledged_rows_after(&self, kind: &str, after: &str, limit: usize) -> Vec<RegistryRow> {
+        let mut page = BTreeMap::new();
+        if let Some(rows) = self.authoritative.get(kind) {
+            for (id, row) in rows {
+                if id.as_str() > after {
+                    page.insert(id, row);
+                    if page.len() > limit.min(64) {
+                        page.pop_last();
+                    }
+                }
+            }
+        }
+        page.into_values().cloned().collect()
     }
 
     /// Monotonic local change counter (any mutation bumps it).
@@ -586,6 +618,7 @@ impl RegistryDoc {
             gc_floor: self.gc_floor,
             clock: self.clock.clone(),
             local_writes: self.local_writes,
+            sequence_reset: self.sequence_reset,
             rows,
             pending: self.pending.clone(),
         };
@@ -615,12 +648,20 @@ impl RegistryDoc {
         doc.gc_floor = state.gc_floor;
         doc.clock = state.clock;
         doc.local_writes = state.local_writes;
+        doc.sequence_reset = state.sequence_reset;
         doc.pending = state.pending;
         for row in state.rows {
             doc.authoritative
                 .entry(row.kind.clone())
                 .or_default()
                 .insert(row.id.clone(), row);
+        }
+        // Older snapshots may have queued imported histories before this gate.
+        for mut batch in std::mem::take(&mut doc.pending) {
+            doc.fold_local_history_ops(&mut batch.ops);
+            if !batch.ops.is_empty() {
+                doc.pending.push(batch);
+            }
         }
         // Nothing is in flight after a load, so the whole queue coalesces —
         // this shrinks snapshots bloated before coalescing existed (178k
@@ -648,6 +689,9 @@ impl RegistryDoc {
         rows: Vec<RegistryRow>,
     ) -> StateOutcome {
         self.generation += 1;
+        self.sequence_reset |= seq < self.server_seq;
+        // Remote frames cannot create or overwrite a profile-local history.
+        let rows = rows.into_iter().filter(|row| !zeron_proto::is_local_history_chat(&row.id));
         if !full {
             for row in rows {
                 self.put_authoritative(row);
@@ -713,7 +757,7 @@ impl RegistryDoc {
     #[must_use]
     pub fn apply_rows(&mut self, seq: u64, rows: Vec<RegistryRow>) -> bool {
         self.generation += 1;
-        for row in rows {
+        for row in rows.into_iter().filter(|row| !zeron_proto::is_local_history_chat(&row.id)) {
             self.put_authoritative(row);
         }
         if seq > self.server_seq + 1 {
@@ -785,7 +829,22 @@ impl RegistryDoc {
         self.clock.next(Self::now_ms(), &device)
     }
 
+    /// Reserved imported histories (including their status and sidebar rows)
+    /// persist in this replica, never in an outgoing registry batch.
+    fn fold_local_history_ops(&mut self, ops: &mut Vec<RowOp>) {
+        ops.retain(|op| {
+            if zeron_proto::is_local_history_chat(&op.id) {
+                self.generation += 1;
+                self.fold_op(op);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn enqueue_ops(&mut self, mut ops: Vec<RowOp>) {
+        self.fold_local_history_ops(&mut ops);
         if ops.is_empty() {
             return;
         }
@@ -1055,6 +1114,8 @@ impl RegistryDoc {
             ("id", json!(device.id)),
             ("name", json!(device.name)),
             ("platform", json!(device.platform)),
+            ("devboxProvider", json!(device.devbox_provider)),
+            ("devboxId", opt_str(device.devbox_id.as_deref())),
             ("lastSeenAt", opt_ms(device.last_seen_at)),
             ("createdAt", opt_ms(device.created_at)),
             ("version", opt_str(device.version.as_deref())),
@@ -1246,6 +1307,7 @@ impl RegistryDoc {
                     .unwrap_or(Value::Null),
             ),
             ("config", config),
+            ("crew", serde_json::to_value(&chat.crew)?),
             (
                 "lastMessagePreview",
                 opt_str(chat.last_message_preview.as_deref()),
@@ -1274,6 +1336,24 @@ impl RegistryDoc {
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
+        Ok(())
+    }
+
+    /// Explicit offline migration only. Keep every supported row field rather
+    /// than round-tripping through a lossy typed projection.
+    pub fn import_crew_row(&mut self, kind: &str, id: &str, fields: BTreeMap<String, Value>) -> Result<(), DocError> {
+        if !matches!(kind, KIND_DEVICES | KIND_SPACES | KIND_CHATS | KIND_PREFERENCES) || id.is_empty() {
+            return Err(DocError::Schema(format!("unsupported Crew registry row {kind}/{id}")));
+        }
+        if self.row_exists(kind, id) {
+            return Err(DocError::Schema(format!("duplicate Crew registry row {kind}/{id}")));
+        }
+        let ms = ["createdAt", "lastSeenAt", "lastMessageAt", "gitCheckedAt", "updatedAt"]
+            .into_iter().filter_map(|key| fields.get(key).and_then(Value::as_i64)).max().unwrap_or(1);
+        self.enqueue_ops(vec![RowOp {
+            kind: kind.into(), id: id.into(), op: OpKind::Upsert, set: Some(fields),
+            hlc: encode_hlc(ms.max(1), 0, "migration"), clocks: None,
+        }]);
         Ok(())
     }
 
@@ -1637,6 +1717,8 @@ impl RegistryDoc {
                     ("id", json!(device.id)),
                     ("name", json!(device.name)),
                     ("platform", json!(device.platform)),
+                    ("devboxProvider", json!(device.devbox_provider)),
+                    ("devboxId", opt_str(device.devbox_id.as_deref())),
                     ("lastSeenAt", opt_ms(device.last_seen_at)),
                     ("createdAt", opt_ms(device.created_at)),
                     ("version", opt_str(device.version.as_deref())),
@@ -1686,6 +1768,7 @@ impl RegistryDoc {
                 fields([
                     ("id", json!(chat.id)),
                     ("deviceId", json!(chat.device_id)),
+                    ("crew", serde_json::to_value(&chat.crew)?),
                     ("title", opt_str(chat.title.as_deref())),
                     ("archived", json!(chat.archived)),
                     ("cwd", opt_str(chat.cwd.as_deref())),

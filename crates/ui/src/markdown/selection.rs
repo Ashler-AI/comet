@@ -60,6 +60,14 @@ pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Offsets retained across frames may now fall inside a character after the
+/// same element's text changes. Use the same left affinity as word selection,
+/// against the text being snapshotted, before publishing a span to consumers.
+fn normalize_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let start = text.floor_char_boundary(range.start);
+    start..text.floor_char_boundary(range.end).max(start)
+}
+
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
 /// `(key, text)` pairs). Handles either direction; empty slices are skipped.
@@ -73,14 +81,14 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
     for (ei, (key, text)) in elements.iter().enumerate().take(end.0 + 1).skip(start.0) {
         let from = if ei == start.0 { start.1 } else { 0 };
         let to = if ei == end.0 { end.1 } else { text.len() };
-        let (from, to) = (from.min(text.len()), to.min(text.len()));
+        let range = normalize_range(text, from..to);
         // Keep empty elements strictly between the endpoints. Rendered code
         // fences register one element per source line, so a blank line must
         // contribute its newline when a selection crosses it.
-        if from < to || (ei > start.0 && ei < end.0) {
+        if !range.is_empty() || (ei > start.0 && ei < end.0) {
             spans.push(Span {
                 key: (*key).to_string(),
-                range: from..to,
+                range,
                 text: (*text).to_string(),
             });
         }
@@ -112,6 +120,7 @@ pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
 
 /// `begin_with_span` on one of several surfaces painted in the same frame.
 pub(crate) fn begin_with_span_in(surface: u64, key: &str, text: &str, range: Range<usize>) {
+    let range = normalize_range(text, range);
     *state().lock().unwrap() = Some(MdSelection {
         surface,
         anchor_key: key.to_string(),
@@ -223,7 +232,14 @@ fn extend_virtualized_drag(
                         .position(|span| span.key == *key)
                         .map(|span_ix| (element_ix, span_ix))
                 })?;
-        let end = existing[span_ix].range.end;
+        // This overlap is inside the selection, not its anchor. If it was
+        // selected through the end, keep covering it through streaming edits.
+        let span = &existing[span_ix];
+        let end = if span.range.end == span.text.len() {
+            elements[element_ix].1.len()
+        } else {
+            span.range.end
+        };
         let mut merged = resolve_spans(elements, head, (element_ix, end));
         merged.extend_from_slice(&existing[span_ix + 1..]);
         Some(merged)
@@ -231,11 +247,14 @@ fn extend_virtualized_drag(
 }
 
 /// Replace the resolved spans (drag update). Returns true if they changed.
-pub fn update_spans(spans: Vec<Span>) -> bool {
+pub fn update_spans(mut spans: Vec<Span>) -> bool {
     let mut guard = state().lock().unwrap();
     let Some(sel) = guard.as_mut() else {
         return false;
     };
+    for span in &mut spans {
+        span.range = normalize_range(&span.text, span.range.clone());
+    }
     if sel.spans == spans {
         return false;
     }
@@ -309,6 +328,19 @@ pub fn selected_text() -> Option<String> {
     Some(join_spans(&sel.spans))
 }
 
+/// Only a single transcript message can be a persistent semantic anchor.
+/// Rendered offsets are not source offsets, so the host reanchors by exact text.
+pub fn selected_message_anchor() -> Option<(String, String)> {
+    let guard = state().lock().unwrap();
+    let selection = guard.as_ref()?;
+    let (message, _) = selection.spans.first()?.key.split_once("#text.")?;
+    if selection.spans.iter().any(|span| span.key.split_once("#text.").map(|(id, _)| id) != Some(message)) {
+        return None;
+    }
+    let exact = join_spans(&selection.spans);
+    (!exact.trim().is_empty() && exact.len() <= 4096).then(|| (message.to_owned(), exact))
+}
+
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
@@ -320,12 +352,7 @@ fn join_spans(spans: &[Span]) -> String {
 /// Word range around `ix` for double-click selection: an alphanumeric/`_`
 /// run, or the single non-space char under the cursor, or empty at spaces.
 pub fn word_range(text: &str, ix: usize) -> Range<usize> {
-    let mut ix = ix.min(text.len());
-    // Snap into a char boundary (mouse indices should already be on one;
-    // defensive against mid-char byte offsets).
-    while ix > 0 && !text.is_char_boundary(ix) {
-        ix -= 1;
-    }
+    let ix = text.floor_char_boundary(ix);
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let before = text[..ix].chars().next_back();
     let at = text[ix..].chars().next();
@@ -457,6 +484,90 @@ mod tests {
         begin_with_span("p1", "hello world", 6..11);
         assert_eq!(wash_range(0, "p1"), Some(6..11));
         assert_eq!(end_drag("p1").as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn semantic_selection_keeps_message_identity_and_bounds() {
+        let _state = test_state_lock();
+        begin_with_span("message-1#text.0:0", "héllo world", 0..6);
+        assert_eq!(selected_message_anchor(), Some(("message-1".into(), "héllo".into())));
+        begin_with_span("file-preview:0", "file text", 0..4);
+        assert_eq!(selected_message_anchor(), None);
+        let oversized = "x".repeat(4097);
+        begin_with_span("message-1#text.0:0", &oversized, 0..oversized.len());
+        assert_eq!(selected_message_anchor(), None);
+        clear_if_owner("message-1#text.0:0");
+    }
+
+    #[test]
+    fn unicode_selection_consumers_share_normalized_snapshots() {
+        let _state = test_state_lock();
+        let key = "message-1#text.0:0";
+        for character in ["—", "中", "🙂"] {
+            let text = format!(" {character} {character}");
+            let end = 1 + character.len();
+            // Both endpoints can come from an older layout. Left affinity
+            // keeps the first complete character and excludes the second.
+            let range = 2..end + 2;
+            let expected = format!("{character} ");
+            for source in 0..3 {
+                match source {
+                    0 => {
+                        begin(key, range.start);
+                        update_drag(&[(key, &text)], (0, range.end));
+                    }
+                    1 => begin_with_span(key, &text, range.clone()),
+                    _ => {
+                        begin(key, range.start);
+                        update_spans(vec![Span {
+                            key: key.into(),
+                            range: range.clone(),
+                            text: text.clone(),
+                        }]);
+                    }
+                }
+                assert_eq!(wash_range(0, key), Some(1..end + 1));
+                assert_eq!(selected_text().as_deref(), Some(expected.as_str()));
+                assert_eq!(selected_message_anchor(), Some(("message-1".into(), expected.clone())));
+                assert_eq!(end_drag(key).as_deref(), Some(expected.as_str()));
+            }
+            begin_with_span(key, &text, word_range(&text, 2));
+            assert_eq!(end_active_drag().as_deref(), Some(character));
+        }
+        clear_if_owner(key);
+    }
+
+    #[test]
+    fn unicode_selection_rebinds_offsets_after_text_updates() {
+        let _state = test_state_lock();
+        let key = "message-1#text.0:0";
+        let prefix = "1234567890123456789012345678901";
+        let old = format!("{prefix}--tail");
+        begin(key, 33);
+        update_drag(&[(key, &old)], (0, 0));
+        assert_eq!(selected_text().as_deref(), Some(&old[..33]));
+        let updated = format!("{prefix}—中🙂");
+        // Byte 33 now lies inside the em dash at 31..34. The same key
+        // survives reparsing, but its old anchor is no longer a boundary.
+        update_drag(&[(key, &updated)], (0, 0));
+        assert_eq!(wash_range(0, key), Some(0..prefix.len()));
+        assert_eq!(selected_message_anchor(), Some(("message-1".into(), prefix.into())));
+        assert_eq!(end_active_drag().as_deref(), Some(prefix));
+
+        // A backwards drag must include the entire updated overlap after
+        // its anchor virtualizes away, not reuse the previous byte length.
+        let last = "message-1#text.2:2";
+        let middle = "message-1#text.1:1";
+        begin(last, "🙂".len());
+        update_drag(&[(middle, "--"), (last, "🙂")], (0, 0));
+        update_drag(&[(key, "—"), (middle, "—中🙂")], (0, 0));
+        let expected = "—\n—中🙂\n🙂";
+        assert_eq!(selected_text().as_deref(), Some(expected));
+        assert_eq!(selected_message_anchor(), Some(("message-1".into(), expected.into())));
+        assert_eq!(end_active_drag().as_deref(), Some(expected));
+        // Copy still uses its snapshots after the registry/text goes away.
+        assert_eq!(selected_text().as_deref(), Some(expected));
+        clear_if_owner(last);
     }
 
     #[test]

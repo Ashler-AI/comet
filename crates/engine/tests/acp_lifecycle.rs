@@ -45,6 +45,7 @@ async fn quiet_acp_prompt_stays_working_until_response() {
             based_on: None,
             expires_at: None,
             status: SessionCommandStatus::Pending,
+            accepted_at: None,
             resolution: None,
         })
         .unwrap();

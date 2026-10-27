@@ -189,11 +189,33 @@ impl Relay {
         }
     }
 
+    /// Non-idempotent control-plane mutations must never retry an ambiguous call.
+    pub(crate) async fn call_once(
+        &self,
+        device_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        let client = self
+            .links
+            .client(device_id)
+            .await
+            .map_err(|e| map_rpc(device_id, method, e))?;
+        match tokio::time::timeout(deadline(method), client.call(method, params)).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(map_rpc(device_id, method, error)),
+            Err(_) => Err(ClientError::HostUnavailable(format!(
+                "{method} outcome unknown; reconcile command id"
+            ))),
+        }
+    }
+
     /// Chunked upload (`UploadChunk` ×N with `seq`, then `UploadCommit`).
     /// Returns the durable host path. Idempotent per `upload_id`.
     pub(crate) async fn upload(
         &self,
         device_id: &str,
+        chat_id: Option<&str>,
         upload_id: &str,
         file_name: &str,
         data: &[u8],
@@ -227,7 +249,7 @@ impl Relay {
                 let report = &report;
                 async move {
                     let params =
-                        json!({ "uploadId": upload_id, "seq": seq, "data": b64::encode(slice) });
+                        json!({ "chatId": chat_id, "uploadId": upload_id, "seq": seq, "data": b64::encode(slice) });
                     let mut last = None;
                     for attempt in 0..3u64 {
                         if attempt > 0 {
@@ -263,7 +285,7 @@ impl Relay {
             .call(
                 device_id,
                 methods::UPLOAD_COMMIT,
-                json!({ "uploadId": upload_id, "fileName": file_name }),
+                json!({ "chatId": chat_id, "uploadId": upload_id, "fileName": file_name }),
             )
             .await?;
         if let Some(progress) = &progress {

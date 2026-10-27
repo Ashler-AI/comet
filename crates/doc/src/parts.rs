@@ -110,6 +110,10 @@ pub enum MessageStatus {
     Streaming,
     Complete,
     Aborted,
+    /// Historical user followup accepted for a later turn; not a queue command.
+    Queued,
+    /// Historical user followup delivered to a steering boundary; not a live run.
+    Steered,
 }
 
 /// Lifecycle of a spawned subagent, carried on its spawn chip.
@@ -437,15 +441,14 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // Tool OUTPUTS never enter the doc (2026-08-10 product
-                    // call: chips are one-liners — name + call info — like
-                    // pre-output builds; the R2 sidecar is parked with them,
-                    // docs/chat2-sync.md A2). Full text lives only in the
-                    // host's run journal. Inline diffs die the same way:
-                    // stats only, never text. `is_error` still folds so
-                    // failed chips read as failed.
-                    let _ = output; // journal-only
-                    *out_slot = None;
+                    // Successful outputs and full diagnostics remain journal-only.
+                    // Keep the existing bounded summary for failures so an expanded
+                    // tool chip explains the error without restoring bulk outputs.
+                    *out_slot = if *is_error {
+                        output.as_deref().and_then(summarize_tool_output)
+                    } else {
+                        None
+                    };
                     *output_bytes = None;
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);

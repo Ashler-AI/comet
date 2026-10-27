@@ -6,6 +6,9 @@ import UIKit
 /// screen paints at once and revalidates. Main-thread only.
 @MainActor
 final class CloudStore {
+    /// Crew keeps the shared upstream ABI for compatibility, but does not
+    /// offer Zeron Cloud, WorkOS provider storage, or billing.
+    private static let enabled = false
     /// The agents Cloud runs, with the vault providers behind them.
     struct Agent: Equatable {
         let harness: String
@@ -52,7 +55,7 @@ final class CloudStore {
 
     // MARK: Reading
 
-    var available: Bool { info?.available ?? false }
+    var available: Bool { Self.enabled && (info?.available ?? false) }
     var credits: Double? { billing.map(\.creditsTotal) ?? info?.credits }
 
     /// Cloud can't start or wake a machine (the desktop's rule).
@@ -88,6 +91,7 @@ final class CloudStore {
 
     /// Re-read the session machines (at most every few seconds).
     func refreshSessions() {
+        guard Self.enabled else { return }
         guard let client, available || info == nil else { return }
         if let last = sessionsRead, Date().timeIntervalSince(last) < 8 { return }
         sessionsRead = Date()
@@ -148,6 +152,7 @@ final class CloudStore {
 
     /// Re-read everything (status first: the rest needs Cloud set up).
     func refresh() {
+        guard Self.enabled else { return }
         guard let client, refreshTask == nil else { return }
         loading = true
         // The task is recorded before anyone hears of the change: an observer
@@ -212,6 +217,7 @@ final class CloudStore {
     private var retryDelay: Double = 30
 
     func refreshAccounts() {
+        guard Self.enabled else { return }
         guard let client else { return }
         Task { [weak self] in
             var lists: [String: [CloudAccountInfo]] = [:]
@@ -231,6 +237,7 @@ final class CloudStore {
 
     /// Re-read every Cloud login's plan usage (keys have none).
     func refreshUsage() {
+        guard Self.enabled else { return }
         guard let client else { return }
         let logins = Self.agents.flatMap { agent in
             (accounts[agent.login] ?? []).map { (agent.login, $0.slot) }
@@ -262,6 +269,7 @@ final class CloudStore {
     }
 
     func refreshGitHub() async {
+        guard Self.enabled else { return }
         guard let client else { return }
         let vault = try? await client.vaultStatus()
         let repos = try? await client.githubRepos(query: nil)
@@ -272,6 +280,7 @@ final class CloudStore {
     }
 
     func refreshBilling() async {
+        guard Self.enabled else { return }
         guard let client else { return }
         let read: Result<BillingInfo, Error>
         do {

@@ -14,6 +14,23 @@ pub struct HarnessConversationLink {
     pub label: &'static str,
     pub url: String,
 }
+/// Legacy routes remain readable; registering the canary must not take over their handlers.
+pub fn crew_link_scope(url: &str) -> Option<zeron_proto::CollaborationScope> {
+    for scheme in ["comet", "comet-staging", "crew-upstream-canary"] {
+        if let Some(link) = zeron_proto::CrewSessionLink::parse_deep_link(url, scheme) {
+            return Some(zeron_proto::CollaborationScope {
+                project_id: link.project_id,
+                deployment_id: link.deployment_id,
+                session_id: Some(link.session_id),
+                unknown: Default::default(),
+            });
+        }
+        if let Some(link) = zeron_proto::ScaffoldSessionLink::parse_deep_link(url, scheme) {
+            return Some(link.scope);
+        }
+    }
+    None
+}
 
 /// Opaque locator: enough to reject links for a different local/synced
 /// workspace without putting device, user, or organization ids in the URL.
@@ -41,9 +58,27 @@ pub fn workspace_locator(
     Some(format!("{:x}", hash.finalize())[..16].to_string())
 }
 
+pub fn crew_session_link(chat: &Chat) -> Option<String> {
+    crew_scope_link(&chat.crew.as_ref()?.scope)
+}
+
+pub fn crew_scope_link(scope: &zeron_proto::CollaborationScope) -> Option<String> {
+    let id = uuid::Uuid::parse_str(scope.session_id.as_deref()?).ok()?;
+    let mut link = format!(
+        "crew-upstream-canary://session/{}/{}",
+        encode_component(&scope.project_id),
+        id
+    );
+    if let Some(deployment) = &scope.deployment_id {
+        link.push_str("?deploymentId=");
+        link.push_str(&encode_component(deployment));
+    }
+    Some(link)
+}
+
 pub fn zeron_conversation_link(chat_id: &str, workspace: &str) -> String {
     format!(
-        "zeron://open/chat/{}?workspace={}",
+        "crew-upstream-canary://open/chat/{}?workspace={}",
         encode_component(chat_id),
         encode_component(workspace)
     )
@@ -51,16 +86,17 @@ pub fn zeron_conversation_link(chat_id: &str, workspace: &str) -> String {
 
 pub fn parse_zeron_conversation_link(url: &str) -> Result<ConversationDeepLink, &'static str> {
     let rest = url
-        .strip_prefix("zeron://open/chat/")
-        .ok_or("not a Zeron conversation link")?;
+        .strip_prefix("crew-upstream-canary://open/chat/")
+        .or_else(|| url.strip_prefix("zeron://open/chat/"))
+        .ok_or("not a Crew conversation link")?;
     let (chat_id, query) = rest.split_once('?').ok_or("missing workspace locator")?;
     if chat_id.is_empty() || chat_id.contains('/') {
         return Err("invalid conversation id");
     }
     let workspace = query
-        .split('&')
-        .find_map(|part| part.strip_prefix("workspace="))
-        .ok_or("missing workspace locator")?;
+        .strip_prefix("workspace=")
+        .filter(|value| !value.is_empty() && !value.contains('&') && !value.contains('#'))
+        .ok_or("invalid workspace locator or unexpected link parameters")?;
     Ok(ConversationDeepLink {
         chat_id: decode_component(chat_id)?,
         workspace: decode_component(workspace)?,
@@ -120,6 +156,8 @@ mod tests {
 
     fn harness_chat(harness: HarnessId) -> Chat {
         Chat {
+            crew: None,
+            harness_session_harness: None,
             id: "chat".into(),
             device_id: "device".into(),
             title: None,
@@ -142,7 +180,6 @@ mod tests {
             created_at: chrono::DateTime::UNIX_EPOCH,
             harness_session_id: Some("thread/one".into()),
             harness_session_cwd: None,
-            harness_session_harness: None,
             parent_chat_id: None,
             space_id: None,
             last_seen_at: None,
@@ -229,5 +266,28 @@ mod tests {
             "codex://threads/thread%2Fone"
         );
         assert!(harness_conversation_link(&harness_chat(HarnessId::Hermes)).is_none());
+    }
+
+    #[test]
+    fn crew_links_preserve_scope_without_credentials() {
+        let session = "011664b5-3660-4fe6-83a2-3647fa6a2f65";
+        for scheme in ["comet", "comet-staging", "crew-upstream-canary"] {
+            let scope = crew_link_scope(&format!(
+                "{scheme}://session/project/{session}?deploymentId=canary"
+            ))
+            .unwrap();
+            assert_eq!(scope.project_id, "project");
+            assert_eq!(scope.deployment_id.as_deref(), Some("canary"));
+            assert_eq!(scope.session_id.as_deref(), Some(session));
+            assert!(
+                crew_link_scope(&format!(
+                    "{scheme}://session/project/{session}?token=secret"
+                ))
+                .is_none()
+            );
+        }
+        let link = zeron_conversation_link("same-session", "scope");
+        assert!(link.starts_with("crew-upstream-canary://"));
+        assert!(parse_zeron_conversation_link(&format!("{link}&token=secret")).is_err());
     }
 }

@@ -57,7 +57,8 @@ final class RemoteVoiceController {
 
     /// Voice controls appear once any registered host can run them.
     var available: Bool {
-        Self.forced || (app?.client?.devices().contains(where: Self.compatible) ?? false)
+        if app?.crewStorageKey != nil { return false }
+        return Self.forced || (app?.client?.devices().contains(where: Self.compatible) ?? false)
     }
 
     private var preferenceKey: String {
@@ -92,7 +93,7 @@ final class RemoteVoiceController {
     /// when there is no host to call; the caller offers the picker.
     @discardableResult
     func start(host: DeviceView? = nil) -> Bool {
-        guard !live, let client = app?.client, let device = host ?? startHost else { return false }
+        guard app?.crewStorageKey == nil, !live, let client = app?.client, let device = host ?? startHost else { return false }
         if host != nil { selectedHost = device.id }
         generation &+= 1
         state = nil; endReason = nil; muted = false; activeSince = nil
@@ -245,13 +246,13 @@ final class RemoteVoiceController {
 
     static func message(for reason: VoiceEndReason, host: String) -> String {
         switch reason {
-        case .microphoneDenied: return "Zeron needs microphone access to talk with Codex."
+        case .microphoneDenied: return "Crew needs microphone access to talk with Codex."
         case .audioUnavailable: return "The audio connection closed. Start a new call to reconnect."
         case .signInRequired: return "Sign in to Codex with ChatGPT on \(host)."
         case .usageUnavailable: return "Codex usage is currently unavailable on \(host)."
         case .busy: return "\(host) is already on a voice call."
         case .hostUnavailable: return "\(host) isn't reachable right now."
-        case .hostIncompatible: return "Update Zeron on \(host) and enable remote voice there."
+        case .hostIncompatible: return "Update Crew on \(host) and enable remote voice there."
         case .connectionLost: return "The call dropped. Start a new one to reconnect."
         }
     }

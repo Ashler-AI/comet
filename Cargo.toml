@@ -32,6 +32,7 @@ members = [
     "crates/zatex",
     "apps/zeron",
 ]
+exclude = ["vendor/loro-internal-1.13.9"]
 
 [workspace.package]
 version = "0.2.129"
@@ -120,12 +121,18 @@ similar = "2"
 
 # async / net
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 libc = "0.2"
 gethostname = "1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 async-trait = "0.1"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+base64 = "0.22"
+percent-encoding = "2"
 
 # serialization
 serde = { version = "1", features = ["derive"] }
@@ -210,3 +217,7 @@ inherits = "release"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Pinned native metadata/operation inspection without expanding the history cache.
+[patch.crates-io]
+loro-internal = { path = "vendor/loro-internal-1.13.9" }

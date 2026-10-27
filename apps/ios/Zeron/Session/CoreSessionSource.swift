@@ -313,7 +313,7 @@ final class CoreSessionSource: SessionSource {
         let note: String? = canSwitchProvider ? nil
             : turnRunning ? "You can switch provider when this turn ends."
             : hostSwitchesProviders ? nil
-            : "This computer needs a newer Zeron to switch provider."
+            : "This computer needs a newer Crew to switch provider."
         let host = row.isCloud ? (name: "Cloud", symbol: "cloud") : (name: app?.deviceName(hostDevice) ?? "This computer", symbol: "desktopcomputer")
         // No model of its own: it runs the default, so that's the one ticked.
         let current = row.model ?? defaultModel(for: row)?.id

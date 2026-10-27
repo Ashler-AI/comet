@@ -6,6 +6,40 @@
 use super::*;
 use zeron_proto::{HarnessId, SandboxLevel, SessionStatus};
 
+#[test]
+fn imported_local_history_survives_registry_sync_without_publication() {
+    let id = "local-chat-0123456789abcdef";
+    let mut doc = RegistryDoc::new("dev-a");
+    let mut imported = chat(id, "dev-a");
+    imported.harness_session_id = Some("native-original".into());
+    imported.cwd = Some("/repo".into());
+    doc.upsert_chat(&imported).unwrap();
+    doc.upsert_session(&session(id, "dev-a", SessionStatus::Idle)).unwrap();
+    assert!(doc.take_pushable().is_empty());
+    doc.change_sidebar_pin(&zeron_proto::SidebarPinChange::Pin {
+        session_id: id.into(), after: None, before: None,
+    }).unwrap();
+    assert!(doc.take_pushable().iter().flat_map(|batch| &batch.ops).all(|op| op.id != id));
+    let mut doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
+    let mut forged = doc.acknowledged_row(KIND_CHATS, id).unwrap().clone();
+    forged.deleted = true;
+    forged.seq = 50;
+    doc.apply_state(50, true, 0, vec![forged.clone()]);
+    assert!(doc.apply_rows(51, vec![forged]));
+    doc.apply_state(0, true, 0, vec![]); // server rollback/reseed
+    doc.set_local_only(true);
+    doc.rename_chat(id, "continued locally").unwrap();
+    doc.set_local_only(false);
+    let actual = doc.chat(id).unwrap().unwrap();
+    assert_eq!(actual.harness_session_id, imported.harness_session_id);
+    assert_eq!(actual.cwd, imported.cwd);
+    assert_eq!(actual.title.as_deref(), Some("continued locally"));
+    assert!(actual.crew.is_none());
+    assert_eq!(doc.read_sessions().unwrap().len(), 1);
+    assert!(doc.sidebar_preferences().unwrap().pinned_session_ids.contains(&id.to_string()));
+    assert!(doc.take_pushable().iter().flat_map(|batch| &batch.ops).all(|op| op.id != id));
+}
+
 fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
 }
@@ -242,6 +276,8 @@ fn device(id: &str, name: &str) -> Device {
         id: id.into(),
         name: name.into(),
         platform: "linux".into(),
+        devbox_provider: None,
+        devbox_id: None,
         last_seen_at: Some(ts(1_000)),
         created_at: Some(ts(500)),
         version: Some("0.1.0".into()),
@@ -251,35 +287,29 @@ fn device(id: &str, name: &str) -> Device {
 }
 
 fn chat(id: &str, device_id: &str) -> Chat {
-    Chat {
-        id: id.into(),
-        device_id: device_id.into(),
-        title: Some("First chat".into()),
-        archived: false,
-        cwd: Some("/tmp/repo".into()),
-        branch: Some("main".into()),
-        checkout_id: None,
-        source_context: None,
-        config: Some(ChatConfig {
-            harness: HarnessId::Mock,
-            model: Some("mock-1".into()),
-            reasoning: None,
-            model_options: Default::default(),
-            sandbox: SandboxLevel::WorkspaceWrite,
-            access: Default::default(),
-            plan: false,
-        }),
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: ts(2_000),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        harness_session_harness: None,
-        parent_chat_id: Some("parent-chat".into()),
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None,
-    }
+    Chat { id: id.into(), crew: None, device_id: device_id.into(),
+    title: Some("First chat".into()),
+    archived: false,
+    cwd: Some("/tmp/repo".into()),
+    branch: Some("main".into()),
+    checkout_id: None,
+    source_context: None,
+    config: Some(ChatConfig {
+        harness: HarnessId::Mock,
+        model: Some("mock-1".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    }),
+    last_message_preview: None,
+    last_message_at: None,
+    created_at: ts(2_000),
+    harness_session_id: None,
+    harness_session_cwd: None,
+    parent_chat_id: Some("parent-chat".into()),
+    space_id: None,
+    last_seen_at: None,
+    room_gen: None, }
 }
 
 fn space(id: &str, device_id: &str, path: &str) -> Space {
@@ -292,7 +322,6 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
         git_checked_at: None,
         checkout_id: None,
         repository_id: None,
-        github_repo: None,
         created_at: ts(1_500),
     }
 }
@@ -300,8 +329,6 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
         last_completed_turn: None,
-        last_turn_outcome: None,
-        terminal_activity: None,
         running_subagents: 0,
         chat_id: chat_id.into(),
         device_id: device_id.into(),
@@ -309,49 +336,6 @@ fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
         started_at: Some(ts(3_000)),
         updated_at: ts(3_500),
     }
-}
-
-#[test]
-fn program_activity_and_native_outcome_survive_replication_and_restart() {
-    use zeron_proto::{
-        DoneStatus, ProgramInputKind, ProgramState, ProgramStatus, TerminalActivity,
-    };
-    let now = ts(3_500);
-    let mut host = RegistryDoc::new("host");
-    let mut viewer = RegistryDoc::new("viewer");
-    let mut row = session("chat", "host", SessionStatus::Idle);
-    row.last_turn_outcome = Some(zeron_proto::NativeTurnOutcome {
-        status: DoneStatus::Interrupted,
-        finished_at: now,
-    });
-    row.terminal_activity = Some(TerminalActivity {
-        terminal_id: "pty".into(),
-        updated_at: ts(3_400),
-        report: ProgramStatus {
-            id: "worker".into(),
-            state: ProgramState::Blocked,
-            kind: Some(ProgramInputKind::Auth),
-            app: Some("demo".into()),
-            title: None,
-            message: Some("Sign in".into()),
-            progress: None,
-        },
-    });
-    host.upsert_session(&row).unwrap();
-    let mut server = HashMap::new();
-    let mut seq = 0;
-    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
-    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
-    let restored = RegistryDoc::from_bytes(&viewer.to_bytes().unwrap(), "viewer").unwrap();
-    assert_eq!(restored.read_sessions().unwrap(), vec![row.clone()]);
-    row.terminal_activity = None;
-    row.last_turn_outcome = Some(zeron_proto::NativeTurnOutcome {
-        status: DoneStatus::Completed,
-        finished_at: now,
-    });
-    host.upsert_session(&row).unwrap();
-    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
-    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }
 
 /// Stand-in for the server: applies every pushable batch from `docs` to a row
@@ -393,6 +377,43 @@ fn server_round(
     }
     for (i, batch) in acks {
         docs[i].ack_batch(&batch, *seq);
+    }
+}
+
+#[test]
+fn immutable_provider_identity_survives_workspace_migration_sync_and_restart() {
+    for (provider, id) in [
+        (zeron_proto::DeviceEnvironment::Namespace, "ofpf7g22n4412"),
+        (zeron_proto::DeviceEnvironment::Boat, "bx_jdyh7avc"),
+    ] {
+        let mut row = device("remote", "A display name is not an identity");
+        row.devbox_provider = Some(provider);
+        row.devbox_id = Some(id.into());
+        assert_eq!(row.devbox_binding(), Some((provider, id)));
+        let legacy = crate::WorkspaceDoc::new();
+        legacy.upsert_device(&row).unwrap();
+        let imported = crate::WorkspaceDoc::new();
+        imported.doc().import(&legacy.export_snapshot().unwrap()).unwrap();
+        let mut owner = RegistryDoc::new("remote");
+        owner.seed_from_workspace(&imported.read_all().unwrap()).unwrap();
+        let mut peer = RegistryDoc::new("peer");
+        let mut server = HashMap::new();
+        let mut seq = 0;
+        server_round(&mut server, &mut seq, &mut [&mut owner, &mut peer]);
+        assert_eq!(peer.read_devices().unwrap(), vec![row.clone()]);
+        row.name = "Renamed remote".into();
+        owner.upsert_device(&row).unwrap();
+        server_round(&mut server, &mut seq, &mut [&mut owner, &mut peer]);
+        let reopened = RegistryDoc::from_bytes(&peer.to_bytes().unwrap(), "peer").unwrap();
+        assert_eq!(reopened.read_devices().unwrap(), vec![row]);
+    }
+    let old = device("old", "bx_jdyh7avc");
+    assert_eq!(old.devbox_binding(), None);
+    let mut invalid = old;
+    invalid.devbox_provider = Some(zeron_proto::DeviceEnvironment::Boat);
+    for id in ["ofpf7g22n4412", "bx_jdyh7av0", "bx_jdyh7avc\n", ""] {
+        invalid.devbox_id = Some(id.into());
+        assert_eq!(invalid.devbox_binding(), None);
     }
 }
 
@@ -622,7 +643,6 @@ fn spaces_round_trip_and_mutate() {
             true,
             Some("checkout-abc"),
             Some("github.com/owner/project"),
-            Some("acme/app"),
             ts(4_000),
         )
         .unwrap()
@@ -637,10 +657,7 @@ fn spaces_round_trip_and_mutate() {
     assert_eq!(row.git_checked_at, Some(ts(4_000)));
 
     assert!(!ws.rename_space("nope", Some("x")).unwrap());
-    assert!(
-        !ws.set_space_git("nope", true, None, None, None, ts(1))
-            .unwrap()
-    );
+    assert!(!ws.set_space_git("nope", true, None, None, ts(1)).unwrap());
 }
 
 #[test]
@@ -1365,83 +1382,6 @@ fn sidebar_sections_keep_placed_order_across_devices() {
     );
     a.write_sidebar_location("one", "later");
     assert_eq!(order(&a), ["legacy", "two", "three"]);
-}
-
-#[test]
-fn sidebar_sections_reorder_and_converge_across_devices() {
-    use zeron_proto::SidebarSectionChange::*;
-    let mut a = RegistryDoc::new("a");
-    let mut b = RegistryDoc::new("b");
-    let mut server = HashMap::new();
-    let mut seq = 0;
-    let create = |doc: &mut RegistryDoc, id: &str| {
-        section_change(
-            doc,
-            Create {
-                id: id.into(),
-                name: id.into(),
-            },
-        )
-    };
-    let moved = |doc: &mut RegistryDoc, id: &str, after: Option<&str>, before: Option<&str>| {
-        section_change(
-            doc,
-            Move {
-                id: id.into(),
-                after: after.map(Into::into),
-                before: before.map(Into::into),
-            },
-        )
-    };
-    let order = |doc: &RegistryDoc| {
-        doc.sidebar_preferences()
-            .unwrap()
-            .sections
-            .into_iter()
-            .map(|s| s.id)
-            .collect::<Vec<_>>()
-    };
-    for id in ["one", "two", "three"] {
-        create(&mut a, id);
-    }
-    // Unmoved sections keep creation order.
-    assert_eq!(order(&a), ["one", "two", "three"]);
-    moved(&mut a, "three", None, Some("one"));
-    assert_eq!(order(&a), ["three", "one", "two"]);
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert_eq!(order(&b), ["three", "one", "two"]);
-    // A section created later, keyless as an older engine writes it, appends.
-    create(&mut b, "four");
-    assert_eq!(order(&b), ["three", "one", "two", "four"]);
-    // Concurrent moves of different sections both survive.
-    moved(&mut a, "one", Some("two"), None);
-    moved(&mut b, "four", None, Some("three"));
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert_eq!(order(&a), order(&b));
-    assert_eq!(order(&a), ["four", "three", "two", "one"]);
-    // Concurrent moves of the same section: the later one wins everywhere.
-    moved(&mut a, "two", None, Some("four"));
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    moved(&mut b, "two", Some("one"), None);
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert_eq!(order(&a), order(&b));
-    assert_eq!(order(&a), ["four", "three", "one", "two"]);
-    // Moving a deleted section is a no-op, and its anchors may be gone.
-    section_change(&mut a, Delete { id: "three".into() });
-    moved(&mut a, "three", None, Some("four"));
-    moved(&mut a, "one", Some("three"), None);
-    assert_eq!(order(&a), ["four", "two", "one"]);
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    // Keying a new section leaves the keyed ones alone, so a concurrent
-    // move on another device survives a later move that keys it.
-    moved(&mut a, "one", None, Some("four"));
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    create(&mut b, "five");
-    moved(&mut b, "two", Some("five"), None);
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert_eq!(order(&a), order(&b));
-    assert_eq!(order(&a), ["one", "four", "five", "two"]);
 }
 
 #[test]
@@ -2355,25 +2295,36 @@ fn attaching_an_edge_after_local_only_writes_reseeds_them() {
 }
 
 #[test]
-fn a_deleted_device_row_reads_as_deleted_not_unknown() {
-    let mut ws = RegistryDoc::new("dev-a");
-    ws.upsert_device(&device("laptop", "Laptop")).unwrap();
-    assert!(!ws.device_deleted("laptop"));
-    assert!(!ws.device_deleted("never-heard-of"));
-    // The edge tombstones a deleted Cloud session's device.
-    let _ = ws.apply_rows(
-        1,
-        vec![RegistryRow::tombstone(
-            KIND_DEVICES,
-            "cloud-1",
-            hlc_by(5_000, "cloud-edge"),
-        )],
-    );
-    assert!(ws.device_deleted("cloud-1"));
-    assert!(ws.read_devices().unwrap().iter().all(|d| d.id != "cloud-1"));
-    // A device that comes back revives its row.
-    let mut back = device("cloud-1", "Cloud session");
-    back.last_seen_at = Some(ts(9_000));
-    ws.upsert_device(&back).unwrap();
-    assert!(!ws.device_deleted("cloud-1"));
+fn directory_projection_never_labels_pending_rename_with_acknowledged_sequence() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    assert!(doc.acknowledged_row(KIND_CHATS, "chat-1").is_none());
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut doc]);
+    let before = doc.acknowledged_row(KIND_CHATS, "chat-1").unwrap().clone();
+    doc.rename_chat("chat-1", "Manual rename").unwrap();
+    assert_eq!(doc.chat("chat-1").unwrap().unwrap().title.as_deref(), Some("Manual rename"));
+    assert_eq!(doc.acknowledged_row(KIND_CHATS, "chat-1"), Some(&before));
+    server_round(&mut server, &mut seq, &mut [&mut doc]);
+    let acknowledged = doc.acknowledged_row(KIND_CHATS, "chat-1").unwrap();
+    assert!(acknowledged.seq > before.seq);
+    assert_eq!(acknowledged.fields["title"], json!("Manual rename"));
+    assert!(acknowledged.clocks["title"] > before.clocks["title"]);
+    doc.delete_chat("chat-1").unwrap();
+    assert!(!doc.acknowledged_row(KIND_CHATS, "chat-1").unwrap().deleted);
+    server_round(&mut server, &mut seq, &mut [&mut doc]);
+    assert!(doc.acknowledged_rows_after(KIND_CHATS, "", 64)[0].deleted);
+}
+
+#[test]
+fn directory_sequence_reset_requires_reconciliation_even_after_reseed_and_restart() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.apply_state(40, true, 0, Vec::new());
+    assert!(!doc.directory_reconciliation_required());
+    doc.apply_state(2, true, 0, Vec::new());
+    assert!(doc.directory_reconciliation_required());
+    doc.apply_state(80, true, 0, Vec::new());
+    let restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
+    assert!(restored.directory_reconciliation_required());
 }

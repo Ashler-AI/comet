@@ -421,6 +421,7 @@ case "$first" in
   emit '{"type":"result","subtype":"success","is_error":false,"result":"only","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-qc"}'
   emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$fid\",\"state\":\"completed\"}"
   emit "{\"type\":\"command_lifecycle\",\"command_uuid\":\"$sid\",\"state\":\"cancelled\"}"
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"after cancellation"}}}'
   exec sleep 30
   ;;
 

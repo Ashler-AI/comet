@@ -57,10 +57,6 @@
     {
       "binding": "BLOBS",
       "bucket_name": "zeron-transport-385-20260915"
-    },
-    {
-      "binding": "RELEASES",
-      "bucket_name": "zeron-transport-385-20260915"
     }
   ],
   "vars": {

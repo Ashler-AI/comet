@@ -204,7 +204,7 @@ impl Runner {
         if !self.host.granted.iter().any(|c| c == "sessionMcp") {
             tracing::warn!(
                 target: "zeron_harness::muse",
-                "this Muse Code build cannot take session MCP servers; running without Zeron's"
+                "this Muse Code build cannot take session MCP servers; running without Crew's"
             );
             return None;
         }

@@ -235,7 +235,7 @@ impl Client {
                             crate::provider_login::http_response(
                                 "502 Bad Gateway",
                                 &[("Content-Type", "text/plain; charset=utf-8")],
-                                "The computer didn't accept the sign-in. Go back to Zeron and try again.",
+                                "The computer didn't accept the sign-in. Go back to Crew and try again.",
                             )
                             .as_bytes(),
                         )

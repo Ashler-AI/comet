@@ -19,6 +19,7 @@ mod session;
 mod voice;
 pub use voice::*;
 mod types;
+mod crew;
 
 use std::sync::Arc;
 

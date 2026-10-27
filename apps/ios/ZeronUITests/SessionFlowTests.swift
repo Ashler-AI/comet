@@ -607,7 +607,7 @@ final class SessionFlowTests: XCTestCase {
         older.buttons["composer-chip-model"].tap()
         XCTAssertTrue(older.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'")).firstMatch.waitForExistence(timeout: 5))
         XCTAssertFalse(older.buttons["model-picker-tab-codex"].exists, "an older host keeps its provider")
-        XCTAssertTrue(older.staticTexts["This computer needs a newer Zeron to switch provider."].exists)
+        XCTAssertTrue(older.staticTexts["This computer needs a newer Crew to switch provider."].exists)
         // A chat started without picking a model runs (and shows) the default.
         XCTAssertTrue(older.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-' AND value == 'Current'")).firstMatch.waitForExistence(timeout: 5), "the default model is ticked")
         older.buttons["model-picker-close"].tap()

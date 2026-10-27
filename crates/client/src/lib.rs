@@ -31,6 +31,8 @@ mod client;
 pub mod cloud;
 pub mod config;
 pub mod connectivity;
+pub mod crew;
+pub mod legacy;
 mod demo;
 pub mod error;
 pub mod events;

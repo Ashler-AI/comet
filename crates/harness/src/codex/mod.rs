@@ -834,6 +834,31 @@ impl CodexHarness {
         title_only: bool,
         idle: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
+        if let Some(source) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.fork_from.as_deref())
+            && (request.resume.as_deref() != Some(source) || title_only)
+        {
+            return Err(HarnessError::Protocol(
+                "Crew fork source does not match Codex resume".into(),
+            ));
+        }
+        if let Some(route) = controls
+            .context
+            .as_ref()
+            .and_then(|context| context.inference.as_ref())
+        {
+            request.model = Some(
+                route
+                    .model
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&route.model)
+                    .to_owned(),
+            );
+        }
         let native = command_request(&request.prompt, "")?;
         if native
             .as_ref()
@@ -874,7 +899,7 @@ impl CodexHarness {
             client,
             incoming,
             stderr_tail,
-        } = spawn_app_server(&exe, &request)?;
+        } = spawn_app_server(&exe, &request, controls.context.as_ref())?;
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             title_only,
@@ -906,13 +931,36 @@ struct AppServer {
     stderr_tail: crate::StderrTail,
 }
 
-fn spawn_app_server(exe: &Path, request: &RunRequest) -> Result<AppServer, HarnessError> {
+fn spawn_app_server(
+    exe: &Path,
+    request: &RunRequest,
+    context: Option<&crate::RunContext>,
+) -> Result<AppServer, HarnessError> {
     let mut cmd = Command::new(exe);
     cmd.arg("app-server");
+    if let Some(route) = context.and_then(|context| context.inference.as_ref()) {
+        let base_url =
+            serde_json::to_string(&format!("{}/v1", route.base_url.trim_end_matches('/')))
+                .expect("loopback URL serializes");
+        for setting in [
+            "model_provider=\"crew\"".to_string(),
+            "model_providers.crew.name=\"Crew Agent Auth\"".to_string(),
+            format!("model_providers.crew.base_url={base_url}"),
+            "model_providers.crew.env_key=\"COMET_INFERENCE_TOKEN\"".to_string(),
+            "model_providers.crew.wire_api=\"responses\"".to_string(),
+            "model_providers.crew.requires_openai_auth=false".to_string(),
+            "model_providers.crew.supports_websockets=false".to_string(),
+            "model_providers.crew.request_max_retries=0".to_string(),
+            "model_providers.crew.stream_max_retries=0".to_string(),
+        ] {
+            cmd.arg("-c").arg(setting);
+        }
+    }
     crate::compose_child_path(&mut cmd, exe);
     // Host-resolved credentials (a Cloud device's managed CODEX_HOME,
     // GH_TOKEN, …). Absent on laptops: the CLI's own login is used.
     crate::apply_run_env(&mut cmd, &request.env);
+    crate::apply_run_context(&mut cmd, context);
     if !request.cwd.is_empty() {
         cmd.current_dir(&request.cwd);
     }
@@ -1003,7 +1051,7 @@ fn initialize_params(opt_out: bool) -> Value {
     json!({
         "clientInfo": {
             "name": "zeron-native",
-            "title": "Zeron",
+            "title": "Crew",
             "version": env!("CARGO_PKG_VERSION"),
         },
         "capabilities": capabilities,
@@ -1289,7 +1337,7 @@ fn command_request(
         | "diff" | "mention" | "mcp" | "skills" | "plan" | "fast" | "logout" | "quit" | "exit"
         | "init" | "rename" | "feedback" | "ps" | "stop" | "clean" | "archive" | "delete" => {
             Err(HarnessError::Protocol(format!(
-                "/{name} is not mapped in Zeron's Codex integration. Available commands: /compact and /review."
+                "/{name} is not mapped in Crew's Codex integration. Available commands: /compact and /review."
             )))
         }
         _ => Ok(None),
@@ -1350,7 +1398,14 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
+        context,
     } = controls;
+    let managed = context
+        .as_ref()
+        .is_some_and(|context| context.inference.is_some());
+    let fork_from = context
+        .as_ref()
+        .and_then(|context| context.fork_from.as_deref());
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
@@ -1406,6 +1461,9 @@ async fn run_session(session: Session) {
             if mcp.side_chats_only() {
                 overrides.extend(agent_tools_off());
             }
+        }
+        if managed {
+            p.insert("modelProvider".into(), "crew".into());
         }
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(sandbox).into());
@@ -1483,7 +1541,7 @@ async fn run_session(session: Session) {
                 }
             }
             attempt += 1;
-            match spawn_app_server(&executable, &request) {
+            match spawn_app_server(&executable, &request, context.as_ref()) {
                 Ok(next) => {
                     child = next.child;
                     client = next.client;
@@ -1534,7 +1592,7 @@ async fn run_session(session: Session) {
 
     // ---- thread + first turn (interruptible) ------------------------------
     let setup = async {
-        if realtime.is_some() {
+        if realtime.is_some() && !managed {
             // Codex's first account/read announces the initial auth snapshot
             // via account/updated. Load it before attaching the voice router,
             // which must keep aborting media on subsequent identity updates.
@@ -1561,37 +1619,31 @@ async fn run_session(session: Session) {
                 }
             }
         }
-        let mut restore_notice = None;
+        let restore_notice: Option<String> = None;
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
-            match resume_thread(&client, Value::Object(p))
-                .await
-                .map_err(|e| (resume_unrecoverable(&e), e))
-            {
-                Ok(thread) => thread,
-                // A missing/unreadable/foreign rollout falls back to a fresh
-                // thread — visibly: the reply will not know the earlier
-                // conversation. The log keeps Codex's own words.
-                Err((Some(reason), e)) => {
-                    if command_request(&request.prompt, resume)?.is_some() {
-                        return Err(e);
-                    }
-                    tracing::warn!(
-                        target: "zeron_harness::codex",
-                        "thread/resume failed (starting fresh): {e}"
-                    );
-                    restore_notice = Some(format!(
-                        "Couldn't restore the earlier Codex conversation ({reason}), so this \
-                         reply starts a new one without its context."
+            if let Some(source) = fork_from {
+                if source != resume || title_only {
+                    return Err(HarnessError::Protocol(
+                        "Crew fork source does not match Codex resume".into(),
                     ));
-                    client
-                        .request("thread/start", Value::Object(start_params.clone()))
-                        .await?
                 }
-                // A dead process or a refusal a fresh thread would hit too:
-                // fail the run rather than silently dropping its history.
-                Err((None, e)) => return Err(e),
+                p.insert("deferGoalContinuation".into(), Value::Bool(true));
+                let thread = client.request("thread/fork", Value::Object(p)).await?;
+                if thread["thread"]["id"]
+                    .as_str()
+                    .is_none_or(|id| id.is_empty() || id == source)
+                {
+                    return Err(HarnessError::Protocol(
+                        "Codex fork did not create a distinct native identity".into(),
+                    ));
+                }
+                thread
+            } else {
+                // Resume may unarchive the exact thread, but must never replace
+                // it with a fresh conversation when its history is unavailable.
+                resume_thread(&client, Value::Object(p)).await?
             }
         } else {
             client
@@ -2699,7 +2751,7 @@ fn handle_server_request(
             let mode = params["mode"].as_str().unwrap_or_default();
             tracing::info!(
                 target: "zeron_harness::codex",
-                mode, "declining an MCP elicitation Zeron can't ask"
+                mode, "declining an MCP elicitation Crew can't ask"
             );
             client.respond(&id, elicitation::decline());
             return;

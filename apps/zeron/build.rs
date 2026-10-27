@@ -1,4 +1,12 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=COMET_DEFAULT_ENVIRONMENT");
+    println!("cargo:rustc-check-cfg=cfg(comet_default_environment, values(\"canary\", \"staging\", \"production\"))");
+    let environment = match std::env::var("COMET_DEFAULT_ENVIRONMENT") {
+        Ok(value) if matches!(value.as_str(), "canary" | "staging" | "production") => value,
+        Err(std::env::VarError::NotPresent) => "canary".into(),
+        _ => panic!("COMET_DEFAULT_ENVIRONMENT must be canary, staging, or production"),
+    };
+    println!("cargo:rustc-cfg=comet_default_environment=\"{environment}\"");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         let plist = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../dist/macos/Info-unbundled.plist");

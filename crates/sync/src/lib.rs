@@ -13,9 +13,19 @@
 pub mod budget;
 pub mod chat_client;
 pub mod chat_frames;
+pub mod crew_backup;
+pub mod crew_backup_assets;
+mod crew_backup_terminal;
+pub mod crew_desktop_backup;
+pub mod crew_import;
+mod crew_import_aliases;
+mod crew_import_epoch;
+mod crew_import_recovery;
+pub mod crew_remote_backup;
 pub mod dial;
 pub mod net_path;
 pub mod registry;
+pub mod scaffold_auth;
 pub mod socket;
 mod store;
 mod sync_jobs;
@@ -29,4 +39,4 @@ pub use registry::{
     ReconnectState, RegistryClient, RegistryEvent, RegistryTransport, RegistryTuning,
 };
 pub use store::{DocsStore, StoreError};
-pub use types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
+pub use types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlLease, UrlProvider};

@@ -386,19 +386,6 @@ impl PullRequestsPage {
         -self.board_list.scroll_px_offset_for_scrollbar().y
     }
 
-    /// Show `items` as a loaded board, without an engine.
-    #[cfg(test)]
-    pub(crate) fn show_test_items(
-        &mut self,
-        items: Vec<ChangeRequestListItem>,
-        cx: &mut Context<Self>,
-    ) {
-        self.items = items;
-        self.view_items = None;
-        self.load_state = PullRequestsLoadState::Ready;
-        cx.notify();
-    }
-
     /// The board's rows for the current list, view, stars and collapsed
     /// groups. Rebuilt only when one of those changes; the list state is
     /// spliced so the row at the top of the viewport stays put.
@@ -1021,7 +1008,10 @@ impl PullRequestsPage {
             return;
         };
         if !state.device_online(&device, Utc::now()) {
-            crate::toast::error(cx, "This device is offline. Reconnect it to open the project.");
+            crate::toast::error(
+                cx,
+                "This device is offline. Reconnect it to open the project.",
+            );
             cx.notify();
             return;
         }
@@ -1311,7 +1301,13 @@ impl PullRequestsPage {
                                     .flex()
                                     .items_baseline()
                                     .gap(px(6.0))
-                                    .child(div().flex_none().max_w_full().truncate().child(name.clone()))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .max_w_full()
+                                            .truncate()
+                                            .child(name.clone()),
+                                    )
                                     .when_some(detail, |el, detail| {
                                         el.child(
                                             div()
@@ -1324,10 +1320,12 @@ impl PullRequestsPage {
                                     }),
                             )
                             .when(loading, |el| {
-                                el.child(crate::loaders::ring_spinner(
+                                el.child(crate::loaders::mini_glyph_spinner(
                                     "pr-project-resolving",
-                                    12.0,
-                                    theme.text_muted,
+                                    1.5,
+                                    theme.glyph,
+                                    cx.entity_id(),
+                                    cx,
                                 ))
                             })
                             // Disconnected glyph, as the device picker shows it.
@@ -1443,7 +1441,6 @@ impl PullRequestsPage {
                                 })),
                         ),
                 )
-
                 .when(!options.is_empty(), |el| {
                     el.child(
                         popover::menu_scroll_host("pr-repository-list-host")
@@ -1856,10 +1853,12 @@ impl PullRequestsPage {
                         .px(px(14.0))
                         .gap(px(8.0))
                         .when(loading, |el| {
-                            el.opacity(0.7).child(crate::loaders::ring_spinner(
+                            el.opacity(0.7).child(crate::loaders::mini_glyph_spinner(
                                 "pull-requests-more-spinner",
-                                12.0,
-                                theme.text_muted,
+                                1.5,
+                                theme.glyph,
+                                cx.entity_id(),
+                                cx,
                             ))
                         })
                         .child(label)
@@ -2383,10 +2382,12 @@ impl Render for PullRequestsPage {
                                     .when(loading, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|page, _, _, cx| page.refresh(cx)))
                                     .child(if refreshing {
-                                        crate::loaders::ring_spinner(
+                                        crate::loaders::mini_glyph_spinner(
                                             "pull-requests-refresh-spinner",
-                                            13.0,
-                                            theme.text_muted,
+                                            1.75,
+                                            theme.glyph,
+                                            cx.entity_id(),
+                                            cx,
                                         )
                                         .into_any_element()
                                     } else {
@@ -2401,8 +2402,6 @@ impl Render for PullRequestsPage {
                             .child(self.render_device_switcher(&theme, cx)),
                     ),
             )
-
-
             .child(
                 div()
                     .mt(px(12.0))
@@ -2506,7 +2505,6 @@ impl Render for PullRequestsPage {
                                                 .id("pull-requests-clear-search")
                                                 .role(gpui::Role::Button)
                                                 .aria_label("Clear search")
-                                                .tooltip(widgets::text_tooltip("Clear search"))
                                                 .tab_index(0)
                                                 .size(px(24.0))
                                                 .flex()
@@ -3632,6 +3630,8 @@ mod tests {
             version: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            devbox_provider: None,
+            devbox_id: None,
         }
     }
 
@@ -3689,7 +3689,6 @@ mod tests {
 
     fn space(id: &str, device: &str, git: bool, created_minutes_ago: i64) -> zeron_proto::Space {
         zeron_proto::Space {
-            github_repo: None,
             id: id.into(),
             device_id: device.into(),
             path: format!("/{id}"),
@@ -3704,6 +3703,8 @@ mod tests {
 
     fn session(space: &str, last_message_at: Option<DateTime<Utc>>) -> zeron_proto::Chat {
         zeron_proto::Chat {
+            crew: None,
+            harness_session_harness: None,
             id: "chat".into(),
             device_id: "local".into(),
             title: None,
@@ -3717,7 +3718,6 @@ mod tests {
             last_message_at,
             created_at: Utc::now(),
             harness_session_id: None,
-            harness_session_harness: None,
             harness_session_cwd: None,
             parent_chat_id: None,
             space_id: Some(space.into()),
@@ -4352,7 +4352,6 @@ mod tests {
         state.update(cx, |state, cx| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
             state.spaces = vec![zeron_proto::Space {
-                github_repo: None,
                 id: "project".into(),
                 device_id: "local".into(),
                 path: "/checkout".into(),
@@ -4536,7 +4535,6 @@ mod tests {
         state.update(cx, |state, cx| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
             state.spaces = vec![zeron_proto::Space {
-                github_repo: None,
                 id: "project".into(),
                 device_id: "local".into(),
                 path: "/checkout".into(),
@@ -4599,7 +4597,6 @@ mod tests {
         state.update(cx, |state, cx| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
             state.spaces = vec![zeron_proto::Space {
-                github_repo: None,
                 id: "project".into(),
                 device_id: "local".into(),
                 path: "/checkout".into(),

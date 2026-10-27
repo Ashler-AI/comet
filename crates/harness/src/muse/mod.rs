@@ -139,6 +139,7 @@ impl MuseHarness {
         controls: RunControls,
         read_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let exe = self.resolve_executable()?;
         let mode = if read_only {
             Mode::ReadOnly
@@ -162,6 +163,7 @@ impl MuseHarness {
                 mut steering,
                 interrupt,
                 turn,
+                context: _,
             } = controls;
             runner.input = Some(std::sync::Arc::from(request_input));
             runner.turn = turn;

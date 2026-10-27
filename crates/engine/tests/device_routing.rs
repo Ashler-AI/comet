@@ -156,7 +156,7 @@ impl Harness for InstantHarness {
     }
     async fn run(
         &self,
-        _request: RunRequest,
+        request: RunRequest,
         _controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         Ok(futures::stream::iter([
@@ -164,7 +164,7 @@ impl Harness for InstantHarness {
                 harness: self.0,
                 model: "instant-1".into(),
                 tools: vec![],
-                cwd: "/tmp".into(),
+                cwd: request.cwd,
                 session_id: "hs-1".into(),
                 assistant_message_id: "a-1".into(),
             }),
@@ -195,7 +195,11 @@ fn registry_for(harness: HarnessId) -> Arc<HarnessRegistry> {
 fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
-    EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
+    let core = EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles");
+    let mut auth = zeron_engine::AuthConfig::new("http://localhost:27640", dir);
+    auth.allow_dev_auth = true;
+    core.set_auth(zeron_engine::Auth::new(auth));
+    core
 }
 
 async fn git(cwd: &std::path::Path, args: &[&str]) {
@@ -236,15 +240,15 @@ struct StaticChangeRequestLookup {
 
 /// Models a host from before the checkout change-request watch existed.
 struct LegacyChangeRequestService {
-    list_harnesses_calls: AtomicUsize,
+    readiness_and_catalog_calls: AtomicUsize,
 }
 
 #[async_trait]
 impl RpcService for LegacyChangeRequestService {
     async fn handle(&self, method: &str, _params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            methods::LIST_HARNESSES => {
-                self.list_harnesses_calls.fetch_add(1, Ordering::AcqRel);
+            methods::LOCAL_DEVICE | methods::LIST_HARNESSES => {
+                self.readiness_and_catalog_calls.fetch_add(1, Ordering::AcqRel);
                 RpcReply::value(&serde_json::json!([]))
             }
             other => Err(RpcError::UnknownMethod(other.into())),
@@ -521,7 +525,7 @@ async fn unsupported_remote_change_request_watch_keeps_the_shared_device_link() 
     let (relay_url, _relay) = fake_device_room().await;
     let dirs = tempfile::tempdir().expect("tempdir");
     let legacy = Arc::new(LegacyChangeRequestService {
-        list_harnesses_calls: AtomicUsize::new(0),
+        readiness_and_catalog_calls: AtomicUsize::new(0),
     });
     let _legacy_host = HostRelay::spawn(
         HostRelayConfig::new(
@@ -583,7 +587,7 @@ async fn unsupported_remote_change_request_watch_keeps_the_shared_device_link() 
         .expect("a capability rejection must not sever the shared link");
     assert_eq!(harnesses, serde_json::json!([]));
     assert_eq!(
-        legacy.list_harnesses_calls.load(Ordering::Acquire),
+        legacy.readiness_and_catalog_calls.load(Ordering::Acquire),
         2,
         "one readiness probe and one forwarded call prove the existing link was reused"
     );
@@ -2019,8 +2023,27 @@ async fn workspace_entry_mutations_are_forwarded_to_the_owning_plain_folder() {
 
 /// Full MCP discovery/create/converse flow over two real engines, a shared
 /// registry and the same device relay used by the routing tests above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mcp_standalone_session_executes_on_the_selected_device() {
+#[test]
+fn mcp_standalone_session_executes_on_the_selected_device() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("MCP routing runtime");
+    // Poll the phases in separate block_on calls. A Tokio test body stack-pins
+    // the retained-history future while also polling online MCP discovery;
+    // their aggregate debug frames overflowed in Zeron::subscribe, not recursion.
+    let (dirs, b, chat, retained) = runtime.block_on(Box::pin(mcp_selected_device_online()));
+    runtime.block_on(Box::pin(assert_mcp_retained_history(&dirs, &b, &chat, &retained)));
+    runtime.block_on(b.shutdown());
+}
+
+async fn mcp_selected_device_online() -> (
+    tempfile::TempDir,
+    EngineCore,
+    zeron_proto::Chat,
+    serde_json::Value,
+) {
     use serde_json::json;
     use zeron_mcp::{Origin, Tools, Zeron};
 
@@ -2041,6 +2064,9 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         None,
     )
     .unwrap();
+    let mut auth = zeron_engine::AuthConfig::new("http://localhost:27640", &remote_dir);
+    auth.allow_dev_auth = true;
+    b.set_auth(zeron_engine::Auth::new(auth));
     let registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
     a.workspace.connect_registry_url(&registry.url());
     b.workspace.connect_registry_url(&registry.url());
@@ -2086,6 +2112,7 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
                 .call("list_harnesses", json!({"device":"device-b"}))
                 .await
                 .is_ok()
+            && a.workspace.peer_liveness("device-b") == zeron_rpc::PeerLiveness::Live
         {
             break;
         }
@@ -2139,6 +2166,12 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         b.sessions.session_status(chat_id).is_some(),
         "B actually ran the harness"
     );
+    {
+        let request = b.sessions.last_request(chat_id).expect("B dispatched the request");
+        assert_eq!(request.prompt, "execute on B");
+        assert_eq!(std::path::Path::new(&request.cwd), folder);
+    }
+    assert!(a.sessions.last_request(chat_id).is_none());
     let read = tools
         .call("read_chat", json!({"chat":chat_id}))
         .await
@@ -2152,6 +2185,12 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
                 && m["text"] == "remote reply"
                 && m["deviceId"] == "device-b")
     );
+    let summary = tools
+        .call("get_chat", json!({"chat":chat_id}))
+        .await
+        .unwrap();
+    assert_eq!(summary["messageCount"], read["total"]);
+    assert_eq!(summary["lastMessage"]["deviceId"], "device-b");
     let sent = tools
         .call(
             "send_message",
@@ -2168,6 +2207,11 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         "only the new turn"
     );
     assert_eq!(sent["turn"]["replies"][0]["deviceId"], "device-b");
+    {
+        let request = b.sessions.last_request(chat_id).expect("B dispatched the second turn");
+        assert_eq!(std::path::Path::new(&request.cwd), folder);
+    }
+    assert!(a.sessions.last_request(chat_id).is_none());
     let waited = tools
         .call("wait_for_turn", json!({"chat":chat_id,"timeout_secs":2}))
         .await
@@ -2191,8 +2235,77 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // Retain the real host's completed transcript, as session-doc sync does.
+    let retained = tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
     a.shutdown().await;
-    b.shutdown().await;
     drop(host);
     relay.abort();
+    (dirs, b, chat, retained)
+}
+
+async fn assert_mcp_retained_history(
+    dirs: &tempfile::TempDir,
+    b: &EngineCore,
+    chat: &zeron_proto::Chat,
+    retained: &serde_json::Value,
+) {
+    use serde_json::json;
+    use zeron_mcp::{Origin, Tools, Zeron};
+
+    let chat_id = chat.id.as_str();
+    let snapshot = b.doc_host.open(chat_id).unwrap().doc().export_snapshot().unwrap();
+    let offline = assemble(&dirs.path().join("offline"), "device-offline");
+    offline.workspace.import_chat_row(chat).unwrap();
+    offline.doc_host.open(chat_id).unwrap().doc().doc().import(&snapshot).unwrap();
+    let mut offline_links = LinkCacheConfig::new(
+        "http://127.0.0.1:1",
+        Arc::new(StaticToken("test-user".into())),
+    );
+    offline_links.liveness = Some(Arc::new(|_| zeron_rpc::PeerLiveness::Dark));
+    offline.set_links(LinkCache::new(offline_links));
+    let offline_client = zeron_rpc::memory_client(offline.rpc_service());
+    let offline_zeron = Arc::new(Zeron::with_client(offline_client, Origin::default()));
+    let offline_tools = Tools::new(offline_zeron.clone());
+    assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
+    let unknown = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(unknown["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+
+    // A stale heartbeat is positive Dark evidence, not a read failure to hide.
+    let dark_registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
+    let (mut presence, _) = tokio_tungstenite::connect_async(dark_registry.url()).await.unwrap();
+    presence.send(WsMessage::Text(json!({"t":"hello","device":"device-b"}).to_string())).await.unwrap();
+    presence.next().await.unwrap().unwrap();
+    presence.send(WsMessage::Text(json!({
+        "t":"presence", "at":chrono::Utc::now().timestamp_millis() - 10 * 60_000,
+    }).to_string())).await.unwrap();
+    presence.next().await.unwrap().unwrap();
+    let mut remote_device = b.workspace.watch_devices().borrow().iter()
+        .find(|device| device.id == "device-b").unwrap().clone();
+    remote_device.last_seen_at = None;
+    offline.workspace.upsert_device_row(&remote_device);
+    let mut devices = offline.workspace.watch_devices();
+    offline.workspace.connect_registry_url(&dark_registry.url());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while offline.workspace.peer_liveness("device-b") != zeron_rpc::PeerLiveness::Dark {
+            devices.changed().await.unwrap();
+        }
+    }).await.expect("stale host presence converges");
+    let dark = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(dark["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+    assert!(offline_zeron.transcript_on(chat_id, Some("device-b")).await.is_err(),
+        "an explicit offline host must not fall back to retained history");
+    offline.workspace.disconnect_edge();
+    assert_eq!(offline.workspace.peer_liveness("device-b"), zeron_rpc::PeerLiveness::Unknown);
+    let disconnected = offline_tools.call("read_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(disconnected["messages"], retained["messages"]);
+    let summary = offline_tools.call("get_chat", json!({"chat":chat_id})).await.unwrap();
+    assert_eq!(summary["messageCount"], retained["total"]);
+    assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
+    offline.shutdown().await;
 }

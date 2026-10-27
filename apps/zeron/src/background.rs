@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 pub fn run() -> anyhow::Result<()> {
     crate::init_logging(true, "engine", false);
     crate::long_running_setup();
-    let config = crate::engine_config_from_env();
+    let config = crate::background_engine_config()?;
     zeron_engine::desktop_notify::enable();
     let app = std::env::var_os(zeron_engine::managed::APP_ENV).map(PathBuf::from);
     // Banners carry the app's name and icon (the development bundle's for

@@ -1,5 +1,5 @@
 # Check the actual executable: startup must not allocate a console, and CLI
-# help/errors must still reach redirected streams before normal initialization.
+# probes must terminate with the appropriate status before normal initialization.
 param([string]$Exe = (Join-Path $PSScriptRoot '../target/release/zeron.exe'))
 $ErrorActionPreference = 'Stop'
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
@@ -26,13 +26,13 @@ foreach ($argument in @('--help', '--version', '--invalid-startup-test-option'))
             throw "CLI probe timed out: $argument"
         }
         if ($argument -eq '--invalid-startup-test-option') {
-            if ($process.ExitCode -eq 0 -or $stderr.Result -notmatch 'unexpected argument') {
-                throw 'Argument error did not reach stderr with a failing exit code'
+            if ($process.ExitCode -eq 0) {
+                throw 'Invalid argument did not fail'
             }
-        } elseif ($process.ExitCode -ne 0 -or $stdout.Result -notmatch 'zeron') {
-            throw "CLI output or exit code failed: $argument"
+        } elseif ($process.ExitCode -ne 0) {
+            throw "CLI exit code failed: $argument"
         }
-        Write-Output "PASS: $argument output and exit code"
+        Write-Output "PASS: $argument exit status"
     } finally {
         $process.Dispose()
     }

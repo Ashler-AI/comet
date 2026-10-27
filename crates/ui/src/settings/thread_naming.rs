@@ -104,6 +104,11 @@ impl Render for ThreadNamingCard {
     fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
+        if self.state.read(cx).managed_inference {
+            return widgets::section_card(&theme).child(widgets::card_row(&theme, true)
+                .child(widgets::row_title(&theme, "Managed thread naming"))
+                .child(widgets::page_subtitle(&theme, "After sign-in, Crew names threads through Agent Auth. The server selects the title model; local provider credentials and model preferences are not used.")));
+        }
         let follows_session = self
             .settings
             .ready()
@@ -144,21 +149,20 @@ impl Render for ThreadNamingCard {
         } else {
             "A small model keeps titles fast and cheap."
         };
-        widgets::section_card(&theme)
-            .child(
-                widgets::card_row(&theme, true)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.0))
-                            .child(widgets::row_title(&theme, "Thread naming"))
-                            .child(widgets::meta_line(
-                                &theme,
-                                vec![div().child(description).into_any_element()],
-                            )),
-                    )
-                    .child(control)
-                    .search_anchor(SettingId::ThreadNaming),
-            )
+        widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .child(widgets::row_title(&theme, "Thread naming"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![div().child(description).into_any_element()],
+                        )),
+                )
+                .child(control)
+                .search_anchor(SettingId::ThreadNaming),
+        )
     }
 }

@@ -103,6 +103,11 @@ impl WorkspaceDoc {
         row.insert("id", device.id.as_str())?;
         row.insert("name", device.name.as_str())?;
         row.insert("platform", device.platform.as_str())?;
+        set_opt_str(&row, "devboxProvider", device.devbox_provider.map(|provider| match provider {
+            zeron_proto::DeviceEnvironment::Namespace => "namespace",
+            zeron_proto::DeviceEnvironment::Boat => "boat",
+        }))?;
+        set_opt_str(&row, "devboxId", device.devbox_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
         set_opt_str(&row, "version", device.version.as_deref())?;
@@ -268,6 +273,10 @@ impl WorkspaceDoc {
                 LoroValue::from(serde_json::to_value(context)?),
             )?,
             None => row.delete("sourceContext")?,
+        }
+        match &chat.crew {
+            Some(crew) => row.insert("crew", LoroValue::from(serde_json::to_value(crew)?))?,
+            None => row.delete("crew")?,
         }
         match &chat.config {
             Some(config) => row.insert("config", LoroValue::from(serde_json::to_value(config)?))?,
@@ -637,6 +646,10 @@ pub(crate) struct RawDevice {
     name: String,
     platform: String,
     #[serde(default)]
+    devbox_provider: Option<zeron_proto::DeviceEnvironment>,
+    #[serde(default)]
+    devbox_id: Option<String>,
+    #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
     created_at: Option<i64>,
@@ -659,6 +672,8 @@ impl From<RawDevice> for Device {
             id: raw.id,
             name: raw.name,
             platform: raw.platform,
+            devbox_provider: raw.devbox_provider,
+            devbox_id: raw.devbox_id,
             last_seen_at: raw.last_seen_at.map(dt),
             created_at: raw.created_at.map(dt),
             version: raw.version,
@@ -751,6 +766,8 @@ pub(crate) struct RawChat {
     room_gen: Option<u32>,
     #[serde(default)]
     parent_chat_id: Option<String>,
+    #[serde(default)]
+    crew: Option<zeron_proto::CrewChatMetadata>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -793,6 +810,7 @@ impl From<RawChat> for Chat {
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
+            crew: raw.crew,
         }
     }
 }
@@ -847,6 +865,8 @@ mod tests {
             id: id.into(),
             name: name.into(),
             platform: "linux".into(),
+            devbox_provider: None,
+            devbox_id: None,
             last_seen_at: Some(ts(1_000)),
             created_at: Some(ts(500)),
             version: Some("0.1.0".into()),
@@ -888,6 +908,7 @@ mod tests {
     fn chat(id: &str, device_id: &str) -> Chat {
         Chat {
             id: id.into(),
+            crew: None,
             device_id: device_id.into(),
             title: Some("First chat".into()),
             archived: false,

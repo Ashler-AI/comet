@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use zeron_proto::AccessToken;
 
 use crate::config::AuthTokens;
 use crate::error::{ClientError, Result};
@@ -147,6 +148,8 @@ pub(crate) fn http() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // Redirects can replay refresh tokens and exchange codes in POST bodies.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
@@ -297,15 +300,37 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 
 enum Mode {
     Demo,
+    Scaffold {
+        auth: zeron_sync::scaffold_auth::ScaffoldAuth,
+        session: zeron_sync::scaffold_auth::ScaffoldSession,
+    },
     Dev {
         bearer: String,
     },
     WorkOs {
         edge_url: String,
         org_id: String,
-        tokens: Arc<Mutex<AuthTokens>>,
+        tokens: Arc<Mutex<WorkOsTokens>>,
         refresh_gate: Arc<tokio::sync::Mutex<()>>,
     },
+}
+
+struct WorkOsTokens {
+    pair: AuthTokens,
+    generation: u64,
+    invalidated: bool,
+}
+
+impl WorkOsTokens {
+    fn lease(&self) -> AccessToken {
+        AccessToken { value: self.pair.access_token.clone(), generation: self.generation }
+    }
+
+    fn replace(&mut self, pair: AuthTokens) {
+        self.pair = pair;
+        self.generation += 1;
+        self.invalidated = false;
+    }
 }
 
 /// Per-client bearer source: dev bearer, or a WorkOS access token refreshed
@@ -321,10 +346,25 @@ impl TokenProvider {
         credentials: &crate::config::Credentials,
         edge_url: &str,
         events: Arc<EventPump>,
-    ) -> Self {
+    ) -> Result<Self> {
         use crate::config::Credentials;
         let mode = match credentials {
             Credentials::Demo(_) => Mode::Demo,
+            Credentials::Scaffold { user_id, org_id, control_origin, session_json } => {
+                use zeron_sync::scaffold_auth::{ScaffoldAuth, ScaffoldConfig, ScaffoldSession, normalized_origin};
+                let session: ScaffoldSession = serde_json::from_str(session_json)
+                    .map_err(|_| ClientError::Auth("Invalid Crew credential".into()))?;
+                if session.device.is_some() || session.identity.user_id != *user_id
+                    || session.identity.project_scope != *org_id || session.identity.deployment_id.is_none()
+                    || session.edge_origin != normalized_origin(edge_url).map_err(scaffold_error)?
+                    || session.resource != normalized_origin(control_origin).map_err(scaffold_error)? {
+                    return Err(ClientError::Auth("Crew credential scope does not match this profile".into()));
+                }
+                let mut config = ScaffoldConfig::new(control_origin.clone(), edge_url.to_owned(), org_id.clone());
+                config.deployment_id = session.identity.deployment_id.clone();
+                let auth = ScaffoldAuth::new(config).map_err(scaffold_error)?;
+                Mode::Scaffold { auth, session }
+            },
             Credentials::Dev { user_id, org_id } => Mode::Dev {
                 bearer: if org_id.is_empty() {
                     user_id.clone()
@@ -335,47 +375,81 @@ impl TokenProvider {
             Credentials::WorkOs { org_id, tokens, .. } => Mode::WorkOs {
                 edge_url: edge_url.to_owned(),
                 org_id: org_id.clone(),
-                tokens: Arc::new(Mutex::new(tokens.clone())),
+                tokens: Arc::new(Mutex::new(WorkOsTokens {
+                    pair: tokens.clone(), generation: 0, invalidated: false,
+                })),
                 refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
             },
         };
-        Self {
+        Ok(Self {
             mode,
             events,
             expired: Arc::new(AtomicBool::new(false)),
-        }
+        })
     }
 
     /// Replace the pair (the platform re-signed-in or restored newer tokens).
     pub(crate) fn update_tokens(&self, next: AuthTokens) {
         if let Mode::WorkOs { tokens, .. } = &self.mode {
-            *lock(tokens) = next;
+            let mut tokens = lock(tokens);
+            tokens.replace(next);
             self.expired.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn invalidate(&self, generation: u64) {
+        match &self.mode {
+            Mode::Scaffold { auth, .. } => auth.invalidate(generation),
+            Mode::WorkOs { tokens, .. } => {
+                let mut tokens = lock(tokens);
+                if tokens.generation == generation {
+                    tokens.invalidated = true;
+                }
+            }
+            Mode::Dev { .. } | Mode::Demo => {}
         }
     }
 
     /// Current bearer, refreshing first when the access token is (nearly)
     /// expired. Network failures fall back to the stale token — the server
     /// rejects and the caller's backoff retries through here.
-    pub(crate) async fn bearer(&self) -> Result<String> {
+    pub(crate) async fn access_token(&self) -> Result<AccessToken> {
         match &self.mode {
             Mode::Demo => Err(ClientError::Auth(
                 "demo mode has no edge credentials".into(),
             )),
-            Mode::Dev { bearer } => Ok(bearer.clone()),
+            Mode::Dev { bearer } => Ok(AccessToken {
+                value: bearer.clone(), generation: 0,
+            }),
+            Mode::Scaffold { auth, session } => {
+                match auth.verify_credential(session).await.map_err(scaffold_error) {
+                    Ok(verified) => {
+                        self.expired.store(false, Ordering::Release);
+                        Ok(verified)
+                    }
+                    Err(ClientError::Auth(reason)) => {
+                        if !self.expired.swap(true, Ordering::AcqRel) {
+                            self.events.ordered(ClientEvent::AuthExpired { reason: reason.clone() });
+                        }
+                        Err(ClientError::Auth(reason))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             Mode::WorkOs {
                 edge_url,
                 org_id,
                 tokens,
                 refresh_gate,
             } => {
-                let now = chrono::Utc::now().timestamp();
-                let current = lock(tokens).clone();
-                if !jwt_expired(&current.access_token, now) {
-                    return Ok(current.access_token);
-                }
-                if self.expired.load(Ordering::Acquire) {
-                    return Err(ClientError::Auth("session expired".into()));
+                {
+                    let current = lock(tokens);
+                    if self.expired.load(Ordering::Acquire) {
+                        return Err(ClientError::Auth("session expired".into()));
+                    }
+                    if !current.invalidated && !jwt_expired(&current.pair.access_token, chrono::Utc::now().timestamp()) {
+                        return Ok(current.lease());
+                    }
                 }
                 // The refresh runs as its own task that stores the rotated
                 // pair itself: callers wrap this in timeouts, and dropping a
@@ -403,25 +477,37 @@ impl TokenProvider {
 async fn refresh_task(
     edge_url: String,
     org_id: String,
-    tokens: Arc<Mutex<AuthTokens>>,
+    tokens: Arc<Mutex<WorkOsTokens>>,
     gate: Arc<tokio::sync::Mutex<()>>,
     events: Arc<EventPump>,
     expired: Arc<AtomicBool>,
-) -> Result<String> {
+) -> Result<AccessToken> {
     let _gate = gate.lock_owned().await;
     // Joined an in-flight refresh: it already rotated the pair.
-    let current = lock(&tokens).clone();
-    if !jwt_expired(&current.access_token, chrono::Utc::now().timestamp()) {
-        return Ok(current.access_token);
+    let (current, generation) = {
+        let current = lock(&tokens);
+        if expired.load(Ordering::Acquire) {
+            return Err(ClientError::Auth("session expired".into()));
+        }
+        if !current.invalidated && !jwt_expired(&current.pair.access_token, chrono::Utc::now().timestamp()) {
+            return Ok(current.lease());
+        }
+        (current.pair.clone(), current.generation)
+    };
+    let result = refresh(&edge_url, &current.refresh_token, Some(&org_id)).await;
+    let mut tokens = lock(&tokens);
+    // A platform replacement wins over any old refresh result or rejection.
+    if tokens.generation != generation {
+        if expired.load(Ordering::Acquire) {
+            return Err(ClientError::Auth("session expired".into()));
+        }
+        return Ok(tokens.lease());
     }
-    if expired.load(Ordering::Acquire) {
-        return Err(ClientError::Auth("session expired".into()));
-    }
-    match refresh(&edge_url, &current.refresh_token, Some(&org_id)).await {
+    match result {
         Ok(next) => {
-            *lock(&tokens) = next.clone();
-            events.ordered(ClientEvent::AuthRefreshed(next.clone()));
-            Ok(next.access_token)
+            tokens.replace(next);
+            events.ordered(ClientEvent::AuthRefreshed(tokens.pair.clone()));
+            Ok(tokens.lease())
         }
         Err(ClientError::Auth(reason)) => {
             if !expired.swap(true, Ordering::AcqRel) {
@@ -433,14 +519,89 @@ async fn refresh_task(
         }
         Err(err) => {
             tracing::warn!(error = %err, "token refresh failed; using the stale access token");
-            Ok(current.access_token)
+            Ok(tokens.lease())
         }
+    }
+}
+
+pub fn scaffold_error(error: zeron_sync::scaffold_auth::AuthError) -> ClientError {
+    use zeron_sync::scaffold_auth::AuthError;
+    match error {
+        AuthError::Unavailable { message, .. } => ClientError::Network(message),
+        other => ClientError::Auth(other.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn crew_bearers_coalesce_and_transient_failures_do_not_expire_credentials() {
+        use std::sync::atomic::{AtomicU16, AtomicUsize};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeron_sync::scaffold_auth::{ScaffoldIdentity, ScaffoldSession, DEFAULT_OAUTH_SCOPES};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let resource = origin.clone();
+        let status = Arc::new(AtomicU16::new(200));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (server_status, server_calls) = (status.clone(), calls.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let size = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.to_ascii_lowercase().contains("authorization: bearer sc_rc_secret"));
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                let body = if request.starts_with("GET /auth/session ") {
+                    serde_json::json!({"userId":"owner", "email":"owner@example.com", "projectScope":"project", "deploymentId":"deployment", "credential":"scaffold", "capabilities":[]})
+                } else {
+                    assert!(request.starts_with("GET /api/code-sandboxes/auth/session "));
+                    serde_json::json!({"ok":true, "resource":resource, "actor":{"sub":"owner", "auth":"iap"}, "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})
+                }.to_string();
+                socket.write_all(format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 120\r\nConnection: close\r\n\r\n{body}", server_status.load(Ordering::SeqCst), body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let session = ScaffoldSession { access_token: "sc_rc_secret".into(), resource: origin.clone(), edge_origin: origin.clone(), identity: ScaffoldIdentity { user_id: "owner".into(), email: "owner@example.com".into(), name: None, project_scope: "project".into(), deployment_id: Some("deployment".into()), capabilities: vec![] }, device: None };
+        let credentials = crate::config::Credentials::Scaffold { user_id: "owner".into(), org_id: "project".into(), control_origin: origin.clone(), session_json: serde_json::to_string(&session).unwrap() };
+        let events = EventPump::new(Arc::new(crate::events::NullListener));
+        let tokens = TokenProvider::new(&credentials, &origin, events).unwrap();
+        let results = futures::future::join_all((0..16).map(|_| tokens.access_token())).await;
+        assert!(results.iter().all(|result| result.as_ref().is_ok_and(|token| token.value == "sc_rc_secret")));
+        let first = tokens.access_token().await.unwrap();
+        assert_eq!(first.value, "sc_rc_secret");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        status.store(429, Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        tokio::time::resume();
+        assert_eq!(tokens.access_token().await.unwrap().generation, first.generation);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "warm verification never time-expires");
+        tokens.invalidate(first.generation);
+        tokens.invalidate(first.generation);
+        let results = futures::future::join_all((0..16).map(|_| tokens.access_token())).await;
+        assert!(results.iter().all(|result| matches!(result, Err(ClientError::Network(_)))));
+        assert!(!tokens.expired.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        status.store(200, Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        let renewed = tokens.access_token().await.unwrap();
+        assert_eq!(renewed.value, "sc_rc_secret");
+        assert_ne!(renewed.generation, first.generation);
+        tokens.invalidate(first.generation);
+        assert_eq!(tokens.access_token().await.unwrap().generation, renewed.generation);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        status.store(403, Ordering::SeqCst);
+        tokens.invalidate(renewed.generation);
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
+        assert!(tokens.expired.load(Ordering::Acquire));
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        server.abort();
+    }
 
     #[test]
     fn percent_decode_handles_edges() {
@@ -530,7 +691,62 @@ mod tests {
                 refresh_token: "r1".into(),
             },
         };
-        (TokenProvider::new(&credentials, edge, events), collect)
+        (TokenProvider::new(&credentials, edge, events).unwrap(), collect)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_credentials_never_follow_cross_origin_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn request(socket: &mut tokio::net::TcpStream) -> String {
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "request ended before its body");
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        return String::from_utf8(bytes).unwrap();
+                    }
+                }
+            }
+        }
+
+        for status in [307, 308] {
+            let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let edge = format!("http://{}", origin.local_addr().unwrap());
+            let location = format!("http://{}/capture", destination.local_addr().unwrap());
+            let source = tokio::spawn(async move {
+                let (mut socket, _) = origin.accept().await.unwrap();
+                let received = request(&mut socket).await;
+                assert!(received.starts_with("POST /auth/refresh HTTP/1.1\r\n"));
+                assert!(received.contains(r#""refreshToken":"r1""#));
+                socket.write_all(format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ).as_bytes()).await.unwrap();
+            });
+            let captured = Arc::new(Mutex::new(None));
+            let capture = captured.clone();
+            let sink = tokio::spawn(async move {
+                let (mut socket, _) = destination.accept().await.unwrap();
+                *lock(&capture) = Some(request(&mut socket).await);
+                socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            });
+            let (tokens, _) = provider(&edge);
+            let result = tokens.access_token().await;
+            source.await.unwrap();
+            sink.abort();
+            assert!(lock(&captured).is_none(), "HTTP {status} forwarded refresh credentials to another origin");
+            assert_eq!(result.unwrap().value, expired_jwt());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -541,10 +757,10 @@ mod tests {
         let tokens = Arc::new(tokens);
         let calls = (0..8).map(|_| {
             let tokens = tokens.clone();
-            tokio::spawn(async move { tokens.bearer().await })
+            tokio::spawn(async move { tokens.access_token().await })
         });
         for call in futures::future::join_all(calls).await {
-            assert_eq!(call.unwrap().unwrap(), "fresh-access");
+            assert_eq!(call.unwrap().unwrap().value, "fresh-access");
         }
         // The fresh token has no parseable exp → treated valid: one refresh.
         assert_eq!(hits.load(Ordering::SeqCst), 1, "single-flight refresh");
@@ -553,14 +769,65 @@ mod tests {
             e,
             ClientEvent::AuthRefreshed(t) if t.refresh_token == "r2"
         )));
+        let first = tokens.access_token().await.unwrap();
+        tokens.invalidate(first.generation);
+        let renewed = tokens.access_token().await.unwrap();
+        assert_ne!(renewed.generation, first.generation);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "rejection forces refresh without JWT expiry");
+        tokens.invalidate(first.generation);
+        assert_eq!(tokens.access_token().await.unwrap().generation, renewed.generation);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "stale rejection cannot refresh newer tokens");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn platform_replacement_fences_pending_refresh_results() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [200, 401] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let edge = format!("http://{}", listener.local_addr().unwrap());
+            let (requested, request_seen) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                socket.read(&mut request).await.unwrap();
+                requested.send(()).unwrap();
+                released.await.unwrap();
+                let body = r#"{"accessToken":"old-refresh","refreshToken":"r2"}"#;
+                socket.write_all(format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            });
+            let (tokens, events) = provider(&edge);
+            let tokens = Arc::new(tokens);
+            let pending = {
+                let tokens = tokens.clone();
+                tokio::spawn(async move { tokens.access_token().await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), request_seen).await.unwrap().unwrap();
+            tokens.update_tokens(AuthTokens {
+                access_token: "replacement".into(), refresh_token: "replacement-refresh".into(),
+            });
+            let replacement = tokens.access_token().await.unwrap();
+            release.send(()).unwrap();
+            let completed = pending.await.unwrap().unwrap();
+            assert_eq!(completed.value, replacement.value);
+            assert_eq!(completed.generation, replacement.generation);
+            assert!(!tokens.expired.load(Ordering::Acquire));
+            server.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!lock(&events.0).iter().any(|event| matches!(
+                event, ClientEvent::AuthExpired { .. } | ClientEvent::AuthRefreshed(_)
+            )));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_refresh_expires_the_session_once() {
         let (edge, _hits) = serve_http(401, r#"{"error":"invalid_grant"}"#).await;
         let (tokens, events) = provider(&edge);
-        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
-        assert!(matches!(tokens.bearer().await, Err(ClientError::Auth(_))));
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
+        assert!(matches!(tokens.access_token().await, Err(ClientError::Auth(_))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let expired = lock(&events.0)
             .iter()
@@ -572,7 +839,7 @@ mod tests {
             access_token: "x.y.z".into(),
             refresh_token: "r9".into(),
         });
-        assert_eq!(tokens.bearer().await.unwrap(), "x.y.z");
+        assert_eq!(tokens.access_token().await.unwrap().value, "x.y.z");
     }
 
     #[tokio::test]
@@ -582,8 +849,31 @@ mod tests {
             user_id: "wing".into(),
             org_id: "acme".into(),
         };
-        let tokens = TokenProvider::new(&credentials, "http://unused", events);
-        assert_eq!(tokens.bearer().await.unwrap(), "wing@acme");
+        let tokens = TokenProvider::new(&credentials, "http://unused", events).unwrap();
+        assert_eq!(tokens.access_token().await.unwrap().value, "wing@acme");
+    }
+
+    #[test]
+    fn crew_credentials_cannot_retarget_an_open_profile() {
+        use zeron_sync::scaffold_auth::{ScaffoldIdentity, ScaffoldSession};
+        let session = ScaffoldSession {
+            access_token: "opaque-user-bearer".into(),
+            identity: ScaffoldIdentity {
+                user_id: "owner".into(), email: "owner@example.com".into(), name: None,
+                project_scope: "project".into(), deployment_id: Some("staging".into()), capabilities: vec![],
+            },
+            resource: "https://control.example".into(),
+            edge_origin: "https://canary.example".into(),
+            device: None,
+        };
+        let credentials = crate::config::Credentials::Scaffold {
+            user_id: "another-user".into(), org_id: "project".into(),
+            control_origin: session.resource.clone(),
+            session_json: serde_json::to_string(&session).unwrap(),
+        };
+        let events = EventPump::new(Arc::new(crate::events::NullListener));
+        assert!(matches!(TokenProvider::new(&credentials, &session.edge_origin, events), Err(ClientError::Auth(_))));
+        assert!(!format!("{credentials:?}").contains("opaque-user-bearer"));
     }
 
     #[test]

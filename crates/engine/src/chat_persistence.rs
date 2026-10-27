@@ -1,7 +1,8 @@
 //! Coalesced chat snapshots. Cursor is sampled BEFORE export; snapshot and
 //! cursor commit atomically. Queue/lock waits never occupy a Tokio worker.
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use zeron_doc::SessionDoc;
@@ -20,10 +21,7 @@ pub(crate) struct ChatPersistence {
     urgent: AtomicBool,
     write: Mutex<()>,
     wake: Option<mpsc::Sender<()>>,
-    /// Seeded from the store, then set by the first verified write: cursor
-    /// repair is once per legacy snapshot, never once per rejoin. The thin
-    /// client reads the same flag from the store (client/src/live/room.rs).
-    cursor_verified: AtomicBool,
+    pub(crate) initial_cursor_verified: bool,
     #[cfg(test)]
     writes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -53,7 +51,7 @@ impl ChatPersistence {
             urgent: AtomicBool::new(false),
             write: Mutex::new(()),
             wake: runtime.as_ref().map(|_| tx),
-            cursor_verified: AtomicBool::new(verified),
+            initial_cursor_verified: verified,
             #[cfg(test)]
             writes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -67,10 +65,6 @@ impl ChatPersistence {
 
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn cursor_verified(&self) -> bool {
-        self.cursor_verified.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_clean(&self) -> bool {
@@ -147,56 +141,44 @@ impl ChatPersistence {
     }
 
     pub(crate) fn flush_sync(&self) {
+        if let Err(error) = self.flush_checked() {
+            tracing::warn!(chat = %self.chat_id, %error, "chat snapshot failed; retrying");
+        }
+    }
+
+    /// The same serialized writer, with failures propagated to durable command
+    /// admission. Never bypass its cursor/epoch bookkeeping with a raw snapshot.
+    pub(crate) fn flush_checked(&self) -> Result<(), crate::EngineError> {
         let flush = || {
-            let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+            let _write = self.write.lock();
             let generation = self.generation.load(Ordering::Acquire);
             if generation == self.saved.load(Ordering::Acquire) {
-                return;
+                return Ok(());
             }
-            let Some(doc) = self.doc.upgrade() else {
-                return;
-            };
-            // Never read the cursor AFTER exporting: a concurrent import
-            // could then label an older snapshot with a newer cursor.
+            let doc = self.doc.upgrade()
+                .ok_or_else(|| crate::EngineError::Other("chat retired before durable admission".into()))?;
+            // Never label an older snapshot with a cursor sampled after export.
             let cursor = self.cursor.load(Ordering::Acquire);
             #[cfg(test)]
-            if let Some(hook) = self.before_export.lock().unwrap().take() {
+            if let Some(hook) = self.before_export.lock().take() {
                 hook();
             }
-            let result = doc
-                .export_snapshot()
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| {
-                    self.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
-                    self.store
-                        .save_verified_snapshot_with_cursor(
-                            &self.chat_id,
-                            &bytes,
-                            cursor,
-                            super::chat2_host::CHAT2_DOC_EPOCH,
-                        )
-                        .map_err(|e| e.to_string())
-                });
-            match result {
-                Ok(()) => {
-                    #[cfg(test)]
-                    self.writes.fetch_add(1, Ordering::Relaxed);
-                    self.cursor_verified.store(true, Ordering::Release);
-                    self.saved.store(generation, Ordering::Release);
-                }
-                Err(error) => {
-                    tracing::warn!(chat = %self.chat_id, %error, "chat snapshot failed; retrying")
-                }
-            }
+            let bytes = doc.export_snapshot()?;
+            self.store.save_verified_snapshot_with_cursor(
+                &self.chat_id, &bytes, cursor, super::chat2_host::CHAT2_DOC_EPOCH,
+            )?;
+            self.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+            #[cfg(test)]
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.saved.store(generation, Ordering::Release);
+            Ok(())
         };
-        // Compatibility for synchronous shutdown/eviction and command APIs.
-        // Async persisters already execute this on the blocking pool.
         if tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         {
-            tokio::task::block_in_place(flush);
+            tokio::task::block_in_place(flush)
         } else {
-            flush();
+            flush()
         }
     }
 }
@@ -287,14 +269,25 @@ mod tests {
     }
 
     #[test]
-    fn an_unverified_cursor_opens_at_zero() {
-        let (_dir, doc, store, _) = fixture();
-        let bytes = doc.export_snapshot().unwrap();
-        store
-            .save_snapshot_with_cursor("legacy", &bytes, 500, 2)
-            .unwrap();
-        let persistence = ChatPersistence::new(&doc, store, "legacy".into(), 500);
-        assert_eq!(persistence.cursor(), 0);
+    fn admission_flush_preserves_verified_cursor_and_reports_disk_failure() {
+        let (dir, doc, store, persistence) = fixture();
+        doc.doc().get_map("test").insert("admitted", 1_i64).unwrap();
+        doc.doc().commit();
+        persistence.applied(17, false);
+        persistence.flush_checked().unwrap();
+        assert_eq!(store.snapshot_cursor("whale").unwrap(), 17);
+        assert!(store.snapshot_cursor_verified("whale").unwrap());
+        assert_eq!(store.snapshot_epoch("whale").unwrap(), super::super::chat2_host::CHAT2_DOC_EPOCH);
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(FAIL,'disk unavailable'); END;").unwrap();
+        doc.doc().get_map("test").insert("admitted", 2_i64).unwrap();
+        doc.doc().commit();
+        persistence.applied(18, false);
+        assert!(persistence.flush_checked().is_err());
+        assert_eq!(store.snapshot_cursor("whale").unwrap(), 17);
+        db.execute_batch("DROP TRIGGER fail_snapshot").unwrap();
+        persistence.flush_checked().unwrap();
+        assert_eq!(store.snapshot_cursor("whale").unwrap(), 18);
     }
 
     #[tokio::test]
@@ -353,67 +346,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn first_verified_write_ends_legacy_cursor_repair() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let doc = Arc::new(SessionDoc::init("born").unwrap());
-        // A cold reader's first open stamps an unverified lineage.
-        store
-            .save_snapshot_with_cursor(
-                "born",
-                &doc.export_snapshot().unwrap(),
-                0,
-                crate::chat2_host::CHAT2_DOC_EPOCH,
-            )
-            .unwrap();
-        let persistence = ChatPersistence::new(&doc, store.clone(), "born".into(), 0);
-        assert!(!persistence.cursor_verified());
-        persistence.applied(7, true); // no runtime: flushes inline
-        assert!(persistence.cursor_verified(), "the next join would rewind");
-        assert!(ChatPersistence::new(&doc, store, "born".into(), 7).cursor_verified());
-    }
-
-    /// Only a write that landed certifies the cursor: a failed one leaves
-    /// the legacy repair in place until a retry succeeds.
-    #[test]
-    fn failed_write_keeps_legacy_cursor_repair() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let doc = Arc::new(SessionDoc::init("born").unwrap());
-        store
-            .save_snapshot_with_cursor(
-                "born",
-                &doc.export_snapshot().unwrap(),
-                0,
-                crate::chat2_host::CHAT2_DOC_EPOCH,
-            )
-            .unwrap();
-        let persistence = ChatPersistence::new(&doc, store.clone(), "born".into(), 0);
-        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
-        db.execute_batch(
-            "CREATE TRIGGER fail_update BEFORE UPDATE ON snapshots BEGIN SELECT RAISE(FAIL, 'injected disk failure'); END;
-             CREATE TRIGGER fail_insert BEFORE INSERT ON snapshots BEGIN SELECT RAISE(FAIL, 'injected disk failure'); END;",
-        )
-        .unwrap();
-        persistence.applied(7, true); // no runtime: flushes inline, and fails
-        assert!(!persistence.is_clean(), "the write failed");
-        assert!(!persistence.cursor_verified());
-        assert!(!store.snapshot_cursor_verified("born").unwrap());
-        db.execute_batch("DROP TRIGGER fail_update; DROP TRIGGER fail_insert;")
-            .unwrap();
-        persistence.flush_sync();
-        assert!(persistence.is_clean());
-        assert!(persistence.cursor_verified());
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_import_cannot_label_an_older_export_with_a_newer_cursor() {
         let (_dir, doc, store, persistence) = fixture();
         persistence.applied(1, false);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *persistence.before_export.lock().unwrap() = Some(Box::new(move || {
+        *persistence.before_export.lock() = Some(Box::new(move || {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }));

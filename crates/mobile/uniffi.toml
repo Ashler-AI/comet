@@ -13,3 +13,7 @@
 "CoreError.Storage.message" = "reason"
 "CoreError.NotImplemented.message" = "reason"
 "CoreError.Internal.message" = "reason"
+
+[bindings.swift]
+# Native presentation uses CoreError's message, not Swift's reflected enum name.
+omit_localized_error_conformance = true

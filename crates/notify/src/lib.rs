@@ -20,7 +20,8 @@
 //!   desktop).
 //! - Windows: no-op for now — toasts require a registered AppUserModelID
 //!   (an installer concern); the app's chime still covers it.
-//! - `ZERON_DISABLE_NOTIFICATIONS` env kill-switch (callers also check the
+//! - `COMET_DISABLE_NOTIFICATIONS` (and the legacy upstream alias) kill-switch
+//!   (callers also check the
 //!   `notificationsEnabled` setting);
 //! - failures are logged and swallowed — a missing notifier must never
 //!   bother the session flow.
@@ -30,37 +31,56 @@
 
 use std::sync::Mutex;
 
-const DISABLE_ENV: &str = "ZERON_DISABLE_NOTIFICATIONS";
+const DISABLE_ENVS: [&str; 2] = ["COMET_DISABLE_NOTIFICATIONS", "ZERON_DISABLE_NOTIFICATIONS"];
 
 /// Reserved notification target routed to Settings → Agents rather than a
 /// conversation. Session ids are generated UUIDs, so this cannot collide
 /// with a real chat.
-pub const AGENT_UPDATES_TARGET: &str = "__zeron_agent_updates__";
+pub const AGENT_UPDATES_TARGET: &str = "__crew_agent_updates__";
 
 /// The app-side link a clicked banner opens when the engine posted it from
-/// its own process: `zeron://notification/<target>`.
-pub const LINK_PREFIX: &str = "zeron://notification/";
+/// its own process. [`set_app_bundle_id`] selects the matching Crew flavor.
+pub const LINK_PREFIX: &str = "comet://notification/";
 
-/// `zeron://notification/<target>` for a banner's target.
+/// A Crew notification URL for a banner's target.
 pub fn link(target: &str) -> String {
-    format!("{LINK_PREFIX}{target}")
+    format!("{}{target}", link_prefix())
 }
 
 /// The target a [`link`] carries, or `None` for any other URL.
 pub fn link_target(url: &str) -> Option<&str> {
-    url.strip_prefix(LINK_PREFIX)
+    [
+        "comet://notification/",
+        "comet-staging://notification/",
+        "crew-upstream-canary://notification/",
+    ]
+    .into_iter()
+    .find_map(|prefix| url.strip_prefix(prefix))
         .filter(|target| !target.is_empty())
+}
+
+fn link_prefix() -> &'static str {
+    link_prefix_for_bundle_id(APP_BUNDLE_ID.get().map(String::as_str))
+}
+
+fn link_prefix_for_bundle_id(id: Option<&str>) -> &'static str {
+    match id {
+        Some("ai.ashler.comet.staging") => "comet-staging://notification/",
+        Some("ai.ashler.crew.upstream-canary") => "crew-upstream-canary://notification/",
+        _ => LINK_PREFIX,
+    }
 }
 
 type ClickHandler = Box<dyn Fn(String) + Send>;
 
 static CLICK: Mutex<Option<ClickHandler>> = Mutex::new(None);
+static APP_BUNDLE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Post a desktop banner, optionally linked to `target` (a chat id, or
 /// [`AGENT_UPDATES_TARGET`]). Any thread. Silently a no-op when disabled or
 /// no notifier is available.
 pub fn post(title: &str, body: &str, target: Option<&str>) {
-    if std::env::var_os(DISABLE_ENV).is_some() {
+    if DISABLE_ENVS.iter().any(|name| std::env::var_os(name).is_some()) {
         return;
     }
     post_impl(title, body, target);
@@ -90,12 +110,13 @@ fn clicked(target: String) {
 }
 
 /// The bundle identifier banners are attributed to when this process has
-/// none of its own: the app's (`sh.zeron.app`, `sh.zeron.app.dev` for the
-/// development bundle). Call before the first [`post`].
+/// none of its own. Call before the first [`post`].
 pub fn set_app_bundle_id(id: &str) {
+    let id = id.replace('\0', "");
+    let _ = APP_BUNDLE_ID.set(id.clone());
     #[cfg(target_os = "macos")]
     {
-        let _ = macos::APP_BUNDLE_ID.set(id.replace('\0', ""));
+        let _ = macos::APP_BUNDLE_ID.set(id);
     }
     #[cfg(not(target_os = "macos"))]
     let _ = id;
@@ -200,8 +221,8 @@ mod macos {
         })
     }
 
-    /// The production app's id: the default identity to adopt.
-    const DEFAULT_BUNDLE_ID: &str = "sh.zeron.app";
+    /// The production Crew app's id: the default identity to adopt.
+    const DEFAULT_BUNDLE_ID: &str = "ai.ashler.comet";
 
     pub(super) static APP_BUNDLE_ID: OnceLock<String> = OnceLock::new();
 
@@ -444,7 +465,7 @@ fn post_impl(title: &str, body: &str, _target: Option<&str>) {
         // `--` ends option parsing: session titles are model-generated, so a
         // `-`-leading one must land as the summary, not as a flag.
         let result = std::process::Command::new("notify-send")
-            .args(["--app-name=Zeron", "--", &title, &body])
+            .args(["--app-name=Crew", "--", &title, &body])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -476,26 +497,34 @@ mod tests {
 
     #[test]
     fn links_round_trip_their_target() {
-        assert_eq!(link("chat-1"), "zeron://notification/chat-1");
+        assert_eq!(link("chat-1"), format!("{LINK_PREFIX}chat-1"));
         assert_eq!(link_target(&link("chat-1")), Some("chat-1"));
         assert_eq!(link_target(LINK_PREFIX), None);
         assert_eq!(link_target("zeron://chat/x"), None);
+        assert_eq!(
+            link_prefix_for_bundle_id(Some("ai.ashler.comet.staging")),
+            "comet-staging://notification/"
+        );
+        assert_eq!(
+            link_prefix_for_bundle_id(Some("ai.ashler.crew.upstream-canary")),
+            "crew-upstream-canary://notification/"
+        );
     }
 
     #[test]
     fn reads_the_bundle_id_from_an_app_plist() {
-        let dir = std::env::temp_dir().join(format!("zeron-notify-{}", std::process::id()));
-        let contents = dir.join("Zeron Dev.app").join("Contents");
+        let dir = std::env::temp_dir().join(format!("crew-notify-{}", std::process::id()));
+        let contents = dir.join("Crew Canary.app").join("Contents");
         std::fs::create_dir_all(&contents).unwrap();
         std::fs::write(
             contents.join("Info.plist"),
-            "<dict>\n<key>CFBundleName</key>\n<string>Zeron Dev</string>\n\
-             <key>CFBundleIdentifier</key>\n    <string>sh.zeron.app.dev</string>\n</dict>",
+            "<dict>\n<key>CFBundleName</key>\n<string>Crew Canary</string>\n\
+             <key>CFBundleIdentifier</key>\n    <string>ai.ashler.comet.canary</string>\n</dict>",
         )
         .unwrap();
         assert_eq!(
-            bundle_id_of(&dir.join("Zeron Dev.app")).as_deref(),
-            Some("sh.zeron.app.dev")
+            bundle_id_of(&dir.join("Crew Canary.app")).as_deref(),
+            Some("ai.ashler.comet.canary")
         );
         assert_eq!(bundle_id_of(&dir.join("Missing.app")), None);
         let _ = std::fs::remove_dir_all(dir);

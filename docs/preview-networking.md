@@ -23,6 +23,9 @@ agent. Their listeners may be one-shot browser callbacks: for example,
 `infisical login` fails with EOF if it receives a discovery HEAD without the
 browser's JSON body. This command check does not identify custom callback
 servers without an authentication argument.
+Native `comet` and `zeron` processes are also excluded before any connection.
+Their control-plane listeners are not HTTP previews, including when another Crew
+profile shares the project cwd or its installation path contains spaces.
 
 Unrelated listeners and non-HTTP services are excluded. Discovery runs every
 two seconds; bounded HEAD probes accept valid HTTP status responses (including

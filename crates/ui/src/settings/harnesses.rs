@@ -130,6 +130,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
+        HarnessId::Omp => "omp",
     }
 }
 
@@ -570,8 +571,6 @@ impl HarnessesPage {
             installed: true,
             can_install: false,
             enabled: Some(true),
-            access_modes: Vec::new(),
-            supports_plan: false,
         }]);
         self.updates = Loadable::Ready(vec![
             serde_json::from_value(serde_json::json!({ "harness": harness, "phase": "current" }))
@@ -994,24 +993,18 @@ impl HarnessesPage {
         }));
     }
 
-    /// Whether the page shows Cloud's providers: the accounts every Cloud
-    /// machine uses, kept by the vault rather than installed on a device.
+    /// Cloud is not a provider target in the Crew build.
     fn targets_cloud(&self) -> bool {
-        self.target_device.as_deref() == Some(zeron_proto::CLOUD_ACCOUNTS_DEVICE)
+        false
     }
 
-    /// The page-header device switcher (the Accounts pattern): platform glyph
-    /// · name · presence dot · sort glyph, opening a dropdown of every
-    /// registered device, then Cloud as one entry (never its machines).
+    /// The page-header device switcher: platform glyph · name · sort glyph,
+    /// opening a dropdown of every registered Crew device.
     fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         use crate::icons::{self, icon};
-        let (mut devices, local_id, cloud) = {
+        let (mut devices, local_id) = {
             let s = self.state.read(cx);
-            (
-                s.provider_devices().cloned().collect::<Vec<_>>(),
-                s.local_device_id.clone(),
-                s.cloud_enabled(),
-            )
+            (s.devices.clone(), s.local_device_id.clone())
         };
         devices.sort_by(|a, b| {
             a.created_at
@@ -1019,13 +1012,17 @@ impl HarnessesPage {
                 .then_with(|| a.id.cmp(&b.id))
         });
         let effective = self.target_device.clone().or_else(|| local_id.clone());
-        let now = chrono::Utc::now();
+        let platform_glyph = |platform: &str| match platform {
+            "macos" | "darwin" => icons::LAPTOP,
+            "ios" | "android" => icons::SMARTPHONE,
+            _ => icons::MONITOR,
+        };
         // Local device = no passthrough (calls stay direct).
         let mut targets: Vec<Option<String>> = Vec::new();
         let mut options = Vec::new();
         for device in &devices {
             let is_local = local_id.as_deref() == Some(device.id.as_str());
-            let glyph = crate::cloud::device_glyph(&device.id, &device.platform);
+            let glyph = platform_glyph(&device.platform);
             let muted = theme.text_muted;
             let option = widgets::SelectOption::new(device.name.clone()).leading(move || {
                 icon(glyph)
@@ -1034,30 +1031,12 @@ impl HarnessesPage {
                     .text_color(muted)
                     .into_any_element()
             });
-            // A sleeping Cloud device says so; it wakes when asked.
-            let presence = self.state.read(cx).device_presence(&device.id, now);
             options.push(if is_local {
                 option.detail("You")
-            } else if matches!(
-                presence,
-                crate::cloud::Presence::Asleep | crate::cloud::Presence::Waking
-            ) {
-                option.detail(presence.label())
             } else {
                 option
             });
             targets.push((!is_local).then(|| device.id.clone()));
-        }
-        if cloud || self.targets_cloud() {
-            let muted = theme.text_muted;
-            options.push(widgets::SelectOption::new("Cloud").leading(move || {
-                icon(icons::CLOUD)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(muted)
-                    .into_any_element()
-            }));
-            targets.push(Some(zeron_proto::CLOUD_ACCOUNTS_DEVICE.to_string()));
         }
         let selected = match targets
             .iter()
@@ -1652,8 +1631,6 @@ mod tests {
                         installed: true,
                         can_install: false,
                         enabled: Some(true),
-                        access_modes: Vec::new(),
-                        supports_plan: false,
                     }]);
                 page.run_pending_sign_in(cx);
                 assert_eq!(page.expanded_harness, Some(zeron_proto::HarnessId::Codex));
@@ -1692,8 +1669,6 @@ mod tests {
             installed: true,
             can_install: false,
             enabled: Some(true),
-            access_modes: Vec::new(),
-            supports_plan: false,
         };
         window
             .update(cx, |page, _, cx| {
@@ -1753,83 +1728,6 @@ mod tests {
             })
             .unwrap();
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
-            .unwrap();
-    }
-
-    /// Providers opened on Cloud: its two harnesses, no toggles or installs,
-    /// and the expanded card's accounts follow the Cloud target.
-    #[gpui::test]
-    fn cloud_target_shows_accounts_without_device_controls(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext;
-        let dir = tempfile::tempdir().unwrap();
-        cx.update(|cx| {
-            crate::settings::init(Default::default(), dir.path(), cx);
-            gpui_base::init(cx);
-            cx.set_global(crate::theme::Theme::default());
-        });
-        let window = cx.add_window(|_, cx| {
-            let state = cx.new(|_| {
-                let mut state = crate::state::AppState::new();
-                state.cloud_status = Some(zeron_proto::CloudStatus {
-                    state: zeron_proto::CloudState::Ready,
-                    device_id: Some("cloud-1".into()),
-                    available: true,
-                    ..Default::default()
-                });
-                state
-            });
-            let mut page = super::HarnessesPage::new(state, cx);
-            page.set_target_device(Some(zeron_proto::CLOUD_ACCOUNTS_DEVICE.into()), cx);
-            page
-        });
-        let descriptor = |id, name: &str| zeron_engine::registry::HarnessDescriptor {
-            id,
-            name: name.into(),
-            supports_steering: false,
-            steering_mode: zeron_proto::SteeringMode::TurnBoundary,
-            reasoning_levels: Vec::new(),
-            installed: true,
-            can_install: true,
-            enabled: Some(true),
-            access_modes: Vec::new(),
-            supports_plan: false,
-        };
-        window
-            .update(cx, |page, _, cx| {
-                assert!(page.targets_cloud());
-                assert!(!page.supports_updates(cx), "Cloud has no harness updates");
-                page.harnesses = super::Loadable::Ready(vec![
-                    descriptor(zeron_proto::HarnessId::ClaudeCode, "Claude Code"),
-                    descriptor(zeron_proto::HarnessId::Codex, "Codex"),
-                ]);
-                page.toggle_agent_details(zeron_proto::HarnessId::Codex, cx);
-                assert!(page.accounts_page.is_some());
-                // Rows count each provider's accounts from the shared list
-                // (drawn below: "1 account" for Claude, "No account" for Codex).
-                let account: zeron_proto::AgentAccount =
-                    serde_json::from_value(serde_json::json!({
-                        "id": "a", "harness": "claude-code", "email": "a@example.com",
-                        "planLabel": null, "active": true
-                    }))
-                    .unwrap();
-                cx.default_global::<crate::settings::accounts::AccountsSnapshotCache>()
-                    .0
-                    .insert(
-                        Some(zeron_proto::CLOUD_ACCOUNTS_DEVICE.into()),
-                        zeron_proto::AgentAccountsSnapshot {
-                            accounts: vec![account],
-                            warnings: Vec::new(),
-                        },
-                    );
-            })
-            .unwrap();
-        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
-            .unwrap();
-        window
-            .update(cx, |page, _, cx| {
-                page.set_target_device(None, cx);
-                assert!(!page.targets_cloud());
-            })
             .unwrap();
     }
 }

@@ -138,6 +138,7 @@ async fn remote_steer_batch_reaches_real_muse_with_every_message() {
             payload: SessionCommandPayload::Steer {prompt: format!("Remember {token}. Reply with the immediately previous user token and this token. Do not use tools."), message_id: Some(format!("message-{i}"))},
             issued_by: "remote-viewer".into(), issued_at: now + i as i64,
             based_on: None, expires_at: None, status: zeron_doc::SessionCommandStatus::Pending, resolution: None,
+            accepted_at: None,
         }).unwrap();
     }
     core.doc_host.drain_commands(&handle).await;

@@ -69,6 +69,11 @@ pub enum WorkspaceScope {
 pub struct EngineInfo {
     pub device_id: String,
     pub workspace_scope: WorkspaceScope,
+    /// Native provider binding, independently validated by the owning engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbox_provider: Option<crate::DeviceEnvironment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devbox_id: Option<String>,
     /// SDK selected by the owning engine, absent on older versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_sdk_version: Option<String>,
@@ -107,6 +112,8 @@ mod tests {
         let info = EngineInfo {
             device_id: "device-1".into(),
             workspace_scope: WorkspaceScope::Local,
+            devbox_provider: Some(crate::DeviceEnvironment::Boat),
+            devbox_id: Some("bx_jdyh7avc".into()),
             cursor_sdk_version: Some("1.0.31".into()),
             capabilities: capabilities::current(),
         };
@@ -115,6 +122,8 @@ mod tests {
             serde_json::json!({
                 "deviceId": "device-1",
                 "workspaceScope": "local",
+                "devboxProvider": "boat",
+                "devboxId": "bx_jdyh7avc",
                 "cursorSdkVersion": "1.0.31",
                 "capabilities": [
                     "composer-references-v1",
@@ -142,6 +151,8 @@ mod tests {
         .unwrap();
         assert!(info.capabilities.is_empty());
         assert!(info.cursor_sdk_version.is_none());
+        assert!(info.devbox_provider.is_none());
+        assert!(info.devbox_id.is_none());
         assert!(!info.supports(capabilities::MESSAGE_QUEUE_V1));
         assert!(!info.supports(capabilities::COMPOSER_REFERENCES_V1));
     }

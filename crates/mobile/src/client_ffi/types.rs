@@ -181,8 +181,14 @@ impl From<DemoOptions> for zc::DemoOptions {
 }
 
 /// How the client authenticates against the edge.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum Credentials {
+    Scaffold {
+        user_id: String,
+        org_id: String,
+        control_origin: String,
+        session_json: String,
+    },
     /// WorkOS session scoped to `org_id`.
     WorkOs {
         user_id: String,
@@ -195,9 +201,17 @@ pub enum Credentials {
     Demo { options: DemoOptions },
 }
 
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Credentials(<redacted>)")
+    }
+}
+
 impl From<Credentials> for zc::Credentials {
     fn from(c: Credentials) -> Self {
         match c {
+            Credentials::Scaffold { user_id, org_id, control_origin, session_json } =>
+                zc::Credentials::Scaffold { user_id, org_id, control_origin, session_json },
             Credentials::WorkOs {
                 user_id,
                 org_id,

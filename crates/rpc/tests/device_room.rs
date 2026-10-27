@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
+use zeron_proto::AccessToken;
 
 use zeron_rpc::device_room::{
     CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, NUDGE_KIND, RELAY_KIND,
@@ -41,11 +42,14 @@ use zeron_rpc::{
 enum Out {
     Frame(Vec<u8>),
     Close,
+    CloseCode(u16),
 }
 
 #[derive(Default)]
 struct RelayState {
     nudge_acks: Vec<serde_json::Value>,
+    reject_next: Option<u16>,
+    requests: Vec<String>,
     host: Option<mpsc::UnboundedSender<Out>>,
     clients: HashMap<String, mpsc::UnboundedSender<Out>>,
     /// Zombie-path simulation: the host stays "connected" (no bounce) but
@@ -130,6 +134,14 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
     let ws =
         match tokio_tungstenite::accept_hdr_async(stream, |req: &WsRequest, res: WsResponse| {
             uri = req.uri().to_string();
+            let mut state = lock(&state);
+            state.requests.push(uri.clone());
+            if let Some(status) = state.reject_next.take() {
+                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(status)
+                    .body(Some("rejected".into()))
+                    .expect("rejection response"));
+            }
             Ok(res)
         })
         .await
@@ -176,6 +188,15 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
                 }
                 Out::Close => {
                     let _ = sink.send(WsMessage::Close(None)).await;
+                    break;
+                }
+                Out::CloseCode(code) => {
+                    let _ = sink.send(WsMessage::Close(Some(
+                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                            code: code.into(),
+                            reason: "test close".into(),
+                        },
+                    ))).await;
                     break;
                 }
             }
@@ -270,6 +291,7 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
 struct TestService {
     label: String,
     active_streams: Arc<AtomicUsize>,
+    peer_messages: AtomicUsize,
 }
 
 impl TestService {
@@ -277,6 +299,7 @@ impl TestService {
         Arc::new(Self {
             label: label.into(),
             active_streams: Arc::new(AtomicUsize::new(0)),
+            peer_messages: AtomicUsize::new(0),
         })
     }
 }
@@ -293,7 +316,11 @@ impl Drop for StreamGuard {
 impl RpcService for TestService {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         match method {
-            methods::LIST_HARNESSES => Ok(RpcReply::Value(serde_json::json!([]))),
+            "DeliverPeerMessage" => {
+                self.peer_messages.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+            methods::LOCAL_DEVICE => Ok(RpcReply::Value(serde_json::json!({"id": self.label}))),
             "Echo" => Ok(RpcReply::Value(
                 serde_json::json!({ "host": self.label, "params": params }),
             )),
@@ -349,7 +376,8 @@ fn noop_nudge() -> zeron_rpc::NudgeHandler {
 }
 
 struct RecoveringToken {
-    value: Mutex<Option<String>>,
+    value: Mutex<Option<AccessToken>>,
+    invalidated: Mutex<Vec<u64>>,
     unavailable: AtomicBool,
     changes: tokio::sync::watch::Sender<u64>,
 }
@@ -358,7 +386,8 @@ impl RecoveringToken {
     fn new(value: Option<&str>) -> Self {
         let (changes, _) = tokio::sync::watch::channel(0);
         Self {
-            value: Mutex::new(value.map(str::to_string)),
+            value: Mutex::new(value.map(|value| AccessToken { value: value.into(), generation: 0 })),
+            invalidated: Mutex::new(Vec::new()),
             unavailable: AtomicBool::new(false),
             changes,
         }
@@ -366,7 +395,10 @@ impl RecoveringToken {
 
     fn replace(&self, value: &str) {
         self.unavailable.store(false, Ordering::SeqCst);
-        *self.value.lock().expect("lock") = Some(value.into());
+        *self.value.lock().expect("lock") = Some(AccessToken {
+            value: value.into(),
+            generation: *self.changes.borrow() + 1,
+        });
         self.changes
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
@@ -387,7 +419,7 @@ impl RecoveringToken {
 
 #[async_trait]
 impl TokenSource for RecoveringToken {
-    async fn token(&self) -> Result<String, TokenError> {
+    async fn token(&self) -> Result<AccessToken, TokenError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(TokenError::TemporarilyUnavailable(
                 "resolver unavailable".into(),
@@ -400,6 +432,10 @@ impl TokenSource for RecoveringToken {
             .ok_or(TokenError::SignedOut)
     }
 
+    fn invalidate(&self, generation: u64) {
+        lock(&self.invalidated).push(generation);
+    }
+
     fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.changes.subscribe())
     }
@@ -408,6 +444,167 @@ impl TokenSource for RecoveringToken {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[tokio::test]
+async fn handshake_rejections_invalidate_only_unauthorized_leases() {
+    for status in [401, 403, 429, 503] {
+        let relay = FakeRelay::start().await;
+        let token = Arc::new(RecoveringToken::new(Some("old-token")));
+        let lease = token.token().await.unwrap();
+        token.replace("new-token");
+        lock(&relay.state).reject_next = Some(status);
+        let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", None, &lease.value);
+        assert!(DeviceLink::connect(&url, token.clone(), lease.generation).await.is_err());
+        assert_eq!(*lock(&token.invalidated), if status == 401 { vec![0] } else { vec![] });
+        assert_eq!(token.token().await.unwrap().generation, 1);
+        assert_eq!(lock(&relay.state).requests.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn host_handshake_rejections_preserve_reconnect_and_classify_auth() {
+    for status in [401, 403, 429, 503] {
+        let relay = FakeRelay::start().await;
+        lock(&relay.state).reject_next = Some(status);
+        let token = Arc::new(RecoveringToken::new(Some("old-token")));
+        let mut config = HostRelayConfig::new(relay.edge_url(), "dev-a", token.clone());
+        config.retry = Duration::from_millis(10);
+        let host = HostRelay::spawn(config, TestService::new("host-a"), noop_nudge());
+        relay.wait_host_connected().await;
+        assert_eq!(*lock(&token.invalidated), if status == 401 { vec![0] } else { vec![] });
+        assert_eq!(lock(&relay.state).requests.len(), 2);
+        drop(host);
+    }
+}
+
+#[tokio::test]
+async fn host_and_device_closes_reject_the_original_lease_only_for_4401() {
+    for code in [4401, 4403, 1013] {
+        let relay = FakeRelay::start().await;
+        let host_token = Arc::new(RecoveringToken::new(Some("old-host")));
+        let host = HostRelay::spawn(
+            HostRelayConfig::new(relay.edge_url(), "dev-a", host_token.clone()),
+            TestService::new("host-a"), noop_nudge(),
+        );
+        relay.wait_host_connected().await;
+        let token = Arc::new(RecoveringToken::new(Some("old-client")));
+        let lease = token.token().await.unwrap();
+        let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("auth-client"), &lease.value);
+        let link = DeviceLink::connect(&url, token.clone(), lease.generation).await.unwrap();
+        wait_until(|| lock(&relay.state).clients.contains_key("auth-client")).await;
+        token.replace("new-client");
+        host_token.replace("new-host");
+        lock(&relay.state).clients["auth-client"].send(Out::CloseCode(code)).unwrap();
+        wait_until(|| link.is_closed()).await;
+        assert_eq!(*lock(&token.invalidated), if code == 4401 { vec![0] } else { vec![] });
+        lock(&relay.state).host.as_ref().unwrap().send(Out::CloseCode(code)).unwrap();
+        if code == 4401 {
+            wait_until(|| !lock(&host_token.invalidated).is_empty()).await;
+        } else {
+            // A subsequent connection proves the old host pump observed the close.
+            wait_until(|| lock(&relay.state).requests.len() >= 3).await;
+        }
+        assert_eq!(*lock(&host_token.invalidated), if code == 4401 { vec![0] } else { vec![] });
+        assert_eq!(token.token().await.unwrap().generation, 1);
+        assert_eq!(host_token.token().await.unwrap().generation, 1);
+        drop(host);
+    }
+}
+
+fn peer_params() -> serde_json::Value {
+    serde_json::json!({"chatId":"target", "command": {
+        "sourceChatId":"source", "sourceDeviceId":"source-device", "id":"stable-command"
+    }})
+}
+
+#[tokio::test]
+async fn directional_handshake_rejection_never_replays_admission() {
+    for device in [false, true] {
+        for status in [401, 403, 429, 503] {
+            let relay = FakeRelay::start().await;
+            lock(&relay.state).reject_next = Some(status);
+            let token = Arc::new(RecoveringToken::new(Some("peer-token")));
+            let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+            let result = if device {
+                links.peer_device_call("dev-a", "target", None, "DeliverPeerMessage", peer_params()).await
+            } else {
+                links.peer_call("target", None, "DeliverPeerMessage", peer_params()).await
+            };
+            assert!(result.is_err());
+            assert_eq!(*lock(&token.invalidated), if status == 401 { vec![0] } else { vec![] });
+            let state = lock(&relay.state);
+            assert_eq!(state.requests.len(), 1, "directional failures must not replay");
+            assert!(state.requests[0].starts_with(if device { "/device/dev-a/ws?" } else { "/session/target/peer/ws?" }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn directional_close_rejects_original_lease_without_replaying_mutation() {
+    for device in [false, true] {
+        for code in [4401, 1013] {
+            let relay = FakeRelay::start().await;
+            let service = TestService::new("host-a");
+            let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service.clone(), noop_nudge());
+            relay.wait_host_connected().await;
+            let token = Arc::new(RecoveringToken::new(Some("old-token")));
+            let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+            let call = tokio::spawn(async move {
+                if device {
+                    links.peer_device_call("dev-a", "target", None, "DeliverPeerMessage", peer_params()).await
+                } else {
+                    links.peer_call("target", None, "DeliverPeerMessage", peer_params()).await
+                }
+            });
+            wait_until(|| service.peer_messages.load(Ordering::SeqCst) == 1).await;
+            token.replace("new-token");
+            lock(&relay.state).clients.values().next().unwrap().send(Out::CloseCode(code)).unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(2), call).await.unwrap().unwrap().is_err());
+            assert_eq!(*lock(&token.invalidated), if code == 4401 { vec![0] } else { vec![] });
+            assert_eq!(service.peer_messages.load(Ordering::SeqCst), 1);
+            assert_eq!(lock(&relay.state).requests.len(), 2);
+            assert_eq!(token.token().await.unwrap().generation, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cached_link_retries_dial_with_fresh_lease_but_never_replays_mutation() {
+    let relay = FakeRelay::start().await;
+    let service = TestService::new("host-a");
+    let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service.clone(), noop_nudge());
+    relay.wait_host_connected().await;
+    lock(&relay.state).reject_next = Some(401);
+    let token = Arc::new(RecoveringToken::new(Some("old-token")));
+    let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+    let dialing = links.clone();
+    let dial = tokio::spawn(async move { dialing.client("dev-a").await });
+    wait_until(|| !lock(&token.invalidated).is_empty()).await;
+    token.replace("fresh-token");
+    let client = tokio::time::timeout(Duration::from_secs(5), dial).await.unwrap().unwrap().unwrap();
+    {
+        let state = lock(&relay.state);
+        assert_eq!(state.requests.len(), 3);
+        assert!(state.requests[1].contains("token=old-token"));
+        assert!(state.requests[2].contains("token=fresh-token"));
+    }
+    let call = tokio::spawn(async move { client.call("DeliverPeerMessage", peer_params()).await });
+    wait_until(|| service.peer_messages.load(Ordering::SeqCst) == 1).await;
+    token.replace("newer-token");
+    lock(&relay.state).clients.values().next().unwrap().send(Out::CloseCode(4401)).unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(2), call).await.unwrap().unwrap().is_err());
+    assert_eq!(*lock(&token.invalidated), vec![0, 1]);
+    assert_eq!(service.peer_messages.load(Ordering::SeqCst), 1);
+    assert_eq!(lock(&relay.state).requests.len(), 3);
+    let fresh = links.client("dev-a").await.expect("next caller reconnects");
+    fresh.call("Echo", serde_json::json!({})).await.unwrap();
+    assert!(lock(&relay.state).requests.last().unwrap().contains("token=newer-token"));
+}
+
 
 #[tokio::test]
 async fn token_recovery_wakes_a_signed_out_host_relay_immediately() {
@@ -595,7 +792,8 @@ async fn client_disconnect_tears_down_virtual_conn() {
     relay.wait_host_connected().await;
 
     let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("conn-x"), "t");
-    let link = DeviceLink::connect(&url).await.expect("link connects");
+    let link = DeviceLink::connect(&url, Arc::new(StaticToken("t".into())), 0)
+        .await.expect("link connects");
     let client = link.client();
     let _items = client
         .subscribe("Never", serde_json::Value::Null)
@@ -814,7 +1012,8 @@ async fn zombie_relay_path_trips_the_echo_deadline() {
     relay.wait_host_connected().await;
 
     let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("c-echo"), "tok");
-    let link = DeviceLink::connect(&url).await.expect("client link dials");
+    let link = DeviceLink::connect(&url, Arc::new(StaticToken("tok".into())), 0)
+        .await.expect("client link dials");
     // Healthy phase: echoes flow, the deadline never trips.
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!link.is_closed(), "echoing link must stay open");

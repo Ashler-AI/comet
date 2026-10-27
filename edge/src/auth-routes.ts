@@ -1,34 +1,33 @@
-/**
- * The /auth/* HTTP surface absorbed from zeron's apps/server:
- *
- *  - POST /auth/exchange     — WorkOS code → tokens (see `workos.ts`).
- *  - POST /auth/refresh      — WorkOS refresh → fresh tokens (org-scopable).
- *  - GET  /auth/orgs         — the caller's active org memberships.
- *  - POST /auth/orgs         — create an org + first (admin) membership.
- *  - GET  /auth/cli/callback — headless sign-in: shows a paste-able code.
- *
- * Exchange/refresh/callback run BEFORE the bearer gate (the caller has no
- * access token yet); the org routes verify the bearer themselves — the user
- * id is ALWAYS the token's `sub`, never request input: users manage their own
- * memberships and no one else's. Error mapping matches the old server: bad
- * body 400, missing bearer 401, WorkOS-off 501, rejected exchange/refresh 401.
- */
-import { bearerFromRequest, verifyToken } from "./auth";
-import type { Env } from "./env";
-import { WorkOsAuthFailed, createOrg, exchange, listOrgs, refresh } from "./workos";
+import { bearerFromRequest, credentialTransportAllowed, requiredCapabilities, verifyScaffoldSessionResult, type ScaffoldAuthEnv, type ScaffoldAuthenticationResult, type Verified } from "./auth";
+import { AUTH_USER_HEADER, type Env } from "./env";
+import { handleNativeGrantEpoch, nativeGrantEpoch, NATIVE_GRANT_ISSUER_HEADER, type NativeGrantEpoch } from "./native-grant-epoch";
+import { boundedAuthJson, scaffoldAdmission, scaffoldTokenFits, SCAFFOLD_DEADLINE_MS, SCAFFOLD_JSON_BYTES } from "./auth-envelope";
+
+const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const GRANT_TTL_MS = 15 * 60 * 1000;
+const ACCESS_TTL_MS = 12 * 60 * 60 * 1000;
+const SCAFFOLD_AUTHORITY_PROFILE_VERSION = "scaffold.comet-runtime.v1";
+
+interface GrantRecord extends NativeGrantEpoch {
+  grantId: string;
+  email: string;
+  capabilities: string[];
+  grantHash: string;
+  issuedAt: number;
+  grantExpiresAt: number;
+  consumedAt?: number;
+  accessHash?: string;
+  accessExpiresAt?: number;
+  revokedAt?: number;
+}
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" }
+    headers: { "content-type": "application/json", "cache-control": "no-store" }
   });
 
-const notConfigured = (): Response => json({ error: "workos not configured" }, 501);
-
-const authFailed = (e: unknown): Response =>
-  json({ error: e instanceof WorkOsAuthFailed ? e.message : "authentication failed" }, 401);
-
-const bodyJson = async <T>(request: Request): Promise<T | undefined> => {
+const bodyJson = async <T>(request: Request | Response): Promise<T | undefined> => {
   try {
     return (await request.json()) as T;
   } catch {
@@ -36,160 +35,648 @@ const bodyJson = async <T>(request: Request): Promise<T | undefined> => {
   }
 };
 
-/** Handle an /auth/* route; undefined means "not an auth route". */
-export const handleAuthRoute = async (
+const randomSecret = (): string =>
+  `${crypto.randomUUID().replaceAll("-", "")}${crypto.randomUUID().replaceAll("-", "")}`;
+
+const hash = async (value: string): Promise<string> => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+};
+
+/** A separate name space from the hexadecimal device-grant IDs; no token is stored. */
+export const scaffoldVerificationName = async (env: ScaffoldAuthEnv, token: string): Promise<string> => {
+  if (!scaffoldTokenFits(token)) throw new Error("Scaffold token too large");
+  return `scaffold-verification:${await hash(JSON.stringify([
+    token, env.SCAFFOLD_CONTROL_PLANE_URL, env.SCAFFOLD_PROJECT_SCOPE,
+    [...requiredCapabilities(env)].sort(), env.ENVIRONMENT, env.SCAFFOLD_DEPLOYMENT_ID
+  ]))}`;
+};
+
+export const verifyScaffoldThroughCoordinator = async (
+  env: ScaffoldAuthEnv, token: string, signal?: AbortSignal
+): Promise<ScaffoldAuthenticationResult> => {
+  if (!scaffoldTokenFits(token)) return { status: "unavailable", retryAfter: "1" };
+  return scaffoldAdmission("dispatch", signal, async signal => {
+    const name = await scaffoldVerificationName(env, token);
+    signal.throwIfAborted();
+    const response = await env.AUTH_GRANTS.get(env.AUTH_GRANTS.idFromName(name)).fetch("https://grant.internal/verify-scaffold", {
+      method: "POST", body: JSON.stringify({ token }), signal
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { status: "unavailable" };
+    }
+    const result = await boundedAuthJson<ScaffoldAuthenticationResult>(response, signal);
+    if (result?.status === "invalid") return { status: "invalid" };
+    if (result?.status === "unavailable") {
+      return typeof result.retryAfter === "string" ? { status: "unavailable", retryAfter: result.retryAfter } : { status: "unavailable" };
+    }
+    if (result?.status === "authenticated") {
+      const identity = result.identity;
+      if (
+        identity?.credential === "scaffold" &&
+        typeof identity.userId === "string" && identity.userId.length > 0 &&
+        typeof identity.email === "string" && identity.email.length > 0 &&
+        identity.projectScope === env.SCAFFOLD_PROJECT_SCOPE.trim() &&
+        identity.orgId === identity.projectScope &&
+        Array.isArray(identity.capabilities) &&
+        identity.capabilities.every((value) => typeof value === "string") &&
+        requiredCapabilities(env).every((value) => identity.capabilities.includes(value))
+      ) return { status: "authenticated", identity };
+    }
+    return { status: "unavailable" };
+  });
+};
+
+export const parseGrantToken = (
+  value: string,
+  prefix: "cg1" | "cs1"
+): { id: string; secret: string } | undefined => {
+  const [actualPrefix, id, secret, extra] = value.split(".");
+  if (actualPrefix !== prefix || extra !== undefined || !id || !secret) return undefined;
+  if (!/^[a-f0-9]{32}$/.test(id) || !/^[a-f0-9]{64}$/.test(secret)) return undefined;
+  return { id, secret };
+};
+
+const grantStub = (env: Env, id: string): DurableObjectStub =>
+  env.AUTH_GRANTS.get(env.AUTH_GRANTS.idFromName(id));
+
+/** Grant storage stays atomic; prefixed verification coordinators retain only pending work/cooldown. */
+export class AuthGrant implements DurableObject {
+  private verification?: Promise<ScaffoldAuthenticationResult>;
+  private verificationController?: AbortController;
+  private verificationWaiters = 0;
+  private unavailableUntil = 0;
+  private unavailableRetryAfter?: string;
+
+  constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {}
+
+  async fetch(request: Request): Promise<Response> {
+    // Do not hold the storage gate here: other isolates must join pending verification.
+    if (new URL(request.url).pathname === "/verify-scaffold") {
+      if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+      const result = await scaffoldAdmission("coordinator", request.signal, async signal => {
+        const body = await boundedAuthJson<{ token?: unknown }>(request, signal);
+        if (typeof body?.token !== "string" || !body.token.startsWith("sc_rc_")) return { status: "invalid" };
+        if (!scaffoldTokenFits(body.token)) return { status: "unavailable", retryAfter: "1" };
+        const name = await scaffoldVerificationName(this.env, body.token);
+        signal.throwIfAborted();
+        if (this.ctx.id.toString() !== this.env.AUTH_GRANTS.idFromName(name).toString()) {
+          return { status: "unavailable" };
+        }
+        return this.verify(body.token, signal);
+      });
+      // Subjects appear twice; cooldown headers also pass this output envelope.
+      // Keep the original upstream cooldown even if its reply cannot be emitted.
+      const encoded = JSON.stringify(result);
+      if (encoded.length > SCAFFOLD_JSON_BYTES || new TextEncoder().encode(encoded).byteLength > SCAFFOLD_JSON_BYTES) {
+        return json({ status: "unavailable", retryAfter: "1" });
+      }
+      return new Response(encoded, { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    }
+    return this.ctx.blockConcurrencyWhile(() => this.handle(request));
+  }
+
+  private async verify(token: string, signal: AbortSignal): Promise<ScaffoldAuthenticationResult> {
+    if (this.unavailableUntil > Date.now()) {
+      return { status: "unavailable", retryAfter: this.unavailableRetryAfter ?? String(Math.ceil((this.unavailableUntil - Date.now()) / 1000)) };
+    }
+    if (!this.verification) {
+      const controller = new AbortController();
+      this.verificationController = controller;
+      const timer = setTimeout(() => controller.abort(), SCAFFOLD_DEADLINE_MS);
+      this.verification = (async (): Promise<ScaffoldAuthenticationResult> => {
+        // A rendezvous, not an authorization TTL: each new batch checks fresh revocation.
+        let result: ScaffoldAuthenticationResult;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const abort = () => { clearTimeout(rendezvous); reject(new Error("Verification cancelled")); };
+            const rendezvous = setTimeout(() => {
+              controller.signal.removeEventListener("abort", abort);
+              resolve();
+            }, 200);
+            controller.signal.addEventListener("abort", abort, { once: true });
+          });
+          controller.signal.throwIfAborted();
+          result = await verifyScaffoldSessionResult(this.env, token, controller.signal);
+        } catch {
+          result = { status: "unavailable", retryAfter: "1" };
+        }
+        if (controller.signal.aborted) return { status: "unavailable", retryAfter: "1" };
+        if (result.status === "unavailable") {
+          const now = Date.now();
+          const value = result.retryAfter?.trim();
+          const numeric = value !== undefined && /^\d+$/.test(value);
+          const deadline = numeric ? now + Number(value) * 1000 : value ? Date.parse(value) : NaN;
+          // Unrepresentable valid delays must not become an early retry or an invalid Infinity header.
+          this.unavailableUntil = numeric && !Number.isSafeInteger(deadline) ? Infinity
+            : Number.isFinite(deadline) ? Math.max(now, deadline) : now + 1000;
+          this.unavailableRetryAfter = this.unavailableUntil === Infinity ? value : undefined;
+        }
+        return result;
+      })().finally(() => {
+        clearTimeout(timer);
+        this.verification = undefined;
+        this.verificationController = undefined;
+      });
+    }
+    this.verificationWaiters++;
+    let waiting = true;
+    const leave = () => {
+      if (!waiting) return;
+      waiting = false;
+      this.verificationWaiters--;
+      if (this.verificationWaiters === 0) this.verificationController?.abort();
+    };
+    signal.addEventListener("abort", leave, { once: true });
+    try {
+      // Do not race here: the isolate admission remains charged for this
+      // continuation until shared work settles, even after the caller leaves.
+      return await this.verification;
+    } finally {
+      signal.removeEventListener("abort", leave);
+      leave();
+    }
+  }
+
+  private async handle(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    const epochs = this.env.NATIVE_GRANT_EPOCHS;
+    if ("NATIVE_GRANT_EPOCHS" in this.env && !epochs) {
+      return json({ error: "epoch_authority_unavailable" }, 503);
+    }
+    if (epochs) {
+      const response = await handleNativeGrantEpoch(this.ctx, this.env, request);
+      if (response) return response;
+    }
+    if (path === "/issue" && request.method === "POST") {
+      const record = await bodyJson<GrantRecord>(request);
+      if (!record || (await this.ctx.storage.get<GrantRecord>("grant"))) {
+        return json({ error: "grant_conflict" }, 409);
+      }
+      if (epochs) {
+        // Public issuance reaches this call only after verifiedSandboxTarget and
+        // ownership checks; no client header or unverified target is forwarded.
+        if (request.headers.get(NATIVE_GRANT_ISSUER_HEADER) !== "1" ||
+            !/^[a-f0-9]{32}$/.test(record.grantId) ||
+            this.env.AUTH_GRANTS.idFromName(record.grantId).toString() !== this.ctx.id.toString()) {
+          return json({ error: "forbidden" }, 403);
+        }
+        if (!(await nativeGrantEpoch(epochs, record, "advance"))) return json({ error: "stale_epoch" }, 409);
+      }
+      await this.ctx.storage.put("grant", record);
+      // A newer verified issuance may overtake the local store. Never publish
+      // an older grant as usable, and never roll its coordinator backward.
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "stale_epoch" }, 409);
+      return json({ ok: true });
+    }
+
+    const record = await this.ctx.storage.get<GrantRecord>("grant");
+    if (!record || record.revokedAt) return json({ error: "invalid_grant" }, 401);
+    if (epochs && (path === "/exchange" || path === "/refresh" || path === "/authenticate") &&
+        !(await nativeGrantEpoch(epochs, record, "check"))) {
+      return json({ error: "invalid_grant" }, 401);
+    }
+
+    if (path === "/exchange" && request.method === "POST") {
+      const body = await bodyJson<{ secret?: string }>(request);
+      if (
+        typeof body?.secret !== "string" ||
+        record.consumedAt ||
+        record.grantExpiresAt <= Date.now() ||
+        (await hash(body.secret)) !== record.grantHash
+      ) {
+        return json({ error: "invalid_grant" }, 401);
+      }
+      const secret = randomSecret();
+      record.consumedAt = Date.now();
+      record.accessHash = await hash(secret);
+      record.accessExpiresAt = Date.now() + ACCESS_TTL_MS;
+      await this.ctx.storage.put("grant", record);
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "invalid_grant" }, 401);
+      return json({
+        accessToken: `cs1.${record.grantId}.${secret}`,
+        expiresAt: record.accessExpiresAt,
+        userId: record.ownerUserId,
+        email: record.email,
+        projectId: record.projectId,
+        deploymentId: record.deploymentId,
+        sandboxId: record.sandboxId,
+        targetDeviceId: record.targetDeviceId,
+        sessionId: record.sessionId,
+        lifecycleEpoch: record.lifecycleEpoch,
+        capabilities: record.capabilities
+      });
+    }
+
+    if (path === "/refresh" && request.method === "POST") {
+      const body = await bodyJson<{ secret?: string }>(request);
+      if (
+        typeof body?.secret !== "string" ||
+        !record.accessHash ||
+        !record.accessExpiresAt ||
+        record.accessExpiresAt <= Date.now() ||
+        (await hash(body.secret)) !== record.accessHash
+      ) {
+        return json({ error: "invalid_token" }, 401);
+      }
+      const secret = randomSecret();
+      record.accessHash = await hash(secret);
+      record.accessExpiresAt = Date.now() + ACCESS_TTL_MS;
+      await this.ctx.storage.put("grant", record);
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "invalid_token" }, 401);
+      return json({
+        accessToken: `cs1.${record.grantId}.${secret}`,
+        expiresAt: record.accessExpiresAt,
+        grantId: record.grantId,
+        userId: record.ownerUserId,
+        email: record.email,
+        projectId: record.projectId,
+        deploymentId: record.deploymentId,
+        sandboxId: record.sandboxId,
+        targetDeviceId: record.targetDeviceId,
+        sessionId: record.sessionId,
+        lifecycleEpoch: record.lifecycleEpoch,
+        capabilities: record.capabilities
+      });
+    }
+
+    if (path === "/authenticate" && request.method === "POST") {
+      const body = await bodyJson<{ secret?: string }>(request);
+      if (
+        typeof body?.secret !== "string" ||
+        !record.accessHash ||
+        !record.accessExpiresAt ||
+        record.accessExpiresAt <= Date.now() ||
+        (await hash(body.secret)) !== record.accessHash
+      ) {
+        return json({ error: "invalid_token" }, 401);
+      }
+      if (epochs && !(await nativeGrantEpoch(epochs, record, "check"))) return json({ error: "invalid_token" }, 401);
+      return json({
+        grantId: record.grantId,
+        userId: record.ownerUserId,
+        email: record.email,
+        projectId: record.projectId,
+        deploymentId: record.deploymentId,
+        sandboxId: record.sandboxId,
+        targetDeviceId: record.targetDeviceId,
+        sessionId: record.sessionId,
+        lifecycleEpoch: record.lifecycleEpoch,
+        capabilities: record.capabilities,
+        grantedAt: record.issuedAt,
+        expiresAt: record.accessExpiresAt,
+        revokedAt: null
+      });
+    }
+
+    if (path === "/revoke" && request.method === "POST") {
+      const body = await bodyJson<{ ownerUserId?: string }>(request);
+      if (body?.ownerUserId !== record.ownerUserId) return json({ error: "forbidden" }, 403);
+      record.revokedAt = Date.now();
+      await this.ctx.storage.put("grant", record);
+      return json({ ok: true });
+    }
+    return json({ error: "not_found" }, 404);
+  }
+}
+
+export const authenticateDeviceToken = async (
+  env: Env,
+  token: string
+): Promise<(Verified & {
+  grantId: string;
+  projectId: string;
+  deploymentId: string;
+  sandboxId: string;
+  targetDeviceId: string;
+  sessionId: string;
+  lifecycleEpoch: number;
+  grantedAt: number;
+  expiresAt: number;
+  revokedAt: null;
+}) | undefined> => {
+  const parsed = parseGrantToken(token, "cs1");
+  if (!parsed) return undefined;
+  const response = await grantStub(env, parsed.id).fetch("https://grant.internal/authenticate", {
+    method: "POST",
+    body: JSON.stringify({ secret: parsed.secret })
+  });
+  if (response.status === 401 || response.status === 403) return undefined;
+  if (!response.ok) throw new Error("grant authority unavailable");
+  const body = await bodyJson<{
+    userId?: unknown;
+    email?: unknown;
+    grantId?: unknown;
+    projectId?: unknown;
+    deploymentId?: unknown;
+    sandboxId?: unknown;
+    targetDeviceId?: unknown;
+    sessionId?: unknown;
+    lifecycleEpoch?: unknown;
+    capabilities?: unknown;
+    grantedAt?: unknown;
+    expiresAt?: unknown;
+    revokedAt?: unknown;
+  }>(response);
+  if (
+    typeof body?.userId !== "string" ||
+    typeof body.email !== "string" ||
+    typeof body.projectId !== "string" ||
+    body.projectId !== env.SCAFFOLD_PROJECT_SCOPE ||
+    typeof body.deploymentId !== "string" ||
+    body.deploymentId !== env.SCAFFOLD_DEPLOYMENT_ID ||
+    typeof body.sandboxId !== "string" ||
+    typeof body.grantId !== "string" ||
+    typeof body.targetDeviceId !== "string" ||
+    typeof body.sessionId !== "string" ||
+    typeof body.lifecycleEpoch !== "number" ||
+    !Number.isSafeInteger(body.lifecycleEpoch) ||
+    body.lifecycleEpoch < 1 ||
+    typeof body.grantedAt !== "number" ||
+    !Number.isSafeInteger(body.grantedAt) ||
+    typeof body.expiresAt !== "number" ||
+    !Number.isSafeInteger(body.expiresAt) ||
+    body.expiresAt <= Date.now() ||
+    body.revokedAt !== null ||
+    !Array.isArray(body.capabilities) ||
+    !body.capabilities.every((value): value is string => typeof value === "string")
+  ) {
+    return undefined;
+  }
+  return {
+    userId: body.userId,
+    email: body.email,
+    projectScope: body.projectId,
+    grantId: body.grantId,
+    projectId: body.projectId,
+    deploymentId: body.deploymentId,
+    sandboxId: body.sandboxId,
+    targetDeviceId: body.targetDeviceId,
+    sessionId: body.sessionId,
+    lifecycleEpoch: body.lifecycleEpoch,
+    grantedAt: body.grantedAt,
+    expiresAt: body.expiresAt,
+    revokedAt: null,
+    capabilities: body.capabilities,
+    credential: "device"
+  };
+};
+
+/** Public one-time exchange. No other auth route is allowed before authentication. */
+export const handlePublicAuthRoute = async (
   request: Request,
   env: Env,
   url: URL
 ): Promise<Response | undefined> => {
-  const parts = url.pathname.split("/").filter(Boolean);
-  if (parts[0] !== "auth") return undefined;
-  const apiKey = env.WORKOS_API_KEY;
-
-  if (parts[1] === "exchange" && parts.length === 2 && request.method === "POST") {
-    if (!apiKey) return notConfigured();
-    const body = await bodyJson<{ code?: string }>(request);
-    if (typeof body?.code !== "string") return json({ error: "missing code" }, 400);
-    try {
-      return json(await exchange(env, apiKey, body.code));
-    } catch (e) {
-      return authFailed(e);
-    }
-  }
-
-  if (parts[1] === "refresh" && parts.length === 2 && request.method === "POST") {
-    if (!apiKey) return notConfigured();
-    const body = await bodyJson<{ refreshToken?: string; organizationId?: string }>(request);
-    if (typeof body?.refreshToken !== "string") return json({ error: "missing refreshToken" }, 400);
-    if (body.organizationId !== undefined && typeof body.organizationId !== "string") {
-      return json({ error: "missing refreshToken" }, 400);
-    }
-    try {
-      return json(await refresh(env, apiKey, body.refreshToken, body.organizationId));
-    } catch (e) {
-      // Identify repeat offenders: a client with a rotated-out session
-      // retries every 30s forever and is otherwise anonymous in the tail
-      // (the Worker outcome is "ok" — only the 401 body says it failed).
-      // The token fingerprint is safe: single-use, and this one is dead.
-      console.warn(
-        "auth/refresh failed",
-        request.headers.get("cf-connecting-ip") ?? "unknown-ip",
-        `token:${body.refreshToken.slice(0, 6)}…len${body.refreshToken.length}`,
-        e instanceof WorkOsAuthFailed ? e.message : String(e)
-      );
-      return authFailed(e);
-    }
-  }
-
-  if (parts[1] === "orgs" && parts.length === 2) {
-    if (!apiKey) return notConfigured();
-    const token = bearerFromRequest(request);
-    const caller = token ? await verifyToken(env, token) : undefined;
-    if (!caller) return json({ error: "invalid or missing bearer token" }, 401);
-    // A Cloud device's runner token acts for its user inside the sandbox, but
-    // never manages memberships (runner-policy.ts covers the post-bearer routes).
-    if (caller.kind === "runner") return json({ error: "forbidden" }, 403);
-    if (request.method === "GET") {
-      try {
-        return json({ orgs: await listOrgs(apiKey, caller.userId) });
-      } catch (e) {
-        return authFailed(e);
-      }
-    }
-    if (request.method === "POST") {
-      const body = await bodyJson<{ name?: string }>(request);
-      if (typeof body?.name !== "string") return json({ error: "missing name" }, 400);
-      const trimmed = body.name.trim();
-      if (trimmed.length === 0 || trimmed.length > 80) {
-        return json({ error: "name must be 1-80 characters" }, 400);
-      }
-      try {
-        return json(await createOrg(apiKey, caller.userId, trimmed));
-      } catch (e) {
-        return authFailed(e);
-      }
-    }
-  }
-
-  if (parts[1] === "cli" && parts[2] === "callback" && request.method === "GET") {
-    return cliCallback(url);
-  }
-
-  return undefined;
+  if (url.pathname !== "/auth/device-grants/exchange") return undefined;
+  if (!credentialTransportAllowed(url)) return json({ error: "secure_transport_required" }, 403);
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  const body = await bodyJson<{ grant?: string }>(request);
+  const parsed = typeof body?.grant === "string" ? parseGrantToken(body.grant, "cg1") : undefined;
+  if (!parsed) return json({ error: "invalid_grant" }, 401);
+  return grantStub(env, parsed.id).fetch("https://grant.internal/exchange", {
+    method: "POST",
+    body: JSON.stringify({ secret: parsed.secret })
+  });
 };
 
-// ---------------------------------------------------------------------------
-// Headless sign-in callback
-// ---------------------------------------------------------------------------
+interface SandboxTarget {
+  projectId: string;
+  sandboxId: string;
+  deploymentId: string;
+  targetDeviceId: string;
+  sessionId: string;
+  lifecycleEpoch: number;
+}
 
-/** Query params land verbatim in the page — escape them. (WorkOS codes/states
- * are URL-safe tokens, but this URL accepts anything.) */
-const escapeHtml = (s: string): string =>
-  s
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-
-const cliPage = (body: string): string => `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="robots" content="noindex" />
-<title>Zeron — sign in</title>
-<style>
-  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
-         background: #0a0a0a; color: #ededed;
-         font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; }
-  main { max-width: 34rem; padding: 2rem; text-align: center; }
-  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.75rem; }
-  p { color: #a1a1a1; margin: 0.25rem 0; }
-  code#paste { display: block; margin: 1.25rem 0 0.75rem; padding: 0.9rem 1rem;
-         background: #171717; border: 1px solid #2e2e2e; border-radius: 8px;
-         font: 13px/1.5 ui-monospace, monospace; word-break: break-all;
-         user-select: all; cursor: pointer; }
-  button { margin-top: 0.25rem; padding: 0.45rem 1rem; border-radius: 8px;
-         border: 1px solid #2e2e2e; background: #ededed; color: #0a0a0a;
-         font: 500 13px ui-sans-serif, system-ui, sans-serif; cursor: pointer; }
-</style>
-</head>
-<body><main>${body}</main></body>
-</html>`;
-
-const html = (body: string, status = 200): Response =>
-  new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
-
-/**
- * The hosted OAuth callback for headless (paste-code) sign-in. Registered as a
- * WorkOS redirect URI; it does NOT exchange the code — it renders `state.code`
- * for the user to paste into the device that started the flow (`zeron login`),
- * where the exchange runs so the tokens land on that machine. The state half
- * must match the pending sign-in there, so the paste is CSRF-checked at the
- * same point the loopback flow is.
- */
-const cliCallback = (url: URL): Response => {
-  const code = url.searchParams.get("code");
-  const state = url.searchParams.get("state");
-  const denied = url.searchParams.get("error");
-  if (denied || !code || !state) {
-    const detail = denied
-      ? `Sign-in was not completed (${escapeHtml(denied)}).`
-      : "This link is missing its sign-in code.";
-    return html(
-      cliPage(`<h1>Sign-in failed</h1><p>${detail}</p><p>Start again from your terminal.</p>`),
-      400
-    );
+const verifiedSandboxTarget = async (
+  request: Request,
+  env: Env,
+  identity: Verified,
+  requested: SandboxTarget
+): Promise<SandboxTarget | undefined> => {
+  const bearer = bearerFromRequest(request);
+  if (!bearer || identity.credential !== "scaffold") return undefined;
+  let origin: string;
+  try {
+    const configured = new URL(env.SCAFFOLD_CONTROL_PLANE_URL);
+    if (
+      !credentialTransportAllowed(configured) ||
+      !["http:", "https:"].includes(configured.protocol) ||
+      !["", "/"].includes(configured.pathname) ||
+      configured.search ||
+      configured.hash
+    ) {
+      return undefined;
+    }
+    origin = configured.origin;
+  } catch {
+    return undefined;
   }
-  const paste = `${escapeHtml(state)}.${escapeHtml(code)}`;
-  return html(
-    cliPage(
-      `<h1>Almost there</h1>
-<p>Paste this code into the terminal that asked for it:</p>
-<code id="paste">${paste}</code>
-<button onclick="navigator.clipboard.writeText(document.getElementById('paste').textContent).then(()=>{this.textContent='Copied'})">Copy code</button>
-<p style="margin-top:1rem;font-size:13px">This code expires in a few minutes and only works on the device that started sign-in.</p>`
-    )
-  );
+  let response: Response;
+  try {
+    response = await fetch(
+      `${origin}/api/code-sandboxes/${encodeURIComponent(requested.sandboxId)}/comet-target/verify`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          accept: "application/json",
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(requested),
+        signal: AbortSignal.timeout(5000),
+        redirect: "manual"
+      }
+    );
+  } catch {
+    throw new Error("sandbox authority unavailable");
+  }
+  if (response.status === 401 || response.status === 403 || response.status === 404) return undefined;
+  if (!response.ok) throw new Error("sandbox authority unavailable");
+  const payload = await bodyJson<{
+    ok?: unknown;
+    profile?: {
+      version?: unknown;
+      projectId?: unknown;
+      sandboxId?: unknown;
+      deploymentId?: unknown;
+      targetDeviceId?: unknown;
+      sessionId?: unknown;
+      lifecycleEpoch?: unknown;
+      actor?: { sub?: unknown };
+    };
+  }>(response);
+  const profile = payload?.profile;
+  const actorSubject =
+    typeof profile?.actor?.sub === "string" ? profile.actor.sub.trim().toLowerCase() : "";
+  if (
+    payload?.ok !== true ||
+    profile?.version !== SCAFFOLD_AUTHORITY_PROFILE_VERSION ||
+    actorSubject !== identity.userId ||
+    typeof profile.projectId !== "string" ||
+    profile.projectId !== requested.projectId ||
+    profile.projectId !== identity.projectScope ||
+    typeof profile.sandboxId !== "string" ||
+    !ID_RE.test(profile.sandboxId) ||
+    profile.sandboxId !== requested.sandboxId ||
+    typeof profile.deploymentId !== "string" ||
+    !ID_RE.test(profile.deploymentId) ||
+    profile.deploymentId !== requested.deploymentId ||
+    typeof profile.targetDeviceId !== "string" ||
+    !ID_RE.test(profile.targetDeviceId) ||
+    typeof profile.lifecycleEpoch !== "number" ||
+    !Number.isSafeInteger(profile.lifecycleEpoch) ||
+    profile.lifecycleEpoch !== requested.lifecycleEpoch ||
+    profile.targetDeviceId !== requested.targetDeviceId ||
+    typeof profile.sessionId !== "string" ||
+    !ID_RE.test(profile.sessionId) ||
+    profile.sessionId !== requested.sessionId
+  ) {
+    return undefined;
+  }
+  return {
+    projectId: profile.projectId,
+    sandboxId: profile.sandboxId,
+    deploymentId: profile.deploymentId,
+    targetDeviceId: profile.targetDeviceId,
+    lifecycleEpoch: profile.lifecycleEpoch,
+    sessionId: profile.sessionId
+  };
+};
+
+const requesterOwnsSession = async (
+  env: Env,
+  target: Pick<SandboxTarget, "projectId" | "deploymentId" | "sessionId">,
+  userId: string
+): Promise<boolean> => {
+  const room = env.CHAT_ROOMS.get(env.CHAT_ROOMS.idFromName(`chat2/${target.sessionId}`));
+  const response = await room.fetch(new Request("https://chat.internal/bind-owner", {
+    method: "POST",
+    headers: { [AUTH_USER_HEADER]: userId }
+  }));
+  if (response.status === 403) return false;
+  if (!response.ok) throw new Error("chat authority unavailable");
+  return true;
+};
+
+export const handleAuthenticatedAuthRoute = async (
+  request: Request,
+  env: Env,
+  url: URL,
+  identity: Verified
+): Promise<Response | undefined> => {
+  if (!credentialTransportAllowed(url)) return json({ error: "secure_transport_required" }, 403);
+  if (url.pathname === "/auth/device-token/refresh") {
+    if (identity.credential !== "device") return json({ error: "forbidden" }, 403);
+    if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+    const bearer = bearerFromRequest(request);
+    const parsed = bearer ? parseGrantToken(bearer, "cs1") : undefined;
+    const identityGrantId = "grantId" in identity ? identity.grantId : undefined;
+    if (!parsed || typeof identityGrantId !== "string" || parsed.id !== identityGrantId) {
+      return json({ error: "forbidden" }, 403);
+    }
+    return grantStub(env, parsed.id).fetch("https://grant.internal/refresh", {
+      method: "POST",
+      body: JSON.stringify({ secret: parsed.secret })
+    });
+  }
+  if (url.pathname !== "/auth/device-grants") return undefined;
+  if (identity.credential === "device") return json({ error: "forbidden" }, 403);
+
+  if (request.method === "POST") {
+    const body = await bodyJson<{
+      deploymentId?: string;
+      sandboxId?: string;
+      targetDeviceId?: string;
+      sessionId?: string;
+      lifecycleEpoch?: number;
+      capabilities?: string[];
+      ttlSeconds?: number;
+    }>(request);
+    if (
+      !body ||
+      typeof body.deploymentId !== "string" ||
+      !ID_RE.test(body.deploymentId) ||
+      body.deploymentId !== env.SCAFFOLD_DEPLOYMENT_ID ||
+      typeof body.sandboxId !== "string" ||
+      !ID_RE.test(body.sandboxId) ||
+      typeof body.targetDeviceId !== "string" ||
+      !ID_RE.test(body.targetDeviceId) ||
+      typeof body.sessionId !== "string" ||
+      typeof body.lifecycleEpoch !== "number" ||
+      !Number.isSafeInteger(body.lifecycleEpoch) ||
+      body.lifecycleEpoch < 1 ||
+      !ID_RE.test(body.sessionId) ||
+      !Array.isArray(body.capabilities) ||
+      (body.ttlSeconds !== undefined &&
+        (typeof body.ttlSeconds !== "number" || !Number.isFinite(body.ttlSeconds))) ||
+      body.capabilities.length === 0 ||
+      !body.capabilities.every(
+        (capability) => typeof capability === "string" && identity.capabilities.includes(capability)
+      )
+    ) {
+      return json({ error: "invalid_grant_request" }, 400);
+    }
+    const target = await verifiedSandboxTarget(request, env, identity, {
+      projectId: identity.projectScope,
+      deploymentId: body.deploymentId,
+      sandboxId: body.sandboxId,
+      targetDeviceId: body.targetDeviceId,
+      sessionId: body.sessionId,
+      lifecycleEpoch: body.lifecycleEpoch
+    });
+    if (!target) return json({ error: "grant_target_forbidden" }, 403);
+    if (!(await requesterOwnsSession(env, target, identity.userId))) {
+      return json({ error: "grant_target_forbidden" }, 403);
+    }
+    const id = crypto.randomUUID().replaceAll("-", "");
+    const secret = randomSecret();
+    const ttl = Math.min(
+      GRANT_TTL_MS,
+      Math.max(60_000, Math.floor((body.ttlSeconds ?? GRANT_TTL_MS / 1000) * 1000))
+    );
+    const issuedAt = Date.now();
+    const expiresAt = issuedAt + ttl;
+    const record: GrantRecord = {
+      grantId: id,
+      ownerUserId: identity.userId,
+      email: identity.email,
+      projectId: identity.projectScope,
+      deploymentId: target.deploymentId,
+      sandboxId: target.sandboxId,
+      targetDeviceId: target.targetDeviceId,
+      sessionId: target.sessionId,
+      lifecycleEpoch: target.lifecycleEpoch,
+      capabilities: [...new Set(body.capabilities)],
+      grantHash: await hash(secret),
+      issuedAt,
+      grantExpiresAt: expiresAt
+    };
+    const response = await grantStub(env, id).fetch("https://grant.internal/issue", {
+      method: "POST",
+      headers: env.NATIVE_GRANT_EPOCHS ? { [NATIVE_GRANT_ISSUER_HEADER]: "1" } : undefined,
+      body: JSON.stringify(record)
+    });
+    if (!response.ok) return json({ error: "grant_store_unavailable" }, 503);
+    return json({
+      grant: `cg1.${id}.${secret}`,
+      expiresAt,
+      accessExpiresAt: issuedAt + ACCESS_TTL_MS
+    });
+  }
+
+  if (request.method === "DELETE") {
+    const grantId = url.searchParams.get("id") ?? "";
+    if (!/^[a-f0-9]{32}$/.test(grantId)) return json({ error: "invalid_grant_id" }, 400);
+    return grantStub(env, grantId).fetch("https://grant.internal/revoke", {
+      method: "POST",
+      body: JSON.stringify({ ownerUserId: identity.userId })
+    });
+  }
+  return json({ error: "method_not_allowed" }, 405);
 };

@@ -28,14 +28,11 @@ async fn managed_install_reaches_session_started() {
     let harness = AcpHarness::grok();
     let (_steer_tx, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease: None,
-        request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
-        steering,
-        interrupt: interrupt.clone(),
-        turn: Default::default(),
-    };
+    let controls = RunControls { context: None, realtime: None, execution_lease: None,
+    request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+    steering,
+    interrupt: interrupt.clone(),
+    turn: Default::default(), };
     let request = RunRequest {
         mcp: None,
         prompt: "say the word ok and stop".into(),

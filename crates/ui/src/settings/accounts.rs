@@ -6,9 +6,6 @@
 //! step is its fallback) and account-shaped loading skeletons. Zeron
 //! retargets devices from the settings sidebar (`targetDeviceId` passthrough;
 //! a remote device's callback is forwarded to this one engine-side).
-//! Cloud is one of those targets: its logins and API keys live in the vault,
-//! a sign-in runs on this computer and is stored for Cloud, and the active
-//! account is what every Cloud machine uses from its next turn.
 //!
 //! The accounts RPC surface is being implemented engine-side in parallel —
 //! every call here surfaces failures as inline UI states rather than assuming
@@ -16,14 +13,14 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Focusable, Hsla, SharedString, Subscription, Task, Window, div,
-    prelude::*, px,
+    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
+    px,
 };
 use std::time::Duration;
 
 use zeron_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, CLOUD_ACCOUNTS_DEVICE, HarnessId, VaultProvider,
+    AgentLoginStatus, HarnessId,
 };
 use zeron_rpc::methods;
 
@@ -137,7 +134,7 @@ pub fn is_openable_login_url(url: &str) -> bool {
     }
 }
 
-pub(crate) fn open_login_url(url: &str, cx: &mut gpui::App) {
+fn open_login_url(url: &str, cx: &mut gpui::App) {
     if is_openable_login_url(url) {
         cx.open_url(url);
     } else {
@@ -178,10 +175,119 @@ pub(crate) fn usage_resets(
         .join(" · ")
 }
 
-pub use zeron_proto::providers::{
-    LoginOption, PROVIDERS, add_account_label, add_option_label, keeps_one_login, login_options,
-    provider_name, provider_note, reports_usage, signs_in, switches_accounts,
-};
+/// The providers zeron can sign into, in display order: (harness, name, CLI
+/// command — named in the empty-state copy, zeron settings.agents.tsx
+/// `PROVIDERS`). Every agent with a login of its own is here; what each one
+/// supports is documented engine-side (`agent_accounts` module docs).
+pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
+    (HarnessId::ClaudeCode, "Claude Code", "claude"),
+    (HarnessId::Codex, "Codex", "codex"),
+    (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (HarnessId::Antigravity, "Antigravity", "Antigravity"),
+    (HarnessId::Grok, "Grok", "grok login"),
+    (HarnessId::Devin, "Devin", "devin auth login"),
+    (HarnessId::Opencode, "OpenCode", "opencode auth login"),
+    (HarnessId::Pi, "Pi", "pi"),
+    (HarnessId::Hermes, "Hermes", "hermes auth add"),
+];
+
+/// Whether `harness` has an Accounts section (and sign-in flow). Pure.
+pub fn signs_in(harness: HarnessId) -> bool {
+    PROVIDERS
+        .iter()
+        .any(|(provider, _, _)| *provider == harness)
+}
+
+pub(crate) fn provider_name(harness: HarnessId) -> &'static str {
+    PROVIDERS
+        .iter()
+        .find(|(provider, _, _)| *provider == harness)
+        .map_or("this provider", |(_, name, _)| name)
+}
+
+/// Whether the provider reports plan usage. One that doesn't shows no meters
+/// and no "usage unavailable" note — there is nothing missing. Pure.
+pub fn reports_usage(harness: HarnessId) -> bool {
+    harness != HarnessId::Antigravity
+}
+
+/// Providers whose agent holds exactly ONE login (Antigravity): once it is
+/// connected there is nothing to add — signing in again only re-confirms it.
+pub fn keeps_one_login(harness: HarnessId) -> bool {
+    harness == HarnessId::Antigravity
+}
+
+/// Whether zeron switches this agent's logins. Hermes rotates through its
+/// own credential pool (listed, never reordered); Antigravity keeps one.
+pub fn switches_accounts(harness: HarnessId) -> bool {
+    !matches!(harness, HarnessId::Hermes | HarnessId::Antigravity)
+}
+
+/// A standing note under a provider's Accounts label, for an agent whose
+/// accounts work differently. Hermes owns its credential pool: zeron lists
+/// it and adds to it through Hermes' own CLI, but never switches or removes
+/// its entries. Pure.
+pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
+    match harness {
+        HarnessId::Hermes => Some(
+            "Hermes manages its own credential pool and rotates through it. Accounts added \
+             here go through `hermes auth add`; remove one with `hermes auth remove`.",
+        ),
+        _ => None,
+    }
+}
+
+/// One way to add an account: agents that keep a login PER model provider
+/// (OpenCode, Pi, Hermes) sign in to a named provider; the rest have one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginOption {
+    /// The engine's `provider` param (`None` = the agent's only login).
+    pub provider: Option<&'static str>,
+    /// Who the user signs in to.
+    pub label: &'static str,
+}
+
+/// The sign-ins zeron offers for `harness`, in button order. Pure.
+pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
+    let option = |provider, label| LoginOption {
+        provider: Some(provider),
+        label,
+    };
+    match harness {
+        HarnessId::Opencode => vec![
+            option("openai", "ChatGPT"),
+            option("github-copilot", "GitHub Copilot"),
+        ],
+        HarnessId::Pi => vec![option("openai-codex", "ChatGPT")],
+        HarnessId::Hermes => vec![
+            option("openai-codex", "ChatGPT"),
+            option("nous", "Nous Portal"),
+        ],
+        _ => vec![LoginOption {
+            provider: None,
+            label: provider_name(harness),
+        }],
+    }
+}
+
+/// The list's last row: connect the first account, or add another. Pure.
+pub fn add_account_label(harness: HarnessId, empty: bool) -> String {
+    if empty {
+        format!("Connect a {} account", provider_name(harness))
+    } else {
+        "Add account".to_string()
+    }
+}
+
+/// [`add_account_label`] for one [`LoginOption`]: a per-provider sign-in
+/// names its provider ("Connect ChatGPT", "Add GitHub Copilot account"). Pure.
+pub fn add_option_label(harness: HarnessId, option: LoginOption, empty: bool) -> String {
+    match option.provider {
+        None => add_account_label(harness, empty),
+        Some(_) if empty => format!("Connect {}", option.label),
+        Some(_) => format!("Add {} account", option.label),
+    }
+}
 
 /// What the sign-in dialog says while the browser finishes — one sentence
 /// per provider, same shape. Pure.
@@ -227,30 +333,6 @@ fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
     }
 }
 
-/// [`login_copy`] for a sign-in stored for Cloud. Pure.
-fn cloud_login_copy(harness: HarnessId) -> &'static str {
-    match harness {
-        HarnessId::Codex => {
-            "Finish signing in to ChatGPT in your browser. The login is stored for Cloud and \
-             becomes the account every Cloud machine uses; this computer's login is untouched."
-        }
-        _ => {
-            "Finish signing in to Claude in your browser. The login is stored for Cloud and \
-             becomes the account every Cloud machine uses; this computer's login is untouched."
-        }
-    }
-}
-
-/// The API key a Cloud provider card also takes: (vault provider, field
-/// label). `None` for providers Cloud doesn't run. Pure.
-pub fn cloud_api_key(harness: HarnessId) -> Option<(VaultProvider, &'static str)> {
-    match harness {
-        HarnessId::ClaudeCode => Some((VaultProvider::AnthropicKey, "Anthropic API key")),
-        HarnessId::Codex => Some((VaultProvider::OpenaiKey, "OpenAI API key")),
-        _ => None,
-    }
-}
-
 /// Accounts of one provider, in the engine's order (slot creation). No
 /// active-first re-sort: switching accounts must not move the switched-to
 /// card — the Active badge already says which one is live, and a list that
@@ -283,6 +365,14 @@ pub(crate) fn render_usage_meter(
     window: &zeron_proto::AgentUsageWindow,
     theme: &Theme,
 ) -> AnyElement {
+    render_usage_meter_width(window, theme, USAGE_BAR_WIDTH)
+}
+
+pub(crate) fn render_usage_meter_width(
+    window: &zeron_proto::AgentUsageWindow,
+    theme: &Theme,
+    bar_width: f32,
+) -> AnyElement {
     let fraction = window.used_fraction.clamp(0.0, 1.0);
     let level = usage_level(fraction);
     let fill = usage_color(level, theme).opacity(match level {
@@ -306,7 +396,7 @@ pub(crate) fn render_usage_meter(
         )
         .child(
             div()
-                .w(px(USAGE_BAR_WIDTH))
+                .w(px(bar_width))
                 .flex_none()
                 .h(px(4.0))
                 .rounded_full()
@@ -402,16 +492,6 @@ impl LoginFlow {
     }
 }
 
-/// Cloud's inline API-key field under a provider's accounts.
-struct ApiKeyEntry {
-    harness: HarnessId,
-    input: Entity<ComposerInput>,
-    saving: bool,
-    error: Option<SharedString>,
-    focus_pending: bool,
-    _events: Subscription,
-}
-
 /// The last accounts list per target device (`None` = this device), shared
 /// by every accounts view so a re-opened Settings paints instantly and
 /// revalidates in place instead of flashing a skeleton.
@@ -424,6 +504,7 @@ impl gpui::Global for AccountsSnapshotCache {}
 
 pub struct AccountsPage {
     state: Entity<AppState>,
+    crew: Entity<super::crew::CrewAccounts>,
     embedded: bool,
     embedded_harness: Option<HarnessId>,
     scroll: widgets::PageScroll,
@@ -441,7 +522,6 @@ pub struct AccountsPage {
     row_menu: popover::Popup<String>,
     login: Option<LoginFlow>,
     login_attempts: u64,
-    api_key: Option<ApiKeyEntry>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
@@ -449,9 +529,24 @@ pub struct AccountsPage {
     poll_task: Option<Task<()>>,
     _observe: Subscription,
     _code_events: Subscription,
+    _crew_events: Subscription,
 }
 
 impl AccountsPage {
+    pub(crate) fn set_crew_view(
+        &mut self,
+        view: super::crew::CrewView,
+        database: Option<zeron_proto::ScaffoldDatabaseEnvironment>,
+        cx: &mut Context<Self>,
+    ) {
+        self.crew
+            .update(cx, |page, cx| page.set_view(view, database, cx));
+    }
+
+    pub(crate) fn capture_annotation_selection(&mut self, cx: &mut Context<Self>) {
+        self.crew
+            .update(cx, |page, cx| page.capture_annotation_selection(cx));
+    }
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::new_with_layout(state, false, None, None, cx)
     }
@@ -479,7 +574,15 @@ impl AccountsPage {
                 this.submit_code(cx);
             }
         });
+        let crew = cx.new(|cx| super::crew::CrewAccounts::new(state.clone(), cx));
+        let crew_events = cx.subscribe(
+            &crew,
+            |page: &mut Self, _, event: &super::crew::AddAccount, cx| {
+                page.start_login(event.0, None, cx);
+            },
+        );
         let mut page = Self {
+            crew,
             state,
             embedded,
             embedded_harness,
@@ -492,7 +595,6 @@ impl AccountsPage {
             row_menu: popover::Popup::default(),
             login: None,
             login_attempts: 0,
-            api_key: None,
             error: None,
             code_input,
             load_task: None,
@@ -500,11 +602,14 @@ impl AccountsPage {
             poll_task: None,
             _observe: observe,
             _code_events: code_events,
+            _crew_events: crew_events,
         };
         // Paint from the last list (this session) or the engine's persisted
         // usage, then force one probe to update in place — the skeleton only
         // ever shows on a genuinely first load.
-        page.load(force_usage_for(LoadTrigger::Mount), cx);
+        if !page.state.read(cx).managed_inference {
+            page.load(force_usage_for(LoadTrigger::Mount), cx);
+        }
         page
     }
 
@@ -522,7 +627,6 @@ impl AccountsPage {
         // login/action state and reload with a forced usage probe (the new
         // device's cache is cold).
         self.login = None;
-        self.api_key = None;
         self.busy_account = None;
         self.error = None;
         self.load(force_usage_for(LoadTrigger::Mount), cx);
@@ -532,7 +636,6 @@ impl AccountsPage {
         if self.embedded_harness != Some(harness) {
             self.embedded_harness = Some(harness);
             self.login = None;
-            self.api_key = None;
             self.error = None;
             cx.notify();
         }
@@ -541,11 +644,6 @@ impl AccountsPage {
     #[cfg(test)]
     pub(crate) fn embedded_harness(&self) -> Option<HarnessId> {
         self.embedded_harness
-    }
-
-    /// Whether the page shows Cloud's accounts (kept by the vault).
-    fn targets_cloud(&self) -> bool {
-        self.target_device.as_deref() == Some(CLOUD_ACCOUNTS_DEVICE)
     }
 
     /// Params with the `targetDeviceId` passthrough merged in.
@@ -570,12 +668,7 @@ impl AccountsPage {
         use crate::icons::{self, icon};
         let (mut devices, local_id) = {
             let s = self.state.read(cx);
-            // Cloud's accounts are on Providers (the legacy page lists
-            // devices only).
-            (
-                s.provider_devices().cloned().collect::<Vec<_>>(),
-                s.local_device_id.clone(),
-            )
+            (s.devices.clone(), s.local_device_id.clone())
         };
         // Stable row order (registration time, then id) — zeron's switcher
         // sorts the same way so rows never reshuffle on heartbeats.
@@ -585,13 +678,17 @@ impl AccountsPage {
                 .then_with(|| a.id.cmp(&b.id))
         });
         let effective = self.target_device.clone().or_else(|| local_id.clone());
-        let now = chrono::Utc::now();
+        let platform_glyph = |platform: &str| match platform {
+            "macos" | "darwin" => icons::LAPTOP,
+            "ios" | "android" => icons::SMARTPHONE,
+            _ => icons::MONITOR,
+        };
         // Local device = no passthrough (calls stay direct).
         let mut targets: Vec<Option<String>> = Vec::new();
         let mut options = Vec::new();
         for device in &devices {
             let is_local = local_id.as_deref() == Some(device.id.as_str());
-            let glyph = crate::cloud::device_glyph(&device.id, &device.platform);
+            let glyph = platform_glyph(&device.platform);
             let muted = theme.text_muted;
             let option = widgets::SelectOption::new(device.name.clone()).leading(move || {
                 icon(glyph)
@@ -600,15 +697,8 @@ impl AccountsPage {
                     .text_color(muted)
                     .into_any_element()
             });
-            // A sleeping Cloud device says so; it wakes when asked.
-            let presence = self.state.read(cx).device_presence(&device.id, now);
             options.push(if is_local {
                 option.detail("You")
-            } else if matches!(
-                presence,
-                crate::cloud::Presence::Asleep | crate::cloud::Presence::Waking
-            ) {
-                option.detail(presence.label())
             } else {
                 option
             });
@@ -656,6 +746,10 @@ impl AccountsPage {
     /// engine's plain list (last known usage, no network) so rows appear at
     /// once, then the probed list replaces it.
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
+        if self.state.read(cx).managed_inference {
+            self.crew.update(cx, |page, cx| page.refresh(cx));
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
@@ -791,6 +885,9 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        if self.login.is_some() {
+            self.cancel_login(cx);
+        }
         self.login_attempts += 1;
         let attempt = self.login_attempts;
         self.login = Some(LoginFlow {
@@ -808,10 +905,15 @@ impl AccountsPage {
             object.insert("provider".into(), serde_json::json!(provider));
         }
         let params = self.params(params);
+        let method = if self.state.read(cx).managed_inference {
+            "crew.accounts.login.start"
+        } else {
+            methods::START_AGENT_LOGIN
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::START_AGENT_LOGIN, params)
+                .call(method, params)
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|value| {
@@ -884,11 +986,13 @@ impl AccountsPage {
         };
         *submitting = true;
         let params = self.params(serde_json::json!({ "loginId": login_id, "code": code }));
+        let method = if self.state.read(cx).managed_inference {
+            "crew.accounts.login.complete"
+        } else {
+            methods::COMPLETE_AGENT_LOGIN
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::COMPLETE_AGENT_LOGIN, params)
-                .await;
+            let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
                 let Some(flow) = page.login.as_mut().filter(|f| f.attempt == attempt) else {
                     return;
@@ -928,6 +1032,11 @@ impl AccountsPage {
             return;
         };
         let params = self.params(serde_json::json!({ "loginId": login_id }));
+        let method = if self.state.read(cx).managed_inference {
+            "crew.accounts.login.poll"
+        } else {
+            methods::POLL_AGENT_LOGIN
+        };
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -935,7 +1044,7 @@ impl AccountsPage {
                     .await;
                 let result = engine
                     .client()
-                    .call(methods::POLL_AGENT_LOGIN, params.clone())
+                    .call(method, params.clone())
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|value| {
@@ -1004,27 +1113,21 @@ impl AccountsPage {
     }
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
-        let login_id = match self.login.take() {
-            // A failed login is already over engine-side.
-            Some(LoginFlow {
-                login_id: Some(login_id),
-                step: LoginStep::Browser { .. } | LoginStep::PasteCode { .. },
-                ..
-            }) => Some(login_id),
-            _ => None,
-        };
+        let login_id = self.login.take().and_then(|flow| flow.login_id);
         self.poll_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
             let params = self.params(serde_json::json!({ "loginId": login_id }));
-            self.action_task = Some(cx.spawn(async move |_, _| {
-                if let Err(err) = engine
-                    .client()
-                    .call(methods::CANCEL_AGENT_LOGIN, params)
-                    .await
-                {
+            let method = if self.state.read(cx).managed_inference {
+                "crew.accounts.login.cancel"
+            } else {
+                methods::CANCEL_AGENT_LOGIN
+            };
+            cx.spawn(async move |_, _| {
+                if let Err(err) = engine.client().call(method, params).await {
                     tracing::debug!(error = %err, "CancelAgentLogin failed (best-effort)");
                 }
-            }));
+            })
+            .detach();
         }
         cx.notify();
     }
@@ -1037,186 +1140,11 @@ impl AccountsPage {
     /// Escape that reached Settings unclaimed cancels an open login first,
     /// so it never closes Settings under the dialog. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.api_key.take().is_some() {
-            cx.notify();
-            return true;
-        }
         if self.login.is_none() {
             return false;
         }
         self.cancel_login(cx);
         true
-    }
-
-    // ---- Cloud API keys ----
-
-    fn open_api_key(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        let Some((_, label)) = cloud_api_key(harness) else {
-            return;
-        };
-        let input = cx.new(|cx| {
-            ComposerInput::new(label, cx)
-                .with_single_line()
-                .with_masked()
-        });
-        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.save_api_key(cx);
-            }
-        });
-        self.api_key = Some(ApiKeyEntry {
-            harness,
-            input,
-            saving: false,
-            error: None,
-            focus_pending: true,
-            _events: events,
-        });
-        cx.notify();
-    }
-
-    /// Store the key for Cloud. It becomes the card's active account, so
-    /// Cloud machines use it from their next turn.
-    fn save_api_key(&mut self, cx: &mut Context<Self>) {
-        let (engine, device) = {
-            let state = self.state.read(cx);
-            let device = state
-                .cloud_status
-                .as_ref()
-                .and_then(|status| status.device_id.clone())
-                .or_else(|| state.cloud_account_device().map(|d| d.id.clone()));
-            (state.engine().cloned(), device)
-        };
-        let Some(entry) = self.api_key.as_mut() else {
-            return;
-        };
-        if entry.saving {
-            return;
-        }
-        let Some((provider, _)) = cloud_api_key(entry.harness) else {
-            return;
-        };
-        let key = entry.input.read(cx).text().trim().to_string();
-        let problem = if key.is_empty() {
-            Some("Paste a key first.")
-        } else if device.is_none() {
-            Some("Turn Cloud on in Settings → Cloud first.")
-        } else {
-            None
-        };
-        let (Some(engine), Some(device), None) = (engine, device, problem) else {
-            entry.error = problem.map(Into::into);
-            cx.notify();
-            return;
-        };
-        entry.saving = true;
-        entry.error = None;
-        let params = serde_json::json!({
-            "provider": provider.as_str(),
-            "key": key,
-            "authorizedDevices": [device],
-        });
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::VAULT_PUT_API_KEY, params)
-                .await;
-            this.update(cx, |page, cx| {
-                match result {
-                    Ok(_) => {
-                        page.api_key = None;
-                        page.load(force_usage_for(LoadTrigger::PostAction), cx);
-                    }
-                    Err(error) => {
-                        if let Some(entry) = page.api_key.as_mut() {
-                            entry.saving = false;
-                            entry.error = Some(error.to_string().into());
-                        }
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// The masked key field, under the card's add row.
-    fn render_api_key_entry(
-        &self,
-        harness: HarnessId,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let entry = self.api_key.as_ref().filter(|e| e.harness == harness)?;
-        let saving = entry.saving;
-        Some(
-            div()
-                .pb(px(8.0))
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(div().flex_1().min_w(px(160.0)).child(popover::dialog_field(
-                            entry.input.clone().into_any_element(),
-                        )))
-                        .child(
-                            widgets::action_button(theme, widgets::ActionTone::Quiet)
-                                .id("accounts-api-key-cancel")
-                                .role(gpui::Role::Button)
-                                .tab_index(0)
-                                .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                .on_click(cx.listener(|page, _, _, cx| {
-                                    page.api_key = None;
-                                    cx.notify();
-                                }))
-                                .child("Cancel"),
-                        )
-                        .child(
-                            widgets::action_button(theme, widgets::ActionTone::Solid)
-                                .id("accounts-api-key-save")
-                                .role(gpui::Role::Button)
-                                .tab_index(0)
-                                .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                .when(saving, |el| el.opacity(0.5))
-                                .when(!saving, |el| {
-                                    el.on_click(cx.listener(|page, _, _, cx| page.save_api_key(cx)))
-                                })
-                                .child(if saving { "Saving…" } else { "Save key" }),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(
-                            "Stored encrypted in your account for Cloud. It becomes the account \
-                             Cloud machines use.",
-                        )),
-                )
-                .when_some(entry.error.clone(), |el, error| {
-                    el.child(
-                        div()
-                            .text_size(crate::typography::ui_rems(12.0))
-                            .text_color(theme.danger_muted.opacity(0.9))
-                            .child(error),
-                    )
-                })
-                .into_any_element(),
-        )
-    }
-
-    /// Sign in with the provider's first option (a failed run's "Log in").
-    pub(crate) fn start_first_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        let provider = login_options(harness)
-            .first()
-            .and_then(|option| option.provider);
-        self.start_login(harness, provider, cx);
     }
 
     fn retry_login(&mut self, cx: &mut Context<Self>) {
@@ -1261,8 +1189,14 @@ impl AccountsPage {
         }
         let theme = Theme::of(cx).for_settings_surface();
         Some(
-            crate::loaders::ring_spinner("accounts-refreshing", 12.0, theme.text_muted)
-                .into_any_element(),
+            crate::loaders::mini_mono_spinner(
+                "accounts-refreshing",
+                1.5,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
@@ -1611,14 +1545,19 @@ impl AccountsPage {
                 .role(gpui::Role::Button)
                 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
         };
-        let copy = match login.step {
-            LoginStep::PasteCode { .. } => {
-                "Your browser opened Claude's sign-in page. Approve access, then paste the \
-                 code Anthropic shows you below. Your current login is untouched until you \
-                 switch."
+        let copy = if self.state.read(cx).managed_inference {
+            if matches!(login.step, LoginStep::PasteCode { .. }) {
+                "Approve access in your browser, then paste the authorization code below to add this account to Agent Auth."
+            } else {
+                "Finish signing in in your browser to add this account to Agent Auth."
             }
-            _ if self.targets_cloud() => cloud_login_copy(login.harness),
-            _ => login_copy(login.harness, login.provider),
+        } else {
+            match login.step {
+                LoginStep::PasteCode { .. } => {
+                    "Approve access in your browser, then paste the authorization code below. Your current login is unchanged until you switch."
+                }
+                _ => login_copy(login.harness, login.provider),
+            }
         };
         // "Reopen the sign-in page" (zeron: `text-[12px]
         // text-muted-foreground/60 hover:underline`), once there is a page.
@@ -1650,10 +1589,12 @@ impl AccountsPage {
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .child(crate::loaders::ring_spinner(
+                .child(crate::loaders::gradient_spinner(
                     "login-poll",
-                    20.0,
-                    theme.text_muted,
+                    &theme,
+                    3.0,
+                    cx.entity_id(),
+                    cx,
                 ))
                 .child(
                     div()
@@ -1879,11 +1820,6 @@ impl AccountsPage {
                     // Adding is the list's last row, not a header button —
                     // it sits where the next account will appear. A
                     // one-login agent that is connected has nothing to add.
-                    let api_key = self
-                        .targets_cloud()
-                        .then(|| cloud_api_key(harness))
-                        .flatten()
-                        .filter(|_| self.api_key.is_none());
                     let add_row = (empty || !keeps_one_login(harness)).then(|| {
                         div()
                             .py(px(8.0))
@@ -1915,33 +1851,12 @@ impl AccountsPage {
                                         .child(SharedString::from(label))
                                 },
                             ))
-                            .when_some(api_key, |el, (_, label)| {
-                                let label = format!("Add {label}");
-                                el.child(
-                                    widgets::action_button(theme, widgets::ActionTone::Quiet)
-                                        .id("accounts-add-api-key")
-                                        .role(gpui::Role::Button)
-                                        .aria_label(label.clone())
-                                        .tab_index(0)
-                                        .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                        .on_click(cx.listener(move |page, _, _, cx| {
-                                            page.open_api_key(harness, cx)
-                                        }))
-                                        .child(
-                                            crate::icons::icon(crate::icons::PLUS)
-                                                .size(px(14.0))
-                                                .text_color(theme.text_muted),
-                                        )
-                                        .child(SharedString::from(label)),
-                                )
-                            })
                     });
                     div()
                         .flex()
                         .flex_col()
                         .children(rows)
                         .children(add_row)
-                        .children(self.render_api_key_entry(harness, theme, cx))
                         .into_any_element()
                 }
             };
@@ -2016,15 +1931,39 @@ impl AccountsPage {
 
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.state.read(cx).managed_inference
+            || self.crew.read(cx).view() != super::crew::CrewView::Accounts
+        {
+            let theme = Theme::of(cx).for_settings_surface();
+            let scrollbar = popover::rail(self, "accounts-page-scrollbar", &theme, cx);
+            let dialog = self.render_login_dialog(window.viewport_size(), cx);
+            return div()
+                .id("crew-accounts-page-host")
+                .relative()
+                .size_full()
+                .on_hover(cx.listener(Self::on_scroll_hovered))
+                .child(
+                    crate::edge_fade::edge_faded(
+                        16.0,
+                        true,
+                        true,
+                        div()
+                            .id("crew-accounts-page")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll.scroll)
+                            .child(widgets::page_column().child(self.crew.clone())),
+                    )
+                    .fade_overflow_y(&self.scroll.scroll),
+                )
+                .children(scrollbar)
+                .children(dialog)
+                .into_any_element();
+        }
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
-        if let Some(entry) = self.api_key.as_mut()
-            && std::mem::take(&mut entry.focus_pending)
-        {
-            window.focus(&entry.input.focus_handle(cx), cx);
-        }
         if let Some(harness) = self.embedded_harness {
             return self.render_embedded_provider(harness, &theme, now, dialog, cx);
         }
@@ -2044,7 +1983,6 @@ impl Render for AccountsPage {
             HarnessId::Pi => (crate::icons::PI_MARK, None),
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
-            HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -2405,41 +2343,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_formatting_is_absolute() {
-        use chrono::Local;
-        let now = Utc::now();
-        assert_eq!(format_reset(None, now), None);
-        // Within ~22h: a local clock time ("resets 3:45 PM").
-        let soon = now + TimeDelta::minutes(125);
-        assert_eq!(
-            format_reset(Some(soon), now),
-            Some(format!(
-                "resets {}",
-                soon.with_timezone(&Local).format("%-I:%M %p")
-            ))
-        );
-        // Within a week: a short weekday ("resets Mon").
-        let later = now + TimeDelta::days(3);
-        assert_eq!(
-            format_reset(Some(later), now),
-            Some(format!(
-                "resets {}",
-                later.with_timezone(&Local).format("%a")
-            ))
-        );
-        // Beyond a week (Codex free tier resets ~monthly): month + day
-        // ("resets Sep 14") — a weekday 4 weeks out carries no information.
-        let monthly = now + TimeDelta::days(26);
-        assert_eq!(
-            format_reset(Some(monthly), now),
-            Some(format!(
-                "resets {}",
-                monthly.with_timezone(&Local).format("%b %-d")
-            ))
-        );
-    }
-
-    #[test]
     fn usage_resets_lists_every_window() {
         let now = Utc::now();
         let soon = now + TimeDelta::minutes(125);
@@ -2736,72 +2639,6 @@ mod tests {
             .unwrap();
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
-    }
-
-    /// Cloud's cards take an API key beside sign-ins; the key field refuses
-    /// an empty key and a Cloud that isn't on, and the sign-in says where the
-    /// login goes.
-    #[gpui::test]
-    fn cloud_cards_add_api_keys_inline(cx: &mut gpui::TestAppContext) {
-        assert_eq!(
-            cloud_api_key(HarnessId::ClaudeCode).map(|(p, _)| p),
-            Some(VaultProvider::AnthropicKey)
-        );
-        assert_eq!(
-            cloud_api_key(HarnessId::Codex).map(|(p, _)| p),
-            Some(VaultProvider::OpenaiKey)
-        );
-        assert_eq!(cloud_api_key(HarnessId::Cursor), None);
-        let window = page(cx);
-        window
-            .update(cx, |page, _, cx| {
-                page.set_target_device(Some(CLOUD_ACCOUNTS_DEVICE.into()), cx);
-                page.set_embedded_harness(HarnessId::ClaudeCode, cx);
-                assert!(page.targets_cloud());
-                page.snapshot = Loadable::Ready(AgentAccountsSnapshot {
-                    accounts: vec![AgentAccount {
-                        id: "anthropic-key:a1".into(),
-                        harness: HarnessId::ClaudeCode,
-                        email: None,
-                        plan_label: Some("API key …abcd".into()),
-                        active: true,
-                        usage_windows: vec![],
-                        usage_fetched_at: None,
-                        usage_error: None,
-                        display_name: None,
-                        organization: None,
-                        auth_kind: Some(zeron_proto::AgentAuthKind::ApiKey),
-                        switchable: true,
-                        saved_at: None,
-                        provider: None,
-                    }],
-                    warnings: vec![],
-                });
-                page.open_api_key(HarnessId::ClaudeCode, cx);
-                page.save_api_key(cx);
-                assert_eq!(
-                    page.api_key.as_ref().and_then(|e| e.error.as_deref()),
-                    Some("Paste a key first.")
-                );
-                let input = page.api_key.as_ref().unwrap().input.clone();
-                input.update(cx, |input, cx| input.set_text("sk-ant-test", cx));
-                page.save_api_key(cx);
-                assert_eq!(
-                    page.api_key.as_ref().and_then(|e| e.error.as_deref()),
-                    Some("Turn Cloud on in Settings → Cloud first.")
-                );
-                page.login = Some(waiting(HarnessId::ClaudeCode, 1));
-            })
-            .unwrap();
-        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
-            .unwrap();
-        window
-            .update(cx, |page, _, cx| {
-                assert!(page.dismiss_on_escape(cx), "escape closes the key field");
-                assert!(page.api_key.is_none());
-            })
-            .unwrap();
-        assert!(cloud_login_copy(HarnessId::Codex).contains("every Cloud machine"));
     }
 
     #[gpui::test]

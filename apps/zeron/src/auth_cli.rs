@@ -82,16 +82,8 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let _lock = engine_lock(&config, "sign in")?;
     let auth = Engine::build_auth(&config).await;
-    if let Some(runner) = auth.runner_identity() {
-        println!(
-            "This is a Cloud device ({}) — it authenticates with its enrolled key; there is nothing to sign in to.",
-            runner.device_id()
-        );
-        return Ok(());
-    }
-    if !auth.workos_enabled() {
-        println!("Auth is in dev mode (no WorkOS client id) — there is nothing to sign in to.");
-        return Ok(());
+    if !auth.is_authenticated_mode() {
+        anyhow::bail!("Crew sign-in requires an explicitly configured Scaffold authority");
     }
     if let AuthState::SignedIn { user, org_id } = auth.state() {
         println!(
@@ -101,12 +93,12 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
                 .map(|org| format!(" (workspace {org})"))
                 .unwrap_or_default()
         );
-        println!("Run `zeron logout` first to switch accounts.");
+        println!("Run `comet logout` first to switch accounts.");
         println!("The next engine start will use the synced workspace.");
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        anyhow::bail!("zeron login needs an interactive terminal");
+        anyhow::bail!("Crew login needs an interactive terminal");
     }
     zeron_engine::terminal_sign_in(&auth).await?;
     match auth.state() {
@@ -119,7 +111,7 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
                     .unwrap_or_default()
             );
             println!(
-                "Sync is ready. Start or restart Zeron to open the synced workspace; existing local sessions will stay local."
+                "Sync is ready. Start or restart Crew to open the synced workspace; existing local sessions will stay local."
             );
         }
         // terminal_sign_in only returns Ok once signed in; keep an honest fallback.
@@ -133,19 +125,9 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let _lock = engine_lock(&config, "sign out")?;
     let auth = Engine::build_auth(&config).await;
-    if let Some(runner) = auth.runner_identity() {
-        println!(
-            "This is a Cloud device ({}) — it has no session to sign out of. Delete it from Settings → Cloud on another device instead.",
-            runner.device_id()
-        );
-        return Ok(());
-    }
-    if !auth.workos_enabled() {
-        // Dev mode has no live session, but clear any stale session.json from a
-        // previous WorkOS-mode run so the next real run starts signed out.
+    if !auth.is_authenticated_mode() {
         auth.sign_out();
-        println!("Auth is in dev mode — cleared any stale saved session.");
-        println!("The next engine start will remain in development mode.");
+        println!("Cleared any saved session. No remote authority is configured.");
         return Ok(());
     }
     match auth.state() {
@@ -181,14 +163,6 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
     let account = account_status(scope, &auth.state());
     println!("Data dir: {}", config.data_dir.display());
     println!("Edge:     {}", config.edge_url);
-    if let Some(runner) = auth.runner_identity() {
-        println!(
-            "Runner:   Cloud device {} (org {}, user {})",
-            runner.device_id(),
-            runner.org_id(),
-            runner.user_id()
-        );
-    }
     println!("Mode:     {}", account.mode);
     println!("Auth:     {}", account.auth);
     match InstanceLock::holder(&config.data_dir) {
@@ -236,7 +210,7 @@ fn engine_lock(config: &EngineConfig, verb: &str) -> anyhow::Result<InstanceLock
     InstanceLock::acquire(&config.data_dir).map_err(|err| {
         anyhow::anyhow!(
             "{err}\nCannot {verb} while an engine is running — stop it first \
-             (`zeron daemon stop`, or quit the Zeron app), or use the running UI instead."
+             (`comet daemon stop`, or quit the Crew app), or use the running UI instead."
         )
     })
 }
@@ -255,6 +229,10 @@ mod tests {
             default_harness: HarnessId::Mock,
             org_id: None,
             workos_client_id: Some("client_test".into()),
+            scaffold: None,
+            device: None,
+            managed_inference: false,
+            device_bootstrap_file: None,
         }
     }
 
