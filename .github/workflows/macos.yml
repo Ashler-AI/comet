@@ -93,7 +93,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
       - name: Install cargo-nextest
         run: |
@@ -122,6 +122,8 @@ jobs:
           # Exercise the packaged executable entry points without debug assertions.
           CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: false
         run: cargo build --locked -p zeron --bins
+      - name: Background engine profile isolation
+        run: cargo test --locked -p zeron --test background_engine
       - name: Updater, preview, CoreText and native UI regressions
         run: |
           # zeron-text's coretext tests are macOS-only (#![cfg(target_os = "macos")]); its other
@@ -189,7 +191,7 @@ jobs:
           git -C frame-source-tests checkout --detach FETCH_HEAD
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
           workspaces: frame-source-tests
       - name: Native frame-source recovery regression
@@ -210,7 +212,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
       - name: Rust mobile core tests
         run: cargo test --locked -p zeron-text -p zeron-markdown -p zeron-client -p zeron-mobile
@@ -274,7 +276,7 @@ jobs:
           rustup target add aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
       - name: Build the Rust core for the simulator
         run: |

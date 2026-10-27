@@ -168,7 +168,8 @@ fn main() -> anyhow::Result<()> {
     attach_parent_console();
     let mut cli = Cli::parse();
     if matches!(cli.command, Some(Command::Engine)) {
-        return zeron_app::background::run();
+        let config = cli.runtime.config(false, true, false)?;
+        return zeron_app::background::run_with_config(config);
     }
     // Provider migration must never initialize auth, paths, locks or a runtime
     // against its old profile. Context files are bindings, not cloud authority.

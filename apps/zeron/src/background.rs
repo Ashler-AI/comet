@@ -8,9 +8,15 @@ use std::path::{Path, PathBuf};
 
 /// Run the background engine until it's stopped.
 pub fn run() -> anyhow::Result<()> {
+    run_with_config(crate::background_engine_config()?)
+}
+
+/// Run the background engine with coordinates already resolved by the app
+/// CLI. The hidden `comet engine` fallback accepts global runtime flags, so it
+/// must not discard them by resolving a second, default configuration.
+pub fn run_with_config(config: zeron_engine::EngineConfig) -> anyhow::Result<()> {
     crate::init_logging(true, "engine", false);
     crate::long_running_setup();
-    let config = crate::background_engine_config()?;
     zeron_engine::desktop_notify::enable();
     let app = std::env::var_os(zeron_engine::managed::APP_ENV).map(PathBuf::from);
     // Banners carry the app's name and icon (the development bundle's for

@@ -17,9 +17,33 @@ fn free_port() -> u16 {
 fn background_engine_serves_its_port_and_stops_on_request() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zeron-engine"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zeron-engine"));
+    command
         .env("COMET_DATA_DIR", dir.path())
-        .env("COMET_IPC_PORT", port.to_string())
+        .env("COMET_IPC_PORT", port.to_string());
+    assert_background_engine(command, dir.path(), port);
+}
+
+#[test]
+fn app_engine_fallback_honors_explicit_runtime_coordinates() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zeron"));
+    command
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--ipc-port")
+        .arg(port.to_string())
+        .arg("engine")
+        .env_remove("COMET_DATA_DIR")
+        .env_remove("ZERON_DATA_DIR")
+        .env_remove("COMET_IPC_PORT")
+        .env_remove("ZERON_IPC_PORT");
+    assert_background_engine(command, dir.path(), port);
+}
+
+fn assert_background_engine(mut command: Command, data_dir: &std::path::Path, port: u16) {
+    let mut child = command
         // The mock Crew profile is isolated and carries no remote authority.
         .env("COMET_HARNESS", "mock")
         .env_remove("COMET_EDGE_TOKEN")
@@ -32,7 +56,7 @@ fn background_engine_serves_its_port_and_stops_on_request() {
     let served = runtime.block_on(async {
         let deadline = Instant::now() + Duration::from_secs(60);
         let client = loop {
-            match zeron_rpc::connect_ipc(port, Some(dir.path())).await {
+            match zeron_rpc::connect_ipc(port, Some(data_dir)).await {
                 Ok(client) => break client,
                 Err(err) if Instant::now() >= deadline => {
                     return Err(format!("never served its port: {err}"));

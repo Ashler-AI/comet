@@ -52,6 +52,8 @@ jobs:
           save-rust-cache: 'true'
       - name: Harness, engine, sync, update, doc and preview tests
         run: scripts/ci/test-core.sh
+      - name: Linux dual-binary installer regression
+        run: bash scripts/test-linux-desktop-entry.sh
 
   ui-tests:
     runs-on: ubuntu-24.04
