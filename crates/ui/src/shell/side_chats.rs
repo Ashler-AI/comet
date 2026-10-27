@@ -897,6 +897,7 @@ mod tests {
         tokio::runtime::Runtime,
         ForkEngine,
     ) {
+        cx.update(gpui_tokio::init);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

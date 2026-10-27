@@ -5937,8 +5937,9 @@ impl Shell {
                         Some(device) => state
                             .devices
                             .iter()
-                            .any(|d| d.id == device)
-                            .then_some(NewSessionTarget::NoProject(device)),
+                            .find(|d| d.id == device)
+                            .filter(|d| !zeron_proto::is_cloud_device(&d.id, &d.platform))
+                            .map(|_| NewSessionTarget::NoProject(device)),
                         None => state
                             .spaces
                             .iter()
