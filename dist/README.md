@@ -113,7 +113,7 @@ scripts/package-linux.sh
 ```
 
 Produces `target/package/comet-<version>-linux-<arch>.tar.gz` for `x86_64` or `aarch64`,
-containing the native `comet` executable, Crew desktop entry/icons, licenses,
+containing the native `comet` and `zeron-engine` executables, Crew desktop entry/icons, licenses,
 installer, and the complete `crew-web/` fixed-session browser assets. The browser
 contract sidecar travels with these assets. Scaffold supplies Node and selects
 the browser runtime location separately; desktop installation does not launch it.
