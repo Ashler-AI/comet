@@ -514,12 +514,18 @@ final class AppModel {
             if row.status == .working { counts.working += 1 }
             if row.status == .awaiting { counts.awaiting += 1 }
         }
+        // Open session chrome also reads fields from the row itself, so a
+        // content revision is observable even when list membership is stable.
+        let rowsChanged = all.count != rows.count || all.contains {
+            rows[$0.key]?.revision != $0.value.revision
+        }
         rows = all
         // Devices coming and going (Settings, host pickers) count as changes.
         let hosts = hostOptions
-        let changed = page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
+        let changed = rowsChanged || page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
         lastHosts = hosts
         live = counts
+        if !freshSideChats.isEmpty { sweepFreshSideChats() }
         frontPage = page
         archived = archivedVMs
         if changed { observers.values.forEach { $0() } }
@@ -624,9 +630,26 @@ final class AppModel {
         Toast.show("Archived", action: "Undo", in: window) { [weak self] in self?.unarchive(id) }
     }
     func unarchive(_ id: String) { attempt("unarchive") { try client?.unarchiveSession(chatId: id) } }
+    func delete(_ id: String) { attempt("delete") { try client?.deleteSession(chatId: id) } }
     func move(_ id: String, toSection section: String?) { attempt("assign") { try client?.assignSection(chatId: id, sectionId: section) } }
     func movePin(_ id: String, after: String?, before: String?) {
         attempt("move pin") { try client?.movePin(chatId: id, after: after, before: before) }
+    }
+    /// Pin between neighbouring rows (`nil` at either edge), preserving the
+    /// exact drop position chosen in the Threads list.
+    func pin(_ id: String, after: String?, before: String?) {
+        attempt("pin") { try client?.pinSessionAt(chatId: id, after: after, before: before) }
+    }
+    /// Move into a custom section between its neighbouring rows.
+    func place(_ id: String, inSection section: String, after: String?, before: String?) {
+        attempt("assign") {
+            try client?.placeSession(
+                chatId: id,
+                sectionId: section,
+                after: after,
+                before: before
+            )
+        }
     }
     func renameSection(_ id: String, _ name: String) { attempt("rename section") { try client?.renameSection(sectionId: id, name: name) } }
     func deleteSection(_ id: String) { attempt("delete section") { try client?.deleteSection(sectionId: id) } }
@@ -645,6 +668,65 @@ final class AppModel {
             NSLog("open session failed: \(error)")
             return nil
         }
+    }
+
+    // MARK: Companions
+
+    func sideChats(of chatId: String) -> [SessionRowVM] {
+        (client?.childSessions(parentId: chatId) ?? [])
+            .filter { !$0.archived }
+            .map(Self.vm)
+    }
+
+    func sessionSubagents(_ chatId: String) -> [SubagentRow] {
+        guard let client, !chatId.contains("--sub--") else { return [] }
+        return (client.session(chatId: chatId) ?? (try? client.openSession(chatId: chatId)))?
+            .subagents() ?? []
+    }
+
+    private(set) var freshSideChats = Set(
+        UserDefaults.standard.stringArray(forKey: "freshSideChats") ?? []
+    ) {
+        didSet {
+            UserDefaults.standard.set(Array(freshSideChats), forKey: "freshSideChats")
+        }
+    }
+
+    func forgetFreshSideChat(_ id: String) {
+        freshSideChats.remove(id)
+    }
+
+    private func sweepFreshSideChats() {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        for id in freshSideChats {
+            guard let row = rows[id] ?? client?.sessionRow(chatId: id) else { continue }
+            if row.preview != nil {
+                freshSideChats.remove(id)
+            } else if SessionViewController.live(id) == nil,
+                      now - row.createdAtMs > 60_000 {
+                freshSideChats.remove(id)
+                delete(id)
+            }
+        }
+    }
+
+    func createSideChat(parentId: String) -> String? {
+        do {
+            let id = try client?.createSideChat(parentId: parentId)
+            if let id { freshSideChats.insert(id) }
+            refreshWorkspace()
+            return id
+        } catch {
+            NSLog("side chat failed: \(error)")
+            return nil
+        }
+    }
+
+    func forkSideChat(sourceId: String) async throws -> String {
+        guard let client else { throw CoreError.Closed }
+        let id = try await client.forkSideChat(sourceId: sourceId)
+        await MainActor.run { refreshWorkspace() }
+        return id
     }
 
     // MARK: New session
