@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { authenticateResult, type Verified } from "./auth";
+import { authenticateResult, verifyScaffoldSessionResult, type Verified } from "./auth";
 import { AuthGrant, authenticateDeviceToken, handleAuthenticatedAuthRoute, handlePublicAuthRoute, scaffoldVerificationName, verifyScaffoldThroughCoordinator } from "./auth-routes";
 import { boundedAuthJson, scaffoldAdmission, SCAFFOLD_JSON_BYTES, SCAFFOLD_TOKEN_BYTES } from "./auth-envelope";
 import { authorizeRoute, requestAuthority, scopedRpcAllowed, socketAuthorized, sendAuthorized, stampRpcAuthority, trustedRequest } from "./authority";
@@ -244,6 +244,39 @@ describe("scoped transport authority", () => {
     const result = await authenticateResult(config as Env, new Request("https://edge.example/auth/session", { headers: { authorization: "Bearer sc_rc_test" } }));
     expect(result).toEqual(expected === "unavailable" && retryAfter !== undefined ? { status: expected, retryAfter } : { status: expected });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it("bounds upstream diagnostics to validated metadata without exposing authority secrets", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const secret = "sc_rc_private_authority_secret";
+    const ray = "0123456789abcdef-SJC";
+    for (const [cfRay, retryAfter, expectedRay, expectedSeconds] of [
+      [ray, "000120", ray, 120],
+      [ray, "999999", ray, 999999],
+      [ray, "1000000", ray, null],
+      [`${ray}-${secret}`, secret, null, null],
+      ["f".repeat(2048), "9".repeat(2048), null, null],
+      ["0123456789abcdef-sjc", "Thu, 22 Oct 2026 12:00:02 GMT", null, null],
+      ["g123456789abcdef-SJC", "1e3", null, null],
+      ["0123456789abcdef-SJ", "-1", null, null]
+    ] as const) {
+      warn.mockClear();
+      const cancel = vi.fn();
+      const response = new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify({ actor: identity.userId, token: secret }))); },
+        cancel
+      }), {
+        status: 503,
+        headers: { "cf-ray": cfRay, "retry-after": retryAfter, authorization: `Bearer ${secret}`, "x-request-id": secret }
+      });
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+      expect(await verifyScaffoldSessionResult(config, secret, new AbortController().signal)).toEqual({ status: "unavailable", retryAfter });
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[1]).toMatchObject({ cfRay: expectedRay, retryAfterSeconds: expectedSeconds });
+      const event = JSON.stringify(warn.mock.calls[0]);
+      expect(new TextEncoder().encode(event).byteLength).toBeLessThanOrEqual(256);
+      for (const privateValue of [secret, identity.userId, config.SCAFFOLD_CONTROL_PLANE_URL]) expect(event).not.toContain(privateValue);
+    }
   });
   it.each([408, 500, 503, "network"] as const)("recovers once from %s and revalidates scope and resource on later requests", async (failure) => {
     const session = { ok: true, actor: { sub: identity.userId, auth: "iap" }, resource: config.SCAFFOLD_CONTROL_PLANE_URL, scopes: ["remote_code:read"] };

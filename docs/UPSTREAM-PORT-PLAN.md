@@ -566,6 +566,14 @@ connected/synced with zero additional workspace disconnects or verification
 redundant verification; it does not hide or claim to repair backend outages.
 That candidate did not include the separate Unicode selection correction below.
 
+Edge upstream-authority failures emit bounded diagnostics before the shared
+cooldown: HTTP status, attempt, a validated Cloudflare Ray ID and numeric
+Retry-After seconds (0–999999). Invalid metadata is omitted as null; each event
+stays below 256 bytes, with at most the existing two attempts. Tokens, bodies,
+actor identities, URLs and arbitrary headers are never logged. Authentication,
+retry decisions and exact Retry-After forwarding remain unchanged. A cooled-down
+outer 503 alone does not establish upstream throttling or quota exhaustion.
+
 The October 20 `23:50:10Z` installed-app crash was a separate markdown-selection
 panic: byte 33 split an em dash at bytes 31–34, then the non-unwinding native
 callback aborted the app. Relaunch automatically resumed all three interrupted
