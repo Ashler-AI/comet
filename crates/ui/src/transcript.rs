@@ -5358,6 +5358,7 @@ impl Transcript {
                         cache.invalidate_row(&user_markdown_key(&row.id));
                     }
                 }
+                let after = old_range.start + count;
                 if old_range.len() == count {
                     // In-place content change, same row count — notably the
                     // live→complete flip, where EVERY row of the streamed
@@ -5372,6 +5373,11 @@ impl Transcript {
                     self.list.remeasure_items(old_range);
                 } else {
                     self.list.splice(old_range, count);
+                }
+                // The following row's top gap depends on its predecessor,
+                // including a provider-switch marker inserted above it.
+                if after < new_rows.len() {
+                    self.list.remeasure_items(after..after + 1);
                 }
                 self.viewport_layout_revision = self.viewport_layout_revision.wrapping_add(1);
             }
