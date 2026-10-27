@@ -94,6 +94,7 @@ pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
 pub use workspace_search::WorkspaceSearch;
+pub use zeron_preview::Scope as PreviewScope;
 
 pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 
