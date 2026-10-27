@@ -10329,6 +10329,7 @@ impl Composer {
                         resume: None,
                         attachments: attachment_paths,
                         worktree: run_worktree,
+                        env: Default::default(),
                     },
                     message_id: message_id.clone(),
                 };

@@ -271,6 +271,8 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir(&data)?;
     let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, &data, service))?;
     let boot = EngineBootConfig {
+        managed_inference: false,
+        scaffold: None,
         data_dir: data.clone(),
         ipc_port,
         edge_url: String::new(),

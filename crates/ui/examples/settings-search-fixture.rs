@@ -146,6 +146,8 @@ fn main() -> anyhow::Result<()> {
                 s
             });
             let boot = EngineBootConfig {
+                managed_inference: false,
+                scaffold: None,
                 data_dir: data.clone(),
                 ipc_port: 0,
                 edge_url: String::new(),

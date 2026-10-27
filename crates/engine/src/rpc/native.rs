@@ -141,7 +141,8 @@ fn request_for(chat: &Chat, prompt: String) -> Result<RunRequest, RpcError> {
     Ok(RunRequest { prompt, harness: Some(config.harness), model: config.model.clone(),
         reasoning: config.reasoning, model_options: config.model_options.clone(),
         cwd: chat.cwd.clone().or_else(|| chat.harness_session_cwd.clone()).ok_or_else(|| failed("Session has no working directory"))?,
-        sandbox: config.sandbox, auto_approve: false, resume: None, attachments: vec![], worktree: None, mcp: None })
+        sandbox: config.sandbox, auto_approve: false, resume: None, attachments: vec![], worktree: None, mcp: None,
+        env: Default::default() })
 }
 
 fn validate_recovered_native_input(original: HandoffInput, requested: &HandoffInput,

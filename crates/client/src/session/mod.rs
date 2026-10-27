@@ -1084,6 +1084,7 @@ impl SessionHandle {
                     attachments: refs.clone(),
                     worktree: request.worktree.clone(),
                     mcp: None,
+                    env: Default::default(),
                 };
                 self.core.queue_command(
                     &device_id,

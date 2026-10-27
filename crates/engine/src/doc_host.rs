@@ -6117,6 +6117,7 @@ impl DocHost {
             attachments: Vec::new(),
             resume: None,
             worktree: None,
+            env: Default::default(),
         })
     }
 

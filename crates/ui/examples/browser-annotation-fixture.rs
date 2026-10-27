@@ -99,6 +99,8 @@ fn main() -> anyhow::Result<()> {
     // Publish the IPC bearer where the attaching viewport looks for it.
     let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, &data, core.rpc_service()))?;
     let boot = EngineBootConfig {
+        managed_inference: false,
+        scaffold: None,
         data_dir: data.clone(),
         ipc_port,
         edge_url: String::new(),
