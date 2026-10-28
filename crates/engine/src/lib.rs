@@ -15,6 +15,15 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, TokenSource, methods};
 
 use zeron_sync::DocsStore;
 
+/// The process advertises the same features before and after profile assembly.
+fn engine_capabilities() -> Vec<String> {
+    let mut capabilities = zeron_proto::capabilities::current();
+    if desktop_notify::enabled() {
+        capabilities.push(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1.to_string());
+    }
+    capabilities
+}
+
 pub mod agent_accounts;
 pub mod auth;
 mod boat_lease;
@@ -840,7 +849,7 @@ impl Engine {
             devbox_provider,
             devbox_id,
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: zeron_proto::capabilities::current(),
+            capabilities: engine_capabilities(),
         })
     }
 

@@ -804,14 +804,7 @@ impl EngineRpc {
             devbox_provider,
             devbox_id,
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: {
-                let mut capabilities = zeron_proto::capabilities::current();
-                if crate::desktop_notify::enabled() {
-                    capabilities
-                        .push(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1.to_string());
-                }
-                capabilities
-            },
+            capabilities: crate::engine_capabilities(),
         };
         let github = GitHubCli::new().with_store(repos.data_dir());
         Self {
