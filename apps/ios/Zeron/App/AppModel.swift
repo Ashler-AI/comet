@@ -480,6 +480,10 @@ final class AppModel {
         }
     }
 
+    /// Something outside the registry stream changed the workspace (a Cloud
+    /// project written here): rebuild now rather than on the next frame.
+    func workspaceDidChange() { refreshWorkspace() }
+
     private func refreshWorkspace() {
         guard let client else { return }
         let ws = client.workspace()

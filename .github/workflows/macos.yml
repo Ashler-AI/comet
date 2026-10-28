@@ -95,6 +95,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
           cache-on-failure: true
+      # ort-sys records native archive paths outside the restored Cargo cache.
+      # Refresh its build script so every build profile links an existing archive.
+      - name: Refresh ONNX Runtime native linkage
+        run: cargo clean --package ort-sys
       - name: Install cargo-nextest
         run: |
           # Pinned release, verified against a checksum.
