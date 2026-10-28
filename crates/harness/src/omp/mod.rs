@@ -626,6 +626,143 @@ pub enum SessionWriterState {
     Unknown,
 }
 
+#[cfg(target_os = "linux")]
+const OMP_WRITER_PROBE_MARKER: &str = "__comet-omp-writer-probe";
+
+/// Dispatch before initializing threads or the application runtime. The lease
+/// and its SIGIO disposition belong only to this short-lived helper process.
+pub fn run_writer_probe_from_env() -> Option<Result<(), HarnessError>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() != Some(std::ffi::OsStr::new(OMP_WRITER_PROBE_MARKER)) {
+            return None;
+        }
+        return Some((|| {
+            let path = args.next().filter(|_| args.next().is_none()).ok_or_else(|| {
+                HarnessError::Protocol("writer probe requires one exact path".into())
+            })?;
+            let state = linux_read_lease_state(Path::new(&path));
+            std::io::stdout().write_all(match state {
+                SessionWriterState::Active => b"A\n",
+                SessionWriterState::Inactive => b"I\n",
+                SessionWriterState::Unknown => b"U\n",
+            })?;
+            Ok(())
+        })());
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_lease_state(path: &Path) -> SessionWriterState {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    // Only invoked after exec, before any threads start. Drop inherited RPC,
+    // journal and IPC descriptors; never alter the parent's descriptor table.
+    // A kernel without close_range cannot safely run this helper.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0
+            || libc::signal(libc::SIGIO, libc::SIG_IGN) == libc::SIG_ERR
+        {
+            return SessionWriterState::Unknown;
+        }
+    }
+    let Ok(file) = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)
+    else {
+        // Includes EWOULDBLOCK from somebody else's exclusive lease. It does
+        // not prove a write descriptor: a read-only FD can hold a write lease.
+        return SessionWriterState::Unknown;
+    };
+    let Ok(metadata) = file.metadata() else { return SessionWriterState::Unknown };
+    if !metadata.is_file() {
+        return SessionWriterState::Unknown;
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is live and all fcntl arguments here are scalar values. Set
+    // the signal recipient explicitly; no lease-break signal reaches Crew.
+    let state = unsafe {
+        if libc::fcntl(fd, libc::F_SETOWN, libc::getpid()) == -1 {
+            return SessionWriterState::Unknown;
+        }
+        if libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) == 0 {
+            let held = libc::fcntl(fd, libc::F_GETLEASE) == libc::F_RDLCK;
+            let released = libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) == 0;
+            if held && released { SessionWriterState::Inactive } else { SessionWriterState::Unknown }
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+            // The successful nonblocking read-open excludes an exclusive
+            // lease. EAGAIN now means an existing writer, or a write-open
+            // waiting for another read lease to break; neither is inactive.
+            SessionWriterState::Active
+        } else {
+            SessionWriterState::Unknown
+        }
+    };
+    // An unlink/rename during the probe must not certify a different inode.
+    let same_file = std::fs::metadata(path).is_ok_and(|current| {
+        current.dev() == metadata.dev() && current.ino() == metadata.ino()
+    });
+    drop(file); // Closing also releases the lease if explicit unlock failed.
+    if same_file { state } else { SessionWriterState::Unknown }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_session_writer_state_with(path: &Path, executable: &Path) -> SessionWriterState {
+    use std::os::fd::AsRawFd as _;
+
+    let Ok(mut child) = ProcessCommand::new(executable)
+        .arg(OMP_WRITER_PROBE_MARKER).arg(path)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+    else { return SessionWriterState::Unknown };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    if !status.is_some_and(|status| status.success()) {
+        return SessionWriterState::Unknown;
+    }
+    let Some(mut stdout) = child.stdout.take() else { return SessionWriterState::Unknown };
+    // Never wait for a pipe inherited by a stray descendant, or accept a
+    // successful exit with truncated, oversized or unrecognized output.
+    if unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return SessionWriterState::Unknown;
+    }
+    let mut bytes = [0u8; 3];
+    if !matches!(stdout.read(&mut bytes), Ok(2))
+        || !matches!(stdout.read(&mut [0u8; 1]), Ok(0))
+    {
+        return SessionWriterState::Unknown;
+    }
+    match &bytes[..2] {
+        b"A\n" => SessionWriterState::Active,
+        b"I\n" => SessionWriterState::Inactive,
+        _ => SessionWriterState::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_session_writer_state(path: &Path) -> SessionWriterState {
+    if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return SessionWriterState::Unknown;
+    }
+    std::env::current_exe().map_or(SessionWriterState::Unknown, |executable| {
+        linux_session_writer_state_with(path, &executable)
+    })
+}
+
 fn parse_lsof_writer_pids(stdout: &[u8]) -> Option<Vec<u32>> {
     let mut pid = None;
     let mut writers = Vec::new();
@@ -707,6 +844,7 @@ fn session_writer_state_with(path: &Path, executable: &Path) -> Option<SessionWr
         }
     })
 }
+#[cfg(not(target_os = "linux"))]
 fn parse_lsof_writer_paths(stdout: &[u8]) -> Option<HashSet<Vec<u8>>> {
     let mut writers = HashSet::new();
     let mut file_open = false;
@@ -777,6 +915,7 @@ fn fdinfo_text_is_write_capable(text: &str) -> Option<bool> {
     Some(access == libc::O_WRONLY || access == libc::O_RDWR)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn session_writer_states_with(
     paths: &[PathBuf],
     executable: &Path,
@@ -885,45 +1024,34 @@ fn linux_session_writer_pids(path: &Path) -> Option<Vec<u32>> {
     }
     (!incomplete).then_some(writers)
 }
-/// Probe many exact OMP JSONL paths with one descriptor scan.
+/// Probe exact OMP JSONL paths, retaining input order.
 ///
 /// Results retain input order. Missing tools and incomplete probes fail closed
 /// as `Unknown`; a confirmed write-capable descriptor remains `Active`.
 pub fn session_writer_states(paths: &[PathBuf]) -> Vec<SessionWriterState> {
-    let mut states = vec![SessionWriterState::Unknown; paths.len()];
     #[cfg(target_os = "linux")]
     {
-        states = paths
-            .iter()
-            .map(|path| match linux_session_writer_pids(path) {
-                Some(pids) if pids.is_empty() => SessionWriterState::Inactive,
-                Some(_) => SessionWriterState::Active,
-                None => SessionWriterState::Unknown,
-            })
-            .collect();
-        if states
-            .iter()
-            .all(|state| *state != SessionWriterState::Unknown)
-        {
-            return states;
-        }
+        paths.iter().map(|path| linux_session_writer_state(path)).collect()
     }
-
-    for executable in [
-        Path::new("/usr/sbin/lsof"),
-        Path::new("/usr/bin/lsof"),
-        Path::new("lsof"),
-    ] {
-        if let Some(fallback) = session_writer_states_with(paths, executable) {
-            for (state, fallback) in states.iter_mut().zip(fallback) {
-                if *state == SessionWriterState::Unknown {
-                    *state = fallback;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut states = vec![SessionWriterState::Unknown; paths.len()];
+        for executable in [
+            Path::new("/usr/sbin/lsof"),
+            Path::new("/usr/bin/lsof"),
+            Path::new("lsof"),
+        ] {
+            if let Some(fallback) = session_writer_states_with(paths, executable) {
+                for (state, fallback) in states.iter_mut().zip(fallback) {
+                    if *state == SessionWriterState::Unknown {
+                        *state = fallback;
+                    }
                 }
+                return states;
             }
-            return states;
         }
+        states
     }
-    states
 }
 
 fn session_writer_pids(path: &Path) -> Option<Vec<u32>> {
@@ -946,11 +1074,14 @@ fn session_writer_pids(path: &Path) -> Option<Vec<u32>> {
 
 /// Probe one exact OMP JSONL path for a live writer.
 ///
-/// Linux uses `/proc/<pid>/fdinfo`, so Scaffold images do not need an `lsof`
-/// package. macOS and other Unix hosts resolve the native absolute `lsof`
-/// locations before consulting `PATH`. A missing tool or failed/incomplete
-/// probe is `Unknown`, never `Inactive`.
+/// Linux uses an isolated kernel read-lease helper, without inspecting other
+/// processes or requiring `lsof`. macOS and other Unix hosts resolve the native
+/// absolute `lsof` locations before consulting `PATH`. An incomplete probe is
+/// `Unknown`, never `Inactive`.
 pub fn session_writer_state(path: &Path) -> SessionWriterState {
+    #[cfg(target_os = "linux")]
+    { linux_session_writer_state(path) }
+    #[cfg(not(target_os = "linux"))]
     match session_writer_pids(path) {
         Some(pids) if pids.is_empty() => SessionWriterState::Inactive,
         Some(_) => SessionWriterState::Active,
@@ -2458,6 +2589,39 @@ pub(crate) type RequestInputFn = Box<
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ownership_lease_helper_rejects_bad_output_and_reaps_on_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("probe");
+        let journal = dir.path().join("journal");
+        for (body, expected) in [
+            ("printf 'I\\n'", SessionWriterState::Inactive),
+            ("printf 'A\\n'", SessionWriterState::Active),
+            ("printf 'U\\n'", SessionWriterState::Unknown),
+            ("exit 0", SessionWriterState::Unknown),
+            ("printf I", SessionWriterState::Unknown),
+            ("printf 'I\\nextra'", SessionWriterState::Unknown),
+            ("printf 'I\\n'; exit 1", SessionWriterState::Unknown),
+            ("kill -KILL $$", SessionWriterState::Unknown),
+        ] {
+            std::fs::write(&helper, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(linux_session_writer_state_with(&journal, &helper), expected, "{body}");
+        }
+        assert_eq!(linux_session_writer_state_with(&journal, &dir.path().join("missing")),
+            SessionWriterState::Unknown);
+        let pid_file = dir.path().join("pid");
+        std::fs::write(&helper, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 10\n", pid_file.display())).unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(linux_session_writer_state_with(&journal, &helper), SessionWriterState::Unknown);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().trim().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "timed-out helper survived");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
 
     #[test]
     fn ownership_probe_distinguishes_readers_writers_and_incomplete_evidence() {

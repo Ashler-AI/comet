@@ -89,10 +89,10 @@ jobs:
         run: python3 -m unittest discover -s skills/devbox/scripts -p 'test_*.py'
       - name: Native auth, runtime, resume, directory and updater regressions
         run: >-
-          cargo test --locked --features zeron-sync/mock-server
+          cargo test --locked --features zeron-sync/mock-server,zeron-harness/native-fixture
           -p zeron-sync -p zeron-client -p zeron-update -p zeron-engine -p zeron-harness
           -p zeron-proto -p zeron-rpc -p zeron-preview
-          --lib --test auth --test scaffold_auth --test omp --test crew_import
+          --lib --test auth --test scaffold_auth --test omp --test omp_ownership --test crew_import
           --test crew_backup --test device_room --test registry_client --test coordinator
       - name: Read-only migration history codec regressions
         run: >-
