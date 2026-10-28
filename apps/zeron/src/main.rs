@@ -164,6 +164,9 @@ fn spawn_malloc_trimmer() {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = zeron_harness::omp::run_writer_probe_from_env() {
+        return result.map_err(anyhow::Error::from);
+    }
     if let Some(result) = zeron_harness::omp::run_supervisor_from_env() {
         return result.map_err(anyhow::Error::from);
     }

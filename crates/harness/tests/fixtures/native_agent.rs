@@ -17,12 +17,57 @@ fn update(session: &str, text: String) {
 }
 
 fn main() {
+    if let Some(result) = zeron_harness::omp::run_writer_probe_from_env() {
+        result.unwrap();
+        return;
+    }
     // A broken test must not leave even a direct fixture process behind.
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(20));
         std::process::exit(99);
     });
     let args: Vec<_> = std::env::args().collect();
+    #[cfg(target_os = "linux")]
+    if args.get(1).is_some_and(|arg| arg == "--ownership-stop") {
+        use zeron_harness::{Harness, OmpHarness};
+        let harness = OmpHarness::new().with_executable(&args[2]).with_session_dir(&args[3]);
+        if let Err(error) = tokio::runtime::Runtime::new().unwrap().block_on(harness.stop_session(&args[4])) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if args.get(1).is_some_and(|arg| arg == "--ownership-states") {
+        use zeron_harness::omp::{session_writer_state, session_writer_states, SessionWriterState};
+        let paths: Vec<std::path::PathBuf> = std::env::args_os().skip(2).map(Into::into).collect();
+        let encode = |states: Vec<SessionWriterState>| states.into_iter().map(|state| match state {
+            SessionWriterState::Active => 'A',
+            SessionWriterState::Inactive => 'I',
+            SessionWriterState::Unknown => 'U',
+        }).collect::<String>();
+        println!("{}", encode(paths.iter().map(|path| session_writer_state(path)).collect()));
+        println!("{}", encode(session_writer_states(&paths)));
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if args.get(1).is_some_and(|arg| arg == "--ownership-holder") {
+        use std::os::fd::AsRawFd;
+        let mode = &args[2];
+        let file = std::fs::OpenOptions::new().read(true).write(mode == "writer").open(&args[3]).unwrap();
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0), 0);
+            if mode == "lease" {
+                assert_ne!(libc::signal(libc::SIGIO, libc::SIG_IGN), libc::SIG_ERR);
+                assert_eq!(libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK), 0);
+            }
+        }
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let mut release = String::new();
+        std::io::stdin().read_line(&mut release).unwrap();
+        return;
+    }
     if args.get(1).is_some_and(|arg| arg == "--launch-report") {
         println!(
             "{}",
