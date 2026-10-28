@@ -897,11 +897,11 @@ mod tests {
         tokio::runtime::Runtime,
         ForkEngine,
     ) {
-        cx.update(gpui_tokio::init);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        cx.update(|cx| gpui_tokio::init_from_handle(cx, runtime.handle().clone()));
         let (out, requests) = tokio::sync::mpsc::channel(256);
         let (replies, inbound) = tokio::sync::mpsc::channel(256);
         let engine = {
