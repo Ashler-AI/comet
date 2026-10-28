@@ -1,8 +1,8 @@
 //! Uploads — attachment staging on the chat's host device
 //! (feature-inventory §3.7 "Uploads"; port of zeron's `uploads.ts`).
 //!
-//! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
-//! target device is remote); chunks stage on disk under `{uploads_root}/tmp/
+//! Clients stream files as base64 chunks sized for the relay; chunks stage
+//! on disk under `{uploads_root}/tmp/
 //! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike zeron's
 //! in-memory buffers), and `commit` assembles them into
 //! `{uploads_root}/{id8}-{name}` and returns the absolute path, which the
@@ -16,6 +16,7 @@
 //! image types, as in zeron; files in the uploads dir read back whatever their
 //! type, so a queued message can restore them for editing.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,6 +67,31 @@ pub fn parse_pending_ref(path: &str) -> Option<(&str, &str)> {
 pub struct AttachmentTransfer {
     pub upload_id: String,
     pub file_name: String,
+}
+
+/// Fast queued writes use their own geometry namespace, never a logical ID's
+/// legacy slots. Keep the first eight characters so pending refs still resolve
+/// to the same committed file on every host, including older receivers.
+pub(crate) fn queued_upload_plan(upload_id: &str) -> (Cow<'_, str>, usize) {
+    const CHUNK_BYTES: usize = 510_000; // Multiple of three: no interior base64 padding.
+    const ENCODED_CHARS: usize = CHUNK_BYTES / 3 * 4;
+    const SUFFIX_LEN: usize = 2 + ENCODED_CHARS.ilog10() as usize + 1;
+    if valid_upload_id(upload_id) && upload_id.len() >= 8
+        && upload_id.len() <= MAX_UPLOAD_ID_LEN - SUFFIX_LEN
+    {
+        (Cow::Owned(format!("{upload_id}-q{ENCODED_CHARS}")), CHUNK_BYTES)
+    } else {
+        // Short IDs would change the committed prefix; long IDs cannot fit
+        // the staging jail. Preserve their existing identity AND geometry.
+        (Cow::Borrowed(upload_id), 45_000)
+    }
+}
+
+const MAX_UPLOAD_ID_LEN: usize = 64;
+
+fn valid_upload_id(upload_id: &str) -> bool {
+    !upload_id.is_empty() && upload_id.len() <= MAX_UPLOAD_ID_LEN
+        && upload_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// Pending refs listed on a text's attachment-ref lines (`- pending://…`).
@@ -306,12 +332,7 @@ impl Uploads {
 
     fn staging_dir(&self, upload_id: &str) -> Result<PathBuf, EngineError> {
         // The id becomes a directory name — jail it to a safe charset.
-        let ok = !upload_id.is_empty()
-            && upload_id.len() <= 64
-            && upload_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
-        if !ok {
+        if !valid_upload_id(upload_id) {
             return Err(EngineError::Other("Invalid upload id".into()));
         }
         Ok(self.inner.tmp.join(upload_id))

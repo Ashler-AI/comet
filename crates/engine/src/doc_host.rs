@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use base64::Engine as _;
+use futures::{StreamExt as _, stream::FuturesUnordered};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -91,7 +92,7 @@ enum SyncAdmission {
 /// stalled-but-open relay link never fails on its own) and a timeout marks
 /// the link suspect; attempts retry on this backoff, cut short by the online
 /// bus / system wake.
-const TRANSFER_CHUNK_B64: usize = 60_000;
+const TRANSFER_INFLIGHT: usize = 3;
 const TRANSFER_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const TRANSFER_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const TRANSFER_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -309,6 +310,10 @@ struct DocHostInner {
     /// (a retry re-adds), so consumers can render a real percent while the
     /// relay leg runs and fall back to indeterminate otherwise.
     transfers: watch::Sender<Vec<zeron_proto::TransferProgress>>,
+    /// One chunk window per upload, including overlapping RetryDelivery escorts.
+    active_transfers: Mutex<HashSet<String>>,
+    /// Explicit retry reuses a live escort for this chat and command.
+    delivering_commands: Mutex<HashSet<(String, String)>>,
     connectivity_grace: Mutex<DegradeGrace>,
     /// Command ids currently BETWEEN mark-processed and their resolution in a
     /// drain. Distinguishes "executing right now" from "consumed by the
@@ -363,6 +368,18 @@ struct TransferProgressGuard<'a> {
 impl Drop for TransferProgressGuard<'_> {
     fn drop(&mut self) {
         self.host.transfer_progress_clear(self.upload_id);
+        lock(&self.host.inner.active_transfers).remove(self.upload_id);
+    }
+}
+
+struct CommandDeliveryGuard {
+    host: DocHost,
+    key: (String, String),
+}
+
+impl Drop for CommandDeliveryGuard {
+    fn drop(&mut self) {
+        lock(&self.host.inner.delivering_commands).remove(&self.key);
     }
 }
 
@@ -1042,6 +1059,8 @@ impl DocHost {
                 connectivity: OnceLock::new(),
                 connectivity_started: AtomicBool::new(false),
                 transfers: watch::channel(Vec::new()).0,
+                active_transfers: Mutex::new(HashSet::new()),
+                delivering_commands: Mutex::new(HashSet::new()),
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
@@ -4506,31 +4525,54 @@ impl DocHost {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return; // bare sync callers (unit tests) skip rather than panic
         };
+        if self.remote_host_for(chat_id).is_none() {
+            return;
+        }
+        let key = (chat_id.to_string(), entry.id.clone());
+        if !lock(&self.inner.delivering_commands).insert(key.clone()) {
+            return;
+        }
+        let delivery = CommandDeliveryGuard {
+            host: self.clone(),
+            key,
+        };
         let host = self.clone();
-        let chat = chat_id.to_string();
         self.spawn_worker_on(&runtime, async move {
-            let Some(target) = host.remote_host_for(&chat) else {
-                return; // local host (or no row yet claimed remotely)
-            };
-            if !transfers.is_empty() && !host.deliver_attachments(&chat, &transfers).await {
-                return; // gave up; the drain's wait cap surfaces the failure
-            }
+            let _delivery = delivery;
+            let chat = &_delivery.key.0;
             let mut wake = zeron_sync::wake::subscribe();
             let mut online = zeron_sync::wake::subscribe_online();
-            let give_up = tokio::time::Instant::now() + RELAY_GIVE_UP;
-            let grace_end = tokio::time::Instant::now() + ROWS_GRACE;
-            while tokio::time::Instant::now() < grace_end {
-                if host.rows_flushed(&chat) {
-                    return; // rows on the edge — the normal path has it
-                }
-                tokio::time::sleep(ROWS_POLL).await;
-            }
+            let mut give_up = tokio::time::Instant::now() + RELAY_GIVE_UP;
+            let mut grace_end = tokio::time::Instant::now() + ROWS_GRACE;
             let mut backoff = RELAY_BACKOFF_BASE;
+            let mut delivered_target = None;
             loop {
-                if host.rows_flushed(&chat) {
+                let Some(target) = host.remote_host_for(chat) else {
+                    return; // became locally hosted: source bytes are here
+                };
+                if delivered_target.as_deref() != Some(target.as_str()) {
+                    delivered_target = if transfers.is_empty() {
+                        Some(target)
+                    } else {
+                        match host.deliver_attachments(chat, &transfers).await {
+                            Ok(actual_target) => actual_target,
+                            Err(()) => return, // drain's wait cap surfaces the failure
+                        }
+                    };
+                    // The relay budget starts after this destination has its bytes.
+                    give_up = tokio::time::Instant::now() + RELAY_GIVE_UP;
+                    grace_end = tokio::time::Instant::now() + ROWS_GRACE;
+                    // Ownership can move during a push; recheck before forwarding.
+                    continue;
+                }
+                if host.rows_flushed(chat) {
                     return; // the normal path won while we were retrying
                 }
-                match host.relay_command(&target, &chat, &entry).await {
+                if tokio::time::Instant::now() < grace_end {
+                    tokio::time::sleep(ROWS_POLL).await;
+                    continue;
+                }
+                match host.relay_command(&target, chat, &entry).await {
                     Ok(outcome) => {
                         tracing::info!(chat = %chat, device = %target, command = %entry.id,
                             outcome, "command delivered via peer relay");
@@ -4559,21 +4601,21 @@ impl DocHost {
         });
     }
 
-    /// Step 1 of the escort: push staged bytes until they land (event-driven
-    /// backoff), `true` on success. Re-resolves the host each attempt (a
-    /// claim can move the chat).
+    /// Push staged bytes until they land (event-driven backoff), returning
+    /// the actual destination, or `None` if the chat became locally hosted.
+    /// Re-resolves the host each attempt because a claim can move the chat.
     async fn deliver_attachments(
         &self,
         chat: &str,
         transfers: &[crate::uploads::AttachmentTransfer],
-    ) -> bool {
+    ) -> Result<Option<String>, ()> {
         let mut wake = zeron_sync::wake::subscribe();
         let mut online = zeron_sync::wake::subscribe_online();
         let mut backoff = TRANSFER_BACKOFF_BASE;
         let deadline = tokio::time::Instant::now() + ATTACHMENT_WAIT_MAX;
         loop {
             let Some(target) = self.remote_host_for(chat) else {
-                return true; // became locally hosted: bytes already here
+                return Ok(None); // became locally hosted: bytes already here
             };
             match self.push_attachments(chat, &target, transfers).await {
                 Ok(()) => {
@@ -4583,12 +4625,12 @@ impl DocHost {
                     // durable nudge (the host's UploadCommit already kicked
                     // its local drains too).
                     self.nudge_remote_host(chat);
-                    return true;
+                    return Ok(Some(target));
                 }
                 Err(TransferError::Permanent(err)) => {
                     tracing::warn!(chat = %chat, device = %target, error = %err,
                         "queued attachment transfer failed permanently");
-                    return false;
+                    return Err(());
                 }
                 Err(TransferError::Transient(err)) => {
                     tracing::warn!(chat = %chat, device = %target, error = %err,
@@ -4598,7 +4640,7 @@ impl DocHost {
             }
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(chat = %chat, "queued attachment transfer gave up (wait cap)");
-                return false;
+                return Err(());
             }
             while wake.try_recv().is_ok() {}
             while online.try_recv().is_ok() {}
@@ -4925,6 +4967,13 @@ impl DocHost {
             .await
             .map_err(|e| Transient(format!("peer link: {e}")))?;
         for transfer in transfers {
+            if !lock(&self.inner.active_transfers).insert(transfer.upload_id.clone()) {
+                return Err(Transient("attachment transfer already running".into()));
+            }
+            let _progress = TransferProgressGuard {
+                host: self,
+                upload_id: &transfer.upload_id,
+            };
             // Bytes come from the uploads jail only — a transfer names an
             // upload identity, never an arbitrary path.
             let source = uploads.pending_target(&transfer.upload_id, &transfer.file_name);
@@ -4937,49 +4986,68 @@ impl DocHost {
             // indeterminate spinner and the retry re-publishes from 0.
             let total = bytes.len() as u64;
             self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, 0, total);
-            let _progress = TransferProgressGuard {
-                host: self,
-                upload_id: &transfer.upload_id,
-            };
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            // Only wire staging is layout-specific. Source, pending refs,
+            // ownership and progress always retain the logical identity.
+            let (wire_upload_id, chunk_bytes) = crate::uploads::queued_upload_plan(&transfer.upload_id);
+            let wire_upload_id = wire_upload_id.as_ref();
+            let mut chunks = FuturesUnordered::new();
             let mut start = 0usize;
             let mut seq = 0u64;
+            let mut done = 0u64;
+            let mut failure = None;
             loop {
-                let end = (start + TRANSFER_CHUNK_B64).min(b64.len());
-                let params = serde_json::json!({
-                    "chatId": chat_id,
-                    "uploadId": transfer.upload_id, "seq": seq, "data": &b64[start..end],
-                });
-                let call = client.call(zeron_rpc::methods::UPLOAD_CHUNK, params);
-                match tokio::time::timeout(TRANSFER_CHUNK_TIMEOUT, call).await {
+                while failure.is_none() && chunks.len() < TRANSFER_INFLIGHT
+                    && (start < bytes.len() || seq == 0)
+                {
+                    let end = (start + chunk_bytes).min(bytes.len());
+                    let raw = &bytes[start..end];
+                    let client = &client;
+                    let chunk_seq = seq;
+                    chunks.push(async move {
+                        let params = serde_json::json!({
+                            "chatId": chat_id,
+                            "uploadId": wire_upload_id, "seq": chunk_seq,
+                            "data": base64::engine::general_purpose::STANDARD.encode(raw),
+                        });
+                        let call = client.call_scoped(zeron_rpc::methods::UPLOAD_CHUNK, params);
+                        (raw.len() as u64, tokio::time::timeout(TRANSFER_CHUNK_TIMEOUT, call).await)
+                    });
+                    start = end;
+                    seq += 1;
+                }
+                let Some((acknowledged, result)) = chunks.next().await else { break };
+                let error = match result {
                     Err(_) => {
                         links.invalidate(target);
-                        return Err(Transient("chunk push timed out; peer link suspect".into()));
+                        Some(Transient("chunk push timed out; peer link suspect".into()))
                     }
                     Ok(Err(zeron_rpc::RpcError::Failed(err))) => {
-                        return Err(Permanent(format!("host refused chunk: {err}")));
+                        Some(Permanent(format!("host refused chunk: {err}")))
                     }
                     Ok(Err(err)) => {
                         links.invalidate(target);
-                        return Err(Transient(format!("chunk push failed: {err}")));
+                        Some(Transient(format!("chunk push failed: {err}")))
                     }
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        done += acknowledged;
+                        self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, done, total);
+                        None
+                    }
+                };
+                // Do not refill after an error. Settle this bounded window
+                // before returning so a retry cannot accumulate old writes.
+                if failure.is_none() || matches!(error.as_ref(), Some(Permanent(_))) {
+                    failure = error;
                 }
-                start = end;
-                seq += 1;
-                // b64 → raw: 4 chars carry 3 bytes; min-clamp absorbs the
-                // final chunk's padding overshoot.
-                let done = ((start as u64) * 3 / 4).min(total);
-                self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, done, total);
-                if start >= b64.len() {
-                    break;
-                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
             }
             let params = serde_json::json!({
                 "chatId": chat_id,
-                "uploadId": transfer.upload_id, "fileName": transfer.file_name,
+                "uploadId": wire_upload_id, "fileName": transfer.file_name,
             });
-            let call = client.call(zeron_rpc::methods::UPLOAD_COMMIT, params);
+            let call = client.call_scoped(zeron_rpc::methods::UPLOAD_COMMIT, params);
             match tokio::time::timeout(TRANSFER_COMMIT_TIMEOUT, call).await {
                 Err(_) => {
                     links.invalidate(target);

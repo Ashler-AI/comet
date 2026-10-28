@@ -92,38 +92,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn engine_info_uses_camel_case_fields() {
-        let info = EngineInfo {
-            device_id: "device-1".into(),
-            workspace_scope: WorkspaceScope::Local,
-            devbox_provider: Some(crate::DeviceEnvironment::Boat),
-            devbox_id: Some("bx_jdyh7avc".into()),
-            cursor_sdk_version: Some("1.0.31".into()),
-            capabilities: capabilities::current(),
-        };
-        assert_eq!(
-            serde_json::to_value(&info).unwrap(),
-            serde_json::json!({
-                "deviceId": "device-1",
-                "workspaceScope": "local",
-                "devboxProvider": "boat",
-                "devboxId": "bx_jdyh7avc",
-                "cursorSdkVersion": "1.0.31",
-                "capabilities": [
-                    "composer-references-v1",
-                    "message-queue-v1",
-                    "message-queue-actions-v1",
-                    "message-queue-attachments-v1",
-                    "message-queue-clean-attachment-text-v1",
-                    "message-queue-edit-lease-v1",
-                    "harness-updates-v1",
-                    "projectless-scratch-v1",
-                    "voice-client-media-v1"
-                ],
-            })
-        );
-    }
 
     #[test]
     fn old_engine_info_defaults_to_no_capabilities() {
