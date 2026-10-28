@@ -128,6 +128,37 @@ fn request(resume: Option<&str>) -> RunRequest {
     }
 }
 #[tokio::test]
+async fn native_autonomous_turn_announces_start_before_output() {
+    let _env = env_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("OMP_ARGV_LOG", temp.path().join("argv")); }
+    let (_sender, steering) = mpsc::channel(4);
+    let mut controls = controls();
+    controls.steering = steering;
+    let mut request = request(None);
+    request.prompt = "scenario:autonomous".into();
+    let mut stream = OmpHarness::new().with_executable(fixture_path()).run(request, controls).await.unwrap();
+    let mut starts = 0;
+    let mut completed = 0;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while completed < 2 {
+            match stream.next().await.expect("native runtime remains open").unwrap() {
+                AgentEvent::TurnStarted => starts += 1,
+                AgentEvent::TextDelta { .. } => assert_eq!(starts, completed + 1),
+                AgentEvent::Done { status, .. } => {
+                    assert_eq!(status, DoneStatus::Completed);
+                    completed += 1;
+                    assert_eq!(starts, completed);
+                }
+                AgentEvent::Steered { .. } => panic!("autonomous work must not acknowledge a user steer"),
+                _ => {}
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(starts, 2);
+}
+
+#[tokio::test]
 async fn state_refresh_drains_burst_events_before_the_response() {
     let _env = env_lock().await;
     let temp = tempfile::tempdir().unwrap();
@@ -227,12 +258,14 @@ async fn native_retry_continuation_finishes_without_an_error_card() {
     request.prompt = "scenario:retry".into();
     let mut stream = harness.run(request, controls()).await.unwrap();
     let mut parts = Vec::new();
+    let mut starts = 0;
     loop {
         let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
             .expect("native retry settles")
             .expect("stream remains open through recovery")
             .expect("valid recovery event");
+        if matches!(event, AgentEvent::TurnStarted) { starts += 1; }
         zeron_doc::fold_event_into_parts(&mut parts, &event);
         if let AgentEvent::Done { status, error, session_id, .. } = event {
             assert_eq!(status, DoneStatus::Completed);
@@ -241,6 +274,7 @@ async fn native_retry_continuation_finishes_without_an_error_card() {
             break;
         }
     }
+    assert_eq!(starts, 2, "retry starts must not clear completed tool output");
     assert!(parts.iter().any(|part| matches!(part,
         zeron_doc::MessagePart::Text { text, .. } if text == "hello from omp"
     )));
