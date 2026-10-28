@@ -60,6 +60,9 @@
 //!    `authenticate`. A login run for ANOTHER device (`requester`) publishes
 //!    its callback port to [`zeron_preview::login`], so the requester can
 //!    forward its own loopback to it over the P2P link.
+//! Shared sign-ins retain exchanged credentials until Agent Auth acknowledges
+//! the matching identity or the flow is cancelled/expires. Only transient
+//! upload failures keep polling; permanent failures surface an error for retry/cancel.
 //!
 //! Usage probes: all three providers expose the rate-limit view their own CLIs render
 //! (`/usage` in Claude Code, `/status` in Codex; Cursor's key has no quota view,
@@ -92,6 +95,7 @@ use zeron_proto::{
 };
 
 use crate::repos::home_dir;
+use crate::scaffold::ScaffoldError;
 use crate::{EngineError, new_id, now_ms};
 
 mod oauth;
@@ -792,16 +796,17 @@ impl AgentAccounts {
             .find(|slot| slot.id == account_id && slot.harness == harness)
             .ok_or_else(|| EngineError::Other("Selected local login no longer exists".into()))?;
         Self::import_shared_slot(remote, &slot).await
+            .map_err(|error| EngineError::Other(error.to_string()))
     }
 
     async fn import_shared_slot(
         remote: &crate::scaffold::ScaffoldClient,
         slot: &Slot,
-    ) -> Result<crate::scaffold::RemoteAgentAccount, EngineError> {
+    ) -> Result<crate::scaffold::RemoteAgentAccount, ScaffoldError> {
         let (provider, access, refresh, expiry, scopes) = match slot.harness {
             HarnessId::ClaudeCode => {
                 let oauth = slot.credentials.get("claudeAiOauth")
-                    .ok_or_else(|| EngineError::Other("Selected login is not Claude OAuth".into()))?;
+                    .ok_or_else(|| ScaffoldError::InvalidResponse("Selected login is not Claude OAuth".into()))?;
                 ("anthropic", str_field(oauth, "accessToken"), str_field(oauth, "refreshToken"),
                     oauth.get("expiresAt").and_then(|value| value.as_i64())
                         .and_then(DateTime::<Utc>::from_timestamp_millis),
@@ -811,17 +816,17 @@ impl AgentAccounts {
             }
             HarnessId::Codex => {
                 let tokens = slot.credentials.get("tokens")
-                    .ok_or_else(|| EngineError::Other("Selected login is not ChatGPT OAuth".into()))?;
+                    .ok_or_else(|| ScaffoldError::InvalidResponse("Selected login is not ChatGPT OAuth".into()))?;
                 let access = str_field(tokens, "access_token");
                 let expiry = access.as_deref().and_then(jwt_claims)
                     .and_then(|claims| claims.get("exp").and_then(|value| value.as_i64()))
                     .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
                 ("openai", access, str_field(tokens, "refresh_token"), expiry, Vec::new())
             }
-            _ => return Err(EngineError::Other("Only Claude and ChatGPT OAuth accounts can be shared".into())),
+            _ => return Err(ScaffoldError::InvalidResponse("Only Claude and ChatGPT OAuth accounts can be shared".into())),
         };
         let required = |value: Option<String>| value.filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| EngineError::Other("Selected OAuth login is incomplete".into()));
+            .ok_or_else(|| ScaffoldError::InvalidResponse("Selected OAuth login is incomplete".into()));
         let import = crate::scaffold::AgentAccountCredentialImport {
             provider: provider.into(),
             provider_account_id: slot.account_key.clone(),
@@ -833,14 +838,13 @@ impl AgentAccounts {
             credential: crate::scaffold::AgentAccountOAuthCredential {
                 access_token: required(access)?,
                 refresh_token: required(refresh)?,
-                expires_at: expiry.ok_or_else(|| EngineError::Other("Selected OAuth expiry is unavailable".into()))?.to_rfc3339(),
+                expires_at: expiry.ok_or_else(|| ScaffoldError::InvalidResponse("Selected OAuth expiry is unavailable".into()))?.to_rfc3339(),
                 scopes,
             },
         };
-        let account = remote.import_agent_account(&import).await
-            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let account = remote.import_agent_account(&import).await?;
         if account.provider != provider || account.provider_account_id != slot.account_key {
-            return Err(EngineError::Other("Agent Auth returned a different account identity".into()));
+            return Err(ScaffoldError::InvalidResponse("Agent Auth returned a different account identity".into()));
         }
         Ok(account)
     }
@@ -1495,15 +1499,16 @@ impl AgentAccounts {
             *pending = Some(Arc::new(slot));
         }
         self.finish_shared_login(remote, login_id).await
+            .map_err(|error| EngineError::Other(error.to_string()))
     }
 
     async fn finish_shared_login(
         &self,
         remote: &crate::scaffold::ScaffoldClient,
         login_id: &str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(), ScaffoldError> {
         let slot = lock(&self.inner.shared_logins).get(login_id).and_then(Clone::clone)
-            .ok_or_else(|| EngineError::Other("Shared sign-in has no exchanged credential.".into()))?;
+            .ok_or_else(|| ScaffoldError::InvalidResponse("Shared sign-in has no exchanged credential.".into()))?;
         Self::import_shared_slot(remote, &slot).await?;
         self.cancel_login(login_id);
         Ok(())
@@ -1527,11 +1532,20 @@ impl AgentAccounts {
     async fn poll_shared_import(&self, remote: &crate::scaffold::ScaffoldClient, login_id: &str) -> AgentLoginPoll {
         match self.finish_shared_login(remote, login_id).await {
             Ok(()) => AgentLoginPoll { status: AgentLoginStatus::Done, message: None, url: None, callback_port: None },
-            // Keep the tokens and retry on the next poll, never redeem the code again.
-            Err(error) => AgentLoginPoll { status: AgentLoginStatus::Pending,
-                message: Some(format!("Agent Auth has not acknowledged the account: {}. Retrying; cancel to discard this sign-in.",
-                    zeron_harness::redact::redact_output(&error.to_string()))),
-                url: None, callback_port: None },
+            // Keep tokens for retry/cancel; only temporary failures keep polling.
+            Err(error) => {
+                let transient = error.is_transient();
+                let message = zeron_harness::redact::redact_output(&error.to_string());
+                AgentLoginPoll {
+                    status: if transient { AgentLoginStatus::Pending } else { AgentLoginStatus::Error },
+                    message: Some(if transient {
+                        format!("Agent Auth has not acknowledged the account: {message}. Retrying; cancel to discard this sign-in.")
+                    } else {
+                        format!("Agent Auth rejected the account: {message}. Retry or cancel this sign-in.")
+                    }),
+                    url: None, callback_port: None,
+                }
+            }
         }
     }
 
@@ -4890,7 +4904,7 @@ mod login_tests {
     }
 
     #[tokio::test]
-    async fn shared_login_retries_import_without_redeeming_or_writing_local_credentials() {
+    async fn shared_login_retries_only_transient_import_failures_and_preserves_credentials() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let account = |id: &str| serde_json::json!({"account": {
@@ -4904,6 +4918,9 @@ mod login_tests {
             }).to_string()),
             ("503 Service Unavailable", "{}".into()), // Optional provider profile.
             ("503 Service Unavailable", "{}".into()), // Agent Auth did not acknowledge.
+            ("503 Service Unavailable", "{}".into()),
+            ("429 Too Many Requests", "{}".into()),
+            ("403 Forbidden", "{}".into()),
             ("200 OK", account("wrong-account")),
             ("200 OK", account("acct-new")),
         ];
@@ -4946,22 +4963,43 @@ mod login_tests {
         assert!(accounts.poll_login(&start.login_id).await.is_err());
         assert!(accounts.complete_shared_login(&remote, &start.login_id, "code#wrong-state").await.is_err());
         assert!(accounts.complete_shared_login(&remote, &start.login_id, "one-use-code").await.is_err());
+        let credential = lock(&accounts.inner.shared_logins).get(&start.login_id).unwrap().clone().unwrap();
+        assert!(!config.root_dir().exists(), "managed OAuth must not create steady-state slots");
+        // Seed an already-saved copy: neither rejection nor flow cleanup may delete it.
+        accounts.write_slot(&credential).unwrap();
+        let saved_file = accounts.slots_dir(HarnessId::ClaudeCode).unwrap().join(format!("{}.json", credential.id));
+        let saved = std::fs::read(&saved_file).unwrap();
+        for expected in [AgentLoginStatus::Pending, AgentLoginStatus::Pending, AgentLoginStatus::Error] {
+            let poll = accounts.poll_shared_login(&remote, &start.login_id).await.unwrap();
+            assert_eq!(poll.status, expected);
+            assert!(Arc::ptr_eq(lock(&accounts.inner.shared_logins).get(&start.login_id).unwrap().as_ref().unwrap(), &credential));
+            assert!(lock(&accounts.inner.flows).contains_key(&start.login_id));
+            assert_eq!(std::fs::read(&saved_file).unwrap(), saved);
+        }
+        // Explicit retry reuses the exchanged credential; a mismatched identity is
+        // not acknowledgement and must not clean up the failed flow either.
+        assert!(accounts.complete_shared_login(&remote, &start.login_id, "do-not-redeem").await.is_err());
         assert!(lock(&accounts.inner.shared_logins).get(&start.login_id).unwrap().is_some());
-        assert_eq!(accounts.poll_shared_login(&remote, &start.login_id).await.unwrap().status, AgentLoginStatus::Pending);
+        assert!(lock(&accounts.inner.flows).contains_key(&start.login_id));
         assert_eq!(accounts.poll_shared_login(&remote, &start.login_id).await.unwrap().status, AgentLoginStatus::Done);
         assert!(!lock(&accounts.inner.shared_logins).contains_key(&start.login_id));
         assert!(!lock(&accounts.inner.flows).contains_key(&start.login_id));
-        assert!(!config.root_dir().exists(), "managed OAuth must not create steady-state slots");
+        assert_eq!(std::fs::read(&saved_file).unwrap(), saved);
         assert_eq!(std::fs::read_to_string(config.claude_creds_file()).unwrap(), "live-claude");
         assert_eq!(std::fs::read_to_string(&config.claude_config_file).unwrap(), "live-profile");
         assert_eq!(std::fs::read_to_string(config.codex_auth_file()).unwrap(), "live-codex");
         let requests = server.await.unwrap();
         assert_eq!(requests.iter().filter(|request| request.starts_with("POST /token ")).count(), 1);
-        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /api/agent-accounts/import ")).count(), 3);
+        assert_eq!(requests.iter().filter(|request| request.starts_with("POST /api/agent-accounts/import ")).count(), 6);
         let cancelled = accounts.start_shared_login(HarnessId::ClaudeCode).await.unwrap();
+        *lock(&accounts.inner.shared_logins).get_mut(&cancelled.login_id).unwrap() = Some(credential);
         accounts.cancel_shared_login(&cancelled.login_id).await;
         assert!(!lock(&accounts.inner.flows).contains_key(&cancelled.login_id));
         assert!(!lock(&accounts.inner.shared_logins).contains_key(&cancelled.login_id));
+        assert_eq!(std::fs::read(&saved_file).unwrap(), saved);
+        assert_eq!(std::fs::read_to_string(config.claude_creds_file()).unwrap(), "live-claude");
+        assert_eq!(std::fs::read_to_string(&config.claude_config_file).unwrap(), "live-profile");
+        assert_eq!(std::fs::read_to_string(config.codex_auth_file()).unwrap(), "live-codex");
     }
 
     #[test]

@@ -50,6 +50,13 @@ bare model ID; Agent Auth still checks account/model access when a run starts.
 Update and restart the running Crew engine to refresh these choices; replacing
 only the frontend or CLI does not update its catalog behavior.
 
+Managed account sign-in retries only temporary Agent Auth failures. A permanent
+denial ends polling and shows an error; exchanged credentials remain available
+until retry/cancel, and existing saved accounts are not removed. Canary profiles
+use the existing staging pool; normal production profiles use production. An
+explicit desktop-profile override follows that profile's deployment, not the
+application bundle's display name.
+
 ### Engine and agent update recovery
 
 Open Crew windows reconnect to a restarted engine only when its device and
