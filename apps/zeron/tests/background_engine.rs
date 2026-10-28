@@ -82,6 +82,13 @@ fn assert_background_engine(mut command: Command, data_dir: &std::path::Path, po
             .call(zeron_rpc::methods::ENGINE_READY, serde_json::json!({}))
             .await
             .map_err(|err| format!("EngineReady: {err}"))?;
+        let ready_info = client
+            .call(zeron_rpc::methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .map_err(|err| format!("ready EngineInfo: {err}"))?;
+        if ready_info["capabilities"] != info["capabilities"] {
+            return Err("engine capabilities changed after startup".into());
+        }
         client
             .call(
                 zeron_rpc::methods::SET_VIEWPORT_FOCUS,
