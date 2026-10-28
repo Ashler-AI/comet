@@ -69,6 +69,12 @@ its stable ID appears in the transcript. Attachment paths remain separate from
 editable text and are expanded at dispatch; legacy expanded rows are recognized
 to avoid duplicate trailers. Queue attachments use committed host uploads.
 
+Immediate sends use a separate command-queue path. When attachments are staged
+locally as `pending://` references, `QueueCommand` stays on the sender engine so
+its transfer escort commits every file on the current host before the run executes.
+The shared message queue above still requires committed host paths; legacy
+upload-before-send routing is unchanged.
+
 Support is negotiated through `EngineInfo` and device-registry capabilities:
 `message-queue-v1`, `message-queue-actions-v1`, `message-queue-attachments-v1`,
 `message-queue-clean-attachment-text-v1` and `message-queue-edit-lease-v1`.
@@ -83,6 +89,8 @@ numbers. Older hosts retain the existing command-send path.
 - Device-routing tests race local and remote consumers over the same row.
 - Desktop tests cover action selection, modifier submission, optimistic echo,
   settings compatibility and transcript anchoring.
+- `composer::tests::first_send_images_reach_remote_harness_without_retry` checks
+  first-send remote image delivery and exactly-once execution across two engines.
 - `apps/ios/ZeronTests/MessageQueueTests.swift` covers projection, policy,
   attachment text, action acknowledgements and keyboard submission. Run with
   the iOS Xcode test suite on macOS.
