@@ -10,10 +10,16 @@
 //!    replica, nudges A's device room, A's host executor drains and runs it;
 //! 5. waits on **B** until the assistant entry lands `complete` with the mock
 //!    transcript (A → edge → B), and the session-status row round-trips.
+//! 6. stages a deterministic 5,357,034-byte file on B, queues its pending ref,
+//!    waits for A's mock completion, then verifies A's bytes and SHA-256 by RPC.
 //!
 //! Prints `PASS`/`FAIL` lines; exits nonzero on failure.
 
 use std::time::{Duration, Instant};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use sha2::{Digest, Sha256};
 
 use zeron_rpc::{RpcClient, connect_ws, methods};
 
@@ -103,6 +109,164 @@ fn apply_transcript_item(
     let frame: zeron_doc::TranscriptFrame =
         serde_json::from_value(item.clone()).map_err(|err| err.to_string())?;
     zeron_doc::apply_transcript_frame(current, frame).map_err(|err| err.to_string())
+}
+
+async fn attachment_smoke(
+    a: &RpcClient,
+    b: &RpcClient,
+    chat_id: &str,
+    a_dev: &str,
+    transcript: &mut Vec<zeron_doc::SessionMessageEntry>,
+) {
+    let payload: Vec<u8> = (0..5_357_034u32)
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect();
+    let expected_sha = format!("{:x}", Sha256::digest(&payload));
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    let file_name = "queued-throughput.bin";
+    let pending_ref = format!("pending://{upload_id}/{file_name}");
+    let mut staged_chunks = 0;
+    for (seq, bytes) in payload.chunks(510_000).enumerate() {
+        b.call(
+            methods::UPLOAD_CHUNK,
+            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": BASE64.encode(bytes) }),
+        )
+        .await
+        .unwrap_or_else(|err| fail(&format!("stage attachment chunk {seq} on B: {err}")));
+        staged_chunks += 1;
+    }
+    let committed = b.call(
+        methods::UPLOAD_COMMIT,
+        serde_json::json!({ "uploadId": upload_id, "fileName": file_name }),
+    )
+    .await
+    .unwrap_or_else(|err| fail(&format!("commit local attachment on B: {err}")));
+    let local_path = committed["path"].as_str()
+        .unwrap_or_else(|| fail("B UploadCommit reply missing path"));
+    pass(&format!("staged {} bytes on B ({staged_chunks} acknowledged local chunks)", payload.len()));
+
+    // Snapshots may coalesce and acknowledgements may arrive out of order.
+    // Log observed bytes without inferring chunk geometry or a throughput bound.
+    let mut progress = b.subscribe_scoped(methods::WATCH_TRANSFERS, serde_json::json!({}))
+        .await
+        .unwrap_or_else(|err| fail(&format!("WatchTransfers on B: {err}")));
+    let watched_id = upload_id.clone();
+    let progress_task = tokio::spawn(async move {
+        while let Some(item) = progress.recv().await {
+            let transfers: Vec<zeron_proto::TransferProgress> = serde_json::from_value(item)
+                .unwrap_or_else(|err| fail(&format!("decode WatchTransfers: {err}")));
+            for transfer in transfers.iter().filter(|t| t.upload_id == watched_id) {
+                println!("INFO: remote attachment progress observed: {}/{} bytes acknowledged", transfer.done, transfer.total);
+            }
+        }
+    });
+    let previous_assistants: Vec<String> = transcript.iter()
+        .filter(|e| e.role == zeron_doc::MessageRole::Assistant)
+        .map(|e| e.id.clone())
+        .collect();
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let started = Instant::now();
+    b.call(
+        methods::QUEUE_COMMAND,
+        serde_json::json!({
+            "chatId": chat_id,
+            "transfers": [{ "uploadId": upload_id, "fileName": file_name }],
+            "command": {
+                "kind": "run",
+                "messageId": message_id,
+                "request": {
+                    "prompt": format!("e2e smoke: queued file\n\nAttached files (local files):\n- {pending_ref}"),
+                    "attachments": [pending_ref],
+                    "model": null,
+                    "reasoning": null,
+                    "cwd": "/tmp",
+                    "sandbox": "workspace-write",
+                    "autoApprove": true,
+                    "resume": null,
+                },
+            },
+        }),
+    )
+    .await
+    .unwrap_or_else(|err| fail(&format!("QueueCommand with attachment on B: {err}")));
+    pass("attachment run queued on B with pending ref and transfers (no targetDeviceId)");
+
+    let remote_path = wait_stream(
+        b,
+        methods::WATCH_DOC_MESSAGES,
+        serde_json::json!({ "chatId": chat_id }),
+        "attachment run completed by A and synced to B",
+        |item| {
+            apply_transcript_item(transcript, item)
+                .unwrap_or_else(|err| fail(&format!("attachment transcript: {err}")));
+            let mut completed = transcript.iter().filter(|entry| {
+                entry.role == zeron_doc::MessageRole::Assistant
+                    && entry.status == Some(zeron_doc::MessageStatus::Complete)
+                    && !previous_assistants.contains(&entry.id)
+            });
+            let assistant = completed.next()?;
+            if completed.next().is_some() {
+                fail("attachment run produced multiple completed assistant entries");
+            }
+            if assistant.device_id != a_dev {
+                fail("attachment run completed on a device other than host A");
+            }
+            let text = serde_json::to_string(assistant)
+                .unwrap_or_else(|err| fail(&format!("serialize attachment assistant: {err}")));
+            if !text.contains(MOCK_TEXT) {
+                fail("attachment run lacks the mock transcript");
+            }
+            let user = transcript.iter().find(|entry| entry.id == message_id
+                && entry.role == zeron_doc::MessageRole::User)?;
+            let path = user.parts.iter().find_map(|part| match part {
+                zeron_doc::MessagePart::Text { text, .. } => text.lines()
+                    .find_map(|line| line.strip_prefix("- ").filter(|path| path.ends_with(file_name)))
+                    .map(str::to_owned),
+                _ => None,
+            })?;
+            if path.starts_with("pending://") || path == local_path {
+                fail("attachment user entry did not resolve to host A's local file");
+            }
+            Some(path)
+        },
+    ).await;
+    progress_task.abort();
+    let _ = progress_task.await;
+    pass(&format!("attachment mock run completed on A and synced to B in {:.3}s since queueing", started.elapsed().as_secs_f64()));
+
+    let mut received = Vec::with_capacity(payload.len());
+    let mut read_chunks = 0;
+    tokio::time::timeout(STEP_TIMEOUT, async {
+        loop {
+            let chunk = a.call(
+                methods::READ_ATTACHMENT_CHUNK,
+                serde_json::json!({ "path": remote_path, "offset": received.len() }),
+            ).await.unwrap_or_else(|err| fail(&format!("read committed attachment on A: {err}")));
+            let data = chunk["data"].as_str()
+                .unwrap_or_else(|| fail("ReadAttachmentChunk missing data"));
+            received.extend(BASE64.decode(data)
+                .unwrap_or_else(|err| fail(&format!("decode A attachment chunk: {err}"))));
+            read_chunks += 1;
+            if chunk["nextOffset"].as_u64() != Some(received.len() as u64)
+                || received.len() > payload.len()
+            {
+                fail("A attachment readback returned an invalid offset or excess bytes");
+            }
+            match chunk["done"].as_bool() {
+                Some(true) => break,
+                Some(false) if !data.is_empty() => {},
+                _ => fail("A attachment readback made no progress or omitted done"),
+            }
+        }
+    }).await.unwrap_or_else(|_| fail("A attachment readback timed out"));
+    if received != payload {
+        fail("A committed attachment differs byte-for-byte from the synthetic payload");
+    }
+    let received_sha = format!("{:x}", Sha256::digest(&received));
+    if received_sha != expected_sha {
+        fail("A committed attachment SHA-256 mismatch");
+    }
+    pass(&format!("A attachment byte-exact: {} bytes, SHA-256 {received_sha} ({read_chunks} RPC readback chunks)", received.len()));
 }
 
 #[tokio::main]
@@ -288,6 +452,8 @@ async fn main() {
     )
     .await;
     pass("session status (A working -> idle) round-tripped to B");
+
+    attachment_smoke(&a, &b, &chat_id, &a_dev, &mut transcript).await;
 
     println!("PASS: two-device e2e smoke complete");
 }

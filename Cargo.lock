@@ -13810,9 +13810,11 @@ version = "0.2.124"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",
