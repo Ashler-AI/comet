@@ -182,6 +182,16 @@ forwarded, retains it through response completion/drop, and blocks idle reaping
 while active. Model discovery does not acquire protection. Retired run tokens
 cannot rebind to a replacement run, even for the same chat and provider.
 
+OMP foreground activity follows native `agent_start` and terminal `agent_end`,
+not every inference request. Background skill-description compression can use
+the same route after a completed turn: it retains provider protection while its
+response is live without reopening the foreground or requiring another Done.
+An autonomous native start reacquires protection before becoming Working; that
+claim and status publication share the run-ownership lock so the final auxiliary
+response cannot release the new turn. Model EOF does not settle a foreground
+turn still running tools. Native starts are host-local control signals, never
+new journal/wire events; stored profile and wire compatibility remain unchanged.
+
 Focused engine regressions cover Boat admission, Namespace markers, terminal
 mailbox races, and relay denial/cancellation/stale-token fencing. These changes
 do not alter delivery receipts, provider credentials, or deployment defaults.
