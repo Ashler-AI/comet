@@ -368,14 +368,12 @@ final class CoreSessionSource: SessionSource {
         return defaultModels[key]
     }
 
-    /// The providers a chat on this host can move to: Cloud runs Claude
-    /// Code and Codex; a computer, the agents it offers.
+    /// The providers a chat on this host can move to. Crew does not expose
+    /// provider changes for legacy Cloud chats.
     private func providers(cloud: Bool) -> [HarnessInfo] {
         // A computer offers what it reports; until it has, only the current
         // provider (a built-in guess could offer one it doesn't have).
-        cloud
-            ? fallbackHarnesses().filter { AppModel.cloudHarnesses.contains($0.id) }
-            : hostHarnesses.filter(\.offered)
+        cloud ? [] : hostHarnesses.filter(\.offered)
     }
 
     private func setConfig(_ change: (inout ChatConfig) -> Void) {
