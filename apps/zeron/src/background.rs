@@ -15,7 +15,7 @@ pub fn run() -> anyhow::Result<()> {
 /// CLI. The hidden `comet engine` fallback accepts global runtime flags, so it
 /// must not discard them by resolving a second, default configuration.
 pub fn run_with_config(config: zeron_engine::EngineConfig) -> anyhow::Result<()> {
-    crate::init_logging(true, "engine", false);
+    crate::init_logging(Some(&config.data_dir), "engine", false);
     crate::long_running_setup();
     zeron_engine::desktop_notify::enable();
     let app = std::env::var_os(zeron_engine::managed::APP_ENV).map(PathBuf::from);

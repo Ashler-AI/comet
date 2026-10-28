@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("--noop-browser") => Ok(()),
         Some("mcp") => {
-            zeron_app::init_logging(false, "mcp", true);
+            zeron_app::init_logging(None, "mcp", true);
             zeron_app::run_mcp()
         }
         Some("--version" | "-V") => {
