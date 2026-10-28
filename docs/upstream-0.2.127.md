@@ -11,8 +11,9 @@ retained locally at `backup/crew-before-zeron-0.2.127-rebase`.
 
 - **Runtime and authentication:** retain Crew profile selection, scoped Scaffold
   authority, managed inference, Boat admission, and OMP. Pass the resolved
-  runtime coordinates to the new background engine. Its executable also handles
-  OMP supervisor and MCP entry points.
+  runtime coordinates to the new background engine and keep its logs in that
+  same profile. Advertise desktop capabilities consistently during startup.
+  Its executable also handles OMP supervisor and MCP entry points.
 - **IPC and recovery:** use profile-bound IPC tokens for desktop, CLI, fixtures,
   and MCP. Keep one-shot mutation delivery, durable command admission and
   identity-preserving Codex resume/fork behavior while integrating upstream
@@ -46,3 +47,23 @@ bindings; they do not authorize or expose those excluded services.
 This source integration does not deploy, publish, migrate profiles, or change
 Scaffold pins. Release qualification remains governed by
 `skills/comet-work/SKILL.md`.
+
+## Verification
+
+Validated implementation: `739754828fc355a5e3e4c060aa7f90a92bfae7f7`.
+
+- [Linux CI](https://github.com/Ashler-AI/comet/actions/runs/40614670276):
+  1,962 core tests and 2,003 UI tests passed, together with both installer
+  regressions and browser persistence, X11, Wayland and renderer-fallback checks.
+  This run used `6d22da15`; the subsequent change only corrected a macOS updater
+  test fixture.
+- [macOS and iOS CI](https://github.com/Ashler-AI/comet/actions/runs/40617111506):
+  both desktop executables built; 15 shared profile/log tests, both background
+  engine process tests and all 117 native regressions passed. Native browser
+  persistence, preview discovery/stable URLs/HMR, frame-source recovery,
+  mobile Rust tests, generated Swift binding comparison and iOS simulator tests
+  passed.
+
+The suites retain their configured skips; nextest reported three leaky core
+tests and one leaky native test, all passing. No typechecks were run. These
+checks qualify the source integration, not a signed release or deployment.
