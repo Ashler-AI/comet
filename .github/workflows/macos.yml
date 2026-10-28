@@ -126,8 +126,8 @@ jobs:
           # Exercise the packaged executable entry points without debug assertions.
           CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: false
         run: cargo build --locked -p zeron --bins
-      - name: Background engine profile isolation
-        run: cargo test --locked -p zeron --test background_engine
+      - name: Background engine and profile regressions
+        run: cargo test --locked -p zeron --lib --test background_engine
       - name: Updater, preview, CoreText and native UI regressions
         run: |
           # zeron-text's coretext tests are macOS-only (#![cfg(target_os = "macos")]); its other
