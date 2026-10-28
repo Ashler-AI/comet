@@ -235,10 +235,19 @@ mod tests {
         let bundle = tmp.path().join(super::super::mac_app_name());
         let macos = bundle.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).unwrap();
-        std::fs::write(bundle.join("Contents/Info.plist"), b"<plist/>").unwrap();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>{}</string><key>CFBundleExecutable</key><string>comet</string></dict></plist>", bundle_id()),
+        )
+        .unwrap();
         std::fs::write(macos.join("comet"), b"main").unwrap();
         let error = verify_bundle_shape(&bundle).unwrap_err();
-        assert!(error.to_string().contains("not a Crew app bundle"));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::write(macos.join("Crew Engine"), b"engine").unwrap();
+        verify_bundle_shape(&bundle).unwrap();
     }
 
     #[test]
