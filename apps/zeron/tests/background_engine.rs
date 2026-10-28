@@ -112,6 +112,10 @@ fn assert_background_engine(mut command: Command, data_dir: &std::path::Path, po
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(status.success(), "engine exited with {status}");
+    assert!(
+        data_dir.join("logs/zeron-engine.log").is_file(),
+        "engine logs must use the same resolved profile as IPC"
+    );
     // It let go of the port: the next engine can take it.
     std::net::TcpListener::bind(("127.0.0.1", port)).expect("port released");
 }

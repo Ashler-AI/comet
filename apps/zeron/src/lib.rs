@@ -60,14 +60,14 @@ pub fn background_engine_config() -> anyhow::Result<zeron_engine::EngineConfig> 
 /// long-running modes — a process launched from Finder or by the app has no
 /// visible output. Long-running modes log at info, one-shot commands at warn
 /// (`RUST_LOG` overrides either).
-pub fn init_logging(long_running: bool, mode: &str, stderr_only: bool) {
+pub fn init_logging(data_dir: Option<&std::path::Path>, mode: &str, stderr_only: bool) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     // loro's internal block-encode diagnostics log at info and flood
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let default_filter = if long_running {
+    let default_filter = if data_dir.is_some() {
         "info,loro_internal=warn,loro=warn"
     } else {
         "warn"
@@ -85,9 +85,8 @@ pub fn init_logging(long_running: bool, mode: &str, stderr_only: bool) {
             .init();
         return;
     }
-    let log_file = long_running
-        .then(|| open_log_file(mode))
-        .flatten()
+    let log_file = data_dir
+        .and_then(|data_dir| open_log_file(data_dir, mode))
         .map(|(file, path)| RotatingLog::new(file, path, LOG_LIMIT));
     let registry = tracing_subscriber::registry()
         .with(filter)
@@ -149,8 +148,11 @@ pub fn run_mcp() -> anyhow::Result<()> {
 /// the exact moment they were needed). A launch that finds the canonical file
 /// locked logs to `zeron-{mode}.{pid}.log` instead; the next lock-holding
 /// launch sweeps pid-suffixed files older than a week.
-pub fn open_log_file(mode: &str) -> Option<(std::fs::File, std::path::PathBuf)> {
-    let dir = paths::data_dir().join("logs");
+pub fn open_log_file(
+    data_dir: &std::path::Path,
+    mode: &str,
+) -> Option<(std::fs::File, std::path::PathBuf)> {
+    let dir = data_dir.join("logs");
     open_log_file_in(&dir, mode)
 }
 
