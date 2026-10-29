@@ -1701,6 +1701,28 @@ async fn antigravity_empty_reply_completes_once() {
 }
 
 #[tokio::test]
+async fn antigravity_managed_gateway_authenticates_without_local_google_credentials() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fake-antigravity-gateway.sh");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let harness = AcpHarness::antigravity().with_executable(fixture);
+    let (mut controls, _steer, _token) = controls();
+    controls.context = Some(zeron_harness::RunContext {
+        session_id: "gateway-session".into(), ipc_port: 0, supervision_token: None, fork_from: None,
+        inference: Some(zeron_harness::InferenceRoute {
+            provider: "antigravity".into(), model: "gemini-3.8-flash-high".into(),
+            base_url: "http://127.0.0.1:9876".into(), token: "opaque-managed-test".into(),
+        }),
+    });
+    let mut req = request("hi");
+    req.model = Some("default".into());
+    let events = run_to_end(&harness, req, controls).await;
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    assert!(events.contains(&AgentEvent::TextDelta { text: "gateway-authorized".into() }));
+}
+
+#[tokio::test]
 async fn antigravity_unknown_saved_model_fails_clearly() {
     let events = antigravity_config_sets("unknown-saved-model", None).await;
     let done = dones(&events);
@@ -2249,7 +2271,7 @@ fn antigravity_detection_and_missing_server_never_install() {
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let adapters = dir.path().join("adapters");
         if scenario == "partial" {
-            let partial = adapters.join("antigravity-acp/1.2.1");
+            let partial = adapters.join("antigravity-acp/1.4.4");
             std::fs::create_dir_all(&partial).unwrap();
             std::fs::write(partial.join("agy_acp_server.par"), "incomplete").unwrap();
         }
@@ -2275,7 +2297,7 @@ fn antigravity_detection_and_missing_server_never_install() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!adapters.join(".tmp-antigravity-acp-1.2.1").exists());
+        assert!(!adapters.join(".tmp-antigravity-acp-1.4.4").exists());
     }
 }
 

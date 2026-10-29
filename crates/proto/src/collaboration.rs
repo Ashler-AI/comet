@@ -506,6 +506,7 @@ pub enum AgentSessionSource {
 pub enum AgentProvider {
     OpenAi,
     Anthropic,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -557,8 +558,27 @@ impl AgentRoute {
         let provider = match self.provider {
             AgentProvider::OpenAi => "openai-codex",
             AgentProvider::Anthropic => "anthropic",
+            AgentProvider::Antigravity => "antigravity",
         };
         format!("{provider}/{}", self.model)
+    }
+
+    /// Native Antigravity owns its tools and conversation; the other managed
+    /// providers continue through OMP.
+    pub fn harness(&self) -> crate::HarnessId {
+        if self.provider == AgentProvider::Antigravity { crate::HarnessId::Antigravity } else { crate::HarnessId::Omp }
+    }
+
+    pub fn execution_model(&self) -> String {
+        if self.provider == AgentProvider::Antigravity { self.model.clone() } else { self.omp_model() }
+    }
+
+    pub fn from_harness_model(harness: crate::HarnessId, model: &str) -> Option<Self> {
+        if harness == crate::HarnessId::Antigravity {
+            let model = model.strip_prefix("antigravity/").unwrap_or(model).trim();
+            return (!model.is_empty() && !model.contains('/')).then(|| Self::automatic(AgentProvider::Antigravity, model));
+        }
+        Self::from_omp_model(model).filter(|route| route.provider != AgentProvider::Antigravity)
     }
 
     pub fn automatic(provider: AgentProvider, model: impl Into<String>) -> Self {
@@ -1273,6 +1293,15 @@ mod tests {
                     | ("inspect", ScaffoldEnvironmentControl::Inspect { .. })
             ));
         }
+    }
+
+    #[test]
+    fn antigravity_routes_cannot_be_interpreted_as_omp_sessions() {
+        assert!(AgentRoute::from_omp_model("antigravity/gemini-4-argon-medium").is_none());
+        assert!(AgentRoute::from_harness_model(crate::HarnessId::Omp, "antigravity/gemini-4-argon-medium").is_none());
+        let native = AgentRoute::from_harness_model(crate::HarnessId::Antigravity, "gemini-4-argon-medium").unwrap();
+        assert_eq!(native.harness(), crate::HarnessId::Antigravity);
+        assert_eq!(native.execution_model(), "gemini-4-argon-medium");
     }
 
     #[test]

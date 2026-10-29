@@ -38,6 +38,7 @@ struct InferenceRouteRequest {
 }
 
 const MAX_CONNECTIONS: usize = 64;
+const MAX_GEMINI_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 // Issuer reuse ends at millisecond expiry, while signed tokens expire at whole
 // seconds. Wait out the final second before asking for the next authority.
 const EXPIRY_BOUNDARY_SECONDS: i64 = 1;
@@ -287,9 +288,8 @@ fn inference_binding(
     harness: HarnessId,
     selected_model: Option<&str>,
 ) -> Option<(&'static str, String)> {
-    // ACP agents own their CLI credentials. A provider-prefixed model id is
-    // not evidence that they implement Crew's Agent Auth relay contract.
-    if !matches!(harness, HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex) {
+    // Only harnesses with an explicit Crew relay adapter may use shared auth.
+    if !matches!(harness, HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Antigravity) {
         return None;
     }
     let selected = selected_model
@@ -303,6 +303,8 @@ fn inference_binding(
         })?;
     let lower = selected.to_ascii_lowercase();
     let provider = match harness {
+        HarnessId::Antigravity if !lower.contains('/') || lower.starts_with("antigravity/") => "antigravity",
+        HarnessId::Antigravity => return None,
         HarnessId::ClaudeCode if !lower.contains('/') => "anthropic",
         HarnessId::Codex if !lower.contains('/') => "openai",
         _ if lower.starts_with("anthropic/") => "anthropic",
@@ -399,6 +401,27 @@ impl InferenceRelay {
         requested_account_id: Option<&str>,
         admission: Option<RunInferenceAdmission>,
     ) -> Result<Option<InferenceRoute>, EngineError> {
+        let cancellation = admission.as_ref().map(|gate| gate.cancellation.child_token())
+            .unwrap_or_default();
+        // Native gateway discovery must use the current owned account's catalog.
+        // Never silently substitute an old static model when discovery fails.
+        let native_model = if harness == HarnessId::Antigravity {
+            let catalog = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(EngineError::Other("Agent Auth route cancelled".into())),
+                catalog = self.inner.client.list_antigravity_models(requested_account_id) =>
+                    catalog.map_err(|error| EngineError::Other(format!("Google model discovery failed: {error}")))?,
+            };
+            let selected = model.map(str::trim).filter(|id| !id.is_empty() && *id != "default")
+                .map(|id| id.strip_prefix("antigravity/").unwrap_or(id))
+                .or(catalog.default_model_id.as_deref())
+                .ok_or_else(|| EngineError::Other("Google did not return a default model; select an available model".into()))?;
+            if !catalog.models.iter().any(|model| model.id == selected) {
+                return Err(EngineError::Other("Selected model is unavailable for this Google account".into()));
+            }
+            Some(selected.to_string())
+        } else { None };
+        let model = native_model.as_deref().or(model);
         let agent_auth_session_id = agent_auth_logical_session_id(session_id);
         let local_session_id =
             matches!(&agent_auth_session_id, Cow::Owned(_)).then(|| session_id.to_string());
@@ -412,8 +435,6 @@ impl InferenceRelay {
             tracing::debug!(?harness, "inference relay skipped for unsupported harness");
             return Ok(None);
         };
-        let cancellation = admission.as_ref().map(|gate| gate.cancellation.child_token())
-            .unwrap_or_default();
         let lease = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(EngineError::Other("Agent Auth route cancelled".into())),
@@ -592,6 +613,9 @@ impl InferenceRelay {
             );
         };
         let path = request.uri().path();
+        if request.method() == Method::GET && path == "/v1beta/models" && route.request.provider == "antigravity" {
+            return json_response(StatusCode::OK, antigravity_model_catalog(&route.request.model));
+        }
         if request.method() == Method::GET && path == "/v1/models" {
             return model_catalog(&route.request);
         }
@@ -601,14 +625,17 @@ impl InferenceRelay {
                 json!({ "error": "method_not_allowed" }),
             );
         }
+        let gemini = antigravity_endpoint(path);
         let endpoint = match path {
             "/v1/responses" => "responses",
             "/v1/messages" => "messages",
+            _ if gemini.is_some() => gemini.as_ref().unwrap().0,
             _ => return json_response(StatusCode::NOT_FOUND, json!({ "error": "not_found" })),
         };
         let query = match request.uri().query() {
             None => None,
             Some("beta=true") if endpoint == "messages" => Some("beta=true"),
+            Some("alt=sse") if endpoint == "antigravity/streamGenerateContent" => None,
             Some(_) => {
                 return json_response(
                     StatusCode::BAD_REQUEST,
@@ -616,7 +643,9 @@ impl InferenceRelay {
                 );
             }
         };
-        let expected_provider = if endpoint == "messages" {
+        let expected_provider = if gemini.is_some() {
+            "antigravity"
+        } else if endpoint == "messages" {
             "anthropic"
         } else {
             "openai"
@@ -641,6 +670,13 @@ impl InferenceRelay {
                 );
             }
         };
+        let gemini_prefix = gemini.as_ref().map(|_| Bytes::from(format!("{{\"model\":{},\"request\":",
+            serde_json::to_string(&route.request.model).expect("model string"))));
+        if let Some(prefix) = &gemini_prefix {
+            if content_length > MAX_GEMINI_ENVELOPE_BYTES.saturating_sub(prefix.len() + 1) as u64 {
+                return json_response(StatusCode::PAYLOAD_TOO_LARGE, json!({"error":"request_too_large"}));
+            }
+        }
         let headers = request.headers().clone();
         let request_id = headers
             .get("x-request-id")
@@ -688,7 +724,20 @@ impl InferenceRelay {
         if cancellation.is_cancelled() {
             return json_response(StatusCode::GONE, json!({ "error": "inference_run_retired" }));
         }
-        let body = reqwest::Body::wrap_stream(request.into_body().into_data_stream());
+        // Wrap the native request without buffering it. The fixed prefix/suffix
+        // preserves streaming; the complete envelope's 16 MiB cap covers actual bytes.
+        let (body, content_length) = if let Some(prefix) = gemini_prefix {
+            let length = content_length + prefix.len() as u64 + 1;
+            let budget = MAX_GEMINI_ENVELOPE_BYTES.saturating_sub(prefix.len() + 1);
+            let request_stream = http_body_util::Limited::new(request.into_body(), budget)
+                .into_data_stream().map(|item| item.map_err(std::io::Error::other));
+            let wrapped = futures::stream::once(async move { Ok::<_, std::io::Error>(prefix) })
+                .chain(request_stream)
+                .chain(futures::stream::once(async { Ok(Bytes::from_static(b"}")) }));
+            (reqwest::Body::wrap_stream(wrapped), length)
+        } else {
+            (reqwest::Body::wrap_stream(request.into_body().into_data_stream()), content_length)
+        };
         let upstream = self
             .inner
             .client
@@ -907,6 +956,21 @@ fn validate_authority(authority: &AgentInferenceAuthority) -> Result<DateTime<Ut
     Ok(expires_at)
 }
 
+/// Only native Gemini inference operations are admitted; URL paths never
+/// become arbitrary upstream destinations or model selectors with separators.
+fn antigravity_endpoint(path: &str) -> Option<(&'static str, String)> {
+    let (model, operation) = path.strip_prefix("/v1beta/models/")?.split_once(':')?;
+    if model.is_empty() || model.len() > 128 || !model.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)) {
+        return None;
+    }
+    let endpoint = match operation {
+        "generateContent" => "antigravity/generateContent",
+        "streamGenerateContent" => "antigravity/streamGenerateContent",
+        _ => return None,
+    };
+    Some((endpoint, model.to_owned()))
+}
+
 fn relay_token(headers: &HeaderMap) -> Option<String> {
     let bearer = headers
         .get(AUTHORIZATION)
@@ -924,11 +988,14 @@ fn relay_token(headers: &HeaderMap) -> Option<String> {
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|token| !token.is_empty() && !token.contains(char::is_whitespace));
-    match (bearer, api_key) {
-        (Some(token), None) | (None, Some(token)) => Some(token.to_string()),
-        (Some(bearer), Some(api_key)) if bearer == api_key => Some(bearer.to_string()),
-        _ => None,
-    }
+    let google_key = headers.get("x-goog-api-key").and_then(|value| value.to_str().ok())
+        .map(str::trim).filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+        // The official gateway transport requires a placeholder SDK API key.
+        // It is never authority and is accepted only alongside the bearer grant.
+        .filter(|value| !(*value == "dummy_api_key" && bearer.is_some()));
+    let mut tokens = [bearer, api_key, google_key].into_iter().flatten();
+    let token = tokens.next()?;
+    tokens.all(|candidate| candidate == token).then(|| token.to_string())
 }
 
 fn sanitize_request_headers(mut headers: HeaderMap) -> HeaderMap {
@@ -936,6 +1003,7 @@ fn sanitize_request_headers(mut headers: HeaderMap) -> HeaderMap {
         headers.remove(name);
     }
     headers.remove("x-api-key");
+    headers.remove("x-goog-api-key");
     for name in [
         "x-agent-auth-owner-subject",
         "x-agent-auth-session-id",
@@ -958,6 +1026,9 @@ fn sanitize_request_headers(mut headers: HeaderMap) -> HeaderMap {
 }
 
 fn model_catalog(request: &InferenceRouteRequest) -> Response<RelayBody> {
+    if request.provider == "antigravity" {
+        return json_response(StatusCode::OK, antigravity_model_catalog(&request.model));
+    }
     let (owned_by, api) = if request.provider == "anthropic" {
         ("anthropic", "anthropic-messages")
     } else {
@@ -975,6 +1046,11 @@ fn model_catalog(request: &InferenceRouteRequest) -> Response<RelayBody> {
             }],
         }),
     )
+}
+
+pub(crate) fn antigravity_model_catalog(model: &str) -> serde_json::Value {
+    json!({"models":[{"name":format!("models/{model}"),"displayName":model,
+        "inputTokenLimit":1048576,"supportedGenerationMethods":["generateContent","streamGenerateContent"]}]})
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response<RelayBody> {

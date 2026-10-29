@@ -111,6 +111,7 @@ pub struct CrewAccounts {
     _model_picked: Subscription,
     model: Option<String>,
     models: Vec<zeron_proto::Model>,
+    native_models: Vec<zeron_proto::Model>,
     account: Option<String>,
     account_select: widgets::SelectState,
     database: ScaffoldDatabaseEnvironment,
@@ -125,7 +126,7 @@ impl CrewAccounts {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let model_picker = cx.new(|cx| crate::pickers::Pickers::new_for_sandboxes(state.clone(), cx));
         let model_picked = cx.subscribe(&model_picker, |page: &mut Self, _, event: &crate::pickers::TitleModelPicked, cx| {
-            page.model = event.0.model.clone();
+            page.model = event.0.model.as_ref().map(|model| if event.0.harness == Some(zeron_proto::HarnessId::Antigravity) { format!("antigravity/{model}") } else { model.clone() });
             page.account = None;
             cx.notify();
         });
@@ -134,7 +135,7 @@ impl CrewAccounts {
             state, view: CrewView::Accounts, status: None, accounts: vec![], environments: vec![], outcome: None,
             busy: false, error: None, notice: None, confirmation: None,
             model_picker, _model_picked: model_picked,
-            model: None, models: vec![],
+            model: None, models: vec![], native_models: vec![],
             account: None, account_select: widgets::SelectState::default(),
             database: ScaffoldDatabaseEnvironment::Local,
             database_select: widgets::SelectState::default(),
@@ -167,12 +168,19 @@ impl CrewAccounts {
                     Some(engine.client().call(zeron_rpc::methods::LIST_MODELS, json!({"harness": zeron_proto::HarnessId::Omp})).await.map_err(|error| error.to_string())
                         .and_then(|value| serde_json::from_value::<Vec<zeron_proto::Model>>(value).map_err(|error| error.to_string())))
                 } else { None };
-                Ok::<_, String>((status, accounts, environments, models))
+                let native_models = if refresh_environments {
+                    Some(if accounts.as_ref().is_ok_and(|snapshot| snapshot.accounts.iter().any(|account|
+                        account.provider == "antigravity" && matches!(account.status.as_str(), "active" | "connected" | "ready"))) {
+                        engine.client().call(zeron_rpc::methods::LIST_MODELS, json!({"harness": zeron_proto::HarnessId::Antigravity})).await.map_err(|error| error.to_string())
+                            .and_then(|value| serde_json::from_value::<Vec<zeron_proto::Model>>(value).map_err(|error| error.to_string()))
+                    } else { Ok(Vec::new()) })
+                } else { None };
+                Ok::<_, String>((status, accounts, environments, models, native_models))
             }.await;
             this.update(cx, |page, cx| {
                 page.busy = false;
                 match result {
-                    Ok((status, accounts, environments, models)) => {
+                    Ok((status, accounts, environments, models, native_models)) => {
                         let recovery_key = json!([status.principal_id, status.scope]).to_string();
                         if page.outcome.is_none() {
                             if let Some(id) = super::current(cx).crew_recovery_commands.get(&recovery_key).cloned() {
@@ -187,6 +195,12 @@ impl CrewAccounts {
                         }
                         if let Some(models) = models {
                             match models { Ok(models) => page.models = models.into_iter().filter(|model| AgentRoute::from_omp_model(&model.id).is_some()).collect(), Err(error) => errors.push(format!("Models: {error}")) }
+                        }
+                        if let Some(models) = native_models {
+                            match models {
+                                Ok(models) => page.native_models = models,
+                                Err(error) => { page.native_models.clear(); errors.push(format!("Google models: {error}")); }
+                            }
                         }
                         page.error = (!errors.is_empty()).then(|| errors.join("\n"));
                     }
@@ -321,11 +335,16 @@ impl CrewAccounts {
 
     fn agent_route(&self) -> Option<AgentRoute> {
         let selected = self.model.as_deref()?;
-        if !self.models.iter().any(|model| model.id == selected) { return None; }
-        let route = AgentRoute::from_omp_model(selected)?;
+        let route = if let Some(native) = selected.strip_prefix("antigravity/") {
+            if !self.native_models.iter().any(|model| model.id == native) { return None; }
+            AgentRoute::from_harness_model(zeron_proto::HarnessId::Antigravity, native)?
+        } else {
+            if !self.models.iter().any(|model| model.id == selected) { return None; }
+            AgentRoute::from_omp_model(selected)?
+        };
         Some(match &self.account {
             Some(account) => {
-                let provider = match route.provider { AgentProvider::Anthropic => "anthropic", AgentProvider::OpenAi => "openai" };
+                let provider = match route.provider { AgentProvider::Anthropic => "anthropic", AgentProvider::OpenAi => "openai", AgentProvider::Antigravity => "antigravity" };
                 if !self.accounts.iter().any(|candidate| candidate.id == *account && candidate.provider.eq_ignore_ascii_case(provider) && matches!(candidate.status.as_str(), "active" | "connected" | "ready")) { return None; }
                 AgentRoute::pinned(route.provider, route.model, account.clone())
             }
@@ -395,11 +414,11 @@ impl Render for CrewAccounts {
         let Some(status) = self.status.clone() else { return body.into_any_element(); };
         if self.view == CrewView::Accounts {
             let now = chrono::Utc::now();
-            for (provider, title, harness) in [("anthropic", "Anthropic", zeron_proto::HarnessId::ClaudeCode), ("openai", "OpenAI", zeron_proto::HarnessId::Codex)] {
+            for (provider, title, harness) in [("anthropic", "Anthropic", zeron_proto::HarnessId::ClaudeCode), ("openai", "OpenAI", zeron_proto::HarnessId::Codex), ("antigravity", "Antigravity", zeron_proto::HarnessId::Antigravity)] {
                 let mut accounts = self.accounts.iter().filter(|account| account.provider.eq_ignore_ascii_case(provider)).peekable();
                 let header = div().flex().items_center().justify_between().gap(px(12.0))
                     .child(div().flex().items_center().gap(px(8.0))
-                        .child(crate::icons::icon(if harness == zeron_proto::HarnessId::Codex { crate::icons::OPENAI_MARK } else { crate::icons::CLAUDE_MARK }).size(px(20.0)).text_color(theme.text_muted))
+                        .child(crate::icons::icon(match harness { zeron_proto::HarnessId::Codex => crate::icons::OPENAI_MARK, zeron_proto::HarnessId::Antigravity => crate::icons::ANTIGRAVITY_MARK, _ => crate::icons::CLAUDE_MARK }).size(px(20.0)).text_color(theme.text_muted))
                         .child(widgets::row_title(&theme, title)))
                     .when(status.role == "local_controller", |el| el.child(Self::action(&theme, format!("crew-add-{provider}"), "Add account")
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddAccount(harness))))));
@@ -455,7 +474,7 @@ impl Render for CrewAccounts {
                         .on_click(cx.listener(|page, _, _, cx| { page.sandbox_options = !page.sandbox_options; cx.notify(); }))))
                 .when(self.sandbox_options, |el| {
                     let provider = self.agent_route().map(|route| route.provider);
-                    let candidates: Vec<_> = self.accounts.iter().filter(|account| matches!(account.status.as_str(), "active" | "connected" | "ready") && match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), None => false }).collect();
+                    let candidates: Vec<_> = self.accounts.iter().filter(|account| matches!(account.status.as_str(), "active" | "connected" | "ready") && match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), Some(AgentProvider::Antigravity) => account.provider.eq_ignore_ascii_case("antigravity"), None => false }).collect();
                     let selected = candidates.iter().position(|account| Some(&account.id) == self.account.as_ref()).map_or(0, |ix| ix + 1);
                     let ids: Vec<_> = candidates.iter().map(|account| account.id.clone()).collect();
                     let options = std::iter::once(widgets::SelectOption::new("Automatic · shared pool")).chain(candidates.iter().map(|account| widgets::SelectOption::new(account.email.clone().or(account.display_name.clone()).unwrap_or_else(|| "Shared account".into())))).collect::<Vec<_>>();

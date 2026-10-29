@@ -406,6 +406,19 @@ pub(crate) struct AgentAccountOAuthCredential {
     pub refresh_token: String,
     pub expires_at: String,
     pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google: Option<AgentAccountGoogleCredential>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentAccountGoogleCredential {
+    pub client_id: String,
+    pub client_secret: String,
+    pub project_id: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -426,6 +439,11 @@ pub(crate) enum AgentAccountStatus {
     Revoked,
     #[serde(other)]
     Unknown,
+}
+
+pub(crate) struct AntigravityModelCatalog {
+    pub(crate) models: Vec<zeron_proto::Model>,
+    pub(crate) default_model_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -592,6 +610,51 @@ impl ScaffoldClient {
         Ok(response.accounts)
     }
 
+    pub(crate) async fn list_antigravity_models(&self, account_id: Option<&str>) -> Result<AntigravityModelCatalog, ScaffoldError> {
+        const MAX_BYTES: usize = 256 * 1024;
+        let mut url = self.origin.join("/api/agent-accounts/models?provider=antigravity").expect("static models path");
+        if let Some(account_id) = account_id { url.query_pairs_mut().append_pair("accountId", account_id); }
+        let cancellation = CancellationToken::new();
+        let request = self.http.get(url).header(reqwest::header::ACCEPT, "application/json").timeout(REQUEST_TIMEOUT);
+        let (mut response, generation) = send_authenticated(self.bearer.as_ref(), request, &cancellation).await?;
+        let status = response.status();
+        let retry_after = response_retry_after(&response);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > MAX_BYTES - bytes.len() {
+                return Err(ScaffoldError::InvalidResponse("Google model catalog exceeded 256 KiB".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(authenticated_error(self.bearer.as_ref(), generation, api_error(status, &bytes, retry_after)));
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Catalog { source_account_id: String, models: Vec<CatalogModel>, default_model_id: Option<String> }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CatalogModel { id: String, display_name: String, context_window: u64 }
+        let mut catalog: Catalog = serde_json::from_slice(&bytes)
+            .map_err(|_| ScaffoldError::InvalidResponse("Google model catalog is invalid".into()))?;
+        if catalog.source_account_id.is_empty()
+            || account_id.is_some_and(|id| id != catalog.source_account_id)
+            || catalog.models.len() > 128
+            || catalog.default_model_id.as_ref().is_some_and(|id| !catalog.models.iter().any(|model| &model.id == id))
+            || catalog.models.iter().any(|model|
+            !model.id.starts_with("gemini-") || model.id.len() > 128
+            || !model.id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            || model.display_name.trim().is_empty() || model.display_name.len() > 256
+            || model.context_window == 0 || model.context_window > 10_000_000) {
+            return Err(ScaffoldError::InvalidResponse("Google model catalog has invalid models".into()));
+        }
+        catalog.models.sort_by_key(|model| Some(&model.id) != catalog.default_model_id.as_ref());
+        Ok(AntigravityModelCatalog { default_model_id: catalog.default_model_id, models: catalog.models.into_iter().map(|model| zeron_proto::Model {
+            id: model.id, label: model.display_name, description: Some(format!("{} token context", model.context_window)),
+            reasoning_levels: Vec::new(), options: Vec::new(),
+        }).collect() })
+    }
+
     pub(crate) async fn import_agent_account(
         &self,
         account: &AgentAccountCredentialImport,
@@ -665,6 +728,8 @@ impl ScaffoldClient {
         let path = match endpoint {
             "responses" => "/api/agent-auth/v2/responses",
             "messages" => "/api/agent-auth/v2/messages",
+            "antigravity/generateContent" => "/api/agent-auth/v2/antigravity/generateContent",
+            "antigravity/streamGenerateContent" => "/api/agent-auth/v2/antigravity/streamGenerateContent",
             _ => {
                 return Err(ScaffoldError::InvalidResponse(
                     "unsupported inference endpoint".into(),
@@ -683,6 +748,7 @@ impl ScaffoldClient {
             "x-agent-auth-owner-subject",
             "x-agent-auth-session-id",
             "x-api-key",
+            "x-goog-api-key",
             "x-agent-auth-provider",
             "x-agent-auth-model",
             "x-agent-auth-harness",
@@ -709,6 +775,7 @@ impl ScaffoldClient {
             .header(reqwest::header::CONTENT_LENGTH, content_length)
             .header("x-agent-auth-request-id", request_id)
             .header("x-agent-auth-conversation-id", conversation_id);
+        if endpoint.starts_with("antigravity/") { request = request.header("x-agent-auth-harness", "antigravity"); }
         if let Some(authority_scope) = authority.authority_scope.as_deref() {
             request = request.header("x-agent-auth-authority-scope", authority_scope);
         }
@@ -3998,6 +4065,25 @@ mod tests {
         Close,
         HeadersThenClose,
         CancelThenClose(CancellationToken),
+    }
+
+    #[tokio::test]
+    async fn antigravity_model_catalog_uses_authorized_metadata_and_rejects_invalid_ids() {
+        let valid = serde_json::json!({"sourceAccountId":"owned-google","defaultModelId":"gemini-4-argon-medium","models":[
+            {"id":"gemini-4-argon-high","displayName":"Gemini 4 Argon (High)","contextWindow":1048576},
+            {"id":"gemini-4-argon-medium","displayName":"Gemini 4 Argon (Medium)","contextWindow":1048576}
+        ]});
+        let mut invalid = valid.clone();
+        invalid["models"][0]["id"] = serde_json::json!("gemini/../../other");
+        let (origin, server) = mock_server(vec![valid.to_string(), invalid.to_string()]).await;
+        let client = ScaffoldClient::new(&origin, "project", Arc::new(zeron_rpc::StaticToken("owner-session".into()))).unwrap();
+        let models = client.list_antigravity_models(None).await.unwrap().models;
+        assert_eq!(models[0].id, "gemini-4-argon-medium");
+        assert_eq!(models[0].label, "Gemini 4 Argon (Medium)");
+        assert!(client.list_antigravity_models(None).await.is_err());
+        let requests = server.await.unwrap();
+        assert!(requests.iter().all(|request| request.starts_with("GET /api/agent-accounts/models?provider=antigravity ")));
+        assert!(requests.iter().all(|request| request.to_ascii_lowercase().contains("authorization: bearer owner-session")));
     }
 
     async fn mock_server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {

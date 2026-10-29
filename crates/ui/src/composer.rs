@@ -8899,7 +8899,8 @@ impl Composer {
             return;
         }
         let resolved = self.scaffold_config.clone().unwrap_or_else(|| self.pickers.read(cx).resolved(cx));
-        let Some(mut route) = resolved.model.as_deref().and_then(zeron_proto::AgentRoute::from_omp_model) else {
+        let Some(mut route) = resolved.harness.zip(resolved.model.as_deref())
+            .and_then(|(harness, model)| zeron_proto::AgentRoute::from_harness_model(harness, model)) else {
             self.show_error("Choose a managed Crew model before creating a sandbox.", cx); return;
         };
         if let Some(account) = resolved.model_options.get("crewAccountId").and_then(serde_json::Value::as_str) {

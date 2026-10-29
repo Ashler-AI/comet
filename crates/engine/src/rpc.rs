@@ -2006,6 +2006,11 @@ impl RpcService for EngineRpc {
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
                 if self.registry.managed_inference() {
+                    if p.harness == HarnessId::Antigravity {
+                        let models = self.crew_services()?.runtime().client().list_antigravity_models(None).await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?;
+                        return RpcReply::value(&models.models);
+                    }
                     let models = zeron_harness::managed_models(p.harness)
                         .ok_or_else(|| RpcError::Failed("This agent does not support Crew managed inference".into()))?;
                     return RpcReply::value(&models);

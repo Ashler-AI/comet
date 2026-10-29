@@ -422,46 +422,46 @@ fn hermes_spec() -> AcpAgentSpec {
 fn antigravity_archive() -> Option<crate::archive_install::ArchivePin> {
     let (url, entry, sha512) = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         (
-            "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.2.1-darwin-arm64.zip",
+            "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.4-darwin-arm64.zip",
             "agy_acp_server.par",
-            "c0049b1f423ffdf0e6a79a6caa104a27b6368522b1eb2c67d9eeed1424af2a07898a66b475b0824a734a0bdd01264473a7d67d1550357a8607fb136507b0afae",
+            "dba574a8f165c7ee3961303fb9e133b6302b2accc0203cc5a6e64e862918832dfc9f1e84f19a6faf5fcea9a8350f29f43528b1b3928e5833e9442284392b54e9",
         )
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         (
-            "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.2.1-darwin-x86_64.zip",
+            "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.4-darwin-x86_64.zip",
             "agy_acp_server.par",
-            "790541c7e7bbbac1cb15bb4a77b02c53f30c997090487fbf42df16846e2e5d8d4f1cec92038d88956fbec33331ebacefe8faf974aad0690aadc2332215712ff2",
+            "28c834e9550ec83e505617dc1053953f2e6e124a805d2d64fce6fc1a643a371d07b7699db408e597e76a28173ef5e788a72febf1d3b4cb593a8b133faba02482",
         )
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         (
-            "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.2.1-linux-x86_64.zip",
+            "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.4-linux-x86_64.zip",
             "agy_acp_server.par",
-            "dd9b778479dbfc753661d63ff66a3235e7249e8451af12adc11d26509172de1ff50452c3af57684009bb944314bd587b2be200bab17df743a2706ce4067d6731",
+            "8d3750b8576ec5cd0339372f7963bc05f9cc57e1ccb4bebfed734f7f0dcc430d9ecf938c421a2c1c3c22b476e2a10d9cf6fe329b9a2644cb337bc2453d89a808",
         )
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         (
-            "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.2.1-linux-arm64.zip",
+            "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.4-linux-arm64.zip",
             "agy_acp_server.par",
-            "d907f928609ff2232bfeeec9177fe925d3e02e1773295cfb30097e5c4e134758021bff916ba5ae2e2e2ff81d374564349f268f92a4577bc88370537011473e29",
+            "db2a76626941d06d34c06c3d8d9b7d846313f134d212209fedff8211ffa754b6b4f3f0f6d405cd2c3951ef94d1f174518f112a222b46dc1168c0f7fbadf5ee8a",
         )
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         (
-            "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.2.1-windows-x86_64.zip",
+            "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.4.4-windows-x86_64.zip",
             "agy_acp_server.exe",
-            "515c0af1d00164ca3a608f4ef04caa4ef8045ffa94a3ef2405c9b43c87c7a74c9f71a232c81917353dc3f2d49b69230f935d2ebfa28f7ee021b5aa088f3fa554",
+            "c4bdab94846806c85f641446af2f934516fceef6293c0664798d7b573ddde2745abcda19972dbcd2fbcb00a0a867a56431f0eb6b9b1126c6350b1ffdf84fa399",
         )
     } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
         (
-            "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.2.1-windows-arm64.zip",
+            "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.4.4-windows-arm64.zip",
             "agy_acp_server.exe",
-            "ae3f4c2d2255c03d4d9548e10a760a107c41c99e4c6c710bd82758791e4fd497b75bdef0cd2cfd7fdff1a5bb2fee7afd81f5d043da92ab52dce5505dd2aa58b3",
+            "92bf0fb51821a8e2fee1aac87ee7411b7a4ce3ec477e33e48157275b4b580afd523cc1f8de4690b8684c9b88b69e9872582990e78f68387c0cd316112cc878da",
         )
     } else {
         return None;
     };
     Some(crate::archive_install::ArchivePin {
         name: "antigravity-acp",
-        version: "1.2.1",
+        version: "1.4.4",
         url,
         entry,
         sha512,
@@ -859,7 +859,7 @@ pub fn can_install(harness: HarnessId) -> bool {
     harness == HarnessId::Antigravity && antigravity_archive().is_some()
 }
 
-/// Only an explicit Settings action may call this installer.
+/// Explicit Settings actions and requested managed Antigravity runs may install.
 pub async fn install_harness(harness: HarnessId) -> Result<(), HarnessError> {
     let pin = (harness == HarnessId::Antigravity)
         .then(antigravity_archive)
@@ -1292,12 +1292,42 @@ impl AcpHarness {
             .with_model_discovery_timeout(ANTIGRAVITY_DISCOVERY_TIMEOUT)
     }
 
+    /// Exercise only official gateway initialization and model discovery. The
+    /// caller serves a private loopback catalog; no prompt or inference is sent.
+    pub async fn probe_managed_gateway(&self, context: &crate::RunContext) -> Result<(), HarnessError> {
+        crate::validate_inference_route(self.id(), Some(context))?;
+        let route = context.inference.as_ref().filter(|route|
+            self.id() == HarnessId::Antigravity && route.provider == "antigravity")
+            .ok_or_else(|| HarnessError::Protocol("Antigravity gateway route required".into()))?;
+        let workspace = ScratchDir::new("antigravity-metadata")?;
+        let (_scratch, mut child, _stderr, prompted) = self
+            .spawn_agent(workspace.path().to_str(), true, &[], None, Some(context)).await?;
+        let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => client_with_sign_in_prompt(stdin, stdout, self.id(), &prompted),
+            _ => {
+                child.shutdown(self.kill_grace).await;
+                return Err(HarnessError::Protocol("agent child has no stdio".into()));
+            }
+        };
+        let flow = async {
+            client.request("initialize", managed_initialize_params(self.id(), true)).await?;
+            request_draining(&client, &mut incoming, "authenticate", gateway_auth_params(route)).await?;
+            request_draining(&client, &mut incoming, "session/new", json!({
+                "cwd":workspace.path(),"mcpServers":[]
+            })).await?;
+            Ok(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(60), flow).await;
+        child.shutdown(self.kill_grace).await;
+        result.map_err(|_| HarnessError::Protocol("Antigravity gateway metadata timed out".into()))?
+    }
+
     /// sign the agent out with acp `logout`, clearing the credentials its
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
         let (_scratch, mut child, _stderr, sign_in_prompted) =
-            self.spawn_agent(home.as_deref(), false, &[], None).await?;
+            self.spawn_agent(home.as_deref(), false, &[], None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
                 client_with_sign_in_prompt(stdin, stdout, self.spec.id, &sign_in_prompted)
@@ -1365,9 +1395,11 @@ impl AcpHarness {
         };
         let accept_url = move |url: &str| url_filter.is_none_or(|accept| accept(url));
         let (exe, args) = self.resolve_program(false).await?;
-        let gemini_home = (self.spec.id == HarnessId::Antigravity)
-            .then(antigravity_paths::home)
-            .transpose()?;
+        let gemini_home = if self.spec.id == HarnessId::Antigravity {
+            Some(env.iter().find(|(key, _)| key == "GEMINI_HOME")
+                .map(|(_, value)| PathBuf::from(value))
+                .map(Ok).unwrap_or_else(antigravity_paths::home)?)
+        } else { None };
         let configured_method = gemini_home
             .as_ref()
             .map(|home| {
@@ -1391,9 +1423,16 @@ impl AcpHarness {
         for (key, value) in env {
             cmd.env(key, value);
         }
-        let scratch = self.adapter_scratch()?;
+        let scratch = if self.spec.id == HarnessId::Antigravity {
+            Some(ScratchDir::new("antigravity-auth")?)
+        } else { self.adapter_scratch()? };
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
+            if self.spec.id == HarnessId::Antigravity {
+                // ACP's one-shot OAuth callback must never receive preview probes.
+                std::fs::write(dir.path().join("auth"), "")?;
+                cmd.current_dir(dir.path()).args(["--flagfile", "auth"]);
+            }
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1681,6 +1720,7 @@ impl AcpHarness {
         block_on_install: bool,
         extra_args: &[String],
         _mcp: Option<&zeron_proto::McpServer>,
+        context: Option<&crate::RunContext>,
     ) -> Result<
         (
             Option<ScratchDir>,
@@ -1690,6 +1730,13 @@ impl AcpHarness {
         ),
         HarnessError,
     > {
+        let managed = context.and_then(|value| value.inference.as_ref()).is_some();
+        if managed && self.spec.id == HarnessId::Antigravity {
+            check_managed_gateway_policy(&antigravity_admin_settings_path())?;
+        }
+        if managed && self.spec.id == HarnessId::Antigravity && !self.installed() {
+            install_harness(HarnessId::Antigravity).await?;
+        }
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
@@ -1713,10 +1760,18 @@ impl AcpHarness {
                 }
             }
         }
-        let scratch = self.adapter_scratch()?;
+        let scratch = if managed && self.spec.id == HarnessId::Antigravity {
+            Some(ScratchDir::new("antigravity-managed")?)
+        } else { self.adapter_scratch()? };
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
+            if managed && self.spec.id == HarnessId::Antigravity {
+                let home = dir.path().join("gemini");
+                std::fs::create_dir_all(home.join("antigravity-acp"))?;
+                cmd.env("GEMINI_HOME", home);
+            }
         }
+        crate::apply_run_context(&mut cmd, context);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1760,7 +1815,7 @@ impl AcpHarness {
         cwd: Option<&std::path::Path>,
     ) -> Result<Vec<SlashCommand>, HarnessError> {
         let (_scratch, mut child, _stderr, sign_in_prompted) = self
-            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[], None)
+            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[], None, None)
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
@@ -1832,7 +1887,7 @@ impl AcpHarness {
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (_scratch, mut child, stderr_tail, sign_in_prompted) =
-            self.spawn_agent(None, false, &[], None).await?;
+            self.spawn_agent(None, false, &[], None, None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
                 client_with_sign_in_prompt(stdin, stdout, self.spec.id, &sign_in_prompted)
@@ -2348,7 +2403,7 @@ impl Harness for AcpHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let (scratch, mut child, stderr_tail, sign_in_prompted) = self
-            .spawn_agent(Some(&request.cwd), true, &[], request.mcp.as_ref())
+            .spawn_agent(Some(&request.cwd), true, &[], request.mcp.as_ref(), controls.context.as_ref())
             .await?;
         let stdin = child
             .stdin
@@ -2497,6 +2552,42 @@ struct ConfigRules {
     harness: HarnessId,
     effort_in_model_id: bool,
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
+}
+
+fn antigravity_admin_settings_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    { PathBuf::from("/Library/Application Support/Antigravity/admin_settings.json") }
+    #[cfg(windows)]
+    { std::env::var_os("ProgramData").filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("PROGRAMDATA").filter(|value| !value.is_empty()))
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Antigravity").join("admin_settings.json") }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    { PathBuf::from("/etc/antigravity/admin_settings.json") }
+}
+
+fn check_managed_gateway_policy(path: &Path) -> Result<(), HarnessError> {
+    // Official MDM settings outrank client gateway metadata. Never override
+    // that policy or risk forwarding the Crew capability to its endpoint.
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(HarnessError::Io(error)),
+        Ok(_) => Err(HarnessError::Protocol(
+            "Crew-managed Antigravity is unavailable while system admin_settings.json is present".into())),
+    }
+}
+
+fn managed_initialize_params(harness: HarnessId, gateway: bool) -> Value {
+    let mut params = initialize_params(harness);
+    if gateway {
+        params["clientCapabilities"]["auth"] = json!({"_meta":{"gateway":true}});
+    }
+    params
+}
+
+fn gateway_auth_params(route: &crate::InferenceRoute) -> Value {
+    json!({"methodId":"gateway","_meta":{"gateway":{"baseUrl":route.base_url,
+        "headers":{"Authorization":format!("Bearer {}", route.token)}}}})
 }
 
 fn initialize_params(harness: HarnessId) -> Value {
@@ -3730,7 +3821,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn: turn_control,
-        context: _,
+        context,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
     let rules = ConfigRules {
@@ -3741,9 +3832,18 @@ async fn run_session(session: Session) {
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
+        let gateway_route = context.as_ref().and_then(|value| value.inference.as_ref())
+            .filter(|_| harness == HarnessId::Antigravity);
         let init = client
-            .request("initialize", initialize_params(harness))
+            .request("initialize", managed_initialize_params(harness, gateway_route.is_some()))
             .await?;
+        if let Some(route) = gateway_route {
+            // The relay has resolved the owned account's current catalog and
+            // selected exact effort variant, including an explicit default.
+            request.model = Some(route.model.clone());
+            // This is an opaque Crew relay token; provider OAuth stays in Agent Auth.
+            request_draining(&client, &mut incoming, "authenticate", gateway_auth_params(route)).await?;
+        }
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
@@ -5055,6 +5155,17 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_gateway_rejects_system_admin_overrides_without_reading_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin_settings.json");
+        assert!(check_managed_gateway_policy(&path).is_ok());
+        std::fs::write(&path, r#"{"gateway":{"url":"https://another-gateway.invalid"}}"#).unwrap();
+        assert!(check_managed_gateway_policy(&path).is_err());
+        std::fs::write(&path, "invalid admin configuration").unwrap();
+        assert!(check_managed_gateway_policy(&path).is_err());
+    }
 
     #[test]
     fn unix_browser_suppression_falls_back_to_zerons_noop_mode() {
