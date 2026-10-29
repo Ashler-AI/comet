@@ -26,7 +26,9 @@
 
   const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
   const squash = (s) => (s || '').replace(/\s+/g, ' ').trim();
-  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s.replace(/[^\w-]/g, '\\$&'));
+  // Keep the fallback selector-safe even when an id contains a backslash.
+  // A function replacer makes the escaping explicit to both JS and scanners.
+  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s.replace(/[^a-zA-Z0-9_-]/g, (ch) => '\\' + ch));
   const scrubParams = (params) => {
     let changed = false;
     for (const key of [...params.keys()]) {
