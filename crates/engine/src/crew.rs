@@ -180,8 +180,8 @@ impl CrewServices {
         self.identity().map_err(|error| EngineError::Other(error.to_string()))?;
         if self.auth.device_mode() {
             let (_, scope) = self.identity().map_err(|error| EngineError::Other(error.to_string()))?;
-            if scope.session_id.as_deref() != Some(session_id) || harness != HarnessId::Omp {
-                return Err(EngineError::Other("Sandbox inference is bound to its OMP session".into()));
+            if scope.session_id.as_deref() != Some(session_id) || !matches!(harness, HarnessId::Omp | HarnessId::Antigravity) {
+                return Err(EngineError::Other("Sandbox inference is bound to its managed session".into()));
             }
         }
         self.relay.prepare_with_admission(session_id, harness, model, account_id, admission).await?

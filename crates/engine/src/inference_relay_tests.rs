@@ -497,6 +497,13 @@ mod tests {
                             let headers = request.headers().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
                             let response = match path.as_str() {
+                                "/api/agent-accounts/models" => json!({
+                                    "sourceAccountId":"google-account", "defaultModelId":"gemini-4-argon-medium",
+                                    "models":[
+                                        {"id":"gemini-3.8-flash-high","displayName":"Gemini Flash","contextWindow":1048576},
+                                        {"id":"gemini-4-argon-medium","displayName":"Gemini Argon","contextWindow":1048576}
+                                    ]
+                                }),
                                 "/api/agent-auth/v2/authority" => {
                                     let authority_id = fixture.issued.fetch_add(1, Ordering::SeqCst) + 1;
                                     let gate = fixture.issuance_gate.lock().clone();
@@ -520,7 +527,8 @@ mod tests {
                                         "expiresAt": fixture.expires_at.lock().to_rfc3339(),
                                     })
                                 }
-                                "/api/agent-auth/v2/responses" | "/api/agent-auth/v2/messages" => {
+                                "/api/agent-auth/v2/responses" | "/api/agent-auth/v2/messages"
+                                | "/api/agent-auth/v2/antigravity/generateContent" | "/api/agent-auth/v2/antigravity/streamGenerateContent" => {
                                     fixture.forwarded.fetch_add(1, Ordering::SeqCst);
                                     captured
                                         .send(CapturedRequest {
@@ -570,6 +578,7 @@ mod tests {
                             if matches!(
                                 path.as_str(),
                                 "/api/agent-auth/v2/responses" | "/api/agent-auth/v2/messages"
+                                | "/api/agent-auth/v2/antigravity/generateContent" | "/api/agent-auth/v2/antigravity/streamGenerateContent"
                             ) {
                                 response_builder = response_builder
                                     .header("x-agent-auth-selected-account-id", "account-actual");
@@ -1238,6 +1247,54 @@ mod tests {
         assert_eq!(captured.api_key, None);
         assert_eq!(captured.conversation_id, "session-anthropic");
         assert_eq!(captured.body["model"], "claude-opus-5");
+    }
+
+    #[tokio::test]
+    async fn antigravity_relay_resolves_provider_default_and_rejects_unlisted_models() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane(tx).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let route = relay.prepare("session-google", HarnessId::Antigravity, None, None).await.unwrap().unwrap();
+        assert_eq!(route.model, "gemini-4-argon-medium");
+        assert!(relay.prepare("session-invalid", HarnessId::Antigravity, Some("gemini-carbon"), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn antigravity_relay_wraps_native_requests_and_rejects_cross_provider_and_invalid_paths() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane(tx).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let route = relay.prepare("session-google", HarnessId::Antigravity, Some("gemini-3.8-flash-high"), None).await.unwrap().unwrap();
+        let http = reqwest::Client::new();
+        let body = json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}]});
+        let catalog = http.get(format!("{}/v1beta/models", route.base_url)).bearer_auth(&route.token)
+            .send().await.unwrap().json::<Value>().await.unwrap();
+        assert_eq!(catalog["models"][0]["name"], "models/gemini-3.8-flash-high");
+        assert!(rx.try_recv().is_err());
+        let response = http.post(format!("{}/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse", route.base_url))
+            .bearer_auth(&route.token).header("x-goog-api-key", "dummy_api_key").json(&body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = rx.recv().await.unwrap();
+        assert_eq!(captured.path, "/api/agent-auth/v2/antigravity/streamGenerateContent");
+        assert_eq!(captured.authorization, "Bearer remote-agent-auth-authority-1");
+        assert_eq!(captured.api_key, None);
+        assert_eq!(captured.body, json!({"model":"gemini-3.8-flash-high","request":body}));
+        for path in ["/v1/messages", "/v1beta/models/gemini:countTokens", "/v1beta/models/a/b:generateContent", "/v1beta/models/gemini:streamGenerateContent?key=secret"] {
+            let response = http.post(format!("{}{path}", route.base_url)).header("x-goog-api-key", &route.token)
+                .json(&body).send().await.unwrap();
+            assert!(response.status().is_client_error(), "{path}");
+        }
+        assert!(rx.try_recv().is_err());
+        let response = http.post(format!("{}/v1beta/models/gemini:generateContent", route.base_url))
+            .header("x-goog-api-key", &route.token).bearer_auth("different-token").json(&body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err());
+        // The wrapper itself consumes the provider's 16 MiB request budget.
+        let oversized = http.post(format!("{}/v1beta/models/gemini:generateContent", route.base_url))
+            .bearer_auth(&route.token).header("content-length", (16 * 1024 * 1024).to_string())
+            .body(vec![b' '; 16 * 1024 * 1024]).send().await.unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

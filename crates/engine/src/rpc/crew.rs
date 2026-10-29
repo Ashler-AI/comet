@@ -489,8 +489,8 @@ impl EngineRpc {
                     model_options: Default::default(), sandbox: zeron_proto::SandboxLevel::DangerFullAccess,
                     access: Default::default(), plan: false,
                 });
-                config.harness = HarnessId::Omp;
-                config.model = Some(route.omp_model());
+                config.harness = route.harness();
+                config.model = Some(route.execution_model());
                 if let Some(account) = &route.account_id { config.model_options.insert("crewAccountId".into(), json!(account)); }
                 else { config.model_options.remove("crewAccountId"); }
             }

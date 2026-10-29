@@ -13,6 +13,7 @@ pub(crate) fn validate_inference_route(
         (HarnessId::Omp, "openai" | "anthropic")
             | (HarnessId::Codex, "openai")
             | (HarnessId::ClaudeCode, "anthropic")
+            | (HarnessId::Antigravity, "antigravity")
     );
     let url = reqwest::Url::parse(&route.base_url).ok();
     let loopback = url.as_ref().is_some_and(|url| {
@@ -90,7 +91,24 @@ pub(crate) fn apply_run_context(cmd: &mut Command, context: Option<&RunContext>)
         "GROQ_API_KEY",
         "MISTRAL_API_KEY",
         "XAI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "AGY_ACP_CCPA_BASE_URL",
+        "AGY_ACP_CCPA_PROJECT",
+        "AGY_LLM_GATEWAY_URL",
+        "AGY_LLM_GATEWAY_API_KEY",
+        "AGY_LLM_GATEWAY_HEADERS",
+        "AGY_LLM_GATEWAY_MODELS",
+        "AGY_LLM_GATEWAY_PROXY_URL",
+        "AGY_LLM_GATEWAY_CA_CERT",
+        "AGY_ACP_ENABLE_GATEWAY_AUTH",
+        "AGY_GATEWAY_URL",
+        "AGY_GATEWAY_API_KEY",
+        "AGY_GATEWAY_HEADERS",
+        "AGY_CA_CERT",
     ] {
+        cmd.env_remove(key);
+    }
         cmd.env_remove(key);
     }
     cmd.env("COMET_INFERENCE_TOKEN", &route.token)
@@ -103,6 +121,15 @@ pub(crate) fn apply_run_context(cmd: &mut Command, context: Option<&RunContext>)
                 format!("{}/v1", route.base_url.trim_end_matches('/')),
             )
             .env("OPENAI_API_KEY", &route.token);
+        }
+        "antigravity" => {
+            // Official discovery/harness HTTP clients otherwise inherit proxy
+            // routing, which must not carry the private loopback capability.
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+                cmd.env_remove(key);
+            }
+            cmd.env("AGY_ACP_ENABLE_GATEWAY_AUTH", "1")
+                .env("AGY_ACP_FORCE_FILE_STORAGE", "1");
         }
         "anthropic" => {
             cmd.env("ANTHROPIC_BASE_URL", route.base_url.trim_end_matches('/'))

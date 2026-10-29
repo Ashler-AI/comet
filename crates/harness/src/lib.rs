@@ -678,6 +678,9 @@ pub use pi::PiHarness;
 pub fn managed_models(harness: HarnessId) -> Option<Vec<Model>> {
     match harness {
         HarnessId::Omp => Some(omp::scaffold_models()),
+        // Google entitlement/catalog metadata comes from Agent Auth; no invented
+        // offline list may survive an empty or failed account catalog response.
+        HarnessId::Antigravity => Some(Vec::new()),
         HarnessId::ClaudeCode => Some(claude::catalog::static_models()),
         // Managed Codex uses the shared provider catalog, not the native CLI's
         // offline fallback. Only the selector prefix differs on its wire.

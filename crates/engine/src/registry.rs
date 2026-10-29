@@ -366,7 +366,7 @@ impl HarnessRegistry {
 
     fn route_allowed(&self, id: HarnessId) -> bool {
         !self.managed_inference
-            || (id == HarnessId::Omp)
+            || matches!(id, HarnessId::Omp | HarnessId::Antigravity)
             || (!self.scaffold_host && matches!(id, HarnessId::ClaudeCode | HarnessId::Codex))
     }
 

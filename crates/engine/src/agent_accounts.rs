@@ -105,7 +105,12 @@ pub struct RelayedCallback {
 }
 
 mod oauth;
+<<<<<<< HEAD
 mod muse;
+mod antigravity;
+=======
+mod antigravity;
+>>>>>>> 14775b1a (feat(agent-auth): add native Antigravity OAuth routing)
 #[cfg(test)]
 mod provider_tests;
 mod stores;
@@ -818,6 +823,20 @@ impl AgentAccounts {
         remote: &crate::scaffold::ScaffoldClient,
         slot: &Slot,
     ) -> Result<crate::scaffold::RemoteAgentAccount, EngineError> {
+        if slot.harness == HarnessId::Antigravity {
+            let credential = serde_json::from_value(slot.credentials.clone())
+                .map_err(|_| EngineError::Other("Google credential import is incomplete".into()))?;
+            let import = crate::scaffold::AgentAccountCredentialImport {
+                provider: "antigravity".into(), provider_account_id: slot.account_key.clone(),
+                email: Some(slot.profile.email.clone()), display_name: slot.profile.display_name.clone(),
+                organization: None, plan: slot.profile.plan.clone(), capabilities: vec!["gemini-*".into()], credential,
+            };
+            let account = remote.import_agent_account(&import).await.map_err(|error| EngineError::Other(error.to_string()))?;
+            if account.provider != "antigravity" || account.provider_account_id != slot.account_key {
+                return Err(EngineError::Other("Agent Auth returned a different Google account".into()));
+            }
+            return Ok(account);
+        }
         let (provider, access, refresh, expiry, scopes) = match slot.harness {
             HarnessId::ClaudeCode => {
                 let oauth = slot.credentials.get("claudeAiOauth")
@@ -855,6 +874,7 @@ impl AgentAccounts {
                 refresh_token: required(refresh)?,
                 expires_at: expiry.ok_or_else(|| EngineError::Other("Selected OAuth expiry is unavailable".into()))?.to_rfc3339(),
                 scopes,
+                google: None,
             },
         };
         let account = remote.import_agent_account(&import).await
@@ -1502,6 +1522,7 @@ impl AgentAccounts {
         let start = match harness {
             HarnessId::ClaudeCode => self.start_claude_paste_login(),
             HarnessId::Codex => self.start_codex_login(None).await?,
+            HarnessId::Antigravity => self.start_shared_antigravity_login()?,
             _ => return Err(EngineError::Other("Only Claude and ChatGPT OAuth accounts can be shared".into())),
         };
         lock(&self.inner.shared_logins).insert(start.login_id.clone(), None);
@@ -1946,6 +1967,52 @@ impl AgentAccounts {
             requester,
         )
         .await
+    }
+
+    /// Add an independent Google grant without touching the device's live login.
+    fn start_shared_antigravity_login(&self) -> Result<AgentLoginStart, EngineError> {
+        self.reap_spawned_flows(HarnessId::Antigravity);
+        let login_id = new_id();
+        let home = self.login_home(&login_id)?;
+        let state = Arc::new(Mutex::new(TaskLoginState::default()));
+        let task_state = state.clone();
+        let task_home = home.clone();
+        let inner = self.inner.clone();
+        let pending_id = login_id.clone();
+        let harness = self.acp_harness(HarnessId::Antigravity).expect("Antigravity ACP");
+        #[cfg(unix)]
+        let browser = ensure_noop_browser(&self.inner.config.private_root()?);
+        #[cfg(not(unix))]
+        let browser = None;
+        let handle = tokio::spawn(async move {
+            let progress = task_state.clone();
+            let outcome = async {
+                if !zeron_harness::Harness::installed(&harness) {
+                    zeron_harness::acp::install_harness(HarnessId::Antigravity).await
+                        .map_err(|error| error.to_string())?;
+                }
+                harness.sign_in_with(zeron_harness::acp::SignInOptions {
+                    browser, method: Some("oauth-personal".into()),
+                    env: vec![("GEMINI_HOME".into(), task_home.as_os_str().to_owned()),
+                        ("AGY_ACP_FORCE_FILE_STORAGE".into(), "1".into())],
+                    url_filter: None,
+                }, move |zeron_harness::acp::SignInProgress::OpenBrowser(url)| { lock(&progress).url = Some(url); })
+                    .await.map_err(|error| error.to_string())?;
+                let user_agent = antigravity::gateway_user_agent(&harness).await.map_err(|error| error.to_string())?;
+                let slot = antigravity::read_slot(&task_home, user_agent).await.map_err(|error| error.to_string())?;
+                let mut pending = lock(&inner.shared_logins);
+                if let Some(entry) = pending.get_mut(&pending_id) { *entry = Some(Arc::new(slot)); }
+                else { return Err("Google sign-in was cancelled".into()); }
+                Ok(())
+            }.await;
+            // Credentials are now retained only in the acknowledged-import lifecycle.
+            let _ = std::fs::remove_dir_all(&task_home);
+            lock(&task_state).outcome = Some(outcome);
+        });
+        lock(&self.inner.flows).insert(login_id.clone(), LoginFlow::Task {
+            harness: HarnessId::Antigravity, started_at: Instant::now(), state, handle, home: Some(home), port: None,
+        });
+        Ok(AgentLoginStart { login_id, url: String::new(), mode: AgentLoginMode::Browser, callback_port: None })
     }
 
     /// Antigravity: its ACP server's own Google sign-in. The start replies at
@@ -2438,6 +2505,12 @@ impl AgentAccounts {
                         url: state.url.clone(),
                         callback_port,
                     });
+                }
+                Some(Ok(())) if lock(&self.inner.shared_logins).contains_key(login_id) => {
+                    // Completion can race the poll's first cached-slot read.
+                    // Only the acknowledged remote import may finish this login.
+                    return Some(AgentLoginPoll { status: AgentLoginStatus::Pending,
+                        message: None, url: None, callback_port: None });
                 }
                 Some(Ok(())) => AgentLoginPoll {
                     status: AgentLoginStatus::Done,
@@ -5070,6 +5143,23 @@ mod login_tests {
         accounts.cancel_shared_login(&cancelled.login_id).await;
         assert!(!lock(&accounts.inner.flows).contains_key(&cancelled.login_id));
         assert!(!lock(&accounts.inner.shared_logins).contains_key(&cancelled.login_id));
+    }
+
+    #[tokio::test]
+    async fn antigravity_shared_task_completion_waits_for_import_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = AgentAccounts::new(config(tmp.path()));
+        let login_id = "shared-google-login";
+        lock(&accounts.inner.shared_logins).insert(login_id.into(), None);
+        lock(&accounts.inner.flows).insert(login_id.into(), LoginFlow::Task {
+            harness: HarnessId::Antigravity, started_at: Instant::now(),
+            state: Arc::new(Mutex::new(TaskLoginState { outcome: Some(Ok(())), ..Default::default() })),
+            handle: tokio::spawn(async {}), home: None, port: None,
+        });
+        let poll = accounts.poll_task_login(login_id).unwrap();
+        assert_eq!(poll.status, AgentLoginStatus::Pending);
+        assert!(lock(&accounts.inner.shared_logins).contains_key(login_id));
+        accounts.cancel_login(login_id);
     }
 
     #[test]
