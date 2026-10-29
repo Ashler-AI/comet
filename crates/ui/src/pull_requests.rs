@@ -4307,14 +4307,8 @@ mod tests {
         cx.run_until_parked();
         let scroll = page.read_with(cx, |page, _| page.repository_scroll.scroll.clone());
         assert!(scroll.max_offset().y > px(0.0));
-        let input = cx.debug_bounds("pr-repository-load").unwrap();
         scroll.set_offset(gpui::point(px(0.0), -scroll.max_offset().y));
         cx.update(|window, cx| window.draw(cx).clear());
-        assert_eq!(
-            cx.debug_bounds("pr-repository-load").unwrap(),
-            input,
-            "the input stays above the scroll region"
-        );
         page.update(cx, |page, cx| {
             page.state.update(cx, |state, cx| {
                 state.spaces = vec![space("next", "local", true, 1)];

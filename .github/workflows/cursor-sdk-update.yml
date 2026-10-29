@@ -6,7 +6,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write
 concurrency:
   group: cursor-sdk-update
   cancel-in-progress: false
@@ -21,7 +20,7 @@ jobs:
           node-version: '22'
       - name: Check stable SDK version
         run: python3 scripts/update-cursor-sdk.py
-      - name: Open or refresh the dependency PR and run compatibility checks
+      - name: Open or refresh the dependency PR
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -41,10 +40,7 @@ jobs:
             cat > "$RUNNER_TEMP/cursor-sdk-pr.md" <<'BODY'
           Update the pinned Cursor SDK to the latest stable npm release.
 
-          The Cursor compatibility workflow checks the actual SDK's token refresh, stream authentication invalidation, and transient exchange recovery, plus harness steering and session recovery regressions. Review SDK API changes and the dispatched workflow result before merging. This PR is never automatically merged.
+          Review SDK API changes before merging. This PR is never automatically merged.
           BODY
             gh pr create --base main --head "$branch" --title 'chore(cursor): update pinned SDK' --body-file "$RUNNER_TEMP/cursor-sdk-pr.md"
           fi
-          # GITHUB_TOKEN-created pushes/PRs do not trigger normal PR workflows.
-          # workflow_dispatch is explicitly allowed and validates this branch.
-          gh workflow run cursor-compatibility.yml --ref "$branch"

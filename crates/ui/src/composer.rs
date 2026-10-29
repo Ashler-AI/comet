@@ -9857,7 +9857,9 @@ impl Composer {
                 let command = serde_json::to_value(&command)
                     .map_err(|e| format!("Send failed: {e}"))?;
                 let mut params = serde_json::json!({ "chatId": chat_id, "command": command });
-                if let Some(target) = &host_device_id {
+                // Locally staged bytes need the local engine's transfer escort.
+                // Forwarding admission to the host bypasses that escort.
+                if !queued_flow && let Some(target) = &host_device_id {
                     params["targetDeviceId"] = target.clone().into();
                 }
                 if !transfers.is_empty() {
@@ -12199,6 +12201,10 @@ mod modal_selection_tests;
 mod attachment_chip_tests;
 
 #[cfg(test)]
+#[path = "../../engine/tests/support/relay_delivery.rs"]
+mod relay_delivery_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -13164,6 +13170,99 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[gpui::test]
+    fn first_send_images_reach_remote_harness_without_retry(cx: &mut gpui::TestAppContext) {
+        use super::relay_delivery_support::{
+            CHAT, assemble, attachment_links, create_attachment_chat, fake_device_room,
+        };
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let dirs = tempfile::tempdir().unwrap();
+        let (relay_url, relay) = runtime.block_on(fake_device_room());
+        let runs_a = Arc::new(Mutex::new(Vec::new()));
+        let runs_b = Arc::new(Mutex::new(Vec::new()));
+        let core_b = assemble(&dirs.path().join("b"), "device-b", runs_b.clone());
+        let host = core_b.start_host_relay(&relay_url);
+        let core_a = assemble(&dirs.path().join("a"), "device-a", runs_a.clone());
+        attachment_links(&core_a, &relay_url);
+        runtime.block_on(create_attachment_chat(&core_a));
+        core_b.workspace.rename_chat(CHAT, "Pre-titled").unwrap();
+
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.local_device_id = Some("device-a".into());
+            state.selected_device = Some("device-b".into());
+            state.selected_chat = Some(CHAT.into());
+            state.devices = core_a.workspace.read_devices().unwrap();
+            state.chats = vec![serde_json::from_value(serde_json::json!({
+                "id": CHAT, "deviceId": "device-b", "cwd": core_b.uploads.dir(),
+                "archived": false, "createdAt": chrono::Utc::now(),
+                "config": { "harness": "mock", "model": "instant-1", "sandbox": "workspace-write" },
+            })).unwrap()];
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::memory_client(core_a.rpc_service()),
+            ).with_test_capabilities(capabilities::current()));
+        });
+        let images: Vec<Vec<u8>> = (0..4).map(|index| {
+            let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2, 2, image::Rgba([index, 64, 128, 255]),
+            ));
+            let mut png = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+            png.into_inner()
+        }).collect();
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.attachments.insert(composer.current_key.clone(), images.iter().enumerate()
+                .map(|(index, bytes)| attachments::stage_png_bytes(format!("image-{index}.png"), bytes.clone()))
+                .collect());
+            composer.send("Describe these four images".into(), false, cx);
+        });
+
+        // Drive the real UI upload/admission and engine escort. No mocked RPC
+        // replies, second send, or RetryDelivery can repair the first command.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            composer.read_with(cx, |composer, _| {
+                assert!(composer.failure.is_none(), "send failed: {:?}", composer.failure);
+            });
+            let entries = core_b.doc_host.open(CHAT).unwrap().doc().read_entries().unwrap();
+            if entries.iter().any(|entry| entry.role == zeron_doc::MessageRole::Assistant
+                && entry.status == Some(zeron_doc::MessageStatus::Complete)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "initial image send never completed on the remote host");
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+        }
+        assert!(runs_a.lock().unwrap().is_empty(), "the controller must not execute the command");
+        {
+            let runs = runs_b.lock().unwrap();
+            assert_eq!(runs.len(), 1, "the original send must execute exactly once");
+            assert_eq!(runs[0].attachments.len(), images.len());
+            assert!(!runs[0].prompt.contains("pending://"));
+            for (path, bytes) in runs[0].attachments.iter().zip(&images) {
+                assert!(std::path::Path::new(path).starts_with(core_b.uploads.dir()));
+                assert_eq!(std::fs::read(path).unwrap(), *bytes, "remote harness must receive the original image bytes");
+            }
+        }
+        let commands = core_a.doc_host.open(CHAT).unwrap().doc().read_commands().unwrap();
+        let [command] = commands.as_slice() else { panic!("expected one original command"); };
+        let SessionCommandPayload::Run { message_id, .. } = &command.payload else { panic!("expected a Run command"); };
+        let entries = core_b.doc_host.open(CHAT).unwrap().doc().read_entries().unwrap();
+        assert_eq!(entries.iter().filter(|entry| entry.id == *message_id
+            && entry.role == zeron_doc::MessageRole::User).count(), 1);
+        assert_eq!(entries.iter().filter(|entry| entry.role == zeron_doc::MessageRole::Assistant
+            && entry.status == Some(zeron_doc::MessageStatus::Complete)).count(), 1);
+
+        runtime.block_on(async { core_a.shutdown().await; core_b.shutdown().await; });
+        drop(host);
+        relay.abort();
     }
 
     #[gpui::test]
