@@ -422,6 +422,8 @@ struct SubscribeTerminalParams {
     terminal_id: String,
     #[serde(default)]
     after_seq: Option<u64>,
+    #[serde(default)]
+    host_replies: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -694,6 +696,7 @@ pub struct EngineRpc {
     repos: Repos,
     workspace_files: crate::WorkspaceFiles,
     terminals: Terminals,
+    remote_terminals: crate::remote_terminals::RemoteTerminals,
     project_actions: ProjectActionsStore,
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
@@ -708,6 +711,7 @@ pub struct EngineRpc {
     updater: Option<zeron_update::Updater>,
     harness_updates: Option<crate::harness_updates::HarnessUpdateCoordinator>,
     local_import: Option<crate::local_import::LocalImporter>,
+    viewport_focus: crate::desktop_notify::ViewportFocus,
     engine_info: EngineInfo,
 }
 
@@ -750,6 +754,7 @@ impl EngineRpc {
             repos,
             workspace_files,
             terminals,
+            remote_terminals: Default::default(),
             project_actions,
             previews: None,
             change_requests,
@@ -764,12 +769,26 @@ impl EngineRpc {
             updater: None,
             harness_updates: None,
             local_import: None,
+            viewport_focus: Default::default(),
             engine_info,
         }
     }
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
+        self
+    }
+
+    pub fn with_remote_terminals(
+        mut self,
+        remote_terminals: crate::remote_terminals::RemoteTerminals,
+    ) -> Self {
+        self.remote_terminals = remote_terminals;
+        self
+    }
+
+    pub fn with_viewport_focus(mut self, focus: crate::desktop_notify::ViewportFocus) -> Self {
+        self.viewport_focus = focus;
         self
     }
 
@@ -1195,6 +1214,70 @@ impl EngineRpc {
                     "no reply from device {target} for {method} within {}s",
                     deadline.as_secs()
                 )))
+            }
+        }
+    }
+
+    async fn remote_terminal(
+        &self,
+        target: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<RpcReply, RpcError> {
+        self.guard_scaffold_target(target, method, &params)?;
+        use crate::remote_terminals::Write;
+        let relay: std::sync::Arc<dyn crate::remote_terminals::Relay> =
+            std::sync::Arc::new(self.clone());
+        let ok = || RpcReply::value(&serde_json::json!({ "ok": true }));
+        match method {
+            methods::SUBSCRIBE_TERMINAL => {
+                let p: SubscribeTerminalParams = parse_params(params)?;
+                let direct = self.previews.clone().map(|previews| {
+                    std::sync::Arc::new(previews)
+                        as std::sync::Arc<dyn crate::remote_terminals::Direct>
+                });
+                let stream = self
+                    .remote_terminals
+                    .subscribe(
+                        relay,
+                        direct,
+                        target,
+                        &p.terminal_id,
+                        p.after_seq.unwrap_or(0),
+                        p.host_replies,
+                    )
+                    .await?;
+                Ok(RpcReply::Stream(stream))
+            }
+            methods::WRITE_TERMINAL => {
+                let p: WriteTerminalParams = parse_params(params)?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&p.data)
+                    .unwrap_or_else(|_| p.data.into_bytes());
+                self.remote_terminals
+                    .send(&relay, target, &p.terminal_id, Write::Input(bytes))?;
+                ok()
+            }
+            methods::RESIZE_TERMINAL => {
+                let p: ResizeTerminalParams = parse_params(params)?;
+                self.remote_terminals.send(
+                    &relay,
+                    target,
+                    &p.terminal_id,
+                    Write::Resize {
+                        cols: p.cols,
+                        rows: p.rows,
+                    },
+                )?;
+                ok()
+            }
+            _ => {
+                let p: TerminalIdParams = parse_params(params.clone())?;
+                let reply = self.forward(target, method, params).await;
+                if reply.is_ok() {
+                    self.remote_terminals.ended(target, &p.terminal_id);
+                }
+                reply
             }
         }
     }
@@ -1902,6 +1985,37 @@ impl RpcService for AuthRpc {
 }
 
 #[async_trait]
+impl crate::remote_terminals::Relay for EngineRpc {
+    async fn call(
+        &self,
+        target: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        match self.forward(target, method, params).await? {
+            RpcReply::Value(value) => Ok(value),
+            RpcReply::Stream(_) => Err(RpcError::Failed(format!(
+                "{method} replied with a stream"
+            ))),
+        }
+    }
+
+    async fn subscribe(
+        &self,
+        target: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<BoxStream<'static, serde_json::Value>, RpcError> {
+        match self.forward(target, method, params).await? {
+            RpcReply::Stream(stream) => Ok(stream),
+            RpcReply::Value(_) => Err(RpcError::Failed(format!(
+                "{method} replied with a value"
+            ))),
+        }
+    }
+}
+
+#[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
         if method == methods::UPDATE_ACCESS_TOKEN && self.relay {
@@ -2270,6 +2384,17 @@ impl RpcService for EngineRpc {
                 self.doc_host.persist_fork(&target).map_err(failed)?;
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)
+            }
+            methods::SET_VIEWPORT_FOCUS => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    viewport_id: String,
+                    focused: bool,
+                }
+                let p: Params = parse_params(params)?;
+                self.viewport_focus.set(&p.viewport_id, p.focused);
+                RpcReply::value(&serde_json::json!({}))
             }
             methods::FOCUS_CHAT => {
                 let p: ChatParams = parse_params(params)?;

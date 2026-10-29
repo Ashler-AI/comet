@@ -1360,7 +1360,14 @@ impl AcpHarness {
             .ok_or_else(|| HarnessError::Protocol("Antigravity gateway route required".into()))?;
         let workspace = ScratchDir::new("antigravity-metadata")?;
         let (_scratch, mut child, _stderr, prompted) = self
-            .spawn_agent(workspace.path().to_str(), true, &[], None, Some(context)).await?;
+            .spawn_agent(
+                workspace.path().to_str(),
+                true,
+                &[],
+                None,
+                &Default::default(),
+            )
+            .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => client_with_sign_in_prompt(stdin, stdout, self.id(), &prompted),
             _ => {
@@ -1370,10 +1377,24 @@ impl AcpHarness {
         };
         let flow = async {
             client.request("initialize", managed_initialize_params(self.id(), true)).await?;
-            request_draining(&client, &mut incoming, "authenticate", gateway_auth_params(route)).await?;
-            request_draining(&client, &mut incoming, "session/new", json!({
+            request_draining(
+                &client,
+                &mut incoming,
+                AccessMode::FullAccess,
+                "authenticate",
+                gateway_auth_params(route),
+            )
+            .await?;
+            request_draining(
+                &client,
+                &mut incoming,
+                AccessMode::FullAccess,
+                "session/new",
+                json!({
                 "cwd":workspace.path(),"mcpServers":[]
-            })).await?;
+                }),
+            )
+            .await?;
             Ok(())
         };
         let result = tokio::time::timeout(Duration::from_secs(60), flow).await;
