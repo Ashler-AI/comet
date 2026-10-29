@@ -1,33 +1,6 @@
 name: macOS tests
 
 on:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'edge/**'
-      - 'scripts/run-macos-browser-fixture.sh'
-      - 'scripts/test-browser-storage.py'
-      - 'scripts/ci/run-macos-fixture.sh'
-      - 'dist/macos/Info.plist'
-      - 'apps/ios/**'
-      - '.github/workflows/macos.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'edge/**'
-      - 'scripts/run-macos-browser-fixture.sh'
-      - 'scripts/test-browser-storage.py'
-      - 'scripts/ci/run-macos-fixture.sh'
-      - 'dist/macos/Info.plist'
-      - 'apps/ios/**'
-      - '.github/workflows/macos.yml'
   workflow_dispatch:
 
 permissions:

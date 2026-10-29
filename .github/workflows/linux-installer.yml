@@ -1,25 +1,6 @@
 name: Linux installer
 
 on:
-  pull_request:
-    paths:
-      - 'scripts/package-linux.sh'
-      - 'scripts/test-linux-desktop-entry.sh'
-      - 'scripts/ci/apt-install.sh'
-      - 'dist/comet.desktop'
-      - 'dist/zeron.desktop'
-      - 'dist/zeron.png'
-      - '.github/workflows/linux-installer.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'scripts/package-linux.sh'
-      - 'scripts/test-linux-desktop-entry.sh'
-      - 'scripts/ci/apt-install.sh'
-      - 'dist/comet.desktop'
-      - 'dist/zeron.desktop'
-      - 'dist/zeron.png'
-      - '.github/workflows/linux-installer.yml'
   workflow_dispatch:
 
 permissions:

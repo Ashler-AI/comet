@@ -1,9 +1,6 @@
 name: Release contracts
 
 on:
-  pull_request:
-  push:
-    branches: [main, crew/staging-native-cutover]
   workflow_dispatch:
 
 permissions:

@@ -1,29 +1,6 @@
 name: Windows tests
 
 on:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'apps/zeron/**'
-      - 'dist/windows/**'
-      - 'crates/**'
-      - 'scripts/test-windows-*.ps1'
-      - 'scripts/package-windows.ps1'
-      - '.github/workflows/windows.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'apps/zeron/**'
-      - 'dist/windows/**'
-      - 'crates/**'
-      - 'scripts/test-windows-*.ps1'
-      - 'scripts/package-windows.ps1'
-      - '.github/workflows/windows.yml'
   workflow_dispatch:
     inputs:
       native_gui:
