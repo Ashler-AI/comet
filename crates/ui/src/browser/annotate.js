@@ -63,7 +63,10 @@
       if (node !== el && node.id && unique('#' + esc(node.id))) { parts.unshift('#' + esc(node.id)); break; }
       let part = node.tagName.toLowerCase();
       const testid = node.getAttribute('data-testid');
-      if (testid) part += `[data-testid="${testid.replace(/"/g, '\\"')}"]`;
+      if (testid) {
+        const escapedTestid = testid.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        part += `[data-testid="${escapedTestid}"]`;
+      }
       else part += [...node.classList].slice(0, 2).map((c) => '.' + esc(c)).join('');
       const parent = node.parentElement;
       if (parent && !testid) {
