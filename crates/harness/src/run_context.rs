@@ -9,7 +9,7 @@ pub(crate) fn validate_inference_route(
         return Ok(());
     };
     let compatible = matches!((harness, route.provider.as_str()),
-        (HarnessId::Omp, "openai" | "anthropic")
+        (HarnessId::Omp, "openai" | "anthropic" | "antigravity")
         | (HarnessId::Codex, "openai")
         | (HarnessId::ClaudeCode, "anthropic")
         | (HarnessId::Antigravity, "antigravity"));
@@ -50,7 +50,7 @@ pub(crate) fn apply_run_context(cmd: &mut Command, context: Option<&RunContext>)
         "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
         "ANTHROPIC_CUSTOM_HEADERS", "OPENAI_CUSTOM_HEADERS",
         "OMP_AUTH_BROKER_URL", "OMP_AUTH_BROKER_TOKEN", "OMP_AUTH_BROKER_TOKEN_FILE",
-        "GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "OMP_GOOGLE_CREDENTIALS", "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_GEMINI_BASE_URL", "GOOGLE_GENAI_USE_VERTEXAI", "AGY_ACP_CCPA_BASE_URL", "AGY_ACP_CCPA_PROJECT",
         "AGY_LLM_GATEWAY_URL", "AGY_LLM_GATEWAY_API_KEY", "AGY_LLM_GATEWAY_HEADERS", "AGY_LLM_GATEWAY_MODELS",
         "AGY_LLM_GATEWAY_PROXY_URL", "AGY_LLM_GATEWAY_CA_CERT", "AGY_ACP_ENABLE_GATEWAY_AUTH",

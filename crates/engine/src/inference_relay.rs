@@ -31,6 +31,7 @@ use crate::{EngineError, new_id};
 
 #[derive(Clone)]
 struct InferenceRouteRequest {
+    harness: HarnessId,
     logical_session_id: String,
     provider: String,
     model: String,
@@ -305,6 +306,7 @@ fn inference_binding(
     let provider = match harness {
         HarnessId::Antigravity if !lower.contains('/') || lower.starts_with("antigravity/") => "antigravity",
         HarnessId::Antigravity => return None,
+        HarnessId::Omp if lower.starts_with("google-antigravity/") => "antigravity",
         HarnessId::ClaudeCode if !lower.contains('/') => "anthropic",
         HarnessId::Codex if !lower.contains('/') => "openai",
         _ if lower.starts_with("anthropic/") => "anthropic",
@@ -352,6 +354,7 @@ fn inference_route_request(
         ));
     }
     Ok(Some(InferenceRouteRequest {
+        harness,
         logical_session_id: logical_session_id.to_string(),
         provider: provider.to_string(),
         model,
@@ -403,9 +406,10 @@ impl InferenceRelay {
     ) -> Result<Option<InferenceRoute>, EngineError> {
         let cancellation = admission.as_ref().map(|gate| gate.cancellation.child_token())
             .unwrap_or_default();
-        // Native gateway discovery must use the current owned account's catalog.
+        // Both Google transports must use the current owned account's catalog.
         // Never silently substitute an old static model when discovery fails.
-        let native_model = if harness == HarnessId::Antigravity {
+        let native_model = if harness == HarnessId::Antigravity
+            || (harness == HarnessId::Omp && inference_binding(harness, model).is_some_and(|(provider, _)| provider == "antigravity")) {
             let catalog = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(EngineError::Other("Agent Auth route cancelled".into())),
@@ -413,13 +417,13 @@ impl InferenceRelay {
                     catalog.map_err(|error| EngineError::Other(format!("Google model discovery failed: {error}")))?,
             };
             let selected = model.map(str::trim).filter(|id| !id.is_empty() && *id != "default")
-                .map(|id| id.strip_prefix("antigravity/").unwrap_or(id))
+                .map(|id| id.strip_prefix("antigravity/").or_else(|| id.strip_prefix("google-antigravity/")).unwrap_or(id))
                 .or(catalog.default_model_id.as_deref())
                 .ok_or_else(|| EngineError::Other("Google did not return a default model; select an available model".into()))?;
             if !catalog.models.iter().any(|model| model.id == selected) {
                 return Err(EngineError::Other("Selected model is unavailable for this Google account".into()));
             }
-            Some(selected.to_string())
+            Some(if harness == HarnessId::Omp { format!("google-antigravity/{selected}") } else { selected.to_string() })
         } else { None };
         let model = native_model.as_deref().or(model);
         let agent_auth_session_id = agent_auth_logical_session_id(session_id);
@@ -625,11 +629,23 @@ impl InferenceRelay {
                 json!({ "error": "method_not_allowed" }),
             );
         }
-        let gemini = antigravity_endpoint(path);
+        let omp_google = route.request.harness == HarnessId::Omp && route.request.provider == "antigravity";
+        if omp_google && request.method() == Method::POST && path == "/v1internal:fetchAvailableModels" {
+            let mut models = serde_json::Map::new();
+            models.insert(route.request.model.clone(), json!({"displayName":route.request.model,"maxTokens":1048576}));
+            return json_response(StatusCode::OK, json!({"models": models}));
+        }
+        let cca_endpoint = if omp_google { match path {
+            "/v1internal:generateContent" => Some("antigravity/generateContent"),
+            "/v1internal:streamGenerateContent" => Some("antigravity/streamGenerateContent"),
+            _ => None,
+        }} else { None };
+        let gemini = if route.request.harness == HarnessId::Antigravity { antigravity_endpoint(path) } else { None };
         let endpoint = match path {
             "/v1/responses" => "responses",
             "/v1/messages" => "messages",
             _ if gemini.is_some() => gemini.as_ref().unwrap().0,
+            _ if cca_endpoint.is_some() => cca_endpoint.unwrap(),
             _ => return json_response(StatusCode::NOT_FOUND, json!({ "error": "not_found" })),
         };
         let query = match request.uri().query() {
@@ -643,7 +659,7 @@ impl InferenceRelay {
                 );
             }
         };
-        let expected_provider = if gemini.is_some() {
+        let expected_provider = if gemini.is_some() || cca_endpoint.is_some() {
             "antigravity"
         } else if endpoint == "messages" {
             "anthropic"
@@ -670,6 +686,9 @@ impl InferenceRelay {
                 );
             }
         };
+        if cca_endpoint.is_some() && content_length > MAX_GEMINI_ENVELOPE_BYTES as u64 {
+            return json_response(StatusCode::PAYLOAD_TOO_LARGE, json!({"error":"request_too_large"}));
+        }
         let gemini_prefix = gemini.as_ref().map(|_| Bytes::from(format!("{{\"model\":{},\"request\":",
             serde_json::to_string(&route.request.model).expect("model string"))));
         if let Some(prefix) = &gemini_prefix {
@@ -735,6 +754,12 @@ impl InferenceRelay {
                 .chain(request_stream)
                 .chain(futures::stream::once(async { Ok(Bytes::from_static(b"}")) }));
             (reqwest::Body::wrap_stream(wrapped), length)
+        } else if cca_endpoint.is_some() {
+            // Wire bytes are bounded while streaming; Agent Auth independently
+            // bounds decompressed gzip bytes before parsing the CCA envelope.
+            let stream = http_body_util::Limited::new(request.into_body(), MAX_GEMINI_ENVELOPE_BYTES)
+                .into_data_stream().map(|item| item.map_err(std::io::Error::other));
+            (reqwest::Body::wrap_stream(stream), content_length)
         } else {
             (reqwest::Body::wrap_stream(request.into_body().into_data_stream()), content_length)
         };
@@ -742,6 +767,8 @@ impl InferenceRelay {
             .inner
             .client
             .proxy_agent_inference(AgentInferenceProxyRequest {
+                harness: Some(if route.request.harness == HarnessId::Omp { "omp" } else { "antigravity" }),
+                bound_model: Some(&route.request.model),
                 endpoint,
                 query,
                 authority: &authority.authority,
@@ -1026,10 +1053,12 @@ fn sanitize_request_headers(mut headers: HeaderMap) -> HeaderMap {
 }
 
 fn model_catalog(request: &InferenceRouteRequest) -> Response<RelayBody> {
-    if request.provider == "antigravity" {
+    if request.provider == "antigravity" && request.harness == HarnessId::Antigravity {
         return json_response(StatusCode::OK, antigravity_model_catalog(&request.model));
     }
-    let (owned_by, api) = if request.provider == "anthropic" {
+    let (owned_by, api) = if request.provider == "antigravity" {
+        ("google-antigravity", "google-gemini-cli")
+    } else if request.provider == "anthropic" {
         ("anthropic", "anthropic-messages")
     } else {
         ("openai-codex", "openai-codex-responses")

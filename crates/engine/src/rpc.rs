@@ -2011,8 +2011,19 @@ impl RpcService for EngineRpc {
                             .map_err(|error| RpcError::Failed(error.to_string()))?;
                         return RpcReply::value(&models.models);
                     }
-                    let models = zeron_harness::managed_models(p.harness)
+                    let mut models = zeron_harness::managed_models(p.harness)
                         .ok_or_else(|| RpcError::Failed("This agent does not support Crew managed inference".into()))?;
+                    if p.harness == HarnessId::Omp && let Ok(crew) = self.crew_services() {
+                        // Other providers remain available when the user has no
+                        // Google account. Explicit Google runs still fail closed.
+                        if let Ok(catalog) = crew.runtime().client().list_antigravity_models(None).await {
+                            models.extend(catalog.models.into_iter().map(|mut model| {
+                                model.id = format!("google-antigravity/{}", model.id);
+                                model.label = format!("{} (Google)", model.label);
+                                model
+                            }));
+                        }
+                    }
                     return RpcReply::value(&models);
                 }
                 let lease = std::sync::Arc::new(self.registry.execution_lease(p.harness).await);

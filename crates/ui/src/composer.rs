@@ -8904,7 +8904,8 @@ impl Composer {
             self.show_error("Choose a managed Crew model before creating a sandbox.", cx); return;
         };
         if let Some(account) = resolved.model_options.get("crewAccountId").and_then(serde_json::Value::as_str) {
-            route = zeron_proto::AgentRoute::pinned(route.provider, route.model, account.to_string());
+            route.routing_mode = zeron_proto::AgentRoutingMode::Pinned;
+            route.account_id = Some(account.to_string());
         }
         if references_require_update(self.input.read(cx).text(), false) || !self.staged_appshots().is_empty() || !self.staged_comments(cx).is_empty() {
             self.show_error("Local file/skill references, app captures and review comments cannot be sent to a new sandbox. Attach file bytes instead; your draft is preserved.", cx); return;

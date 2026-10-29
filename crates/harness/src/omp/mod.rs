@@ -382,6 +382,15 @@ fn run_omp_supervisor(_args: impl Iterator<Item = OsString>) -> Result<(), Harne
     ))
 }
 
+// OMP consumes discovery variants through a logical model. Pin the served
+// tier as its thinking level so the account-bound route cannot drift.
+fn managed_google_model(model: &str) -> (&str, Option<&str>) {
+    match model.rsplit_once('-') {
+        Some((logical, tier @ ("low" | "medium" | "high" | "xhigh"))) => (logical, Some(tier)),
+        _ => (model, None),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct OmpRunConfig {
     path: PathBuf,
@@ -2430,6 +2439,17 @@ impl Harness for OmpHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let executable = self.resolve_executable()?;
+        if controls.context.as_ref().and_then(|context| context.inference.as_ref())
+            .is_some_and(|route| route.provider == "antigravity") {
+            let probe = executable.clone();
+            let supported = tokio::task::spawn_blocking(move || {
+                crate::executable::binary_version(&probe)
+                    .is_some_and(|version| version >= semver::Version::new(18, 13, 3))
+            }).await.map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            if !supported {
+                return Err(HarnessError::Protocol("Google through Crew requires OMP 18.13.3 or newer. Update OMP in Settings → Agents.".into()));
+            }
+        }
         if let Some(fork_from) = controls
             .context
             .as_ref()
@@ -2490,19 +2510,64 @@ impl Harness for OmpHarness {
             .and_then(|context| context.inference.as_ref())
         {
             let gateway = crate::scratch::ScratchDir::new("omp-agent-auth")?;
-            let extension = gateway.path().join("agent-auth.ts");
-            std::fs::write(&extension, include_str!("auth_gateway.ts"))?;
-            command.arg("--extension").arg(extension);
-            let provider = match inference.provider.as_str() {
-                "openai" => "comet-openai",
-                "anthropic" => "comet-anthropic",
-                _ => return Err(HarnessError::Protocol("Unsupported Agent Auth provider".into())),
+            let model = if inference.provider == "antigravity" {
+                // A static provider override survives OMP's variant normalization;
+                // registerProvider alone can fall back to Google's direct URL.
+                std::fs::write(gateway.path().join("models.yml"), serde_json::to_vec(&serde_json::json!({
+                    "providers": {"google-antigravity": {
+                        "baseUrl": inference.base_url.trim_end_matches('/'),
+                        "apiKey": "OMP_GOOGLE_CREDENTIALS"
+                    }}
+                })).map_err(|error| HarnessError::Protocol(error.to_string()))?)?;
+                let extension = gateway.path().join("google-route.ts");
+                std::fs::write(&extension, include_str!("google_auth_gateway.ts"))?;
+                command.args(["--profile", "default", "--no-extensions", "--crew-google-route"])
+                    .arg("--extension").arg(extension)
+                    .env_remove("OMP_PROFILE").env_remove("PI_PROFILE")
+                    .env("PI_CODING_AGENT_DIR", gateway.path())
+                    .env("OMP_GOOGLE_BOUND_MODEL", &inference.model)
+                    .env("OMP_GOOGLE_CREDENTIALS", serde_json::json!({
+                        "token": inference.token, "projectId": "crew-managed"
+                    }).to_string());
+                // Journals and content-addressed image blobs must survive this
+                // disposable profile. Only the blob directory is linked; auth,
+                // settings, model caches, and extensions remain run-isolated.
+                let session_root = session_dirs.first().ok_or_else(|| HarnessError::Protocol("OMP session directory unavailable".into()))?;
+                let blobs = session_root.parent().ok_or_else(|| HarnessError::Protocol("OMP blob directory unavailable".into()))?.join("blobs");
+                std::fs::create_dir_all(&blobs)?;
+                let blobs = std::fs::canonicalize(blobs)?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&blobs, gateway.path().join("blobs"))?;
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_dir(&blobs, gateway.path().join("blobs"))?;
+                let sessions = session_root.join("crew-managed");
+                std::fs::create_dir_all(&sessions)?;
+                command.arg("--session-dir").arg(sessions);
+                let (logical, tier) = managed_google_model(&inference.model);
+                let selected = format!("google-antigravity/{logical}");
+                let mut overlay = std::fs::OpenOptions::new().append(true).open(&run_config.path)?;
+                writeln!(overlay, "providers:\n  antigravityEndpoint: auto\nenabledModels:\n  - {selected}\nretry:\n  modelFallback: false\n  usageAwareFallback: false\ncontextPromotion:\n  enabled: false")?;
+                writeln!(overlay, "modelRoles:")?;
+                for role in ["default", "smol", "slow", "vision", "plan", "commit", "tiny", "memory", "task", "advisor", "widget", "judge"] {
+                    writeln!(overlay, "  {role}: {selected}")?;
+                }
+                if let Some(tier) = tier { command.args(["--thinking", tier]); }
+                format!("google-antigravity/{logical}")
+            } else {
+                let extension = gateway.path().join("agent-auth.ts");
+                std::fs::write(&extension, include_str!("auth_gateway.ts"))?;
+                command.arg("--extension").arg(extension);
+                let provider = match inference.provider.as_str() {
+                    "openai" => "comet-openai",
+                    "anthropic" => "comet-anthropic",
+                    _ => return Err(HarnessError::Protocol("Unsupported Agent Auth provider".into())),
+                };
+                let model = inference.model.rsplit('/').next().unwrap_or(&inference.model);
+                format!("{provider}/{model}")
             };
-            let model = inference.model.rsplit('/').next().unwrap_or(&inference.model);
-            let model = format!("{provider}/{model}");
             command.args(["--model", &model]);
-            // Keep role-selected children on this run's Agent Auth route without
-            // changing workstation preferences or shadowable extension flags.
+            if inference.provider == "antigravity" { command.args(["--models", &model]); }
+            // All role-selected children inherit this exact managed route.
             for role in ["PI_SMOL_MODEL", "PI_SLOW_MODEL", "PI_PLAN_MODEL"] {
                 command.env(role, &model);
             }

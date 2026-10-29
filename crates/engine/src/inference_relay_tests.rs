@@ -1262,6 +1262,30 @@ mod tests {
         assert_eq!(captured.body["model"], "claude-opus-5");
     }
 
+    // Failure modes: missing Google admission, double-wrapped CCA payload, or
+    // native clients invoking the distinct OMP transport with the same token.
+    #[tokio::test]
+    async fn omp_google_relay_preserves_cca_and_separates_native_transport() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane(tx).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
+        let route = relay.prepare("session-omp-google", HarnessId::Omp, Some("google-antigravity/gemini-4-argon-medium"), None).await.unwrap().unwrap();
+        let http = reqwest::Client::new();
+        let body = json!({"model":"gemini-4-argon-medium","project":"crew-managed","request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]},"userAgent":"antigravity","requestId":"test"});
+        let response = http.post(format!("{}/v1internal:streamGenerateContent?alt=sse", route.base_url))
+            .bearer_auth(&route.token).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = rx.recv().await.unwrap();
+        assert_eq!(captured.path, "/api/agent-auth/v2/antigravity/streamGenerateContent");
+        assert_eq!(captured.body, body);
+        let native = relay.prepare("session-native", HarnessId::Antigravity, None, None).await.unwrap().unwrap();
+        let response = http.post(format!("{}/v1internal:streamGenerateContent?alt=sse", native.base_url))
+            .bearer_auth(&native.token).json(&body).send().await.unwrap();
+        assert!(response.status().is_client_error());
+        assert!(rx.try_recv().is_err());
+        assert!(relay.prepare("session-unlisted", HarnessId::Omp, Some("google-antigravity/gemini-carbon"), None).await.is_err());
+    }
+
     #[tokio::test]
     async fn antigravity_relay_resolves_provider_default_and_rejects_unlisted_models() {
         let (tx, _rx) = mpsc::unbounded_channel();

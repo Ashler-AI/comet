@@ -335,7 +335,7 @@ impl CrewAccounts {
 
     fn agent_route(&self) -> Option<AgentRoute> {
         let selected = self.model.as_deref()?;
-        let route = if let Some(native) = selected.strip_prefix("antigravity/") {
+        let mut route = if let Some(native) = selected.strip_prefix("antigravity/") {
             if !self.native_models.iter().any(|model| model.id == native) { return None; }
             AgentRoute::from_harness_model(zeron_proto::HarnessId::Antigravity, native)?
         } else {
@@ -346,7 +346,9 @@ impl CrewAccounts {
             Some(account) => {
                 let provider = match route.provider { AgentProvider::Anthropic => "anthropic", AgentProvider::OpenAi => "openai", AgentProvider::Antigravity => "antigravity" };
                 if !self.accounts.iter().any(|candidate| candidate.id == *account && candidate.provider.eq_ignore_ascii_case(provider) && matches!(candidate.status.as_str(), "active" | "connected" | "ready")) { return None; }
-                AgentRoute::pinned(route.provider, route.model, account.clone())
+                route.routing_mode = zeron_proto::AgentRoutingMode::Pinned;
+                route.account_id = Some(account.clone());
+                route
             }
             None => route,
         })
