@@ -568,6 +568,8 @@ pub enum AgentRouteFallback {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<crate::HarnessId>,
     pub provider: AgentProvider,
     pub model: String,
     pub fallback: AgentRouteFallback,
@@ -589,29 +591,33 @@ impl AgentRoute {
             AgentProvider::Anthropic
         } else if lower.starts_with("openai/") || lower.starts_with("openai-codex/") {
             AgentProvider::OpenAi
+        } else if lower.starts_with("google-antigravity/") {
+            AgentProvider::Antigravity
         } else {
             return None;
         };
-        Some(Self::automatic(provider, model))
+        let mut route = Self::automatic(provider, model);
+        if provider == AgentProvider::Antigravity { route.harness = Some(crate::HarnessId::Omp); }
+        Some(route)
     }
 
     pub fn omp_model(&self) -> String {
         let provider = match self.provider {
             AgentProvider::OpenAi => "openai-codex",
             AgentProvider::Anthropic => "anthropic",
-            AgentProvider::Antigravity => "antigravity",
+            AgentProvider::Antigravity => "google-antigravity",
         };
         format!("{provider}/{}", self.model)
     }
 
-    /// Native Antigravity owns its tools and conversation; the other managed
-    /// providers continue through OMP.
+    /// Existing Google routes remain native; an explicit OMP route uses its
+    /// dedicated Google provider and owns tools/conversation in OMP.
     pub fn harness(&self) -> crate::HarnessId {
-        if self.provider == AgentProvider::Antigravity { crate::HarnessId::Antigravity } else { crate::HarnessId::Omp }
+        self.harness.unwrap_or(if self.provider == AgentProvider::Antigravity { crate::HarnessId::Antigravity } else { crate::HarnessId::Omp })
     }
 
     pub fn execution_model(&self) -> String {
-        if self.provider == AgentProvider::Antigravity { self.model.clone() } else { self.omp_model() }
+        if self.harness() == crate::HarnessId::Antigravity { self.model.clone() } else { self.omp_model() }
     }
 
     pub fn from_harness_model(harness: crate::HarnessId, model: &str) -> Option<Self> {
@@ -619,11 +625,12 @@ impl AgentRoute {
             let model = model.strip_prefix("antigravity/").unwrap_or(model).trim();
             return (!model.is_empty() && !model.contains('/')).then(|| Self::automatic(AgentProvider::Antigravity, model));
         }
-        Self::from_omp_model(model).filter(|route| route.provider != AgentProvider::Antigravity)
+        Self::from_omp_model(model).filter(|route| harness == crate::HarnessId::Omp || route.provider != AgentProvider::Antigravity)
     }
 
     pub fn automatic(provider: AgentProvider, model: impl Into<String>) -> Self {
         Self {
+            harness: None,
             provider,
             model: model.into(),
             fallback: AgentRouteFallback::Disabled,
@@ -638,6 +645,7 @@ impl AgentRoute {
         account_id: impl Into<String>,
     ) -> Self {
         Self {
+            harness: None,
             provider,
             model: model.into(),
             fallback: AgentRouteFallback::Disabled,
@@ -647,6 +655,9 @@ impl AgentRoute {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.harness.is_some_and(|harness| harness != crate::HarnessId::Omp || self.provider != AgentProvider::Antigravity) {
+            return Err("only OMP may override the provider default harness");
+        }
         if self.model.trim().is_empty() {
             return Err("agent route model is required");
         }
@@ -1339,6 +1350,19 @@ mod tests {
                     | ("inspect", ScaffoldEnvironmentControl::Inspect { .. })
             ));
         }
+    }
+
+    // Failure modes: provider-only routing launches the native harness; a saved
+    // OMP route loses its harness on serialization; old native routes change.
+    #[test]
+    fn omp_google_routes_preserve_the_explicit_harness() {
+        let route = AgentRoute::from_omp_model("google-antigravity/gemini-4-argon-medium").unwrap();
+        assert_eq!(route.provider, AgentProvider::Antigravity);
+        assert_eq!(route.harness(), crate::HarnessId::Omp);
+        assert_eq!(route.execution_model(), "google-antigravity/gemini-4-argon-medium");
+        let restored: AgentRoute = serde_json::from_value(serde_json::to_value(&route).unwrap()).unwrap();
+        assert_eq!(restored.harness(), crate::HarnessId::Omp);
+        assert_eq!(AgentRoute::automatic(AgentProvider::Antigravity, "gemini-4-argon-medium").harness(), crate::HarnessId::Antigravity);
     }
 
     #[test]

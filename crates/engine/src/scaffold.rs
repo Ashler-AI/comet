@@ -485,6 +485,8 @@ pub(crate) struct AgentInferenceAuthority {
 }
 
 pub(crate) struct AgentInferenceProxyRequest<'a> {
+    pub harness: Option<&'a str>,
+    pub bound_model: Option<&'a str>,
     pub endpoint: &'a str,
     pub query: Option<&'a str>,
     pub authority: &'a AgentInferenceAuthority,
@@ -714,6 +716,8 @@ impl ScaffoldClient {
         proxy: AgentInferenceProxyRequest<'_>,
     ) -> Result<reqwest::Response, ScaffoldError> {
         let AgentInferenceProxyRequest {
+            harness,
+            bound_model,
             endpoint,
             query,
             authority,
@@ -775,7 +779,8 @@ impl ScaffoldClient {
             .header(reqwest::header::CONTENT_LENGTH, content_length)
             .header("x-agent-auth-request-id", request_id)
             .header("x-agent-auth-conversation-id", conversation_id);
-        if endpoint.starts_with("antigravity/") { request = request.header("x-agent-auth-harness", "antigravity"); }
+        if endpoint.starts_with("antigravity/") { request = request.header("x-agent-auth-harness", harness.unwrap_or("antigravity"));
+            if let Some(model) = bound_model { request = request.header("x-agent-auth-model", model); } }
         if let Some(authority_scope) = authority.authority_scope.as_deref() {
             request = request.header("x-agent-auth-authority-scope", authority_scope);
         }
@@ -4648,6 +4653,8 @@ mod tests {
         let authority = test_inference_authority();
         let response = client
             .proxy_agent_inference(AgentInferenceProxyRequest {
+                harness: None,
+                bound_model: None,
                 endpoint: "responses",
                 query: None,
                 authority: &authority,
@@ -4698,6 +4705,8 @@ mod tests {
         );
         let response = client
             .proxy_agent_inference(AgentInferenceProxyRequest {
+                harness: None,
+                bound_model: None,
                 endpoint: "messages",
                 query: Some("beta=true"),
                 authority: &authority,
@@ -4755,6 +4764,8 @@ mod tests {
 
         let response = client
             .proxy_agent_inference(AgentInferenceProxyRequest {
+                harness: None,
+                bound_model: None,
                 endpoint: "messages",
                 query: None,
                 authority: &authority,

@@ -9,19 +9,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::process::{Command, Stdio as ManagedStdio};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt as _;
+use crate::process::{Command, Stdio as ManagedStdio};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
-    UserInputQuestion,
+    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, SlashCommand, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -270,9 +269,7 @@ fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), Ha
     }
     let mut command = ProcessCommand::new(executable);
     command.args(args);
-    let command_catalog = command
-        .get_args()
-        .any(|arg| arg == "--comet-command-catalog");
+    let command_catalog = command.get_args().any(|arg| arg == "--comet-command-catalog");
     unsafe {
         command.pre_exec(|| {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
@@ -320,15 +317,9 @@ fn run_omp_supervisor(mut args: impl Iterator<Item = OsString>) -> Result<(), Ha
                             let mut empty = true;
                             for line in String::from_utf8_lossy(&output.stdout).lines() {
                                 let mut fields = line.split_whitespace();
-                                let Some(pid) =
-                                    fields.next().and_then(|pid| pid.parse::<u32>().ok())
-                                else {
-                                    continue;
-                                };
-                                let group =
-                                    fields.next().and_then(|group| group.parse::<u32>().ok());
-                                let zombie =
-                                    fields.next().is_some_and(|state| state.starts_with('Z'));
+                                let Some(pid) = fields.next().and_then(|pid| pid.parse::<u32>().ok()) else { continue };
+                                let group = fields.next().and_then(|group| group.parse::<u32>().ok());
+                                let zombie = fields.next().is_some_and(|state| state.starts_with('Z'));
                                 if group != Some(root) || pid == root || zombie {
                                     continue;
                                 }
@@ -391,6 +382,15 @@ fn run_omp_supervisor(_args: impl Iterator<Item = OsString>) -> Result<(), Harne
     ))
 }
 
+// OMP consumes discovery variants through a logical model. Pin the served
+// tier as its thinking level so the account-bound route cannot drift.
+fn managed_google_model(model: &str) -> (&str, Option<&str>) {
+    match model.rsplit_once('-') {
+        Some((logical, tier @ ("low" | "medium" | "high" | "xhigh"))) => (logical, Some(tier)),
+        _ => (model, None),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct OmpRunConfig {
     path: PathBuf,
@@ -418,10 +418,7 @@ impl OmpRunConfig {
             let _ = std::fs::remove_file(&path);
             return Err(error.into());
         }
-        Ok(Self {
-            path,
-            gateway: None,
-        })
+        Ok(Self { path, gateway: None })
     }
 
     fn apply(&self, command: &mut Command, inherited: Option<&std::ffi::OsStr>) {
@@ -638,6 +635,143 @@ pub enum SessionWriterState {
     Unknown,
 }
 
+#[cfg(target_os = "linux")]
+const OMP_WRITER_PROBE_MARKER: &str = "__comet-omp-writer-probe";
+
+/// Dispatch before initializing threads or the application runtime. The lease
+/// and its SIGIO disposition belong only to this short-lived helper process.
+pub fn run_writer_probe_from_env() -> Option<Result<(), HarnessError>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() != Some(std::ffi::OsStr::new(OMP_WRITER_PROBE_MARKER)) {
+            return None;
+        }
+        return Some((|| {
+            let path = args.next().filter(|_| args.next().is_none()).ok_or_else(|| {
+                HarnessError::Protocol("writer probe requires one exact path".into())
+            })?;
+            let state = linux_read_lease_state(Path::new(&path));
+            std::io::stdout().write_all(match state {
+                SessionWriterState::Active => b"A\n",
+                SessionWriterState::Inactive => b"I\n",
+                SessionWriterState::Unknown => b"U\n",
+            })?;
+            Ok(())
+        })());
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_lease_state(path: &Path) -> SessionWriterState {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    // Only invoked after exec, before any threads start. Drop inherited RPC,
+    // journal and IPC descriptors; never alter the parent's descriptor table.
+    // A kernel without close_range cannot safely run this helper.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0
+            || libc::signal(libc::SIGIO, libc::SIG_IGN) == libc::SIG_ERR
+        {
+            return SessionWriterState::Unknown;
+        }
+    }
+    let Ok(file) = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)
+    else {
+        // Includes EWOULDBLOCK from somebody else's exclusive lease. It does
+        // not prove a write descriptor: a read-only FD can hold a write lease.
+        return SessionWriterState::Unknown;
+    };
+    let Ok(metadata) = file.metadata() else { return SessionWriterState::Unknown };
+    if !metadata.is_file() {
+        return SessionWriterState::Unknown;
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is live and all fcntl arguments here are scalar values. Set
+    // the signal recipient explicitly; no lease-break signal reaches Crew.
+    let state = unsafe {
+        if libc::fcntl(fd, libc::F_SETOWN, libc::getpid()) == -1 {
+            return SessionWriterState::Unknown;
+        }
+        if libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) == 0 {
+            let held = libc::fcntl(fd, libc::F_GETLEASE) == libc::F_RDLCK;
+            let released = libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) == 0;
+            if held && released { SessionWriterState::Inactive } else { SessionWriterState::Unknown }
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+            // The successful nonblocking read-open excludes an exclusive
+            // lease. EAGAIN now means an existing writer, or a write-open
+            // waiting for another read lease to break; neither is inactive.
+            SessionWriterState::Active
+        } else {
+            SessionWriterState::Unknown
+        }
+    };
+    // An unlink/rename during the probe must not certify a different inode.
+    let same_file = std::fs::metadata(path).is_ok_and(|current| {
+        current.dev() == metadata.dev() && current.ino() == metadata.ino()
+    });
+    drop(file); // Closing also releases the lease if explicit unlock failed.
+    if same_file { state } else { SessionWriterState::Unknown }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_session_writer_state_with(path: &Path, executable: &Path) -> SessionWriterState {
+    use std::os::fd::AsRawFd as _;
+
+    let Ok(mut child) = ProcessCommand::new(executable)
+        .arg(OMP_WRITER_PROBE_MARKER).arg(path)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+    else { return SessionWriterState::Unknown };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    if !status.is_some_and(|status| status.success()) {
+        return SessionWriterState::Unknown;
+    }
+    let Some(mut stdout) = child.stdout.take() else { return SessionWriterState::Unknown };
+    // Never wait for a pipe inherited by a stray descendant, or accept a
+    // successful exit with truncated, oversized or unrecognized output.
+    if unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        return SessionWriterState::Unknown;
+    }
+    let mut bytes = [0u8; 3];
+    if !matches!(stdout.read(&mut bytes), Ok(2))
+        || !matches!(stdout.read(&mut [0u8; 1]), Ok(0))
+    {
+        return SessionWriterState::Unknown;
+    }
+    match &bytes[..2] {
+        b"A\n" => SessionWriterState::Active,
+        b"I\n" => SessionWriterState::Inactive,
+        _ => SessionWriterState::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_session_writer_state(path: &Path) -> SessionWriterState {
+    if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return SessionWriterState::Unknown;
+    }
+    std::env::current_exe().map_or(SessionWriterState::Unknown, |executable| {
+        linux_session_writer_state_with(path, &executable)
+    })
+}
+
 fn parse_lsof_writer_pids(stdout: &[u8]) -> Option<Vec<u32>> {
     let mut pid = None;
     let mut writers = Vec::new();
@@ -719,6 +853,7 @@ fn session_writer_state_with(path: &Path, executable: &Path) -> Option<SessionWr
         }
     })
 }
+#[cfg(not(target_os = "linux"))]
 fn parse_lsof_writer_paths(stdout: &[u8]) -> Option<HashSet<Vec<u8>>> {
     let mut writers = HashSet::new();
     let mut file_open = false;
@@ -789,6 +924,7 @@ fn fdinfo_text_is_write_capable(text: &str) -> Option<bool> {
     Some(access == libc::O_WRONLY || access == libc::O_RDWR)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn session_writer_states_with(
     paths: &[PathBuf],
     executable: &Path,
@@ -897,45 +1033,34 @@ fn linux_session_writer_pids(path: &Path) -> Option<Vec<u32>> {
     }
     (!incomplete).then_some(writers)
 }
-/// Probe many exact OMP JSONL paths with one descriptor scan.
+/// Probe exact OMP JSONL paths, retaining input order.
 ///
 /// Results retain input order. Missing tools and incomplete probes fail closed
 /// as `Unknown`; a confirmed write-capable descriptor remains `Active`.
 pub fn session_writer_states(paths: &[PathBuf]) -> Vec<SessionWriterState> {
-    let mut states = vec![SessionWriterState::Unknown; paths.len()];
     #[cfg(target_os = "linux")]
     {
-        states = paths
-            .iter()
-            .map(|path| match linux_session_writer_pids(path) {
-                Some(pids) if pids.is_empty() => SessionWriterState::Inactive,
-                Some(_) => SessionWriterState::Active,
-                None => SessionWriterState::Unknown,
-            })
-            .collect();
-        if states
-            .iter()
-            .all(|state| *state != SessionWriterState::Unknown)
-        {
-            return states;
-        }
+        paths.iter().map(|path| linux_session_writer_state(path)).collect()
     }
-
-    for executable in [
-        Path::new("/usr/sbin/lsof"),
-        Path::new("/usr/bin/lsof"),
-        Path::new("lsof"),
-    ] {
-        if let Some(fallback) = session_writer_states_with(paths, executable) {
-            for (state, fallback) in states.iter_mut().zip(fallback) {
-                if *state == SessionWriterState::Unknown {
-                    *state = fallback;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut states = vec![SessionWriterState::Unknown; paths.len()];
+        for executable in [
+            Path::new("/usr/sbin/lsof"),
+            Path::new("/usr/bin/lsof"),
+            Path::new("lsof"),
+        ] {
+            if let Some(fallback) = session_writer_states_with(paths, executable) {
+                for (state, fallback) in states.iter_mut().zip(fallback) {
+                    if *state == SessionWriterState::Unknown {
+                        *state = fallback;
+                    }
                 }
+                return states;
             }
-            return states;
         }
+        states
     }
-    states
 }
 
 fn session_writer_pids(path: &Path) -> Option<Vec<u32>> {
@@ -958,11 +1083,14 @@ fn session_writer_pids(path: &Path) -> Option<Vec<u32>> {
 
 /// Probe one exact OMP JSONL path for a live writer.
 ///
-/// Linux uses `/proc/<pid>/fdinfo`, so Scaffold images do not need an `lsof`
-/// package. macOS and other Unix hosts resolve the native absolute `lsof`
-/// locations before consulting `PATH`. A missing tool or failed/incomplete
-/// probe is `Unknown`, never `Inactive`.
+/// Linux uses an isolated kernel read-lease helper, without inspecting other
+/// processes or requiring `lsof`. macOS and other Unix hosts resolve the native
+/// absolute `lsof` locations before consulting `PATH`. An incomplete probe is
+/// `Unknown`, never `Inactive`.
 pub fn session_writer_state(path: &Path) -> SessionWriterState {
+    #[cfg(target_os = "linux")]
+    { linux_session_writer_state(path) }
+    #[cfg(not(target_os = "linux"))]
     match session_writer_pids(path) {
         Some(pids) if pids.is_empty() => SessionWriterState::Inactive,
         Some(_) => SessionWriterState::Active,
@@ -1414,9 +1542,7 @@ fn resolve_session(
             "Crew session journal does not exist".into(),
         ));
     }
-    Err(HarnessError::Protocol(
-        "Could not resolve the exact OMP journal; refusing an unverified resume".into(),
-    ))
+    Err(HarnessError::Protocol("Could not resolve the exact OMP journal; refusing an unverified resume".into()))
 }
 
 fn matching_session_files(session_dirs: &[PathBuf], session_id: &str) -> (Vec<PathBuf>, bool) {
@@ -1523,12 +1649,7 @@ fn fork_snapshot_len(bytes: &[u8], active: bool) -> Result<usize, HarnessError> 
         if record.kind == Some("message") {
             state.observe(
                 record.message.as_ref().and_then(|message| message.role),
-                record.stop_reason.or_else(|| {
-                    record
-                        .message
-                        .as_ref()
-                        .and_then(|message| message.stop_reason)
-                }),
+                record.stop_reason.or_else(|| record.message.as_ref().and_then(|message| message.stop_reason)),
                 offset as u64,
             );
         }
@@ -1545,12 +1666,7 @@ fn fork_session_file(
 
 /// Copy a completed-turn native branch without stopping its calling agent.
 /// The durable caller supplies a private target and immutable branch identity.
-pub fn fork_native_session(
-    source: &str,
-    target: &Path,
-    id: &str,
-    scaffold_host: bool,
-) -> Result<String, HarnessError> {
+pub fn fork_native_session(source: &str, target: &Path, id: &str, scaffold_host: bool) -> Result<String, HarnessError> {
     fork_session_to(&omp_session_dirs(scaffold_host), source, Some((target, id)))
 }
 
@@ -1558,33 +1674,19 @@ pub fn fork_native_session(
 pub fn native_session_blob_dir(source: &str, scaffold_host: bool) -> Result<PathBuf, HarnessError> {
     let (_, path) = resolve_session(&omp_session_dirs(scaffold_host), source)?;
     let path = path.ok_or_else(|| HarnessError::Protocol("Native journal unavailable".into()))?;
-    if path
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "native-resumes" || name == "native-branches")
-    {
+    if path.parent().and_then(Path::file_name).is_some_and(|name|
+        name == "native-resumes" || name == "native-branches") {
         // SessionManager always writes to getBlobsDir(), even for --resume /path.
         // These journals were hydrated before launch; subsequent refs are native
         // runtime writes, not pointers back into the immutable imported archive.
-        return omp_session_dirs(scaffold_host)
-            .first()
-            .and_then(|dir| dir.parent())
+        return omp_session_dirs(scaffold_host).first().and_then(|dir| dir.parent())
             .map(|root| root.join("blobs"))
             .ok_or_else(|| HarnessError::Protocol("Native runtime blob store unavailable".into()));
     }
-    if let Some(sessions) = path
-        .ancestors()
-        .find(|path| path.file_name().is_some_and(|name| name == "sessions"))
-    {
-        return Ok(sessions
-            .parent()
-            .ok_or_else(|| HarnessError::Protocol("Native store has no parent".into()))?
-            .join("blobs"));
+    if let Some(sessions) = path.ancestors().find(|path| path.file_name().is_some_and(|name| name == "sessions")) {
+        return Ok(sessions.parent().ok_or_else(|| HarnessError::Protocol("Native store has no parent".into()))?.join("blobs"));
     }
-    Ok(path
-        .parent()
-        .ok_or_else(|| HarnessError::Protocol("Native journal has no parent".into()))?
-        .join("blobs"))
+    Ok(path.parent().ok_or_else(|| HarnessError::Protocol("Native journal has no parent".into()))?.join("blobs"))
 }
 
 fn fork_session_to(
@@ -1611,50 +1713,33 @@ fn fork_session_to(
             "OMP session journal is empty".into(),
         ));
     }
-    let writers = session_writer_pids(source_path).ok_or_else(|| {
-        HarnessError::Protocol("Could not verify the OMP source journal while forking".into())
-    })?;
+    let writers = session_writer_pids(source_path).ok_or_else(|| HarnessError::Protocol(
+        "Could not verify the OMP source journal while forking".into()))?;
     if writers.len() > 1 {
-        return Err(HarnessError::Protocol(
-            "Native source has multiple writers; refusing an ambiguous snapshot".into(),
-        ));
+        return Err(HarnessError::Protocol("Native source has multiple writers; refusing an ambiguous snapshot".into()));
     }
     #[cfg(unix)]
     if !writers.is_empty() {
         let mut owned = Vec::new();
         supervised_descendants(std::process::id(), &mut owned);
-        if writers.iter().any(|pid| {
-            !owned
-                .iter()
-                .any(|(child, birth)| child == pid && process_birth(*pid).as_ref() == Some(birth))
-        }) {
-            return Err(HarnessError::Protocol(
-                "Native source has a writer not owned by this engine".into(),
-            ));
+        if writers.iter().any(|pid| !owned.iter().any(|(child, birth)|
+            child == pid && process_birth(*pid).as_ref() == Some(birth))) {
+            return Err(HarnessError::Protocol("Native source has a writer not owned by this engine".into()));
         }
     }
     #[cfg(not(unix))]
     if !writers.is_empty() {
-        return Err(HarnessError::Protocol(
-            "Active native snapshot ownership is unavailable on this platform".into(),
-        ));
+        return Err(HarnessError::Protocol("Active native snapshot ownership is unavailable on this platform".into()));
     }
     let active = !writers.is_empty();
 
-    let fork_session_id = destination
-        .map(|(_, id)| id.to_owned())
+    let fork_session_id = destination.map(|(_, id)| id.to_owned())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let target = destination
-        .map(|(path, _)| path.to_owned())
-        .unwrap_or_else(|| {
-            source_path
-                .parent()
-                .expect("resolved session parent")
-                .join(format!("crew-fork-{fork_session_id}.jsonl"))
-        });
-    let parent = target
-        .parent()
-        .ok_or_else(|| HarnessError::Protocol("Native fork has no parent".into()))?;
+    let target = destination.map(|(path, _)| path.to_owned()).unwrap_or_else(|| {
+        source_path.parent().expect("resolved session parent")
+            .join(format!("crew-fork-{fork_session_id}.jsonl"))
+    });
+    let parent = target.parent().ok_or_else(|| HarnessError::Protocol("Native fork has no parent".into()))?;
     let mut output = tempfile::NamedTempFile::new_in(parent)?;
     let result = (|| -> Result<(), HarnessError> {
         let mut reader = BufReader::new(source.take(byte_count));
@@ -1714,12 +1799,7 @@ fn fork_session_to(
             if record.kind == Some("message") {
                 snapshot.observe(
                     record.message.as_ref().and_then(|message| message.role),
-                    record.stop_reason.or_else(|| {
-                        record
-                            .message
-                            .as_ref()
-                            .and_then(|message| message.stop_reason)
-                    }),
+                    record.stop_reason.or_else(|| record.message.as_ref().and_then(|message| message.stop_reason)),
                     output_bytes,
                 );
             }
@@ -1734,16 +1814,12 @@ fn fork_session_to(
                 "OMP session journal has no session header".into(),
             ));
         }
-        output
-            .as_file()
-            .set_len(snapshot.snapshot_len(active, output_bytes)?)?;
+        output.as_file().set_len(snapshot.snapshot_len(active, output_bytes)?)?;
         output.as_file().sync_all()?;
         Ok(())
     })();
     result?;
-    output
-        .persist_noclobber(&target)
-        .map_err(|error| HarnessError::Io(error.error))?;
+    output.persist_noclobber(&target).map_err(|error| HarnessError::Io(error.error))?;
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
     Ok(fork_session_id)
@@ -1973,9 +2049,7 @@ impl OmpHarness {
             return crate::executable::validate_native_override(executable);
         }
         resolve_omp_executable().ok_or_else(|| {
-            HarnessError::NotInstalled(
-                "omp (install Crew's pinned native OMP runtime or set OMP_EXECUTABLE)".into(),
-            )
+            HarnessError::NotInstalled("omp (install Crew's pinned native OMP runtime or set OMP_EXECUTABLE)".into())
         })
     }
 
@@ -2113,9 +2187,7 @@ impl OmpHarness {
 
     fn command_catalog_command(&self, executable: &Path, cwd: &str, guard: &Path) -> Command {
         let mut command = self.rpc_mode_command(executable, cwd, false);
-        command
-            .args(["--no-session", "--comet-command-catalog", "--extension"])
-            .arg(guard);
+        command.args(["--no-session", "--comet-command-catalog", "--extension"]).arg(guard);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -2219,25 +2291,14 @@ impl Harness for OmpHarness {
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
     }
-    fn installed(&self) -> bool {
-        self.resolve_executable().is_ok()
-    }
-    fn executable_path(&self) -> Option<PathBuf> {
-        self.resolve_executable().ok()
-    }
-    fn deterministic_turn_end(&self) -> bool {
-        true
-    }
-    fn stops_turn_in_place(&self) -> bool {
-        true
-    }
+    fn installed(&self) -> bool { self.resolve_executable().is_ok() }
+    fn executable_path(&self) -> Option<PathBuf> { self.resolve_executable().ok() }
+    fn deterministic_turn_end(&self) -> bool { true }
+    fn stops_turn_in_place(&self) -> bool { true }
     fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
-        let files: Vec<_> = omp_session_dirs(self.scaffold_host)
-            .iter()
+        let files: Vec<_> = omp_session_dirs(self.scaffold_host).iter()
             .filter_map(|sessions| sessions.parent())
-            .flat_map(|root| {
-                ["models.json", "settings.json", "auth.json"].map(|name| root.join(name))
-            })
+            .flat_map(|root| ["models.json", "settings.json", "auth.json"].map(|name| root.join(name)))
             .collect();
         crate::model_context::context(self.id(), &self.resolve_executable()?, &files).map(Some)
     }
@@ -2308,9 +2369,7 @@ impl Harness for OmpHarness {
     }
 
     async fn commands_for(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
-        let cwd = cwd
-            .to_str()
-            .ok_or_else(|| HarnessError::Protocol("OMP cwd is not UTF-8".into()))?;
+        let cwd = cwd.to_str().ok_or_else(|| HarnessError::Protocol("OMP cwd is not UTF-8".into()))?;
         let executable = self.resolve_executable()?;
         let catalog = crate::scratch::ScratchDir::new("omp-command-catalog")?;
         let guard = catalog.path().join("guard.js");
@@ -2321,25 +2380,24 @@ impl Harness for OmpHarness {
         std::fs::write(&config, "skillful: false\nmemory:\n  backend: off\n")?;
         let mut command = self.command_catalog_command(&executable, cwd, &guard);
         command.env_remove(PI_CONFIG_FILES_ENV);
-        for path in config_overlay_paths(std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(), &config)
-        {
+        for path in config_overlay_paths(std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(), &config) {
             command.arg("--config").arg(path);
         }
-        let mut child = command.spawn().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(executable.display().to_string())
-            } else {
-                HarnessError::Io(error)
-            }
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    HarnessError::NotInstalled(executable.display().to_string())
+                } else {
+                    HarnessError::Io(error)
+                }
+            })?;
         #[cfg(unix)]
         let process_group = child.id().map(|pid| pid as i32);
         #[cfg(not(unix))]
         let process_group = None;
-        let process_group_guard = rpc_mode::ProcessGroupGuard::new(
-            process_group,
-            cfg!(unix) && self.supervisor_executable.is_some(),
-        );
+        let process_group_guard =
+            rpc_mode::ProcessGroupGuard::new(process_group, cfg!(unix) && self.supervisor_executable.is_some());
         let stdin = child
             .stdin
             .take()
@@ -2381,6 +2439,17 @@ impl Harness for OmpHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         crate::validate_inference_route(self.id(), controls.context.as_ref())?;
         let executable = self.resolve_executable()?;
+        if controls.context.as_ref().and_then(|context| context.inference.as_ref())
+            .is_some_and(|route| route.provider == "antigravity") {
+            let probe = executable.clone();
+            let supported = tokio::task::spawn_blocking(move || {
+                crate::executable::binary_version(&probe)
+                    .is_some_and(|version| version >= semver::Version::new(18, 13, 3))
+            }).await.map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            if !supported {
+                return Err(HarnessError::Protocol("Google through Crew requires OMP 18.13.3 or newer. Update OMP in Settings → Agents.".into()));
+            }
+        }
         if let Some(fork_from) = controls
             .context
             .as_ref()
@@ -2441,27 +2510,64 @@ impl Harness for OmpHarness {
             .and_then(|context| context.inference.as_ref())
         {
             let gateway = crate::scratch::ScratchDir::new("omp-agent-auth")?;
-            let extension = gateway.path().join("agent-auth.ts");
-            std::fs::write(&extension, include_str!("auth_gateway.ts"))?;
-            command.arg("--extension").arg(extension);
-            let provider = match inference.provider.as_str() {
-                "openai" => "comet-openai",
-                "anthropic" => "comet-anthropic",
-                _ => {
-                    return Err(HarnessError::Protocol(
-                        "Unsupported Agent Auth provider".into(),
-                    ));
+            let model = if inference.provider == "antigravity" {
+                // A static provider override survives OMP's variant normalization;
+                // registerProvider alone can fall back to Google's direct URL.
+                std::fs::write(gateway.path().join("models.yml"), serde_json::to_vec(&serde_json::json!({
+                    "providers": {"google-antigravity": {
+                        "baseUrl": inference.base_url.trim_end_matches('/'),
+                        "apiKey": "OMP_GOOGLE_CREDENTIALS"
+                    }}
+                })).map_err(|error| HarnessError::Protocol(error.to_string()))?)?;
+                let extension = gateway.path().join("google-route.ts");
+                std::fs::write(&extension, include_str!("google_auth_gateway.ts"))?;
+                command.args(["--profile", "default", "--no-extensions", "--crew-google-route"])
+                    .arg("--extension").arg(extension)
+                    .env_remove("OMP_PROFILE").env_remove("PI_PROFILE")
+                    .env("PI_CODING_AGENT_DIR", gateway.path())
+                    .env("OMP_GOOGLE_BOUND_MODEL", &inference.model)
+                    .env("OMP_GOOGLE_CREDENTIALS", serde_json::json!({
+                        "token": inference.token, "projectId": "crew-managed"
+                    }).to_string());
+                // Journals and content-addressed image blobs must survive this
+                // disposable profile. Only the blob directory is linked; auth,
+                // settings, model caches, and extensions remain run-isolated.
+                let session_root = session_dirs.first().ok_or_else(|| HarnessError::Protocol("OMP session directory unavailable".into()))?;
+                let blobs = session_root.parent().ok_or_else(|| HarnessError::Protocol("OMP blob directory unavailable".into()))?.join("blobs");
+                std::fs::create_dir_all(&blobs)?;
+                let blobs = std::fs::canonicalize(blobs)?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&blobs, gateway.path().join("blobs"))?;
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_dir(&blobs, gateway.path().join("blobs"))?;
+                let sessions = session_root.join("crew-managed");
+                std::fs::create_dir_all(&sessions)?;
+                command.arg("--session-dir").arg(sessions);
+                let (logical, tier) = managed_google_model(&inference.model);
+                let selected = format!("google-antigravity/{logical}");
+                let mut overlay = std::fs::OpenOptions::new().append(true).open(&run_config.path)?;
+                writeln!(overlay, "providers:\n  antigravityEndpoint: auto\nenabledModels:\n  - {selected}\nretry:\n  modelFallback: false\n  usageAwareFallback: false\ncontextPromotion:\n  enabled: false")?;
+                writeln!(overlay, "modelRoles:")?;
+                for role in ["default", "smol", "slow", "vision", "plan", "commit", "tiny", "memory", "task", "advisor", "widget", "judge"] {
+                    writeln!(overlay, "  {role}: {selected}")?;
                 }
+                if let Some(tier) = tier { command.args(["--thinking", tier]); }
+                format!("google-antigravity/{logical}")
+            } else {
+                let extension = gateway.path().join("agent-auth.ts");
+                std::fs::write(&extension, include_str!("auth_gateway.ts"))?;
+                command.arg("--extension").arg(extension);
+                let provider = match inference.provider.as_str() {
+                    "openai" => "comet-openai",
+                    "anthropic" => "comet-anthropic",
+                    _ => return Err(HarnessError::Protocol("Unsupported Agent Auth provider".into())),
+                };
+                let model = inference.model.rsplit('/').next().unwrap_or(&inference.model);
+                format!("{provider}/{model}")
             };
-            let model = inference
-                .model
-                .rsplit('/')
-                .next()
-                .unwrap_or(&inference.model);
-            let model = format!("{provider}/{model}");
             command.args(["--model", &model]);
-            // Keep role-selected children on this run's Agent Auth route without
-            // changing workstation preferences or shadowable extension flags.
+            if inference.provider == "antigravity" { command.args(["--models", &model]); }
+            // All role-selected children inherit this exact managed route.
             for role in ["PI_SMOL_MODEL", "PI_SLOW_MODEL", "PI_PLAN_MODEL"] {
                 command.env(role, &model);
             }
@@ -2549,27 +2655,48 @@ pub(crate) type RequestInputFn = Box<
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ownership_lease_helper_rejects_bad_output_and_reaps_on_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("probe");
+        let journal = dir.path().join("journal");
+        for (body, expected) in [
+            ("printf 'I\\n'", SessionWriterState::Inactive),
+            ("printf 'A\\n'", SessionWriterState::Active),
+            ("printf 'U\\n'", SessionWriterState::Unknown),
+            ("exit 0", SessionWriterState::Unknown),
+            ("printf I", SessionWriterState::Unknown),
+            ("printf 'I\\nextra'", SessionWriterState::Unknown),
+            ("printf 'I\\n'; exit 1", SessionWriterState::Unknown),
+            ("kill -KILL $$", SessionWriterState::Unknown),
+        ] {
+            std::fs::write(&helper, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(linux_session_writer_state_with(&journal, &helper), expected, "{body}");
+        }
+        assert_eq!(linux_session_writer_state_with(&journal, &dir.path().join("missing")),
+            SessionWriterState::Unknown);
+        let pid_file = dir.path().join("pid");
+        std::fs::write(&helper, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 10\n", pid_file.display())).unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(linux_session_writer_state_with(&journal, &helper), SessionWriterState::Unknown);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().trim().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "timed-out helper survived");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
     #[test]
     fn ownership_probe_distinguishes_readers_writers_and_incomplete_evidence() {
-        assert_eq!(
-            parse_lsof_writer_pids(b"p10\nf3\nar\nnx\np11\nf4\naw\nnx\n"),
-            Some(vec![11])
-        );
+        assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nar\nnx\np11\nf4\naw\nnx\n"), Some(vec![11]));
         assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nar\nnx\n"), Some(vec![]));
         assert_eq!(parse_lsof_writer_pids(b"p10\nf3\nnx\n"), None);
-        assert_eq!(
-            fdinfo_text_is_write_capable("flags:\t0100000\n"),
-            Some(false)
-        );
-        assert_eq!(
-            fdinfo_text_is_write_capable("flags:\t0100002\n"),
-            Some(true)
-        );
+        assert_eq!(fdinfo_text_is_write_capable("flags:\t0100000\n"), Some(false));
+        assert_eq!(fdinfo_text_is_write_capable("flags:\t0100002\n"), Some(true));
         assert_eq!(fdinfo_text_is_write_capable("pos:\t0\n"), None);
-        assert_eq!(
-            linux_parent_and_group("321 (worker name) S 42 77 77 0 -1 0"),
-            Some((42, 77))
-        );
+        assert_eq!(linux_parent_and_group("321 (worker name) S 42 77 77 0 -1 0"), Some((42, 77)));
     }
 
     #[test]
@@ -2580,16 +2707,8 @@ mod tests {
             "{\"type\":\"message\",\"id\":\"tool\",\"stopReason\":\"toolUse\",\"message\":{\"role\":\"assistant\"}}\n",
         ).as_bytes();
         let boundary = fork_snapshot_len(bytes, true).unwrap();
-        assert!(
-            std::str::from_utf8(&bytes[..boundary])
-                .unwrap()
-                .contains("\"user\"")
-        );
-        assert!(
-            !std::str::from_utf8(&bytes[..boundary])
-                .unwrap()
-                .contains("\"tool\"")
-        );
+        assert!(std::str::from_utf8(&bytes[..boundary]).unwrap().contains("\"user\""));
+        assert!(!std::str::from_utf8(&bytes[..boundary]).unwrap().contains("\"tool\""));
         assert_eq!(fork_snapshot_len(bytes, false).unwrap(), bytes.len());
     }
 
@@ -2597,20 +2716,10 @@ mod tests {
     fn active_snapshot_never_includes_nested_tool_use_or_partial_tail() {
         let header = "{\"type\":\"session\",\"id\":\"source\",\"cwd\":\"/repo\"}\n";
         let user = "{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n";
-        let running = format!(
-            "{header}{user}{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"toolUse\"}}}}\n{{\"partial\":"
-        );
-        assert_eq!(
-            fork_snapshot_len(running.as_bytes(), true).unwrap(),
-            header.len() + user.len()
-        );
-        let complete = format!(
-            "{header}{user}{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\"}}}}\n"
-        );
-        assert_eq!(
-            fork_snapshot_len(complete.as_bytes(), true).unwrap(),
-            complete.len()
-        );
+        let running = format!("{header}{user}{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"toolUse\"}}}}\n{{\"partial\":");
+        assert_eq!(fork_snapshot_len(running.as_bytes(), true).unwrap(), header.len() + user.len());
+        let complete = format!("{header}{user}{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\"}}}}\n");
+        assert_eq!(fork_snapshot_len(complete.as_bytes(), true).unwrap(), complete.len());
     }
 
     #[test]
@@ -2627,13 +2736,9 @@ mod tests {
         let snapshot = std::fs::read(&target).unwrap();
         assert!(fork_native_session(source.to_str().unwrap(), &target, &id, false).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), snapshot);
-        #[cfg(unix)]
-        {
+        #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&target).unwrap().permissions().mode() & 0o077,
-                0
-            );
+            assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o077, 0);
         }
     }
 }

@@ -8,14 +8,11 @@ pub(crate) fn validate_inference_route(
     let Some(route) = context.and_then(|context| context.inference.as_ref()) else {
         return Ok(());
     };
-    let compatible = matches!(
-        (harness, route.provider.as_str()),
-        (HarnessId::Omp, "openai" | "anthropic")
-            | (HarnessId::Codex, "openai")
-            | (HarnessId::ClaudeCode, "anthropic")
-            | (HarnessId::Antigravity, "antigravity")
-    );
-    let url = reqwest::Url::parse(&route.base_url).ok();
+    let compatible = matches!((harness, route.provider.as_str()),
+        (HarnessId::Omp, "openai" | "anthropic" | "antigravity")
+        | (HarnessId::Codex, "openai")
+        | (HarnessId::ClaudeCode, "anthropic")
+        | (HarnessId::Antigravity, "antigravity"));    let url = reqwest::Url::parse(&route.base_url).ok();
     let loopback = url.as_ref().is_some_and(|url| {
         url.scheme() == "http"
             && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
@@ -106,10 +103,12 @@ pub(crate) fn apply_run_context(cmd: &mut Command, context: Option<&RunContext>)
         "AGY_GATEWAY_API_KEY",
         "AGY_GATEWAY_HEADERS",
         "AGY_CA_CERT",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "OMP_GOOGLE_CREDENTIALS",
     ] {
         cmd.env_remove(key);
-    }
-        cmd.env_remove(key);
+    }        cmd.env_remove(key);
     }
     cmd.env("COMET_INFERENCE_TOKEN", &route.token)
         .env("OMP_AUTH_GATEWAY_URL", route.base_url.trim_end_matches('/'))
