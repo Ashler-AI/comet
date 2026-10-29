@@ -91,6 +91,8 @@ fn request(resume: Option<&str>) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         resume: resume.map(str::to_owned),
         attachments: Vec::new(),
     }

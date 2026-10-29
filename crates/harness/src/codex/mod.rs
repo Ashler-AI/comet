@@ -1387,7 +1387,7 @@ async fn run_session(session: Session) {
     // The runtime's process tree when its teardown began (see
     // [`crate::shutdown_agent`]).
     #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut torn_down: Vec<i32> = Vec::new();
+    let mut torn_down: Vec<crate::process::Tracked> = Vec::new();
 
     'main: loop {
         tokio::select! {
@@ -1606,7 +1606,7 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
-                        let error = turn_error_message(&params).or_else(|| {
+                        let error = turn_error_message(&params, None).or_else(|| {
                             (params
                                 .pointer("/turn/status")
                                 .and_then(Value::as_str)
@@ -1710,7 +1710,7 @@ async fn run_session(session: Session) {
                                 },
                                 result: None,
                                 error: Some(
-                                    turn_error_message(&params)
+                                    turn_error_message(&params, None)
                                         .unwrap_or_else(|| "Codex turn failed".into()),
                                 ),
                                 session_id: Some(thread_id.clone()),
