@@ -872,6 +872,8 @@ mod tests {
             spawn_error(busy, Some(tmp.path()), || unreachable!()),
             crate::HarnessError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied
         ));
+    }
+
     // Official standalone OMP prints a slash-qualified version, which must
     // pass minimum-version admission without accepting arbitrary path suffixes.
     #[test]
