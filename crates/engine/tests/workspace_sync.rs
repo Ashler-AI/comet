@@ -705,6 +705,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 git_checked_at: Some(now),
                 checkout_id: Some("co-1".into()),
                 repository_id: None,
+                github_repo: None,
                 created_at: now,
             })
             .unwrap();
@@ -730,6 +731,8 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
             .unwrap();
         legacy
             .upsert_session(&Session {
+                last_turn_outcome: None,
+                terminal_activity: None,
                 last_completed_turn: None,
                 running_subagents: 0,
                 chat_id: "chat-legacy".into(),

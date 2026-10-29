@@ -25,7 +25,7 @@ use gpui::{
 
 use zeron_engine::registry::{HarnessDescriptor, TitleSettings};
 use zeron_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    AccessMode, ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
     ScaffoldDatabaseEnvironment, Space,
 };
 use zeron_rpc::methods;
@@ -152,6 +152,8 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    pub access: AccessMode,
+    pub plan: bool,
 }
 
 impl ResolvedRunConfig {
@@ -163,6 +165,8 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            access: self.access,
+            plan: self.plan,
         })
     }
 }
@@ -1589,6 +1593,8 @@ impl Pickers {
                 model: self.effective_model_id(cx).map(str::to_string),
                 reasoning: self.explicit_reasoning(cx),
                 model_options: self.explicit_options(cx),
+                access: AccessMode::default(),
+                plan: false,
             };
         }
         ResolvedRunConfig {
@@ -1600,6 +1606,8 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            access: AccessMode::default(),
+            plan: false,
         }
     }
 

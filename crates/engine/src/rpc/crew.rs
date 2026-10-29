@@ -487,6 +487,7 @@ impl EngineRpc {
                 let config = chat.config.get_or_insert_with(|| ChatConfig {
                     harness: HarnessId::Omp, model: None, reasoning: None,
                     model_options: Default::default(), sandbox: zeron_proto::SandboxLevel::DangerFullAccess,
+                    access: Default::default(), plan: false,
                 });
                 config.harness = HarnessId::Omp;
                 config.model = Some(route.omp_model());

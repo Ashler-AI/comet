@@ -552,7 +552,7 @@ mod tests {
         workspace.create_chat(local_id, None, Some("test-device"), Some(zeron_proto::ChatConfig {
             harness: zeron_proto::HarnessId::Omp, model: Some("original-model".into()),
             reasoning: None, model_options: Default::default(),
-            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite, access: Default::default(), plan: false,
         }), Some("/original/repo".into())).unwrap();
         workspace.set_chat_harness_session(
             local_id,

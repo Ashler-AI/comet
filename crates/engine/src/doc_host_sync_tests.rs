@@ -17,6 +17,7 @@ async fn local_history_preserves_transcript_and_continuation_without_cloud_work(
         workspace.create_chat(id, None, Some("host"), Some(zeron_proto::ChatConfig {
             harness: HarnessId::Omp, model: Some("original-model".into()), reasoning: None,
             model_options: Default::default(), sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            access: Default::default(), plan: false,
         }), Some("/original/repo".into())).unwrap();
         workspace.set_chat_harness_session(
             id,

@@ -6359,6 +6359,7 @@ mod tests {
         chat.config = Some(zeron_proto::ChatConfig {
             harness: HarnessId::Omp, model: request.model.clone(), reasoning: request.reasoning,
             model_options: request.model_options.clone(), sandbox: request.sandbox,
+            access: request.access, plan: request.plan,
         });
         workspace.import_chat_row(&chat).unwrap();
         let host = DocHost::new(store.clone(), crate::DocHostConfig {
