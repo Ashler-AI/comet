@@ -1353,6 +1353,34 @@ impl AcpHarness {
             .with_model_discovery_timeout(ANTIGRAVITY_DISCOVERY_TIMEOUT)
     }
 
+    pub async fn probe_managed_gateway(&self, context: &crate::RunContext) -> Result<(), HarnessError> {
+        crate::validate_inference_route(self.id(), Some(context))?;
+        let route = context.inference.as_ref().filter(|route|
+            self.id() == HarnessId::Antigravity && route.provider == "antigravity")
+            .ok_or_else(|| HarnessError::Protocol("Antigravity gateway route required".into()))?;
+        let workspace = ScratchDir::new("antigravity-metadata")?;
+        let (_scratch, mut child, _stderr, prompted) = self
+            .spawn_agent(workspace.path().to_str(), true, &[], None, Some(context)).await?;
+        let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => client_with_sign_in_prompt(stdin, stdout, self.id(), &prompted),
+            _ => {
+                child.shutdown(self.kill_grace).await;
+                return Err(HarnessError::Protocol("agent child has no stdio".into()));
+            }
+        };
+        let flow = async {
+            client.request("initialize", managed_initialize_params(self.id(), true)).await?;
+            request_draining(&client, &mut incoming, "authenticate", gateway_auth_params(route)).await?;
+            request_draining(&client, &mut incoming, "session/new", json!({
+                "cwd":workspace.path(),"mcpServers":[]
+            })).await?;
+            Ok(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(60), flow).await;
+        child.shutdown(self.kill_grace).await;
+        result.map_err(|_| HarnessError::Protocol("Antigravity gateway metadata timed out".into()))?
+    }
+
     /// sign the agent out with acp `logout`, clearing the credentials its
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
@@ -2626,6 +2654,19 @@ struct ConfigRules {
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     /// Fixed for the agent's life (see `reconfigures_in_place`).
     access: AccessMode,
+}
+
+fn managed_initialize_params(harness: HarnessId, gateway: bool) -> Value {
+    let mut params = initialize_params(harness);
+    if gateway {
+        params["clientCapabilities"]["auth"] = json!({"_meta":{"gateway":true}});
+    }
+    params
+}
+
+fn gateway_auth_params(route: &crate::InferenceRoute) -> Value {
+    json!({"methodId":"gateway","_meta":{"gateway":{"baseUrl":route.base_url,
+        "headers":{"Authorization":format!("Bearer {}", route.token)}}}})
 }
 
 fn initialize_params(harness: HarnessId) -> Value {
