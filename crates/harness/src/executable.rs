@@ -459,11 +459,9 @@ pub(crate) fn parse_version(bytes: &[u8]) -> Option<semver::Version> {
     String::from_utf8_lossy(bytes)
         .split_whitespace()
         .find_map(|word| {
-            semver::Version::parse(
-                word.trim_matches(|c: char| matches!(c, '(' | ')' | ','))
-                    .trim_start_matches('v'),
-            )
-            .ok()
+            let word = word.trim_matches(|c: char| matches!(c, '(' | ')' | ','));
+            let version = word.strip_prefix("omp/").unwrap_or(word);
+            semver::Version::parse(version.trim_start_matches('v')).ok()
         })
 }
 
@@ -874,6 +872,13 @@ mod tests {
             spawn_error(busy, Some(tmp.path()), || unreachable!()),
             crate::HarnessError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied
         ));
+    // Official standalone OMP prints a slash-qualified version, which must
+    // pass minimum-version admission without accepting arbitrary path suffixes.
+    #[test]
+    fn official_omp_version_is_recognized_without_accepting_paths() {
+        assert_eq!(parse_version(b"omp/18.13.3\n"), Some(semver::Version::new(18, 13, 3)));
+        assert!(parse_version(b"/tmp/omp/18.13.3").is_none());
+        assert!(parse_version(b"other/18.13.3").is_none());
     }
 
     #[test]
