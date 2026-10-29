@@ -12,7 +12,8 @@ pub(crate) fn validate_inference_route(
         (HarnessId::Omp, "openai" | "anthropic" | "antigravity")
         | (HarnessId::Codex, "openai")
         | (HarnessId::ClaudeCode, "anthropic")
-        | (HarnessId::Antigravity, "antigravity"));    let url = reqwest::Url::parse(&route.base_url).ok();
+        | (HarnessId::Antigravity, "antigravity"));
+    let url = reqwest::Url::parse(&route.base_url).ok();
     let loopback = url.as_ref().is_some_and(|url| {
         url.scheme() == "http"
             && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
@@ -108,7 +109,6 @@ pub(crate) fn apply_run_context(cmd: &mut Command, context: Option<&RunContext>)
         "OMP_GOOGLE_CREDENTIALS",
     ] {
         cmd.env_remove(key);
-    }        cmd.env_remove(key);
     }
     cmd.env("COMET_INFERENCE_TOKEN", &route.token)
         .env("OMP_AUTH_GATEWAY_URL", route.base_url.trim_end_matches('/'))
