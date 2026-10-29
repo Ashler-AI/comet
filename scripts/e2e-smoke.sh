@@ -3,7 +3,9 @@
 # zeron-rpc e2e_driver example proving the doc-queued cross-device command path:
 #
 #   B queues a Run into the chat doc -> nudge -> A (host) executes via the mock
-#   harness -> transcript + session status sync A -> edge -> B.
+#   harness -> transcript + session status sync A -> edge -> B; then B stages a
+#   synthetic 5,357,034-byte .bin, queues its pending ref, and the driver checks
+#   A's committed bytes + SHA-256 through RPC after the second mock run completes.
 #
 # Both engines run as the SAME user (alice@org1) on different devices — zeron's
 # one-user-many-devices model; chat/device rooms are claim-on-first-join per user.
@@ -106,8 +108,8 @@ echo "build: zeron + e2e_driver"
 # Two invocations: a single one with `--example` builds ONLY the example
 # (the target filter applies across every -p), silently skipping the zeron
 # bin — the smoke then dies on "No such file or directory".
-(cd "$ROOT" && cargo build -q -p zeron)
-(cd "$ROOT" && cargo build -q -p zeron-rpc --example e2e_driver)
+(cd "$ROOT" && cargo build --locked -q -p zeron)
+(cd "$ROOT" && cargo build --locked -q -p zeron-rpc --example e2e_driver)
 ZERON="$ROOT/target/debug/zeron"
 DRIVER="$ROOT/target/debug/examples/e2e_driver"
 
