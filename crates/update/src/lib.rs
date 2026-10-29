@@ -806,6 +806,11 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Atomically repoint `app_root/current` at `app_root/<ver>` (symlink to a temp
 /// name, then rename over — never a window with no `current`).
 pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
