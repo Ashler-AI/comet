@@ -135,8 +135,10 @@ mod tests {
         let auth = zeron_engine::Auth::new(auth_config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.ipc_port = listener.local_addr().unwrap().port();
+        let ipc_token = zeron_rpc::ipc_auth::issue_token(temp.path()).unwrap();
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
             listener, std::sync::Arc::new(zeron_engine::rpc::AuthRpc::new(auth.clone())),
+            ipc_token,
         ));
         let (tokens, lock) = update_authentication(&config).await.unwrap();
         assert!(lock.is_none());
