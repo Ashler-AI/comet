@@ -105,12 +105,8 @@ pub struct RelayedCallback {
 }
 
 mod oauth;
-<<<<<<< HEAD
 mod muse;
 mod antigravity;
-=======
-mod antigravity;
->>>>>>> 14775b1a (feat(agent-auth): add native Antigravity OAuth routing)
 #[cfg(test)]
 mod provider_tests;
 mod stores;
