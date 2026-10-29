@@ -64,7 +64,11 @@ pub fn crew_session_link(chat: &Chat) -> Option<String> {
 
 pub fn crew_scope_link(scope: &zeron_proto::CollaborationScope) -> Option<String> {
     let id = uuid::Uuid::parse_str(scope.session_id.as_deref()?).ok()?;
-    let mut link = format!("crew-upstream-canary://session/{}/{}", encode_component(&scope.project_id), id);
+    let mut link = format!(
+        "crew-upstream-canary://session/{}/{}",
+        encode_component(&scope.project_id),
+        id
+    );
     if let Some(deployment) = &scope.deployment_id {
         link.push_str("?deploymentId=");
         link.push_str(&encode_component(deployment));
@@ -89,7 +93,8 @@ pub fn parse_zeron_conversation_link(url: &str) -> Result<ConversationDeepLink, 
     if chat_id.is_empty() || chat_id.contains('/') {
         return Err("invalid conversation id");
     }
-    let workspace = query.strip_prefix("workspace=")
+    let workspace = query
+        .strip_prefix("workspace=")
         .filter(|value| !value.is_empty() && !value.contains('&') && !value.contains('#'))
         .ok_or("invalid workspace locator or unexpected link parameters")?;
     Ok(ConversationDeepLink {
@@ -150,30 +155,36 @@ mod tests {
     use super::*;
 
     fn harness_chat(harness: HarnessId) -> Chat {
-        Chat { crew: None, id: "chat".into(),
-        device_id: "device".into(),
-        title: None,
-        archived: false,
-        cwd: None,
-        branch: None,
-        checkout_id: None,
-        source_context: None,
-        config: Some(zeron_proto::ChatConfig {
-            harness,
-            model: None,
-            reasoning: None,
-            model_options: Default::default(),
-            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-        }),
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: chrono::DateTime::UNIX_EPOCH,
-        harness_session_id: Some("thread/one".into()),
-        harness_session_cwd: None,
-        parent_chat_id: None,
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None, }
+        Chat {
+            crew: None,
+            harness_session_harness: None,
+            id: "chat".into(),
+            device_id: "device".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: Some(zeron_proto::ChatConfig {
+                harness,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
+            }),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            harness_session_id: Some("thread/one".into()),
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
     }
 
     #[test]
@@ -261,11 +272,19 @@ mod tests {
     fn crew_links_preserve_scope_without_credentials() {
         let session = "011664b5-3660-4fe6-83a2-3647fa6a2f65";
         for scheme in ["comet", "comet-staging", "crew-upstream-canary"] {
-            let scope = crew_link_scope(&format!("{scheme}://session/project/{session}?deploymentId=canary")).unwrap();
+            let scope = crew_link_scope(&format!(
+                "{scheme}://session/project/{session}?deploymentId=canary"
+            ))
+            .unwrap();
             assert_eq!(scope.project_id, "project");
             assert_eq!(scope.deployment_id.as_deref(), Some("canary"));
             assert_eq!(scope.session_id.as_deref(), Some(session));
-            assert!(crew_link_scope(&format!("{scheme}://session/project/{session}?token=secret")).is_none());
+            assert!(
+                crew_link_scope(&format!(
+                    "{scheme}://session/project/{session}?token=secret"
+                ))
+                .is_none()
+            );
         }
         let link = zeron_conversation_link("same-session", "scope");
         assert!(link.starts_with("crew-upstream-canary://"));

@@ -40,9 +40,12 @@ async fn turn(
         cwd: cwd.into(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: vec![],
         worktree: None,
         resume: session.clone(),
+        env: Default::default(),
     };
     let mut stream = harness
         .run(request, controls)
@@ -160,9 +163,12 @@ async fn parked(harness: &CursorHarness, count: usize) {
         cwd: workspace.path().to_str().unwrap().into(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: vec![],
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
     let mut stream = harness.run(request, controls).await.unwrap();
     let mut id = String::new();
@@ -274,9 +280,12 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
         cwd: workspace.path().to_str().unwrap().into(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: vec![],
         worktree: None,
         resume: seed,
+        env: Default::default(),
     };
     let mut stream = harness.run(request, controls).await.unwrap();
     let producer = tokio::spawn(async move {
@@ -409,9 +418,12 @@ async fn history(harness: &CursorHarness, count: usize) {
         cwd: workspace.path().to_str().unwrap().into(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: vec![],
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
     let mut stream = harness.run(request, controls).await.unwrap();
     let (start_tx, start_rx) = oneshot::channel();

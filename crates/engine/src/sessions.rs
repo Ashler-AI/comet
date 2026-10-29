@@ -36,6 +36,9 @@ use zeron_proto::{
 
 use crate::boat_lease::{BoatLease, BoatRun};
 use crate::doc_host::{ChatDocHandle, DocHost};
+
+#[path = "session_activity.rs"]
+mod activity;
 use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
@@ -68,6 +71,9 @@ type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnsw
 struct HarnessSessionRef {
     session_id: String,
     cwd: String,
+    /// The provider that minted this id. Older durable rows may not yet have
+    /// an owner tag, but a known owner must match before an id is resumed.
+    harness: Option<HarnessId>,
 }
 
 /// The configuration a live harness runtime launched with. The steering
@@ -183,6 +189,27 @@ struct RunHandle {
     /// is unambiguously before the stop (cancelled with it) or after it
     /// (re-dispatched to a fresh runtime — never lost).
     retiring: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while graceful shutdown owns an in-flight turn. A later user Stop
+    /// clears it so shutdown recovery never revives explicitly stopped work.
+    shutdown_cut: std::sync::atomic::AtomicBool,
+    /// Credential identity used when this provider process started.
+    credential: Option<String>,
+    /// CLI executable identity when this provider process started.
+    binary: Option<String>,
+    /// Whether this run was launched with provider-native subagents disabled.
+    side_chats_only: bool,
+}
+
+/// The CLI binary a run launches now: real path, modification time and size.
+fn binary_identity(harness: &dyn Harness) -> Option<String> {
+    let path = std::fs::canonicalize(harness.executable_path()?).ok()?;
+    let metadata = path.metadata().ok()?;
+    Some(format!(
+        "{}:{:?}:{}",
+        path.display(),
+        metadata.modified().ok(),
+        metadata.len()
+    ))
 }
 
 /// Connection-owned: a stale subscription releases only its original run.
@@ -257,6 +284,12 @@ struct RoutedSteer {
     request: Option<Box<RunRequest>>,
 }
 
+#[derive(Debug, Clone)]
+struct Revival {
+    message_id: String,
+    continuation: Option<String>,
+}
+
 struct Inner {
     boat_lease: BoatLease,
     namespace_tasks: crate::namespace_tasks::NamespaceTasks,
@@ -264,12 +297,18 @@ struct Inner {
     device_id: String,
     /// The engine is shutting down: dying runs re-dispatch nothing.
     shutting_down: std::sync::atomic::AtomicBool,
+    revive_after_shutdown: std::sync::atomic::AtomicBool,
+    revivals: Mutex<HashMap<String, Revival>>,
     /// Per chat: messages a Stop cancelled while they were still on their
     /// way (see [`SessionsEngine::cancel_sent_messages`]).
     cancelled_sends: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    user_stops: Mutex<HashMap<String, u64>>,
     /// Loopback IPC port this engine serves, once known (0 = not serving):
     /// what the injected `zeron mcp` server dials back into.
     ipc_port: std::sync::atomic::AtomicU16,
+    /// Profile-local bearer path for authenticated IPC. Agents receive the
+    /// path and read the rotating token when they connect.
+    ipc_token_file: Mutex<Option<std::path::PathBuf>>,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
@@ -282,6 +321,10 @@ struct Inner {
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
     sessions_tx: watch::Sender<Vec<Session>>,
+    /// View-only projection that merges terminal-reported activity into the
+    /// native session rows without changing native control state.
+    activity_tx: OnceLock<watch::Sender<Vec<Session>>>,
+    activity_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Last dispatched request per chat — the steer→new-turn fallback re-derives its
     /// run config from this (chat config rows land with the workspace doc in M4).
     last_requests: Mutex<HashMap<String, RunRequest>>,
@@ -391,8 +434,12 @@ impl SessionsEngine {
                 voice: crate::voice::VoiceManager::default(),
                 device_id,
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
+                revive_after_shutdown: std::sync::atomic::AtomicBool::new(true),
+                revivals: Mutex::new(HashMap::new()),
                 cancelled_sends: Mutex::new(HashMap::new()),
+                user_stops: Mutex::new(HashMap::new()),
                 ipc_port: std::sync::atomic::AtomicU16::new(0),
+                ipc_token_file: Mutex::new(None),
                 journal,
                 registry,
                 doc_host: Mutex::new(None),
@@ -400,6 +447,8 @@ impl SessionsEngine {
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
+                activity_tx: OnceLock::new(),
+                activity_task: Mutex::new(None),
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
@@ -668,6 +717,10 @@ impl SessionsEngine {
             .store(port, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn set_ipc_token_file(&self, path: std::path::PathBuf) {
+        *lock(&self.inner.ipc_token_file) = Some(path);
+    }
+
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
     pub fn set_doc_host(&self, host: DocHost) {
@@ -729,7 +782,11 @@ impl SessionsEngine {
 
     /// Status watch: the full session list, re-sent on every transition.
     pub fn watch_sessions(&self) -> watch::Receiver<Vec<Session>> {
-        self.inner.sessions_tx.subscribe()
+        self.inner
+            .activity_tx
+            .get()
+            .unwrap_or(&self.inner.sessions_tx)
+            .subscribe()
     }
 
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
@@ -799,6 +856,20 @@ impl SessionsEngine {
             )
         });
         live.is_some_and(|(harness, routable)| routable && !self.steers_mid_turn(harness))
+    }
+
+    /// The harness of the chat's live run, while one is in flight.
+    pub fn live_harness(&self, chat_id: &str) -> Option<HarnessId> {
+        if !self.turn_in_flight(chat_id) {
+            return None;
+        }
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| h.runtime_config.harness_id)
+    }
+
+    pub fn note_provider_switch(&self, chat_id: &str, harness_id: HarnessId, doc: &ChatDocHandle) {
+        self.inner.note_provider_switch(chat_id, harness_id, doc);
     }
 
     /// Whether an accepted agent update gates the chat's live run, so a new
@@ -882,7 +953,7 @@ impl SessionsEngine {
                 _ => break,
             }
         }
-        self.dispatch_inner(chat_id, HarnessId::Codex, request, None, false, true)
+        self.dispatch_inner(chat_id, HarnessId::Codex, request, None, false, None, true)
             .await
     }
 
@@ -917,7 +988,7 @@ impl SessionsEngine {
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
         self.ensure_execution_allowed(chat_id, request.resume.as_deref())?;
-        let result = self.dispatch_with(chat_id, harness_id, request, message_id, false)
+        let result = self.dispatch_with(chat_id, harness_id, request, message_id, false, None)
             .await;
         // Admission can fail before drive_run exists (for example Agent Auth).
         // The saved user entry is not proof of execution: retain the reason in
@@ -953,6 +1024,7 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
         startup_retry: bool,
+        stops_seen: Option<u64>,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(self.dispatch_inner(
             chat_id,
@@ -960,6 +1032,7 @@ impl SessionsEngine {
             request,
             message_id,
             startup_retry,
+            stops_seen,
             false,
         ))
     }
@@ -971,6 +1044,7 @@ impl SessionsEngine {
         mut request: RunRequest,
         mut message_id: Option<String>,
         startup_retry: bool,
+        stops_seen: Option<u64>,
         idle: bool,
     ) -> Result<String, EngineError> {
         self.ensure_execution_allowed(chat_id, request.resume.as_deref())?;
@@ -1000,6 +1074,14 @@ impl SessionsEngine {
         if !idle {
             self.inner.boat_lease.protect().await.map_err(EngineError::Other)?;
         }
+        if let Some(id) = &message_id
+            && self.inner.reviving(chat_id, id)
+            && lock(&self.inner.runs).contains_key(chat_id)
+        {
+            self.inner.drop_revival(chat_id, id);
+            tracing::info!(chat = %chat_id, "auto-resume skipped: the chat moved on");
+            return Ok(String::new());
+        }
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -1015,9 +1097,26 @@ impl SessionsEngine {
                 h.routed_steers.clone(),
                 h.fork_history_sent.clone(),
                 h.retiring.clone(),
+                h.credential.clone(),
+                h.binary.clone(),
+                h.runtime_config.harness.clone(),
+                h.side_chats_only,
             )
         });
-        if let Some((run_id, steerable, route, steer_tx, ledger, history_sent, retiring)) = routed {
+        if let Some((
+            run_id,
+            steerable,
+            route,
+            steer_tx,
+            ledger,
+            history_sent,
+            retiring,
+            credential,
+            binary,
+            live_harness,
+            side_chats_only,
+        )) = routed
+        {
             if idle {
                 // No prompt rides an idle start, so nothing could carry an
                 // in-place reconfiguration: only the runtime as is will do.
@@ -1027,6 +1126,18 @@ impl SessionsEngine {
                     Err(EngineError::Other("incompatible live runtime".into()))
                 };
             }
+            let route = if self
+                .credential_changed(chat_id, harness_id, credential.as_deref())
+                .await
+                || self
+                    .binary_changed(chat_id, harness_id, live_harness, binary.as_deref())
+                    .await
+                || self.native_subagents_changed(chat_id, harness_id, side_chats_only)
+            {
+                None
+            } else {
+                route
+            };
             let user_id = message_id.clone().unwrap_or_else(new_id);
             let mut bootstrap = None;
             let same_runtime = route.is_some();
@@ -1156,7 +1267,16 @@ impl SessionsEngine {
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
+        let revival = {
+            let mut revivals = lock(&self.inner.revivals);
+            match revivals.get(chat_id) {
+                Some(revival) if revival.message_id == user_id => revivals.remove(chat_id),
+                _ => None,
+            }
+        };
         if !idle {
+            self.inner
+                .note_provider_switch(chat_id, harness_id, &handle);
             handle.write_user_message(&user_id, &request.prompt, now_ms())?;
         }
 
@@ -1169,9 +1289,20 @@ impl SessionsEngine {
         // and starting the retry fresh silently dropped a good conversation.
         let mut resume_injected = false;
         if request.resume.is_none() {
-            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+            request.resume = self
+                .inner
+                .resume_for(chat_id, &request.cwd, harness_id)
+                .or_else(|| {
+                    Inner::own_provider_session(handle.doc(), harness_id, &request.cwd)
+                });
             resume_injected = request.resume.is_some();
         }
+        let revival = revival.map(|mut revival| {
+            if request.resume.is_none() {
+                revival.continuation = None;
+            }
+            revival
+        });
         self.ensure_execution_allowed(chat_id, request.resume.as_deref())?;
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let fork_from = self.native_fork_source(chat_id, harness_id, request.resume.as_deref())?;
@@ -1238,7 +1369,10 @@ impl SessionsEngine {
                         answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
                         _ = tx.closed() => {
                             lock(&pending).remove(&request_id);
-                            let _ = engine_tx.send(AgentEvent::InputResolved { request_id });
+                            let _ = engine_tx.send(AgentEvent::InputResolved {
+                                request_id,
+                                answers: Some(Vec::new()),
+                            });
                         }
                     }
                 });
@@ -1250,6 +1384,15 @@ impl SessionsEngine {
         let fork_history_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (voice_handle, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
         let voice_active = Arc::new(VoiceActivity::default());
+        let credential = self.inner.registry.run_credential(harness_id).await;
+        let binary = {
+            let harness = harness.clone();
+            tokio::task::spawn_blocking(move || binary_identity(harness.as_ref()))
+                .await
+                .ok()
+                .flatten()
+        };
+        let side_chats_only = self.inner.side_chats_only(chat_id, harness_id);
         let controls = RunControls {
             context: Some(zeron_harness::RunContext {
                 session_id: chat_id.to_owned(),
@@ -1266,13 +1409,42 @@ impl SessionsEngine {
             turn: turn.clone(),
         };
 
+        let superseded = revival.is_some()
+            && handle
+                .doc()
+                .read_entries()
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .find(|entry| entry.role == MessageRole::User)
+                .is_some_and(|entry| entry.id != user_id);
         let mut runs = lock(&self.inner.runs);
+        let stops = self.inner.user_stop_count(chat_id);
+        let moved_on = superseded || (revival.is_some() && runs.contains_key(chat_id));
+        let stopped = stops_seen.is_some_and(|seen| seen != stops);
+        if moved_on || stopped {
+            drop(runs);
+            if moved_on {
+                tracing::info!(chat = %chat_id, "auto-resume skipped: the chat moved on");
+            } else {
+                tracing::info!(chat = %chat_id, "startup retry abandoned after Stop");
+                self.inner.abandon_retry(chat_id, false);
+            }
+            return Ok(String::new());
+        }
         if self.inner.shutting_down.load(std::sync::atomic::Ordering::Acquire) || interrupt_token.is_cancelled() {
             drop(runs);
+            if stops_seen.is_some() {
+                self.inner.abandon_retry(chat_id, true);
+                return Ok(String::new());
+            }
             if let (Some(crew), Some(route)) = (self.inner.crew.get(), inference.as_ref()) {
                 crew.retire_inference(route);
             }
             return Err(EngineError::Other("Crew run interrupted before admission".into()));
+        }
+        if !idle {
+            self.inner.journal.clear_user_stop(chat_id);
         }
         runs.insert(
             chat_id.to_string(),
@@ -1298,6 +1470,10 @@ impl SessionsEngine {
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fork_history_sent: fork_history_sent.clone(),
                 retiring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                shutdown_cut: std::sync::atomic::AtomicBool::new(false),
+                credential,
+                binary,
+                side_chats_only,
             },
         );
         drop(runs);
@@ -1342,14 +1518,81 @@ impl SessionsEngine {
                 user_message_id: user_id,
                 resume_injected,
                 startup_retry,
+                revival,
+                stops_seen: stops,
                 fork_history_sent,
                 started,
             },
             turn,
             provider_run,
             inference_changed,
+            side_chats_only,
         ));
         Ok(run_id)
+    }
+
+    async fn credential_changed(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        started_with: Option<&str>,
+    ) -> bool {
+        if self.turn_in_flight(chat_id) || self.holds_background_work(chat_id) {
+            return false;
+        }
+        match self.inner.registry.run_credential(harness_id).await {
+            Some(now) if Some(now.as_str()) != started_with => {
+                tracing::info!(chat = %chat_id, harness = ?harness_id,
+                    "credential changed; replacing the parked session");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn binary_changed(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        harness: Arc<dyn Harness>,
+        started_with: Option<&str>,
+    ) -> bool {
+        let Some(started_with) = started_with else {
+            return false;
+        };
+        if self.turn_in_flight(chat_id) || self.holds_background_work(chat_id) {
+            return false;
+        }
+        let now = tokio::task::spawn_blocking(move || binary_identity(harness.as_ref()))
+            .await
+            .ok()
+            .flatten();
+        match now {
+            Some(now) if now != started_with => {
+                tracing::info!(chat = %chat_id, harness = ?harness_id,
+                    "agent CLI changed on disk; replacing the parked session");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn native_subagents_changed(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        started_side_chats_only: bool,
+    ) -> bool {
+        let side_chats_only = self.inner.side_chats_only(chat_id, harness_id);
+        if started_side_chats_only == side_chats_only
+            || self.turn_in_flight(chat_id)
+            || self.holds_background_work(chat_id)
+        {
+            return false;
+        }
+        tracing::info!(chat = %chat_id, harness = ?harness_id,
+            "native subagents switched; replacing the parked session");
+        true
     }
 
     /// A warm send's prompt with the fork's copied history in front, when the
@@ -1523,7 +1766,24 @@ impl SessionsEngine {
     /// conversation in a fresh process. (Sending, steering and switching
     /// models never come here: they keep the runtime and its work.)
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        self.note_user_stop(chat_id);
         self.terminate(chat_id).await
+    }
+
+    fn note_user_stop(&self, chat_id: &str) {
+        *lock(&self.inner.user_stops)
+            .entry(chat_id.to_string())
+            .or_default() += 1;
+        let live = if let Some(run) = lock(&self.inner.runs).get(chat_id) {
+            run.shutdown_cut
+                .store(false, std::sync::atomic::Ordering::Release);
+            true
+        } else {
+            false
+        };
+        if live && self.turn_in_flight(chat_id) {
+            self.inner.journal.note_user_stop(chat_id);
+        }
     }
 
     /// End the in-flight turn so another prompt can take its place ("send
@@ -1539,6 +1799,7 @@ impl SessionsEngine {
     /// settle fall back to [`Self::terminate`].
     pub async fn stop_turn(&self, chat_id: &str) -> Result<bool, EngineError> {
         const STOP_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
+        self.note_user_stop(chat_id);
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| {
@@ -1644,10 +1905,11 @@ impl SessionsEngine {
         let Some(resolver) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = resolver.send(answers);
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
+            answers: Some(answers.clone()),
         });
+        let _ = resolver.send(answers);
         Ok(true)
     }
 
@@ -1683,17 +1945,31 @@ impl SessionsEngine {
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
 
-        let stale = self.inner.journal.stale_sessions()?;
+        let mut cut_off: std::collections::BTreeMap<String, Option<i64>> = self
+            .inner
+            .journal
+            .stale_sessions()?
+            .into_iter()
+            .map(|chat_id| (chat_id, None))
+            .collect();
+        for (chat_id, at) in self.inner.journal.shutdown_interrupts()? {
+            if cut_off.contains_key(&chat_id) || self.inner.ended_by_shutdown(&chat_id) {
+                cut_off.entry(chat_id).or_insert(Some(at));
+            } else {
+                self.inner.journal.clear_shutdown_interrupt(&chat_id);
+            }
+        }
         let mut recovered = self.recover_imported()?;
-        for chat_id in stale {
+        for (chat_id, shutdown_at) in cut_off {
+            self.inner.journal.clear_shutdown_interrupt(&chat_id);
             // Only an actual new native session associated after trusted Start
             // can recover. Original/unknown journals never seed a new epoch.
             if let Some(history) = self.original_epoch_history(&chat_id) {
-                let Some((native, _)) = self.inner.journal_harness_session(&chat_id) else { continue; };
+                let Some((native, _, _)) = self.inner.journal_harness_session(&chat_id) else { continue; };
                 if history.native_session_id.as_deref() == Some(native.as_str())
                     || self.ensure_execution_allowed(&chat_id, Some(&native)).is_err()
                     || self.inner.workspace().and_then(|workspace| workspace.chat_harness_session(&chat_id))
-                        .is_none_or(|(stored, _)| stored != native)
+                        .is_none_or(|stored| stored.session_id != native)
                 { continue; }
             }
             // Imported execution has an exact durable request and native command claim.
@@ -1703,114 +1979,146 @@ impl SessionsEngine {
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
             }
+            let stopped = self.inner.journal.user_stopped(&chat_id);
+            self.inner.journal.clear_user_stop(&chat_id);
             let handle = self.doc_handle(&chat_id)?;
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
             // same harness conversation (zeron recoverDraft, sessions.ts:538).
-            if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
+            if let Some((session_id, cwd, Some(harness))) =
+                self.inner.journal_harness_session(&chat_id)
+            {
                 self.inner
-                    .remember_harness_session(&chat_id, &session_id, &cwd);
+                    .remember_harness_session(&chat_id, &session_id, &cwd, harness);
             }
             // The revival prompt: the last user message (idempotent re-dispatch
             // under the SAME id — `write_user_message` dedupes by id, so the
             // transcript never shows a duplicate).
-            let prompt = handle.doc().read_entries().ok().and_then(|entries| {
-                entries
-                    .iter()
-                    .rev()
-                    .find(|e| e.role == MessageRole::User)
-                    .and_then(|e| {
-                        e.parts.iter().find_map(|p| match p {
-                            MessagePart::Text { text, .. } => Some((e.id.clone(), text.clone())),
-                            _ => None,
-                        })
+            let entries = handle.doc().read_entries().unwrap_or_default();
+            let prompt = entries
+                .iter()
+                .rev()
+                .find(|e| e.role == MessageRole::User)
+                .and_then(|e| {
+                    e.parts.iter().find_map(|p| match p {
+                        MessagePart::Text { text, .. } => Some((e.id.clone(), text.clone())),
+                        _ => None,
                     })
-            });
-            let attempts = self.inner.journal.resume_attempts(&chat_id);
+                });
+            let now = now_ms();
+            let attempts = self
+                .inner
+                .journal
+                .resume_attempts(&chat_id, now - RESUME_FRESH_MS);
             // Fresh: the crashed reply's streaming entry is recent — or no
             // reply entry reached disk at all (the doc saves on a debounce,
             // and a kill moments into the turn leaves the user's message as
             // the transcript's last word), and that message is recent.
-            let fresh = handle
-                .doc()
-                .read_entries()
-                .ok()
-                .and_then(|entries| {
-                    entries
+            let fresh = shutdown_at.is_some_and(|at| now - at < RESUME_FRESH_MS)
+                || shutdown_at.is_none()
+                    && entries
                         .iter()
                         .rev()
                         .find(|e| e.status == Some(MessageStatus::Streaming))
                         .or_else(|| entries.last().filter(|e| e.role == MessageRole::User))
-                        .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
-                })
-                .unwrap_or(false);
-            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
+                        .is_some_and(|e| now - e.created_at < RESUME_FRESH_MS);
+            let crashed = shutdown_at.is_none();
+            let tail = self
+                .inner
+                .journal
+                .events_rev(&chat_id)
+                .map(|events| turn_tail(events.map_while(Result::ok).map(|(_, event)| event), !crashed))
+                .unwrap_or_default();
+            let request = prompt
+                .as_ref()
+                .and_then(|(_, text)| self.revival_request(&chat_id, text));
+            let pickup = match &request {
+                Some((_, harness_id))
+                    if fresh
+                        && !stopped
+                        && !(crashed && tail.finished)
+                        && prompt
+                            .as_ref()
+                            .is_some_and(|(_, text)| !native_command(text, *harness_id)) =>
+                {
+                    if tail.awaiting_input {
+                        Pickup::AwaitingAnswer
+                    } else if attempts >= MAX_AUTO_RESUME {
+                        Pickup::Exhausted
+                    } else {
+                        Pickup::Resume
+                    }
+                }
+                _ => Pickup::Skip,
+            };
 
-            let note = if will_resume {
-                "Run interrupted by engine restart — resuming"
-            } else {
-                "Run interrupted by engine restart"
+            let note = match pickup {
+                Pickup::Resume => "Run interrupted by engine restart — resuming".to_owned(),
+                Pickup::AwaitingAnswer => "Run interrupted by engine restart while it waited for your answer — send a message to continue".to_owned(),
+                Pickup::Exhausted => format!(
+                    "Run interrupted by engine restart — not resumed automatically after {MAX_AUTO_RESUME} tries in a row; send a message to continue"
+                ),
+                Pickup::Skip => "Run interrupted by engine restart".to_owned(),
             };
-            let done = AgentEvent::Done {
-                status: DoneStatus::Interrupted,
-                result: None,
-                error: Some(note.into()),
-                session_id: None,
-            };
-            self.inner.publish(&chat_id, &done);
-            let stamped = handle.mark_abandoned_streams(note)?.len();
-            self.set_status(&chat_id, SessionStatus::Idle, false);
-            tracing::info!(chat = %chat_id, stamped, will_resume, attempts, "recovered stale session journal");
+            if crashed {
+                self.inner.publish(
+                    &chat_id,
+                    &AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: Some(note.clone()),
+                        session_id: None,
+                    },
+                );
+            }
+            let stamped = handle.mark_abandoned_streams(&note)?.len();
+            self.inner.set_status_with_completion(
+                &chat_id,
+                None,
+                SessionStatus::Idle,
+                false,
+                None,
+                Some(DoneStatus::Interrupted),
+            );
+            tracing::info!(chat = %chat_id, stamped, ?pickup, attempts, "recovered interrupted session");
             recovered += 1;
 
-            if !will_resume {
-                continue;
-            }
-            let attempt = self.inner.journal.note_resume_attempt(&chat_id);
-            let (user_id, prompt_text) = prompt.expect("gated by will_resume");
+            let (Pickup::Resume, Some((user_id, prompt_text)), Some((mut request, harness_id))) =
+                (pickup, prompt, request)
+            else { continue; };
+            let attempt = self.inner.journal.note_resume_attempt(
+                &chat_id,
+                now,
+                now - RESUME_FRESH_MS,
+            );
+            let continuation = (tail.reached_provider && answered_in(&entries, &user_id))
+                .then(|| revival_prompt(&prompt_text));
+            lock(&self.inner.revivals).insert(
+                chat_id.clone(),
+                Revival {
+                    message_id: user_id.clone(),
+                    continuation,
+                },
+            );
+            request.resume = None;
+            request.attachments = Vec::new();
             let sessions = self.clone();
             tokio::spawn(async move {
                 let Some(host) = sessions.inner.doc_host() else {
                     return;
                 };
-                let request = sessions
-                    .last_request(&chat_id)
-                    .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
-                    // Last resort: the journal's own cwd (zeron's draft config)
-                    // — a crash can predate the debounced workspace-row write.
-                    .or_else(|| {
-                        let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
-                        Some(RunRequest {
-                            mcp: None,
-                            prompt: String::new(),
-                            harness: None,
-                            model: None,
-                            reasoning: None,
-                            model_options: Default::default(),
-                            cwd,
-                            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
-                            attachments: Vec::new(),
-                            resume: None,
-                            worktree: None,
-                        })
-                    });
-                let Some(mut request) = request else {
-                    tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
+                if sessions.has_run(&chat_id) {
+                    sessions.inner.drop_revival(&chat_id, &user_id);
                     return;
-                };
-                request.prompt = prompt_text;
-                request.resume = None; // dispatch re-injects the remembered session
-                request.attachments = Vec::new();
-                let harness_id = host.harness_for_request(&chat_id, &request);
+                }
                 match host
                     .dispatch_with_source_context(
                         &sessions,
                         &chat_id,
                         harness_id,
                         request,
-                        Some(user_id),
+                        Some(user_id.clone()),
                     )
                     .await
                 {
@@ -1818,12 +2126,43 @@ impl SessionsEngine {
                         tracing::info!(chat = %chat_id, attempt, "auto-resumed crashed run")
                     }
                     Err(err) => {
+                        sessions.inner.drop_revival(&chat_id, &user_id);
                         tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed")
                     }
                 }
             });
         }
         Ok(recovered)
+    }
+
+    fn revival_request(&self, chat_id: &str, prompt: &str) -> Option<(RunRequest, HarnessId)> {
+        let host = self.inner.doc_host()?;
+        let mut request = self
+            .last_request(chat_id)
+            .or_else(|| host.request_from_chat_row(chat_id, prompt))
+            .or_else(|| {
+                let (_, cwd, _) = self.inner.journal_harness_session(chat_id)?;
+                Some(RunRequest {
+                    mcp: None,
+                    prompt: String::new(),
+                    harness: None,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    cwd,
+                    sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                    auto_approve: false,
+                    access: Default::default(),
+                    plan: false,
+                    attachments: Vec::new(),
+                    resume: None,
+                    worktree: None,
+                    env: Default::default(),
+                })
+            })?;
+        request.prompt = prompt.to_owned();
+        let harness_id = host.harness_for_request(chat_id, &request);
+        Some((request, harness_id))
     }
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
@@ -1833,6 +2172,34 @@ impl SessionsEngine {
             .store(true, std::sync::atomic::Ordering::Release);
         self.inner.boat_lease.shutdown_now();
         self.inner.voice.retire();
+        if self
+            .inner
+            .revive_after_shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let working: Vec<String> = lock(&self.inner.statuses)
+                .values()
+                .filter(|session| session.status == SessionStatus::Working)
+                .map(|session| session.chat_id.clone())
+                .collect();
+            let runs = lock(&self.inner.runs);
+            for chat_id in working {
+                if let Some(run) = runs
+                    .get(&chat_id)
+                    .filter(|run| !run.retiring.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    run.shutdown_cut
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        } else {
+            let live: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
+            for chat_id in live {
+                if self.turn_in_flight(&chat_id) {
+                    self.inner.journal.note_user_stop(&chat_id);
+                }
+            }
+        }
         if let Some(crew) = self.inner.crew.get() {
             for run in lock(&self.inner.runs).values() {
                 if let Some(route) = &run.inference {
@@ -1850,6 +2217,12 @@ impl SessionsEngine {
         self.inner.namespace_tasks.shutdown();
     }
 
+    pub fn forgo_revival(&self) {
+        self.inner
+            .revive_after_shutdown
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
     fn is_live(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.inner.runs)
             .get(chat_id)
@@ -1862,6 +2235,100 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    fn mark_shutdown_cut(&self, chat_id: &str, run_id: &str) -> bool {
+        let cut = lock(&self.runs)
+            .get(chat_id)
+            .filter(|run| run.run_id == run_id)
+            .is_some_and(|run| {
+                run.shutdown_cut
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+            });
+        if cut
+            && self
+                .revive_after_shutdown
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.journal.note_shutdown_interrupt(chat_id, now_ms());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ended_by_shutdown(&self, chat_id: &str) -> bool {
+        self.journal
+            .events_rev(chat_id)
+            .ok()
+            .and_then(|mut events| events.next())
+            .and_then(Result::ok)
+            .is_some_and(|(_, event)| {
+                matches!(
+                    event,
+                    AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        ..
+                    }
+                )
+            })
+    }
+
+    fn reviving(&self, chat_id: &str, message_id: &str) -> bool {
+        lock(&self.revivals)
+            .get(chat_id)
+            .is_some_and(|revival| revival.message_id == message_id)
+    }
+
+    fn user_stop_count(&self, chat_id: &str) -> u64 {
+        lock(&self.user_stops).get(chat_id).copied().unwrap_or(0)
+    }
+
+    fn abandon_retry(&self, chat_id: &str, cut_by_shutdown: bool) {
+        // A retry has no live handle of its own. Serialize every durable
+        // abandonment side effect with run insertion so a newer replacement
+        // can never inherit this retry's Done or shutdown marker.
+        let runs = lock(&self.runs);
+        if runs.contains_key(chat_id) {
+            return;
+        }
+        if cut_by_shutdown
+            && self
+                .revive_after_shutdown
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.journal.note_shutdown_interrupt(chat_id, now_ms());
+        }
+        self.publish(
+            chat_id,
+            &AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                result: None,
+                error: cut_by_shutdown.then(|| SHUTDOWN_NOTE.into()),
+                session_id: None,
+            },
+        );
+        drop(runs);
+        // `None` rechecks ownership after releasing the lock above; if a run
+        // arrived meanwhile, its status remains untouched.
+        self.set_status_with_completion(
+            chat_id,
+            None,
+            SessionStatus::Idle,
+            false,
+            None,
+            Some(DoneStatus::Interrupted),
+        );
+    }
+
+    fn drop_revival(&self, chat_id: &str, message_id: &str) {
+        let mut revivals = lock(&self.revivals);
+        if revivals
+            .get(chat_id)
+            .is_some_and(|revival| revival.message_id == message_id)
+        {
+            revivals.remove(chat_id);
+        }
+    }
+
     fn protection_required(&self) -> bool {
         self.boat_lease.required() || self.namespace_tasks.required()
     }
@@ -1939,14 +2406,8 @@ impl Inner {
         self.start_turn(&identity.chat_id, handle)?;
         handle.inference_requests += 1;
         let changed = handle.inference_changed.clone();
-        // OMP also uses this route for background skill-description compression.
-        // Only its native turn events own foreground status; every request still
-        // owns provider protection until its response is consumed or dropped.
-        let inference_drives_turn = handle.runtime_config.harness_id != HarnessId::Omp;
         drop(runs);
-        if inference_drives_turn {
-            self.set_run_status(&identity.chat_id, &identity.run_id, SessionStatus::Working, false);
-        }
+        self.set_run_status(&identity.chat_id, &identity.run_id, SessionStatus::Working, false);
         if let Some(changed) = changed { changed.notify_one(); }
         Ok(Some(InferenceActivity { inner: Arc::downgrade(self), identity: identity.clone() }))
     }
@@ -2083,17 +2544,19 @@ impl Inner {
             self.sessions_tx.send_replace(list);
             session
         };
-        if let Some(ws) = self.workspace() {
+        if self.activity_tx.get().is_none()
+            && let Some(ws) = self.workspace()
+        {
             ws.record_session(&session);
         }
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
-        self.set_status_with_completion(chat_id, None, status, fresh_start, None);
+        self.set_status_with_completion(chat_id, None, status, fresh_start, None, None);
     }
 
     fn set_run_status(&self, chat_id: &str, run_id: &str, status: SessionStatus, fresh_start: bool) {
-        self.set_status_with_completion(chat_id, Some(run_id), status, fresh_start, None);
+        self.set_status_with_completion(chat_id, Some(run_id), status, fresh_start, None, None);
     }
 
     /// Publish how many subagents of `chat_id` are streaming. A change is
@@ -2120,7 +2583,9 @@ impl Inner {
             self.sessions_tx.send_replace(list);
             session
         };
-        if let Some(ws) = self.workspace() {
+        if self.activity_tx.get().is_none()
+            && let Some(ws) = self.workspace()
+        {
             ws.record_session(&session);
         }
     }
@@ -2141,22 +2606,11 @@ impl Inner {
         status: SessionStatus,
         fresh_start: bool,
         completed_turn: Option<String>,
+        outcome: Option<DoneStatus>,
     ) {
         // Hold ownership through status publication: a late retired task must
         // never settle or release whichever replacement now owns the chat.
         let runs = lock(&self.runs);
-        self.set_status_with_completion_locked(&runs, chat_id, run_id, status, fresh_start, completed_turn);
-    }
-
-    fn set_status_with_completion_locked(
-        &self,
-        runs: &MutexGuard<'_, HashMap<String, RunHandle>>,
-        chat_id: &str,
-        run_id: Option<&str>,
-        status: SessionStatus,
-        fresh_start: bool,
-        completed_turn: Option<String>,
-    ) {
         let handle = runs.get(chat_id);
         match run_id {
             Some(run) if !handle.is_some_and(|h| h.run_id == run) => return,
@@ -2183,6 +2637,8 @@ impl Inner {
                     status,
                     started_at: None,
                     updated_at: now,
+                    last_turn_outcome: None,
+                    terminal_activity: None,
                     running_subagents: 0,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
@@ -2199,6 +2655,19 @@ impl Inner {
                 entry.last_completed_turn = Some(turn);
             }
             entry.status = status;
+            if let Some(outcome) = outcome {
+                entry.last_turn_outcome = Some(zeron_proto::NativeTurnOutcome {
+                    status: outcome,
+                    finished_at: now,
+                });
+            } else if status == SessionStatus::Errored {
+                entry.last_turn_outcome = Some(zeron_proto::NativeTurnOutcome {
+                    status: DoneStatus::Errored,
+                    finished_at: now,
+                });
+            } else if status == SessionStatus::Working && (fresh_start || !was_active) {
+                entry.last_turn_outcome = None;
+            }
             entry.updated_at = now;
             match status {
                 SessionStatus::Working if fresh_start || !was_active => {
@@ -2219,7 +2688,9 @@ impl Inner {
         };
         // Mirror the transition into the workspace doc's session-status row so
         // remote devices' sidebars show this run (staleness-checked client-side).
-        if let Some(ws) = self.workspace() {
+        if self.activity_tx.get().is_none()
+            && let Some(ws) = self.workspace()
+        {
             ws.record_session(&session);
         }
     }
@@ -2237,27 +2708,57 @@ impl Inner {
             .is_some_and(|handle| handle.continues_with_sent_message())
     }
 
+    /// Whether a run of `chat_id` launches without its provider's own
+    /// subagents (Settings → Providers), delegating through side chats
+    /// instead. Never for a chat that has a parent: delegation is one level
+    /// deep, so a side chat can't create chats and keeps its provider's own.
+    /// Nor while its parent is unknown here (its run outran its row).
+    fn side_chats_only(&self, chat_id: &str, harness_id: HarnessId) -> bool {
+        !self.registry.native_subagents(harness_id)
+            && self.workspace().is_none_or(|ws| {
+                !ws.parent_unknown(chat_id)
+                    && !ws
+                        .chat(chat_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|chat| chat.parent_chat_id.is_some())
+            })
+    }
+
     /// Zeron's own MCP server for a run of `chat_id`: this binary's `zeron
     /// mcp` subcommand, dialing the engine's IPC port and stamped with the
     /// originating chat + device so the agent's side chats link back here.
     /// None when the engine serves no port or its executable is unknown.
-    fn zeron_mcp(&self, chat_id: &str) -> Option<zeron_proto::McpServer> {
+    fn zeron_mcp(&self, chat_id: &str, side_chats_only: bool) -> Option<zeron_proto::McpServer> {
         let port = self.ipc_port.load(std::sync::atomic::Ordering::Relaxed);
         if port == 0 {
             return None;
         }
         let command = std::env::current_exe().ok()?.to_str()?.to_owned();
+        let mut env: std::collections::BTreeMap<String, String> = [
+            ("ZERON_IPC_PORT".to_owned(), port.to_string()),
+            ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
+            ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
+        ]
+        .into_iter()
+        .collect();
+        if side_chats_only {
+            env.insert(
+                zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV.to_owned(),
+                "1".to_owned(),
+            );
+        }
+        if let Some(path) = lock(&self.ipc_token_file).as_ref() {
+            env.insert(
+                "ZERON_IPC_TOKEN_FILE".into(),
+                path.to_string_lossy().into_owned(),
+            );
+        }
         Some(zeron_proto::McpServer {
             name: "zeron".into(),
             command,
             args: vec!["mcp".into()],
-            env: [
-                ("ZERON_IPC_PORT".to_owned(), port.to_string()),
-                ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
-                ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
-            ]
-            .into_iter()
-            .collect(),
+            env,
         })
     }
 
@@ -2278,7 +2779,13 @@ impl Inner {
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (zeron sessions.ts:1039).
-    fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
+    fn remember_harness_session(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        harness: HarnessId,
+    ) {
         if session_id.is_empty() {
             return;
         }
@@ -2287,10 +2794,11 @@ impl Inner {
             HarnessSessionRef {
                 session_id: session_id.to_string(),
                 cwd: cwd.to_string(),
+                harness: Some(harness),
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, session_id, cwd);
+            ws.set_chat_harness_session(chat_id, session_id, cwd, Some(harness));
         }
     }
 
@@ -2309,7 +2817,7 @@ impl Inner {
     /// harness session stores are keyed by cwd, so a session created elsewhere
     /// never rides `--resume`. An empty stored id is the explicit tombstone —
     /// no resume, no falling through to staler sources.
-    fn resume_for(&self, chat_id: &str, cwd: &str) -> Option<String> {
+    fn resume_for(&self, chat_id: &str, cwd: &str, harness: HarnessId) -> Option<String> {
         // The same directory, however it is spelled: an agent reports where
         // it runs with symlinks resolved (`/private/var/…` for `/var/…` on
         // macOS), and until a turn's Done restores the request's spelling a
@@ -2321,20 +2829,115 @@ impl Inner {
                 || std::fs::canonicalize(session_cwd)
                     .is_ok_and(|a| std::fs::canonicalize(cwd).is_ok_and(|b| a == b))
         };
-        if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
-            return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
+        if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned()
+            && let Some(owner) = known.harness
+        {
+            return (!known.session_id.is_empty() && cwd_ok(&known.cwd) && owner == harness)
                 .then_some(known.session_id);
         }
         if let Some(ws) = self.workspace()
-            && let Some((session_id, session_cwd)) = ws.chat_harness_session(chat_id)
+            && let Some(stored) = ws.chat_harness_session(chat_id)
         {
-            return (!session_id.is_empty() && cwd_ok(session_cwd.as_deref().unwrap_or("")))
-                .then_some(session_id);
+            if stored.session_id.is_empty() {
+                return None;
+            }
+            let owner = stored.harness.or_else(|| {
+                let (id, session_cwd, owner) = self.journal_harness_session(chat_id)?;
+                let owner = owner?;
+                self.remember_harness_session(chat_id, &id, &session_cwd, owner);
+                Some(owner)
+            });
+            let cwd_matches = cwd_ok(stored.cwd.as_deref().unwrap_or(""));
+            if let Some(owner) = owner {
+                lock(&self.harness_sessions).insert(
+                    chat_id.to_string(),
+                    HarnessSessionRef {
+                        session_id: stored.session_id.clone(),
+                        cwd: stored.cwd.clone().unwrap_or_default(),
+                        harness: Some(owner),
+                    },
+                );
+            }
+            return (cwd_matches && owner.is_none_or(|owner| owner == harness))
+                .then_some(stored.session_id);
         }
-        let (session_id, session_cwd) = self.journal_harness_session(chat_id)?;
+        let (session_id, session_cwd, owner) = self.journal_harness_session(chat_id)?;
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
-        self.remember_harness_session(chat_id, &session_id, &session_cwd);
-        cwd_ok(&session_cwd).then_some(session_id)
+        if let Some(owner) = owner {
+            self.remember_harness_session(chat_id, &session_id, &session_cwd, owner);
+        }
+        (cwd_ok(&session_cwd) && owner.is_none_or(|owner| owner == harness)).then_some(session_id)
+    }
+
+    fn owned_session(&self, chat_id: &str) -> Option<HarnessSessionRef> {
+        if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned()
+            && known.harness.is_some()
+        {
+            return Some(known);
+        }
+        if let Some(ws) = self.workspace()
+            && let Some(stored) = ws.chat_harness_session(chat_id)
+        {
+            if stored.session_id.is_empty() {
+                return None;
+            }
+            let harness = stored
+                .harness
+                .or_else(|| self.journal_harness_session(chat_id)?.2)?;
+            return Some(HarnessSessionRef {
+                session_id: stored.session_id,
+                cwd: stored.cwd.unwrap_or_default(),
+                harness: Some(harness),
+            });
+        }
+        let (session_id, cwd, harness) = self.journal_harness_session(chat_id)?;
+        Some(HarnessSessionRef {
+            session_id,
+            cwd,
+            harness: Some(harness?),
+        })
+    }
+
+    fn own_provider_session(doc: &SessionDoc, harness: HarnessId, cwd: &str) -> Option<String> {
+        if !doc.provider_switched() {
+            return None;
+        }
+        doc.provider_session(harness.as_str())
+            .filter(|mark| !mark.session_id.is_empty() && session_cwd_matches(&mark.cwd, cwd))
+            .map(|mark| mark.session_id)
+    }
+
+    fn note_provider_session(
+        doc: &SessionDoc,
+        harness: HarnessId,
+        session_id: &str,
+        cwd: &str,
+        through: Option<&str>,
+    ) {
+        if session_id.is_empty() || !doc.provider_switched() {
+            return;
+        }
+        let entries = doc.read_entries().unwrap_or_default();
+        let position = |id: &str| entries.iter().position(|entry| entry.id == id);
+        let seen = match through {
+            Some(id) => position(id).map(|_| id.to_owned()),
+            None => entries.last().map(|entry| entry.id.clone()),
+        };
+        let previous = doc
+            .provider_session(harness.as_str())
+            .filter(|mark| mark.session_id == session_id);
+        let seen = match (previous.and_then(|mark| mark.seen), seen) {
+            (Some(old), Some(new)) if position(&old) > position(&new) => Some(old),
+            (old, new) => new.or(old),
+        };
+        let mark = zeron_doc::ProviderSessionMark {
+            session_id: session_id.to_owned(),
+            cwd: cwd.to_owned(),
+            seen,
+        };
+        if let Err(err) = doc.set_provider_session(harness.as_str(), &mark) {
+            tracing::warn!(error = %err, "provider session record write failed");
+        }
     }
 
     /// The last harness session id named anywhere in the chat's journal, with
@@ -2344,7 +2947,10 @@ impl Inner {
     /// Walks the journal newest-first and stops at the answer, so boot recovery
     /// doesn't load whole multi-MB journals: the newest non-empty id wins, and a
     /// `Done` id takes the cwd of the nearest earlier `SessionStarted` (any id).
-    fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String)> {
+    fn journal_harness_session(
+        &self,
+        chat_id: &str,
+    ) -> Option<(String, String, Option<HarnessId>)> {
         let warn = |err: crate::run_journal::JournalError| {
             tracing::warn!(chat = %chat_id, error = %err, "journal scan for harness session failed");
         };
@@ -2370,13 +2976,16 @@ impl Inner {
             }
             match event {
                 AgentEvent::SessionStarted {
-                    session_id, cwd, ..
+                    session_id,
+                    cwd,
+                    harness,
+                    ..
                 } => {
                     if let Some(id) = done_id {
-                        return Some((id, cwd));
+                        return Some((id, cwd, Some(harness)));
                     }
                     if !session_id.is_empty() {
-                        return Some((session_id, cwd));
+                        return Some((session_id, cwd, Some(harness)));
                     }
                 }
                 AgentEvent::Done {
@@ -2388,7 +2997,7 @@ impl Inner {
                 _ => {}
             }
         }
-        done_id.map(|id| (id, String::new()))
+        done_id.map(|id| (id, String::new(), None))
     }
 
     /// Actual driver exit only: close admission and claim every accepted steer
@@ -2444,7 +3053,120 @@ fn note_fork_history_session(doc: &SessionDoc, carried: bool, session_id: &str) 
     }
 }
 
+fn session_cwd_matches(session_cwd: &str, cwd: &str) -> bool {
+    session_cwd.is_empty()
+        || session_cwd == cwd
+        || std::fs::canonicalize(session_cwd)
+            .is_ok_and(|a| std::fs::canonicalize(cwd).is_ok_and(|b| a == b))
+}
+
+/// Ceiling on the prior conversation replayed into a provider session that
+/// lacks it. Characters of serialized history, not tokens: roughly 20k
+/// tokens, small enough to leave every supported model room to work.
+const HISTORY_REPLAY_CHARS: usize = 80_000;
+/// One message's replayed text is cut past this, keeping its head.
+const HISTORY_MESSAGE_CHARS: usize = 8_000;
+/// A replayed tool call keeps only this much of its output.
+const HISTORY_TOOL_OUTPUT_CHARS: usize = 600;
+
+/// `text` cut to `max` characters on a char boundary, with a marker when cut.
+fn clip_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}… [truncated]", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
 impl Inner {
+    /// Record the seam when a chat moves to another provider and preserve the
+    /// outgoing provider's resumable session for a later switch back.
+    fn note_provider_switch(&self, chat_id: &str, harness_id: HarnessId, doc: &ChatDocHandle) {
+        let entries = doc.doc().read_entries().unwrap_or_default();
+        if entries.is_empty() {
+            return;
+        }
+        let latest = 'entries: {
+            for entry in entries.iter().rev() {
+                for part in &entry.parts {
+                    match part {
+                        MessagePart::Switch { to_harness, .. } => {
+                            break 'entries Some(
+                                to_harness.as_deref().and_then(HarnessId::from_slug),
+                            );
+                        }
+                        MessagePart::Fork { .. } => break 'entries None,
+                        _ => {}
+                    }
+                }
+            }
+            None
+        };
+        let owned = || self.owned_session(chat_id);
+        let previous = match latest {
+            Some(to) => to,
+            None => owned().and_then(|known| known.harness),
+        };
+        let Some(previous) = previous else {
+            return;
+        };
+        if previous == harness_id {
+            return;
+        }
+        if !doc.doc().provider_switched()
+            && let Some(known) = owned().filter(|known| known.harness == Some(previous))
+            && !known.session_id.is_empty()
+        {
+            let mark = zeron_doc::ProviderSessionMark {
+                session_id: known.session_id,
+                cwd: known.cwd,
+                seen: entries
+                    .iter()
+                    .rposition(|entry| entry.role != MessageRole::User)
+                    .map(|index| entries[index].id.clone()),
+            };
+            if let Err(err) = doc.doc().set_provider_session(previous.as_str(), &mark) {
+                tracing::warn!(chat = %chat_id, error = %err, "provider session record write failed");
+            }
+        }
+        let label = |id: HarnessId| {
+            self.registry
+                .descriptors()
+                .into_iter()
+                .find(|descriptor| descriptor.id == id)
+                .map_or_else(|| id.as_str().to_owned(), |descriptor| descriptor.name)
+        };
+        let created_at = now_ms();
+        let id = format!("switch:{created_at}");
+        let unanswered = entries
+            .iter()
+            .rev()
+            .take_while(|entry| entry.role == MessageRole::User)
+            .count();
+        let inserted = doc.doc().insert_message_before_last(
+            unanswered,
+            &SessionMessageEntry {
+                id: id.clone(),
+                role: MessageRole::System,
+                parts: vec![MessagePart::Switch {
+                    id,
+                    from: label(previous),
+                    to: label(harness_id),
+                    from_harness: Some(previous.as_str().to_owned()),
+                    to_harness: Some(harness_id.as_str().to_owned()),
+                }],
+                created_at,
+                device_id: self.device_id.clone(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            },
+        );
+        match inserted.and_then(|_| doc.doc().mark_provider_switched()) {
+            Ok(()) => tracing::info!(chat = %chat_id, from = previous.as_str(), to = harness_id.as_str(), "chat switched provider"),
+            Err(err) => tracing::warn!(chat = %chat_id, error = %err, "provider switch marker write failed"),
+        }
+    }
+
     /// `prompt` with the conversation a side chat's provider session lacks in
     /// front of it, or `None` when it lacks nothing. A fresh session gets the
     /// whole transcript (`current` excluded); a continued one only the fork's
@@ -2459,32 +3181,46 @@ impl Inner {
         current: Option<&str>,
         provider: ProviderSession<'_>,
     ) -> Option<String> {
-        if native_command(prompt, harness_id)
-            || !self
-                .workspace()
-                .and_then(|ws| ws.chat(chat_id).ok().flatten())
-                .is_some_and(|chat| chat.parent_chat_id.is_some())
-        {
+        let side_chat = self
+            .workspace()
+            .and_then(|ws| ws.chat(chat_id).ok().flatten())
+            .is_some_and(|chat| chat.parent_chat_id.is_some());
+        let switched = doc.provider_switched();
+        if native_command(prompt, harness_id) || !(side_chat || switched) {
             return None;
         }
-        let entries: Vec<_> = doc
-            .read_entries()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| Some(entry.id.as_str()) != current)
-            .collect();
+        let mut entries = doc.read_entries().unwrap_or_default();
+        let watermark = match provider {
+            ProviderSession::Continued(session) if switched => doc
+                .provider_session(harness_id.as_str())
+                .filter(|mark| session.is_none_or(|id| id == mark.session_id))
+                .map(|mark| mark.seen),
+            _ => None,
+        };
+        if let Some(seen) = &watermark {
+            let start = seen
+                .as_deref()
+                .and_then(|seen| entries.iter().position(|entry| entry.id == seen))
+                .map_or(0, |index| index + 1);
+            entries.drain(..start);
+        }
+        entries.retain(|entry| Some(entry.id.as_str()) != current);
         let end = match provider {
             ProviderSession::Fresh => entries.len(),
+            ProviderSession::Continued(_) if watermark.is_some() => entries.len(),
             ProviderSession::Continued(session) => {
                 let delivered = doc.fork_history_session();
                 if session.is_some() && delivered.as_deref() == session {
                     return None;
                 }
-                entries.iter().position(|entry| {
-                    entry
-                        .parts
-                        .iter()
-                        .any(|part| matches!(part, zeron_doc::MessagePart::Fork { .. }))
+                entries.iter().rposition(|entry| {
+                    entry.parts.iter().any(|part| {
+                        matches!(
+                            part,
+                            zeron_doc::MessagePart::Fork { .. }
+                                | zeron_doc::MessagePart::Switch { .. }
+                        )
+                    })
                 })?
             }
         };
@@ -2499,37 +3235,159 @@ impl Inner {
                         zeron_doc::MessagePart::Tool { call, output, .. } => Some(format!(
                             "Tool: {}\n{}",
                             serde_json::to_string(call).unwrap_or_default(),
-                            output.clone().unwrap_or_default()
+                            clip_chars(
+                                output.as_deref().unwrap_or_default(),
+                                HISTORY_TOOL_OUTPUT_CHARS
+                            )
                         )),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                (entry.role, text)
+                (entry.role, clip_chars(&text, HISTORY_MESSAGE_CHARS))
             })
             .filter(|(_, text)| !text.is_empty())
             .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
             .collect();
-        (!history.is_empty()).then(|| {
-            format!(
-                "Continue this side conversation using the following prior conversation as context.\n<conversation>\n{}\n</conversation>\n\n{}",
-                serde_json::to_string(&history).unwrap_or_default(),
-                prompt
-            )
-        })
+        // Newest messages win the budget: what was just said matters most.
+        let mut budget = HISTORY_REPLAY_CHARS;
+        let mut kept = history
+            .iter()
+            .rev()
+            .take_while(|message| {
+                let cost = message.to_string().len();
+                let fits = cost <= budget;
+                budget = budget.saturating_sub(cost);
+                fits
+            })
+            .count();
+        // A single message over the whole budget still goes out (clipped).
+        kept = kept.max(1.min(history.len()));
+        let omitted = history.len() - kept;
+        let history = &history[omitted..];
+        if history.is_empty() {
+            return None;
+        }
+        let intro = if watermark.is_some() {
+            "While you were away, this conversation continued with a different AI provider. The messages you missed are below; answer the final request as the continuation of the whole conversation. Tool calls listed below ran on the other provider — do not assume their state is still live."
+        } else if switched {
+            "This conversation was started with a different AI provider and you are now taking over. The earlier messages are below as context; answer the final request as the continuation of that conversation. Tool calls listed below ran on the previous provider — do not assume their state is still live."
+        } else {
+            "Continue this side conversation using the following prior conversation as context."
+        };
+        let omitted_note = if omitted > 0 {
+            format!("({omitted} earlier messages omitted for length.)\n")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{intro}\n{omitted_note}<conversation>\n{}\n</conversation>\n\n{}",
+            serde_json::to_string(history).unwrap_or_default(),
+            prompt
+        ))
     }
 }
 
 /// Whether the provider routes this prompt as a native command: its delivered
 /// text leads with `/name` (Codex `command_request`, OpenCode commands, Claude
 /// slash commands). Anything put in front of it would make it model input.
+const SHUTDOWN_NOTE: &str = "Run interrupted by engine shutdown";
+
 fn native_command(prompt: &str, harness: HarnessId) -> bool {
+    use zeron_proto::invocation::{self, Invocation};
+    let selected = invocation::invocation_links(prompt)
+        .into_iter()
+        .next()
+        .is_some_and(|(range, selection)| {
+            prompt[..range.start].trim().is_empty()
+                && match selection {
+                    Invocation::Command { .. } => true,
+                    Invocation::Skill { command: Some(command), .. } => command.harness == harness,
+                    Invocation::Skill { .. } => false,
+                }
+        });
+    if selected {
+        return true;
+    }
     let delivered = if harness == HarnessId::Codex {
-        zeron_proto::invocation::invocation_prompt(prompt)
+        invocation::invocation_prompt(prompt)
     } else {
-        zeron_proto::invocation::harness_prompt(prompt, harness)
+        invocation::harness_prompt(prompt, harness)
     };
-    zeron_proto::invocation::leading_command(&delivered).is_some()
+    invocation::leading_command(&delivered)
+        .is_some_and(|(name, _)| invocation::valid_skill_command_name(name))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pickup {
+    Resume,
+    AwaitingAnswer,
+    Exhausted,
+    Skip,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TurnTail {
+    reached_provider: bool,
+    awaiting_input: bool,
+    finished: bool,
+}
+
+fn turn_tail(events: impl Iterator<Item = AgentEvent>, closed: bool) -> TurnTail {
+    let mut tail = TurnTail { finished: true, ..TurnTail::default() };
+    let mut answered = std::collections::HashSet::new();
+    for (index, event) in events.enumerate() {
+        match event {
+            AgentEvent::Done { .. } if index == 0 && closed => continue,
+            AgentEvent::Done { .. } => break,
+            AgentEvent::Subagent { .. } => continue,
+            AgentEvent::InputResolved { request_id, .. } => {
+                answered.insert(request_id);
+            }
+            AgentEvent::InputRequested { request_id, .. } => {
+                tail.reached_provider = true;
+                tail.awaiting_input |= !answered.contains(&request_id);
+            }
+            AgentEvent::TextDelta { text } | AgentEvent::ReasoningDelta { text } => {
+                tail.reached_provider |= !text.trim().is_empty();
+            }
+            AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::GeneratedImage { .. }
+            | AgentEvent::Visual { .. }
+            | AgentEvent::AssistantMessageCompleted { .. }
+            | AgentEvent::Steered { .. } => tail.reached_provider = true,
+            _ => {}
+        }
+        tail.finished = false;
+    }
+    tail
+}
+
+fn answered_in(entries: &[SessionMessageEntry], user_id: &str) -> bool {
+    entries
+        .iter()
+        .skip_while(|entry| entry.id != user_id)
+        .skip(1)
+        .any(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.parts.iter().any(|part| match part {
+                    MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } => {
+                        !text.trim().is_empty()
+                    }
+                    MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
+                    _ => false,
+                })
+        })
+}
+
+fn revival_prompt(original: &str) -> String {
+    format!(
+        "Your previous turn was cut off before it finished (Crew restarted). Continue where you \
+         left off. Anything you already completed, such as edits, commands or commits, is done: \
+         check before repeating it. The request is below for reference; if it is not in your \
+         history yet, handle it now.\n\n<request>\n{original}\n</request>"
+    )
 }
 
 /// A turn is in flight: streaming, or parked on a question it is still owed an
@@ -2564,6 +3422,19 @@ pub(crate) fn subagent_doc_id(chat_id: &str, tool_use_id: &str) -> String {
         let _ = write!(hex, "{b:02x}");
     }
     format!("{chat_id}--sub--{hex}")
+}
+
+/// Spawn gate: whether tagged traffic for `id` gets a subagent doc, and with
+/// it a unit on the badge. Only a spawn chip of THIS chat does, one this run
+/// folded or one already in the doc: those are the rows the lanes card lists.
+/// Claude also tags the agents a subagent starts with their own call ids,
+/// chips of that subagent's doc; sinks for them badged chats over an empty
+/// card (#999). Traffic for any other id stays in the run journal.
+fn is_chat_spawn(id: &str, folded: &[MessagePart], doc: &SessionDoc) -> bool {
+    folded.iter().any(|part| {
+        matches!(part, MessagePart::Tool { id: part_id, call, .. }
+            if part_id == id && call.is_subagent_spawn())
+    }) || doc.has_subagent_spawn(id)
 }
 
 /// Test-only instrumentation: how often `drive_run`'s coalesced commit branch
@@ -2821,6 +3692,8 @@ struct RunResumeState {
     user_message_id: String,
     resume_injected: bool,
     startup_retry: bool,
+    revival: Option<Revival>,
+    stops_seen: u64,
     fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
     /// Set once the harness stream is open (see [`RunHandle::started`]).
     started: Arc<std::sync::atomic::AtomicBool>,
@@ -2904,19 +3777,21 @@ async fn drive_run(
     turn: TurnControl,
     _provider_run: ProviderRun,
     inference_changed: Option<Arc<tokio::sync::Notify>>,
+    side_chats_only: bool,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
+    let mut run_session: Option<(String, String)> = None;
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
     // The host stamps its own MCP server onto every run it drives, so the
     // agent can spawn and talk to side chats through the engine it runs in.
     if request.mcp.is_none() {
-        request.mcp = inner.zeron_mcp(&chat_id);
+        request.mcp = inner.zeron_mcp(&chat_id, side_chats_only);
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
@@ -2925,6 +3800,13 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
+    if let Some(continuation) = resume_state
+        .revival
+        .as_ref()
+        .and_then(|revival| revival.continuation.clone())
+    {
+        request.prompt = continuation;
+    }
     // A side chat owns a fresh provider session. Bootstrap it from the frozen
     // conversation, never resume (and mutate) the parent's provider session.
     let mut carried_history = false;
@@ -2966,7 +3848,6 @@ async fn drive_run(
     // Waiting here keeps dispatch and the shared queue-flush watcher responsive.
     // The pending-update marker still orders new subprocesses after installation.
     // Share the lease with the adapter so child cleanup outlives this event loop.
-    let interrupt = controls.interrupt.clone();
     let mut _execution_lease = None;
     let started = match prepared {
         Ok(()) => {
@@ -2986,17 +3867,31 @@ async fn drive_run(
                     wire_request.prompt =
                         zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
                 }
-                let admission = if resume_state.idle {
-                    Ok(())
-                } else {
-                    let runs = lock(&inner.runs);
-                    runs.get(&chat_id).filter(|h| h.run_id == run_id)
-                        .ok_or_else(|| EngineError::Other("Crew turn disappeared during startup".into()))
-                        .and_then(|handle| inner.start_turn(&chat_id, handle))
+                wire_request.env.insert(
+                    zeron_proto::ORIGIN_ENV.into(),
+                    zeron_proto::chat_origin(&chat_id),
+                );
+                let environment = inner
+                    .registry
+                    .prepare_run(harness_id, &mut wire_request)
+                    .await;
+                let admission = match environment {
+                    Err(message) => Err(zeron_harness::HarnessError::NotSignedIn(message)),
+                    Ok(()) if resume_state.idle => Ok(()),
+                    Ok(()) => {
+                        let runs = lock(&inner.runs);
+                        runs.get(&chat_id).filter(|h| h.run_id == run_id)
+                            .ok_or_else(|| zeron_harness::HarnessError::Protocol(
+                                "Crew turn disappeared during startup".into(),
+                            ))
+                            .and_then(|handle| inner.start_turn(&chat_id, handle)
+                                .map_err(|error| zeron_harness::HarnessError::Protocol(error.to_string())))
+                    }
                 };
                 match admission {
-                    Err(error) => Err(zeron_harness::HarnessError::Protocol(error.to_string())),
+                    Err(error) => Err(error),
                     Ok(()) => {
+                        let interrupt = controls.interrupt.clone();
                         tokio::select! {
                             biased;
                             _ = interrupt.cancelled() => Ok(futures::stream::once(async {
@@ -3222,6 +4117,9 @@ async fn drive_run(
     // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
     // settled subagent: it announces more work is coming.
     let mut settled_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Tagged ids that failed the spawn gate ([`is_chat_spawn`]): not looked
+    // up again until a call with that id folds.
+    let mut foreign_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
@@ -3231,6 +4129,7 @@ async fn drive_run(
     let mut last_subagent_activity: Option<tokio::time::Instant> = None;
 
     let mut final_completed_turn = None;
+    let mut final_outcome = None;
     let final_status = loop {
         if !lock(&inner.runs).get(&chat_id).is_some_and(|h| h.run_id == run_id) {
             break SessionStatus::Idle;
@@ -3475,6 +4374,7 @@ async fn drive_run(
                     self_continued_turn = false;
                     inner.set_status_with_completion(
                         &chat_id, Some(&run_id), SessionStatus::Idle, false, completed_turn,
+                        Some(DoneStatus::Completed),
                     );
                     continue;
                 }
@@ -3493,6 +4393,15 @@ async fn drive_run(
         // An asynchronous preparation can outlive the bounded terminate wait.
         if !lock(&inner.runs).get(&chat_id).is_some_and(|h| h.run_id == run_id) {
             break SessionStatus::Idle;
+        }
+        // Provider failure is not a user Stop: surface a durable recoverable
+        // error even when the harness closes before the injected Error arrives.
+        if inner.boat_lease.failed(&run_id)
+            && let AgentEvent::Done { status, error, .. } = &mut event
+        {
+            interrupted = true;
+            *status = DoneStatus::Errored;
+            *error = Some(crate::boat_lease::FAILURE.into());
         }
 
         // ── subagent routing ───────────────────────────────────────────
@@ -3541,6 +4450,14 @@ async fn drive_run(
             // would link the chip to that never-created doc (an empty tab
             // on click).
             let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            let opens_sink =
+                !sink_known && !done_only && !foreign_subagents.contains(parent_tool_use_id) && {
+                    let spawn = is_chat_spawn(parent_tool_use_id, &folded, doc_ref);
+                    if !spawn {
+                        foreign_subagents.insert(parent_tool_use_id.clone());
+                    }
+                    spawn
+                };
             if chip_streaming {
                 if !sink_known && !done_only {
                     for p in folded.iter_mut() {
@@ -3569,7 +4486,7 @@ async fn drive_run(
                 }
             }
             // Open the sink lazily; an open failure degrades to chip-only.
-            if !sink_known && !done_only {
+            if opens_sink {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
                     Ok(handle) => Some(handle.writer()),
                     Err(err) => {
@@ -3701,76 +4618,33 @@ async fn drive_run(
                 continue;
             }
         }
+        if let AgentEvent::PlanUsage {
+            windows,
+            plan_label,
+        } = &event
+        {
+            let credential = lock(&inner.runs)
+                .get(&chat_id)
+                .and_then(|run| run.credential.clone());
+            if let Some(credential) = credential {
+                inner
+                    .registry
+                    .record_plan_usage(
+                        harness_id,
+                        &credential,
+                        windows.clone(),
+                        plan_label.clone(),
+                    )
+                    .await;
+            }
+            continue;
+        }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
             }
             continue;
-        }
-        if matches!(event, AgentEvent::TurnStarted) {
-            if idle_since.is_some() && !interrupted {
-                let protection = async {
-                    if interrupt.is_cancelled() { return Ok(false); }
-                    if inner.boat_lease.required() && !inner.boat_lease.active(&run_id) {
-                        tokio::select! {
-                            biased;
-                            result = inner.boat_lease.protect() => result.map_err(EngineError::Other)?,
-                            _ = interrupt.cancelled() => return Ok(false),
-                        }
-                    }
-                    let runs = lock(&inner.runs);
-                    let handle = runs.get(&chat_id).filter(|h| h.run_id == run_id)
-                        .ok_or_else(|| EngineError::Other("Stale Crew native turn".into()))?;
-                    if handle.retiring.load(std::sync::atomic::Ordering::Acquire)
-                        || handle.interrupt_token.is_cancelled() {
-                        return Ok(false);
-                    }
-                    inner.start_turn(&chat_id, handle)?;
-                    // The last auxiliary response may drop concurrently. Keep
-                    // ownership locked until Working is visible, so its Drop
-                    // cannot release this newly admitted foreground turn.
-                    inner.set_status_with_completion_locked(
-                        &runs, &chat_id, Some(&run_id), SessionStatus::Working, true, None,
-                    );
-                    Ok::<bool, EngineError>(true)
-                }.await;
-                match protection {
-                    Ok(true) => {
-                        idle_since = None;
-                        self_continued_turn = false;
-                        entry_id = new_id();
-                        segment_started = now_ms();
-                    }
-                    Ok(false) => {
-                        // Cancellation is not a provider denial. Keep its
-                        // provenance instead of inspecting the token after an
-                        // error, since protection failure can cancel it too.
-                        interrupted = true;
-                        interrupt.cancel();
-                        event = AgentEvent::Done {
-                            status: DoneStatus::Interrupted, result: None, error: None, session_id: None,
-                        };
-                    }
-                    Err(error) => {
-                        interrupted = true;
-                        interrupt.cancel();
-                        event = AgentEvent::Done {
-                            status: DoneStatus::Errored, result: None, error: Some(error.to_string()), session_id: None,
-                        };
-                    }
-                }
-            }
-            if matches!(event, AgentEvent::TurnStarted) { continue; }
-        }
-        // Provider failure is not a user Stop: surface a durable recoverable
-        // error even when the harness closes before the injected Error arrives.
-        if inner.boat_lease.failed(&run_id)
-            && let AgentEvent::Done { status, error, .. } = &mut event
-        {
-            interrupted = true;
-            *status = DoneStatus::Errored;
-            *error = Some(crate::boat_lease::FAILURE.into());
         }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
@@ -3904,6 +4778,8 @@ async fn drive_run(
                     continue;
                 }
                 seen_tools.insert(id.clone());
+                // This call may be (or become) a spawn: look again.
+                foreign_subagents.remove(id);
             }
             AgentEvent::ToolResult { id, .. }
                 if !in_segment(&folded, id) && seen_tools.contains(id) =>
@@ -3943,17 +4819,28 @@ async fn drive_run(
                 chat = %chat_id,
                 "run died before session start; retrying once (resume kept)"
             );
+            if let Some(revival) = resume_state.revival.clone() {
+                lock(&inner.revivals).insert(chat_id.clone(), revival);
+            }
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
             };
             let chat = chat_id.clone();
             let message_id = resume_state.user_message_id.clone();
+            let stops_seen = resume_state.stops_seen;
             tokio::spawn(async move {
                 // The user entry write inside dispatch is idempotent by
                 // message id; `startup_retry` makes this attempt final.
                 if let Err(err) = engine
-                    .dispatch_with(&chat, harness_id, retry, Some(message_id), true)
+                    .dispatch_with(
+                        &chat,
+                        harness_id,
+                        retry,
+                        Some(message_id),
+                        true,
+                        Some(stops_seen),
+                    )
                     .await
                 {
                     tracing::error!(chat = %chat, error = %err, "startup-crash retry dispatch failed");
@@ -4023,15 +4910,30 @@ async fn drive_run(
                 saw_session_started = true;
                 // The event's own cwd (where the harness actually created the
                 // session) scopes the stored id, not the request's.
-                inner.remember_harness_session(&chat_id, session_id, cwd);
+                inner.remember_harness_session(&chat_id, session_id, cwd, harness_id);
                 note_fork_history_session(&doc, carried_history, session_id);
+                if !resume_state.idle {
+                    Inner::note_provider_session(
+                        &doc,
+                        harness_id,
+                        session_id,
+                        cwd,
+                        Some(&resume_state.user_message_id),
+                    );
+                }
+                run_session = Some((session_id.clone(), cwd.clone()));
             }
             AgentEvent::Done {
                 session_id: Some(session_id),
                 ..
             } => {
-                inner.remember_harness_session(&chat_id, session_id, &run_cwd);
+                inner.remember_harness_session(&chat_id, session_id, &run_cwd, harness_id);
                 note_fork_history_session(&doc, carried_history, session_id);
+                let cwd = run_session
+                    .take()
+                    .filter(|(started, _)| started == session_id)
+                    .map_or_else(|| run_cwd.clone(), |(_, cwd)| cwd);
+                run_session = Some((session_id.clone(), cwd));
             }
             AgentEvent::InputRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,
@@ -4106,6 +5008,9 @@ async fn drive_run(
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
             }
+            if let Some((session_id, cwd)) = &run_session {
+                Inner::note_provider_session(&doc, harness_id, session_id, cwd, None);
+            }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival
                 // budget: only consecutive crash-revive-crash cycles spend it.
@@ -4173,10 +5078,13 @@ async fn drive_run(
                     },
                     false,
                     completed_turn,
+                    (!pending_steer && turn_was_active).then_some(*status),
                 );
                 continue;
             }
             final_completed_turn = completed_turn;
+            // Retiring an already parked process is not a new turn outcome.
+            final_outcome = turn_was_active.then_some(*status);
             break match status {
                 DoneStatus::Errored => SessionStatus::Errored,
                 _ => SessionStatus::Idle,
@@ -4214,7 +5122,17 @@ async fn drive_run(
     // a sender waiting for mailbox capacity must fall back to a fresh runtime,
     // never append an accepted message after its final orphan drain.
     let orphans = inner.retire_run(&chat_id, &run_id);
-    inner.set_status_with_completion(&chat_id, Some(&run_id), final_status, false, final_completed_turn);
+    inner.set_status_with_completion(
+        &chat_id,
+        Some(&run_id),
+        final_status,
+        false,
+        final_completed_turn,
+        final_outcome,
+    );
+    if interrupted {
+        inner.mark_shutdown_cut(&chat_id, &run_id);
+    }
     inner.remove_run(&chat_id, &run_id);
     // A Stop cancels the messages it found waiting; one accepted after it
     // began is still the user's next message and must run.
@@ -4566,7 +5484,14 @@ mod tests {
             let want = want.map(|(id, cwd)| (id.to_string(), cwd.to_string()));
             let replayed = sessions.inner.journal.replay(chat, 0).unwrap();
             assert_eq!(forward(replayed), want, "{chat}: reference");
-            assert_eq!(sessions.inner.journal_harness_session(chat), want, "{chat}");
+            assert_eq!(
+                sessions
+                    .inner
+                    .journal_harness_session(chat)
+                    .map(|(id, cwd, _)| (id, cwd)),
+                want,
+                "{chat}"
+            );
         }
         // Torn tail: the last complete SessionStarted still governs.
         let path = dir.path().join("journals").join("started-only.jsonl");
@@ -4574,7 +5499,7 @@ mod tests {
         std::io::Write::write_all(&mut f, b"{\"seq\":3,\"event\":{\"type\":\"done\"").unwrap();
         assert_eq!(
             sessions.inner.journal_harness_session("started-only"),
-            Some(("s1".into(), "/a".into()))
+            Some(("s1".into(), "/a".into(), Some(HarnessId::ClaudeCode)))
         );
     }
 
@@ -4589,9 +5514,12 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            access: Default::default(),
+            plan: false,
             resume: None,
             attachments: Vec::new(),
             worktree: None,
+            env: Default::default(),
         }
     }
 
@@ -4695,7 +5623,12 @@ mod tests {
         request.prompt.clear();
         core.sessions
             .inner
-            .remember_harness_session("idle", "old-native-thread", &request.cwd);
+            .remember_harness_session(
+                "idle",
+                "old-native-thread",
+                &request.cwd,
+                HarnessId::Codex,
+            );
         core.sessions.start_idle("idle", request).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4704,7 +5637,10 @@ mod tests {
                         .session_status("idle")
                         .is_some_and(|s| s.status == SessionStatus::Errored)
                 } else {
-                    core.sessions.inner.resume_for("idle", "/tmp").as_deref()
+                    core.sessions
+                        .inner
+                        .resume_for("idle", "/tmp", HarnessId::Codex)
+                        .as_deref()
                         == Some("new-native-thread")
                 };
                 if completed {
@@ -4736,7 +5672,10 @@ mod tests {
                 SessionStatus::Idle
             );
             assert_eq!(
-                core.workspace.chat_harness_session("idle").unwrap().0,
+                core.workspace
+                    .chat_harness_session("idle")
+                    .unwrap()
+                    .session_id,
                 "new-native-thread"
             );
             let events = core.sessions.inner.journal.replay("idle", 0).unwrap();
@@ -4887,7 +5826,6 @@ mod tests {
     /// Feed-by-hand harness: the test pushes wire events through a channel
     /// and decides when the stream ends.
     struct FeedHarness {
-        id: HarnessId,
         feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
         steering: Option<mpsc::UnboundedSender<mpsc::Receiver<SteerMessage>>>,
     }
@@ -4895,16 +5833,13 @@ mod tests {
     #[async_trait::async_trait]
     impl Harness for FeedHarness {
         fn id(&self) -> HarnessId {
-            self.id
+            HarnessId::Mock
         }
         fn display_name(&self) -> &str {
             "Feed"
         }
         fn supports_steering(&self) -> bool {
             true
-        }
-        fn deterministic_turn_end(&self) -> bool {
-            self.id == HarnessId::Omp
         }
         fn steering_mode(&self) -> zeron_proto::SteeringMode {
             zeron_proto::SteeringMode::StepBoundary
@@ -4945,7 +5880,7 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let (mailboxes, mut harness_calls) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
+        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
         let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         registry.register(Arc::new(IdleStartupFixture {
             idle_calls: idle_calls.clone(),
@@ -4960,7 +5895,12 @@ mod tests {
         inner.namespace_tasks = crate::namespace_tasks::tests::tasks_in(&markers);
         sessions.set_doc_host(DocHost::new(Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap()),
             crate::doc_host::DocHostConfig { device_id: "host".into(), default_harness: HarnessId::Mock, edge: None }));
-        sessions.inner.remember_harness_session("prewarm", "old-native-thread", "/tmp");
+        sessions.inner.remember_harness_session(
+            "prewarm",
+            "old-native-thread",
+            "/tmp",
+            HarnessId::Codex,
+        );
         let mut idle = request();
         idle.prompt.clear();
         sessions.start_idle("prewarm", idle).await.unwrap();
@@ -5025,7 +5965,7 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let (mailboxes, mut harness_calls) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
+        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
         let mut sessions = SessionsEngine::new("host".into(),
             Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry));
         Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = BoatLease::new(Ok(None),
@@ -5055,7 +5995,14 @@ mod tests {
         assert_eq!(orphans[0].message_id, "accepted");
         // Publication can wake a queue consumer while the exact retiring handle
         // is still installed. The already-reserved sender must re-check it too.
-        sessions.inner.set_status_with_completion("chat", Some(&run), SessionStatus::Idle, false, None);
+        sessions.inner.set_status_with_completion(
+            "chat",
+            Some(&run),
+            SessionStatus::Idle,
+            false,
+            None,
+            None,
+        );
         assert_eq!(mailbox.recv().await.unwrap().prompt, "backpressure");
         assert_eq!(racing.await.unwrap(), SteerOutcome::NotSteerable);
         assert_eq!(sessions.steer("chat", "after idle", Some("after".into())).await.unwrap(), SteerOutcome::NotSteerable);
@@ -5074,7 +6021,7 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let (mailboxes, mut harness_calls) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
+        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
         let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         registry.register(Arc::new(IdleStartupFixture {
             idle_calls: idle_calls.clone(),
@@ -5100,7 +6047,12 @@ mod tests {
         sessions.set_doc_host(DocHost::new(store, crate::doc_host::DocHostConfig {
             device_id: "host".into(), default_harness: HarnessId::Mock, edge: None,
         }));
-        sessions.inner.remember_harness_session("prewarm", "old-native-thread", "/tmp");
+        sessions.inner.remember_harness_session(
+            "prewarm",
+            "old-native-thread",
+            "/tmp",
+            HarnessId::Codex,
+        );
         let mut idle = request();
         idle.prompt.clear();
         sessions.start_idle("prewarm", idle.clone()).await.unwrap();
@@ -5126,11 +6078,29 @@ mod tests {
         }
         let live_run = dispatch.await.unwrap();
         let mut steering = harness_calls.recv().await.unwrap();
+        let events_before = sessions.inner.journal.replay("chat", 0).unwrap().len();
+        sessions.inner.abandon_retry("chat", true);
+        assert_eq!(sessions.inner.journal.replay("chat", 0).unwrap().len(), events_before);
+        assert!(
+            sessions
+                .inner
+                .journal
+                .shutdown_interrupts()
+                .unwrap()
+                .into_iter()
+                .all(|(chat_id, _)| chat_id != "chat"),
+            "a stopped retry must not journal over the replacement run"
+        );
+        assert_eq!(
+            sessions.session_status("chat").unwrap().status,
+            SessionStatus::Working
+        );
         // A retired task can finish after the bounded terminate wait and after
         // a replacement owns this chat. Neither status nor TTL belongs to it.
         sessions.inner.remove_run("chat", "retired-run");
         sessions.inner.set_status_with_completion(
             "chat", Some("retired-run"), SessionStatus::Idle, false, Some("stale-completion".into()),
+            None,
         );
         sessions.inner.set_run_status("chat", "retired-run", SessionStatus::Working, true);
         sessions.inner.set_status("chat", SessionStatus::Errored, false);
@@ -5219,203 +6189,10 @@ mod tests {
 
 
     #[tokio::test(start_paused = true)]
-    async fn cancelling_native_start_during_protection_is_interrupted_not_errored() {
-        native_start_protection_outcome(false).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn native_start_ready_provider_error_takes_precedence_over_cancellation() {
-        native_start_protection_outcome(true).await;
-    }
-
-    async fn native_start_protection_outcome(provider_fails: bool) {
-        let dir = tempfile::tempdir().unwrap();
-        let (feed, rx) = mpsc::unbounded_channel();
-        let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness {
-            id: HarnessId::Omp, feed: Mutex::new(Some(rx)), steering: None,
-        }));
-        let mut sessions = SessionsEngine::new(
-            "host".into(), Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry),
-        );
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let called = Arc::new(tokio::sync::Notify::new());
-        let provider_calls = calls.clone();
-        let provider_called = called.clone();
-        let (failure, failure_rx) = oneshot::channel::<Result<(), String>>();
-        let failure_rx = Arc::new(Mutex::new(Some(failure_rx)));
-        Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = BoatLease::new(
-            Ok(Some("bx_23456789".into())), Arc::new(move |_, cancel| {
-                let call = provider_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                provider_called.notify_one();
-                let failure = (provider_fails && call >= 2).then(|| lock(&failure_rx).take().unwrap());
-                Box::pin(async move {
-                    if call < 2 { return Ok(()); }
-                    if let Some(failure) = failure { return failure.await.unwrap(); }
-                    cancel.cancelled().await;
-                    Err("provider request cancelled".into())
-                })
-            }),
-        );
-        let store = Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap());
-        sessions.set_doc_host(DocHost::new(store, crate::doc_host::DocHostConfig {
-            device_id: "host".into(), default_harness: HarnessId::Omp, edge: None,
-        }));
-        let run = sessions.dispatch("chat", HarnessId::Omp, request(), None).await.unwrap();
-        let interrupt = lock(&sessions.inner.runs)["chat"].interrupt_token.clone();
-        feed.send(AgentEvent::Done {
-            status: DoneStatus::Completed, result: None, error: None, session_id: None,
-        }).unwrap();
-        sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
-            row.chat_id == "chat" && row.status == SessionStatus::Idle)).await.unwrap();
-        // Initial admission and its idle TTL reset finish before the held request.
-        while calls.load(std::sync::atomic::Ordering::Acquire) < 2 { called.notified().await; }
-        feed.send(AgentEvent::TurnStarted).unwrap();
-        while calls.load(std::sync::atomic::Ordering::Acquire) < 3 { called.notified().await; }
-        if provider_fails {
-            // Make both select branches ready before the driver is polled.
-            interrupt.cancel();
-            failure.send(Err("denied".into())).unwrap();
-            sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
-                row.chat_id == "chat" && row.status == SessionStatus::Errored)).await.unwrap();
-        } else {
-            assert!(sessions.terminate("chat").await.unwrap());
-        }
-        assert!(!sessions.is_live("chat", &run));
-        assert_eq!(sessions.session_status("chat").unwrap().status,
-            if provider_fails { SessionStatus::Errored } else { SessionStatus::Idle });
-        let Some((_, AgentEvent::Done { status, error, .. })) = sessions.inner.journal.last_event("chat").unwrap() else {
-            panic!("native admission did not journal its completion");
-        };
-        assert_eq!(status, if provider_fails { DoneStatus::Errored } else { DoneStatus::Interrupted });
-        assert_eq!(error.is_some(), provider_fails);
-        assert!(!sessions.inner.boat_lease.active(&run));
-        let entries = sessions.doc_handle("chat").unwrap().doc().read_entries().unwrap();
-        assert_eq!(entries.iter().flat_map(|entry| &entry.parts).any(|part|
-            matches!(part, MessagePart::Error { .. })), provider_fails);
-        sessions.shutdown().await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn native_auxiliary_inference_releases_lease_without_reopening_completed_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        let (feed, rx) = mpsc::unbounded_channel();
-        let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness {
-            id: HarnessId::Omp, feed: Mutex::new(Some(rx)), steering: None,
-        }));
-        let mut sessions = SessionsEngine::new(
-            "host".into(), Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry),
-        );
-        let allow = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let provider_allow = allow.clone();
-        Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = BoatLease::new(
-            Ok(Some("bx_23456789".into())), Arc::new(move |_, _| {
-                let allowed = provider_allow.load(std::sync::atomic::Ordering::Acquire);
-                Box::pin(async move { if allowed { Ok(()) } else { Err("denied".into()) } })
-            }),
-        );
-        let store = Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap());
-        sessions.set_doc_host(DocHost::new(store, crate::doc_host::DocHostConfig {
-            device_id: "host".into(), default_harness: HarnessId::Omp, edge: None,
-        }));
-        let run = sessions.dispatch("chat", HarnessId::Omp, request(), None).await.unwrap();
-        let (_, mut events) = sessions.subscribe("chat", 0).unwrap();
-        let (interrupt, token) = {
-            let runs = lock(&sessions.inner.runs);
-            let handle = &runs["chat"];
-            (handle.interrupt_token.clone(), handle.supervision_token.clone())
-        };
-        let supervision = sessions.retain_supervision("chat", &token).unwrap();
-        feed.send(AgentEvent::TextDelta { text: "complete".into() }).unwrap();
-        feed.send(AgentEvent::Done {
-            status: DoneStatus::Completed, result: None, error: None, session_id: None,
-        }).unwrap();
-        sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
-            row.chat_id == "chat" && row.status == SessionStatus::Idle)).await.unwrap();
-        let completed = sessions.session_status("chat").unwrap().last_completed_turn;
-        assert!(completed.is_some());
-        assert!(!sessions.inner.boat_lease.active(&run));
-
-        // OMP compresses skill descriptions outside the foreground agent loop.
-        // Those requests own protection, but never owe another native Done.
-        let admission = sessions.inner.inference_admission("chat", &run, &interrupt).unwrap();
-        let first = (admission.check)().await.unwrap();
-        let second = (admission.check)().await.unwrap();
-        assert!(sessions.inner.boat_lease.active(&run));
-        assert!(sessions.inner.inference_in_flight("chat", &run));
-        assert_eq!(sessions.session_status("chat").unwrap().status, SessionStatus::Idle);
-        drop(first);
-        assert!(sessions.inner.boat_lease.active(&run), "overlapping auxiliary stream lost protection");
-        drop(second);
-        tokio::task::yield_now().await;
-        let status = sessions.session_status("chat").unwrap();
-        assert_eq!(status.status, SessionStatus::Idle);
-        assert_eq!(status.last_completed_turn, completed);
-        assert!(!sessions.inner.boat_lease.active(&run));
-        assert!(!sessions.inner.inference_in_flight("chat", &run));
-        assert!(sessions.is_live("chat", &run), "supervised warm runtime was retired");
-
-        async fn wait_status(sessions: &SessionsEngine, status: SessionStatus) {
-            sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
-                row.chat_id == "chat" && row.status == status)).await.unwrap();
-        }
-        let done = || AgentEvent::Done {
-            status: DoneStatus::Completed, result: None, error: None, session_id: None,
-        };
-        // An autonomous native start must protect work before any model request.
-        feed.send(AgentEvent::TurnStarted).unwrap();
-        wait_status(&sessions, SessionStatus::Working).await;
-        assert!(sessions.inner.boat_lease.active(&run));
-        assert!(!sessions.inner.inference_in_flight("chat", &run));
-        let foreground = (admission.check)().await.unwrap();
-        let auxiliary = (admission.check)().await.unwrap();
-        drop(foreground);
-        drop(auxiliary);
-        assert_eq!(sessions.session_status("chat").unwrap().status, SessionStatus::Working);
-        assert!(sessions.inner.boat_lease.active(&run), "model EOF ended a native foreground turn");
-        let lingering = (admission.check)().await.unwrap();
-        feed.send(done()).unwrap();
-        wait_status(&sessions, SessionStatus::Idle).await;
-        assert!(sessions.inner.boat_lease.active(&run), "native Done released a live response");
-        drop(lingering);
-        assert!(!sessions.inner.boat_lease.active(&run));
-
-        // Exercise the final auxiliary Drop on both sides of native admission.
-        // The runs lock makes protection + Working publication indivisible.
-        for drop_before_start in [true, false] {
-            let auxiliary = (admission.check)().await.unwrap();
-            feed.send(AgentEvent::TurnStarted).unwrap();
-            if drop_before_start {
-                drop(auxiliary);
-                wait_status(&sessions, SessionStatus::Working).await;
-            } else {
-                wait_status(&sessions, SessionStatus::Working).await;
-                drop(auxiliary);
-            }
-            assert!(sessions.inner.boat_lease.active(&run));
-            assert!(!sessions.inner.inference_in_flight("chat", &run));
-            feed.send(done()).unwrap();
-            wait_status(&sessions, SessionStatus::Idle).await;
-            assert!(!sessions.inner.boat_lease.active(&run));
-        }
-        allow.store(false, std::sync::atomic::Ordering::Release);
-        feed.send(AgentEvent::TurnStarted).unwrap();
-        wait_status(&sessions, SessionStatus::Errored).await;
-        assert!(interrupt.is_cancelled(), "unprotected native start was not interrupted");
-        assert!(!sessions.inner.boat_lease.active(&run));
-        while let Ok(event) = events.try_recv() {
-            assert!(!matches!(event.event, AgentEvent::TurnStarted), "native control escaped into the event stream");
-        }
-        drop(supervision);
-        sessions.shutdown().await;
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn supervision_subscription_retains_exact_run_until_last_drop() {
         async fn park(core: &crate::EngineCore, registry: &HarnessRegistry) -> (mpsc::UnboundedSender<AgentEvent>, String, String) {
             let (feed, rx) = mpsc::unbounded_channel();
-            registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: None }));
+            registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: None }));
             let run = core.sessions.dispatch("supervised", HarnessId::Mock, request(), None).await.unwrap();
             feed.send(AgentEvent::Done {
                 status: DoneStatus::Completed, result: None, error: None, session_id: None,
@@ -5488,7 +6265,6 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
         registry.register(Arc::new(FeedHarness {
-            id: HarnessId::Mock,
             feed: Mutex::new(Some(rx)),
             steering: None,
         }));
@@ -5510,26 +6286,17 @@ mod tests {
             assistant_message_id: "a1".into(),
         })
         .unwrap();
-        feed.send(AgentEvent::Subagent {
-            parent_tool_use_id: "tool-1".into(),
-            event: Box::new(AgentEvent::ReasoningDelta {
-                text: String::new(),
-            }),
+        // A background subagent's shape: its spawn's turn ends, and it speaks
+        // after the parent's last commit window, so its sink wakes with the
+        // parent clean, parked and past its deadline.
+        feed.send(AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: zeron_proto::ToolCall::Unknown {
+                name: "Agent: probe".into(),
+                input: None,
+            },
         })
         .unwrap();
-        // Well past several commit windows with the stream still open: the
-        // loop must idle between commits, not spin on a past deadline.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let ticks = FLUSH_TICKS.with(|t| t.get());
-        assert!(
-            (1..=8).contains(&ticks),
-            "commit branch fired {ticks} times in 1s for one empty subagent event"
-        );
-        assert_eq!(
-            core.sessions.session_status(chat).map(|s| s.status),
-            Some(SessionStatus::Working),
-            "stream still open, turn still running"
-        );
         feed.send(AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
@@ -5537,6 +6304,34 @@ mod tests {
             session_id: None,
         })
         .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3 * STREAM_COMMIT_MS)).await;
+        // Empty events trickling in inside one window: the first must arm it
+        // rather than commit, and no later one commits on its own.
+        for _ in 0..12 {
+            feed.send(AgentEvent::Subagent {
+                parent_tool_use_id: "tool-1".into(),
+                event: Box::new(AgentEvent::ReasoningDelta {
+                    text: String::new(),
+                }),
+            })
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Well past several commit windows with the stream still open: the
+        // loop must idle between commits, not spin on a past deadline.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let ticks = FLUSH_TICKS.with(|t| t.get());
+        assert!(
+            (1..=8).contains(&ticks),
+            "commit branch fired {ticks} times in 1s for 12 empty subagent events"
+        );
+        assert_eq!(
+            core.sessions
+                .session_status(chat)
+                .map(|session| (session.status, session.running_subagents)),
+            Some((SessionStatus::Idle, 1)),
+            "parked, with the subagent's sink open"
+        );
         core.sessions.shutdown().await;
     }
 
@@ -5564,6 +6359,7 @@ mod tests {
         chat.config = Some(zeron_proto::ChatConfig {
             harness: HarnessId::Omp, model: request.model.clone(), reasoning: request.reasoning,
             model_options: request.model_options.clone(), sandbox: request.sandbox,
+            access: request.access, plan: request.plan,
         });
         workspace.import_chat_row(&chat).unwrap();
         let host = DocHost::new(store.clone(), crate::DocHostConfig {
@@ -5746,7 +6542,7 @@ mod tests {
         workspace.import_chat_row(&chat).unwrap();
         let (feed, events) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(events)), steering: None }));
+        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(events)), steering: None }));
         let sessions = SessionsEngine::new("importer".into(),
             Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry));
         sessions.inner.original_epoch_histories.set(
@@ -5812,7 +6608,12 @@ mod tests {
         })).unwrap()).unwrap();
         sessions.reset_original_epoch_native_association(id);
         assert!(sessions.ensure_execution_allowed(id, None).is_ok());
-        assert_eq!(sessions.inner.resume_for(id, "/original/repo"), None);
+        assert_eq!(
+            sessions
+                .inner
+                .resume_for(id, "/original/repo", HarnessId::Mock),
+            None
+        );
         assert!(sessions.ensure_execution_allowed(id, Some("original-native")).is_err());
         assert!(sessions.ensure_execution_allowed("different-chat", Some("original-native")).is_err());
         let old_selector = dir.path().join("native-resumes/original-native.jsonl");
@@ -5874,7 +6675,12 @@ mod tests {
             owner_registry: true,
         }).unwrap();
         workspace.create_chat(chat_id, None, Some("host"), None, Some("/original/repo".into())).unwrap();
-        workspace.set_chat_harness_session(chat_id, "original-native", "/original/repo");
+        workspace.set_chat_harness_session(
+            chat_id,
+            "original-native",
+            "/original/repo",
+            Some(HarnessId::Omp),
+        );
         let host = DocHost::new(store, crate::DocHostConfig {
             device_id: "host".into(), default_harness: HarnessId::Omp, edge: None,
         });
@@ -5882,13 +6688,21 @@ mod tests {
         sessions.set_doc_host(host.clone());
         // A new engine has no live-process cache: resume comes from the durable row.
         assert!(lock(&sessions.inner.harness_sessions).is_empty());
-        let id = sessions.inner.resume_for(chat_id, "/original/repo").unwrap();
+        let id = sessions
+            .inner
+            .resume_for(chat_id, "/original/repo", HarnessId::Omp)
+            .unwrap();
         assert_eq!(id, "original-native");
         let copied_path = dir.path().join("native-resumes/original-native.jsonl")
             .canonicalize().unwrap().to_string_lossy().into_owned();
         assert_eq!(sessions.native_launch_selector(&id), copied_path);
         assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&copied_path).unwrap());
-        assert!(sessions.inner.resume_for(chat_id, "/other/repo").is_none());
+        assert!(
+            sessions
+                .inner
+                .resume_for(chat_id, "/other/repo", HarnessId::Omp)
+                .is_none()
+        );
         std::fs::remove_file(&copied_path).unwrap();
         // Missing launch data remains a failed exact-path resume, never a lookup
         // against another user's or the old installed app's native store.

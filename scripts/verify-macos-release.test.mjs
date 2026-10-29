@@ -27,6 +27,8 @@ test(`valid release checksums cannot authorize an untrusted ${bundleId} update`,
     const macos = path.join(app, "Contents", "MacOS");
     mkdirSync(macos, { recursive: true });
     copyFileSync("/usr/bin/true", path.join(macos, "comet"));
+    copyFileSync("/usr/bin/true", path.join(macos, "Crew Engine"));
+    run("/usr/bin/codesign", ["--force", "--sign", "-", path.join(macos, "Crew Engine")], temp);
     writeFileSync(path.join(app, "Contents", "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>${bundleId}</string>

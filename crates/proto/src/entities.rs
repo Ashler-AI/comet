@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{AccessMode, HarnessId, ReasoningLevel, SandboxLevel};
 
 /// Admission limit for new pins. Concurrent offline additions may exceed it;
 /// existing pins remain visible, reorderable and removable without truncation.
@@ -83,8 +83,12 @@ pub enum DeviceEnvironment {
 impl DeviceEnvironment {
     pub fn valid_devbox_id(&self, id: &str) -> bool {
         match self {
-            Self::Namespace => id.len() == 13
-                && id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            Self::Namespace => {
+                id.len() == 13
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            }
             Self::Boat => valid_boat_sandbox_id(id),
         }
     }
@@ -136,7 +140,9 @@ impl Device {
 pub fn valid_boat_sandbox_id(id: &str) -> bool {
     id.strip_prefix("bx_").is_some_and(|suffix| {
         suffix.len() == 8
-            && suffix.bytes().all(|byte| b"23456789abcdefghjkmnpqrstuvwxyz".contains(&byte))
+            && suffix
+                .bytes()
+                .all(|byte| b"23456789abcdefghjkmnpqrstuvwxyz".contains(&byte))
     })
 }
 
@@ -149,9 +155,15 @@ mod device_binding_tests {
         let mut device: Device = serde_json::from_value(serde_json::json!({
             "id": "remote", "name": "bx_jdyh7avc", "platform": "linux",
             "lastSeenAt": null, "futureMetadata": {"provider": "boat"}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(device.devbox_binding(), None);
-        assert!(serde_json::to_value(&device).unwrap().get("devboxId").is_none());
+        assert!(
+            serde_json::to_value(&device)
+                .unwrap()
+                .get("devboxId")
+                .is_none()
+        );
         device.devbox_provider = Some(DeviceEnvironment::Boat);
         device.devbox_id = Some("bx_jdyh7avc".into());
         let wire = serde_json::to_value(&device).unwrap();
@@ -162,12 +174,32 @@ mod device_binding_tests {
 
     #[test]
     fn boat_ids_require_the_immutable_provider_alphabet_and_exact_length() {
-        for id in ["bx_jdyh7avc", "bx_23456789", "bx_abcdefgh", "bx_jkmnpqrs", "bx_tuvwxyz2"] {
+        for id in [
+            "bx_jdyh7avc",
+            "bx_23456789",
+            "bx_abcdefgh",
+            "bx_jkmnpqrs",
+            "bx_tuvwxyz2",
+        ] {
             assert!(valid_boat_sandbox_id(id), "{id}");
         }
-        for id in ["", "jdyh7avc", "bx_jdyh7av", "bx_jdyh7avcc", "bx_jdyh7av0",
-            "bx_jdyh7av1", "bx_jdyh7avi", "bx_jdyh7avl", "bx_jdyh7avo", "bx_jdyh7avA",
-            " bx_jdyh7avc", "bx_jdyh7avc\n", "BX_jdyh7avc", "bx_jdyh7avé", "ofpf7g22n4412"] {
+        for id in [
+            "",
+            "jdyh7avc",
+            "bx_jdyh7av",
+            "bx_jdyh7avcc",
+            "bx_jdyh7av0",
+            "bx_jdyh7av1",
+            "bx_jdyh7avi",
+            "bx_jdyh7avl",
+            "bx_jdyh7avo",
+            "bx_jdyh7avA",
+            " bx_jdyh7avc",
+            "bx_jdyh7avc\n",
+            "BX_jdyh7avc",
+            "bx_jdyh7avé",
+            "ofpf7g22n4412",
+        ] {
             assert!(!valid_boat_sandbox_id(id), "{id:?}");
         }
     }
@@ -207,6 +239,11 @@ pub struct Space {
     /// readers: projects with equal ids group together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_id: Option<String>,
+    /// Owner-stamped when git: the GitHub repository (`owner/name`) of the
+    /// folder's `origin` remote. When Cloud reaches it, a session in this
+    /// project can run on its own Cloud machine (the checkout picker's Cloud).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_repo: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -237,6 +274,12 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    /// The chat's access mode; absent on chats created before modes, which
+    /// ran with full access.
+    #[serde(default, skip_serializing_if = "AccessMode::is_full_access")]
+    pub access: AccessMode,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
 }
 
 /// Immutable-at-run-start repository context owned by one conversation.
@@ -288,6 +331,13 @@ pub struct Chat {
     /// is only injected when the next run launches from the same cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
+    /// Slug of the harness (`HarnessId::as_str`) that owns
+    /// `harness_session_id`. A resume id only means something to the harness
+    /// that minted it, so a chat switched to another provider must not hand
+    /// it over. `None` on rows written before the tag existed: those are
+    /// taken to belong to the chat's configured harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session_harness: Option<String>,
     /// The space this chat belongs to. Invariant: `Some` for every UI-created
     /// chat; rows with a missing/dangling space id are not rendered (the host
     /// device's repair sweep deletes its own danglers).
@@ -354,14 +404,52 @@ pub enum ChatIndicator {
     Idle,
 }
 
-/// Derive the display status. `live` must already be staleness-gated by the
-/// caller (the UI's 45s window) — pass `None` for a stale/absent session row.
+/// Derive display status from fresh evidence. Use `view::display_status` at
+/// presentation boundaries; it handles stale activity without inventing success.
 pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
-    match live.map(|s| s.status) {
+    chat_indicator_inner(chat, live, true)
+}
+
+pub(crate) fn chat_indicator_inner(
+    chat: &Chat,
+    live: Option<&Session>,
+    terminal_activity: bool,
+) -> ChatIndicator {
+    let terminal = live
+        .filter(|_| terminal_activity)
+        .and_then(|s| s.terminal_activity.as_ref());
+    let terminal_unseen = terminal.is_some_and(|activity| {
+        chat.last_seen_at
+            .is_none_or(|seen| activity.updated_at > seen)
+    });
+    match live.map(|s| {
+        if terminal_activity {
+            s.activity_status()
+        } else {
+            s.status
+        }
+    }) {
         Some(SessionStatus::Working) => ChatIndicator::Working,
         Some(SessionStatus::AwaitingInput) => ChatIndicator::AwaitingInput,
-        Some(SessionStatus::Errored) if chat.unseen() => ChatIndicator::Errored,
-        _ if chat.unseen() => ChatIndicator::Completed,
+        _ if live.is_some_and(|s| s.status == SessionStatus::Errored) && chat.unseen()
+            || terminal_unseen
+                && terminal.is_some_and(|a| a.report.state == crate::ProgramState::Error) =>
+        {
+            ChatIndicator::Errored
+        }
+        _ if terminal_unseen
+            && terminal.is_some_and(|a| a.report.state == crate::ProgramState::Done) =>
+        {
+            ChatIndicator::Completed
+        }
+        _ if chat.unseen()
+            && !live.is_some_and(|s| {
+                s.last_turn_outcome
+                    .is_some_and(|o| o.status == crate::DoneStatus::Interrupted)
+            }) =>
+        {
+            ChatIndicator::Completed
+        }
         _ => ChatIndicator::Idle,
     }
 }
@@ -375,12 +463,29 @@ pub enum SessionStatus {
     Errored,
 }
 
+/// Native outcome evidence survives coalesced watches, including consecutive
+/// turns with the same outcome. Terminal leases never rewrite `finished_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTurnOutcome {
+    pub status: crate::DoneStatus,
+    pub finished_at: DateTime<Utc>,
+}
+
 /// Live run status for a chat — drives the Working indicator and sidebar status dots.
 /// Staleness-checked client-side against `updated_at` so a crashed backend never shows
 /// an eternal "Working".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
+    /// Latest native turn outcome, independently of process lifetime and
+    /// unread activity. Missing on older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_outcome: Option<NativeTurnOutcome>,
+    /// OSC 7501 activity is additive; it never changes native `status` or
+    /// `last_completed_turn` (which command execution and waits rely on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_activity: Option<crate::TerminalActivity>,
     /// Last successfully completed assistant turn. Retained while the next turn
     /// runs so coalesced status watches do not lose normal queue completions.
     /// Interrupts, failures and liveness expiry never advance this marker.
@@ -396,6 +501,29 @@ pub struct Session {
     /// has not opened; read it through `view::running_subagents`.
     #[serde(default)]
     pub running_subagents: u32,
+}
+
+impl Session {
+    /// Attention across native and terminal work. Native execution control must
+    /// keep using `status`: a terminal report cannot complete/steer a native run.
+    pub fn activity_status(&self) -> SessionStatus {
+        let terminal = self.terminal_activity.as_ref().map(|a| a.report.state);
+        if self.status == SessionStatus::AwaitingInput
+            || terminal == Some(crate::ProgramState::Blocked)
+        {
+            SessionStatus::AwaitingInput
+        } else if self.status == SessionStatus::Working
+            || terminal == Some(crate::ProgramState::Working)
+        {
+            SessionStatus::Working
+        } else if self.status == SessionStatus::Errored
+            || terminal == Some(crate::ProgramState::Error)
+        {
+            SessionStatus::Errored
+        } else {
+            SessionStatus::Idle
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1489,6 +1617,11 @@ pub struct TerminalSession {
     pub cwd: String,
     /// Shell basename (`zsh`, `bash`, …) for the tab label.
     pub shell: String,
+    /// The host answers the terminal's queries itself (device attributes,
+    /// cursor position, …), so a viewer must not answer them too. Absent
+    /// from hosts that predate it, whose viewers answer as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_replies: bool,
 }
 
 /// One `SubscribeTerminal` stream item. `seq` is a per-terminal monotonic counter

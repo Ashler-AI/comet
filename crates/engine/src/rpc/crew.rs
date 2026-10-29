@@ -477,7 +477,8 @@ impl EngineRpc {
                 archived: false, cwd: None, branch: None, checkout_id: None, source_context: None,
                 config: None, last_message_preview: None, last_message_at: None,
                 created_at: chrono::Utc::now(), harness_session_id: None, harness_session_cwd: None,
-                space_id: None, last_seen_at: None, room_gen: Some(2), parent_chat_id: None, crew: None,
+                harness_session_harness: None, space_id: None, last_seen_at: None, room_gen: Some(2),
+                parent_chat_id: None, crew: None,
             });
             chat.device_id = host.clone();
             chat.room_gen = Some(2);
@@ -486,6 +487,7 @@ impl EngineRpc {
                 let config = chat.config.get_or_insert_with(|| ChatConfig {
                     harness: HarnessId::Omp, model: None, reasoning: None,
                     model_options: Default::default(), sandbox: zeron_proto::SandboxLevel::DangerFullAccess,
+                    access: Default::default(), plan: false,
                 });
                 config.harness = route.harness();
                 config.model = Some(route.execution_model());

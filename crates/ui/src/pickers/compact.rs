@@ -497,12 +497,7 @@ impl Pickers {
                 }));
             // Each side fades over the tabs hidden past it, up to one tab
             // pitch, reaching zero exactly at the clip edge.
-            crate::edge_fade::edge_faded(
-                COMPACT_ROW_HEIGHT + popover::MENU_GAP,
-                false,
-                false,
-                tabs,
-            )
+            crate::edge_fade::edge_faded(COMPACT_ROW_HEIGHT + popover::MENU_GAP, false, false, tabs)
                 .fade_left(true)
                 .fade_right(true)
                 .fade_scroll_x(&self.compact_strip_scroll)
@@ -521,6 +516,8 @@ impl Pickers {
                     .id("compact-model-back")
                     .role(gpui::Role::Button)
                     .aria_label("Back")
+                    .aria_keyshortcuts("Escape")
+                    .tooltip(|_, cx| cx.new(|_| PickerHint("Back · Esc".into())).into())
                     .flex_none()
                     .size(px(COMPACT_ROW_HEIGHT))
                     .rounded(px(popover::MENU_ITEM_RADIUS))
@@ -1469,7 +1466,7 @@ mod tests {
     }
 }
 
-struct PickerHint(SharedString);
+pub(super) struct PickerHint(pub(super) SharedString);
 impl Render for PickerHint {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_popup();

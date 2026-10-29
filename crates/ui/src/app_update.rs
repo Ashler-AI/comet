@@ -448,4 +448,3 @@ pub fn install_on_quit(cx: &mut App) {
         update.update(cx, |update, _| update.install_on_quit());
     }
 }
-

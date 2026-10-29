@@ -141,7 +141,8 @@ fn request_for(chat: &Chat, prompt: String) -> Result<RunRequest, RpcError> {
     Ok(RunRequest { prompt, harness: Some(config.harness), model: config.model.clone(),
         reasoning: config.reasoning, model_options: config.model_options.clone(),
         cwd: chat.cwd.clone().or_else(|| chat.harness_session_cwd.clone()).ok_or_else(|| failed("Session has no working directory"))?,
-        sandbox: config.sandbox, auto_approve: false, resume: None, attachments: vec![], worktree: None, mcp: None })
+        sandbox: config.sandbox, auto_approve: false, resume: None, attachments: vec![], worktree: None, mcp: None,
+        access: config.access, plan: config.plan, env: Default::default() })
 }
 
 fn validate_recovered_native_input(original: HandoffInput, requested: &HandoffInput,
@@ -226,7 +227,7 @@ fn native_handoff_target(host: &crate::DocHost, workspace: &crate::WorkspaceHost
             let mut model_options = serde_json::Map::new();
             if let Some(account) = &route.account_id { model_options.insert("crewAccountId".into(), json!(account)); }
             let published = zeron_proto::ChatConfig { harness: HarnessId::Omp, model: Some(route.omp_model()), reasoning: None,
-                model_options, sandbox: zeron_proto::SandboxLevel::DangerFullAccess };
+                model_options, sandbox: zeron_proto::SandboxLevel::DangerFullAccess, access: Default::default(), plan: false };
             if config != &published {
                 return Err(failed("Pending native handoff target already has different source configuration"));
             }
@@ -244,9 +245,11 @@ fn native_handoff_target(host: &crate::DocHost, workspace: &crate::WorkspaceHost
         if entry.role != saved.role || entry.created_at != saved.created_at || entry.device_id != saved.device_id
             || entry.status != saved.status || entry.continuation_of != saved.continuation_of || entry.duration_ms != saved.duration_ms
             || entry.parts.len() != saved.parts.len() || !entry.parts.iter().zip(&saved.parts).all(|(known, original)| match (known, original) {
-                (zeron_doc::MessagePart::Input { id, request_id, questions, resolved: true },
-                    zeron_doc::MessagePart::Input { id: original_id, request_id: original_request, questions: original_questions, .. }) =>
-                    id == original_id && request_id == original_request && questions == original_questions,
+                (zeron_doc::MessagePart::Input { id, request_id, questions, resolved: true, answers },
+                    zeron_doc::MessagePart::Input { id: original_id, request_id: original_request,
+                        questions: original_questions, answers: original_answers, .. }) =>
+                    id == original_id && request_id == original_request && questions == original_questions
+                        && answers == original_answers,
                 (zeron_doc::MessagePart::Input { .. }, _) => false,
                 _ => known == original,
             })
@@ -845,14 +848,15 @@ mod tests {
             let mut source = workspace.chat("source").unwrap().unwrap();
             source.config = Some(zeron_proto::ChatConfig { harness: HarnessId::Omp,
                 model: Some("anthropic/claude-sonnet-4-5".into()), reasoning: None,
-                model_options: serde_json::from_value(json!({"source-setting":true})).unwrap(), sandbox: zeron_proto::SandboxLevel::DangerFullAccess });
+                model_options: serde_json::from_value(json!({"source-setting":true})).unwrap(), sandbox: zeron_proto::SandboxLevel::DangerFullAccess,
+                access: Default::default(), plan: false });
             workspace.import_chat_row(&source).unwrap();
             let source_doc = host.open("source").unwrap();
             for id in ["saved-first", "saved-last"] {
                 source_doc.doc().push_message(&zeron_doc::SessionMessageEntry {
                     id: id.into(), role: zeron_doc::MessageRole::Assistant,
                     parts: vec![zeron_doc::MessagePart::Input { id: format!("part-{id}"), request_id: format!("input-{id}"),
-                        questions: vec![], resolved: false }],
+                        questions: vec![], resolved: false, answers: None }],
                     created_at: 1, device_id: "controller".into(), status: Some(zeron_doc::MessageStatus::Complete),
                     continuation_of: None, duration_ms: None,
                 }).unwrap();

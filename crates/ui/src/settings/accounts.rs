@@ -533,12 +533,19 @@ pub struct AccountsPage {
 }
 
 impl AccountsPage {
-    pub(crate) fn set_crew_view(&mut self, view: super::crew::CrewView, database: Option<zeron_proto::ScaffoldDatabaseEnvironment>, cx: &mut Context<Self>) {
-        self.crew.update(cx, |page, cx| page.set_view(view, database, cx));
+    pub(crate) fn set_crew_view(
+        &mut self,
+        view: super::crew::CrewView,
+        database: Option<zeron_proto::ScaffoldDatabaseEnvironment>,
+        cx: &mut Context<Self>,
+    ) {
+        self.crew
+            .update(cx, |page, cx| page.set_view(view, database, cx));
     }
 
     pub(crate) fn capture_annotation_selection(&mut self, cx: &mut Context<Self>) {
-        self.crew.update(cx, |page, cx| page.capture_annotation_selection(cx));
+        self.crew
+            .update(cx, |page, cx| page.capture_annotation_selection(cx));
     }
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::new_with_layout(state, false, None, None, cx)
@@ -568,9 +575,12 @@ impl AccountsPage {
             }
         });
         let crew = cx.new(|cx| super::crew::CrewAccounts::new(state.clone(), cx));
-        let crew_events = cx.subscribe(&crew, |page: &mut Self, _, event: &super::crew::AddAccount, cx| {
-            page.start_login(event.0, None, cx);
-        });
+        let crew_events = cx.subscribe(
+            &crew,
+            |page: &mut Self, _, event: &super::crew::AddAccount, cx| {
+                page.start_login(event.0, None, cx);
+            },
+        );
         let mut page = Self {
             crew,
             state,
@@ -875,7 +885,9 @@ impl AccountsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        if self.login.is_some() { self.cancel_login(cx); }
+        if self.login.is_some() {
+            self.cancel_login(cx);
+        }
         self.login_attempts += 1;
         let attempt = self.login_attempts;
         self.login = Some(LoginFlow {
@@ -893,7 +905,11 @@ impl AccountsPage {
             object.insert("provider".into(), serde_json::json!(provider));
         }
         let params = self.params(params);
-        let method = if self.state.read(cx).managed_inference { "crew.accounts.login.start" } else { methods::START_AGENT_LOGIN };
+        let method = if self.state.read(cx).managed_inference {
+            "crew.accounts.login.start"
+        } else {
+            methods::START_AGENT_LOGIN
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -907,6 +923,13 @@ impl AccountsPage {
                 .ok();
         }));
         cx.notify();
+    }
+
+    pub(crate) fn start_first_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let provider = login_options(harness)
+            .first()
+            .and_then(|option| option.provider);
+        self.start_login(harness, provider, cx);
     }
 
     /// Fold a StartAgentLogin reply into the flow `attempt` (if still open).
@@ -970,12 +993,13 @@ impl AccountsPage {
         };
         *submitting = true;
         let params = self.params(serde_json::json!({ "loginId": login_id, "code": code }));
-        let method = if self.state.read(cx).managed_inference { "crew.accounts.login.complete" } else { methods::COMPLETE_AGENT_LOGIN };
+        let method = if self.state.read(cx).managed_inference {
+            "crew.accounts.login.complete"
+        } else {
+            methods::COMPLETE_AGENT_LOGIN
+        };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(method, params)
-                .await;
+            let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
                 let Some(flow) = page.login.as_mut().filter(|f| f.attempt == attempt) else {
                     return;
@@ -1015,7 +1039,11 @@ impl AccountsPage {
             return;
         };
         let params = self.params(serde_json::json!({ "loginId": login_id }));
-        let method = if self.state.read(cx).managed_inference { "crew.accounts.login.poll" } else { methods::POLL_AGENT_LOGIN };
+        let method = if self.state.read(cx).managed_inference {
+            "crew.accounts.login.poll"
+        } else {
+            methods::POLL_AGENT_LOGIN
+        };
         self.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -1096,18 +1124,24 @@ impl AccountsPage {
         self.poll_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
             let params = self.params(serde_json::json!({ "loginId": login_id }));
-            let method = if self.state.read(cx).managed_inference { "crew.accounts.login.cancel" } else { methods::CANCEL_AGENT_LOGIN };
+            let method = if self.state.read(cx).managed_inference {
+                "crew.accounts.login.cancel"
+            } else {
+                methods::CANCEL_AGENT_LOGIN
+            };
             cx.spawn(async move |_, _| {
-                if let Err(err) = engine
-                    .client()
-                    .call(method, params)
-                    .await
-                {
+                if let Err(err) = engine.client().call(method, params).await {
                     tracing::debug!(error = %err, "CancelAgentLogin failed (best-effort)");
                 }
-            }).detach();
+            })
+            .detach();
         }
         cx.notify();
+    }
+
+    /// Whether a dialog [`Self::dismiss_on_escape`] would close is open.
+    pub(crate) fn has_escape_surface(&self) -> bool {
+        self.login.is_some()
     }
 
     /// Escape that reached Settings unclaimed cancels an open login first,
@@ -1526,7 +1560,9 @@ impl AccountsPage {
             }
         } else {
             match login.step {
-                LoginStep::PasteCode { .. } => "Approve access in your browser, then paste the authorization code below. Your current login is unchanged until you switch.",
+                LoginStep::PasteCode { .. } => {
+                    "Approve access in your browser, then paste the authorization code below. Your current login is unchanged until you switch."
+                }
                 _ => login_copy(login.harness, login.provider),
             }
         };
@@ -1902,18 +1938,34 @@ impl AccountsPage {
 
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.state.read(cx).managed_inference || self.crew.read(cx).view() != super::crew::CrewView::Accounts {
+        if self.state.read(cx).managed_inference
+            || self.crew.read(cx).view() != super::crew::CrewView::Accounts
+        {
             let theme = Theme::of(cx).for_settings_surface();
             let scrollbar = popover::rail(self, "accounts-page-scrollbar", &theme, cx);
             let dialog = self.render_login_dialog(window.viewport_size(), cx);
-            return div().id("crew-accounts-page-host").relative().size_full()
+            return div()
+                .id("crew-accounts-page-host")
+                .relative()
+                .size_full()
                 .on_hover(cx.listener(Self::on_scroll_hovered))
-                .child(crate::edge_fade::edge_faded(16.0, true, true,
-                    div().id("crew-accounts-page").size_full().overflow_y_scroll()
-                        .track_scroll(&self.scroll.scroll)
-                        .child(widgets::page_column().child(self.crew.clone())))
-                    .fade_overflow_y(&self.scroll.scroll))
-                .children(scrollbar).children(dialog).into_any_element();
+                .child(
+                    crate::edge_fade::edge_faded(
+                        16.0,
+                        true,
+                        true,
+                        div()
+                            .id("crew-accounts-page")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll.scroll)
+                            .child(widgets::page_column().child(self.crew.clone())),
+                    )
+                    .fade_overflow_y(&self.scroll.scroll),
+                )
+                .children(scrollbar)
+                .children(dialog)
+                .into_any_element();
         }
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();

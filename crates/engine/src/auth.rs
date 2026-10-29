@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -263,6 +264,9 @@ struct AuthInner {
     /// Single-flight refresh/verification. Rotating credentials must finish even
     /// if an individual HTTP/WS consumer cancels its wait.
     refresh_gate: tokio::sync::Mutex<()>,
+    /// Set during managed-engine shutdown after any rotating credential has
+    /// finished. No later consumer may start another exchange in this process.
+    refresh_quiesced: AtomicBool,
     refresh_flight: Mutex<Option<(u64, RefreshFlight)>>,
     /// Failed refreshes are shared across every HTTP/WS token consumer, not
     /// just delayed by the background loop. Resettable without waiting on HTTP.
@@ -361,6 +365,7 @@ impl Auth {
                 access: Mutex::new(None),
                 sign_in: Mutex::new(SignInLifecycle::default()),
                 refresh_gate: tokio::sync::Mutex::new(()),
+                refresh_quiesced: AtomicBool::new(false),
                 refresh_flight: Mutex::new(None),
                 refresh_retry: Mutex::new(RefreshRetry::default()),
                 retry_tx,
@@ -1139,11 +1144,24 @@ impl Auth {
         flight.await.map_err(EngineError::Other)
     }
 
+    /// Bound shutdown on an in-flight credential rotation and prevent a new
+    /// one from starting before the successor engine takes the profile lock.
+    pub async fn quiesce_refresh(&self, limit: Duration) {
+        let gate = tokio::time::timeout(limit, self.inner.refresh_gate.lock()).await;
+        self.inner.refresh_quiesced.store(true, Ordering::SeqCst);
+        if gate.is_err() {
+            tracing::warn!("an auth refresh was still running at shutdown");
+        }
+    }
+
     async fn refresh_serialized(
         &self,
         organization_id: Option<&str>,
     ) -> Result<Option<String>, EngineError> {
         let _gate = self.inner.refresh_gate.lock().await;
+        if self.inner.refresh_quiesced.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         // Re-check under the gate: the refresh we queued behind may have done the work.
         if !self.scaffold_enabled() && organization_id.is_none()
             && let Some(entry) = &*lock(&self.inner.access)

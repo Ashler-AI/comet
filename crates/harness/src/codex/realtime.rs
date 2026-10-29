@@ -12,9 +12,9 @@ use tokio_util::sync::CancellationToken;
 type AudioAbort = Arc<Mutex<Option<(u64, CancellationToken)>>>;
 use zeron_proto::voice::*;
 
-/// Every Zeron voice session is a projectless orchestrator. Given to both the
+/// Every Crew voice session is a projectless orchestrator. Given to both the
 /// realtime voice model and the backing Codex model that runs its delegations.
-pub const ORCHESTRATOR_INSTRUCTIONS: &str = "This is a Zeron voice session and you are the user's orchestrator. Use the Zeron MCP tools to do the work: list and read chats, create new chats with the right agent and project, send them messages, check on their progress, and report back. Delegate coding and file changes to those chats instead of doing them yourself in this session. Keep spoken replies short and conversational.";
+pub const ORCHESTRATOR_INSTRUCTIONS: &str = "This is a Crew voice session and you are the user's orchestrator. Use the Crew MCP tools to do the work: list and read chats, create new chats with the right agent and project, send them messages, check on their progress, and report back. Delegate coding and file changes to those chats instead of doing them yourself in this session. Keep spoken replies short and conversational.";
 
 #[derive(Clone)]
 pub(super) struct ThreadContext {
@@ -181,12 +181,20 @@ pub(super) fn attach(
             let mut commands = controls.commands;
             while let Some(command) = commands.recv().await {
                 match command {
-                    VoiceCommand::Probe { reply, .. } => { let _ = reply.send(Err(VoiceRejection::Unsupported)); }
-                    VoiceCommand::External { reply, .. } => { let _ = reply.send(Err(VoiceRejection::Unsupported)); }
+                    VoiceCommand::Probe { reply, .. } => {
+                        let _ = reply.send(Err(VoiceRejection::Unsupported));
+                    }
+                    VoiceCommand::External { reply, .. } => {
+                        let _ = reply.send(Err(VoiceRejection::Unsupported));
+                    }
                     VoiceCommand::Start { reply, .. }
                     | VoiceCommand::Mute { reply, .. }
-                    | VoiceCommand::Append { reply, .. } => { let _ = reply.send(Err(VoiceRejection::Unsupported)); }
-                    VoiceCommand::Stop { reply } => { let _ = reply.send(Ok(())); }
+                    | VoiceCommand::Append { reply, .. } => {
+                        let _ = reply.send(Err(VoiceRejection::Unsupported));
+                    }
+                    VoiceCommand::Stop { reply } => {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
             }
         }));

@@ -3,7 +3,7 @@
 One upstream-based implementation produces the native desktop and headless Crew
 runtime. Internal Cargo packages and artwork filenames may remain `zeron`; the
 published compatibility executable is **`comet`**. The workspace release is
-**0.2.126**. This release is staging-only: do not publish production or
+**0.2.127**. This release is staging-only: do not publish production or
 repin production Scaffold. The authoritative lifecycle is
 [`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md).
 
@@ -113,7 +113,7 @@ scripts/package-linux.sh
 ```
 
 Produces `target/package/comet-<version>-linux-<arch>.tar.gz` for `x86_64` or `aarch64`,
-containing the native `comet` executable, Crew desktop entry/icons, licenses,
+containing the native `comet` and `zeron-engine` executables, Crew desktop entry/icons, licenses,
 installer, and the complete `crew-web/` fixed-session browser assets. The browser
 contract sidecar travels with these assets. Scaffold supplies Node and selects
 the browser runtime location separately; desktop installation does not launch it.

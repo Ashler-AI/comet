@@ -404,7 +404,11 @@ fn scroll_child_index(sections: &[PaletteSection], row_ix: usize) -> usize {
     for (section_ix, section) in sections.iter().enumerate() {
         if row_ix < rows_before + section.rows.len() {
             let child = row_ix + section_ix + 1;
-            return if row_ix == rows_before { child - 1 } else { child };
+            return if row_ix == rows_before {
+                child - 1
+            } else {
+                child
+            };
         }
         rows_before += section.rows.len();
     }
@@ -518,8 +522,8 @@ impl Shell {
         let query = palette.search.read(cx).text().trim().to_owned();
         // An empty query lists the workspace's recent files (the default
         // Files list); a single character is too broad to search.
-        let Some(client) =
-            workspace.filter(|_| query.is_empty() || query.chars().count() >= MIN_WORKSPACE_QUERY_CHARS)
+        let Some(client) = workspace
+            .filter(|_| query.is_empty() || query.chars().count() >= MIN_WORKSPACE_QUERY_CHARS)
         else {
             palette.files.clear();
             palette.content.clear();
@@ -668,22 +672,29 @@ impl Shell {
         // files (the host's empty-query list), each path once.
         let recent_files = |limit| {
             let mut seen = std::collections::HashSet::new();
-            let opened = self.recent_files(&self.active_chat).map(|path| (path.clone(), false));
+            let opened = self
+                .recent_files(&self.active_chat)
+                .map(|path| (path.clone(), false));
             let changed = palette
                 .files
                 .results
                 .iter()
                 .filter(|found| found.kind != WorkspaceEntryKind::Directory)
                 .map(|found| (found.path.clone(), false));
-            PaletteSection::new(
+            let section = PaletteSection::new(
                 Section::RecentFiles,
                 opened
                     .chain(changed)
                     .filter(|(path, _)| seen.insert(path.clone()))
                     .take(limit)
                     .map(|(path, is_dir)| RowKind::File { path, is_dir }),
-            )
-            .with_status(palette.files.progress())
+            );
+            // Only once there are files to show: an empty "Searching…"
+            // section that then finds nothing would shrink the card away.
+            let status = (!section.rows.is_empty())
+                .then(|| palette.files.progress())
+                .flatten();
+            section.with_status(status)
         };
         let files = |limit| {
             PaletteSection::new(
@@ -1075,7 +1086,11 @@ impl Shell {
                     (None, None) => None,
                     _ => Some("?"),
                 };
-                let folder = match (project, state.device_name(&chat.device_id)) {
+                // A Cloud chat's own machine isn't a device worth naming.
+                let device = (!zeron_proto::is_cloud_device(&chat.device_id, ""))
+                    .then(|| state.device_name(&chat.device_id))
+                    .flatten();
+                let folder = match (project, device) {
                     (Some(project), Some(device)) => format!("{project} @ {device}"),
                     (Some(project), None) => project.to_string(),
                     (None, device) => device.unwrap_or_default().to_string(),
@@ -1143,6 +1158,7 @@ impl Shell {
         let focus = palette.focus.clone();
         let scroll = palette.scroll.clone();
         let current_tab = palette.tab;
+        let files_loading = palette.files.loading || palette.files.indexing;
         let theme = Theme::of(cx).for_popup();
         let mut children = Vec::new();
         let mut ix = 0;
@@ -1196,11 +1212,18 @@ impl Shell {
             .gap(px(SIDEBAR_LIST_GAP))
             .children(children)
             .when(sections.is_empty(), |el| {
-                el.child(palette_empty(
-                    &theme,
-                    "No results",
-                    "Try a command, chat title, project, or device.",
-                ))
+                let (title, hint) = match (current_tab, query.is_empty()) {
+                    (Tab::Files, true) if files_loading => ("Looking for recent files…", ""),
+                    (Tab::Files, true) => (
+                        "No recent files",
+                        "Files you open or change in this workspace show up here.",
+                    ),
+                    _ => (
+                        "No results",
+                        "Try a command, chat title, project, or device.",
+                    ),
+                };
+                el.child(palette_empty(&theme, title, hint))
             });
         let body = palette_results_fade(body, &scroll);
         let tabs = div()
@@ -1402,6 +1425,20 @@ pub(super) fn palette_footer() -> gpui::Div {
         .gap(px(12.0))
 }
 
+/// The card's chrome beside its results at their tallest: the search header,
+/// New project's breadcrumbs and the footer (Cmd+K has no crumbs and simply
+/// ends shorter).
+const PALETTE_CHROME_HEIGHT: f32 = 120.0;
+
+/// Where a palette card's top sits: where a card at its tallest would sit
+/// centered, never under the titlebar. Results growing or shrinking only
+/// move the bottom edge, and Cmd+K and New project share the line, so
+/// typing or switching between them never jumps the card.
+fn palette_top(viewport: gpui::Size<Pixels>) -> f32 {
+    let tallest = palette_results_height(viewport) + PALETTE_CHROME_HEIGHT;
+    ((f32::from(viewport.height) - tallest) / 2.0).max(Theme::TITLEBAR_HEIGHT + 16.0)
+}
+
 /// Mount a palette card over the scrimmed window, frosted like the composer.
 pub(super) fn palette_overlay(
     viewport: gpui::Size<Pixels>,
@@ -1421,8 +1458,9 @@ pub(super) fn palette_overlay(
                     // preserving its color through the frosted palette.
                     .bg(popover::scrim_alpha(0.35))
                     .flex()
+                    .flex_col()
                     .items_center()
-                    .justify_center()
+                    .pt(px(palette_top(viewport)))
                     .child(card),
             ),
     )
@@ -1453,17 +1491,12 @@ pub(super) fn command_key_hint(theme: &Theme, keys: &str, label: &'static str) -
             .text_color(theme.text_muted)
             .child(SharedString::from(keys.to_string())),
     };
-    div()
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .child(cap)
-        .child(
-            div()
-                .text_size(crate::typography::ui_rems(10.0))
-                .text_color(theme.text_muted)
-                .child(label),
-        )
+    div().flex().items_center().gap(px(5.0)).child(cap).child(
+        div()
+            .text_size(crate::typography::ui_rems(10.0))
+            .text_color(theme.text_muted)
+            .child(label),
+    )
 }
 
 #[cfg(test)]
@@ -1483,13 +1516,17 @@ mod tests {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                ipc_port: 0,
-                edge_url: "http://127.0.0.1:1".into(),
-                edge_token: None,
-                org_id: None,
-                workos_client_id: None,
-                default_harness: zeron_proto::HarnessId::Mock, },
+                EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
                 cx,
             )
         });
@@ -1967,7 +2004,11 @@ mod tests {
             .collect();
         // Files only; no content search runs without a query.
         assert_eq!(paths, ["src/recent.rs", "README.md"]);
-        assert!(engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx).is_empty());
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
     }
 
     #[gpui::test]

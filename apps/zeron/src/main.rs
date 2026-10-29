@@ -37,6 +37,10 @@ struct Cli {
 enum Command {
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless(crew_cli::HeadlessArgs),
+    /// The packaged desktop's background engine. It keeps sessions alive
+    /// after the Crew window closes.
+    #[command(hide = true)]
+    Engine,
     /// Sign in and enable sync on the next engine start.
     Login,
     /// Remove the saved session and return to local-only on the next start.
@@ -126,16 +130,6 @@ enum DaemonCommand {
 }
 
 
-/// mimalloc, macOS only: libmalloc never returns the streaming churn's
-/// high-water pages, so transient allocation became permanent RSS
-/// (docs/memory-plan.md §1). Pinned to mimalloc v2 in the workspace manifest —
-/// the crate's default v3 has the same pathology (churn retained as permanent
-/// RSS, ~6x glibc's growth on identical workloads, no idle recovery). Linux
-/// measured flat on glibc, so it keeps the system allocator.
-#[cfg(target_os = "macos")]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 /// glibc gives threads their own arenas (up to 8 × cores) and on free returns
 /// only the top of each heap, so churn freed mid-heap stays resident: a
 /// headless engine held 6.6GB in 129 arenas after a day. `malloc_trim` also
@@ -164,9 +158,6 @@ fn spawn_malloc_trimmer() {
 }
 
 fn main() -> anyhow::Result<()> {
-    if let Some(result) = zeron_harness::omp::run_writer_probe_from_env() {
-        return result.map_err(anyhow::Error::from);
-    }
     if let Some(result) = zeron_harness::omp::run_supervisor_from_env() {
         return result.map_err(anyhow::Error::from);
     }
@@ -176,6 +167,10 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
     let mut cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Engine)) {
+        let config = cli.runtime.config(false, true, false)?;
+        return zeron_app::background::run_with_config(config);
+    }
     // Provider migration must never initialize auth, paths, locks or a runtime
     // against its old profile. Context files are bindings, not cloud authority.
     cli.command = match cli.command {
@@ -184,7 +179,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::VerifyRemoteBackup(args)) => return remote_backup_cli::verify(args),
         Some(Command::InspectBackup(args)) => return session_cli::inspect(args),
         Some(Command::ExportBackup(args)) if args.offline() => {
-            return tokio::runtime::Runtime::new()?.block_on(session_cli::export(args, 0));
+            return tokio::runtime::Runtime::new()?.block_on(session_cli::export(args, 0, None));
         }
         Some(Command::ImportBackup { backup, destination, validate_only, verify_only,
             identity_session: Some(identity), source_context: Some(context), device_id: Some(device) }) => {
@@ -302,24 +297,30 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::ScaffoldAuthority) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(crew_cli::scaffold_authority(config.ipc_port))
+            runtime.block_on(crew_cli::scaffold_authority(
+                config.ipc_port,
+                &config.data_dir,
+            ))
         }
         Some(Command::Session { command }) => {
-            tokio::runtime::Runtime::new()?.block_on(session_cli::run(command, config.ipc_port))
+            tokio::runtime::Runtime::new()?.block_on(session_cli::run(command, config.ipc_port, &config.data_dir))
         }
         Some(Command::Scaffold { command }) => {
-            tokio::runtime::Runtime::new()?.block_on(session_cli::scaffold(command, config.ipc_port))
+            tokio::runtime::Runtime::new()?.block_on(session_cli::scaffold(command, config.ipc_port, &config.data_dir))
         }
         Some(Command::ImportBackup { backup, destination, validate_only, verify_only, .. }) => {
-            tokio::runtime::Runtime::new()?.block_on(session_cli::import(backup, destination, validate_only, verify_only, config.ipc_port))
+            tokio::runtime::Runtime::new()?.block_on(session_cli::import(
+                backup, destination, validate_only, verify_only, config.ipc_port, &config.data_dir,
+            ))
         }
         Some(Command::ExportBackup(args)) => {
-            tokio::runtime::Runtime::new()?.block_on(session_cli::export(args, config.ipc_port))
+            tokio::runtime::Runtime::new()?.block_on(session_cli::export(args, config.ipc_port, Some(&config.data_dir)))
         }
         Some(Command::ExportRemoteBackup(_) | Command::ImportRemoteBackup(_) | Command::VerifyRemoteBackup(_) | Command::InspectBackup(_)) => unreachable!("offline migration dispatched before runtime configuration"),
+        Some(Command::Engine) => unreachable!("background engine dispatched before runtime configuration"),
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(sync_cli(config.ipc_port))
+            runtime.block_on(sync_cli(config.ipc_port, &config.data_dir))
         }
         Some(Command::Mcp) => {
             // One bridge per agent session, and it only relays: stdio
@@ -333,6 +334,7 @@ fn main() -> anyhow::Result<()> {
                 .build()?;
             let mut mcp = zeron_mcp::McpConfig::from_env();
             mcp.ipc_port = config.ipc_port;
+            mcp.data_dir = Some(config.data_dir.clone());
             if let Ok(id) = std::env::var("COMET_SESSION_ID") { mcp.origin.chat_id = Some(id); }
             if let Ok(id) = std::env::var("COMET_DEVICE_ID") { mcp.origin.device_id = Some(id); }
             runtime.block_on(zeron_mcp::run(mcp))
@@ -401,11 +403,11 @@ fn attach_parent_console() {
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
 /// The introspection surface every 2026-08 incident was missing — "is this
 /// device's workspace room actually receiving?" as a one-liner.
-async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
-    let client = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+async fn sync_cli(ipc_port: u16, data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let client = zeron_rpc::connect_ipc(ipc_port, Some(data_dir))
         .await
         .map_err(|e| {
-            anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is zeron running?")
+            anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is Crew running?")
         })?;
     let status = client
         .call(zeron_rpc::methods::SYNC_STATUS, serde_json::json!({}))

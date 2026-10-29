@@ -10,6 +10,8 @@ struct NewSessionDraft: Equatable, Codable {
     var harness = "claude-code"
     var model: String?
     var effort: String?
+    /// Run on its own Cloud machine (optional: drafts saved before Cloud).
+    var cloud: Bool?
 }
 
 /// Options the pickers offer (from the core's workspace + host catalogs).
@@ -27,6 +29,10 @@ struct ProjectOption: Equatable {
     let groupKey: String
     let groupName: String
     let colorIndex: Int
+    /// Lives on Cloud alone.
+    var isCloud = false
+    /// `owner/name` of its GitHub repository, when known.
+    var githubRepo: String?
 }
 
 struct HostOption: Equatable {
@@ -41,6 +47,7 @@ struct ModelChoice: Equatable {
     let id: String
     let label: String
     let efforts: [String]
+    var detail: String? = nil
 }
 
 /// "Ask anything" → a composer-first canvas. Context is set with native menus
@@ -58,6 +65,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     /// Embedded in the iPad split's main column (no sheet chrome).
     private let embedded: Bool
+    private var composerRest: NSLayoutConstraint?
     private var backgroundObserver: NSObjectProtocol?
 
     deinit {
@@ -140,7 +148,11 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             guard let self else { return UIMenu() }
             return AttachmentPicker.menu(host: self, limit: 8 - self.composer.images.count) { [weak self] in self?.composer.addImages($0) }
         }
-        composer.onChipTap = { _, _ in }
+        // The model chip opens the picker sheet (tabs per provider).
+        composer.onChipTap = { [weak self] id, _ in
+            guard let self, id == "model" else { return }
+            self.present(self.modelPicker(), animated: true)
+        }
         composer.mentionSearch = { [weak self] q in
             guard let self, let p = self.project else { return [] }
             return await self.app.searchFiles(deviceId: p.device, spaceId: p.id, query: q)
@@ -164,7 +176,9 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             free.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -20),
             free.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             free.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            heroStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            // Safe area, not view: insets can differ side to side (the
+            // iPhone Duo's camera and status bar sit on one edge).
+            heroStack.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             heroStack.centerYAnchor.constraint(equalTo: free.centerYAnchor),
             heroStack.topAnchor.constraint(greaterThanOrEqualTo: free.topAnchor),
             heroStack.bottomAnchor.constraint(lessThanOrEqualTo: free.bottomAnchor),
@@ -172,8 +186,8 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             composer.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             composer.widthAnchor.constraint(lessThanOrEqualToConstant: 768),
             fill,
-            composer.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor, constant: -8),
         ])
+        composerRest = pinAboveKeyboard(composer)
         if draft.projectId == nil, draft.hostId == nil { draft.projectId = app.projectOptions.first?.id }
         if draft.projectId == nil, draft.hostId == nil {
             // No projects yet: run on the first reachable host.
@@ -208,13 +222,18 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     private static func catalogModels() -> [ModelChoice] {
         fallbackHarnesses().filter(\.offered).flatMap { h in
-            fallbackModels(harness: h.id).map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels) }
+            fallbackModels(harness: h.id).map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels, detail: $0.description) }
         }
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if focusOnAppear { composer.becomeFirstResponder() }
+    }
+
+    override func viewWillLayoutSubviews() {
+        super.viewWillLayoutSubviews()
+        composerRest?.constant = -composerRestGap
     }
 
     override func viewDidLayoutSubviews() {
@@ -258,7 +277,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             chips.append(ComposerChip(id: "project", title: "No project", symbol: "tray"))
             chips.append(ComposerChip(id: "host", title: host?.name ?? "Choose host", symbol: "desktopcomputer"))
         }
-        let model = models.first { $0.harness == draft.harness && $0.id == draft.model } ?? models.first { $0.harness == draft.harness }
+        let model = draftModel
         // Never the harness name in place of a model: a model this host
         // hasn't listed still gets its catalog label.
         let modelTitle = model?.label ?? draft.model.map { modelLabel(harness: draft.harness, model: $0) } ?? fallbackModels(harness: draft.harness).first?.label ?? HarnessNames.label(draft.harness)
@@ -271,7 +290,6 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             "project": { [weak self] in self?.projectMenu() },
             "host": { [weak self] in self?.hostMenu() },
             "branch": { [weak self] in self?.branchMenu() },
-            "model": { [weak self] in self?.modelMenu() },
             "effort": { [weak self] in self?.effortMenu() },
         ]
         mark.image = BrandMarks.image(for: draft.harness, side: 34)
@@ -331,9 +349,10 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
     }
 
     private func pickCheckout(_ p: ProjectOption) {
-        if p.id != draft.projectId { draft.branch = nil }
+        if p.id != draft.projectId || draft.cloud == true { draft.branch = nil }
         draft.projectId = p.id
         draft.hostId = nil
+        draft.cloud = nil
         loadModels()
     }
 
@@ -342,13 +361,14 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
     /// home.
     private func hostMenu() -> UIMenu {
         let checkouts = self.checkouts
-        if !checkouts.isEmpty {
-            return UIMenu(title: "Run on", children: checkouts.map { p in
+        if !checkouts.isEmpty || project != nil {
+            let items: [UIMenuElement] = checkouts.map { p in
                 let shared = checkouts.filter { $0.device == p.device }.count > 1
                 return UIAction(title: p.deviceName, subtitle: shared ? p.path : (p.online ? "Online" : "Offline"), image: UIImage(systemName: "desktopcomputer"), state: p.id == draft.projectId ? .on : .off) { [weak self] _ in
                     self?.pickCheckout(p)
                 }
-            })
+            }
+            return UIMenu(title: "Run on", children: items)
         }
         return UIMenu(title: "Run on", children: app.hostOptions.map { h in
             UIAction(title: h.name, subtitle: h.online ? "Online" : "Offline", image: UIImage(systemName: "desktopcomputer"), state: h.id == draft.hostId ? .on : .off) { [weak self] _ in
@@ -359,7 +379,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
     }
 
     private func branchMenu() -> UIMenu {
-        UIMenu(title: "Checkout", children: [
+        return UIMenu(title: "Checkout", children: [
             UIAction(title: "New worktree", state: draft.worktree ? .on : .off) { [weak self] _ in
                 self?.draft.worktree.toggle()
                 self?.refreshChips()
@@ -379,22 +399,38 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         ])
     }
 
-    private func modelMenu() -> UIMenu {
-        let byHarness = Dictionary(grouping: models, by: \.harness)
-        return UIMenu(title: "Model", children: byHarness.keys.sorted().map { h in
-            UIMenu(title: byHarness[h]!.first!.harnessLabel, image: BrandMarks.image(for: h, side: 16), options: .displayInline, children: byHarness[h]!.map { m in
-                UIAction(title: m.label, state: m.harness == draft.harness && m.id == draft.model ? .on : .off) { [weak self] _ in
-                    self?.draft.harness = m.harness
-                    self?.draft.model = m.id
-                    self?.draft.effort = nil
-                    self?.refreshChips()
-                }
-            })
-        })
+    /// A tab per provider the target runs (the draft's first), each listing
+    /// the models already loaded for it.
+    private func modelPicker() -> UIViewController {
+        var order: [String] = [draft.harness]
+        for m in models where !order.contains(m.harness) { order.append(m.harness) }
+        let tabs = order.compactMap { h -> ModelPickerTab? in
+            let choices = models.filter { $0.harness == h }
+            guard let first = choices.first else { return nil }
+            let rows = choices.map { ModelPickerRow(id: $0.id, label: $0.label, detail: $0.detail) }
+            return ModelPickerTab(harness: h, label: first.harnessLabel) { rows }
+        }
+        let host = (name: app.deviceName(deviceId), symbol: "desktopcomputer")
+        return ModelPickerViewController.sheet(tabs: tabs, harness: draft.harness, model: draft.model, host: host) { [weak self] harness, model in
+            guard let self else { return }
+            if harness != self.draft.harness { self.draft.effort = nil }
+            self.draft.harness = harness
+            self.draft.model = model.id
+            self.refreshChips()
+        }
+    }
+
+    /// The draft's own model when it names one (even one this list lacks:
+    /// it's what gets sent, so its label and efforts are its own); the
+    /// provider's default only when it names none.
+    private var draftModel: ModelChoice? {
+        draft.model == nil
+            ? models.first { $0.harness == draft.harness }
+            : models.first { $0.harness == draft.harness && $0.id == draft.model }
     }
 
     private func effortMenu() -> UIMenu {
-        let model = models.first { $0.harness == draft.harness && $0.id == draft.model } ?? models.first { $0.harness == draft.harness }
+        let model = draftModel
         return UIMenu(title: "Reasoning effort", children: (model?.efforts ?? []).map { e in
             UIAction(title: e.capitalized, state: e == draft.effort ? .on : .off) { [weak self] _ in
                 self?.draft.effort = e

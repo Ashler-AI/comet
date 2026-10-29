@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.."
 DEMO_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/crew-demo.XXXXXX")"
 DAEMON_DIR="$DEMO_ROOT/daemon"
 UI_DIR="$DEMO_ROOT/ui"
+PROJECTS_DIR="$DEMO_ROOT/projects"
 IPC=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 DELAY=""
 [[ "${1:-}" == "--slow" ]] && DELAY=350
@@ -20,9 +21,11 @@ DELAY=""
 echo "▸ building (first run takes a few minutes)…"
 # This is a source/mock launch, never a packaged application identity.
 unset COMET_PACKAGE_ENVIRONMENT COMET_DEFAULT_ENVIRONMENT
-cargo build -p zeron -q
-TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')"
-CREW="$TARGET_DIR/debug/zeron"
+CREW="$DEMO_ROOT/comet"
+PROBE="$DEMO_ROOT/rpc_probe"
+trap 'rm -rf "$DEMO_ROOT"' EXIT
+python3 scripts/local-cargo.py build --locked -p zeron -p zeron-rpc --bin zeron --example rpc_probe \
+  --copy-binary debug/zeron "$CREW" --copy-binary debug/examples/rpc_probe "$PROBE"
 
 echo "▸ starting engine daemon on :$IPC"
 env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
@@ -39,16 +42,18 @@ for _ in $(seq 1 40); do
 done
 kill -0 "$DAEMON_PID" 2>/dev/null || { wait "$DAEMON_PID"; exit 1; }
 
-probe() { cargo run -q -p zeron-rpc --example rpc_probe -- "ws://127.0.0.1:$IPC" "$@"; }
+probe() { ZERON_DATA_DIR="$DAEMON_DIR" "$PROBE" "ws://127.0.0.1:$IPC" "$@"; }
 
 if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   echo "▸ seeding demo chats"
   DEV=$(probe LocalDevice '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["deviceId"])')
-  # One space per demo folder, created up-front (chats join by space id).
+  # One space per demo folder, created up-front (chats join by space id);
+  # a folder already registered keeps its first space, so each is listed once.
   declare -A SPACES=()
   for project in zeron soccertcg aether; do
     sid=$(uuidgen | tr 'A-Z' 'a-z')
-    probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
+    mkdir -p "$PROJECTS_DIR/$project"
+    probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$PROJECTS_DIR/$project\"}" >/dev/null
     SPACES[$project]="$sid"
   done
   seed() { # title project branch age_hours run
@@ -73,6 +78,6 @@ fi
 
 echo "▸ opening Crew (composer is live — type into it; --slow shows streaming)"
 env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
-  ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_HARNESS=mock RUST_LOG=warn \
+  ASHLER_INCREMENTAL_TSC_CHECKS=false COMET_HARNESS=mock ZERON_IPC_TOKEN_FILE="$DAEMON_DIR/ipc-token" RUST_LOG=warn \
   "$CREW" --data-dir "$UI_DIR" --ipc-port "$IPC" \
   --edge-url http://127.0.0.1:27941

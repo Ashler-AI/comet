@@ -363,6 +363,18 @@ pub struct PullRequestsPage {
 }
 
 impl PullRequestsPage {
+    #[cfg(test)]
+    pub(crate) fn show_test_items(
+        &mut self,
+        items: Vec<ChangeRequestListItem>,
+        cx: &mut Context<Self>,
+    ) {
+        self.items = items;
+        self.view_items = None;
+        self.load_state = PullRequestsLoadState::Ready;
+        cx.notify();
+    }
+
     pub(crate) fn preview(&self, url: &str) -> Option<ChangeRequestListItem> {
         self.items.iter().find(|item| item.url == url).cloned()
     }
@@ -1008,7 +1020,10 @@ impl PullRequestsPage {
             return;
         };
         if !state.device_online(&device, Utc::now()) {
-            crate::toast::error(cx, "This device is offline. Reconnect it to open the project.");
+            crate::toast::error(
+                cx,
+                "This device is offline. Reconnect it to open the project.",
+            );
             cx.notify();
             return;
         }
@@ -1298,7 +1313,13 @@ impl PullRequestsPage {
                                     .flex()
                                     .items_baseline()
                                     .gap(px(6.0))
-                                    .child(div().flex_none().max_w_full().truncate().child(name.clone()))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .max_w_full()
+                                            .truncate()
+                                            .child(name.clone()),
+                                    )
                                     .when_some(detail, |el, detail| {
                                         el.child(
                                             div()
@@ -1432,7 +1453,6 @@ impl PullRequestsPage {
                                 })),
                         ),
                 )
-
                 .when(!options.is_empty(), |el| {
                     el.child(
                         popover::menu_scroll_host("pr-repository-list-host")
@@ -2394,8 +2414,6 @@ impl Render for PullRequestsPage {
                             .child(self.render_device_switcher(&theme, cx)),
                     ),
             )
-
-
             .child(
                 div()
                     .mt(px(12.0))
@@ -3691,29 +3709,34 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: Utc::now() - TimeDelta::minutes(created_minutes_ago),
         }
     }
 
     fn session(space: &str, last_message_at: Option<DateTime<Utc>>) -> zeron_proto::Chat {
-        zeron_proto::Chat { crew: None, id: "chat".into(),
-        device_id: "local".into(),
-        title: None,
-        archived: false,
-        cwd: None,
-        branch: None,
-        checkout_id: None,
-        source_context: None,
-        config: None,
-        last_message_preview: None,
-        last_message_at,
-        created_at: Utc::now(),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        parent_chat_id: None,
-        space_id: Some(space.into()),
-        last_seen_at: None,
-        room_gen: None, }
+        zeron_proto::Chat {
+            crew: None,
+            harness_session_harness: None,
+            id: "chat".into(),
+            device_id: "local".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: Some(space.into()),
+            last_seen_at: None,
+            room_gen: None,
+        }
     }
 
     fn project(id: &str, device: &str) -> ProjectRef {
@@ -4307,8 +4330,14 @@ mod tests {
         cx.run_until_parked();
         let scroll = page.read_with(cx, |page, _| page.repository_scroll.scroll.clone());
         assert!(scroll.max_offset().y > px(0.0));
+        let input = cx.debug_bounds("pr-repository-load").unwrap();
         scroll.set_offset(gpui::point(px(0.0), -scroll.max_offset().y));
         cx.update(|window, cx| window.draw(cx).clear());
+        assert_eq!(
+            cx.debug_bounds("pr-repository-load").unwrap(),
+            input,
+            "the input stays above the scroll region"
+        );
         page.update(cx, |page, cx| {
             page.state.update(cx, |state, cx| {
                 state.spaces = vec![space("next", "local", true, 1)];
@@ -4344,6 +4373,7 @@ mod tests {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
+                github_repo: None,
                 created_at: Utc::now(),
             }];
             state.selected_space = Some("project".into());
@@ -4527,6 +4557,7 @@ mod tests {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
+                github_repo: None,
                 created_at: Utc::now(),
             }];
             state.selected_space = Some("project".into());
@@ -4589,6 +4620,7 @@ mod tests {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
+                github_repo: None,
                 created_at: Utc::now(),
             }];
             state.selected_space = Some("project".into());

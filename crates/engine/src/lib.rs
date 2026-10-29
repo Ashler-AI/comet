@@ -15,10 +15,22 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, TokenSource, methods};
 
 use zeron_sync::DocsStore;
 
+/// The process advertises the same features before and after profile assembly.
+fn engine_capabilities() -> Vec<String> {
+    let mut capabilities = zeron_proto::capabilities::current();
+    if desktop_notify::enabled() {
+        capabilities.push(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1.to_string());
+    }
+    capabilities
+}
+
 pub mod agent_accounts;
 pub mod auth;
 mod boat_lease;
 pub mod devbox;
+pub mod deferred;
+pub mod desktop_notify;
+pub mod managed;
 mod namespace_tasks;
 pub mod crew;
 mod crew_directory;
@@ -30,6 +42,7 @@ mod change_request_store;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
+pub mod commit_credit;
 pub mod diff_sync;
 pub mod doc_host;
 mod fs_watch;
@@ -42,6 +55,7 @@ mod model_catalogs;
 pub mod profile;
 pub mod project_actions;
 pub mod registry;
+pub mod remote_terminals;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
@@ -89,6 +103,7 @@ pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
 pub use workspace_search::WorkspaceSearch;
+pub use zeron_preview::Scope as PreviewScope;
 
 pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 
@@ -157,6 +172,8 @@ pub struct EngineCore {
     pub repos: Repos,
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    /// I/O routing for terminals on other devices (direct link or relay).
+    pub remote_terminals: remote_terminals::RemoteTerminals,
     pub project_actions: ProjectActionsStore,
     pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
@@ -166,6 +183,8 @@ pub struct EngineCore {
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
     pub device_id: String,
+    /// Which app windows are focused (desktop banners hold back while one is).
+    pub viewport_focus: desktop_notify::ViewportFocus,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
@@ -304,6 +323,7 @@ impl EngineCore {
         let workspace_files =
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
+        sessions.track_terminal_activity(terminals.clone(), workspace.clone());
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let previews = zeron_preview::PreviewService::new(
@@ -351,6 +371,9 @@ impl EngineCore {
         // the P2P service, which serves it to that device alone.
         let agent_accounts =
             AgentAccounts::with_callback_routes(agent_accounts_config, previews.callback_routes());
+        registry.set_account_environment(Arc::new(agent_accounts::MuseRunEnvironment(
+            agent_accounts.clone(),
+        )));
         let update_prefs_root = if profile.managed_scaffold() { profile.store_root() } else { data_dir };
         let harness_updates =
             harness_updates::HarnessUpdateCoordinator::new(update_prefs_root, registry.clone());
@@ -385,6 +408,7 @@ impl EngineCore {
             repos,
             workspace_files,
             terminals,
+            remote_terminals: Default::default(),
             project_actions,
             previews,
             change_requests,
@@ -394,6 +418,7 @@ impl EngineCore {
             agent_accounts,
             harness_updates,
             device_id,
+            viewport_focus: desktop_notify::ViewportFocus::default(),
             local_import,
             workspace_scope: profile.scope(),
             crew,
@@ -529,7 +554,9 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
-        .with_harness_updates(self.harness_updates.clone());
+        .with_remote_terminals(self.remote_terminals.clone())
+        .with_harness_updates(self.harness_updates.clone())
+        .with_viewport_focus(self.viewport_focus.clone());
         if let Some(crew) = &self.crew {
             rpc = rpc.with_crew(crew.clone());
         }
@@ -574,8 +601,17 @@ impl EngineCore {
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if auth.is_some_and(|auth| forgoes_revival(self.workspace_scope, &auth.state())) {
+            self.sessions.forgo_revival();
+        }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
+        self.sessions.stop_activity_projection().await;
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();
         // Cancel + await every worker that can reach Edge before flushing: a
@@ -813,7 +849,7 @@ impl Engine {
             devbox_provider,
             devbox_id,
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: zeron_proto::capabilities::current(),
+            capabilities: engine_capabilities(),
         })
     }
 
@@ -894,6 +930,11 @@ impl Engine {
         let registry = Arc::new(default_registry().with_execution_policy(
             config.managed_inference, auth.device_mode(),
         ));
+        // Commit credit is a per-device opt-in on this non-Cloud engine.
+        registry.set_commit_credit(Arc::new(commit_credit::CommitCredit::open(
+            profile.device_root(),
+            false,
+        )));
         let omp = if auth.device_mode() {
             zeron_harness::omp::OmpHarness::scaffold_host()
         } else {
@@ -961,14 +1002,17 @@ impl Engine {
         core.set_auth(auth.clone());
         let preview_workspace = core.workspace.clone();
         let preview_device = core.device_id.clone();
-        let projects = Arc::new(move || {
-            preview_workspace
+        let preview_terminals = core.terminals.clone();
+        let projects = Arc::new(move || zeron_preview::Scope {
+            chats: preview_workspace
                 .read_chats()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|chat| chat.device_id == preview_device)
-                .filter_map(|chat| chat.cwd.map(std::path::PathBuf::from))
-                .collect()
+                .filter_map(|chat| Some((chat.id, std::path::PathBuf::from(chat.cwd?))))
+                .collect(),
+            terminals: preview_terminals.chats(),
+            reserved_ports: zeron_harness::agent_ports::reserved(),
         });
         let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
             edge_url: config.edge_url.clone(),
@@ -990,6 +1034,10 @@ impl Engine {
                 Box::pin(async move { tokens.token().await.map(|credential| credential.value).map_err(anyhow::Error::from) })
             })
         };
+        core.harness_updates.set_compatibility_feed(format!(
+            "{}/releases/harness-compatibility.json",
+            config.edge_url.trim_end_matches('/')
+        ));
         let updater = zeron_update::Updater::spawn(config.edge_url.clone(), update_tokens, Some(quiescent));
         if let Some(mut token_changes) = tokens.subscribe() {
             let updater_for_tokens = updater.clone();
@@ -1103,10 +1151,14 @@ impl Engine {
             inner: runtime.core().rpc_service(),
             stop_tx,
         });
-        let server = serve_ipc(config.ipc_port, service).await?;
+        let server = serve_ipc(config.ipc_port, &config.data_dir, service).await?;
         // Only a port this process actually serves goes to agents: the
         // injected MCP server must dial back into THIS engine.
         runtime.core().sessions.set_ipc_port(config.ipc_port);
+        runtime
+            .core()
+            .sessions
+            .set_ipc_token_file(zeron_rpc::ipc_auth::token_path(&config.data_dir));
 
         tokio::select! {
             result = &mut shutdown => result?,
@@ -1129,6 +1181,12 @@ impl Engine {
         runtime.shutdown().await;
         Ok(())
     }
+}
+
+/// Signed-out synced sessions are explicitly ended; local sessions remain
+/// eligible for crash/shutdown revival because local auth is normally absent.
+pub(crate) fn forgoes_revival(scope: WorkspaceScope, auth: &AuthState) -> bool {
+    scope == WorkspaceScope::Synced && matches!(auth, AuthState::SignedOut)
 }
 
 async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>) {
@@ -1173,12 +1231,14 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// port, not who can reach it.
 pub async fn serve_ipc(
     port: u16,
+    data_dir: &Path,
     service: std::sync::Arc<dyn zeron_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    let token = zeron_rpc::ipc_auth::issue_token(data_dir)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "IPC server listening");
     Ok(tokio::spawn(zeron_rpc::serve_ws_listener(
-        listener, service,
+        listener, service, token,
     )))
 }
 

@@ -91,6 +91,10 @@ fn main() -> anyhow::Result<()> {
                     &port.to_string(),
                 ])
                 .current_dir(&project)
+                .env(
+                    zeron_proto::ORIGIN_ENV,
+                    zeron_proto::chat_origin("preview-fixture"),
+                )
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()?,
@@ -103,12 +107,17 @@ fn main() -> anyhow::Result<()> {
             .arg("api.js")
             .arg(port().to_string())
             .current_dir(&project)
+            .env(
+                zeron_proto::ORIGIN_ENV,
+                zeron_proto::chat_origin("preview-fixture"),
+            )
             .spawn()?,
     );
     let runtime = tokio::runtime::Runtime::new()?;
+    let engine_data = temp.path().join("engine");
     let core = runtime.block_on(async {
         zeron_engine::EngineCore::assemble(
-            &temp.path().join("engine"),
+            &engine_data,
             Arc::new(zeron_engine::default_registry()),
             zeron_proto::HarnessId::ClaudeCode,
             None,
@@ -131,21 +140,36 @@ fn main() -> anyhow::Result<()> {
     core.workspace
         .rename_chat("preview-fixture", "Build the Fieldnotes workspace")?;
     let root = project.clone();
-    runtime.block_on(
-        core.previews
-            .start(Arc::new(move || vec![root.clone()]), None),
-    );
+    runtime.block_on(core.previews.start(
+        Arc::new(move || zeron_engine::PreviewScope {
+            chats: vec![("preview-fixture".into(), root.clone())],
+            ..Default::default()
+        }),
+        None,
+    ));
     let ipc_port = port();
-    let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, core.rpc_service()))?;
+    let _ipc = runtime.block_on(zeron_engine::serve_ipc(
+        ipc_port,
+        &engine_data,
+        core.rpc_service(),
+    ))?;
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
-    let boot = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: data.clone(),
-    ipc_port,
-    edge_url: String::new(),
-    edge_token: None,
-    org_id: None,
-    workos_client_id: None,
-    default_harness: zeron_proto::HarnessId::ClaudeCode, };
+    std::fs::copy(
+        zeron_rpc::ipc_auth::token_path(&engine_data),
+        zeron_rpc::ipc_auth::token_path(&data),
+    )?;
+    let boot = EngineBootConfig {
+        managed_inference: false,
+        scaffold: None,
+        data_dir: data.clone(),
+        ipc_port,
+        edge_url: String::new(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: zeron_proto::HarnessId::ClaudeCode,
+    };
     let handle = runtime.block_on(state::EngineHandle::bootstrap(boot.clone()))?;
     let chats = core.workspace.read_chats()?;
     let spaces = core.workspace.read_spaces()?;
@@ -201,7 +225,7 @@ fn main() -> anyhow::Result<()> {
                 drop(vite_child.take()); pause(cx,2600).await;
                 anyhow::ensure!(browser.read_with(cx,|b,_|b.fixture_previews().services.len()==1),"stopped Vite remained in discovery");
                 std::fs::write(project.join("index.html"),html.replace("Fieldnotes</title>","Fieldnotes · Restarted</title>"))?;
-                vite_child = Some(Child(std::process::Command::new("node").arg(vite_restart).args(["--host","127.0.0.1","--strictPort","--port",&second_port.to_string()]).current_dir(restart_root).stdout(std::process::Stdio::null()).spawn()?));
+                vite_child = Some(Child(std::process::Command::new("node").arg(vite_restart).args(["--host","127.0.0.1","--strictPort","--port",&second_port.to_string()]).current_dir(restart_root).env(zeron_proto::ORIGIN_ENV,zeron_proto::chat_origin("preview-fixture")).stdout(std::process::Stdio::null()).spawn()?));
                 for _ in 0..150 { if browser.read_with(cx,|b,_|b.fixture_previews().services.iter().any(|s|s.port==second_port)) {break;} pause(cx,100).await; }
                 let after = browser.read_with(cx,|b,_|b.fixture_previews()); anyhow::ensure!(after.services.iter().any(|s|s.port==second_port && s.url(after.proxy_port)==stable),"port change lost stable identity");
                 window.update(cx,|_,w,cx|browser.update(cx,|b,cx|b.navigate(&stable,w,cx)))?;

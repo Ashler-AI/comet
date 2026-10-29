@@ -23,6 +23,7 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
 use crate::motion::ReduceMotion;
 use crate::popover::{self, Popup};
+use crate::settings::search::{SearchAnchor, SettingId};
 use crate::settings::widgets;
 use crate::theme::{Appearance, Theme};
 use crate::theme_library;
@@ -159,6 +160,15 @@ impl FontKind {
         }
     }
 
+    /// The row's key in the settings search.
+    fn setting(self) -> SettingId {
+        match self {
+            Self::Ui => SettingId::InterfaceFont,
+            Self::Terminal => SettingId::TerminalFont,
+            Self::Code => SettingId::CodeFont,
+        }
+    }
+
     fn description(self) -> &'static str {
         match self {
             Self::Ui => "Menus and conversations",
@@ -253,6 +263,20 @@ impl FontKind {
 /// (terminal 13, code 12.5) are rungs, so today's rendering is reachable.
 const MONO_FONT_SIZES: [f32; 10] = [10.0, 11.0, 12.0, 12.5, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0];
 
+/// "Math size" choices, in percent of the text around a formula.
+const MATH_SIZES: [u16; 6] = [90, 100, 110, 120, 135, 150];
+
+/// Ladder position of a stored math size; a hand-edited value in range but
+/// off the ladder snaps to the nearest rung.
+fn nearest_math_size_ix(size: u16) -> usize {
+    MATH_SIZES
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, rung)| rung.abs_diff(size))
+        .map(|(ix, _)| ix)
+        .unwrap_or_default()
+}
+
 fn nearest_mono_ix(size: f32) -> usize {
     MONO_FONT_SIZES
         .iter()
@@ -299,6 +323,8 @@ pub struct AppearancePage {
     size_select: widgets::SelectState,
     terminal_size_select: widgets::SelectState,
     code_size_select: widgets::SelectState,
+    math_font_select: widgets::SelectState,
+    math_size_select: widgets::SelectState,
     font_menu_dismissed_at: Option<std::time::Instant>,
     terminal_font_menu_dismissed_at: Option<std::time::Instant>,
     code_font_menu_dismissed_at: Option<std::time::Instant>,
@@ -365,6 +391,125 @@ impl AppearancePage {
             window,
             cx,
         );
+    }
+
+    /// "Render math", "Math font" and "Math size": how Markdown sets LaTeX
+    /// formulas.
+    fn render_math_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> [AnyElement; 3] {
+        use crate::settings::{MATH_SIZE_DEFAULT, MathFont};
+        let settings = crate::settings::current(cx);
+        let (render_math, math_font, math_size) =
+            (settings.render_math, settings.math_font, settings.math_size);
+        let font_control = widgets::select("math-font", "Math font", theme, |page: &mut Self| {
+            &mut page.math_font_select
+        })
+        .options(
+            MathFont::ALL
+                .into_iter()
+                .map(|font| widgets::SelectOption::new(font.label()).detail(font.style())),
+            MathFont::ALL
+                .into_iter()
+                .position(|font| font == math_font)
+                .unwrap_or_default(),
+        )
+        .width(160.0)
+        .menu_width(220.0)
+        .on_select(|_, ix, _, cx| {
+            crate::settings::set_math_font(MathFont::ALL[ix], cx);
+            cx.notify();
+        })
+        .render(&self.math_font_select, cx);
+        let size_control = widgets::select("math-size", "Math size", theme, |page: &mut Self| {
+            &mut page.math_size_select
+        })
+        .options(
+            MATH_SIZES.into_iter().map(|size| {
+                let option = widgets::SelectOption::new(format!("{size}%"));
+                if size == MATH_SIZE_DEFAULT {
+                    option.detail("Default")
+                } else {
+                    option
+                }
+            }),
+            nearest_math_size_ix(math_size),
+        )
+        .width(160.0)
+        .on_select(|_, ix, _, cx| {
+            crate::settings::set_math_size(MATH_SIZES[ix], cx);
+            cx.notify();
+        })
+        .render(&self.math_size_select, cx);
+        [
+            widgets::card_row(theme, false)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(widgets::row_title(theme, "Render math"))
+                        .child(widgets::meta_line(
+                            theme,
+                            vec![
+                                div()
+                                    .child(
+                                        "Typeset LaTeX in messages. Off shows the source as code.",
+                                    )
+                                    .into_any_element(),
+                            ],
+                        )),
+                )
+                .child(
+                    widgets::toggle_switch(theme, render_math, "render-math")
+                        .id("render-math-toggle")
+                        .tab_index(0)
+                        .role(gpui::Role::Switch)
+                        .aria_label("Render math")
+                        .focus_visible(|s| s.border_2().border_color(theme.accent))
+                        .cursor_pointer()
+                        .aria_toggled(if render_math {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            crate::settings::set_render_math(!render_math, cx);
+                            cx.notify();
+                        })),
+                )
+                .search_anchor(SettingId::RenderMath)
+                .into_any_element(),
+            widgets::card_row(theme, false)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .child(widgets::row_title(theme, "Math font"))
+                        .child(widgets::meta_line(
+                            theme,
+                            vec![div().child(math_font.description()).into_any_element()],
+                        )),
+                )
+                .child(font_control)
+                .search_anchor(SettingId::MathFont)
+                .into_any_element(),
+            widgets::card_row(theme, false)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .child(widgets::row_title(theme, "Math size"))
+                        .child(widgets::meta_line(
+                            theme,
+                            vec![
+                                div()
+                                    .child("Relative to the text around it.")
+                                    .into_any_element(),
+                            ],
+                        )),
+                )
+                .child(size_control)
+                .search_anchor(SettingId::MathSize)
+                .into_any_element(),
+        ]
     }
 
     fn render_transcript_width(
@@ -528,6 +673,7 @@ impl AppearancePage {
                             .child("1,200 px"),
                     ),
             )
+            .search_anchor(SettingId::ConversationWidth)
             .into_any_element()
     }
 
@@ -566,6 +712,8 @@ impl AppearancePage {
             size_select: widgets::SelectState::default(),
             terminal_size_select: widgets::SelectState::default(),
             code_size_select: widgets::SelectState::default(),
+            math_font_select: widgets::SelectState::default(),
+            math_size_select: widgets::SelectState::default(),
             font_menu_dismissed_at: None,
             terminal_font_menu_dismissed_at: None,
             code_font_menu_dismissed_at: None,
@@ -853,6 +1001,11 @@ impl AppearancePage {
         self.set_selected_font(kind, next);
         cx.notify();
         true
+    }
+
+    /// Whether a dialog [`Self::dismiss_on_escape`] would close is open.
+    pub(crate) fn has_escape_surface(&self) -> bool {
+        self.import_dialog.is_some() || self.review_entry.is_some()
     }
 
     /// Escape that reached Settings unclaimed closes the topmost dialog
@@ -1404,6 +1557,14 @@ fn reduce_motion_helper(preference: ReduceMotion, system: bool) -> &'static str 
     }
 }
 
+fn smooth_scrolling_helper(enabled: bool, reduced: bool) -> &'static str {
+    if enabled && reduced {
+        "Mouse wheels step instantly while motion is reduced."
+    } else {
+        "Mouse wheels glide instead of jumping. Trackpads are unaffected."
+    }
+}
+
 fn surface_helper(surface: SurfacePreference, resolved: SurfaceTreatment) -> String {
     match surface {
         SurfacePreference::ThemeDefault => format!(
@@ -1502,7 +1663,7 @@ fn miniature_split(
         .into_any_element()
 }
 
-fn preview(
+pub(crate) fn preview(
     mode: AppearanceMode,
     themes: &ThemeSelection,
     accent: AccentSelection,
@@ -1548,7 +1709,7 @@ fn compact_action(
     label: &str,
     id: impl Into<SharedString>,
 ) -> gpui::Stateful<gpui::Div> {
-    widgets::text_action(theme, widgets::ActionTone::Outlined, label).id(id.into())
+    widgets::text_action(theme, widgets::ActionTone::Filled, label).id(id.into())
 }
 
 fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
@@ -1719,7 +1880,7 @@ fn report_panel(theme: &Theme, report: &ImportReport) -> impl IntoElement {
     )
 }
 
-fn accent_swatch(
+pub(crate) fn accent_swatch(
     page_theme: &Theme,
     selection: AccentSelection,
     selected: bool,
@@ -1766,6 +1927,7 @@ fn accent_swatch(
         .id(SharedString::from(format!("accent-{}", selection.label())))
         .aria_label(selection.label())
         .aria_selected(selected)
+        .tooltip(widgets::text_tooltip(selection.label()))
         .flex_none()
         .w(px(30.0))
         .h(px(34.0))
@@ -2403,7 +2565,7 @@ impl AppearancePage {
                             .mt(px(1.0))
                             .flex_none(),
                     )
-                    .child("Zeron finds light and dark variants automatically."),
+                    .child("Crew finds light and dark variants automatically."),
             );
         }
 
@@ -2463,7 +2625,9 @@ impl AppearancePage {
                     .justify_center()
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.surface_raised_hover))
+                    .tooltip(widgets::text_tooltip("Close"))
                     .tab_index(0).role(gpui::Role::Button)
+                    .aria_label("Close")
 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
 .on_click(cx.listener(|this, _, _, cx| {
                         this.import_dialog = None;
@@ -2886,6 +3050,7 @@ impl AppearancePage {
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .aria_label("Zoom out")
+                            .tooltip(widgets::text_tooltip("Zoom out"))
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let Some(dialog) = this.background_adjustment_dialog.as_ref()
@@ -2912,6 +3077,7 @@ impl AppearancePage {
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .aria_label("Zoom in")
+                            .tooltip(widgets::text_tooltip("Zoom in"))
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let Some(dialog) = this.background_adjustment_dialog.as_ref()
@@ -2996,6 +3162,7 @@ impl AppearancePage {
                     .tab_index(0)
                     .role(gpui::Role::Button)
                     .aria_label("Close background adjustment")
+                    .tooltip(widgets::text_tooltip("Close"))
                     .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.dismiss_background_adjustment(window, cx)
@@ -3331,6 +3498,7 @@ impl AppearancePage {
                         .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                         .on_click(cx.listener(|this, _, _, cx| this.open_import(cx))),
                 )
+                .search_anchor(SettingId::ThemeLibrary)
                 .into_any_element(),
         ];
         if !imported.is_empty() {
@@ -3425,10 +3593,10 @@ impl Render for AppearancePage {
             .into_iter()
             .enumerate()
         {
-            let label = if appearance_kind.is_light() {
-                "Light theme"
+            let (label, setting) = if appearance_kind.is_light() {
+                ("Light theme", SettingId::LightTheme)
             } else {
-                "Dark theme"
+                ("Dark theme", SettingId::DarkTheme)
             };
             let selector = self.render_theme_selector(appearance_kind, &current_themes, &theme, cx);
             theme_rows.push(
@@ -3440,6 +3608,7 @@ impl Render for AppearancePage {
                             .child(widgets::row_title(&theme, label)),
                     )
                     .child(selector)
+                    .search_anchor(setting)
                     .into_any_element(),
             );
         }
@@ -3507,6 +3676,7 @@ impl Render for AppearancePage {
                         .gap(px(8.0))
                         .children(accent_controls),
                 )
+                .search_anchor(SettingId::AccentColor)
                 .into_any_element(),
         );
         let match_wallpaper = crate::settings::current(cx).wallpaper_theme_colors;
@@ -3529,6 +3699,7 @@ impl Render for AppearancePage {
                         crate::settings::wallpaper_colors::set_enabled(!match_wallpaper, cx);
                         cx.notify();
                     })))
+                .search_anchor(SettingId::WallpaperColors)
                 .into_any_element(),
         );
         let color_rows = settings_rows;
@@ -3553,6 +3724,7 @@ impl Render for AppearancePage {
                         )),
                 )
                 .child(surface_control)
+                .search_anchor(SettingId::Glass)
                 .into_any_element(),
         );
         let background_available = current_background
@@ -3680,6 +3852,7 @@ impl Render for AppearancePage {
                             )
                         }),
                 )
+                .search_anchor(SettingId::NewThreadBackground)
                 .into_any_element(),
         );
         let wallpaper_settings = crate::settings::current(cx);
@@ -3732,6 +3905,7 @@ impl Render for AppearancePage {
                             )
                         }),
                 )
+                .search_anchor(SettingId::WallpaperFolder)
                 .into_any_element(),
         );
         if background_available {
@@ -3777,6 +3951,7 @@ impl Render for AppearancePage {
                             )),
                     )
                     .child(effect_control)
+                    .search_anchor(SettingId::BackgroundEffect)
                     .into_any_element(),
             );
         }
@@ -3803,6 +3978,7 @@ impl Render for AppearancePage {
         })
         .render(&self.reduce_motion_select, cx);
         let pause_in_background = crate::motion::pause_in_background(cx);
+        let smooth_scrolling = crate::settings::smooth_scrolling(cx);
         let motion_rows = vec![
             widgets::card_row(&theme, true)
                 .child(
@@ -3823,6 +3999,7 @@ impl Render for AppearancePage {
                         )),
                 )
                 .child(reduce_motion_control)
+                .search_anchor(SettingId::ReduceMotion)
                 .into_any_element(),
             widgets::card_row(&theme, false)
                 .child(
@@ -3835,7 +4012,7 @@ impl Render for AppearancePage {
                             vec![
                                 div()
                                     .child(
-                                        "Hold animations still while Zeron isn't the focused window.",
+                                        "Hold animations still while Crew isn't the focused window.",
                                     )
                                     .into_any_element(),
                             ],
@@ -3863,6 +4040,45 @@ impl Render for AppearancePage {
                         cx.notify();
                     })),
                 )
+                .search_anchor(SettingId::PauseAnimations)
+                .into_any_element(),
+            widgets::card_row(&theme, false)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(widgets::row_title(&theme, "Smooth scrolling"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![
+                                div()
+                                    .child(smooth_scrolling_helper(
+                                        smooth_scrolling,
+                                        crate::motion::reduced_motion(cx),
+                                    ))
+                                    .into_any_element(),
+                            ],
+                        )),
+                )
+                .child(
+                    widgets::toggle_switch(&theme, smooth_scrolling, "smooth-scrolling")
+                        .id("smooth-scrolling-toggle")
+                        .tab_index(0)
+                        .role(gpui::Role::Switch)
+                        .aria_label("Smooth scrolling")
+                        .focus_visible(|s| s.border_2().border_color(theme.accent))
+                        .cursor_pointer()
+                        .aria_toggled(if smooth_scrolling {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            crate::settings::set_smooth_scrolling(!smooth_scrolling, cx);
+                            cx.notify();
+                        })),
+                )
+                .search_anchor(SettingId::SmoothScrolling)
                 .into_any_element(),
         ];
         let library_rows = self.render_theme_library_rows(&theme, cx);
@@ -3938,10 +4154,13 @@ impl Render for AppearancePage {
                             .gap(px(8.0))
                             .child(picker)
                             .child(size_control),
-                    ),
+                    )
+                    .search_anchor(kind.setting()),
             );
         }
-        font_rows = font_rows.child(self.render_transcript_width(&theme, window, cx));
+        font_rows = font_rows
+            .child(self.render_transcript_width(&theme, window, cx))
+            .children(self.render_math_rows(&theme, cx));
         let mut font_section = widgets::section(&theme, "Fonts and layout", font_rows);
         for kind in FontKind::ALL {
             let (requested, effective) = (kind.requested(cx), kind.effective(cx));
@@ -4022,7 +4241,10 @@ impl Render for AppearancePage {
                                     widgets::section(
                                         &theme,
                                         "Color scheme",
-                                        widgets::option_card_row().children(cards),
+                                        widgets::option_card_row()
+                                            .children(cards)
+                                            .search_anchor(SettingId::ColorScheme)
+                                            .block(),
                                     )
                                     .mt(px(24.0))
                                     .gap(px(12.0)),
@@ -4061,6 +4283,7 @@ impl Render for AppearancePage {
                 )
                 .fade_overflow_y(&self.scroll.scroll),
             )
+            .child(widgets::page_reveal(&self.scroll.scroll))
             .children(scrollbar)
             .children(modal)
     }
@@ -4488,6 +4711,21 @@ mod tests {
         assert_eq!(MONO_FONT_SIZES[nearest_mono_ix(0.0)], MONO_FONT_SIZES[0]);
         assert_eq!(MONO_FONT_SIZES[nearest_mono_ix(99.0)], 20.0);
         assert_eq!(MONO_FONT_SIZES[nearest_mono_ix(12.4)], 12.5);
+    }
+
+    #[test]
+    fn math_size_ladder_holds_the_default_inside_the_legal_range() {
+        use crate::settings::{MATH_SIZE_DEFAULT, MATH_SIZE_MAX, MATH_SIZE_MIN};
+        assert!(MATH_SIZES.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            MATH_SIZES
+                .iter()
+                .all(|size| (MATH_SIZE_MIN..=MATH_SIZE_MAX).contains(size))
+        );
+        assert_eq!(MATH_SIZES[nearest_math_size_ix(MATH_SIZE_DEFAULT)], 100);
+        assert_eq!(MATH_SIZES[nearest_math_size_ix(MATH_SIZE_MIN)], 90);
+        assert_eq!(MATH_SIZES[nearest_math_size_ix(MATH_SIZE_MAX)], 150);
+        assert_eq!(MATH_SIZES[nearest_math_size_ix(133)], 135);
     }
 
     #[test]

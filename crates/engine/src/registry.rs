@@ -93,6 +93,9 @@ struct HarnessPrefsFile {
     /// on without a trip to Settings.
     disabled: Vec<HarnessId>,
     titles: TitleSettings,
+    /// Harnesses the user turned native subagents off for: their runs
+    /// delegate through side chats only.
+    native_subagents_off: Vec<HarnessId>,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
     #[serde(skip_serializing)]
@@ -109,8 +112,46 @@ pub struct TitleSettings {
     pub model: Option<String>,
 }
 
+/// Per-device native subagent preferences (Settings → Providers).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct NativeSubagentSettings {
+    /// Registered harnesses whose native subagents can be turned off.
+    pub switchable: Vec<HarnessId>,
+    /// The ones turned off: their runs delegate through side chats only.
+    pub off: Vec<HarnessId>,
+}
+
 type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + Sync>;
 type InstalledProbe = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// Host-side environment applied immediately before a provider process starts.
+/// Values inserted into [`zeron_proto::RunRequest::env`] are process-local and
+/// are never persisted with the session request.
+#[async_trait::async_trait]
+pub trait RunEnvironment: Send + Sync {
+    async fn prepare(
+        &self,
+        harness: HarnessId,
+        request: &mut zeron_proto::RunRequest,
+    ) -> Result<(), String>;
+
+    /// Opaque identity of the credential a new run would use, when known.
+    async fn credential(&self, _harness: HarnessId) -> Option<String> {
+        None
+    }
+
+    /// Record provider-reported plan usage against the credential that
+    /// actually started the run.
+    async fn record_usage(
+        &self,
+        _harness: HarnessId,
+        _credential: &str,
+        _windows: Vec<zeron_proto::AgentUsageWindow>,
+        _plan_label: Option<String>,
+    ) {
+    }
+}
 
 enum Slot {
     Ready(Arc<dyn Harness>),
@@ -137,6 +178,12 @@ pub struct HarnessRegistry {
     gates: Mutex<HashMap<HarnessId, Arc<tokio::sync::RwLock<()>>>>,
     pending_updates: Mutex<std::collections::HashSet<HarnessId>>,
     update_generation: tokio::sync::watch::Sender<u64>,
+    /// Optional host/provider environment, followed by the local account
+    /// environment. Crew-managed inference normally leaves the former empty.
+    run_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
+    account_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
+    /// Credits Zeron in agents' commits ([`crate::commit_credit`]).
+    commit_credit: std::sync::OnceLock<Arc<crate::commit_credit::CommitCredit>>,
     managed_inference: bool,
     scaffold_host: bool,
 }
@@ -233,6 +280,9 @@ impl HarnessRegistry {
             gates: Mutex::new(HashMap::new()),
             pending_updates: Mutex::new(std::collections::HashSet::new()),
             update_generation,
+            run_environment: Mutex::new(None),
+            account_environment: Mutex::new(None),
+            commit_credit: std::sync::OnceLock::new(),
             managed_inference: false,
             scaffold_host: false,
         }
@@ -246,6 +296,72 @@ impl HarnessRegistry {
 
     pub fn managed_inference(&self) -> bool {
         self.managed_inference
+    }
+
+    pub fn set_run_environment(&self, environment: Arc<dyn RunEnvironment>) {
+        *self
+            .run_environment
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(environment);
+    }
+
+    pub fn set_account_environment(&self, environment: Arc<dyn RunEnvironment>) {
+        *self
+            .account_environment
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(environment);
+    }
+
+    fn environments(&self) -> Vec<Arc<dyn RunEnvironment>> {
+        [&self.run_environment, &self.account_environment]
+            .into_iter()
+            .filter_map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner).clone())
+            .collect()
+    }
+
+    pub fn set_commit_credit(&self, credit: Arc<crate::commit_credit::CommitCredit>) {
+        let _ = self.commit_credit.set(credit);
+    }
+
+    pub fn commit_credit(&self) -> Option<&Arc<crate::commit_credit::CommitCredit>> {
+        self.commit_credit.get()
+    }
+
+    pub async fn prepare_run(
+        &self,
+        harness: HarnessId,
+        request: &mut zeron_proto::RunRequest,
+    ) -> Result<(), String> {
+        for environment in self.environments() {
+            environment.prepare(harness, request).await?;
+        }
+        if let Some(credit) = self.commit_credit.get() {
+            credit.apply(&mut request.env);
+        }
+        Ok(())
+    }
+
+    pub async fn run_credential(&self, harness: HarnessId) -> Option<String> {
+        for environment in self.environments() {
+            if let Some(credential) = environment.credential(harness).await {
+                return Some(credential);
+            }
+        }
+        None
+    }
+
+    pub async fn record_plan_usage(
+        &self,
+        harness: HarnessId,
+        credential: &str,
+        windows: Vec<zeron_proto::AgentUsageWindow>,
+        plan_label: Option<String>,
+    ) {
+        for environment in self.environments() {
+            environment
+                .record_usage(harness, credential, windows.clone(), plan_label.clone())
+                .await;
+        }
     }
 
     fn route_allowed(&self, id: HarnessId) -> bool {
@@ -495,6 +611,43 @@ impl HarnessRegistry {
         }
         settings.model = settings.model.filter(|model| !model.trim().is_empty());
         self.prefs().titles = settings;
+        self.persist_prefs();
+        Ok(())
+    }
+
+    /// Whether runs of `id` keep the provider's own subagent tools. Off only
+    /// by the user's choice, for a driver that can launch without them.
+    pub fn native_subagents(&self, id: HarnessId) -> bool {
+        !(zeron_harness::switches_native_subagents(id)
+            && self.prefs().native_subagents_off.contains(&id))
+    }
+
+    pub fn native_subagent_settings(&self) -> NativeSubagentSettings {
+        let registered: Vec<HarnessId> = self.order().iter().copied().collect();
+        NativeSubagentSettings {
+            switchable: registered
+                .into_iter()
+                .filter(|id| zeron_harness::switches_native_subagents(*id))
+                .collect(),
+            off: self.prefs().native_subagents_off.clone(),
+        }
+    }
+
+    /// Turn `id`'s native subagents on or off and persist. Each chat picks
+    /// the change up at its next turn once its background work is done: a
+    /// parked session still holding some is kept as it started.
+    pub fn set_native_subagents(&self, id: HarnessId, on: bool) -> Result<(), String> {
+        if !zeron_harness::switches_native_subagents(id) {
+            return Err(format!("{id:?} has no native subagents to turn off"));
+        }
+        {
+            let mut prefs = self.prefs();
+            match (on, prefs.native_subagents_off.contains(&id)) {
+                (true, true) => prefs.native_subagents_off.retain(|h| *h != id),
+                (false, false) => prefs.native_subagents_off.push(id),
+                _ => return Ok(()),
+            }
+        }
         self.persist_prefs();
         Ok(())
     }
@@ -810,6 +963,22 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
+    );
+    // Muse Code over its native session protocol (`muse serve`). Muse owns
+    // its login; Crew only starts the installed CLI and carries its session.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Muse,
+            name: "Muse Code".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::MuseHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::MuseHarness::new()) as Arc<dyn Harness>)),
     );
     registry
 }
@@ -1207,6 +1376,84 @@ mod tests {
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
     }
+
+    #[test]
+    fn native_subagents_switch_off_per_harness_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        test_slot(&registry, HarnessId::ClaudeCode, true);
+        test_slot(&registry, HarnessId::Codex, true);
+        test_slot(&registry, HarnessId::Opencode, true);
+        assert!(registry.native_subagents(HarnessId::ClaudeCode));
+        assert_eq!(
+            registry.native_subagent_settings().switchable,
+            vec![HarnessId::ClaudeCode]
+        );
+        assert!(
+            registry
+                .set_native_subagents(HarnessId::Codex, false)
+                .is_err()
+        );
+
+        registry
+            .set_native_subagents(HarnessId::ClaudeCode, false)
+            .unwrap();
+        assert!(!registry.native_subagents(HarnessId::ClaudeCode));
+        assert!(registry.native_subagents(HarnessId::Codex));
+
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(
+            reloaded.native_subagent_settings().off,
+            vec![HarnessId::ClaudeCode]
+        );
+        reloaded
+            .set_native_subagents(HarnessId::ClaudeCode, true)
+            .unwrap();
+        assert!(reloaded.native_subagents(HarnessId::ClaudeCode));
+
+        *reloaded.prefs() =
+            serde_json::from_str(r#"{"nativeSubagentsOff":["opencode"]}"#).unwrap();
+        assert!(reloaded.native_subagents(HarnessId::Opencode));
+    }
+
+    /// Every agent spawn carries the commit-credit hooks while that's on.
+    #[tokio::test]
+    async fn runs_carry_the_commit_credit_hooks() {
+        let data = tempfile::tempdir().unwrap();
+        let mut request: zeron_proto::RunRequest = serde_json::from_str(
+            r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#,
+        )
+        .unwrap();
+        let registry = HarnessRegistry::new();
+        let credit = Arc::new(crate::commit_credit::CommitCredit::open(data.path(), false));
+        credit.set(true).unwrap();
+        registry.set_commit_credit(credit.clone());
+        registry
+            .prepare_run(HarnessId::ClaudeCode, &mut request)
+            .await
+            .unwrap();
+        let hooks = data.path().join("git-hooks");
+        assert_eq!(
+            request.env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+            Some("core.hooksPath")
+        );
+        assert_eq!(
+            request.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+            Some(hooks.to_string_lossy().as_ref())
+        );
+        assert!(hooks.join("commit-msg").exists());
+
+        // Off on this device: nothing added.
+        credit.set(false).unwrap();
+        request.env.clear();
+        registry
+            .prepare_run(HarnessId::ClaudeCode, &mut request)
+            .await
+            .unwrap();
+        assert!(request.env.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1258,6 +1505,7 @@ mod title_tests {
         let prefs: HarnessPrefsFile = serde_json::from_str(r#"{"disabled":["codex"]}"#).unwrap();
         assert_eq!(prefs.titles, TitleSettings::default());
         assert_eq!(prefs.disabled, vec![HarnessId::Codex]);
+        assert!(prefs.native_subagents_off.is_empty());
     }
 }
 

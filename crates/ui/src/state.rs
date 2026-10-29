@@ -18,7 +18,7 @@
 //! unit tests; rendering reads them.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,6 +39,15 @@ use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_cl
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
 };
+
+/// Start a separate engine process when the app owns startup; tests and
+/// fixtures leave this false and keep the in-process fallback.
+static LAUNCH_BACKGROUND_ENGINE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn launch_background_engine() {
+    LAUNCH_BACKGROUND_ENGINE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
 // Recently viewed transcripts stay renderable while a fresh watch opens. Move
 // ownership on navigation; never clone whale payloads or retain live watches.
@@ -125,6 +134,9 @@ pub enum EngineMode {
 trait EngineBackend: Send + Sync {
     fn client(&self) -> &RpcClient;
     fn mode(&self) -> EngineMode;
+    fn reconnect_coordinates(&self) -> Option<(u16, PathBuf)> {
+        None
+    }
     async fn media_client(&self) -> Result<RpcClient, RpcError> {
         Err(RpcError::Failed("voice media unavailable".into()))
     }
@@ -248,13 +260,15 @@ async fn wait_for_deferred_engine(
 struct RemoteEngine {
     client: Arc<RpcClient>,
     url: String,
+    ipc_port: u16,
+    data_dir: PathBuf,
     lifecycle_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[async_trait]
 impl EngineBackend for RemoteEngine {
     async fn media_client(&self) -> Result<RpcClient, RpcError> {
-        connect_ws(&self.url).await
+        zeron_rpc::connect_ipc(self.ipc_port, Some(&self.data_dir)).await
     }
     fn client(&self) -> &RpcClient {
         &self.client
@@ -263,6 +277,9 @@ impl EngineBackend for RemoteEngine {
         EngineMode::Remote {
             url: self.url.clone(),
         }
+    }
+    fn reconnect_coordinates(&self) -> Option<(u16, PathBuf)> {
+        Some((self.ipc_port, self.data_dir.clone()))
     }
     async fn shutdown(&self) {
         // The daemon outlives this viewport; only stop our readiness probe.
@@ -298,7 +315,7 @@ impl EngineHandle {
         static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _gate = BOOTSTRAP_GATE.lock().await;
 
-        if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
+        if let Some(handle) = Self::attach_to_daemon(config.ipc_port, &config.data_dir).await {
             return Ok(handle);
         }
 
@@ -316,6 +333,12 @@ impl EngineHandle {
             device_bootstrap_file: None,
             managed_inference: config.managed_inference,
         };
+        let launching = LAUNCH_BACKGROUND_ENGINE.load(std::sync::atomic::Ordering::SeqCst);
+        if Self::should_launch_background(launching, engine_config.ipc_port).await
+            && let Some(handle) = Self::launch_background(&engine_config).await
+        {
+            return Ok(handle);
+        }
 
         // Own the data dir before opening anything under it or binding IPC —
         // the lock, not the port bind, is the ownership decision. A failed
@@ -332,7 +355,10 @@ impl EngineHandle {
                         return Err(err.into());
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    if let Some(handle) = Self::attach_to_daemon(engine_config.ipc_port).await {
+                    if let Some(handle) =
+                        Self::attach_to_daemon(engine_config.ipc_port, &engine_config.data_dir)
+                            .await
+                    {
                         return Ok(handle);
                     }
                 }
@@ -363,7 +389,12 @@ impl EngineHandle {
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service.clone()).await
+        let ipc_task = match zeron_engine::serve_ipc(
+            engine_config.ipc_port,
+            &engine_config.data_dir,
+            service.clone(),
+        )
+        .await
         {
             Ok(task) => Some(task),
             Err(err) => {
@@ -459,10 +490,60 @@ impl EngineHandle {
         Ok(handle)
     }
 
+    async fn should_launch_background(launching: bool, ipc_port: u16) -> bool {
+        if !launching || ipc_port == 0 {
+            return false;
+        }
+        let taken = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+        )
+        .await
+        .is_ok_and(|connected| connected.is_ok());
+        if taken {
+            tracing::warn!(
+                port = ipc_port,
+                "the engine port is held by something else; embedding"
+            );
+        }
+        !taken
+    }
+
+    async fn launch_background(config: &EngineConfig) -> Option<EngineHandle> {
+        const STARTUP: std::time::Duration = std::time::Duration::from_secs(20);
+        let app = std::env::current_exe().ok()?;
+        let mut child = match zeron_engine::managed::launch(config, &app) {
+            Ok(child) => child,
+            Err(err) => {
+                tracing::warn!(error = %err, "couldn't start the background engine; embedding one");
+                return None;
+            }
+        };
+        tracing::info!(pid = child.id(), "background engine started");
+        let deadline = std::time::Instant::now() + STARTUP;
+        loop {
+            if let Some(handle) = Self::attach_to_daemon(config.ipc_port, &config.data_dir).await {
+                zeron_engine::managed::reap(child);
+                return Some(handle);
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                tracing::warn!(%status, "background engine exited during startup; embedding one");
+                return None;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("background engine didn't come up in time; embedding one");
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+
     /// Probe the IPC port and, if a live engine answers, attach as a remote
     /// viewport. `None` means embed: nothing listening, a non-engine listener,
     /// or a listener without an identity.
-    async fn attach_to_daemon(ipc_port: u16) -> Option<EngineHandle> {
+    async fn attach_to_daemon(ipc_port: u16, data_dir: &Path) -> Option<EngineHandle> {
         let url = format!("ws://127.0.0.1:{ipc_port}");
         let probe = tokio::time::timeout(
             std::time::Duration::from_millis(750),
@@ -472,7 +553,7 @@ impl EngineHandle {
         if !matches!(probe, Ok(Ok(_))) {
             return None;
         }
-        match Self::connect_daemon(url, None).await {
+        match Self::connect_daemon(url, ipc_port, data_dir.to_path_buf(), None).await {
             Ok(handle) => Some(handle),
             Err(err) => {
                 tracing::warn!(error = %err, "not an engine; embedding instead");
@@ -481,8 +562,13 @@ impl EngineHandle {
         }
     }
 
-    async fn connect_daemon(url: String, expected: Option<&EngineInfo>) -> Result<Self, RpcError> {
-        let client = Arc::new(connect_ws(&url).await?);
+    async fn connect_daemon(
+        url: String,
+        ipc_port: u16,
+        data_dir: PathBuf,
+        expected: Option<&EngineInfo>,
+    ) -> Result<Self, RpcError> {
+        let client = Arc::new(zeron_rpc::connect_ipc(ipc_port, Some(&data_dir)).await?);
         let engine_info = query_engine_info(&client).await?;
         if expected.is_some_and(|expected| {
             engine_info.device_id != expected.device_id
@@ -513,6 +599,8 @@ impl EngineHandle {
             inner: Arc::new(RemoteEngine {
                 client,
                 url,
+                ipc_port,
+                data_dir,
                 lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
             }),
             engine_info,
@@ -528,6 +616,9 @@ impl EngineHandle {
         let EngineMode::Remote { url } = self.mode() else {
             return Err(RpcError::Closed);
         };
+        let Some((ipc_port, data_dir)) = self.inner.reconnect_coordinates() else {
+            return Err(RpcError::Closed);
+        };
         tokio::select! {
             biased;
             _ = self.stopped.cancelled() => Err(RpcError::Closed),
@@ -535,7 +626,12 @@ impl EngineHandle {
                 loop {
                     let attempt = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        Self::connect_daemon(url.clone(), Some(&self.engine_info)),
+                        Self::connect_daemon(
+                            url.clone(),
+                            ipc_port,
+                            data_dir.clone(),
+                            Some(&self.engine_info),
+                        ),
                     ).await;
                     if let Ok(Ok(mut handle)) = attempt {
                         handle.stopped = self.stopped.clone();
@@ -553,6 +649,8 @@ impl EngineHandle {
             inner: Arc::new(RemoteEngine {
                 client: Arc::new(client),
                 url: "memory://test".into(),
+                ipc_port: 0,
+                data_dir: PathBuf::new(),
                 lifecycle_task: tokio::sync::Mutex::new(None),
             }),
             engine_info: EngineInfo {
@@ -642,7 +740,8 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 pub use zeron_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, running_subagents, sort_active, sort_chats, sort_spaces, sort_tabs,
+    parse_auth_state, project_label, running_subagents, sort_active, sort_chats, sort_spaces,
+    sort_tabs,
 };
 
 /// What a session row shows that ticks with the clock rather than with its
@@ -909,6 +1008,11 @@ pub struct AppState {
     clock: ClockTransitions,
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
+    /// This window's identity and focus report for engine-owned desktop
+    /// notifications.
+    viewport_id: String,
+    viewport_focused: bool,
+    focus_task: Option<Task<()>>,
     transcript_task: Option<Task<()>>,
     // A send's acknowledgement must remain observable after leaving its chat.
     pending_send_tasks: HashMap<String, (Option<Task<()>>, Option<Task<()>>)>,
@@ -1025,6 +1129,9 @@ impl AppState {
             clock: ClockTransitions::default(),
             engine: None,
             watch_tasks: Vec::new(),
+            viewport_id: uuid::Uuid::new_v4().to_string(),
+            viewport_focused: false,
+            focus_task: None,
             transcript_task: None,
             pending_send_tasks: HashMap::new(),
             change_requests: ChangeRequestClientState::default(),
@@ -1447,8 +1554,7 @@ impl AppState {
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline
-            || !self.device_online(&chat.device_id, Utc::now())
+        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, Utc::now())
         {
             return true;
         }
@@ -1672,7 +1778,11 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> Result<(), TranscriptDesync> {
         self.receive_transcript_frame(update.frame, cx)?;
-        if let Some(pending) = self.selected_chat.as_ref().and_then(|id| self.pending_sends.get_mut(id)) {
+        if let Some(pending) = self
+            .selected_chat
+            .as_ref()
+            .and_then(|id| self.pending_sends.get_mut(id))
+        {
             let delivery = update.command_delivery.get(&pending.message_id).cloned();
             if pending.delivery != delivery {
                 pending.delivery = delivery;
@@ -1894,7 +2004,10 @@ impl AppState {
 
     pub fn send_preparing(&self, chat_id: &str) -> bool {
         self.pending_sends.get(chat_id).is_some_and(|pending| {
-            matches!(pending.delivery, Some(zeron_doc::CommandDeliveryStatus::Preparing))
+            matches!(
+                pending.delivery,
+                Some(zeron_doc::CommandDeliveryStatus::Preparing)
+            )
         }) && !self.chat_delivery_degraded(chat_id)
     }
 
@@ -1914,7 +2027,8 @@ impl AppState {
         self.pending_sends.get(chat_id).is_some_and(|p| {
             self.send_failure(chat_id).is_none()
                 && (self.send_preparing(chat_id)
-                    || now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                    || now.signed_duration_since(p.started).num_milliseconds()
+                        <= UNDELIVERED_GRACE_MS
                     || self.chat_delivery_degraded(chat_id))
         })
     }
@@ -1926,7 +2040,8 @@ impl AppState {
         self.pending_sends.get(chat_id).is_some_and(|p| {
             self.send_failure(chat_id).is_some()
                 || (!self.send_preparing(chat_id)
-                    && now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS)
+                    && now.signed_duration_since(p.started).num_milliseconds()
+                        > UNDELIVERED_GRACE_MS)
         })
     }
 
@@ -1952,11 +2067,19 @@ impl AppState {
     }
 
     /// Delivery belongs to the sent chat/message, not whichever chat is selected.
-    fn receive_pending_send_update(&mut self, chat_id: &str, update: &zeron_doc::TranscriptUpdate) -> bool {
-        let Some(pending) = self.pending_sends.get_mut(chat_id) else { return false };
+    fn receive_pending_send_update(
+        &mut self,
+        chat_id: &str,
+        update: &zeron_doc::TranscriptUpdate,
+    ) -> bool {
+        let Some(pending) = self.pending_sends.get_mut(chat_id) else {
+            return false;
+        };
         let adopted = match &update.frame {
             TranscriptFrame::Reset { reset } => reset.iter().any(|e| e.id == pending.message_id),
-            TranscriptFrame::Delta { upsert, .. } => upsert.iter().any(|u| u.entry.id == pending.message_id),
+            TranscriptFrame::Delta { upsert, .. } => {
+                upsert.iter().any(|u| u.entry.id == pending.message_id)
+            }
         };
         if adopted {
             self.pending_sends.remove(chat_id);
@@ -1964,16 +2087,29 @@ impl AppState {
             return true;
         }
         let delivery = update.command_delivery.get(&pending.message_id).cloned();
-        if matches!(delivery, Some(zeron_doc::CommandDeliveryStatus::Failed { .. })) {
+        if matches!(
+            delivery,
+            Some(zeron_doc::CommandDeliveryStatus::Failed { .. })
+        ) {
             self.pending_send_tasks.remove(chat_id);
         }
-        if pending.delivery == delivery { return false; }
+        if pending.delivery == delivery {
+            return false;
+        }
         pending.delivery = delivery;
         true
     }
 
-    fn ack_pending_send_from_queue(&mut self, chat_id: &str, items: &[zeron_doc::QueuedMessage]) -> bool {
-        if self.pending_sends.get(chat_id).is_some_and(|p| items.iter().any(|q| q.id == p.message_id)) {
+    fn ack_pending_send_from_queue(
+        &mut self,
+        chat_id: &str,
+        items: &[zeron_doc::QueuedMessage],
+    ) -> bool {
+        if self
+            .pending_sends
+            .get(chat_id)
+            .is_some_and(|p| items.iter().any(|q| q.id == p.message_id))
+        {
             self.pending_sends.remove(chat_id);
             self.pending_send_tasks.remove(chat_id);
             return true;
@@ -2102,7 +2238,8 @@ impl AppState {
     /// Existing threads keep their host even while their browse row is absent.
     /// The explicit canvas target is the fallback, never an implicit local host.
     pub(crate) fn active_device_id(&self) -> Option<String> {
-        self.selected_chat_row().map(|chat| chat.device_id.clone())
+        self.selected_chat_row()
+            .map(|chat| chat.device_id.clone())
             .or_else(|| self.effective_device_id())
     }
 
@@ -2514,6 +2651,7 @@ impl AppState {
         }
         self.engine = None;
         self.watch_tasks.clear();
+        self.focus_task = None;
         self.transcript_task = None;
         self.pending_send_tasks.clear();
         self.queue_task = None;
@@ -2703,6 +2841,67 @@ impl AppState {
         .detach();
     }
 
+    pub fn set_viewport_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.viewport_focused == focused && self.focus_task.is_some() {
+            return;
+        }
+        self.viewport_focused = focused;
+        self.report_focus(cx);
+    }
+
+    fn report_focus(&mut self, cx: &mut Context<Self>) {
+        const REPEAT: std::time::Duration = std::time::Duration::from_secs(20);
+        let Some(engine) = self.engine.clone().filter(|engine| {
+            engine
+                .engine_info()
+                .supports(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1)
+        }) else {
+            self.focus_task = None;
+            return;
+        };
+        let viewport_id = self.viewport_id.clone();
+        let focused = self.viewport_focused;
+        self.focus_task = Some(cx.spawn(async move |_, cx| {
+            loop {
+                let params = serde_json::json!({ "viewportId": viewport_id, "focused": focused });
+                if let Err(error) = engine
+                    .client()
+                    .call(methods::SET_VIEWPORT_FOCUS, params)
+                    .await
+                {
+                    tracing::debug!(%error, "viewport focus report failed");
+                }
+                if !focused {
+                    return;
+                }
+                cx.background_executor().timer(REPEAT).await;
+            }
+        }));
+    }
+
+    pub fn viewport_closing(&self) -> Option<impl std::future::Future<Output = ()> + use<>> {
+        let engine = self.engine.clone().filter(|engine| {
+            engine
+                .engine_info()
+                .supports(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1)
+        })?;
+        let params = serde_json::json!({ "viewportId": self.viewport_id, "focused": false });
+        Some(async move {
+            let _ = engine
+                .client()
+                .call(methods::SET_VIEWPORT_FOCUS, params)
+                .await;
+        })
+    }
+
+    pub fn engine_posts_banners(&self) -> bool {
+        self.engine.as_ref().is_some_and(|engine| {
+            engine
+                .engine_info()
+                .supports(zeron_proto::capabilities::DESKTOP_NOTIFICATIONS_V1)
+        })
+    }
+
     /// Wire the connected engine: mark Ready and start the standing watches.
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
@@ -2721,6 +2920,7 @@ impl AppState {
             self.harness_updates.clear();
         }
         self.engine = Some(handle.clone());
+        self.report_focus(cx);
         if let Some(update) = crate::app_update::AppUpdate::global(cx) {
             update.update(cx, |update, _| update.set_engine(Some(handle.clone())));
         }
@@ -2856,7 +3056,8 @@ impl AppState {
 
     pub fn open_deep_link(&mut self, url: &str, cx: &mut Context<Self>) {
         if crate::links::crew_link_scope(url).is_some()
-            || (self.managed_inference && crate::links::parse_zeron_conversation_link(url).is_ok()) {
+            || (self.managed_inference && crate::links::parse_zeron_conversation_link(url).is_ok())
+        {
             let pending = crate::settings::PendingCrewLink {
                 url: url.to_owned(),
                 owner: self.auth_user().map(|user| user.id.clone()),
@@ -2918,27 +3119,55 @@ impl AppState {
     }
 
     fn apply_pending_crew_link(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(pending) = self.pending_crew_link.clone() else { return false; };
+        let Some(pending) = self.pending_crew_link.clone() else {
+            return false;
+        };
         if pending.expires_at <= chrono::Utc::now().timestamp() {
             self.pending_crew_link = None;
-            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| settings.pending_crew_link = None);
-            self.deep_link_notice = Some("Session link expired while waiting for login. Open the original link again.".into());
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                settings.pending_crew_link = None
+            });
+            self.deep_link_notice = Some(
+                "Session link expired while waiting for login. Open the original link again."
+                    .into(),
+            );
             return true;
         }
-        let Some(AuthState::SignedIn { user, org_id }) = &self.auth else { return false; };
-        if self.workspace_scope != Some(WorkspaceScope::Synced) { return false; }
+        let Some(AuthState::SignedIn { user, org_id }) = &self.auth else {
+            return false;
+        };
+        if self.workspace_scope != Some(WorkspaceScope::Synced) {
+            return false;
+        }
         let owner = user.id.clone();
         let conversation = crate::links::parse_zeron_conversation_link(&pending.url).ok();
         let same_scope = if let Some(link) = &conversation {
-            if !self.chats_synced { return false; }
-            crate::links::workspace_locator(self.workspace_scope, self.auth.as_ref(), self.local_device_id.as_deref()).as_deref() == Some(link.workspace.as_str())
+            if !self.chats_synced {
+                return false;
+            }
+            crate::links::workspace_locator(
+                self.workspace_scope,
+                self.auth.as_ref(),
+                self.local_device_id.as_deref(),
+            )
+            .as_deref()
+                == Some(link.workspace.as_str())
         } else {
-            crate::links::crew_link_scope(&pending.url).is_some_and(|scope| org_id.as_deref() == Some(scope.project_id.as_str()))
+            crate::links::crew_link_scope(&pending.url)
+                .is_some_and(|scope| org_id.as_deref() == Some(scope.project_id.as_str()))
         };
-        let valid = pending.owner.as_ref().is_none_or(|expected| expected == &owner) && same_scope;
-        let Some(engine) = self.engine().cloned() else { return false; };
+        let valid = pending
+            .owner
+            .as_ref()
+            .is_none_or(|expected| expected == &owner)
+            && same_scope;
+        let Some(engine) = self.engine().cloned() else {
+            return false;
+        };
         self.pending_crew_link = None;
-        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| settings.pending_crew_link = None);
+        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+            settings.pending_crew_link = None
+        });
         if !valid {
             self.deep_link_notice = Some("This session link belongs to a different account or project. Switch to its profile and reopen the link.".into());
             return true;
@@ -3011,7 +3240,10 @@ impl AppState {
                     (self.transcript_task.take(), self.queue_task.take()),
                 );
             } else if let Some(pending) = self.pending_sends.get_mut(previous)
-                && matches!(pending.delivery, Some(zeron_doc::CommandDeliveryStatus::Preparing))
+                && matches!(
+                    pending.delivery,
+                    Some(zeron_doc::CommandDeliveryStatus::Preparing)
+                )
             {
                 pending.delivery = None;
             }
@@ -3098,7 +3330,10 @@ impl AppState {
         if let Some(id) = chat_id.as_deref() {
             if self.pending_send_tasks.remove(id).is_some()
                 && let Some(pending) = self.pending_sends.get_mut(id)
-                && matches!(pending.delivery, Some(zeron_doc::CommandDeliveryStatus::Preparing))
+                && matches!(
+                    pending.delivery,
+                    Some(zeron_doc::CommandDeliveryStatus::Preparing)
+                )
             {
                 // The replacement watch must supply its own preparation evidence.
                 pending.delivery = None;
@@ -3224,7 +3459,10 @@ impl AppState {
         cx.spawn(async move |_, _| {
             if let Err(error) = handle
                 .client()
-                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .call(
+                    methods::FOCUS_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
                 .await
             {
                 tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
@@ -3243,10 +3481,7 @@ impl AppState {
 }
 
 /// One closure signal replaces the shared transport and all its observations.
-fn spawn_reconnect_watch(
-    cx: &mut Context<AppState>,
-    handle: EngineHandle,
-) -> Option<Task<()>> {
+fn spawn_reconnect_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Option<Task<()>> {
     if !matches!(handle.mode(), EngineMode::Remote { .. }) {
         return None;
     }
@@ -3256,14 +3491,21 @@ fn spawn_reconnect_watch(
             _ = handle.stopped.cancelled() => return,
             _ = handle.client().closed() => {},
         }
-        if !this.update(cx, |state, cx| {
-            if !state.engine.as_ref().is_some_and(|current| current.same_connection(&handle)) {
-                return false;
-            }
-            state.connectivity_observed = false;
-            cx.notify();
-            true
-        }).unwrap_or(false) {
+        if !this
+            .update(cx, |state, cx| {
+                if !state
+                    .engine
+                    .as_ref()
+                    .is_some_and(|current| current.same_connection(&handle))
+                {
+                    return false;
+                }
+                state.connectivity_observed = false;
+                cx.notify();
+                true
+            })
+            .unwrap_or(false)
+        {
             return;
         }
         // Dropping the viewport's task also cancels its in-flight dial, even
@@ -3281,11 +3523,15 @@ fn spawn_reconnect_watch(
         if let Ok(Ok(replacement)) = reconnect.await {
             this.update(cx, |state, cx| {
                 if !handle.stopped.is_cancelled()
-                    && state.engine.as_ref().is_some_and(|current| current.same_connection(&handle))
+                    && state
+                        .engine
+                        .as_ref()
+                        .is_some_and(|current| current.same_connection(&handle))
                 {
                     state.attach_engine(replacement, cx);
                 }
-            }).ok();
+            })
+            .ok();
         }
     }))
 }
@@ -3308,10 +3554,16 @@ fn spawn_deferred_engine_watch(
             result = wait_for_deferred_engine(&mut deferred) => result,
         };
         let Err(failure) = result else { return };
-        if !this.update(cx, |state, _| {
-            !handle.stopped.is_cancelled()
-                && state.engine.as_ref().is_some_and(|current| current.same_connection(&handle))
-        }).unwrap_or(false) {
+        if !this
+            .update(cx, |state, _| {
+                !handle.stopped.is_cancelled()
+                    && state
+                        .engine
+                        .as_ref()
+                        .is_some_and(|current| current.same_connection(&handle))
+            })
+            .unwrap_or(false)
+        {
             return;
         }
         tracing::error!(error = %failure, "engine assembly failed after attachment");
@@ -3319,7 +3571,11 @@ fn spawn_deferred_engine_watch(
         // remote handles stop their completed readiness probe.
         handle.shutdown().await;
         this.update(cx, |state, cx| {
-            if !state.engine.as_ref().is_some_and(|current| current.same_connection(&handle)) {
+            if !state
+                .engine
+                .as_ref()
+                .is_some_and(|current| current.same_connection(&handle))
+            {
                 return;
             }
             state.connection = ConnectionStatus::Failed(failure);
@@ -3614,7 +3870,9 @@ fn spawn_transcript_watch(
                     .unwrap_or(false);
                 let Ok(selected) = this.update(cx, |state, _| {
                     state.selected_chat.as_deref() == Some(chat_id.as_str())
-                }) else { return };
+                }) else {
+                    return;
+                };
                 let decoded = cx
                     .background_executor()
                     .spawn(async move {
@@ -3914,18 +4172,24 @@ mod tests {
     async fn remote_viewport_treats_legacy_daemon_as_ready() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let token = zeron_rpc::ipc_auth::issue_token(dir.path()).unwrap();
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
             listener,
             Arc::new(LegacyIdentityRpc),
+            token,
         ));
-        let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: port,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: None,
-        default_harness: HarnessId::Mock, })
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
         .await
         .expect("legacy daemon remains attachable");
 
@@ -3947,13 +4211,17 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_embeds_engine_when_port_is_free() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: free_port().await,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None, // offline
-        org_id: None,
-        workos_client_id: None,
-        default_harness: HarnessId::Mock, })
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
@@ -3983,13 +4251,17 @@ mod tests {
         std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
         let port = free_port().await;
 
-        let error = match EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: port,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: Some("client_test".into()),
-        default_harness: HarnessId::Mock, })
+        let error = match EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
         .await
         {
             Ok(handle) => {
@@ -4023,6 +4295,8 @@ mod tests {
     async fn remote_viewport_observes_deferred_engine_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let token = zeron_rpc::ipc_auth::issue_token(dir.path()).unwrap();
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
             listener,
@@ -4037,16 +4311,20 @@ mod tests {
                 },
                 state: state_rx,
             }),
+            token,
         ));
 
-        let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: port,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: None,
-        default_harness: HarnessId::Mock, })
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
         .await
         .expect("second viewport attaches over IPC");
         assert!(matches!(handle.mode(), EngineMode::Remote { .. }));
@@ -4076,19 +4354,23 @@ mod tests {
         // separate daemon, and no launch ordering.
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: port,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None, // offline
-        org_id: None,
-        workos_client_id: None,
-        default_harness: HarnessId::Mock, })
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
 
         // Attach the way an external viewport would, and speak the same protocol.
-        let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
+        let attached = zeron_rpc::connect_ipc(port, Some(dir.path()))
             .await
             .expect("a second viewport must be able to attach");
         let harnesses = attached
@@ -4116,13 +4398,17 @@ mod tests {
         // and turn the other into a plain remote attach.
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
-        let config = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: port,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None, // offline
-        org_id: None,
-        workos_client_id: None,
-        default_harness: HarnessId::Mock, };
+        let config = EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        };
         let (a, b) = tokio::join!(
             EngineHandle::bootstrap(config.clone()),
             EngineHandle::bootstrap(config.clone()),
@@ -4174,13 +4460,17 @@ mod tests {
             .unwrap();
         let port = squatter.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: port,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: None,
-        default_harness: HarnessId::Mock, })
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
         .await
         .expect("a taken port must not fail the boot");
         assert_eq!(handle.mode(), EngineMode::InProcess);
@@ -4199,13 +4489,17 @@ mod tests {
     #[tokio::test]
     async fn production_bootstrap_opens_local_data_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: free_port().await,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: Some("client_test".into()),
-        default_harness: HarnessId::Mock, })
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
         .await
         .unwrap();
 
@@ -4248,13 +4542,17 @@ mod tests {
             r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
         )
         .unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().to_path_buf(),
-        ipc_port: free_port().await,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: Some("client_test".into()),
-        default_harness: HarnessId::Mock, })
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
         .await
         .unwrap();
 
@@ -4301,16 +4599,25 @@ mod tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
-
         let ui_dir = tempfile::tempdir().unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig { managed_inference: false, scaffold: None, data_dir: ui_dir.path().to_path_buf(),
-        ipc_port: port,
-        edge_url: "http://127.0.0.1:1".into(),
-        edge_token: None,
-        org_id: None,
-        workos_client_id: None,
-        default_harness: HarnessId::Mock, })
+        let token = zeron_rpc::ipc_auth::issue_token(ui_dir.path()).unwrap();
+        tokio::spawn(zeron_rpc::serve_ws_listener(
+            listener,
+            core.rpc_service(),
+            token,
+        ));
+
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            managed_inference: false,
+            scaffold: None,
+            data_dir: ui_dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
         .await
         .unwrap();
         assert_eq!(
@@ -4352,30 +4659,48 @@ mod tests {
         }
         #[async_trait]
         impl RpcService for Daemon {
-            async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
-                self.requests.lock().unwrap().push(if method == methods::MUTATE {
-                    format!("Mutate:{}", params["op"].as_str().unwrap_or_default())
-                } else { method.into() });
+            async fn handle(
+                &self,
+                method: &str,
+                params: serde_json::Value,
+            ) -> Result<RpcReply, RpcError> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(if method == methods::MUTATE {
+                        format!("Mutate:{}", params["op"].as_str().unwrap_or_default())
+                    } else {
+                        method.into()
+                    });
                 let frame = match method {
-                    methods::ENGINE_INFO => return RpcReply::value(&EngineInfo {
-                        device_id: self.device.into(), workspace_scope: self.scope,
-                        cursor_sdk_version: None,
-                        capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
-                        devbox_provider: None, devbox_id: None,
-                    }),
+                    methods::ENGINE_INFO => {
+                        return RpcReply::value(&EngineInfo {
+                            device_id: self.device.into(),
+                            workspace_scope: self.scope,
+                            cursor_sdk_version: None,
+                            capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+                            devbox_provider: None,
+                            devbox_id: None,
+                        });
+                    }
                     methods::ENGINE_READY => return RpcReply::value(&true),
                     // Received, but no acknowledgement before the daemon dies.
                     methods::QUEUE_COMMAND => {
                         let command: zeron_doc::SessionCommandPayload =
                             serde_json::from_value(params["command"].clone()).unwrap();
-                        assert!(matches!(command, zeron_doc::SessionCommandPayload::Run { request, message_id }
-                            if message_id == "selected-command" && request.prompt == "send this exactly once"));
+                        assert!(
+                            matches!(command, zeron_doc::SessionCommandPayload::Run { request, message_id }
+                            if message_id == "selected-command" && request.prompt == "send this exactly once")
+                        );
                         return std::future::pending().await;
                     }
                     methods::MUTATE => return RpcReply::value(&true),
                     methods::WATCH_CHATS => serde_json::to_value(vec![
-                        chat("selected", 0, None), chat("background", 0, None), chat("cached", 0, None),
-                    ]).unwrap(),
+                        chat("selected", 0, None),
+                        chat("background", 0, None),
+                        chat("cached", 0, None),
+                    ])
+                    .unwrap(),
                     methods::WATCH_SESSIONS => {
                         let mut row = session("selected", SessionStatus::Working, 0, Utc::now());
                         row.running_subagents = self.generation;
@@ -4384,12 +4709,22 @@ mod tests {
                     methods::WATCH_DOC_MESSAGES => {
                         let id = params["chatId"].as_str().unwrap();
                         serde_json::to_value(zeron_doc::TranscriptUpdate {
-                            frame: TranscriptFrame::reset(&[user_entry(&format!("{id}-{}", self.generation))]),
-                            context_usage: None, replay_baseline: None,
+                            frame: TranscriptFrame::reset(&[user_entry(&format!(
+                                "{id}-{}",
+                                self.generation
+                            ))]),
+                            context_usage: None,
+                            replay_baseline: None,
                             command_delivery: if self.generation == 2 && id == "background" {
-                                HashMap::from([("background-command".into(), zeron_doc::CommandDeliveryStatus::Preparing)])
-                            } else { HashMap::new() },
-                        }).unwrap()
+                                HashMap::from([(
+                                    "background-command".into(),
+                                    zeron_doc::CommandDeliveryStatus::Preparing,
+                                )])
+                            } else {
+                                HashMap::new()
+                            },
+                        })
+                        .unwrap()
                     }
                     methods::WATCH_QUEUE => serde_json::json!({ "items": [{
                         "id": "queued", "text": "keep queued", "attachments": [],
@@ -4397,18 +4732,27 @@ mod tests {
                     }] }),
                     other => return Err(RpcError::UnknownMethod(other.into())),
                 };
-                Ok(RpcReply::Stream(futures::stream::once(async move { frame })
-                    .chain(futures::stream::pending()).boxed()))
+                Ok(RpcReply::Stream(
+                    futures::stream::once(async move { frame })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                ))
             }
         }
-        fn serve(port: u16, daemon: Arc<Daemon>) -> (tokio::runtime::Runtime, u16) {
+        fn serve(port: u16, daemon: Arc<Daemon>, token: &str) -> (tokio::runtime::Runtime, u16) {
             // Own accepted sockets too: aborting only serve_ws_listener would
             // leave existing clients connected and would not model process death.
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let port = runtime.block_on(async {
-                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .unwrap();
                 let port = listener.local_addr().unwrap().port();
-                tokio::spawn(zeron_rpc::serve_ws_listener(listener, daemon));
+                tokio::spawn(zeron_rpc::serve_ws_listener(
+                    listener,
+                    daemon,
+                    token.to_owned(),
+                ));
                 port
             });
             (runtime, port)
@@ -4422,16 +4766,26 @@ mod tests {
             loop {
                 runtime.block_on(async { tokio::task::yield_now().await });
                 cx.run_until_parked();
-                if ready(cx) { return; }
-                assert!(Instant::now() < deadline, "reconnect observation did not arrive");
+                if ready(cx) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "reconnect observation did not arrive"
+                );
                 std::thread::yield_now();
             }
         }
 
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let daemon = |device, scope, generation| Arc::new(Daemon {
-            device, scope, generation, requests: requests.clone(),
-        });
+        let daemon = |device, scope, generation| {
+            Arc::new(Daemon {
+                device,
+                scope,
+                generation,
+                requests: requests.clone(),
+            })
+        };
         // Client transport and Tokio bridge completions must wake GPUI on the
         // test thread. Only the daemon's socket side runs on worker threads.
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4440,8 +4794,12 @@ mod tests {
             .unwrap();
         let _guard = runtime.enter();
         cx.update(|cx| gpui_tokio::init_from_handle(cx, runtime.handle().clone()));
-        let (server, port) = serve(0, daemon("dev", WorkspaceScope::Local, 1));
-        let original = runtime.block_on(EngineHandle::attach_to_daemon(port)).unwrap();
+        let ipc_dir = tempfile::tempdir().unwrap();
+        let ipc_token = zeron_rpc::ipc_auth::issue_token(ipc_dir.path()).unwrap();
+        let (server, port) = serve(0, daemon("dev", WorkspaceScope::Local, 1), &ipc_token);
+        let original = runtime
+            .block_on(EngineHandle::attach_to_daemon(port, ipc_dir.path()))
+            .unwrap();
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, cx| {
             state.select_chat(Some("cached".into()), cx);
@@ -4454,11 +4812,19 @@ mod tests {
             state.push_echo("selected", user_entry("selected-command"));
             state.watch_subagent_doc("subagent".into(), cx);
         });
-        drive_until(cx, &runtime, |cx| state.read_with(cx, |state, _| {
-            state.transcript.first().is_some_and(|row| row.id == "selected-1")
-                && state.sub_transcript("subagent").first().is_some_and(|row| row.id == "subagent-1")
-                && state.queue.len() == 1
-        }));
+        drive_until(cx, &runtime, |cx| {
+            state.read_with(cx, |state, _| {
+                state
+                    .transcript
+                    .first()
+                    .is_some_and(|row| row.id == "selected-1")
+                    && state
+                        .sub_transcript("subagent")
+                        .first()
+                        .is_some_and(|row| row.id == "subagent-1")
+                    && state.queue.len() == 1
+            })
+        });
         let command_handle = original.clone();
         let mutation = runtime.spawn(async move {
             let command = zeron_doc::SessionCommandPayload::Run {
@@ -4471,32 +4837,64 @@ mod tests {
                     cwd: "/tmp".into(),
                     sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                     auto_approve: false,
+                    access: Default::default(),
+                    plan: false,
                     resume: None,
                     attachments: Vec::new(),
                     worktree: None,
                     mcp: None,
+                    env: Default::default(),
                 },
                 message_id: "selected-command".into(),
             };
-            command_handle.client().call(methods::QUEUE_COMMAND, serde_json::json!({
-                "chatId": "selected", "command": command,
-            })).await
+            command_handle
+                .client()
+                .call(
+                    methods::QUEUE_COMMAND,
+                    serde_json::json!({
+                        "chatId": "selected", "command": command,
+                    }),
+                )
+                .await
         });
-        drive_until(cx, &runtime, |_| requests.lock().unwrap().iter().any(|method| method == methods::QUEUE_COMMAND));
-        let mutation_count = requests.lock().unwrap().iter().filter(|method| method.starts_with("Mutate:")).count();
+        drive_until(cx, &runtime, |_| {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| method == methods::QUEUE_COMMAND)
+        });
+        let mutation_count = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| method.starts_with("Mutate:"))
+            .count();
         drop(server);
         runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(2), original.client().closed()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), original.client().closed())
+                .await
+                .unwrap();
             assert!(matches!(mutation.await.unwrap(), Err(RpcError::Closed)));
         });
         // Neither another device nor another workspace at the same port may attach.
-        for (device, scope) in [("stranger", WorkspaceScope::Local), ("dev", WorkspaceScope::Synced)] {
-            let (stranger, _) = serve(port, daemon(device, scope, 99));
+        for (device, scope) in [
+            ("stranger", WorkspaceScope::Local),
+            ("dev", WorkspaceScope::Synced),
+        ] {
+            let (stranger, _) = serve(port, daemon(device, scope, 99), &ipc_token);
             let rejection = runtime.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(2),
-                    EngineHandle::connect_daemon(format!("ws://127.0.0.1:{port}"), Some(original.engine_info())),
-                ).await.expect("identity probe must finish")
+                    EngineHandle::connect_daemon(
+                        format!("ws://127.0.0.1:{port}"),
+                        port,
+                        ipc_dir.path().to_path_buf(),
+                        Some(original.engine_info()),
+                    ),
+                )
+                .await
+                .expect("identity probe must finish")
             });
             assert!(matches!(rejection, Err(RpcError::Failed(_))));
             assert!(original.replacement.get().is_none());
@@ -4506,36 +4904,86 @@ mod tests {
             assert_eq!(state.selected_chat.as_deref(), Some("selected"));
             assert_eq!(state.transcript[0].id, "selected-1");
             assert_eq!(state.queue[0].id, "queued");
-            assert_eq!(state.pending_sends["selected"].message_id, "selected-command");
-            assert_eq!(state.pending_sends["background"].message_id, "background-command");
+            assert_eq!(
+                state.pending_sends["selected"].message_id,
+                "selected-command"
+            );
+            assert_eq!(
+                state.pending_sends["background"].message_id,
+                "background-command"
+            );
             assert_eq!(state.pending_echoes()[0].id, "selected-command");
             assert_eq!(state.transcript_cache[0].entries[0].id, "cached-history");
         });
-        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 2));
-        drive_until(cx, &runtime, |cx| state.read_with(cx, |state, _| {
-            state.engine.as_ref().is_some_and(|engine| !engine.same_connection(&original))
-                && state.transcript.first().is_some_and(|row| row.id == "selected-2")
-                && state.sub_transcript("subagent").first().is_some_and(|row| row.id == "subagent-2")
-                && state.sessions.first().is_some_and(|row| row.running_subagents == 2)
-                && state.send_preparing("background")
-        }));
+        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 2), &ipc_token);
+        drive_until(cx, &runtime, |cx| {
+            state.read_with(cx, |state, _| {
+                state
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| !engine.same_connection(&original))
+                    && state
+                        .transcript
+                        .first()
+                        .is_some_and(|row| row.id == "selected-2")
+                    && state
+                        .sub_transcript("subagent")
+                        .first()
+                        .is_some_and(|row| row.id == "subagent-2")
+                    && state
+                        .sessions
+                        .first()
+                        .is_some_and(|row| row.running_subagents == 2)
+                    && state.send_preparing("background")
+            })
+        });
         let fresh = state.read_with(cx, |state, _| {
             assert_eq!(state.selected_chat.as_deref(), Some("selected"));
             assert_eq!(state.queue[0].id, "queued");
-            assert_eq!(state.pending_sends["selected"].message_id, "selected-command");
-            assert_eq!(state.pending_sends["background"].message_id, "background-command");
+            assert_eq!(
+                state.pending_sends["selected"].message_id,
+                "selected-command"
+            );
+            assert_eq!(
+                state.pending_sends["background"].message_id,
+                "background-command"
+            );
             assert_eq!(state.transcript_cache[0].entries[0].id, "cached-history");
             state.engine.clone().unwrap()
         });
-        assert!(runtime.block_on(original.reconnect()).unwrap().same_connection(&fresh));
-        assert_eq!(requests.lock().unwrap().iter().filter(|method| method.as_str() == methods::QUEUE_COMMAND).count(), 1);
-        assert_eq!(requests.lock().unwrap().iter().filter(|method| method.starts_with("Mutate:")).count(), mutation_count);
+        assert!(
+            runtime
+                .block_on(original.reconnect())
+                .unwrap()
+                .same_connection(&fresh)
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| method.as_str() == methods::QUEUE_COMMAND)
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| method.starts_with("Mutate:"))
+                .count(),
+            mutation_count
+        );
         drop(server);
         runtime.block_on(fresh.client().closed());
         cx.run_until_parked();
         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
-        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 3));
-        assert!(runtime.block_on(fresh.reconnect()).is_err(), "account replacement cancels reconnect");
+        let (server, _) = serve(port, daemon("dev", WorkspaceScope::Local, 3), &ipc_token);
+        assert!(
+            runtime.block_on(fresh.reconnect()).is_err(),
+            "account replacement cancels reconnect"
+        );
         cx.run_until_parked();
         state.read_with(cx, |state, _| {
             assert!(state.engine.is_none());
@@ -4549,24 +4997,28 @@ mod tests {
         let base = DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
             .unwrap()
             .to_utc();
-        Chat { crew: None, id: id.into(),
-        device_id: "dev".into(),
-        title: None,
-        archived: false,
-        cwd: None,
-        branch: None,
-        checkout_id: None,
-        source_context: None,
-        config: None,
-        last_message_preview: None,
-        last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),
-        created_at: base + TimeDelta::minutes(created_min),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        parent_chat_id: None,
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None, }
+        Chat {
+            crew: None,
+            harness_session_harness: None,
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),
+            created_at: base + TimeDelta::minutes(created_min),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
     }
 
     fn space(id: &str, device_id: &str, path: &str, created_min: i64) -> Space {
@@ -4582,6 +5034,7 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: base + TimeDelta::minutes(created_min),
         }
     }
@@ -4593,6 +5046,8 @@ mod tests {
         now: DateTime<Utc>,
     ) -> Session {
         Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             last_completed_turn: None,
             running_subagents: 0,
             chat_id: chat_id.into(),
@@ -4854,9 +5309,15 @@ mod tests {
         let now = Utc::now();
         let mut state = AppState::new();
         state.sessions = vec![zeron_proto::Session {
-            chat_id: "rowless".into(), device_id: "remote".into(),
-            status: zeron_proto::SessionStatus::Working, started_at: Some(now), updated_at: now,
-            running_subagents: 0, last_completed_turn: None,
+            last_turn_outcome: None,
+            terminal_activity: None,
+            chat_id: "rowless".into(),
+            device_id: "remote".into(),
+            status: zeron_proto::SessionStatus::Working,
+            started_at: Some(now),
+            updated_at: now,
+            running_subagents: 0,
+            last_completed_turn: None,
         }];
         state.selected_chat = Some("different".into());
         assert_eq!(state.indicator_for("rowless", now), Indicator::Working);
@@ -4868,6 +5329,8 @@ mod tests {
         let mut state = AppState::new();
         let now = Utc::now();
         let mut row = Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             last_completed_turn: None,
             running_subagents: 0,
             chat_id: "chat".into(),
@@ -4900,6 +5363,8 @@ mod tests {
         let mut state = AppState::new();
         let now = Utc::now();
         state.sessions = vec![Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             last_completed_turn: None,
             running_subagents: 0,
             chat_id: "chat".into(),
@@ -5093,8 +5558,13 @@ mod tests {
             s.sessions = vec![session("c", SessionStatus::Working, 0, later)];
             let mut adopted = update("m1");
             adopted.frame = TranscriptFrame::Delta {
-                upsert: vec![zeron_doc::TranscriptUpsert { after: None, entry: user_entry("m1") }],
-                append: vec![], remove: vec![], count: 1,
+                upsert: vec![zeron_doc::TranscriptUpsert {
+                    after: None,
+                    entry: user_entry("m1"),
+                }],
+                append: vec![],
+                remove: vec![],
+                count: 1,
             };
             assert!(s.receive_pending_send_update("c", &adopted));
             assert!(!s.send_undelivered("c", later));
@@ -5108,29 +5578,36 @@ mod tests {
             s.begin_pending_send("c", "m2", later);
             assert!(!s.receive_pending_send_update("c", &update("m1")));
             assert_eq!(s.pending_sends["c"].message_id, "m2");
-            s.pending_send_tasks.insert("c".into(), (
-                Some(cx.spawn(async |_, _| std::future::pending::<()>().await)),
-                Some(cx.spawn(async |_, _| std::future::pending::<()>().await)),
-            ));
+            s.pending_send_tasks.insert(
+                "c".into(),
+                (
+                    Some(cx.spawn(async |_, _| std::future::pending::<()>().await)),
+                    Some(cx.spawn(async |_, _| std::future::pending::<()>().await)),
+                ),
+            );
             let rejected = zeron_doc::TranscriptUpdate {
                 frame: TranscriptFrame::reset(&[]),
                 context_usage: None,
                 replay_baseline: None,
-                command_delivery: HashMap::from([("m2".into(), zeron_doc::CommandDeliveryStatus::Failed {
-                    reason: "worktree failed".into(),
-                })]),
+                command_delivery: HashMap::from([(
+                    "m2".into(),
+                    zeron_doc::CommandDeliveryStatus::Failed {
+                        reason: "worktree failed".into(),
+                    },
+                )]),
             };
             assert!(s.receive_pending_send_update("c", &rejected));
             assert_eq!(s.send_failure("c"), Some("worktree failed"));
             assert!(s.send_undelivered("c", later));
-            assert!(!s.pending_send_tasks.contains_key("c"), "terminal delivery releases both observers");
+            assert!(
+                !s.pending_send_tasks.contains_key("c"),
+                "terminal delivery releases both observers"
+            );
         });
     }
 
     #[gpui::test]
-    fn reselecting_pending_send_requires_fresh_preparation_evidence(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn reselecting_pending_send_requires_fresh_preparation_evidence(cx: &mut gpui::TestAppContext) {
         let now = DateTime::from_timestamp_millis(1_000_000).unwrap();
         let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
         let state = cx.new(|_| AppState::new());
@@ -5180,12 +5657,18 @@ mod tests {
             assert!(!s.send_pending("c", later));
             assert!(s.send_undelivered("c", later));
             s.select_chat(Some("c".into()), cx);
-            assert!(!s.send_preparing("c"), "cached transcript is not a fresh receipt");
+            assert!(
+                !s.send_preparing("c"),
+                "cached transcript is not a fresh receipt"
+            );
             assert!(s.send_undelivered("c", later));
             s.receive_transcript_update(
-                update(zeron_doc::CommandDeliveryStatus::Failed { reason: "worktree failed".into() }),
+                update(zeron_doc::CommandDeliveryStatus::Failed {
+                    reason: "worktree failed".into(),
+                }),
                 cx,
-            ).unwrap();
+            )
+            .unwrap();
             s.select_chat(Some("other".into()), cx);
             assert_eq!(s.send_failure("c"), Some("worktree failed"));
             assert!(s.send_undelivered("c", now));
@@ -5220,9 +5703,12 @@ mod tests {
             assert!(s.send_undelivered("c", later));
             s.connectivity.state = zeron_proto::ConnectivityState::Disabled;
             s.receive_transcript_update(
-                update(zeron_doc::CommandDeliveryStatus::Failed { reason: "worktree failed".into() }),
+                update(zeron_doc::CommandDeliveryStatus::Failed {
+                    reason: "worktree failed".into(),
+                }),
                 cx,
-            ).unwrap();
+            )
+            .unwrap();
             assert!(s.send_undelivered("c", now));
             assert!(!s.send_pending("c", now));
             assert_eq!(s.send_failure("c"), Some("worktree failed"));
@@ -5341,12 +5827,9 @@ mod tests {
             display_status(&c, Some(&idle), now),
             ChatIndicator::Completed
         );
-        // Stale working session falls back to the seen check.
+        // A lost host is not a successful completion, even with unread text.
         let stale = session("c", SessionStatus::Working, 300, now);
-        assert_eq!(
-            display_status(&c, Some(&stale), now),
-            ChatIndicator::Completed
-        );
+        assert_eq!(display_status(&c, Some(&stale), now), ChatIndicator::Idle);
         // Seen after the last message = Idle.
         c.last_seen_at = c.last_message_at.map(|t| t + TimeDelta::minutes(1));
         assert_eq!(display_status(&c, Some(&idle), now), ChatIndicator::Idle);
@@ -6046,6 +6529,8 @@ mod tests {
             error: None,
             can_apply: true,
             manual_command: None,
+            compatibility: None,
+            held_back: None,
         };
         assert!(!state.apply_harness_updates(vec![]));
         assert!(state.apply_harness_updates(vec![status(HarnessUpdatePhase::Available)]));
@@ -6063,6 +6548,8 @@ mod tests {
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            access: Default::default(),
+            plan: false,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -6087,6 +6574,8 @@ mod tests {
                 reasoning: None,
                 model_options: serde_json::Map::new(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
             },
         );
     }
@@ -6252,7 +6741,10 @@ mod tests {
         assert!(!state.ack_pending_send_from_queue("c1", &[row("unrelated")]));
         assert!(state.ack_pending_send_from_queue("c1", &[row("background-held")]));
         assert!(!state.pending_sends.contains_key("c1"));
-        assert_eq!(state.queue[0].id, "held", "background receipts do not replace the visible queue");
+        assert_eq!(
+            state.queue[0].id, "held",
+            "background receipts do not replace the visible queue"
+        );
     }
 
     #[test]
@@ -6792,7 +7284,11 @@ impl AppState {
     }
 }
 
-#[cfg(feature = "project-palette-fixture")]
+#[cfg(any(
+    test,
+    feature = "project-palette-fixture",
+    feature = "pull-request-fixture"
+))]
 impl AppState {
     /// Seed provider metadata for the isolated native sidebar review fixture.
     pub fn fixture_sidebar_change_request(

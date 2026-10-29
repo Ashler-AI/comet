@@ -16,7 +16,6 @@ struct ProjectActionContext {
     target_device_id: Option<String>,
 }
 
-
 impl Shell {
     pub(super) fn attach_worktree_setup(
         &mut self,
@@ -27,7 +26,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if let Some(error) = setup_error {
-            self.show_notice(crate::toast::ToastKind::Error, format!("Setup action failed: {error}"), cx);
+            self.show_notice(
+                crate::toast::ToastKind::Error,
+                format!("Setup action failed: {error}"),
+                cx,
+            );
         }
         let Some(run) = setup_action else {
             cx.notify();
@@ -43,7 +46,11 @@ impl Shell {
             panel.attach_reserved_session(&chat_id, tab, run.terminal, target_device_id, cx)
         });
         if !attached {
-            self.show_notice(crate::toast::ToastKind::Error, "Setup action started, but its terminal could not be attached", cx);
+            self.show_notice(
+                crate::toast::ToastKind::Error,
+                "Setup action started, but its terminal could not be attached",
+                cx,
+            );
         }
 
         let selected = self.active_chat == chat_id;
@@ -131,7 +138,6 @@ impl Shell {
         }
         cx.notify();
     }
-
 
     pub(super) fn open_project_action_editor(
         &mut self,
@@ -503,8 +509,6 @@ impl Shell {
         .detach();
     }
 
-
-
     pub(super) fn render_project_action_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
@@ -588,6 +592,9 @@ impl Shell {
             icon_row = icon_row.child(
                 div()
                     .id(SharedString::from(format!("action-icon-{label}")))
+                    .role(gpui::Role::Button)
+                    .aria_label(label)
+                    .aria_selected(kind == selected_icon)
                     .size(px(34.0))
                     .flex()
                     .items_center()
@@ -611,6 +618,7 @@ impl Shell {
                         }
                         cx.notify();
                     }))
+                    .tooltip(crate::settings::widgets::text_tooltip(label))
                     .child(
                         icon(action_icon(kind))
                             .size(px(16.0))
@@ -728,11 +736,6 @@ fn project_action_params(
     params
 }
 
-
-
-
-
-
 fn action_field_label(theme: &Theme, label: &str) -> gpui::Div {
     div()
         .mt(px(12.0))
@@ -742,4 +745,3 @@ fn action_field_label(theme: &Theme, label: &str) -> gpui::Div {
         .text_color(theme.text_muted)
         .child(SharedString::from(label.to_string()))
 }
-

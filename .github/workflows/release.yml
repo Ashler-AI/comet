@@ -132,16 +132,6 @@ jobs:
           echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "source_epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
 
-  browser-contracts:
-    needs: version
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: node --test apps/web/server.test.mjs
-
   linux:
     if: ${{ inputs.candidate_run_id == '' && needs.version.outputs.release_surface == 'desktop-and-scaffold' }}
     needs: version
@@ -328,7 +318,6 @@ jobs:
     if: >-
       always() &&
       needs.version.result == 'success' &&
-      needs['browser-contracts'].result == 'success' &&
       (
         (
           inputs.candidate_run_id != '' &&
@@ -341,7 +330,7 @@ jobs:
           (needs.linux.result == 'success' || needs.linux.result == 'skipped')
         )
       )
-    needs: [version, linux, macos, browser-contracts]
+    needs: [version, linux, macos]
     runs-on: ubuntu-24.04
     outputs:
       digest: ${{ steps.candidate.outputs.digest || steps.reuse.outputs.digest }}

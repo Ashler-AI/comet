@@ -51,7 +51,8 @@ impl RuntimeArgs {
         pinned: bool,
         mut env: impl FnMut(&str) -> Option<std::ffi::OsString>,
     ) -> anyhow::Result<EngineConfig> {
-        let isolated = !pinned && (persist || own_runtime)
+        let managed_child = env(zeron_engine::managed::MANAGED_ENV).is_some();
+        let isolated = !managed_child && !pinned && (persist || own_runtime)
             && env("COMET_LOCAL_AGENT_RUNTIME").as_deref() == Some(std::ffi::OsStr::new("1"));
         if isolated && (self.data_dir.as_ref().is_none_or(|dir| dir.as_os_str().is_empty()) || self.ipc_port.is_none()) {
             bail!("Crew agent launches require explicit --data-dir and --ipc-port for an independent runtime");
@@ -262,8 +263,8 @@ pub fn configure_device(config: &mut EngineConfig, path: &Path) -> anyhow::Resul
     Ok(())
 }
 
-pub async fn scaffold_authority(ipc_port: u16) -> anyhow::Result<()> {
-    let client = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}")).await?;
+pub async fn scaffold_authority(ipc_port: u16, data_dir: &Path) -> anyhow::Result<()> {
+    let client = zeron_rpc::connect_ipc(ipc_port, Some(data_dir)).await?;
     let authority = client.call("ScaffoldHostAuthority", serde_json::json!({})).await?;
     println!("{}", serde_json::to_string(&authority)?);
     Ok(())
@@ -382,6 +383,35 @@ mod runtime_tests {
         assert_eq!(resolve(&client, false, false, &[("COMET_LOCAL_AGENT_RUNTIME", "1"), ("COMET_IPC_PORT", "39016")]).unwrap().ipc_port, 39016);
         assert_eq!(std::fs::read(path).unwrap(), persisted);
         assert!(!parent.exists());
+    }
+
+    #[test]
+    fn managed_engine_keeps_the_parent_injected_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("managed-profile");
+        let profile_text = profile.to_str().unwrap();
+        let vars = [
+            (zeron_engine::managed::MANAGED_ENV, "1"),
+            ("COMET_LOCAL_AGENT_RUNTIME", "1"),
+            ("COMET_DATA_DIR", profile_text),
+            ("COMET_IPC_PORT", "39018"),
+            ("COMET_EDGE_URL", "https://managed-edge.example.test"),
+            ("COMET_SCAFFOLD_URL", "https://managed-control.example.test"),
+            ("COMET_PROJECT_SCOPE", "managed-project"),
+            ("COMET_DEPLOYMENT_ID", "managed-deployment"),
+            ("COMET_HARNESS", "omp"),
+        ];
+
+        let config = resolve(&RuntimeArgs::default(), false, true, &vars).unwrap();
+
+        assert_eq!(config.data_dir, profile);
+        assert_eq!(config.ipc_port, 39018);
+        assert_eq!(config.edge_url, "https://managed-edge.example.test");
+        assert_eq!(config.default_harness, HarnessId::Omp);
+        let scaffold = config.scaffold.unwrap();
+        assert_eq!(scaffold.control_origin, "https://managed-control.example.test");
+        assert_eq!(scaffold.project_scope, "managed-project");
+        assert_eq!(scaffold.deployment_id.as_deref(), Some("managed-deployment"));
     }
 }
 

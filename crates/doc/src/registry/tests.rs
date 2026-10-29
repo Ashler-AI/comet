@@ -300,11 +300,14 @@ fn chat(id: &str, device_id: &str) -> Chat {
         reasoning: None,
         model_options: Default::default(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        access: Default::default(),
+        plan: false,
     }),
     last_message_preview: None,
     last_message_at: None,
     created_at: ts(2_000),
     harness_session_id: None,
+    harness_session_harness: None,
     harness_session_cwd: None,
     parent_chat_id: Some("parent-chat".into()),
     space_id: None,
@@ -322,6 +325,7 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
         git_checked_at: None,
         checkout_id: None,
         repository_id: None,
+        github_repo: None,
         created_at: ts(1_500),
     }
 }
@@ -329,6 +333,8 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
         last_completed_turn: None,
+        last_turn_outcome: None,
+        terminal_activity: None,
         running_subagents: 0,
         chat_id: chat_id.into(),
         device_id: device_id.into(),
@@ -643,6 +649,7 @@ fn spaces_round_trip_and_mutate() {
             true,
             Some("checkout-abc"),
             Some("github.com/owner/project"),
+            Some("owner/project"),
             ts(4_000),
         )
         .unwrap()
@@ -654,10 +661,11 @@ fn spaces_round_trip_and_mutate() {
         row.repository_id.as_deref(),
         Some("github.com/owner/project")
     );
+    assert_eq!(row.github_repo.as_deref(), Some("owner/project"));
     assert_eq!(row.git_checked_at, Some(ts(4_000)));
 
     assert!(!ws.rename_space("nope", Some("x")).unwrap());
-    assert!(!ws.set_space_git("nope", true, None, None, ts(1)).unwrap());
+    assert!(!ws.set_space_git("nope", true, None, None, None, ts(1)).unwrap());
 }
 
 #[test]

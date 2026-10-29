@@ -44,17 +44,22 @@ TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"
 BIN="$(mktemp)"
-trap 'rm -f "$BIN"' EXIT
+ENGINE_BIN="$(mktemp)"
+trap 'rm -f "$BIN" "$ENGINE_BIN"' EXIT
 if [[ "$PROFILE" == "release" ]]; then
-  python3 scripts/local-cargo.py build --release --locked -p zeron --copy-binary release/zeron "$BIN"
+  python3 scripts/local-cargo.py build --release --locked -p zeron --copy-binary release/zeron "$BIN" --copy-binary release/zeron-engine "$ENGINE_BIN"
 else
-  python3 scripts/local-cargo.py build --locked -p zeron --copy-binary debug/zeron "$BIN"
+  python3 scripts/local-cargo.py build --locked -p zeron --copy-binary debug/zeron "$BIN" --copy-binary debug/zeron-engine "$ENGINE_BIN"
 fi
+# The background engine the app starts: sessions keep running with the app
+# closed, in a process of its own.
+
 
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/comet"
-rm -f "$BIN"
+install -m 755 "$ENGINE_BIN" "$STAGE/zeron-engine"
+rm -f "$BIN" "$ENGINE_BIN"
 install -m 644 "$ROOT/dist/comet.desktop" "$STAGE/comet.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/comet.png"
 install -m 644 "$ROOT/dist/zeron.svg" "$STAGE/comet.svg"
@@ -78,6 +83,10 @@ sed "s/__VERSION__/$VERSION/g" >"$STAGE/install.sh" <<'INSTALL'
 # Install Crew for this user without replacing a running release in place.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -x "$HERE/comet" ] && [ -x "$HERE/zeron-engine" ] || {
+  echo "Crew app or background engine is missing or non-executable; the installed release was not activated." >&2
+  exit 1
+}
 VERSION="__VERSION__"
 APP_ROOT="$HOME/.crew/app"
 # Include web and desktop assets: a same-version bundle can change without
@@ -96,6 +105,10 @@ if [ ! -x "$DEST/comet" ]; then
   if ! mv -T "$STAGE" "$DEST"; then
     [ -x "$DEST/comet" ] || exit 1
   fi
+fi
+if [ ! -x "$DEST/zeron-engine" ] || ! "$DEST/zeron-engine" --version >/dev/null; then
+  echo "Crew background engine is missing or cannot start; the installed release was not activated." >&2
+  exit 1
 fi
 if ! "$DEST/comet" --version >/dev/null; then
   echo "Crew could not start; see the loader error above. Install the missing runtime libraries (including ALSA, libasound.so.2), then retry." >&2

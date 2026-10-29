@@ -154,9 +154,12 @@ fn run_request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     }
 }
 
@@ -569,6 +572,8 @@ async fn chat_config_selects_the_run_harness() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
             }),
             None,
         )
@@ -700,6 +705,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 git_checked_at: Some(now),
                 checkout_id: Some("co-1".into()),
                 repository_id: None,
+                github_repo: None,
                 created_at: now,
             })
             .unwrap();
@@ -716,6 +722,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
             last_message_at: Some(now),
             created_at: now,
             harness_session_id: Some("hs-9".into()),
+            harness_session_harness: None,
             room_gen: None,
             parent_chat_id: None,
             harness_session_cwd: Some("/tmp/legacy".into()),
@@ -724,6 +731,8 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
             .unwrap();
         legacy
             .upsert_session(&Session {
+                last_turn_outcome: None,
+                terminal_activity: None,
                 last_completed_turn: None,
                 running_subagents: 0,
                 chat_id: "chat-legacy".into(),

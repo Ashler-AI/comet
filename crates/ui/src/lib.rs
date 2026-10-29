@@ -31,7 +31,6 @@ mod composer_markdown;
 mod context_usage;
 mod dictation;
 pub mod edge_fade;
-pub mod rounded_clip;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
@@ -49,7 +48,8 @@ mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
-pub mod notify;
+pub mod rounded_clip;
+pub use zeron_notify as notify;
 pub mod orb;
 pub mod overscroll;
 pub mod pickers;
@@ -63,20 +63,22 @@ mod pull_request_test_support;
 pub mod pull_requests;
 pub mod queue;
 pub mod rail;
+pub(crate) mod reply_images;
 mod roll_text;
 pub mod running_pill;
 pub mod settings;
 pub mod shell;
+pub mod smooth_scroll;
 pub mod sound;
 pub mod state;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
-mod todo_panel;
-pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
 pub mod toast;
+mod todo_panel;
+pub(crate) mod tool_images;
 pub mod transcript;
 pub mod typography;
 pub mod visuals;
@@ -119,13 +121,17 @@ pub struct UiConfig {
 
 impl UiConfig {
     fn boot(&self) -> EngineBootConfig {
-        EngineBootConfig { managed_inference: self.managed_inference, scaffold: self.scaffold.clone(), data_dir: self.data_dir.clone(),
-        ipc_port: self.ipc_port,
-        edge_url: self.edge_url.clone(),
-        edge_token: self.edge_token.clone(),
-        org_id: self.org_id.clone(),
-        workos_client_id: self.workos_client_id.clone(),
-        default_harness: self.default_harness, }
+        EngineBootConfig {
+            managed_inference: self.managed_inference,
+            scaffold: self.scaffold.clone(),
+            data_dir: self.data_dir.clone(),
+            ipc_port: self.ipc_port,
+            edge_url: self.edge_url.clone(),
+            edge_token: self.edge_token.clone(),
+            org_id: self.org_id.clone(),
+            workos_client_id: self.workos_client_id.clone(),
+            default_harness: self.default_harness,
+        }
     }
 }
 
@@ -174,7 +180,12 @@ pub fn run_app(config: UiConfig) {
         gpui_tokio::init_from_handle(cx, runtime_handle);
         gpui_base::init(cx);
         let data_dir = config.boot().data_dir.clone();
-        let ui_settings = settings::UiSettings::load(&data_dir);
+        let mut ui_settings = settings::UiSettings::load(&data_dir);
+        // Older keymaps stored custom combos as the recording layout typed
+        // them; convert against the layout, which only the app can read.
+        ui_settings
+            .keymap
+            .adopt_layout_neutral(&settings::key_equivalents(cx));
         settings::init(ui_settings.clone(), data_dir.clone(), cx);
         let font_availability = typography::register_fonts(cx);
         // Typography first: theme installation reads the effective family, so
@@ -224,6 +235,13 @@ pub fn run_app(config: UiConfig) {
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
+                // A banner the background engine posted, clicked: the engine
+                // opens the app on `zeron://notification/<target>`.
+                if let Some(target) = notify::link_target(&url) {
+                    let target = target.to_owned();
+                    let _ = cx.update(|cx| open_notification_target(target, &url_state, cx));
+                    continue;
+                }
                 url_state.update(cx, |state, cx| state.open_deep_link(&url, cx));
             }
         })
@@ -241,6 +259,16 @@ pub fn run_app(config: UiConfig) {
             }
         })
         .detach();
+        // Sessions run in the background engine, which outlives this window
+        // (and posts the desktop banners); embedding stays the fallback, or
+        // the choice with ZERON_EMBED_ENGINE=1. An embedded engine posts the
+        // banners itself.
+        zeron_engine::desktop_notify::enable();
+        if std::env::var_os("ZERON_EMBED_ENGINE")
+            .is_none_or(|value| value.is_empty() || value == "0")
+        {
+            state::launch_background_engine();
+        }
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
@@ -249,11 +277,17 @@ pub fn run_app(config: UiConfig) {
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
             app_update::install_on_quit(cx);
+            // The background engine outlives this app: banners resume at
+            // once rather than after the last focus report goes stale.
+            let unfocus = quit_state.read(cx).viewport_closing();
             let shutdown =
                 quit_state.read(cx).engine().cloned().map(|handle| {
                     gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
                 });
             async move {
+                if let Some(unfocus) = unfocus {
+                    unfocus.await;
+                }
                 if let Some(task) = shutdown {
                     let _ = task.await;
                 }
@@ -276,6 +310,17 @@ pub fn run_app(config: UiConfig) {
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
+        // Switching keyboard layout moves the keys behind ⌘-shortcuts (AZERTY
+        // reaches ⌘1 as ⌘&): rebind against the new layout, then refresh the
+        // menu bar's snapshot of the keymap and redraw the hints that name
+        // those keys.
+        cx.on_keyboard_layout_change(|cx| {
+            let settings = settings::current(cx);
+            shell::apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
+            cx.set_menus(app_menus::app_menus());
+            cx.refresh_windows();
+        })
+        .detach();
         cx.activate(true);
     });
 }

@@ -154,14 +154,17 @@ APP_TARBALL="$OUT_DIR/$ARTIFACT_PREFIX-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
 BUILD_BIN="$(mktemp)"
-trap 'rm -f "$BUILD_BIN"' EXIT
-python3 scripts/local-cargo.py build --locked --release -p zeron --bin zeron --target-dir "$BUILD_DIR" \
-  --copy-binary release/zeron "$BUILD_BIN"
+ENGINE_BIN="$(mktemp)"
+trap 'rm -f "$BUILD_BIN" "$ENGINE_BIN"' EXIT
+python3 scripts/local-cargo.py build --locked --release -p zeron --bin zeron --bin zeron-engine --target-dir "$BUILD_DIR" \
+  --copy-binary release/zeron "$BUILD_BIN" \
+  --copy-binary release/zeron-engine "$ENGINE_BIN"
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$BUILD_BIN" "$APP/Contents/MacOS/comet"
-rm -f "$BUILD_BIN"
+install -m 755 "$ENGINE_BIN" "$APP/Contents/MacOS/Crew Engine"
+rm -f "$BUILD_BIN" "$ENGINE_BIN"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$APP/Contents/Info.plist"
@@ -198,12 +201,18 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/comet.icns"
 rm -rf "$ICONSET"
 
 # Sign inside-out rather than relying on --deep to repair nested signatures.
+ENGINE_SIGN_ARGS=(--identifier "$BUNDLE_ID.engine")
+if [[ "$SIGNING" == distribution ]]; then
+  ENGINE_REQUIREMENT="${APP_REQUIREMENT/\"$BUNDLE_ID\"/\"$BUNDLE_ID.engine\"}"
+  ENGINE_SIGN_ARGS+=(--requirements "=designated => $ENGINE_REQUIREMENT")
+fi
+codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/dist/macos/Zeron.entitlements" "${ENGINE_SIGN_ARGS[@]}" "$APP/Contents/MacOS/Crew Engine"
 codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/dist/macos/Zeron.entitlements" ${APP_SIGN_ARGS[@]+"${APP_SIGN_ARGS[@]}"} "$APP/Contents/MacOS/comet"
 codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/dist/macos/Zeron.entitlements" ${APP_SIGN_ARGS[@]+"${APP_SIGN_ARGS[@]}"} "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 NOTARY_DIR="$(mktemp -d)"
-trap 'rm -f "$BUILD_BIN"; rm -rf "$NOTARY_DIR"' EXIT
+trap 'rm -f "$BUILD_BIN" "$ENGINE_BIN"; rm -rf "$NOTARY_DIR"' EXIT
 notarize() {
   xcrun notarytool submit "$1" --keychain-profile "$NOTARYTOOL_KEYCHAIN_PROFILE" \
     ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} --wait --output-format json >"$NOTARY_DIR/result.json"

@@ -44,7 +44,6 @@ struct Binding {
     source_cwd: String,
     session_only: bool,
 }
-
 #[derive(Serialize, Deserialize)]
 struct NativeArtifact {
     archive_sha256: String,
@@ -900,4 +899,3 @@ mod tests {
         assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"untouched");
     }
 }
-

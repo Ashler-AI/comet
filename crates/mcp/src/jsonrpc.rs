@@ -38,19 +38,45 @@ Do not wait for one worker before launching the next independent worker. \
 Use `kind: chat` in `create_chat` or each `create_chats` request for a standalone \
 session visible in Sessions; it cannot have a parent. Use `kind: side` for a child \
 with an explicit parent or your origin chat. Omitted kind keeps legacy defaults: \
-side with an origin/parent, standalone otherwise. Side chats cannot create chats. \
+side with an origin/parent, standalone otherwise. \
 Discover hosts with `list_devices`, then `list_projects {device}`, \
 `list_harnesses {device}` and `list_models {device, harness}`. A project fixes \
 its host; with both project and device it must belong to that device. Use listed \
 ids when names/paths repeat. Without project or device, creation uses the local engine. \
 If a chat is `awaitingInput`, answer it with `respond_to_input`.\n\
 \n\
+Delegation is provider-agnostic: `list_harnesses` shows every provider, and \
+those marked `connected` can take work from you whichever provider you run \
+on (a claude-code agent may hand a task to codex, and the reverse). Pass \
+`harness` (and a model from `list_models`) to `create_chat` to choose one. \
+Delegation is one level deep: a chat that has a parent cannot create chats. \
+Pass `cloud: true` to run a child on a Cloud machine of its own (Codex or Claude Code); \
+from a Cloud chat it clones the same repository, and without `cloud` it shares your machine.\n\
+\n\
 When a chart, table, diagram, dashboard, or 3D view would say more than prose and \
 `show_visual` is available, write a Luau visual script and show it with `show_visual` before \
 your final reply. Zeron renders it with its own native interface and enforces its style: \
 content sits directly on the chat with no cards or boxed panels, text uses the interface font \
 and type scale, and colors are theme tokens that work on frosted glass or opaque, light or dark. \
-The reader sees the visual above that reply, so don't announce or restate it.";
+The reader sees the visual above that reply, so don't announce or restate it. To show the \
+reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
+draw images through `show_visual`.";
+
+/// Appended to [`INSTRUCTIONS`] when the host launched the agent without its
+/// own subagent tools ([`zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV`]).
+const SIDE_CHATS_ONLY: &str = "\n\n\
+Your own subagent tools are turned off in Zeron's settings: where you would start a \
+subagent, delegate through Zeron chats instead, with `create_chats` (or `create_chat`).";
+
+/// What `initialize` tells the agent, with the side-chat rule when its host
+/// turned the agent's own subagents off.
+fn instructions(side_chats_only: bool) -> std::borrow::Cow<'static, str> {
+    if side_chats_only {
+        format!("{INSTRUCTIONS}{SIDE_CHATS_ONLY}").into()
+    } else {
+        INSTRUCTIONS.into()
+    }
+}
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -163,7 +189,7 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                         "name": "zeron",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": INSTRUCTIONS,
+                    "instructions": instructions(tools.side_chats_only()),
                 }),
             )
         }
@@ -232,4 +258,17 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
         "id": id,
         "error": { "code": code, "message": message },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn side_chats_only_instructions_add_the_delegation_rule() {
+        assert_eq!(instructions(false), INSTRUCTIONS);
+        let side_chats = instructions(true);
+        assert!(side_chats.starts_with(INSTRUCTIONS));
+        assert!(side_chats.ends_with("with `create_chats` (or `create_chat`)."));
+    }
 }

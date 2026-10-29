@@ -77,13 +77,17 @@ fn setup(cx: &mut TestAppContext) -> (Entity<Shell>, &mut VisualTestContext) {
             let state = cx.new(|_| AppState::new());
             let mut shell = Shell::new(
                 state,
-                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                ipc_port: 0,
-                edge_url: "http://127.0.0.1:1".into(),
-                edge_token: None,
-                org_id: None,
-                workos_client_id: None,
-                default_harness: zeron_proto::HarnessId::Mock, },
+                EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
                 cx,
             );
             shell.settings.sidebar_organization = SidebarOrganization::InOneList;
@@ -587,20 +591,42 @@ fn pull_requests_from_a_chat_open_as_tabs_beside_the_focused_session(cx: &mut Te
             assert!(!shell.chat_pull_requests.contains_key(&id));
         });
     });
-    // Pull requests sent to the browser in Settings keep opening there.
+    // Pull requests sent to the default browser in Settings open there, even
+    // while other links open in Zeron.
     cx.update(|window, cx| {
         settings::update(SavePolicy::Immediate, cx, |settings| {
             settings.pull_request_destination = settings::PullRequestDestination::External;
-            // Keep the link out of an embedded browser, which a test can't host.
-            settings.open_web_links_in_zeron = false;
         });
+        assert!(settings::current(cx).open_web_links_in_zeron);
         shell.update(cx, |shell, cx| {
-            let before = shell.chat_pull_requests.len();
+            let before = (shell.chat_pull_requests.len(), shell.browsers.len());
             assert_eq!(
                 shell.activate_session_link(&link("https://github.com/e/f/pull/3"), window, cx),
                 LinkOutcome::External("https://github.com/e/f/pull/3".into())
             );
-            assert_eq!(shell.chat_pull_requests.len(), before);
+            assert_eq!(
+                (shell.chat_pull_requests.len(), shell.browsers.len()),
+                before
+            );
+        });
+    });
+    // With "Open links in Zeron" off, a pull request link leaves Zeron too,
+    // even with the pull request view selected.
+    cx.update(|window, cx| {
+        settings::update(SavePolicy::Immediate, cx, |settings| {
+            settings.pull_request_destination = settings::PullRequestDestination::Native;
+            settings.open_web_links_in_zeron = false;
+        });
+        shell.update(cx, |shell, cx| {
+            let before = (shell.chat_pull_requests.len(), shell.browsers.len());
+            assert_eq!(
+                shell.activate_session_link(&link("https://github.com/g/h/pull/4"), window, cx),
+                LinkOutcome::External("https://github.com/g/h/pull/4".into())
+            );
+            assert_eq!(
+                (shell.chat_pull_requests.len(), shell.browsers.len()),
+                before
+            );
         });
     });
 }

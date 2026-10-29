@@ -7,6 +7,19 @@ const MAX_MESSAGE = 1024 * 1024;
 type Attachment = { device: string; connection: string; connected: number; lastSeen: number; budgetAt: number; messages: number; authority?: SocketAuthority };
 type Service = Record<string, string | number | boolean>;
 
+/** Set only by the authenticated Worker route when a device is completing a
+ * provider sign-in. Direct callers cannot opt themselves into the higher cap. */
+export const PREVIEW_SIGN_IN_HEADER = "x-zeron-preview-sign-in";
+const DEVICE_LIMIT = 16;
+/** Provider callbacks have no relay fallback, so allow a bounded temporary
+ * signaling seat even when ordinary device presence filled the room. */
+const SIGN_IN_DEVICE_LIMIT = 64;
+
+/** A reconnect replaces its existing socket and never consumes another seat. */
+export function previewAdmits(connected: number, reconnecting: boolean, signIn: boolean): boolean {
+  return reconnecting || connected < (signIn ? SIGN_IN_DEVICE_LIMIT : DEVICE_LIMIT);
+}
+
 export function previewCatalog(value: unknown, device: string): Service[] | undefined {
   if (!Array.isArray(value) || value.length > 256) return;
   const ids = new Set<string>();
@@ -18,9 +31,11 @@ export function previewCatalog(value: unknown, device: string): Service[] | unde
     if (!strings.every(k => typeof s[k] === "string" && (s[k] as string).length <= (k === "cwd" || k === "projectCwd" ? 4096 : 128))) return;
     if (s.deviceId !== device || !ID.test(s.id as string) || ids.has(s.id as string) || !HOST.test(s.hostname as string)) return;
     if (!Number.isInteger(s.port) || (s.port as number) < 1 || (s.port as number) > 65535 || !Number.isSafeInteger(s.pid) || (s.pid as number) < 1 || !Number.isSafeInteger(s.startedAt) || (s.startedAt as number) < 0 || typeof s.zeronOwned !== "boolean") return;
+    if (s.chatId !== undefined && (typeof s.chatId !== "string" || s.chatId.length > 128)) return;
     ids.add(s.id as string);
     const clean: Service = {};
     for (const key of [...strings, "port", "pid", "startedAt", "zeronOwned"]) clean[key] = s[key] as string | number | boolean;
+    if (s.chatId !== undefined) clean.chatId = s.chatId as string;
     output.push(clean);
   }
   return output;
@@ -49,7 +64,8 @@ export class PreviewRoom {
     const device = new URL(request.url).searchParams.get("device") ?? "";
     if (!ID.test(device)) return new Response("Invalid device", { status: 400 });
     const existing = this.sockets().find(ws => this.info(ws).device === device);
-    if (!existing && this.sockets().length >= 16) return new Response("Device limit reached", { status: 429 });
+    const signIn = request.headers.get(PREVIEW_SIGN_IN_HEADER) === "1";
+    if (!previewAdmits(this.sockets().length, !!existing, signIn)) return new Response("Device limit reached", { status: 429 });
     if (existing) { existing.serializeAttachment({ ...this.info(existing), device: "" }); existing.close(1000, "Device reconnected"); }
     this.state.storage.sql.exec("DELETE FROM preview_catalog WHERE device = ?", device);
     const pair = new WebSocketPair();

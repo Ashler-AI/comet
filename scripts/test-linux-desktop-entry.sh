@@ -59,6 +59,7 @@ PKG="comet-$VERSION-linux-$(uname -m)"
 mkdir -p "$WORK/pkg/$PKG"
 printf '#!/bin/sh\nexit 0\n' >"$WORK/pkg/$PKG/comet"
 chmod 755 "$WORK/pkg/$PKG/comet"
+cp "$WORK/pkg/$PKG/comet" "$WORK/pkg/$PKG/zeron-engine"
 cp "$ROOT/dist/comet.desktop" "$WORK/pkg/$PKG/comet.desktop"
 printf 'not-really-a-png' >"$WORK/pkg/$PKG/comet.png"
 printf '<svg xmlns="http://www.w3.org/2000/svg"/>' >"$WORK/pkg/$PKG/comet.svg"
@@ -130,6 +131,7 @@ check() {
   grep -qxF "TryExec=$home/.crew/app/current/comet" "$entry" || fail "TryExec"
   grep -qxF "Icon=$home/.crew/app/current/comet.png" "$entry" || fail "Icon"
   grep -qxF "MimeType=x-scheme-handler/comet;" "$entry" || fail "scheme"
+  [ -x "$home/.crew/app/current/zeron-engine" ] || fail "background engine missing"
   [ -L "$home/.local/bin/comet" ] || fail "comet launcher missing"
   [ "$(readlink "$home/.local/bin/comet")" = "$home/.crew/app/current/comet" ] || fail "launcher target"
   cmp "$WORK/pkg/$PKG/comet" "$home/.local/bin/comet" || fail "executable differs"
@@ -254,3 +256,14 @@ grep -q 'Crew could not start' "$WORK/out.log" || fail "missing loader error"
 [ "$(readlink "$home/.crew/app/current")" = "$current" ] || fail "unloadable release changed current"
 [ -z "$(ls -A "$WORK/tmp")" ] || fail "failed install left files in TMPDIR"
 echo 'ok: release integrity and rollback'
+
+# An incomplete dual-binary release cannot replace a working installation.
+home="$WORK/tarball-a/home"
+current="$(readlink "$home/.crew/app/current")"
+mv "$WORK/pkg/$PKG/zeron-engine" "$WORK/engine-fixture"
+if env -i HOME="$home" PATH=/usr/bin:/bin bash "$WORK/pkg/$PKG/install.sh" >"$WORK/out.log" 2>&1; then
+  fail "installer accepted a release without its background engine"
+fi
+grep -q 'background engine is missing' "$WORK/out.log" || fail "missing background engine diagnostic"
+[ "$(readlink "$home/.crew/app/current")" = "$current" ] || fail "incomplete release changed current"
+mv "$WORK/engine-fixture" "$WORK/pkg/$PKG/zeron-engine"

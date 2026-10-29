@@ -28,7 +28,7 @@ use tokio::sync::watch;
 
 use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
 use zeron_proto::projectless;
-use zeron_proto::{Chat, ChatConfig, Device, Session, SidebarPreferencesState, Space};
+use zeron_proto::{Chat, ChatConfig, Device, HarnessId, Session, SidebarPreferencesState, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
@@ -195,6 +195,9 @@ struct WorkspaceHostInner {
     /// device's overlay back to its boot-time row `lastSeenAt` — an instant
     /// (and false) "offline" badge for a host that beat 20s ago.
     presence_seen: Mutex<std::collections::HashMap<String, i64>>,
+    /// Chats whose row this host claimed for a command that outran their
+    /// `createChat` ([`WorkspaceHost::claim_chat`]).
+    claimed: Mutex<std::collections::HashSet<String>>,
     /// Called with a device id whenever its presence heartbeat proves it alive —
     /// wired to `LinkCache::reset_cooldown` so a peer that comes back is dialed
     /// immediately instead of waiting out the failure backoff.
@@ -212,6 +215,18 @@ pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A chat row's stored harness-native session (see
+/// [`WorkspaceHost::chat_harness_session`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHarnessSession {
+    /// Empty = the "do not resume" tombstone.
+    pub session_id: String,
+    pub cwd: Option<String>,
+    /// The harness that minted `session_id`. `None` on rows that predate
+    /// the tag.
+    pub harness: Option<HarnessId>,
 }
 
 #[derive(Clone)]
@@ -352,6 +367,7 @@ impl WorkspaceHost {
                 room: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
+                claimed: Mutex::default(),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
@@ -690,6 +706,14 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.chat(chat_id))?)
     }
 
+    /// Whether `chat_id`'s parent is unknown here yet: this host claimed its
+    /// row for a command that arrived first ([`Self::claim_chat`]), and its
+    /// `createChat` hasn't landed ([`RegistryDoc::chat_parent_recorded`]).
+    pub fn parent_unknown(&self, chat_id: &str) -> bool {
+        lock(&self.inner.claimed).contains(chat_id)
+            && !self.read(|doc| doc.chat_parent_recorded(chat_id))
+    }
+
     pub(crate) fn acknowledged_chat(&self, id: &str) -> Option<zeron_doc::registry::RegistryRow> {
         self.read(|doc| doc.acknowledged_row(zeron_doc::registry::KIND_CHATS, id).cloned())
     }
@@ -859,6 +883,7 @@ impl WorkspaceHost {
             None => (None, None),
         };
         self.mutate(|doc| doc.claim_chat(chat_id, cwd.as_deref(), space_id.as_deref(), now));
+        lock(&self.inner.claimed).insert(chat_id.to_owned());
         Ok(())
     }
 
@@ -895,6 +920,7 @@ impl WorkspaceHost {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: Utc::now(),
         };
         self.mutate(|doc| doc.upsert_space(&space))?;
@@ -932,8 +958,15 @@ impl WorkspaceHost {
     /// of its latest run and the cwd it was created under. An empty `session_id`
     /// tombstones the row ("do not resume" after a rejected resume). Best-effort:
     /// a missing chat row (claim happens on first command) just returns.
-    pub fn set_chat_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
-        match self.mutate(|doc| doc.set_chat_harness_session(chat_id, session_id, cwd)) {
+    pub fn set_chat_harness_session(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        harness: Option<HarnessId>,
+    ) {
+        let slug = harness.map(HarnessId::as_str);
+        match self.mutate(|doc| doc.set_chat_harness_session(chat_id, session_id, cwd, slug)) {
             Ok(_) => {}
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry harness-session write failed");
@@ -941,15 +974,22 @@ impl WorkspaceHost {
         }
     }
 
-    /// The chat row's stored harness session `(session_id, cwd)`, if stamped.
-    /// The empty-string tombstone passes through — callers must treat it as
-    /// "explicitly no resume" (and must NOT fall back to older sources).
-    pub fn chat_harness_session(&self, chat_id: &str) -> Option<(String, Option<String>)> {
+    /// The chat row's stored harness session, if stamped. The empty-string
+    /// tombstone passes through — callers must treat it as "explicitly no
+    /// resume" (and must NOT fall back to older sources).
+    pub fn chat_harness_session(&self, chat_id: &str) -> Option<StoredHarnessSession> {
         match self.read(|doc| doc.chat(chat_id)) {
             Ok(chat) => {
                 let chat = chat?;
                 let id = chat.harness_session_id?;
-                Some((id, chat.harness_session_cwd))
+                Some(StoredHarnessSession {
+                    session_id: id,
+                    cwd: chat.harness_session_cwd,
+                    harness: chat
+                        .harness_session_harness
+                        .as_deref()
+                        .and_then(HarnessId::from_slug),
+                })
             }
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
@@ -1041,6 +1081,7 @@ impl WorkspaceHost {
                 last_message_at: None,
                 created_at: Utc::now(),
                 harness_session_id: None,
+                harness_session_harness: None,
                 // Born on chat2: a brand-new chat has an empty doc — nothing
                 // to seed, no migration race to lose. Only pre-existing chats
                 // go through the seed+flip path (the host migration sweep).
@@ -1101,6 +1142,7 @@ impl WorkspaceHost {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
+                github_repo: None,
                 created_at: Utc::now(),
             })
         })?;
@@ -1134,11 +1176,19 @@ impl WorkspaceHost {
         detected: bool,
         checkout_id: Option<&str>,
         repository_id: Option<&str>,
+        github_repo: Option<&str>,
     ) -> Result<bool, EngineError> {
         match self.read(|doc| doc.space(space_id))? {
             Some(space) if space.device_id == self.inner.config.device_id => {
                 Ok(self.mutate(|doc| {
-                    doc.set_space_git(space_id, detected, checkout_id, repository_id, Utc::now())
+                    doc.set_space_git(
+                        space_id,
+                        detected,
+                        checkout_id,
+                        repository_id,
+                        github_repo,
+                        Utc::now(),
+                    )
                 })?)
             }
             Some(space) => {
@@ -2193,6 +2243,8 @@ mod tests {
 
     fn running_session(at: chrono::DateTime<chrono::Utc>) -> zeron_proto::Session {
         zeron_proto::Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
             chat_id: "chat-1".into(),
             device_id: "test-device".into(),
             status: zeron_proto::SessionStatus::Working,

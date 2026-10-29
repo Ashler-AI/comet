@@ -53,7 +53,13 @@ fn mac_app_name() -> &'static str {
 }
 
 fn launchd_label() -> &'static str {
-    if staging_mac_app() { "ai.ashler.comet.staging" } else { "ai.ashler.comet" }
+    match option_env!("COMET_PACKAGE_ENVIRONMENT")
+        .or(option_env!("COMET_DEFAULT_ENVIRONMENT"))
+    {
+        Some("production") => "ai.ashler.comet",
+        Some("canary") => "ai.ashler.crew.upstream-canary",
+        _ => "ai.ashler.comet.staging",
+    }
 }
 
 /// The version compiled into this binary (the workspace version).
@@ -716,8 +722,11 @@ pub async fn stage_headless(
                 "--strip-components=1",
             ],
         )?;
-        if !unpacked.join("comet").is_file() {
+        if !is_executable_file(&unpacked.join("comet")) {
             bail!("tarball {file} did not contain a comet binary");
+        }
+        if !is_executable_file(&unpacked.join("zeron-engine")) {
+            bail!("tarball {file} did not contain the Crew background engine");
         }
         verify_staged_binary(&unpacked.join("comet"), version).await?;
         match std::fs::rename(&unpacked, &dest) {
@@ -790,6 +799,18 @@ fn same_payload(expected: &Path, cached: &Path) -> std::io::Result<bool> {
     }
 }
 
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Atomically repoint `app_root/current` at `app_root/<ver>` (symlink to a temp
 /// name, then rename over — never a window with no `current`).
 pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
@@ -798,7 +819,9 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let target = app_root.join(version);
-        if !target.join("comet").exists() {
+        if !is_executable_file(&target.join("comet"))
+            || !is_executable_file(&target.join("zeron-engine"))
+        {
             bail!("{} is not a staged install", target.display());
         }
         let tmp = app_root.join(format!(".current-{}", std::process::id()));
@@ -815,10 +838,34 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     }
 }
 
+type ManagedRestart = Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+static MANAGED_RESTART: std::sync::OnceLock<ManagedRestart> = std::sync::OnceLock::new();
+
+/// Register restart behavior for the desktop-owned background engine, which
+/// is not supervised by Crew's launchd/systemd daemon units.
+pub fn set_managed_restart(restart: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static) {
+    let _ = MANAGED_RESTART.set(Box::new(restart));
+}
+
+type ManagedRestartReady = Box<dyn Fn() -> bool + Send + Sync>;
+static MANAGED_RESTART_READY: std::sync::OnceLock<ManagedRestartReady> = std::sync::OnceLock::new();
+
+pub fn set_managed_restart_ready(ready: impl Fn() -> bool + Send + Sync + 'static) {
+    let _ = MANAGED_RESTART_READY.set(Box::new(ready));
+}
+
+fn managed_restart_ready() -> bool {
+    MANAGED_RESTART_READY.get().is_none_or(|ready| ready())
+}
+
 /// Whether this process is the engine service [`restart_service`] manages:
+/// either the desktop-owned engine, or systemd/launchd using Crew's identity.
 /// systemd places it in its Crew unit's cgroup; launchd names the job in
 /// `XPC_SERVICE_NAME`.
 pub fn running_as_installed_service() -> bool {
+    if MANAGED_RESTART.get().is_some() {
+        return true;
+    }
     if cfg!(target_os = "macos") {
         std::env::var("XPC_SERVICE_NAME").is_ok_and(|label| label == launchd_label())
     } else if cfg!(target_os = "linux") {
@@ -834,7 +881,16 @@ fn service_from_cgroup(cgroups: &str) -> Option<&str> {
         .lines()
         .filter_map(|line| line.rsplit(':').next())
         .flat_map(|path| path.split('/'))
-        .find(|part| matches!(*part, "comet-native-staging.service" | "comet-native.service"))
+        .find(|part| {
+            matches!(
+                *part,
+                "crew-upstream-canary.service"
+                    | "crew-staging.service"
+                    | "crew-production.service"
+                    | "comet-native-staging.service"
+                    | "comet-native.service"
+            )
+        })
 }
 
 /// Restart the installed engine service (the same units `comet daemon` and the
@@ -842,6 +898,9 @@ fn service_from_cgroup(cgroups: &str) -> Option<&str> {
 /// picks up the new binary. Only queues the restart: the caller may be the
 /// service itself, which must stay responsive to the stop signal that follows.
 pub fn restart_service() -> anyhow::Result<()> {
+    if let Some(restart) = MANAGED_RESTART.get() {
+        return restart();
+    }
     require_managed_update_platform()?;
     if cfg!(target_os = "macos") {
         let output = std::process::Command::new("id").arg("-u").output()?;
@@ -1505,7 +1564,12 @@ impl SupersededRestart {
         let Some(installed) = installed_version(&detect_install()) else {
             return;
         };
-        self.poll_installed(&installed, current_version(), quiescent, restart_service);
+        self.poll_installed(
+            &installed,
+            current_version(),
+            || quiescent() && managed_restart_ready(),
+            restart_service,
+        );
     }
 
     fn poll_installed(
@@ -1854,6 +1918,18 @@ mod tests {
         for ver in ["0.1.0", "0.1.1"] {
             std::fs::create_dir_all(app_root.join(ver)).unwrap();
             std::fs::write(app_root.join(ver).join("comet"), ver).unwrap();
+            std::fs::write(app_root.join(ver).join("zeron-engine"), ver).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                app_root.join(ver).join("comet"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                app_root.join(ver).join("zeron-engine"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
         }
         std::os::unix::fs::symlink(app_root.join("0.1.0"), app_root.join("current")).unwrap();
         apply_headless(&app_root, "0.1.1").unwrap();
@@ -1863,6 +1939,12 @@ mod tests {
         );
         // Unstaged version refuses.
         assert!(apply_headless(&app_root, "0.2.0").is_err());
+        std::fs::create_dir_all(app_root.join("0.2.0")).unwrap();
+        std::fs::write(app_root.join("0.2.0/comet"), b"main only").unwrap();
+        assert!(
+            apply_headless(&app_root, "0.2.0").is_err(),
+            "an update without the background engine must not activate"
+        );
     }
     #[test]
     fn schedule_is_wall_clock_with_failure_backoff() {
@@ -1924,6 +2006,16 @@ mod tests {
 
     #[test]
     fn systemd_service_cgroup_is_recognized() {
+        assert_eq!(
+            service_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/crew-staging.service\n"
+            ),
+            Some("crew-staging.service")
+        );
+        assert_eq!(
+            service_from_cgroup("0::/user.slice/user@1000.service/crew-production.service\n"),
+            Some("crew-production.service")
+        );
         assert_eq!(service_from_cgroup(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/comet-native-staging.service\n"
         ), Some("comet-native-staging.service"));
@@ -2042,6 +2134,8 @@ mod tests {
         std::fs::create_dir_all(payload.join("crew-web")).unwrap();
         std::fs::write(payload.join("comet"), b"#!/bin/sh\necho 'comet 9.9.9'\n").unwrap();
         std::fs::set_permissions(payload.join("comet"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(payload.join("zeron-engine"), b"#!/bin/sh\necho 'comet-engine 9.9.9'\n").unwrap();
+        std::fs::set_permissions(payload.join("zeron-engine"), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(payload.join("crew-web/server.mjs"), b"trusted web").unwrap();
         let archive = temp.path().join("release.tar.gz");
         run("tar", &["-czf", archive.to_str().unwrap(), "-C", temp.path().to_str().unwrap(), "payload"]).unwrap();

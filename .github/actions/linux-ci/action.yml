@@ -12,8 +12,8 @@ inputs:
     required: true
   save-rust-cache:
     description: >-
-      Whether this job may save the cache when it runs on main. Give it to
-      exactly one job per key. Pull requests never save.
+      Whether this job may save the cache on main or a manual verification
+      branch. Give it to exactly one job per key. Pull requests never save.
     default: 'false'
   apt-packages:
     description: apt packages to install (space separated). Nothing is installed when empty.
@@ -70,8 +70,16 @@ runs:
         prefix-key: ci-linux-v1
         shared-key: ${{ inputs.rust-cache }}
         add-job-id-key: false
-        save-if: ${{ inputs.save-rust-cache == 'true' && github.ref == 'refs/heads/main' }}
+        save-if: ${{ inputs.save-rust-cache == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
         cache-on-failure: true
+
+    # ort-sys emits a link path into ~/.cache/ort.pyke.io, outside the Rust
+    # target cache. Re-run its small build script so a fresh runner downloads
+    # and verifies that native archive instead of reusing a dangling link path.
+    - name: Refresh ONNX Runtime native linkage
+      if: inputs.rust-cache == 'ui'
+      shell: bash
+      run: cargo clean --package ort-sys
 
     # After the cache restore, so the checksum-verified binary is the one that
     # runs (rust-cache restores ~/.cargo/bin).

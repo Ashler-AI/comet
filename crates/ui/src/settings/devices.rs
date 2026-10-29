@@ -35,17 +35,25 @@ pub(crate) async fn wake_host(
     executor: &gpui::BackgroundExecutor,
     device: &zeron_proto::Device,
 ) -> Result<zeron_proto::Device, String> {
-    let request = engine.client().call_scoped(methods::WAKE_DEVICE, serde_json::json!({"deviceId": device.id}));
+    let request = engine.client().call_scoped(
+        methods::WAKE_DEVICE,
+        serde_json::json!({"deviceId": device.id}),
+    );
     let deadline = executor.timer(Duration::from_secs(180));
     futures::pin_mut!(request, deadline);
     let value = match futures::future::select(request, deadline).await {
         futures::future::Either::Left((result, _)) => result.map_err(|error| error.to_string())?,
-        futures::future::Either::Right(_) => return Err("Connection timed out. Your draft is preserved.".into()),
+        futures::future::Either::Right(_) => {
+            return Err("Connection timed out. Your draft is preserved.".into());
+        }
     };
     validate_wake_reply(device, value)
 }
 
-fn validate_wake_reply(expected: &zeron_proto::Device, value: serde_json::Value) -> Result<zeron_proto::Device, String> {
+fn validate_wake_reply(
+    expected: &zeron_proto::Device,
+    value: serde_json::Value,
+) -> Result<zeron_proto::Device, String> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Reply {
@@ -55,14 +63,19 @@ fn validate_wake_reply(expected: &zeron_proto::Device, value: serde_json::Value)
         device: zeron_proto::Device,
         ready: bool,
     }
-    let reply: Reply = serde_json::from_value(value).map_err(|error| format!("Invalid connection response: {error}"))?;
-    if !reply.ready || expected.devbox_binding().is_none()
-        || reply.device_id != expected.id || reply.device.id != expected.id
+    let reply: Reply = serde_json::from_value(value)
+        .map_err(|error| format!("Invalid connection response: {error}"))?;
+    if !reply.ready
+        || expected.devbox_binding().is_none()
+        || reply.device_id != expected.id
+        || reply.device.id != expected.id
         || Some(reply.devbox_provider) != expected.devbox_provider
         || Some(reply.devbox_id.as_str()) != expected.devbox_id.as_deref()
         || reply.device.devbox_binding() != expected.devbox_binding()
     {
-        return Err("The connected device does not match the selected host. Nothing was sent.".into());
+        return Err(
+            "The connected device does not match the selected host. Nothing was sent.".into(),
+        );
     }
     Ok(reply.device)
 }
@@ -137,12 +150,27 @@ impl DevicesPage {
     }
 
     fn wake_device(&mut self, device_id: &str, cx: &mut Context<Self>) {
-        if self.wake_task.is_some() { return; }
+        if self.wake_task.is_some() {
+            return;
+        }
         let state = self.state.read(cx);
-        let Some(device) = state.devices.iter().find(|device| device.id == device_id).cloned() else { return; };
+        let Some(device) = state
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .cloned()
+        else {
+            return;
+        };
         if state.local_device_id.as_deref() == Some(device_id)
-            || state.device_online(device_id, Utc::now()) || device.devbox_binding().is_none() { return; }
-        let Some(engine) = state.engine().cloned() else { return; };
+            || state.device_online(device_id, Utc::now())
+            || device.devbox_binding().is_none()
+        {
+            return;
+        }
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
         self.waking = Some(device.id.clone());
         self.error = None;
         self.wake_task = Some(cx.spawn(async move |this, cx| {
@@ -154,7 +182,8 @@ impl DevicesPage {
                     Ok(fresh) => page.state.update(cx, |state, cx| {
                         let mut devices = state.devices.clone();
                         if let Some(slot) = devices.iter_mut().find(|row| row.id == device.id)
-                            && slot.devbox_binding() == device.devbox_binding() {
+                            && slot.devbox_binding() == device.devbox_binding()
+                        {
                             *slot = fresh;
                             state.apply_devices(devices);
                             cx.notify();
@@ -163,7 +192,8 @@ impl DevicesPage {
                     Err(error) => page.error = Some(format!("Could not connect: {error}").into()),
                 }
                 cx.notify();
-            }).ok();
+            })
+            .ok();
         }));
         cx.notify();
     }
@@ -187,6 +217,11 @@ impl DevicesPage {
             _events: events,
         });
         cx.notify();
+    }
+
+    /// Whether a dialog [`Self::dismiss_on_escape`] would close is open.
+    pub(crate) fn has_escape_surface(&self) -> bool {
+        self.rename.is_some()
     }
 
     /// Escape that reached Settings unclaimed closes the rename dialog first,
@@ -421,16 +456,30 @@ impl Render for DevicesPage {
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .when(can_wake, |el| el.child(
-                            widgets::text_action(&theme, widgets::ActionTone::Filled, if is_waking { "Connecting…" } else { "Wake" })
+                        .when(can_wake, |el| {
+                            el.child(
+                                widgets::text_action(
+                                    &theme,
+                                    widgets::ActionTone::Filled,
+                                    if is_waking { "Connecting…" } else { "Wake" },
+                                )
                                 .id(("device-wake", ix))
                                 .tab_index(if wake_busy { -1 } else { 0 })
                                 .role(gpui::Role::Button)
                                 .aria_label(format!("Wake {}", device.name))
                                 .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                .when(wake_busy, |el| el.opacity(0.5).aria_description("Unavailable while a device is connecting"))
-                                .when(!wake_busy, |el| el.on_click(cx.listener(move |this, _, _, cx| this.wake_device(&wake_id, cx))))
-                        ))
+                                .when(wake_busy, |el| {
+                                    el.opacity(0.5).aria_description(
+                                        "Unavailable while a device is connecting",
+                                    )
+                                })
+                                .when(!wake_busy, |el| {
+                                    el.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.wake_device(&wake_id, cx)
+                                    }))
+                                }),
+                            )
+                        })
                         .child(
                             widgets::text_action(
                                 &theme,
@@ -539,11 +588,12 @@ mod tests {
     use chrono::TimeDelta;
 
     #[gpui::test]
-    fn stalled_wake_times_out_and_cancels_when_hidden_or_dropped(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn stalled_wake_times_out_and_cancels_when_hidden_or_dropped(cx: &mut gpui::TestAppContext) {
         use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
 
         struct CancelSignal(Arc<tokio::sync::Notify>);
         impl Drop for CancelSignal {
@@ -603,7 +653,9 @@ mod tests {
             assert!(page.error.as_ref().unwrap().contains("timed out"));
         });
         runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+                .await
+                .unwrap();
         });
 
         page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
@@ -616,7 +668,9 @@ mod tests {
         });
         cx.run_until_parked();
         runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+                .await
+                .unwrap();
         });
 
         page.update(cx, |page, cx| page.wake_device("remote".into(), cx));
@@ -624,17 +678,26 @@ mod tests {
         let released = Arc::new(AtomicUsize::new(0));
         page.update(cx, |_, cx| {
             let released = released.clone();
-            cx.on_release(move |_, _| { released.fetch_add(1, Ordering::SeqCst); }).detach();
+            cx.on_release(move |_, _| {
+                released.fetch_add(1, Ordering::SeqCst);
+            })
+            .detach();
         });
         drop(page);
         // Dropping Entity queues disposal; only an App update flushes the
         // deferred entity value (and its owned wake_task). Running the task
         // dispatcher alone leaves that task alive while waiting on Tokio.
         cx.update(|_| {});
-        assert_eq!(released.load(Ordering::SeqCst), 1, "the page must actually be disposed before awaiting server cancellation");
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "the page must actually be disposed before awaiting server cancellation"
+        );
         cx.run_until_parked();
         runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), cancelled.notified()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+                .await
+                .unwrap();
         });
         state.read_with(cx, |state, _| {
             assert!(state.devices[0].last_seen_at.is_none());
@@ -642,9 +705,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn wake_is_explicit_single_flight_and_requires_exact_ready_ids(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn wake_is_explicit_single_flight_and_requires_exact_ready_ids(cx: &mut gpui::TestAppContext) {
         use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
         use std::sync::{Arc, Mutex};
 
@@ -683,9 +744,13 @@ mod tests {
                     match attempt {
                         1 => response["deviceId"] = "other".into(),
                         2 => response["devboxId"] = "bx_abcdefgh".into(),
-                        3 => { response.as_object_mut().unwrap().remove("devboxId"); }
+                        3 => {
+                            response.as_object_mut().unwrap().remove("devboxId");
+                        }
                         4 => return Err(zeron_rpc::RpcError::Failed("Unavailable".into())),
-                        5 => { response.as_object_mut().unwrap().remove("device"); }
+                        5 => {
+                            response.as_object_mut().unwrap().remove("device");
+                        }
                         6 => response["device"]["id"] = "other".into(),
                         7 => response["device"]["devboxId"] = "bx_abcdefgh".into(),
                         8 => {}
@@ -775,14 +840,19 @@ mod tests {
             let device: zeron_proto::Device = serde_json::from_value(serde_json::json!({
                 "id": "remote", "name": "host", "platform": "linux",
                 "devboxProvider": provider, "devboxId": id,
-            })).unwrap();
+            }))
+            .unwrap();
             let reply = serde_json::json!({
                 "deviceId": "remote", "devboxProvider": provider, "devboxId": id,
                 "device": device, "ready": true,
             });
             assert!(validate_wake_reply(&device, reply.clone()).is_ok());
-            for (field, value) in [("ready", serde_json::json!(false)), ("deviceId", serde_json::json!("other")),
-                ("devboxId", serde_json::json!("other")), ("devboxProvider", serde_json::json!("unknown"))] {
+            for (field, value) in [
+                ("ready", serde_json::json!(false)),
+                ("deviceId", serde_json::json!("other")),
+                ("devboxId", serde_json::json!("other")),
+                ("devboxProvider", serde_json::json!("unknown")),
+            ] {
                 let mut wrong = reply.clone();
                 wrong[field] = value;
                 assert!(validate_wake_reply(&device, wrong).is_err());

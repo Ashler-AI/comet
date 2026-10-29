@@ -29,6 +29,7 @@ fn validate_team(team: Option<&str>) -> anyhow::Result<&str> {
 
 pub(super) struct Policy {
     requirement: String,
+    engine_requirement: String,
     compiled_requirement: Vec<u8>,
 }
 
@@ -43,9 +44,13 @@ impl Policy {
         let requirement = format!(
             "identifier \"{bundle_id}\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team}\""
         );
+        let engine_requirement = format!(
+            "identifier \"{bundle_id}.engine\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team}\""
+        );
         let compiled_requirement = compile_requirement(&requirement)?;
         Ok(Self {
             requirement,
+            engine_requirement,
             compiled_requirement,
         })
     }
@@ -53,6 +58,7 @@ impl Policy {
     pub(super) fn verify_distribution(&self, bundle: &Path) -> anyhow::Result<()> {
         verify_bundle_shape(bundle)?;
         self.verify_identity(bundle)?;
+        self.verify_engine_identity(bundle)?;
         let display = checked(
             Command::new("/usr/bin/codesign")
                 .args(["--display", "-r-"])
@@ -89,9 +95,19 @@ impl Policy {
         verify_signature(bundle, &self.requirement)
     }
 
+    fn verify_engine_identity(&self, bundle: &Path) -> anyhow::Result<()> {
+        verify_signature(
+            &bundle.join("Contents/MacOS/Crew Engine"),
+            &self.engine_requirement,
+        )
+    }
+
     pub(super) fn verify_installed(&self, bundle: &Path) -> anyhow::Result<()> {
         verify_bundle_shape(bundle)?;
-        let identity_error = match self.verify_identity(bundle) {
+        let identity_error = match self
+            .verify_identity(bundle)
+            .and_then(|_| self.verify_engine_identity(bundle))
+        {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
@@ -128,6 +144,9 @@ fn verify_bundle_shape(bundle: &Path) -> anyhow::Result<()> {
             .file_type()
             .is_file()
         || !std::fs::symlink_metadata(bundle.join("Contents/MacOS/comet"))?
+            .file_type()
+            .is_file()
+        || !std::fs::symlink_metadata(bundle.join("Contents/MacOS/Crew Engine"))?
             .file_type()
             .is_file()
     {
@@ -211,12 +230,35 @@ mod tests {
     }
 
     #[test]
+    fn bundle_shape_requires_the_background_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join(super::super::mac_app_name());
+        let macos = bundle.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>{}</string><key>CFBundleExecutable</key><string>comet</string></dict></plist>", bundle_id()),
+        )
+        .unwrap();
+        std::fs::write(macos.join("comet"), b"main").unwrap();
+        let error = verify_bundle_shape(&bundle).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::write(macos.join("Crew Engine"), b"engine").unwrap();
+        verify_bundle_shape(&bundle).unwrap();
+    }
+
+    #[test]
     fn intact_adhoc_bundle_cannot_be_a_distribution_or_authorize_migration() {
         let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join(super::super::mac_app_name());
         let binary = bundle.join("Contents/MacOS/comet");
+        let engine = bundle.join("Contents/MacOS/Crew Engine");
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         std::fs::copy("/usr/bin/true", &binary).unwrap();
+        std::fs::copy("/usr/bin/true", &engine).unwrap();
         std::fs::write(
             bundle.join("Contents/Info.plist"),
             format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>{}</string><key>CFBundleExecutable</key><string>comet</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>", bundle_id()),
@@ -225,6 +267,13 @@ mod tests {
         let resource = bundle.join("Contents/Resources/sealed.txt");
         std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
         std::fs::write(&resource, b"original").unwrap();
+        checked(
+            Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-", "--identifier"])
+                .arg(format!("{}.engine", bundle_id()))
+                .arg(&engine),
+        )
+        .unwrap();
         checked(
             Command::new("/usr/bin/codesign")
                 .args(["--force", "--sign", "-", "--identifier", bundle_id()])

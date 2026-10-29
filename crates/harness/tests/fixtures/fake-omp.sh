@@ -183,11 +183,6 @@ while IFS= read -r line; do
       printf '%s\n' '{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"read","args":{"path":"README.md"},"intent":"Read file"}'
       printf '%s\n' '{"type":"tool_execution_end","toolCallId":"tool-1","toolName":"read","isError":false,"result":{"content":[{"type":"text","text":"# README"}],"details":{}}}'
       finish_turn
-      if has "$line" 'scenario:autonomous'; then
-        printf '%s\n' '{"type":"agent_start"}'
-        printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"autonomous reply"}}'
-        finish_turn
-      fi
       ;;
     abort)
       [ -z "${OMP_HANG_ABORT:-}" ] || continue

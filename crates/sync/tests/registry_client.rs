@@ -44,6 +44,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
     last_message_at: None,
     created_at: ts(2_000),
     harness_session_id: None,
+    harness_session_harness: None,
     harness_session_cwd: None,
     parent_chat_id: None,
     space_id: None,
@@ -116,6 +117,8 @@ async fn two_clients_converge_and_stream_live_updates() {
         let mut doc = doc_a.lock().unwrap();
         doc.upsert_session(&Session {
             last_completed_turn: None,
+            last_turn_outcome: None,
+            terminal_activity: None,
             running_subagents: 0,
             chat_id: "chat-1".into(),
             device_id: "dev-a".into(),
@@ -521,6 +524,8 @@ async fn churn_stays_bounded_no_history_growth() {
             let mut d = doc.lock().unwrap();
             d.upsert_session(&Session {
                 last_completed_turn: None,
+                last_turn_outcome: None,
+                terminal_activity: None,
                 running_subagents: 0,
                 chat_id: "chat-1".into(),
                 device_id: "dev-a".into(),

@@ -1803,6 +1803,12 @@ impl Changes {
         changes
     }
 
+    pub fn for_branch(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.scope = DiffScope::Branch;
+        changes
+    }
+
     /// A dedicated History surface. It shares the commit-opening event path
     /// with diffs, but is never offered as an item in a Diff tab's scope menu.
     pub fn for_history(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -6115,24 +6121,28 @@ rename to new_name.rs
     }
 
     fn chat(checkout: Option<&str>, device: &str, cwd: Option<&str>) -> Chat {
-        Chat { crew: None, id: "c1".into(),
-        device_id: device.into(),
-        title: None,
-        archived: false,
-        cwd: cwd.map(Into::into),
-        branch: None,
-        checkout_id: checkout.map(Into::into),
-        source_context: None,
-        config: None,
-        last_message_preview: None,
-        last_message_at: None,
-        created_at: Utc::now(),
-        harness_session_id: None,
-        harness_session_cwd: None,
-        parent_chat_id: None,
-        space_id: None,
-        last_seen_at: None,
-        room_gen: None, }
+        Chat {
+            crew: None,
+            harness_session_harness: None,
+            id: "c1".into(),
+            device_id: device.into(),
+            title: None,
+            archived: false,
+            cwd: cwd.map(Into::into),
+            branch: None,
+            checkout_id: checkout.map(Into::into),
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
     }
 
     #[test]

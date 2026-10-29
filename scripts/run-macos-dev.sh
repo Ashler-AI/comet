@@ -8,7 +8,7 @@ export ASHLER_INCREMENTAL_TSC_CHECKS=false
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
-DEV_ROOT="$ROOT/target/macos-dev"
+DEV_ROOT="${COMET_DEV_ROOT:-$ROOT/target/macos-dev}"
 APP="$DEV_ROOT/Crew Canary Dev.app"
 CONTENTS="$APP/Contents"
 DATA_DIR="${COMET_DEV_DATA_DIR:-$DEV_ROOT/data}"
@@ -19,13 +19,24 @@ if pgrep -f -x "$CONTENTS/MacOS/comet" >/dev/null 2>&1; then
   echo "Crew Canary Dev is already running. Quit it before rebuilding the signed bundle." >&2
   exit 1
 fi
+# A development engine may still own a profile after its viewport exits.
+ENGINE="$CONTENTS/MacOS/Crew Engine"
+if pgrep -f -x "$ENGINE" >/dev/null 2>&1; then
+  echo "This development bundle's engine is running; choose a separate build directory." >&2
+  exit 1
+fi
 
 cd "$ROOT"
-cargo build --locked -p zeron
+SNAPSHOT="$(mktemp -d)"
+trap 'rm -rf "$SNAPSHOT"' EXIT
+python3 scripts/local-cargo.py build --locked -p zeron \
+  --copy-binary debug/zeron "$SNAPSHOT/comet" \
+  --copy-binary debug/zeron-engine "$SNAPSHOT/engine"
 
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$DATA_DIR"
-TARGET_DIR="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
-install -m 755 "$TARGET_DIR/debug/zeron" "$CONTENTS/MacOS/comet"
+install -m 755 "$SNAPSHOT/comet" "$CONTENTS/MacOS/comet"
+install -m 755 "$SNAPSHOT/engine" "$ENGINE"
+
 sed "s/__VERSION__/$VERSION/g" "$ROOT/dist/macos/Info-dev.plist" >"$CONTENTS/Info.plist"
 plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$CONTENTS/Info.plist"
 plutil -replace LSEnvironment.COMET_DATA_DIR -string "$DATA_DIR" "$CONTENTS/Info.plist"
@@ -33,6 +44,12 @@ plutil -replace LSEnvironment.COMET_IPC_PORT -string "$IPC_PORT" "$CONTENTS/Info
 if [[ -n "${CODEX_EXECUTABLE:-}" ]]; then
   plutil -insert LSEnvironment.CODEX_EXECUTABLE -string "$CODEX_EXECUTABLE" "$CONTENTS/Info.plist"
 fi
+# Isolated development coordinates follow Crew's runtime resolver.
+for var in COMET_EDGE_URL COMET_SCAFFOLD_URL COMET_PROJECT_SCOPE COMET_DEPLOYMENT_ID; do
+  if [[ -n "${!var:-}" ]]; then
+    plutil -insert "LSEnvironment.$var" -string "${!var}" "$CONTENTS/Info.plist"
+  fi
+done
 
 mkdir -p "$CONTENTS/Resources/licenses"
 cp "$ROOT/crates/voice/NOTICE.md" "$CONTENTS/Resources/licenses"/parakeet-v3.txt
@@ -55,9 +72,12 @@ IDENTITY="${COMET_DEV_CODESIGN_IDENTITY:-}"
 if [[ -z "$IDENTITY" ]]; then
   IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -1)"
 fi
+# Inside out: the engine first, then the bundle that seals it.
 if [[ -n "$IDENTITY" ]]; then
+  codesign --entitlements "$ROOT/dist/macos/Zeron.entitlements" --force --sign "$IDENTITY" --identifier "$BUNDLE_ID.engine" "$ENGINE"
   codesign --entitlements "$ROOT/dist/macos/Zeron.entitlements" --force --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 else
+  codesign --entitlements "$ROOT/dist/macos/Zeron.entitlements" --force --sign - --identifier "$BUNDLE_ID.engine" "$ENGINE"
   codesign --entitlements "$ROOT/dist/macos/Zeron.entitlements" --force --sign - --identifier "$BUNDLE_ID" "$APP"
   echo "warning: no Apple Development signing identity found; macOS may ask for permissions again after a rebuild" >&2
 fi
@@ -80,6 +100,11 @@ OPEN_ENV=(
 if [[ -n "${CODEX_EXECUTABLE:-}" ]]; then
   OPEN_ENV+=(--env "CODEX_EXECUTABLE=$CODEX_EXECUTABLE")
 fi
+for var in ZERON_EDGE_URL ZERON_WORKOS_CLIENT_ID ZERON_CALLBACK_PORT; do
+  if [[ -n "${!var:-}" ]]; then
+    OPEN_ENV+=(--env "$var=${!var}")
+  fi
+done
 if [[ -n "${ZERON_OPEN_ROUTE:-}" ]]; then
   OPEN_ENV+=(--env "ZERON_OPEN_ROUTE=$ZERON_OPEN_ROUTE")
 fi

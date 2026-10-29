@@ -157,7 +157,7 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
 pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
     let auth = Engine::build_auth(&config).await;
     let next_scope = Engine::initial_workspace_scope(&auth);
-    let scope = live_engine_scope(config.ipc_port)
+    let scope = live_engine_scope(config.ipc_port, &config.data_dir)
         .await
         .unwrap_or(next_scope);
     let account = account_status(scope, &auth.state());
@@ -189,8 +189,8 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
 /// Prefer the immutable scope of a live runtime. Falling back to the next-boot
 /// derivation is correct when no engine is listening and tolerant of old
 /// daemons that predate EngineInfo.
-async fn live_engine_scope(ipc_port: u16) -> Option<WorkspaceScope> {
-    let client = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+async fn live_engine_scope(ipc_port: u16, data_dir: &std::path::Path) -> Option<WorkspaceScope> {
+    let client = zeron_rpc::connect_ipc(ipc_port, Some(data_dir))
         .await
         .ok()?;
     let value = client

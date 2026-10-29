@@ -23,7 +23,10 @@ pub type UnknownFields = BTreeMap<String, serde_json::Value>;
 /// This name is not ownership evidence; importers must verify provenance separately.
 pub fn is_local_history_chat(chat_id: &str) -> bool {
     chat_id.strip_prefix("local-chat-").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     })
 }
 
@@ -37,9 +40,12 @@ pub fn is_cloud_session_id(chat_id: &str) -> bool {
 /// Chat2 also carries native subagent documents, not just public session UUIDs.
 /// Match its route alphabet while keeping imported histories strictly local.
 pub fn chat_allows_sync(chat_id: &str) -> bool {
-    !chat_id.is_empty() && chat_id.len() <= 128
+    !chat_id.is_empty()
+        && chat_id.len() <= 128
         && !chat_id.starts_with("local-chat-")
-        && chat_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        && chat_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 /// Immutable provenance for an extinct imported execution epoch, not retirement
@@ -75,15 +81,18 @@ pub struct CrewChatMetadata {
 
 impl CrewChatMetadata {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.owner_subject.trim().is_empty() || self.owner_subject.len() > 512
+        if self.owner_subject.trim().is_empty()
+            || self.owner_subject.len() > 512
             || self.scope.project_id.trim().is_empty()
-            || self.session_id.trim().is_empty() || self.session_id.len() > 256
+            || self.session_id.trim().is_empty()
+            || self.session_id.len() > 256
             || self.scope.session_id.as_deref() != Some(self.session_id.as_str())
         {
             return Err("Crew identity requires an owner and exact session scope");
         }
         if let Some(environment) = &self.environment {
-            if environment.owner_principal != self.owner_subject || environment.scope != self.scope {
+            if environment.owner_principal != self.owner_subject || environment.scope != self.scope
+            {
                 return Err("Crew environment identity differs from chat identity");
             }
         }
@@ -91,22 +100,38 @@ impl CrewChatMetadata {
             route.validate()?;
         }
         if let Some(history) = &self.original_epoch_history {
-            if history.sandbox_id.is_empty() || history.source_device_id.is_empty()
+            if history.sandbox_id.is_empty()
+                || history.source_device_id.is_empty()
                 || history.lifecycle_epoch == 0
                 || history.coordinator_lifecycle_epoch < history.lifecycle_epoch
                 || !matches!(history.original_status.as_str(), "stopped" | "failed")
-                || history.native_session_id.as_deref().is_some_and(str::is_empty)
+                || history
+                    .native_session_id
+                    .as_deref()
+                    .is_some_and(str::is_empty)
                 || history.source_evidence_sha256.len() != 64
-                || !history.source_evidence_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            { return Err("Original epoch history requires its exact inventoried source evidence"); }
+                || !history
+                    .source_evidence_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(
+                    "Original epoch history requires its exact inventoried source evidence",
+                );
+            }
         }
         Ok(())
     }
 
     /// A verified project user may access their own sessions. A session-bound
     /// principal needs an explicit, live capability grant even when owner-named.
-    pub fn permits(&self, principal: &CollaborationPrincipal, grant: Option<&CapabilityGrant>,
-        capability: &str, now: i64) -> bool {
+    pub fn permits(
+        &self,
+        principal: &CollaborationPrincipal,
+        grant: Option<&CapabilityGrant>,
+        capability: &str,
+        now: i64,
+    ) -> bool {
         if self.validate().is_err()
             || principal.project_id != self.scope.project_id
             || principal.deployment_id != self.scope.deployment_id
@@ -117,7 +142,9 @@ impl CrewChatMetadata {
         if principal.session_id.is_none() && principal.subject == self.owner_subject {
             return true;
         }
-        grant.is_some_and(|grant| grant.scope == self.scope && grant.permits(principal, capability, now))
+        grant.is_some_and(|grant| {
+            grant.scope == self.scope && grant.permits(principal, capability, now)
+        })
     }
 }
 
@@ -126,9 +153,19 @@ impl CrewChatMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "camelCase")]
 pub enum AnnotationCommand {
-    Create { id: String, body: String, anchor: SemanticAnchor },
-    Edit { id: String, body: String },
-    Resolve { id: String, resolved: bool },
+    Create {
+        id: String,
+        body: String,
+        anchor: SemanticAnchor,
+    },
+    Edit {
+        id: String,
+        body: String,
+    },
+    Resolve {
+        id: String,
+        resolved: bool,
+    },
 }
 
 /// Verified internal identity and its explicit control-plane scope.
@@ -285,12 +322,16 @@ impl CrewSessionLink {
     fn decode_identifier(encoded: &str) -> Option<String> {
         let bytes = encoded.as_bytes();
         if bytes.iter().enumerate().any(|(index, byte)| {
-            *byte == b'%' && !bytes.get(index + 1..index + 3)
-                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
+            *byte == b'%'
+                && !bytes
+                    .get(index + 1..index + 3)
+                    .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit))
         }) {
             return None;
         }
-        let decoded = percent_encoding::percent_decode_str(encoded).decode_utf8().ok()?;
+        let decoded = percent_encoding::percent_decode_str(encoded)
+            .decode_utf8()
+            .ok()?;
         (!decoded.trim().is_empty() && decoded.len() <= 256 && !decoded.contains('\0'))
             .then(|| decoded.into_owned())
     }
@@ -1231,8 +1272,13 @@ mod tests {
         assert_eq!(value["scope"]["sessionId"], "session-a");
         let mut legacy = value;
         legacy.as_object_mut().unwrap().remove("sessionOnly");
-        assert!(matches!(serde_json::from_value::<ScaffoldEnvironmentControl>(legacy).unwrap(),
-            ScaffoldEnvironmentControl::HandoffOmpSession { session_only: false, .. }));
+        assert!(matches!(
+            serde_json::from_value::<ScaffoldEnvironmentControl>(legacy).unwrap(),
+            ScaffoldEnvironmentControl::HandoffOmpSession {
+                session_only: false,
+                ..
+            }
+        ));
     }
     #[test]
     fn agent_route_update_control_uses_camel_case_wire_shape() {
@@ -1407,15 +1453,36 @@ mod tests {
         ).unwrap();
         assert_eq!(scoped.project_id, "project/a");
         assert_eq!(scoped.deployment_id.as_deref(), Some("deploy é"));
-        for suffix in ["/extra", "?token=secret", "#fragment", "%2Fother", "?deploymentId=", "?deploymentId=a&deploymentId=b", "?deploymentId=%FF", "?deploymentId=%zz"] {
-            assert!(super::CrewSessionLink::parse_deep_link(
-                &format!("{base}{suffix}"), "comet-staging",
-            ).is_none());
+        for suffix in [
+            "/extra",
+            "?token=secret",
+            "#fragment",
+            "%2Fother",
+            "?deploymentId=",
+            "?deploymentId=a&deploymentId=b",
+            "?deploymentId=%FF",
+            "?deploymentId=%zz",
+        ] {
+            assert!(
+                super::CrewSessionLink::parse_deep_link(
+                    &format!("{base}{suffix}"),
+                    "comet-staging",
+                )
+                .is_none()
+            );
         }
-        for path in ["/011664b5-3660-4fe6-83a2-3647fa6a2f65", "project/not-a-uuid", "project%00a/011664b5-3660-4fe6-83a2-3647fa6a2f65"] {
-            assert!(super::CrewSessionLink::parse_deep_link(
-                &format!("comet-staging://session/{path}"), "comet-staging",
-            ).is_none());
+        for path in [
+            "/011664b5-3660-4fe6-83a2-3647fa6a2f65",
+            "project/not-a-uuid",
+            "project%00a/011664b5-3660-4fe6-83a2-3647fa6a2f65",
+        ] {
+            assert!(
+                super::CrewSessionLink::parse_deep_link(
+                    &format!("comet-staging://session/{path}"),
+                    "comet-staging",
+                )
+                .is_none()
+            );
         }
     }
 

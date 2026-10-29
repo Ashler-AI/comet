@@ -84,36 +84,9 @@ Before presenting login URLs, verify the required local ports are free. Credenti
 
 Use the selected provider's forwarding commands for all four mappings. Keep the setup-scoped forwards alive through authentication and endpoint checks, then stop them **before an ordinary Crew turn**. Never expose Tilt, callbacks, or browser CDP through public hosting. The coding session travels over Crew's relay, not these tunnels.
 
-Run `~/.local/bin/crew-devbox-$CHANNEL login` on the host; open its actual printed authorization URL locally and let the fixed forwarded callback complete login. For gcloud, use `~/.local/bin/crew-devbox-gcloud-login` and the `8085` forward. Do not use remote bootstrap, `--no-browser`, or copied credentials. Inspect a pending login before retrying; duplicate flows can select `8086` and strand the callback. Infisical keeps its supported interactive login; GitHub uses the owner credential below instead of another browser approval.
+Run `~/.local/bin/crew-devbox-$CHANNEL login` on the host; open its actual printed authorization URL locally and let the fixed forwarded callback complete login. For gcloud, use `~/.local/bin/crew-devbox-gcloud-login` and the `8085` forward. Do not use remote bootstrap, `--no-browser`, or copied credentials. Inspect a pending login before retrying; duplicate flows can select `8086` and strand the callback. GitHub and Infisical use their supported interactive/device flows.
 
 Start the host with `~/.local/bin/crew-devbox-autostart "$CHANNEL"`. Namespace retains its dedicated self-respawning tmux server and declared `.bashrc` boot hook. Boat uses one guarded, channel-qualified `crew-devbox-$CHANNEL.service` running the native `headless` command with explicit coordinates and linger; do not run native `daemon install` over another channel's service. The immutable binary digest is rechecked before every service start. An occupied IPC port is accepted only for the expected owned process: its kernel executable image must match pinned SHA-256, size, owner and mode, and that PID must own the LISTEN socket inode. Cold-restore relocation is permitted; a matching pathname is never authority. Boat imports current verified `BOAT_ID` into the service manager, never a snapshotted unit file. If native identity is unavailable at OS boot, startup fails closed until an explicit trusted Crew wake supplies it. Already-active owned engines are not restarted. Only an already-enabled existing `ashler-localdev.service` is resumed; this does not prove app/Tilt readiness.
-
-## GitHub from Infisical
-
-After signing into Infisical on the devbox, reuse Scaffold's existing owner PAT from project `platform`, environment `platform`, path `/services/scaffold/user-github-pats`. This canonical owner store applies to both Crew channels; do not substitute the staging service's credential store. Resolve the owner email from authenticated Crew/Infisical identity, not a machine name, and the expected `OWNER_GITHUB_LOGIN` from the owner identity established above.
-
-Derive `GITHUB_PAT_KEY` with Scaffold's `githubPatEnvironmentName` convention: remove any `+tag` from the email local part, uppercase the email, replace runs of non-ASCII-alphanumeric characters with `_`, trim surrounding `_`, and prefix `GITHUB_PAT_`. Resolve `PLATFORM_PROJECT_ID` from the platform checkout's `.infisical.json` or authenticated project metadata. Fetch only that owner's key, never the PAT bundle, another owner's PAT, or a GitHub App private key. Missing, invalid, or mismatched credentials stop setup; do not silently select a shared fallback. The selected credential must have the GitHub CLI scopes plus `repo` and `workflow` for normal repository/workflow changes.
-
-Run on the devbox, without tracing or printing the credential:
-
-```bash
-(
-  set +x
-  set -euo pipefail
-  token="$(infisical secrets get "$GITHUB_PAT_KEY" \
-    --projectId "$PLATFORM_PROJECT_ID" --env=platform \
-    --path=/services/scaffold/user-github-pats \
-    --plain --silent --secret-overriding=false)"
-  [[ -n "$token" ]] || { echo 'Owner GitHub credential is missing from Infisical.' >&2; exit 1; }
-  [[ "$(GH_TOKEN="$token" gh api --hostname github.com user --jq .login)" == "$OWNER_GITHUB_LOGIN" ]] || \
-    { echo 'GitHub credential does not match the devbox owner.' >&2; exit 1; }
-  printf '%s\n' "$token" | env -u GH_TOKEN -u GITHUB_TOKEN \
-    gh auth login --hostname github.com --git-protocol https --with-token
-  env -u GH_TOKEN -u GITHUB_TOKEN gh auth setup-git --hostname github.com
-)
-```
-
-Verify `gh api --hostname github.com user` and an authenticated `git ls-remote` for the requested repository, and confirm any file-backed `gh` credential is owner-only (`0600`). Keep the owner's Git author identity. Re-run this setup after central token rotation; do not bake authenticated profiles into templates or add a second credential service. This uses existing Infisical/GitHub CLIs and does not replace the pinned Crew runtime.
 
 ## Work and sleep
 
@@ -128,8 +101,6 @@ The matching native controller's explicit Wake or pending send must boot only th
 ## Ashler runtime and proof
 
 Read the checkout's `docs/agents/localdev.md` and `infra/localdev/README.md`; use maintained Linux installation paths for Docker, kubectl, kind, ctlptl, Tilt, just, gcloud and Infisical. Follow `just bootstrap`, `just env`, and `just dev`, not a competing stack. Retain the maintained Next.js binding (`0.0.0.0` by default): Docker/kind must reach `http://host.docker.internal:3000` for callbacks. Deny public inbound app traffic through provider private access or the host firewall while allowing required Docker bridge traffic. Keep Tilt/CDP and credential callbacks loopback-only; never publish them through provider hosting. Keep `ASHLER_INCREMENTAL_TSC_CHECKS=false`; never run local typechecks.
-
-Before starting the Linux kind stack, check `fs.inotify.max_user_instances`. Kind containers share host-UID quotas: a full stack can exhaust the default 128 instances. If below 1024, persist `fs.inotify.max_user_instances = 1024` in `/etc/sysctl.d/60-ashler-localdev-inotify.conf` and apply that file with `sudo sysctl -p`. Retain higher existing values; do not raise watch-count or heap limits without evidence.
 
 Seed only the confirmed host-local database. After stop/resume, verify app and Tilt separately from Crew readiness. Use maintained local recovery instructions for stale kind networking; never reset, migrate or reseed data merely to make wake pass, and never apply local recovery to shared databases. This skill does not select or promise datastore persistence.
 

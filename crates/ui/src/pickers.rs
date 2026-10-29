@@ -25,7 +25,7 @@ use gpui::{
 
 use zeron_engine::registry::{HarnessDescriptor, TitleSettings};
 use zeron_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    AccessMode, ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
     ScaffoldDatabaseEnvironment, Space,
 };
 use zeron_rpc::methods;
@@ -152,6 +152,8 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    pub access: AccessMode,
+    pub plan: bool,
 }
 
 impl ResolvedRunConfig {
@@ -163,6 +165,8 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            access: self.access,
+            plan: self.plan,
         })
     }
 }
@@ -333,7 +337,8 @@ fn windows_browser_path(path: &str) -> Option<WindowsBrowserPath<'_>> {
     })
 }
 
-fn is_windows_path(path: &str) -> bool {
+/// Drive- or UNC-rooted: separators are backslashes.
+pub fn is_windows_path(path: &str) -> bool {
     windows_browser_path(path).is_some()
 }
 
@@ -539,6 +544,136 @@ pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
     None
 }
 
+/// A path as typed or pasted into the new-project path field: surrounding
+/// whitespace and one pair of matching quotes dropped, and shell escapes
+/// (`My\ Folder`, from a folder dragged into a terminal) undone — except on
+/// a `windows` device, whose backslashes are separators.
+pub fn clean_typed_path(text: &str, windows: bool) -> String {
+    let text = text.trim();
+    let text = ['"', '\'']
+        .iter()
+        .find_map(|quote| text.strip_prefix(*quote)?.strip_suffix(*quote))
+        .unwrap_or(text);
+    unescape_typed_path(text, windows)
+}
+
+/// Shell escapes undone (`My\ Folder` → `My Folder`, `\\` → `\`), except
+/// on a `windows` device, whose backslashes are separators.
+pub fn unescape_typed_path(text: &str, windows: bool) -> String {
+    if windows || is_windows_path(text) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => out.push(chars.next().unwrap_or('\\')),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// A path or folder name as the path field writes it: on POSIX a literal
+/// `\` is doubled, so [`unescape_typed_path`] gives it back.
+pub fn escape_typed_path(text: &str, windows: bool) -> String {
+    if windows || is_windows_path(text) {
+        text.to_owned()
+    } else {
+        text.replace('\\', r"\\")
+    }
+}
+
+/// `~` or `~/…`: the device's home, or a path under it.
+pub fn is_home_relative(text: &str) -> bool {
+    text == "~" || text.starts_with("~/") || text.starts_with(r"~\")
+}
+
+/// Lexically resolve `.`, `..` and repeated separators in an absolute
+/// browser path. The device lists whatever spelling it is sent, so a typed
+/// `~/code/../notes` would otherwise open (and add) a project with `..` in
+/// its path. `..` stops at the root; extended (`\\?\`) paths are verbatim by
+/// definition and stay as they are.
+pub fn normalize_browser_path(path: &str) -> String {
+    fn segments<'a>(rest: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+        let mut kept = Vec::new();
+        for segment in rest {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    kept.pop();
+                }
+                segment => kept.push(segment),
+            }
+        }
+        kept
+    }
+    if let Some(windows) = windows_browser_path(path) {
+        if windows.extended {
+            return path.to_owned();
+        }
+        let rest = segments(windows.rest.split(|ch| windows.is_separator(ch)));
+        return format!("{}{}", windows.root_path(), rest.join("\\"));
+    }
+    format!("/{}", segments(path.split('/')).join("/"))
+}
+
+/// Where a path typed in the new-project path field points, absolute and
+/// normalized: `~` and `~/x` under the device's `home`, absolute and
+/// drive-rooted paths as typed, anything else relative to `base` (the open
+/// folder) — `../site`, `src`. On a `windows` device (or one whose paths
+/// say so) `/` is `\`, `\code` is on the open folder's drive and `D:code`
+/// at that drive's root. `None` when that takes a `home` or `base` not
+/// known yet.
+pub fn resolve_typed_path(
+    text: &str,
+    base: Option<&str>,
+    home: Option<&str>,
+    windows: bool,
+) -> Option<String> {
+    let windows = windows || base.or(home).is_some_and(is_windows_path);
+    let mut text = clean_typed_path(text, windows);
+    if windows {
+        // `//nas/share` is a share, `/code` a drive's root.
+        text = text.replace('/', r"\");
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let drive_relative = |text: &str| {
+        let bytes = text.as_bytes();
+        bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    };
+    let target = match typed_path_target(&text, home) {
+        Some(target) => target,
+        None if is_home_relative(&text) => return None,
+        None if windows && text.starts_with('\\') => {
+            let root = windows_browser_path(base?)?.root_path();
+            child_path(&root, text.trim_start_matches('\\'))
+        }
+        None if windows && drive_relative(&text) => format!(r"{}\{}", &text[..2], &text[2..]),
+        None => child_path(base?, &text),
+    };
+    Some(normalize_browser_path(&target))
+}
+
+/// A typed path split at its last separator: the folder part as typed
+/// (separator included, empty for a bare name) and the name being typed
+/// after it. `\` separates only on a `windows` device or in a
+/// Windows-shaped path.
+pub fn split_typed_leaf(text: &str, windows: bool) -> (&str, &str) {
+    let windows = windows || is_windows_path(text);
+    let at = if windows {
+        text.rfind(['/', '\\'])
+    } else {
+        text.rfind('/')
+    };
+    match at {
+        Some(at) => (&text[..=at], &text[at + 1..]),
+        None => ("", text),
+    }
+}
+
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     if let Some(windows) = windows_browser_path(path) {
@@ -590,7 +725,10 @@ struct ProjectRow {
 
 #[derive(Clone, Debug, PartialEq)]
 enum DeviceTarget {
-    Device { device_id: String, space: Option<Space> },
+    Device {
+        device_id: String,
+        space: Option<Space>,
+    },
     Scaffold(ScaffoldDatabaseEnvironment),
 }
 
@@ -783,6 +921,9 @@ pub struct Pickers {
     /// Space the branch draft/cache belong to (see the state observer).
     space_owner: Option<String>,
     device_owner: Option<String>,
+    /// The checkout kind each project's canvas was left with, put back when
+    /// the canvas returns to that project (see the state observer).
+    checkout_by_space: HashMap<String, CheckoutKind>,
     target_generation: u64,
     menu_geometry: HashMap<PickerKind, popover::MenuGeometry>,
     model_trigger_bounds: Option<gpui::Bounds<gpui::Pixels>>,
@@ -912,7 +1053,14 @@ impl Pickers {
     }
 
     pub(crate) fn new_for_sandboxes(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let mut picker = Self::new_for_titles(state, TitleSettings { harness: Some(HarnessId::Omp), model: None }, cx);
+        let mut picker = Self::new_for_titles(
+            state,
+            TitleSettings {
+                harness: Some(HarnessId::Omp),
+                model: None,
+            },
+            cx,
+        );
         picker.managed_models_only = true;
         picker
     }
@@ -966,6 +1114,7 @@ impl Pickers {
             | ComposerInputEvent::PastedPaths(_)
             | ComposerInputEvent::PastedText { .. }
             | ComposerInputEvent::OpenAttachment(_)
+            | ComposerInputEvent::AnnotationHovered(_)
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged
             | ComposerInputEvent::MentionNavigate(_)
@@ -986,11 +1135,17 @@ impl Pickers {
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
-            // (and possibly the device) changed under them.
+            // (and possibly the device) changed under them. The checkout kind
+            // is the project's own: it is filed away on the way out and put
+            // back on return, so a visit elsewhere can't quietly turn "New
+            // worktree" into a run in the main checkout.
             let space = state.read(cx).selected_space.clone();
             let device = state.read(cx).active_device_id();
             let device_changed = device != this.device_owner;
             if space != this.space_owner || device_changed {
+                if let Some(left) = this.space_owner.take() {
+                    this.checkout_by_space.insert(left, this.config.checkout);
+                }
                 this.space_owner = space;
                 this.device_owner = device;
                 this.setting_menu = None;
@@ -998,7 +1153,15 @@ impl Pickers {
                 this.held_ref = this.selected_ref().cloned().or(this.held_ref.take());
                 this.refs_task = None;
                 this.config.branch = None;
-                this.config.checkout = CheckoutKind::default();
+                this.config.checkout = match state.read(cx).selected_space_row() {
+                    // Only a git project can make a worktree.
+                    Some(space) if space.git_detected => this
+                        .checkout_by_space
+                        .get(&space.id)
+                        .copied()
+                        .unwrap_or_default(),
+                    _ => CheckoutKind::default(),
+                };
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
             }
@@ -1016,7 +1179,8 @@ impl Pickers {
                 } else {
                     this.harnesses = Loadable::Idle;
                 }
-                this.models.retain(|_, slot| matches!(slot, Loadable::Ready(_)));
+                this.models
+                    .retain(|_, slot| matches!(slot, Loadable::Ready(_)));
                 this.stale_models = this.models.keys().copied().collect();
                 this.revalidating.clear();
                 this.model_refresh_errors.clear();
@@ -1067,6 +1231,7 @@ impl Pickers {
             managed_models_only: false,
             space_owner,
             device_owner,
+            checkout_by_space: HashMap::new(),
             target_generation: 0,
             menu_geometry: HashMap::new(),
             model_trigger_bounds: None,
@@ -1174,10 +1339,10 @@ impl Pickers {
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
         let mut offered = offered_harnesses(list);
         if self.managed_models_only || self.config.scaffold_database.is_some() {
-            offered.retain(|d| matches!(d.id, HarnessId::Omp | HarnessId::Antigravity));
+            offered.retain(|d| d.id == HarnessId::Omp);
             return offered;
         }
-        if self.title.is_some() && !self.managed_models_only {
+        if self.title.is_some() {
             offered.retain(|d| zeron_harness::supports_titles(d.id) && d.id != HarnessId::Mock);
         }
         offered
@@ -1204,7 +1369,9 @@ impl Pickers {
 
     /// Effective harness: picked, or the chat's config, or the first listed.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
-        if self.config.scaffold_database.is_some() { return Some(self.config.harness.filter(|harness| matches!(harness, HarnessId::Omp | HarnessId::Antigravity)).unwrap_or(HarnessId::Omp)); }
+        if self.managed_models_only || self.config.scaffold_database.is_some() {
+            return Some(HarnessId::Omp);
+        }
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -1321,8 +1488,8 @@ impl Pickers {
             return ModelName::Named(label.into());
         }
         // A list still from the previous device is loading for this one.
-        let catalog_loading = self.harnesses_stale
-            || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        let catalog_loading =
+            self.harnesses_stale || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
         let models_loading = self.effective_harness(cx).is_some_and(|harness| {
             !matches!(
                 self.models.get(&harness),
@@ -1426,6 +1593,8 @@ impl Pickers {
                 model: self.effective_model_id(cx).map(str::to_string),
                 reasoning: self.explicit_reasoning(cx),
                 model_options: self.explicit_options(cx),
+                access: AccessMode::default(),
+                plan: false,
             };
         }
         ResolvedRunConfig {
@@ -1437,6 +1606,8 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            access: AccessMode::default(),
+            plan: false,
         }
     }
 
@@ -1652,8 +1823,15 @@ impl Pickers {
     // ---- loads ----
 
     /// Refresh only after an explicit wake. Ordinary discovery never wakes hosts.
-    pub(crate) fn refresh_after_wake(&mut self, device_id: &str, harness: Option<HarnessId>, cx: &mut Context<Self>) {
-        if self.space_target(cx).as_deref() != Some(device_id) { return; }
+    pub(crate) fn refresh_after_wake(
+        &mut self,
+        device_id: &str,
+        harness: Option<HarnessId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.space_target(cx).as_deref() != Some(device_id) {
+            return;
+        }
         self.target_generation = self.target_generation.wrapping_add(1);
         self.load_task = None;
         self.refs_task = None;
@@ -1667,16 +1845,30 @@ impl Pickers {
         self.refs_space = None;
         self.ensure_harnesses(true, cx);
         self.prefetch_models(true, cx);
-        if let Some(harness) = harness { self.ensure_models(harness, true, cx); }
-        if self.state.read(cx).selected_space_row().is_some_and(|space| space.device_id == device_id) {
+        if let Some(harness) = harness {
+            self.ensure_models(harness, true, cx);
+        }
+        if self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| space.device_id == device_id)
+        {
             self.ensure_refs(true, cx);
         }
         cx.notify();
     }
 
-    pub(crate) fn wake_refresh_result(&self, device_id: &str, harness: Option<HarnessId>, cx: &App) -> Option<Result<(), String>> {
+    pub(crate) fn wake_refresh_result(
+        &self,
+        device_id: &str,
+        harness: Option<HarnessId>,
+        cx: &App,
+    ) -> Option<Result<(), String>> {
         if self.space_target(cx).as_deref() != Some(device_id) {
-            return Some(Err("The selected device changed. Your draft is preserved.".into()));
+            return Some(Err(
+                "The selected device changed. Your draft is preserved.".into()
+            ));
         }
         fn loaded<T>(slot: &Loadable<T>) -> Option<Result<(), &str>> {
             match slot {
@@ -1691,12 +1883,23 @@ impl Pickers {
                 Some(harness) => self.models.get(&harness).and_then(loaded),
                 None => Some(Ok(())),
             },
-            if self.state.read(cx).selected_space_row().is_some_and(|space| space.git_detected && space.device_id == device_id) {
+            if self
+                .state
+                .read(cx)
+                .selected_space_row()
+                .is_some_and(|space| space.git_detected && space.device_id == device_id)
+            {
                 loaded(&self.refs)
-            } else { Some(Ok(())) },
+            } else {
+                Some(Ok(()))
+            },
         ];
         for slot in &slots {
-            if let Some(Err(error)) = slot { return Some(Err(format!("Could not refresh the connected device: {error}"))); }
+            if let Some(Err(error)) = slot {
+                return Some(Err(format!(
+                    "Could not refresh the connected device: {error}"
+                )));
+            }
         }
         slots.iter().all(Option::is_some).then_some(Ok(()))
     }
@@ -1758,7 +1961,12 @@ impl Pickers {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(mut list) => {
                             if pickers.state.read(cx).managed_inference {
-                                list.retain(|descriptor| matches!(descriptor.id, HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Antigravity));
+                                list.retain(|descriptor| {
+                                    matches!(
+                                        descriptor.id,
+                                        HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex
+                                    )
+                                });
                             }
                             Loadable::Ready(list)
                         }
@@ -1872,8 +2080,12 @@ impl Pickers {
                         // (`default` alias rows, orphan `[1m]` variants,
                         // version-less alias labels).
                         Ok(mut models) => {
-                            if pickers.managed_models_only || pickers.config.scaffold_database.is_some() {
-                                models.retain(|model| zeron_proto::AgentRoute::from_harness_model(harness, &model.id).is_some());
+                            if pickers.managed_models_only
+                                || pickers.config.scaffold_database.is_some()
+                            {
+                                models.retain(|model| {
+                                    zeron_proto::AgentRoute::from_omp_model(&model.id).is_some()
+                                });
                             }
                             Loadable::Ready(normalize_model_rows(harness, models))
                         }
@@ -2821,7 +3033,11 @@ impl Pickers {
                             device_id: member.device_id.clone(),
                             space: Some((*member).clone()),
                         },
-                        name: state.device_name(&member.device_id).unwrap_or("Unknown device").to_owned().into(),
+                        name: state
+                            .device_name(&member.device_id)
+                            .unwrap_or("Unknown device")
+                            .to_owned()
+                            .into(),
                         detail: shared.then(|| member.path.clone()),
                     }
                 })
@@ -2829,25 +3045,44 @@ impl Pickers {
         } else {
             let mut devices: Vec<&zeron_proto::Device> = state.devices.iter().collect();
             devices.sort_by_key(|d| {
-                (local != Some(d.id.as_str()), d.name.to_lowercase(), d.id.clone())
+                (
+                    local != Some(d.id.as_str()),
+                    d.name.to_lowercase(),
+                    d.id.clone(),
+                )
             });
             devices
                 .into_iter()
                 .map(|device| DeviceRow {
-                    target: DeviceTarget::Device { device_id: device.id.clone(), space: None },
+                    target: DeviceTarget::Device {
+                        device_id: device.id.clone(),
+                        space: None,
+                    },
                     name: device.name.clone().into(),
                     detail: None,
                 })
                 .collect()
         };
         if state.managed_inference {
-            rows.extend([
-                ("Scaffold (Local DB)", ScaffoldDatabaseEnvironment::Local),
-                ("Scaffold (Staging DB)", ScaffoldDatabaseEnvironment::StagingSnapshot),
-                ("Scaffold (Production DB)", ScaffoldDatabaseEnvironment::ProductionSnapshot),
-            ].into_iter().map(|(name, database)| DeviceRow {
-                target: DeviceTarget::Scaffold(database), name: name.into(), detail: None,
-            }));
+            rows.extend(
+                [
+                    ("Scaffold (Local DB)", ScaffoldDatabaseEnvironment::Local),
+                    (
+                        "Scaffold (Staging DB)",
+                        ScaffoldDatabaseEnvironment::StagingSnapshot,
+                    ),
+                    (
+                        "Scaffold (Production DB)",
+                        ScaffoldDatabaseEnvironment::ProductionSnapshot,
+                    ),
+                ]
+                .into_iter()
+                .map(|(name, database)| DeviceRow {
+                    target: DeviceTarget::Scaffold(database),
+                    name: name.into(),
+                    detail: None,
+                }),
+            );
         }
         rows
     }
@@ -2881,16 +3116,28 @@ impl Pickers {
         self.device_rows(cx)
             .iter()
             .position(|row| match &row.target {
-                DeviceTarget::Device { space: Some(space), .. } => self.config.scaffold_database.is_none() && selected.as_deref() == Some(space.id.as_str()),
-                DeviceTarget::Device { device_id, .. } => self.config.scaffold_database.is_none() && effective.as_deref() == Some(device_id.as_str()),
-                DeviceTarget::Scaffold(database) => self.config.scaffold_database == Some(*database),
+                DeviceTarget::Device {
+                    space: Some(space), ..
+                } => {
+                    self.config.scaffold_database.is_none()
+                        && selected.as_deref() == Some(space.id.as_str())
+                }
+                DeviceTarget::Device { device_id, .. } => {
+                    self.config.scaffold_database.is_none()
+                        && effective.as_deref() == Some(device_id.as_str())
+                }
+                DeviceTarget::Scaffold(database) => {
+                    self.config.scaffold_database == Some(*database)
+                }
             })
             .unwrap_or(0)
     }
 
     /// Keep remote provisioning on the composer; selection never creates a sandbox.
     fn pick_device_row(&mut self, row: DeviceRow, cx: &mut Context<Self>) {
-        if self.config.scaffold_database.is_some() || matches!(&row.target, DeviceTarget::Scaffold(_)) {
+        if self.config.scaffold_database.is_some()
+            || matches!(&row.target, DeviceTarget::Scaffold(_))
+        {
             self.models.clear();
             self.stale_models.clear();
             self.revalidating.clear();
@@ -2903,7 +3150,9 @@ impl Pickers {
         }
         self.config.scaffold_database = None;
         match row.target {
-            DeviceTarget::Device { space: Some(space), .. } => self.pick_space(space.id, cx),
+            DeviceTarget::Device {
+                space: Some(space), ..
+            } => self.pick_space(space.id, cx),
             DeviceTarget::Device { device_id, .. } => self.pick_device(device_id, cx),
             DeviceTarget::Scaffold(database) => {
                 self.config.scaffold_database = Some(database);
@@ -2935,7 +3184,9 @@ impl Pickers {
                 state.local_device_id.clone(),
                 rows.iter()
                     .map(|row| match &row.target {
-                        DeviceTarget::Device { device_id, .. } => state.device_online(device_id, now),
+                        DeviceTarget::Device { device_id, .. } => {
+                            state.device_online(device_id, now)
+                        }
                         DeviceTarget::Scaffold(_) => true,
                     })
                     .collect(),
@@ -3285,10 +3536,15 @@ impl Pickers {
             return;
         }
         // ⌘1…⌘9 jump-picks the Nth visible model row (t3 modelPickerKeys;
-        // the chips on the rows advertise these).
+        // the chips on the rows advertise these). Read the digit through the
+        // layout: AZERTY types ⌘1 as ⌘&.
         if self.open_kind() == Some(PickerKind::HarnessModel)
             && event.keystroke.modifiers.platform
-            && let Ok(n) = event.keystroke.key.parse::<usize>()
+            && let Some(n) = crate::settings::canonical_key(
+                &event.keystroke.key,
+                &crate::settings::key_equivalents(cx),
+            )
+            .and_then(|key| key.parse::<usize>().ok())
             && (1..=9).contains(&n)
         {
             self.activate_model_index(n - 1, cx);
@@ -3773,10 +4029,15 @@ impl Pickers {
                 .map(str::to_string)
                 .unwrap_or_else(|| "This device".to_string())
                 .into();
-            let device_label = self.config.scaffold_database.map(|database| SharedString::from(scaffold_destination_label(database))).unwrap_or(device_label);
-            let offline = self.config.scaffold_database.is_none() && device_id
-                .as_deref()
-                .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
+            let device_label = self
+                .config
+                .scaffold_database
+                .map(|database| SharedString::from(scaffold_destination_label(database)))
+                .unwrap_or(device_label);
+            let offline = self.config.scaffold_database.is_none()
+                && device_id
+                    .as_deref()
+                    .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
             let project_label: SharedString = state
                 .selected_space_row()
                 .map(|s| s.display_name().to_string())
@@ -3816,13 +4077,15 @@ impl Pickers {
                 "device-popover",
                 closing,
             ))
-            .when(self.config.scaffold_database.is_none(), |el| el.child(attach_overlay_end(
-                project_chip,
-                &mut overlay,
-                PickerKind::Space,
-                "project-popover",
-                closing,
-            )))
+            .when(self.config.scaffold_database.is_none(), |el| {
+                el.child(attach_overlay_end(
+                    project_chip,
+                    &mut overlay,
+                    PickerKind::Space,
+                    "project-popover",
+                    closing,
+                ))
+            })
             .into_any_element()
     }
 
@@ -3832,7 +4095,9 @@ impl Pickers {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.config.scaffold_database.is_some() { return None; }
+        if self.config.scaffold_database.is_some() {
+            return None;
+        }
         let git = self
             .state
             .read(cx)
@@ -4541,6 +4806,9 @@ impl Pickers {
         tabs = tabs.child(
             div()
                 .id("model-tab-favorites")
+                .role(gpui::Role::Tab)
+                .aria_label("Starred")
+                .aria_selected(favorites_view)
                 .relative()
                 .w(px(32.0))
                 .h(px(32.0))
@@ -4552,6 +4820,7 @@ impl Pickers {
                 .when(!favorites_view, |el| {
                     el.hover(|s| s.bg(crate::theme::ink(0.06)))
                 })
+                .tooltip(|_, cx| cx.new(|_| compact::PickerHint("Starred".into())).into())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.setting_menu = None;
                     this.model_rail = ModelRail::Favorites;
@@ -4578,10 +4847,14 @@ impl Pickers {
             let harness = descriptor.id;
             let is_viewed = !favorites_view && effective == Some(harness);
             let (icon_path, tint) = harness_brand_icon(harness);
+            let name: SharedString = descriptor.name.clone().into();
             tabs =
                 tabs.child(
                     div()
                         .id(("harness-tab", ix))
+                        .role(gpui::Role::Tab)
+                        .aria_label(name.clone())
+                        .aria_selected(is_viewed)
                         .relative()
                         .w(px(32.0))
                         .h(px(32.0))
@@ -4591,6 +4864,7 @@ impl Pickers {
                         .justify_center()
                         .cursor_pointer()
                         .when(!is_viewed, |el| el.hover(|s| s.bg(crate::theme::ink(0.06))))
+                        .tooltip(move |_, cx| cx.new(|_| compact::PickerHint(name.clone())).into())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.setting_menu = None;
                             this.model_rail = ModelRail::Harness;
@@ -4948,7 +5222,8 @@ impl Pickers {
             }))
             .child(body);
         if ix < 9 {
-            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
+            let key = crate::settings::bound_key(&(ix + 1).to_string());
+            el = el.child(popover::kbd_hint(&theme, &format!("⌘{key}")));
         }
         // A model configured in place opens its settings card on hover.
         // The title picker has no settings, so no card either.
@@ -5027,6 +5302,14 @@ impl Pickers {
                 ));
             }
         }
+        // The compact picker's wording: the name tells a screen reader's
+        // list of stars apart.
+        let star_hint: SharedString = if is_fav {
+            format!("Remove {} from favorites", row.model.label)
+        } else {
+            format!("Add {} to favorites", row.model.label)
+        }
+        .into();
         el = el.child(
             div()
                 .id(("model-star", ix))
@@ -5039,6 +5322,14 @@ impl Pickers {
                 .justify_center()
                 .cursor_pointer()
                 .hover(|s| s.bg(crate::theme::ink(0.08)))
+                .role(gpui::Role::Button)
+                .aria_label(star_hint.clone())
+                .aria_toggled(if is_fav {
+                    gpui::Toggled::True
+                } else {
+                    gpui::Toggled::False
+                })
+                .tooltip(move |_, cx| cx.new(|_| compact::PickerHint(star_hint.clone())).into())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.toggle_model_favorite(harness, &star_model, cx);
@@ -6149,6 +6440,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Grok => (crate::icons::GROK_MARK, None),
         // Nous Research's mark (the Hermes product icon), monochrome.
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
+        HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
         // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
@@ -6427,7 +6719,12 @@ impl Render for Pickers {
         // so instead of wearing a brand mark for an agent that can't run.
         let no_agents = self.no_agents_available() && self.effective_harness(cx).is_none();
         let model_name = self.model_name(cx);
-        let model_label: SharedString = if self.managed_models_only && self.title.as_ref().is_none_or(|title| title.model.is_none()) {
+        let model_label: SharedString = if self.managed_models_only
+            && self
+                .title
+                .as_ref()
+                .is_none_or(|title| title.model.is_none())
+        {
             "Choose a managed model…".into()
         } else if let Some(title) = &self.title {
             // The saved choice, not the tab being browsed.
@@ -6452,8 +6749,8 @@ impl Render for Pickers {
             }
         };
         // A list still from the previous device is loading for this one.
-        let catalog_loading = self.harnesses_stale
-            || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        let catalog_loading =
+            self.harnesses_stale || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
         // Harness unknown while the catalog resolves: the pixel-glyph loader
         // instead of guessing a brand mark.
         let chip_icon_loading = self.title.is_none()
@@ -7472,6 +7769,7 @@ mod tests {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
+                github_repo: None,
                 created_at: chrono::Utc::now(),
             }]);
             state
@@ -7515,6 +7813,7 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -7577,7 +7876,9 @@ mod tests {
                 Loadable::Ready(vec![bare_model("gpt", "GPT")]),
                 cx,
             );
-            pickers.models.insert(HarnessId::ClaudeCode, Loadable::Loading);
+            pickers
+                .models
+                .insert(HarnessId::ClaudeCode, Loadable::Loading);
         });
         state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
         cx.run_until_parked();
@@ -7683,6 +7984,100 @@ mod tests {
     }
 
     #[gpui::test]
+    fn project_round_trip_puts_the_canvas_checkout_back(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "local"), git_space("b", "local")]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.pick_checkout(CheckoutKind::NewWorktree, cx);
+            pickers.config.branch = Some("main".into());
+        });
+        state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
+        cx.run_until_parked();
+        // The pick was a's: b starts in its own folder.
+        pickers.read_with(cx, |pickers, _| {
+            assert_eq!(pickers.config.checkout, CheckoutKind::Local);
+        });
+        state.update(cx, |state, cx| state.select_space(Some("a".into()), cx));
+        cx.run_until_parked();
+        pickers.read_with(cx, |pickers, _| {
+            assert_eq!(pickers.config.checkout, CheckoutKind::NewWorktree);
+            assert_eq!(pickers.checkout_label(), "New worktree");
+            // a's refs reload on the way back; the ref pick starts over.
+            assert_eq!(pickers.config.branch, None);
+        });
+    }
+
+    #[gpui::test]
+    fn canvas_reopens_with_its_checkout_after_another_projects_chat(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "local"), git_space("b", "local")]);
+            state.apply_chats(vec![
+                serde_json::from_value(serde_json::json!({
+                    "id":"in-b", "deviceId":"local", "spaceId":"b", "archived":false,
+                    "createdAt":"2026-09-01T00:00:00Z",
+                }))
+                .unwrap(),
+            ]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.pick_checkout(CheckoutKind::NewWorktree, cx);
+        });
+        state.update(cx, |state, cx| state.select_chat(Some("in-b".into()), cx));
+        cx.run_until_parked();
+        // New session: the canvas target comes back, and its checkout with it.
+        state.update(cx, |state, cx| state.select_chat(None, cx));
+        cx.run_until_parked();
+        pickers.read_with(cx, |pickers, cx| {
+            assert_eq!(pickers.state.read(cx).selected_space.as_deref(), Some("a"));
+            assert_eq!(pickers.config.checkout, CheckoutKind::NewWorktree);
+        });
+    }
+
+    #[gpui::test]
+    fn a_project_that_lost_git_never_gets_a_worktree_back(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "local"), git_space("b", "local")]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.pick_checkout(CheckoutKind::NewWorktree, cx);
+        });
+        state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
+        cx.run_until_parked();
+        state.update(cx, |state, _| {
+            state.apply_spaces(vec![
+                Space {
+                    git_detected: false,
+                    ..git_space("a", "local")
+                },
+                git_space("b", "local"),
+            ]);
+        });
+        state.update(cx, |state, cx| state.select_space(Some("a".into()), cx));
+        cx.run_until_parked();
+        // No checkout chip shows without git: a kept "New worktree" would ask
+        // for a worktree the user can neither see nor change.
+        pickers.read_with(cx, |pickers, _| {
+            assert_eq!(pickers.config.checkout, CheckoutKind::Local);
+        });
+    }
+
+    #[gpui::test]
     fn project_picker_lists_repositories_then_their_devices(cx: &mut gpui::TestAppContext) {
         let space = |id: &str, device: &str, name: &str, repository: Option<&str>, minutes| Space {
             id: id.into(),
@@ -7693,6 +8088,7 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: repository.map(str::to_string),
+            github_repo: None,
             created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
                 + chrono::TimeDelta::minutes(minutes),
         };
@@ -7802,17 +8198,36 @@ mod tests {
             for (query, database) in [
                 ("local db", ScaffoldDatabaseEnvironment::Local),
                 ("staging db", ScaffoldDatabaseEnvironment::StagingSnapshot),
-                ("production db", ScaffoldDatabaseEnvironment::ProductionSnapshot),
+                (
+                    "production db",
+                    ScaffoldDatabaseEnvironment::ProductionSnapshot,
+                ),
             ] {
-                pickers.search.update(cx, |search, cx| search.set_text(query, cx));
-                let targets: Vec<_> = pickers.filtered_device_rows(cx).into_iter().map(|row| row.target).collect();
+                pickers
+                    .search
+                    .update(cx, |search, cx| search.set_text(query, cx));
+                let targets: Vec<_> = pickers
+                    .filtered_device_rows(cx)
+                    .into_iter()
+                    .map(|row| row.target)
+                    .collect();
                 assert_eq!(targets, [DeviceTarget::Scaffold(database)]);
-                pickers.pick_device_row(DeviceRow { target: DeviceTarget::Scaffold(database), name: scaffold_destination_label(database).into(), detail: None }, cx);
+                pickers.pick_device_row(
+                    DeviceRow {
+                        target: DeviceTarget::Scaffold(database),
+                        name: scaffold_destination_label(database).into(),
+                        detail: None,
+                    },
+                    cx,
+                );
                 assert_eq!(pickers.draft().scaffold_database, Some(database));
                 assert!(pickers.state.read(cx).selected_chat.is_none());
                 assert_eq!(pickers.effective_harness(cx), Some(HarnessId::Omp));
             }
-            assert_eq!(pickers.state.read(cx).selected_space.as_deref(), Some("server"));
+            assert_eq!(
+                pickers.state.read(cx).selected_space.as_deref(),
+                Some("server")
+            );
         });
     }
 
@@ -9094,7 +9509,10 @@ mod tests {
                 assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude"));
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rows_len(cx), 2);
-                assert_eq!(picker.model_rows(cx)[picker.active].harness, HarnessId::ClaudeCode);
+                assert_eq!(
+                    picker.model_rows(cx)[picker.active].harness,
+                    HarnessId::ClaudeCode
+                );
             })
             .unwrap();
     }
@@ -9208,7 +9626,10 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(
                     picker.compact_groups(cx),
-                    vec![(Some(HarnessId::Codex), 0), (Some(HarnessId::ClaudeCode), 2)]
+                    vec![
+                        (Some(HarnessId::Codex), 0),
+                        (Some(HarnessId::ClaudeCode), 2)
+                    ]
                 );
                 picker.toggle_model_favorite(HarnessId::Codex, "gpt-a", cx);
                 assert_eq!(
@@ -9269,7 +9690,9 @@ mod tests {
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::Codex);
                 assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
                 // Searching must also find another provider's model.
-                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                picker
+                    .search
+                    .update(cx, |input, cx| input.set_text("Claude", cx));
                 assert_eq!(picker.model_rows_len(cx), 1);
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
                 picker.activate_model_index(0, cx);
@@ -9299,14 +9722,13 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rows_len(cx), 1);
                 assert_eq!(picker.rail_descriptors(cx)[0].id, HarnessId::Codex);
-                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                picker
+                    .search
+                    .update(cx, |input, cx| input.set_text("Claude", cx));
                 assert_eq!(picker.model_rows_len(cx), 0);
                 picker.search.update(cx, |input, cx| input.set_text("", cx));
                 // A chat's provider is fixed: one tab, its own.
-                assert_eq!(
-                    picker.compact_groups(cx),
-                    vec![(Some(HarnessId::Codex), 0)]
-                );
+                assert_eq!(picker.compact_groups(cx), vec![(Some(HarnessId::Codex), 0)]);
                 picker.compact_model_list = false;
                 picker.focus_on_mount = true;
             })
@@ -9839,6 +10261,102 @@ mod tests {
         assert!(is_typed_path(r"D:\x"));
         assert!(is_typed_path("/x") && is_typed_path("~"));
         assert!(!is_typed_path("src") && !is_typed_path("ab:/x"));
+    }
+
+    #[test]
+    fn pasted_paths_lose_quotes_and_shell_escapes() {
+        let clean = |text| clean_typed_path(text, false);
+        assert_eq!(clean("  /Users/ana/code \n"), "/Users/ana/code");
+        assert_eq!(clean("'/Users/ana/My Code'"), "/Users/ana/My Code");
+        assert_eq!(clean("\"~/My Code\""), "~/My Code");
+        // A folder dragged into a terminal.
+        assert_eq!(
+            clean(r"/Users/ana/My\ Code\ \(old\)"),
+            "/Users/ana/My Code (old)"
+        );
+        // Mismatched quotes are part of the name.
+        assert_eq!(clean("'/tmp/x\""), "'/tmp/x\"");
+        // Windows backslashes are separators, drive-rooted or relative.
+        assert_eq!(clean(r"D:\Random\zeron"), r"D:\Random\zeron");
+        assert_eq!(clean_typed_path(r"'..\site'", true), r"..\site");
+        assert_eq!(clean_typed_path(r"~\code", true), r"~\code");
+    }
+
+    #[test]
+    fn typed_paths_resolve_dots_home_and_the_open_folder() {
+        let (base, home) = (Some("/home/wing/code"), Some("/home/wing"));
+        let resolve = |text| resolve_typed_path(text, base, home, false);
+        assert_eq!(resolve("/srv//data/"), Some("/srv/data".into()));
+        assert_eq!(resolve("~/code/../notes"), Some("/home/wing/notes".into()));
+        assert_eq!(resolve("~"), Some("/home/wing".into()));
+        // Relative to the open folder, like a shell's cd.
+        assert_eq!(
+            resolve("zeron/src"),
+            Some("/home/wing/code/zeron/src".into())
+        );
+        assert_eq!(resolve("../site"), Some("/home/wing/site".into()));
+        assert_eq!(resolve("./"), Some("/home/wing/code".into()));
+        // `..` stops at the root.
+        assert_eq!(resolve("/../../etc"), Some("/etc".into()));
+        assert_eq!(resolve("/"), Some("/".into()));
+        assert_eq!(resolve("  "), None);
+        // `~` needs the device's home, a relative path an open folder.
+        assert_eq!(resolve_typed_path("~/code", base, None, false), None);
+        assert_eq!(resolve_typed_path("code", None, home, false), None);
+        assert_eq!(
+            resolve_typed_path("/srv/data", None, None, false),
+            Some("/srv/data".into())
+        );
+        // A backslash in a POSIX name, as the field writes it, survives.
+        let written = escape_typed_path(r"/home/wing/a\b/", false);
+        assert_eq!(written, r"/home/wing/a\\b/");
+        assert_eq!(resolve(written.as_str()), Some(r"/home/wing/a\b".into()));
+    }
+
+    #[test]
+    fn typed_windows_paths_resolve_on_any_client() {
+        let (base, home) = (Some(r"C:\Users\Ana\code"), Some(r"C:\Users\Ana"));
+        let resolve = |text| resolve_typed_path(text, base, home, false);
+        // Rooted on the open folder's drive, or at a named drive's root.
+        assert_eq!(resolve(r"\Projects"), Some(r"C:\Projects".into()));
+        assert_eq!(resolve("/Projects"), Some(r"C:\Projects".into()));
+        assert_eq!(resolve("D:work"), Some(r"D:\work".into()));
+        // `/` reads as `\`, so a forward-slash share stays a share.
+        assert_eq!(
+            resolve("//nas/projects/app"),
+            Some(r"\\nas\projects\app".into())
+        );
+        assert_eq!(escape_typed_path(r"C:\a", false), r"C:\a");
+        // A Windows device before anything listed: rooted paths wait for it.
+        assert_eq!(resolve_typed_path("/code", None, None, true), None);
+        assert_eq!(resolve(r"D:\Random\..\zeron\"), Some(r"D:\zeron".into()));
+        assert_eq!(
+            resolve("D:/Random/./zeron"),
+            Some(r"D:\Random\zeron".into())
+        );
+        assert_eq!(resolve(r"~\notes"), Some(r"C:\Users\Ana\notes".into()));
+        assert_eq!(resolve(r"..\site"), Some(r"C:\Users\Ana\site".into()));
+        assert_eq!(resolve(r"C:\.."), Some(r"C:\".into()));
+        assert_eq!(
+            resolve(r"\\server\share\team\..\repo"),
+            Some(r"\\server\share\repo".into())
+        );
+        // Verbatim paths are taken as they are.
+        assert_eq!(normalize_browser_path(r"\\?\D:\a\..\b"), r"\\?\D:\a\..\b");
+    }
+
+    #[test]
+    fn typed_paths_split_at_the_name_being_typed() {
+        let split = |text| split_typed_leaf(text, false);
+        assert_eq!(split("/home/wing/co"), ("/home/wing/", "co"));
+        assert_eq!(split("~/"), ("~/", ""));
+        assert_eq!(split("code"), ("", "code"));
+        assert_eq!(split(r"D:\Random\ze"), (r"D:\Random\", "ze"));
+        assert_eq!(split("D:/Random/ze"), ("D:/Random/", "ze"));
+        // A backslash is part of a POSIX name, a separator on Windows.
+        assert_eq!(split(r"/tmp/a\b"), ("/tmp/", r"a\b"));
+        assert_eq!(split_typed_leaf(r"code\ze", true), (r"code\", "ze"));
+        assert_eq!(split_typed_leaf(r"~\co", true), (r"~\", "co"));
     }
 
     #[test]

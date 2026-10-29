@@ -57,6 +57,8 @@ impl Shell {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
             });
         let saved = settings::current(cx);
         let device = saved.codex_voice_device.unwrap_or(device);
@@ -131,11 +133,19 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if self.state.read(cx).managed_inference {
-            return Some(div().id("crew-voice-unavailable").role(gpui::Role::Image)
-                .aria_label("Realtime voice unavailable in Crew managed mode")
-                .opacity(0.4).size(px(SIDEBAR_FOOTER_BUTTON_SIZE))
-                .tooltip(crate::settings::widgets::text_tooltip("Realtime voice unavailable: no Agent Auth adapter"))
-                .child(icon(icons::MICROPHONE).size(px(16.0))).into_any_element());
+            return Some(
+                div()
+                    .id("crew-voice-unavailable")
+                    .role(gpui::Role::Image)
+                    .aria_label("Realtime voice unavailable in Crew managed mode")
+                    .opacity(0.4)
+                    .size(px(SIDEBAR_FOOTER_BUTTON_SIZE))
+                    .tooltip(crate::settings::widgets::text_tooltip(
+                        "Realtime voice unavailable: no Agent Auth adapter",
+                    ))
+                    .child(icon(icons::MICROPHONE).size(px(16.0)))
+                    .into_any_element(),
+            );
         }
         self.check_voice_codex(false, cx);
         let voice = self.voice.read(cx);
@@ -257,6 +267,9 @@ impl Shell {
                         cx.stop_propagation();
                         this.voice.update(cx, |voice, cx| voice.dismiss_reason(cx));
                     }))
+                    .role(gpui::Role::Button)
+                    .aria_label("Dismiss")
+                    .tooltip(stage_tooltip("Dismiss"))
                     .child(
                         icon(icons::CLOSE)
                             .size(px(14.0))
@@ -816,13 +829,17 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: HarnessId::Mock, },
+                    EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: HarnessId::Mock,
+                    },
                     cx,
                 );
                 shell.reduced_motion = true;
@@ -882,13 +899,17 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: HarnessId::Mock, },
+                    EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: HarnessId::Mock,
+                    },
                     cx,
                 );
                 shell.reduced_motion = true;
@@ -987,13 +1008,17 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
-                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: HarnessId::Mock, },
+                    EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: HarnessId::Mock,
+                    },
                     cx,
                 );
                 shell.reduced_motion = true;
@@ -1074,13 +1099,17 @@ mod tests {
                 let state = cx.new(|_| AppState::new());
                 let shell = Shell::new(
                     state,
-                    EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                    ipc_port: 0,
-                    edge_url: "http://127.0.0.1:1".into(),
-                    edge_token: None,
-                    org_id: None,
-                    workos_client_id: None,
-                    default_harness: HarnessId::Mock, },
+                    EngineBootConfig {
+                        managed_inference: false,
+                        scaffold: None,
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: HarnessId::Mock,
+                    },
                     cx,
                 );
                 shell.voice.update(cx, |voice, _| {

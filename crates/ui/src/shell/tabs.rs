@@ -80,6 +80,16 @@ fn panel_titlebar_widths(
     }
 }
 
+/// A target the opener names for the new-session canvas, over the sidebar
+/// filter and the canvas's own last pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NewSessionTarget {
+    /// This project (space id).
+    Project(String),
+    /// No project, on this device (id): a "No project" sidebar group.
+    NoProject(String),
+}
+
 impl Shell {
     /// The same binding navigates the focused pane. Keep the persisted action
     /// IDs so existing user keymaps and the native browser bridge still work.
@@ -236,9 +246,14 @@ impl Shell {
     /// open it just hides (detach, not close — the source chat's tabs and
     /// PTYs survive for the return trip).
     ///
-    /// `project` (the per-project `+` on a sidebar group header) homes the
-    /// canvas on that project and wins over the sidebar filter.
-    pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
+    /// `target` (the `+` on a sidebar group header) homes the canvas on that
+    /// project, or on no project on that device, and wins over the sidebar
+    /// filter.
+    pub(super) fn open_new_session(
+        &mut self,
+        target: Option<NewSessionTarget>,
+        cx: &mut Context<Self>,
+    ) {
         self.command_palette = None;
         self.set_voice_stage_open(false, cx);
         self.set_route(Route::Chat, cx);
@@ -258,20 +273,24 @@ impl Shell {
             }
         }
         self.nav.push(NavEntry::Chat(String::new()));
-        let target = {
-            let state = self.state.read(cx);
-            project
-                .or_else(|| self.settings.space_filter.clone())
-                .filter(|id| state.space_row(id).is_some())
-        };
+        let project = match &target {
+            Some(NewSessionTarget::Project(project)) => Some(project.clone()),
+            Some(NewSessionTarget::NoProject(_)) => None,
+            None => self.settings.space_filter.clone(),
+        }
+        .filter(|id| self.state.read(cx).space_row(id).is_some());
         let defaults = crate::settings::composer::ComposerDefaults::load(&self.data_dir);
         self.state.update(cx, |s, cx| {
             // Leaving a chat puts the canvas's own target back; the filter
             // (an explicit standing choice) then applies on top of it.
             let restores = s.canvas_target.is_some();
             s.select_chat(None, cx);
-            if target.is_some() {
-                s.select_space(target, cx);
+            if let Some(NewSessionTarget::NoProject(device)) = target {
+                // The composer's "Don't work in a project" pick, on that device.
+                s.select_space(None, cx);
+                s.select_device(device, cx);
+            } else if project.is_some() {
+                s.select_space(project, cx);
             } else if !restores && defaults.no_project {
                 // No canvas target was set aside (e.g. after a runtime swap):
                 // fall back to the saved new-session opt-out.
@@ -409,7 +428,12 @@ impl Shell {
             }
         };
         let environment_label = self.state.read(cx).selected_chat_row().map(|chat| {
-            match chat.crew.as_ref().and_then(|crew| crew.environment.as_ref()).map(|environment| &environment.source) {
+            match chat
+                .crew
+                .as_ref()
+                .and_then(|crew| crew.environment.as_ref())
+                .map(|environment| &environment.source)
+            {
                 Some(zeron_proto::SessionEnvironmentSource::Scaffold { .. }) => "Scaffold",
                 _ => "Local host",
             }
@@ -429,12 +453,24 @@ impl Shell {
             content_width,
         } = self.titlebar_trailing_layout(on_canvas, cx);
 
-        let running_subagents = {
+        // What runs alongside the open chat: its working subagents and side
+        // chats, counted on the session card's toggle.
+        let running_lanes = {
             let state = self.state.read(cx);
-            state
-                .selected_chat
-                .as_deref()
-                .map_or(0, |chat| state.running_subagents_for(chat, Utc::now()))
+            let now = Utc::now();
+            state.selected_chat.as_deref().map_or(0, |chat| {
+                let side_chats = state
+                    .chats
+                    .iter()
+                    .filter(|side| {
+                        !side.archived
+                            && side.parent_chat_id.as_deref() == Some(chat)
+                            && state.display_status_for(side, now)
+                                == zeron_proto::ChatIndicator::Working
+                    })
+                    .count() as u32;
+                state.running_subagents_for(chat, now) + side_chats
+            })
         };
         let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
@@ -553,15 +589,6 @@ impl Shell {
                                 .aria_label(files_panel_label)
                                 .when(self.files_panel_open(cx) && fit.files, |button| {
                                     button.bg(crate::theme::wash(0.09))
-                                })
-                                // Running subagents live in this panel: mark the
-                                // button so they are findable while it is closed.
-                                .when(running_subagents > 0, |button| {
-                                    crate::running_pill::mark_files_button(
-                                        button,
-                                        running_subagents,
-                                        &theme,
-                                    )
                                 }),
                             )
                             .child(header_icon_button_with(
@@ -609,6 +636,11 @@ impl Shell {
                 cx.listener(|this, _, _, _| this.note_session_info_press()),
             )
             .when(open, |button| button.bg(crate::theme::wash(0.09)))
+            // Running subagents and side chats ride the card's lanes: the
+            // button counts them, open or closed, for as long as they run.
+            .when(running_lanes > 0, |button| {
+                crate::running_pill::mark_titlebar_button(button, running_lanes, &theme)
+            })
         });
         let inner = div()
             .size_full()
@@ -654,12 +686,17 @@ impl Shell {
                                 })
                                 .child(title),
                         )
-                        .when_some(environment_label, |el, label| el.child(
-                            div().id("session-environment").flex_none()
-                                .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_muted)
-                                .aria_label(format!("Session environment: {label}"))
-                                .child(label),
-                        )),
+                        .when_some(environment_label, |el, label| {
+                            el.child(
+                                div()
+                                    .id("session-environment")
+                                    .flex_none()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted)
+                                    .aria_label(format!("Session environment: {label}"))
+                                    .child(label),
+                            )
+                        }),
                 )
             })
             .child(div().flex_1())

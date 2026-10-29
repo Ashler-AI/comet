@@ -42,13 +42,17 @@ fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut Vis
         });
         let mut shell = Shell::new(
             state,
-            EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-            ipc_port: 0,
-            edge_url: String::new(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
-            default_harness: zeron_proto::HarnessId::Mock, },
+            EngineBootConfig {
+                managed_inference: false,
+                scaffold: None,
+                data_dir: dir.path().into(),
+                ipc_port: 0,
+                edge_url: String::new(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock,
+            },
             cx,
         );
         shell.debug_gate = Some(GatePhase::Ready);
@@ -389,5 +393,184 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
         let landed = draw(&shell, cx, 0);
         near(landed.widths.iter().sum(), 1600.0);
         expect(settled(&shell, cx), landed.widths);
+    }
+}
+
+#[gpui::test]
+fn side_chat_menu_rename_keeps_the_editor_visible_without_opening_files(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side", "title": "Side chat", "parentChatId": "a",
+                    "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap(),
+            );
+            cx.notify();
+        });
+        shell.chat_menu.open(ChatMenuState {
+            chat_id: "side".into(),
+            tab: None,
+            position: gpui::point(px(800.0), px(200.0)),
+            page: ChatMenuPage::Root,
+        });
+    });
+    settled(&shell, cx);
+    assert!(shell.read_with(cx, |shell, cx| !shell.files_panel_open(cx)));
+
+    let rename = cx.debug_bounds("chat-menu-rename").unwrap();
+    cx.simulate_click(rename.center(), Default::default());
+    settled(&shell, cx);
+
+    shell.read_with(cx, |shell, cx| {
+        assert!(
+            !shell.files_panel_open(cx),
+            "Rename must not open the explorer"
+        );
+        assert!(shell.session_info_visible(cx));
+        assert_eq!(shell.chat_rename.as_ref().unwrap().chat_id, "side");
+    });
+    let field = cx
+        .debug_bounds("session-lanes-chat-side-title-editor")
+        .unwrap();
+    let card = cx.debug_bounds("session-lanes").unwrap();
+    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+}
+
+#[gpui::test]
+fn side_chat_rename_leaves_takeover_to_show_its_editor(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side", "title": "Side chat", "parentChatId": "a",
+                    "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap(),
+            );
+            cx.notify();
+        });
+        shell.toggle_right_pane(cx);
+    });
+    settled(&shell, cx);
+    change(&shell, cx, |s, _, cx| s.toggle_right_pane_expand(cx));
+    near(settled(&shell, cx).widths[3], 0.0);
+
+    change(&shell, cx, |s, _, cx| s.open_rename_chat("side".into(), cx));
+    let frame = settled(&shell, cx);
+    assert!(!shell.read_with(cx, |s, _| s.right_pane_expanded));
+    assert!(frame.widths[3] > 0.0, "the transcript column must return");
+    let field = cx
+        .debug_bounds("session-lanes-chat-side-title-editor")
+        .unwrap();
+    let card = cx.debug_bounds("session-lanes").unwrap();
+    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+}
+
+fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_motion: bool) {
+    let (_dir, shell, cx) = setup(cx);
+    cx.simulate_resize(gpui::size(px(width), px(900.0)));
+    cx.update(|_, cx| motion::set_reduced_motion(cx, reduced_motion));
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            let now = Utc::now();
+            for index in 0..40 {
+                state.chats.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("side-{index}"), "title": format!("Side {index}"),
+                        "parentChatId": "a", "deviceId": "local", "archived": false,
+                        "createdAt": now - chrono::Duration::minutes(index),
+                    }))
+                    .unwrap(),
+                );
+            }
+            cx.notify();
+        });
+    });
+    settled(&shell, cx);
+    assert!(cx.debug_bounds("session-lanes").is_none());
+
+    // Reveal a paged-out row from a hidden card, then a row above the new
+    // scroll position. Both directions must leave the whole editor visible.
+    for (chat, selector) in [
+        ("side-39", "session-lanes-chat-side-39-title-editor"),
+        ("side-0", "session-lanes-chat-side-0-title-editor"),
+    ] {
+        change(&shell, cx, |shell, _, cx| {
+            shell.open_rename_chat(chat.into(), cx);
+        });
+        settled(&shell, cx);
+        for _ in 0..4 {
+            cx.run_until_parked();
+            draw(&shell, cx, 100);
+        }
+        let field = cx.debug_bounds(selector).unwrap();
+        let card = cx.debug_bounds("session-lanes").unwrap();
+        assert!(
+            field.top() >= card.top() && field.bottom() <= card.bottom(),
+            "{chat}'s editor {field:?} is outside the card {card:?}"
+        );
+        cx.update(|window, cx| {
+            shell.read_with(cx, |shell, cx| {
+                let rename = shell.chat_rename.as_ref().unwrap();
+                assert_eq!(rename.chat_id, chat);
+                assert!(rename.input.focus_handle(cx).is_focused(window));
+            });
+        });
+    }
+}
+
+#[gpui::test]
+fn side_chat_rename_scrolls_to_its_row_in_a_docked_card(cx: &mut TestAppContext) {
+    check_side_chat_rename_scroll(cx, 1600.0, false);
+}
+
+#[gpui::test]
+fn side_chat_rename_scrolls_to_its_row_in_a_floating_card_without_motion(cx: &mut TestAppContext) {
+    check_side_chat_rename_scroll(cx, 1000.0, true);
+}
+
+#[gpui::test]
+fn the_session_card_lands_with_a_chat_switch_and_eases_on_its_toggle(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |s, _, _| {
+        s.settings.session_info_hidden = false;
+        // b's surface host leaves its transcript no room for the card.
+        s.panels.update("b", |p| p.changes_open = true);
+    });
+    settled(&shell, cx);
+    let card = cx
+        .debug_bounds("session-info")
+        .expect("a's wide column shows the card");
+    // Where the card's reveal is easing to, if it eases at all.
+    let easing_to = |cx: &mut VisualTestContext| {
+        shell.read_with(cx, |s, _| s.session_info_tween.map(|tween| tween.to))
+    };
+
+    // The panels snap to b's; the card must not fade out over b's transcript.
+    change(&shell, cx, |s, _, cx| select(s, Some("b"), cx));
+    draw(&shell, cx, 0);
+    assert!(cx.debug_bounds("session-info").is_none());
+    assert_eq!(easing_to(cx), None);
+
+    // Back on a, it is at rest from the first frame.
+    change(&shell, cx, |s, _, cx| select(s, Some("a"), cx));
+    draw(&shell, cx, 0);
+    let landed = cx
+        .debug_bounds("session-info")
+        .expect("a shows its card from the first frame");
+    near(f32::from(landed.left()), f32::from(card.left()));
+    assert_eq!(easing_to(cx), None);
+
+    // Its own toggle still eases it out, then back in.
+    for (reveal, shown) in [(0.0, false), (1.0, true)] {
+        change(&shell, cx, |s, _, cx| s.toggle_session_info(cx));
+        draw(&shell, cx, 0);
+        assert_eq!(easing_to(cx), Some(reveal));
+        settled(&shell, cx);
+        assert_eq!(cx.debug_bounds("session-info").is_some(), shown);
     }
 }

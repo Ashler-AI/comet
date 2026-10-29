@@ -98,7 +98,7 @@ test("ad-hoc packaging is forbidden in CI but accepts an explicitly local CI=fal
   assert.ifError(local.error);
   assert.equal(local.status, 86, local.stderr + local.stdout);
   assert.match(local.stdout, /BUILD_BOUNDARY staging staging/);
-  assert.match(local.stdout, /CARGO_ARGS build --locked --release -p zeron --bin zeron --target-dir .+\/target\/staging --jobs=2\n/);
+  assert.match(local.stdout, /CARGO_ARGS build --locked --release -p zeron --bin zeron --bin zeron-engine --target-dir .+\/target\/staging --jobs=2\n/);
 });
 
 test("unselected local packaging retains Canary and explicit production stays production", { skip: !nativeHost }, () => {
@@ -108,7 +108,7 @@ test("unselected local packaging retains Canary and explicit production stays pr
     assert.equal(result.status, 86, result.stderr + result.stdout);
     assert.ok(result.stdout.includes(`BUILD_BOUNDARY ${expected} ${expected}`));
     const targetSuffix = expected === "canary" ? "/canary" : "";
-    assert.match(result.stdout, new RegExp(`CARGO_ARGS build --locked --release -p zeron --bin zeron --target-dir .+/target${targetSuffix} --jobs=2\\n`));
+    assert.match(result.stdout, new RegExp(`CARGO_ARGS build --locked --release -p zeron --bin zeron --bin zeron-engine --target-dir .+/target${targetSuffix} --jobs=2\\n`));
   }
 });
 
@@ -128,10 +128,17 @@ test("distribution verification rejects wrong bundle metadata and unsigned execu
         encoding: "utf8", timeout: 10_000,
       });
     };
+    const missingEngine = verify("ai.ashler.comet");
+    assert.equal(missingEngine.status, 1);
+    assert.match(missingEngine.stderr, /background engine is missing/);
+    const engine = path.join(app, "Contents", "MacOS", "Crew Engine");
+    writeFileSync(engine, "#!/bin/sh\nexit 0\n");
+    chmodSync(engine, 0o700);
     for (const identifier of ["ai.ashler.comet.staging", "ai.ashler.comet"]) {
       const result = verify(identifier);
       assert.ifError(result.error);
       assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stderr, /background engine is missing/);
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });

@@ -4,17 +4,24 @@
 //! Context occupancy is replicated per chat; billing `Usage` remains a harness passthrough.
 
 pub mod agent;
+pub mod agent_messages;
+pub mod annotation;
 pub mod attachment_mentions;
-pub mod chat_mentions;
 pub mod change_request_assessment;
+pub mod chat_mentions;
+pub mod cloud;
 pub mod collaboration;
 pub mod device_paths;
 pub mod entities;
 pub mod file_mentions;
 pub mod invocation;
 pub mod motion;
+pub mod plan_usage;
 pub mod preview;
+pub mod program_status;
 pub mod projectless;
+pub mod providers;
+pub mod run_errors;
 pub mod runtime;
 pub mod sidebar_pins;
 pub mod view;
@@ -22,10 +29,12 @@ pub mod voice;
 pub mod workspace;
 
 pub use agent::*;
+pub use cloud::*;
 pub use collaboration::*;
-pub use runtime::*;
 pub use entities::*;
 pub use preview::*;
+pub use program_status::*;
+pub use runtime::*;
 pub use sidebar_pins::*;
 pub use workspace::*;
 
@@ -48,7 +57,10 @@ impl std::fmt::Debug for AccessToken {
 #[cfg(test)]
 #[test]
 fn credential_debug_redacts_the_bearer() {
-    let token = AccessToken { value: "private-credential".into(), generation: 42 };
+    let token = AccessToken {
+        value: "private-credential".into(),
+        generation: 42,
+    };
     let debug = format!("{token:?}");
     assert!(!debug.contains(&token.value));
     assert!(debug.contains("42"));

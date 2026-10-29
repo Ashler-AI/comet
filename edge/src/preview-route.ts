@@ -1,5 +1,6 @@
 import type { Verified } from "./auth";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
+import { PREVIEW_SIGN_IN_HEADER } from "./preview-room";
 /** Route identity comes exclusively from verified JWT claims. */
 export function previewRoute(request: Request, env: Pick<Env, "PREVIEW_ROOMS">, auth: Pick<Verified, "userId" | "orgId">): Promise<Response> | Response | undefined {
   const url = new URL(request.url);
@@ -9,9 +10,14 @@ export function previewRoute(request: Request, env: Pick<Env, "PREVIEW_ROOMS">, 
   if (auth.orgId !== parts[1]) return new Response("Forbidden", { status: 403 });
   const device = url.searchParams.get("device") ?? "";
   if (!id.test(device)) return new Response("Invalid device", { status: 400 });
+  const signIn = url.searchParams.get("signIn") === "1";
   const room = env.PREVIEW_ROOMS.get(env.PREVIEW_ROOMS.idFromName(`preview1/${parts[1]}/${auth.userId}`));
   url.pathname = "/ws"; url.search = `?device=${device}`;
   const headers = new Headers(request.headers);
   headers.set(AUTH_USER_HEADER, auth.userId); headers.delete(ROOM_KIND_HEADER);
+  // This header changes admission policy, so always remove the caller's value
+  // and derive it only from the authenticated route's validated query.
+  headers.delete(PREVIEW_SIGN_IN_HEADER);
+  if (signIn) headers.set(PREVIEW_SIGN_IN_HEADER, "1");
   return room.fetch(new Request(url, { method: request.method, headers }));
 }

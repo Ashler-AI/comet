@@ -32,17 +32,23 @@ if [[ "${ZERON_SKIP_CORE:-}" == "1" && -f "$OUT/libzeron_mobile.a" ]]; then
   exit 0
 fi
 
-# Xcode exports the app SDK and puts raw toolchain compilers before Apple's
-# SDK-selecting /usr/bin shims. Neither may leak into host build scripts/bindgen.
+# Xcode exports SDKROOT/deployment vars for the *app* SDK; host build scripts
+# (proc macros, build.rs) must not see them, so cargo runs in a clean env.
+# Keep whichever cargo the caller's PATH finds, and rustup's homes: rustup
+# isn't always in ~/.cargo/bin (a CI runner image moved it).
+CARGO_DIRS="$HOME/.cargo/bin"
+if FOUND="$(command -v cargo)"; then CARGO_DIRS="$(dirname "$FOUND"):$CARGO_DIRS"; fi
+KEEP=()
+for name in CARGO_HOME RUSTUP_HOME; do
+  if [[ -n "${!name:-}" ]]; then KEEP+=("$name=${!name}"); fi
+done
 run_cargo() {
   env -i HOME="$HOME" USER="${USER:-}" TERM="${TERM:-dumb}" \
-    PATH="/usr/bin:/bin:$PATH" \
+    ${KEEP[@]+"${KEEP[@]}"} \
+    PATH="$CARGO_DIRS:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     ASHLER_INCREMENTAL_TSC_CHECKS=false \
     IPHONEOS_DEPLOYMENT_TARGET=26.0 \
     CARGO_TARGET_DIR="$ROOT/target" \
-    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
-    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}" \
-    CARGO_PROFILE_MOBILE_DEBUG="${CARGO_PROFILE_MOBILE_DEBUG:-line-tables-only}" \
     cargo "$@"
 }
 

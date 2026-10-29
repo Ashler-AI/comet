@@ -141,12 +141,17 @@ fn files_panel_workspace_navigation_and_external_updates() {
             .rename_chat(id, &format!("Explore files · {id}"))
             .unwrap();
     }
-    let (port, _ipc) = runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
-        (port, server)
-    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    // The viewport below attaches with the bearer published in its data dir.
+    let _ipc = runtime
+        .block_on(zeron_engine::serve_ipc(
+            port,
+            &directory.path().join("ui"),
+            core.rpc_service(),
+        ))
+        .unwrap();
     let output = std::env::var_os("ZERON_FILES_CAPTURES").map(PathBuf::from);
     let application = if output.is_some() {
         gpui_platform::application()
@@ -190,13 +195,17 @@ fn files_panel_workspace_navigation_and_external_updates() {
             crate::composer::init(cx, settings.composer_send_behavior);
             crate::terminal::panel::init(cx);
             crate::app_menus::init(cx);
-            let boot = EngineBootConfig { managed_inference: false, scaffold: None, data_dir: data,
-            ipc_port: port,
-            edge_url: String::new(),
-            edge_token: None,
-            org_id: None,
-            workos_client_id: None,
-            default_harness: zeron_proto::HarnessId::Mock, };
+            let boot = EngineBootConfig {
+                managed_inference: false,
+                scaffold: None,
+                data_dir: data,
+                ipc_port: port,
+                edge_url: String::new(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock,
+            };
             let state = cx.new(|_| AppState::new());
             let window = cx
                 .open_window(

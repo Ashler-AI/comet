@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
 use zeron_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
-use zeron_rpc::{connect_ws, memory_client, methods};
+use zeron_rpc::{connect_ipc, memory_client, methods};
 
 fn config(
     data_dir: &std::path::Path,
@@ -500,7 +500,7 @@ async fn headless_stop_rpc_drains_the_daemon_and_releases_ipc() {
             result = &mut daemon => panic!("headless engine exited before IPC connected: {result:?}"),
             client = async {
                 loop {
-                    match connect_ws(&format!("ws://127.0.0.1:{port}")).await {
+                    match connect_ipc(port, Some(dir.path())).await {
                         Ok(client) => break client,
                         Err(error) => last_connect_error = Some(error),
                     }
@@ -558,7 +558,7 @@ async fn headless_sign_out_closes_joined_edge_rooms_and_stops_daemon() {
             result = &mut daemon => panic!("headless engine exited before IPC connected: {result:?}"),
             client = async {
                 loop {
-                    match connect_ws(&format!("ws://127.0.0.1:{port}")).await {
+                    match connect_ipc(port, Some(dir.path())).await {
                         Ok(client) => break client,
                         Err(error) => last_connect_error = Some(error),
                     }

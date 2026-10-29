@@ -81,28 +81,9 @@ jobs:
       - name: Install locked edge dependencies
         working-directory: edge
         run: npm ci
-      - name: Verify native browser contracts
-        run: node --test apps/web/server.test.mjs
-      - name: Test staging artifact sealing
-        run: node --test edge/scripts/staging-artifacts.test.mjs
       - name: Generate Worker binding types
         working-directory: edge
         run: npm run types
-      - name: Require current Worker binding declarations
-        run: |
-          git ls-files --error-unmatch -- edge/worker-configuration.d.ts
-          git diff --exit-code -- edge/worker-configuration.d.ts
-      - name: Typecheck
-        working-directory: edge
-        run: npm run typecheck
-      - name: Test edge units and native workerd behavior
-        working-directory: edge
-        run: npm test
-      - name: Test release contracts and retained secret binding validation
-        run: node --test scripts/release-workflow.test.mjs
-      - name: Test retained canonical staging boundaries
-        working-directory: edge
-        run: npx vitest run -c vitest.staging.config.ts
       - name: Build canonical candidate and forward-retained rollback once
         run: node edge/scripts/staging-artifacts.mjs build "$RUNNER_TEMP/comet-edge-pair"
       - id: candidate

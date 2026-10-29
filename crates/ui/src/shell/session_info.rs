@@ -13,6 +13,7 @@ use crate::project_actions::{ProjectActionsStatus, action_icon};
 pub(super) const SESSION_CARD_WIDTH: f32 = 272.0;
 const SESSION_CARD_INSET: f32 = 12.0;
 const SESSION_CARD_GAP: f32 = 24.0;
+const SESSION_CARDS_GAP: f32 = 8.0;
 /// The transcript's own side gutters (its rows pad 48px each side).
 const TRANSCRIPT_GUTTER: f32 = 48.0;
 
@@ -28,6 +29,45 @@ pub(super) fn session_card_reserve(main: f32, transcript: f32) -> Option<f32> {
     let reserve = (main + transcript - 2.0 * (card_left - SESSION_CARD_GAP)).max(0.0);
     (main - reserve - 2.0 * TRANSCRIPT_GUTTER >= transcript - 0.5).then_some(reserve)
 }
+
+#[derive(Default)]
+pub(super) struct SessionDiffs {
+    diffs: Vec<zeron_proto::CheckoutDiff>,
+    target: Option<Option<String>>,
+    _watch: Option<Task<()>>,
+    base: Option<(String, String)>,
+    branch: Option<(String, (u32, u32))>,
+    fetched: Option<String>,
+    _fetch: Option<Task<()>>,
+}
+
+impl SessionDiffs {
+    fn checksum(&self, chat: &zeron_proto::Chat) -> Option<String> {
+        crate::changes::resolve_diff(&self.diffs, chat).map(|diff| diff.checksum.clone())
+    }
+
+    fn totals(&self, chat: &zeron_proto::Chat) -> Option<(u32, u32)> {
+        let context = format!("{}|{}", chat.id, chat.cwd.as_deref()?);
+        self.branch
+            .as_ref()
+            .filter(|(key, _)| *key == context)
+            .map(|&(_, totals)| totals)
+            .filter(|&(adds, dels)| adds + dels > 0)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SessionPreviews {
+    snapshot: zeron_proto::PreviewSnapshot,
+    chat: Option<String>,
+    _watch: Option<Task<()>>,
+    shown: usize,
+    scroll: gpui::ScrollHandle,
+    bar: popover::MenuScrollbarState,
+}
+
+const PORTS_INITIAL: usize = 3;
+const PORTS_PAGE: usize = 10;
 
 /// A non-interactive card row: icon slot, label, optional trailing detail.
 fn info_row(theme: &Theme, glyph: AnyElement, label: SharedString) -> gpui::Div {
@@ -80,6 +120,203 @@ fn session_environment_url(
 }
 
 impl Shell {
+    fn ensure_session_diffs(&mut self, cx: &mut Context<Self>) {
+        let (target, engine) = {
+            let state = self.state.read(cx);
+            let Some(chat) = state.selected_chat_row() else {
+                return;
+            };
+            let device = chat.device_id.clone();
+            let target =
+                (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device);
+            (target, state.engine().cloned())
+        };
+        if self.session_diffs.target.as_ref() == Some(&target) {
+            return;
+        }
+        let Some(engine) = engine else {
+            return;
+        };
+        self.session_diffs.diffs.clear();
+        self.session_diffs.target = Some(target.clone());
+        self.session_diffs._watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let mut params = serde_json::Map::new();
+                if let Some(target) = &target {
+                    params.insert(
+                        "targetDeviceId".into(),
+                        serde_json::Value::String(target.clone()),
+                    );
+                }
+                if let Ok(mut rx) = engine
+                    .client()
+                    .subscribe(
+                        methods::WATCH_CHECKOUT_DIFFS,
+                        serde_json::Value::Object(params),
+                    )
+                    .await
+                {
+                    while let Some(value) = rx.recv().await {
+                        let alive = this.update(cx, |this, cx| {
+                            let chat = this.state.read(cx).selected_chat_row().cloned();
+                            let checksum = |diffs: &SessionDiffs| {
+                                chat.as_ref().and_then(|chat| diffs.checksum(chat))
+                            };
+                            let before = checksum(&this.session_diffs);
+                            if crate::changes::apply_diff_frame(
+                                &mut this.session_diffs.diffs,
+                                value,
+                            ) && checksum(&this.session_diffs) != before
+                            {
+                                cx.notify();
+                            }
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        }));
+    }
+
+    fn ensure_session_previews(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.session_previews.chat.as_deref() == Some(chat_id) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.session_previews = SessionPreviews {
+            chat: Some(chat_id.to_owned()),
+            ..Default::default()
+        };
+        let chat_id = chat_id.to_owned();
+        self.session_previews._watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                if let Ok(mut rx) = engine
+                    .client()
+                    .subscribe(
+                        methods::WATCH_PREVIEWS,
+                        serde_json::json!({ "chatId": chat_id }),
+                    )
+                    .await
+                {
+                    while let Some(value) = rx.recv().await {
+                        let Ok(snapshot) =
+                            serde_json::from_value::<zeron_proto::PreviewSnapshot>(value)
+                        else {
+                            continue;
+                        };
+                        let alive = this.update(cx, |this, cx| {
+                            if this.session_previews.snapshot != snapshot {
+                                this.session_previews.snapshot = snapshot;
+                                cx.notify();
+                            }
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let alive = this.update(cx, |this, cx| {
+                    if !this.session_previews.snapshot.services.is_empty() {
+                        this.session_previews.snapshot.services.clear();
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        }));
+    }
+
+    fn ensure_branch_totals(&mut self, chat: &zeron_proto::Chat, cx: &mut Context<Self>) {
+        let Some(cwd) = chat.cwd.clone() else {
+            return;
+        };
+        let Some(checksum) = self.session_diffs.checksum(chat) else {
+            return;
+        };
+        let context = format!("{}|{cwd}", chat.id);
+        let key = format!("{context}|{checksum}");
+        if self.session_diffs.fetched.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let target = self.session_diffs.target.clone().flatten();
+        let repo = format!("{}:{cwd}", target.as_deref().unwrap_or("local"));
+        let known_base = self
+            .session_diffs
+            .base
+            .as_ref()
+            .filter(|(at, _)| *at == repo)
+            .map(|(_, base)| base.clone());
+        let current = chat.branch.clone();
+        self.session_diffs.fetched = Some(key.clone());
+        self.session_diffs._fetch = Some(cx.spawn(async move |this, cx| {
+            let with_target = |mut params: serde_json::Map<String, serde_json::Value>| {
+                if let Some(target) = &target {
+                    params.insert(
+                        "targetDeviceId".into(),
+                        serde_json::Value::String(target.clone()),
+                    );
+                }
+                serde_json::Value::Object(params)
+            };
+            let base = match known_base {
+                Some(base) => Some(base),
+                None => {
+                    let mut params = serde_json::Map::new();
+                    params.insert("repoPath".into(), serde_json::Value::String(cwd.clone()));
+                    engine
+                        .client()
+                        .call(methods::LIST_BRANCHES, with_target(params))
+                        .await
+                        .ok()
+                        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                        .and_then(|branches| {
+                            crate::changes::default_base_ref(&branches, current.as_deref())
+                        })
+                }
+            };
+            let diff = match &base {
+                Some(base) => {
+                    let mut params = serde_json::Map::new();
+                    params.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+                    params.insert("mode".into(), "branch".into());
+                    params.insert("baseRef".into(), serde_json::Value::String(base.clone()));
+                    engine
+                        .client()
+                        .call(methods::GET_CHECKOUT_DIFF, with_target(params))
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            serde_json::from_value::<zeron_proto::CheckoutDiff>(value).ok()
+                        })
+                }
+                None => None,
+            };
+            this.update(cx, |this, cx| {
+                let diffs = &mut this.session_diffs;
+                if diffs.fetched.as_deref() != Some(key.as_str()) {
+                    return;
+                }
+                if let Some(base) = base {
+                    diffs.base = Some((repo, base));
+                }
+                diffs.branch = diff.map(|diff| (context, (diff.additions, diff.deletions)));
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// The card's reserve at the main column's LIVE width (see
     /// [`session_card_reserve`]): while the sidebar or a pane animates, the
     /// settled width would move or hide the card ahead of the column.
@@ -129,9 +366,19 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn show_session_info(&mut self, cx: &mut Context<Self>) {
+        if !self.session_info_fits(cx) {
+            self.session_info_overlay = true;
+        } else if self.settings.session_info_hidden {
+            self.settings.session_info_hidden = false;
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
     /// Dismiss the card floating over the transcript; one shown beside it
     /// stays put.
-    fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
         if self.session_info_overlay {
             self.session_info_overlay = false;
             cx.notify();
@@ -144,7 +391,10 @@ impl Shell {
         link: SessionEnvironmentLink,
         cx: &mut Context<Self>,
     ) {
-        let url = self.state.read(cx).selected_chat_row()
+        let url = self
+            .state
+            .read(cx)
+            .selected_chat_row()
             .filter(|chat| chat.id == chat_id)
             .and_then(|chat| session_environment_url(&chat.id, chat.crew.as_ref(), link));
         if let Some(url) = url {
@@ -157,7 +407,8 @@ impl Shell {
     /// it), its reveal, 0 (hidden) → 1 (shown), and the room the transcript
     /// holds free for it. The reveal eases on the shell's resize clock
     /// whenever the card shows or hides, by toggle or by the column crossing
-    /// the fit, and the reserve eases with it.
+    /// the fit, and the reserve eases with it. A switch between chats lands
+    /// it directly, with the destination's panels.
     pub(super) fn session_info_frame(&mut self, has_selection: bool, cx: &App) -> (bool, f32, f32) {
         let reserve = self.session_info_reserve(cx);
         if let Some(reserve) = reserve {
@@ -170,11 +421,13 @@ impl Shell {
             self.session_info_docked = reserve.is_some();
         }
         let target = if shown { 1.0 } else { 0.0 };
-        if shown != self.session_info_shown {
+        if std::mem::take(&mut self.session_info_snap) {
+            self.session_info_tween = None;
+        } else if shown != self.session_info_shown {
             let from = self.eval_tween(self.session_info_tween, 1.0 - target);
             self.session_info_tween = Some(WidthTween::new(from, target));
-            self.session_info_shown = shown;
         }
+        self.session_info_shown = shown;
         let reveal = self.eval_tween(self.session_info_tween, target);
         // Hiding as the column stops fitting, the card keeps its docked look
         // and the transcript eases back from the last room it held.
@@ -197,6 +450,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if reveal <= 0.001 {
+            self.session_diffs = SessionDiffs::default();
+            self.session_previews = SessionPreviews::default();
             return None;
         }
         let theme = Theme::of(cx).for_popup();
@@ -254,36 +509,84 @@ impl Shell {
             None => info_row(&theme, row_glyph(icons::HOME, &theme), "No project".into())
                 .into_any_element(),
         };
+        self.ensure_session_diffs(cx);
+        self.ensure_branch_totals(&chat, cx);
+        let totals = self.session_diffs.totals(&chat);
         let branch_row = branch.map(|branch| {
             info_row(&theme, row_glyph(icons::GIT_BRANCH, &theme), branch.clone())
                 .id("session-info-branch")
                 .tooltip(crate::settings::widgets::text_tooltip(branch))
+                .children(totals.map(|(adds, dels)| {
+                    let stat = |text: String, color: gpui::Hsla| {
+                        div()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(color)
+                            .child(SharedString::from(text))
+                    };
+                    div()
+                        .id("session-info-diff")
+                        .debug_selector(|| "session-info-diff".into())
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(5.0))
+                        .mr(px(-5.0))
+                        .py(px(2.0))
+                        .rounded(px(5.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::ink(0.08)))
+                        .tooltip(crate::settings::widgets::text_tooltip("Branch changes"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_session_info_overlay(cx);
+                            this.add_branch_diff_surface(window, cx);
+                        }))
+                        .child(stat(format!("+{adds}"), crate::changes::add_color(&theme)))
+                        .child(stat(format!("−{dels}"), crate::changes::del_color(&theme)))
+                }))
         });
 
         let environment_links = [
-            ("crew-session-web", "Web", "Open Web in browser", SessionEnvironmentLink::Web),
-            ("crew-session-tilt", "Tilt", "Open Tilt in browser", SessionEnvironmentLink::Tilt),
-        ].map(|(id, label, aria_label, link)| {
+            (
+                "crew-session-web",
+                "Web",
+                "Open Web in browser",
+                SessionEnvironmentLink::Web,
+            ),
+            (
+                "crew-session-tilt",
+                "Tilt",
+                "Open Tilt in browser",
+                SessionEnvironmentLink::Tilt,
+            ),
+        ]
+        .map(|(id, label, aria_label, link)| {
             session_environment_url(&chat.id, chat.crew.as_ref(), link)?;
             let click_chat = chat.id.clone();
             let key_chat = chat.id.clone();
-            Some(popover::picker_row(&theme, false, false, id)
-                .id(id)
-                .role(gpui::Role::Link)
-                .aria_label(aria_label)
-                .tab_index(0)
-                .focus_visible(|style| style.border_2().border_color(theme.accent))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_session_environment_link(&click_chat, link, cx);
-                }))
-                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
-                    if !event.is_held && matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        cx.stop_propagation();
-                        this.open_session_environment_link(&key_chat, link, cx);
-                    }
-                }))
-                .child(popover::picker_icon_slot(row_glyph(icons::GLOBE, &theme)))
-                .child(div().flex_1().child(label)))
+            Some(
+                popover::picker_row(&theme, false, false, id)
+                    .id(id)
+                    .role(gpui::Role::Link)
+                    .aria_label(aria_label)
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_2().border_color(theme.accent))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_session_environment_link(&click_chat, link, cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                        if !event.is_held
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            cx.stop_propagation();
+                            this.open_session_environment_link(&key_chat, link, cx);
+                        }
+                    }))
+                    .child(popover::picker_icon_slot(row_glyph(icons::GLOBE, &theme)))
+                    .child(div().flex_1().child(label)),
+            )
         });
 
         // ── This conversation.
@@ -311,6 +614,8 @@ impl Shell {
 
         // ── The project's run actions.
         let actions = self.render_session_info_actions(&theme, cx);
+        let lanes =
+            self.render_session_lanes(&chat, !docked, self.viewport_height / 2.0, &theme, cx);
 
         let body = div()
             .id("session-info-body")
@@ -326,50 +631,104 @@ impl Shell {
             .child(project_row)
             .children(branch_row)
             .when_some(chat.crew.as_ref(), |body, crew| {
-                let label = match crew.environment.as_ref().map(|environment| &environment.source) {
-                    Some(zeron_proto::SessionEnvironmentSource::Scaffold { lifecycle, .. }) => format!("{} · {}", crew.environment.as_ref().and_then(|environment| environment.name.as_deref()).unwrap_or("Scaffold sandbox"), crate::settings::crew::lifecycle_label(*lifecycle)),
-                    _ => if local { "Local host".into() } else { "Remote host".into() },
+                let label = match crew
+                    .environment
+                    .as_ref()
+                    .map(|environment| &environment.source)
+                {
+                    Some(zeron_proto::SessionEnvironmentSource::Scaffold { lifecycle, .. }) => {
+                        format!(
+                            "{} · {}",
+                            crew.environment
+                                .as_ref()
+                                .and_then(|environment| environment.name.as_deref())
+                                .unwrap_or("Scaffold sandbox"),
+                            crate::settings::crew::lifecycle_label(*lifecycle)
+                        )
+                    }
+                    _ => {
+                        if local {
+                            "Local host".into()
+                        } else {
+                            "Remote host".into()
+                        }
+                    }
                 };
-                body.child(info_row(&theme, row_glyph(icons::MONITOR, &theme), label.into())
-                    .id("crew-session-environment")
-                    .tooltip(crate::settings::widgets::text_tooltip(format!("Owner {}\nProject {}\nDeployment {}\nSession {}", crew.owner_subject, crew.scope.project_id, crew.scope.deployment_id.as_deref().unwrap_or("none"), crew.session_id))))
+                body.child(
+                    info_row(&theme, row_glyph(icons::MONITOR, &theme), label.into())
+                        .id("crew-session-environment")
+                        .tooltip(crate::settings::widgets::text_tooltip(format!(
+                            "Owner {}\nProject {}\nDeployment {}\nSession {}",
+                            crew.owner_subject,
+                            crew.scope.project_id,
+                            crew.scope.deployment_id.as_deref().unwrap_or("none"),
+                            crew.session_id
+                        ))),
+                )
             })
             .children(environment_links.into_iter().flatten())
-            .when(!online, |body| body.child(crate::settings::widgets::page_subtitle(&theme,
-                "Host offline. Synced history remains available; continuing requires its host.")))
-            .when(self.state.read(cx).managed_inference, |body| body.child(
-                crate::settings::widgets::ghost_action(&theme)
-                    .id("crew-session-sandboxes").role(gpui::Role::Button).tab_index(0)
-                    .aria_label("Manage Scaffold sandboxes")
-                    .focus_visible(|style| style.border_2().border_color(theme.accent))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.close_session_info_overlay(cx);
-                        this.open_settings(SettingsSection::Sandboxes, cx);
-                    })).child("Manage sandboxes")))
-            .when(chat.crew.is_some(), |body| body.child(crate::settings::widgets::ghost_action(&theme)
-                .id("crew-session-controls").role(gpui::Role::Button)
-                .aria_label("Shared annotations").tab_index(0)
-                .focus_visible(|style| style.border_2().border_color(theme.accent))
-                .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| { window.prevent_default(); cx.stop_propagation(); })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.accounts_page.is_none() {
-                        let state = this.state.clone();
-                        this.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
-                    }
-                    if crate::markdown::selection::selected_message_anchor().is_some()
-                        && let Some(page) = &this.accounts_page {
-                        page.update(cx, |page, cx| page.capture_annotation_selection(cx));
-                    }
-                    this.open_settings(SettingsSection::Annotations, cx);
-                }))
-                .child("Shared annotations")))
+            .when(!online, |body| {
+                body.child(crate::settings::widgets::page_subtitle(
+                    &theme,
+                    "Host offline. Synced history remains available; continuing requires its host.",
+                ))
+            })
+            .when(self.state.read(cx).managed_inference, |body| {
+                body.child(
+                    crate::settings::widgets::ghost_action(&theme)
+                        .id("crew-session-sandboxes")
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .aria_label("Manage Scaffold sandboxes")
+                        .focus_visible(|style| style.border_2().border_color(theme.accent))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_session_info_overlay(cx);
+                            this.open_settings(SettingsSection::Sandboxes, cx);
+                        }))
+                        .child("Manage sandboxes"),
+                )
+            })
+            .when(chat.crew.is_some(), |body| {
+                body.child(
+                    crate::settings::widgets::ghost_action(&theme)
+                        .id("crew-session-controls")
+                        .role(gpui::Role::Button)
+                        .aria_label("Shared annotations")
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_2().border_color(theme.accent))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.accounts_page.is_none() {
+                                let state = this.state.clone();
+                                this.accounts_page =
+                                    Some(cx.new(|cx| AccountsPage::new(state, cx)));
+                            }
+                            if crate::markdown::selection::selected_message_anchor().is_some()
+                                && let Some(page) = &this.accounts_page
+                            {
+                                page.update(cx, |page, cx| page.capture_annotation_selection(cx));
+                            }
+                            this.open_settings(SettingsSection::Annotations, cx);
+                        }))
+                        .child("Shared annotations"),
+                )
+            })
             .child(popover::picker_divider())
             .child(side_chat)
             .child(fork)
             .children(actions);
 
+        let ports =
+            self.render_session_ports(&chat.id, !docked, self.viewport_height / 3.0, &theme, cx);
+
         let card = div()
             .w(px(SESSION_CARD_WIDTH))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
             .rounded(px(popover::CARD_RADIUS))
             .overflow_hidden()
             .border_1()
@@ -377,6 +736,8 @@ impl Shell {
             .bg(popover::surface_bg(&theme))
             .when(!docked && !theme.is_frost(), |card| card.shadow_lg())
             .child(body);
+        let frosted =
+            |card| crate::frost::frosted(popover::CARD_RADIUS, crate::frost::MENU_BLUR, card);
 
         // Docked, the card slides in from the right beside the column;
         // floating, it drops in from just above. Either way it is placed from
@@ -394,6 +755,10 @@ impl Shell {
                 .absolute()
                 .top(px(Theme::TITLEBAR_HEIGHT + 12.0 + dy))
                 .right(px(SESSION_CARD_INSET - dx))
+                .max_h(px(max_height.max(240.0)))
+                .flex()
+                .flex_col()
+                .gap(px(SESSION_CARDS_GAP))
                 .opacity(ease)
                 .occlude()
                 // Over the transcript it is a popover: a press elsewhere, or
@@ -403,11 +768,150 @@ impl Shell {
                         cx.listener(|this, _, _, cx| this.close_session_info_overlay(cx)),
                     )
                 })
-                .child(crate::frost::frosted(
-                    popover::CARD_RADIUS,
-                    crate::frost::MENU_BLUR,
-                    card,
-                ))
+                .child(frosted(card.into_any_element()))
+                .children(ports.map(frosted))
+                .child(frosted(lanes))
+                .into_any_element(),
+        )
+    }
+
+    fn render_session_ports(
+        &mut self,
+        chat_id: &str,
+        floating: bool,
+        max_height: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.ensure_session_previews(chat_id, cx);
+        let snapshot = &self.session_previews.snapshot;
+        if snapshot.services.is_empty() {
+            return None;
+        }
+        let note = |text: SharedString| {
+            div()
+                .px(px(9.0))
+                .py(px(5.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .line_height(px(18.0))
+                .text_color(theme.text_muted)
+                .child(text)
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> =
+            vec![popover::menu_heading(theme, "Ports").into_any_element()];
+        let available = snapshot.error.is_none();
+        let shown = self.session_previews.shown.max(PORTS_INITIAL);
+        let hidden = snapshot.services.len().saturating_sub(shown);
+        for service in snapshot.services.iter().take(shown) {
+            let url = service.url(snapshot.proxy_port);
+            let row_id = SharedString::from(format!("session-info-preview-{}", service.id));
+            let port = SharedString::from(format!(":{}", service.port));
+            let detail = SharedString::from(if snapshot.remote {
+                format!("{} · {url}", service.device_name)
+            } else {
+                url.clone()
+            });
+            rows.push(
+                popover::picker_row(theme, false, false, row_id.clone())
+                    .id(row_id)
+                    .tooltip(crate::settings::widgets::text_tooltip(detail))
+                    .when(!available, |row| row.opacity(0.5).cursor_default())
+                    .when(available, |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_session_info_overlay(cx);
+                            this.browser_context.register_preview(&url);
+                            this.set_surfaces_open(true, cx);
+                            this.add_browser_surface(Some(url.clone()), window, cx);
+                        }))
+                    })
+                    .child(popover::picker_icon_slot(row_glyph(icons::GLOBE, theme)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(service.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(port),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if hidden > 0 {
+            rows.push(
+                popover::picker_row(theme, false, false, "session-ports-more")
+                    .id("session-ports-more")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        let previews = &mut this.session_previews;
+                        previews.shown = previews.shown.max(PORTS_INITIAL) + PORTS_PAGE;
+                        cx.notify();
+                    }))
+                    .child(popover::picker_icon_slot(div().into_any_element()))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(format!("Show {} more", hidden.min(PORTS_PAGE))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        // Listed but unreachable: why.
+        if let Some(error) = &snapshot.error {
+            rows.push(note(error.clone().into()));
+        }
+        let body = div()
+            .id("session-ports-body")
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.session_previews.scroll)
+            .p(px(popover::CARD_INSET))
+            .flex()
+            .flex_col()
+            .gap(px(popover::MENU_GAP))
+            .children(rows);
+        // The rail shows only once the ports outgrow the card and scroll.
+        let scrollbar = popover::rail_for(
+            self,
+            popover::RailAccess {
+                bar: |this: &mut Self| &mut this.session_previews.bar,
+                scroll: |this: &Self| this.session_previews.scroll.clone(),
+            },
+            "session-ports-scrollbar",
+            theme,
+            cx,
+        );
+        Some(
+            div()
+                .id("session-ports")
+                .debug_selector(|| "session-ports".into())
+                .relative()
+                .w(px(SESSION_CARD_WIDTH))
+                .max_h(px(max_height))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .rounded(px(popover::CARD_RADIUS))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.border)
+                .bg(popover::surface_bg(theme))
+                .when(floating && !theme.is_frost(), |card| card.shadow_lg())
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if this.session_previews.bar.set_list_hovered(*hovered) {
+                        cx.notify();
+                    }
+                }))
+                .child(body)
+                .children(scrollbar)
                 .into_any_element(),
         )
     }
@@ -583,19 +1087,34 @@ mod tests {
                     "links": { "web": "https://example.com/app", "tilt": "http://localhost:10350/" } }
             }
         })).unwrap();
-        assert_eq!(session_environment_url("session", Some(&crew), Web).as_deref(), Some("https://example.com/app"));
-        assert_eq!(session_environment_url("session", Some(&crew), Tilt).as_deref(), Some("http://localhost:10350/"));
+        assert_eq!(
+            session_environment_url("session", Some(&crew), Web).as_deref(),
+            Some("https://example.com/app")
+        );
+        assert_eq!(
+            session_environment_url("session", Some(&crew), Tilt).as_deref(),
+            Some("http://localhost:10350/")
+        );
         assert!(session_environment_url("other-session", Some(&crew), Web).is_none());
         assert!(session_environment_url("session", None, Web).is_none());
 
-        for url in [None, Some("javascript:alert(1)"), Some("https://user:pass@example.com/"),
-            Some("https:///missing-authority"), Some("https://example.com/\npath"), Some("example.com")] {
+        for url in [
+            None,
+            Some("javascript:alert(1)"),
+            Some("https://user:pass@example.com/"),
+            Some("https:///missing-authority"),
+            Some("https://example.com/\npath"),
+            Some("example.com"),
+        ] {
             if let zeron_proto::SessionEnvironmentSource::Scaffold { links, .. } =
                 &mut crew.environment.as_mut().unwrap().source
             {
                 links.web = url.map(str::to_owned);
             }
-            assert!(session_environment_url("session", Some(&crew), Web).is_none(), "{url:?}");
+            assert!(
+                session_environment_url("session", Some(&crew), Web).is_none(),
+                "{url:?}"
+            );
             assert!(session_environment_url("session", Some(&crew), Tilt).is_some());
         }
         crew.environment.as_mut().unwrap().owner_principal = "other-owner".into();

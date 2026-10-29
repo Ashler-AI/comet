@@ -21,7 +21,10 @@ pub(crate) struct ChatPersistence {
     urgent: AtomicBool,
     write: Mutex<()>,
     wake: Option<mpsc::Sender<()>>,
-    pub(crate) initial_cursor_verified: bool,
+    /// Seeded from the store, then set by the first verified write: cursor
+    /// repair is once per legacy snapshot, never once per rejoin. The thin
+    /// client reads the same flag from the store (client/src/live/room.rs).
+    cursor_verified: AtomicBool,
     #[cfg(test)]
     writes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -51,7 +54,7 @@ impl ChatPersistence {
             urgent: AtomicBool::new(false),
             write: Mutex::new(()),
             wake: runtime.as_ref().map(|_| tx),
-            initial_cursor_verified: verified,
+            cursor_verified: AtomicBool::new(verified),
             #[cfg(test)]
             writes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -65,6 +68,10 @@ impl ChatPersistence {
 
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cursor_verified(&self) -> bool {
+        self.cursor_verified.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_clean(&self) -> bool {
@@ -170,6 +177,7 @@ impl ChatPersistence {
             self.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
             #[cfg(test)]
             self.writes.fetch_add(1, Ordering::Relaxed);
+            self.cursor_verified.store(true, Ordering::Release);
             self.saved.store(generation, Ordering::Release);
             Ok(())
         };
@@ -271,12 +279,14 @@ mod tests {
     #[test]
     fn admission_flush_preserves_verified_cursor_and_reports_disk_failure() {
         let (dir, doc, store, persistence) = fixture();
+        assert!(!persistence.cursor_verified());
         doc.doc().get_map("test").insert("admitted", 1_i64).unwrap();
         doc.doc().commit();
         persistence.applied(17, false);
         persistence.flush_checked().unwrap();
         assert_eq!(store.snapshot_cursor("whale").unwrap(), 17);
         assert!(store.snapshot_cursor_verified("whale").unwrap());
+        assert!(persistence.cursor_verified());
         assert_eq!(store.snapshot_epoch("whale").unwrap(), super::super::chat2_host::CHAT2_DOC_EPOCH);
         let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
         db.execute_batch("CREATE TRIGGER fail_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(FAIL,'disk unavailable'); END;").unwrap();

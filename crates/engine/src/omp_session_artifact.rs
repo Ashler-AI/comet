@@ -1027,8 +1027,10 @@ mod tests {
             let request = RunRequest { prompt, model: Some(model.clone()), harness: None, worktree: None,
                 mcp: None, reasoning: None, model_options: serde_json::Map::new(), cwd: cwd.clone(),
                 sandbox: SandboxLevel::DangerFullAccess, auto_approve: false,
+                access: Default::default(), plan: false,
                 resume: Some(journal.to_string_lossy().into_owned()),
-                attachments: if turn == 1 { vec![new_image.to_string_lossy().into_owned()] } else { Vec::new() } };
+                attachments: if turn == 1 { vec![new_image.to_string_lossy().into_owned()] } else { Vec::new() },
+                env: Default::default() };
             let mut events = harness.run(request, controls).await.expect("real native resume starts");
             let (mut text, mut identity, mut completed) = (String::new(), false, false);
             tokio::time::timeout(std::time::Duration::from_secs(180), async {

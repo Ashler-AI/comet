@@ -94,12 +94,25 @@ use zeron_proto::{
 use crate::repos::home_dir;
 use crate::{EngineError, new_id, now_ms};
 
+/// What a relayed sign-in callback answered: the device that caught the
+/// browser redirect returns the same status and redirect target to its browser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayedCallback {
+    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
 mod oauth;
+mod muse;
 mod antigravity;
 #[cfg(test)]
 mod provider_tests;
 mod stores;
 mod usage;
+
+pub use muse::MuseRunEnvironment;
 
 // Claude Code's public OAuth client (the one the CLI itself uses for the manual
 // "paste the code" flow — no secret involved, PKCE carries the proof).
@@ -194,6 +207,8 @@ pub struct AgentAccountsConfig {
     pub pi_agent_dir: PathBuf,
     /// Hermes' `HERMES_HOME` (default `~/.hermes`) — holds `auth.json`.
     pub hermes_home: PathBuf,
+    /// XDG config root used by Muse for its account metadata.
+    pub muse_config_root: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -227,6 +242,10 @@ impl AgentAccountsConfig {
             opencode_auth_file: stores::default_opencode_auth_file(),
             pi_agent_dir: stores::default_pi_agent_dir(),
             hermes_home: stores::default_hermes_home(),
+            muse_config_root: std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home_dir().join(".config")),
         }
     }
 
@@ -248,6 +267,7 @@ impl AgentAccountsConfig {
             opencode_auth_file: root.join("opencode").join("auth.json"),
             pi_agent_dir: root.join("pi"),
             hermes_home: root.join("hermes"),
+            muse_config_root: root.join("xdg-config"),
         }
     }
 
@@ -1043,6 +1063,7 @@ impl AgentAccounts {
             HarnessId::Devin,
             HarnessId::Opencode,
             HarnessId::Pi,
+            HarnessId::Muse,
         ]
         .into_iter()
         .map(|harness| (harness, self.read_slots(harness)))
@@ -1050,6 +1071,12 @@ impl AgentAccounts {
         let (hermes, hermes_active) = self.hermes_slots();
         active_keys.insert(HarnessId::Hermes, hermes_active);
         providers.push((HarnessId::Hermes, hermes));
+        if let Some(slot) = self.muse_active() {
+            active_keys
+                .entry(HarnessId::Muse)
+                .or_default()
+                .insert(slot.account_key);
+        }
         if force_usage {
             let targets: Vec<(HarnessId, &Slot, bool)> = providers
                 .iter()
@@ -1193,6 +1220,7 @@ impl AgentAccounts {
                 self.write_grok_entry(slot.store_key.as_deref(), &slot.credentials)?
             }
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
+            HarnessId::Muse => self.set_muse_active(Some(&slot.id))?,
             HarnessId::Opencode | HarnessId::Pi => {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
@@ -1442,6 +1470,10 @@ impl AgentAccounts {
             ));
         }
         let _ops = self.inner.ops.lock().await;
+        if harness == HarnessId::Muse {
+            self.forget_muse(account_id).await?;
+            return self.list_locked(false).await;
+        }
         let snapshot = self.list_locked(false).await?;
         let row = snapshot
             .accounts
@@ -1591,6 +1623,7 @@ impl AgentAccounts {
             HarnessId::Antigravity => self.start_antigravity_login(requester),
             HarnessId::Grok => self.start_grok_login(requester).await?,
             HarnessId::Devin => self.start_devin_login(requester)?,
+            HarnessId::Muse => self.start_muse_login().await?,
             HarnessId::Opencode => match provider.unwrap_or("openai") {
                 "openai" => {
                     self.start_openai_login(HarnessId::Opencode, "openai")
@@ -1737,7 +1770,7 @@ impl AgentAccounts {
                 &[("Content-Type", "text/html; charset=utf-8")],
                 &format!(
                     "<!doctype html><title>Sign-in failed</title><p>{}</p>\
-                     <p>Return to Zeron to try again.</p>",
+                     <p>Go back to Crew to try again.</p>",
                     html_escape(&zeron_harness::redact::redact_output(&error.to_string()))
                 ),
             ),
@@ -2494,6 +2527,75 @@ impl AgentAccounts {
     }
 
     /// Drop a flow's bookkeeping, and with it any callback route it published.
+    /// Replay a sign-in browser callback that another device caught on its
+    /// loopback listener. Only a live login registered for `requester` can be
+    /// reached, and only a plain HTTP path is forwarded.
+    pub async fn relay_callback(
+        &self,
+        login_id: &str,
+        requester: &str,
+        path: &str,
+    ) -> Result<RelayedCallback, EngineError> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let port = self
+            .inner
+            .callback_routes
+            .port_for(login_id, requester)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        if !path.starts_with('/')
+            || path.len() > 8 * 1024
+            || path.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(EngineError::Other("not a sign-in callback path".into()));
+        }
+        let connect = async {
+            match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                Ok(socket) => Ok(socket),
+                Err(v4) => tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
+                    .await
+                    .map_err(|_| v4),
+            }
+        };
+        let exchange = async {
+            let mut socket = connect.await?;
+            let request = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            let mut buf = [0u8; 4096];
+            while response.len() < 64 * 1024 {
+                let read = socket.read(&mut buf).await?;
+                if read == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buf[..read]);
+                if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok::<_, std::io::Error>(response)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(20), exchange)
+            .await
+            .map_err(|_| EngineError::Other("the sign-in didn't answer its callback".into()))?
+            .map_err(|e| EngineError::Other(format!("couldn't reach the sign-in: {e}")))?;
+        let head = String::from_utf8_lossy(&response);
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let location = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("location")
+                .then(|| value.trim().to_owned())
+        });
+        Ok(RelayedCallback { status, location })
+    }
+
     fn remove_flow(&self, login_id: &str) -> Option<LoginFlow> {
         self.inner.callback_routes.remove(login_id);
         lock(&self.inner.shared_logins).remove(login_id);
@@ -2892,6 +2994,11 @@ impl AgentAccounts {
         usage.retain(|key, _| live.contains(key));
         // Persist under the lock: overlapping lists must not interleave
         // writes of the same file.
+        self.persist_usage(&usage);
+    }
+
+    /// Write the usage cache; the caller holds [`Inner::usage`].
+    fn persist_usage(&self, usage: &HashMap<String, UsageEntry>) {
         let file = UsageCacheFile {
             entries: usage.clone(),
         };
@@ -3365,6 +3472,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Omp => "omp",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "antigravity",
+        HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
     }
 }

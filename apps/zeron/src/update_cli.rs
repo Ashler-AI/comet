@@ -11,7 +11,7 @@ async fn update_authentication(
 ) -> anyhow::Result<(zeron_update::AccessTokenProvider, Option<InstanceLock>)> {
     // A running engine owns rotating credentials. Otherwise retain its lock
     // alongside the local Auth until the authenticated update work finishes.
-    match zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{}", config.ipc_port)).await {
+    match zeron_rpc::connect_ipc(config.ipc_port, Some(&config.data_dir)).await {
         Ok(client) => {
             let client = std::sync::Arc::new(client);
             let edge_url = config.edge_url.clone();
@@ -135,8 +135,10 @@ mod tests {
         let auth = zeron_engine::Auth::new(auth_config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.ipc_port = listener.local_addr().unwrap().port();
+        let ipc_token = zeron_rpc::ipc_auth::issue_token(temp.path()).unwrap();
         let server = tokio::spawn(zeron_rpc::serve_ws_listener(
             listener, std::sync::Arc::new(zeron_engine::rpc::AuthRpc::new(auth.clone())),
+            ipc_token,
         ));
         let (tokens, lock) = update_authentication(&config).await.unwrap();
         assert!(lock.is_none());

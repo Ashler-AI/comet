@@ -7,6 +7,7 @@ use zeron_rpc::methods;
 
 use crate::pickers::{Pickers, TitleModelPicked};
 use crate::popover::Loadable;
+use crate::settings::search::{SearchAnchor, SettingId};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -148,20 +149,20 @@ impl Render for ThreadNamingCard {
         } else {
             "A small model keeps titles fast and cheap."
         };
-        widgets::section_card(&theme)
-            .child(
-                widgets::card_row(&theme, true)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.0))
-                            .child(widgets::row_title(&theme, "Thread naming"))
-                            .child(widgets::meta_line(
-                                &theme,
-                                vec![div().child(description).into_any_element()],
-                            )),
-                    )
-                    .child(control),
-            )
+        widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .child(widgets::row_title(&theme, "Thread naming"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![div().child(description).into_any_element()],
+                        )),
+                )
+                .child(control)
+                .search_anchor(SettingId::ThreadNaming),
+        )
     }
 }

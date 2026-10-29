@@ -332,34 +332,6 @@ impl Shell {
                     FilesEvent::ShowAllFilesChanged(show_all) => {
                         this.set_files_show_all(*show_all, cx)
                     }
-                    // Footer rows land in the surface host beside the explorer,
-                    // through the same paths a spawn chip and a side-chat tab use.
-                    FilesEvent::OpenSubagent {
-                        doc_id,
-                        title,
-                        frozen,
-                    } => this.add_subagent_surface(
-                        this.active_chat.clone(),
-                        doc_id.clone(),
-                        title.clone(),
-                        *frozen,
-                        cx,
-                    ),
-                    FilesEvent::OpenChildChat(chat_id) => this.open_child_chat_tab(chat_id, cx),
-                    FilesEvent::RenameChildChat(chat_id) => {
-                        this.open_rename_chat(chat_id.clone(), cx)
-                    }
-                    FilesEvent::ChildChatContextMenu { chat_id, position } => {
-                        this.chat_menu.open(ChatMenuState {
-                            chat_id: chat_id.clone(),
-                            tab: None,
-                            position: *position,
-                            page: ChatMenuPage::Root,
-                        });
-                        cx.notify();
-                    }
-                    FilesEvent::NewChildChat => this.create_child_chat(None, cx),
-                    FilesEvent::ForkChat => this.create_side_chat(cx),
                     _ => cx.notify(),
                 },
             );
@@ -471,6 +443,7 @@ impl Shell {
                 }
             });
         }
+        let content = content.map(IntoElement::into_any_element);
         self.sync_explorer_selection(cx);
         let content_width = self.files_content_width(cx);
         // The explorer is the right pane's rightmost column: its left hairline
@@ -628,13 +601,17 @@ mod tests {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                ipc_port: 0,
-                edge_url: "http://127.0.0.1:1".into(),
-                edge_token: None,
-                org_id: None,
-                workos_client_id: None,
-                default_harness: zeron_proto::HarnessId::Mock, },
+                EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
                 cx,
             )
         });
@@ -692,13 +669,17 @@ mod tests {
             let state = cx.new(|_| AppState::new());
             Shell::new(
                 state,
-                EngineBootConfig { managed_inference: false, scaffold: None, data_dir: dir.path().into(),
-                ipc_port: 0,
-                edge_url: "http://127.0.0.1:1".into(),
-                edge_token: None,
-                org_id: None,
-                workos_client_id: None,
-                default_harness: zeron_proto::HarnessId::Mock, },
+                EngineBootConfig {
+                    managed_inference: false,
+                    scaffold: None,
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
                 cx,
             )
         });

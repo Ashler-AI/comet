@@ -22,7 +22,8 @@ concurrency:
 jobs:
   staging:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/crew/staging-native-cutover'
-    runs-on: macos-26-xlarge
+    # Xcode 27.1 keeps the app out of compatibility mode on iPhone Duo.
+    runs-on: xcode-27
     timeout-minutes: 90
     env:
       REVIEWED_SHA: ${{ inputs.reviewed_sha }}
@@ -32,16 +33,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Pin reviewed source and stable Xcode 26
+      - name: Pin reviewed source and Xcode 27.1
         shell: bash
         run: |
           set -euo pipefail
           test "$REVIEWED_SHA" = "$GITHUB_SHA"
           [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]
           test "$BUILD_NUMBER" -ge 37
-          xcode=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | sort -V | tail -n 1)
-          test -n "$xcode"
-          sudo xcode-select --switch "$xcode/Contents/Developer"
+          test -d /Applications/Xcode_27.1.app
+          sudo xcode-select --switch /Applications/Xcode_27.1.app/Contents/Developer
+          xcodebuild -version
       - name: Rust toolchain and targets
         run: |
           rustup show active-toolchain || rustup toolchain install

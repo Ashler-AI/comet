@@ -76,13 +76,13 @@ fn prompt_file(path: &Path) -> anyhow::Result<String> {
 fn print_json(value: &Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?); Ok(())
 }
-pub async fn connect(port: u16) -> anyhow::Result<zeron_rpc::RpcClient> {
-    zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{port}")).await
+pub async fn connect(port: u16, data_dir: &Path) -> anyhow::Result<zeron_rpc::RpcClient> {
+    zeron_rpc::connect_ipc(port, Some(data_dir)).await
         .with_context(|| format!("no Crew engine listening on 127.0.0.1:{port}; start the matching isolated engine"))
 }
-pub async fn run(command: SessionCommand, port: u16) -> anyhow::Result<()> {
+pub async fn run(command: SessionCommand, port: u16, data_dir: &Path) -> anyhow::Result<()> {
     if matches!(&command, SessionCommand::Current) { println!("{}", current(None)?); return Ok(()); }
-    let client = connect(port).await?;
+    let client = connect(port, data_dir).await?;
     if let SessionCommand::PublishImported { chat_ids } = &command {
         for id in chat_ids {
             if !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == *id) {
@@ -169,8 +169,8 @@ pub enum ScaffoldCommand {
     /// Read or reconcile an immutable operation; never replay an ambiguous create.
     Outcome { command_id: String, #[arg(long)] reconcile: bool },
 }
-pub async fn scaffold(command: ScaffoldCommand, port: u16) -> anyhow::Result<()> {
-    let client = connect(port).await?;
+pub async fn scaffold(command: ScaffoldCommand, port: u16, data_dir: &Path) -> anyhow::Result<()> {
+    let client = connect(port, data_dir).await?;
     let value = match command {
         ScaffoldCommand::List => {
             let status = client.call("crew.status", json!({})).await?;
@@ -249,7 +249,7 @@ impl ExportBackupArgs {
     pub fn offline(&self) -> bool { self.identity_session.is_some() }
 }
 
-pub async fn export(args: ExportBackupArgs, port: u16) -> anyhow::Result<()> {
+pub async fn export(args: ExportBackupArgs, port: u16, data_dir: Option<&Path>) -> anyhow::Result<()> {
     if !args.writers_stopped { bail!("export requires an explicit stopped-writer confirmation"); }
     let native_roots = args.native_history_roots.into_iter().map(std::fs::canonicalize)
         .collect::<std::io::Result<Vec<_>>>()?;
@@ -290,7 +290,8 @@ pub async fn export(args: ExportBackupArgs, port: u16) -> anyhow::Result<()> {
         "inventoryAttachmentsOnly":args.inventory_attachments_only,
         "writersStopped":true,
     });
-    print_json(&connect(port).await?.call("ExportCrewBackup", params).await?)
+    print_json(&connect(port, data_dir.context("online export requires the Crew profile")?).await?
+        .call("ExportCrewBackup", params).await?)
 }
 
 async fn verified_desktop_principal(
@@ -351,10 +352,10 @@ pub async fn import_offline(
     print_json(&serde_json::to_value(operation(&backup, &destination, &principal, &device_id)?)?)
 }
 
-pub async fn import(backup: PathBuf, destination: PathBuf, validate_only: bool, verify_only: bool, port: u16) -> anyhow::Result<()> {
+pub async fn import(backup: PathBuf, destination: PathBuf, validate_only: bool, verify_only: bool, port: u16, data_dir: &Path) -> anyhow::Result<()> {
     let backup = backup.canonicalize()?;
     let destination = std::path::absolute(destination)?;
-    let report = connect(port).await?.call("ImportCrewBackup", json!({"backup":backup,"destination":destination,"validateOnly":validate_only,"verifyOnly":verify_only})).await?;
+    let report = connect(port, data_dir).await?.call("ImportCrewBackup", json!({"backup":backup,"destination":destination,"validateOnly":validate_only,"verifyOnly":verify_only})).await?;
     print_json(&report)?;
     if validate_only && report.get("valid").and_then(Value::as_bool) != Some(true) {
         bail!("backup validation failed; retain the JSON reconciliation report, no destination was written");

@@ -15,7 +15,6 @@ pub(crate) struct IsolatedRecoveryReceipt {
     pub rebound_sha256: String,
     pub rebound_bytes: u64,
 }
-
 fn namespace(operation_id: &str) -> String {
     format!("{:x}", Sha256::digest(operation_id.as_bytes()))
 }
@@ -161,4 +160,3 @@ mod non_unix_tests {
         no_requests(&listener);
     }
 }
-

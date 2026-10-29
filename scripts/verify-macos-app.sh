@@ -20,14 +20,16 @@ EXECUTABLE="$APP/Contents/MacOS/comet"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")" == comet ]] || fail "unexpected bundle executable"
 [[ -f "$EXECUTABLE" && -x "$EXECUTABLE" && ! -L "$EXECUTABLE" ]] || fail "bundle executable is missing, non-executable, or symlinked"
 
-REQUIREMENT="identifier \"$BUNDLE_ID\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$COMET_MACOS_SIGNING_TEAM_ID\""
-EXPECTED_REQUIREMENT="$(csreq -r "=$REQUIREMENT" -t)"
+ENGINE="$APP/Contents/MacOS/Crew Engine"
+[[ -f "$ENGINE" && -x "$ENGINE" && ! -L "$ENGINE" ]] || fail "background engine is missing, non-executable, or symlinked"
 verify_code() {
-  local code="$1" details requirement="" line
-  codesign --verify --deep --strict --verbose=2 --test-requirement "=$REQUIREMENT" "$code"
+  local code="$1" identifier="$2" details requirement="" line requirement_policy expected_requirement
+  requirement_policy="identifier \"$identifier\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$COMET_MACOS_SIGNING_TEAM_ID\""
+  expected_requirement="$(csreq -r "=$requirement_policy" -t)"
+  codesign --verify --deep --strict --verbose=2 --test-requirement "=$requirement_policy" "$code"
   details="$(codesign --display --verbose=4 "$code" 2>&1)"
   details=$'\n'"$details"$'\n'
-  [[ "$details" == *$'\nIdentifier='"$BUNDLE_ID"$'\n'* ]] || fail "code identifier mismatch: $code"
+  [[ "$details" == *$'\nIdentifier='"$identifier"$'\n'* ]] || fail "code identifier mismatch: $code"
   [[ "$details" == *$'\nTeamIdentifier='"$COMET_MACOS_SIGNING_TEAM_ID"$'\n'* ]] || fail "code signing team mismatch: $code"
   details="$(codesign --display -r- "$code" 2>&1)"
   while IFS= read -r line; do
@@ -40,10 +42,11 @@ verify_code() {
   # Parse both expressions, so codesign's display quoting and exists comments
   # cannot change the comparison. Only the stable policy is accepted: no cdhash,
   # certificate fingerprint/serial, version, alternate team, or extra clauses.
-  [[ "$(csreq -r "=$requirement" -t)" == "$EXPECTED_REQUIREMENT" ]] || fail "designated requirement is not the stable Crew distribution policy: $code"
+  [[ "$(csreq -r "=$requirement" -t)" == "$expected_requirement" ]] || fail "designated requirement is not the stable Crew distribution policy: $code"
 }
-verify_code "$APP"
-verify_code "$EXECUTABLE"
+verify_code "$APP" "$BUNDLE_ID"
+verify_code "$EXECUTABLE" "$BUNDLE_ID"
+verify_code "$ENGINE" "$BUNDLE_ID.engine"
 xcrun stapler validate "$APP"
 spctl --assess --type execute --verbose=2 "$APP"
 echo "Verified Crew distribution bundle: $APP ($BUNDLE_ID, team $COMET_MACOS_SIGNING_TEAM_ID)"
