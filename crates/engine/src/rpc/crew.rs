@@ -62,6 +62,23 @@ fn validate_start_history(sandbox_id: &str, expected_epoch: u64,
     }
 }
 
+fn bind_scaffold_workspace(chat: &mut Chat, host: &str, sandbox_id: &str, handoff_cwd: Option<String>) {
+    let same_sandbox = matches!(chat.crew.as_ref().and_then(|crew| crew.environment.as_ref()).map(|environment| &environment.source),
+        Some(SessionEnvironmentSource::Scaffold { sandbox_id: previous, .. }) if previous == sandbox_id);
+    if chat.device_id != host && !same_sandbox {
+        // A local project path belongs to its old host, not the sandbox. Keep
+        // same-sandbox worktrees across epoch changes; handoff receipts win below.
+        chat.cwd = None;
+        chat.space_id = None;
+    }
+    chat.device_id = host.to_owned();
+    chat.cwd.get_or_insert_with(|| "/workspace/ashler-platform".into());
+    if let Some(cwd) = handoff_cwd {
+        chat.cwd = Some(cwd.clone());
+        chat.harness_session_cwd = Some(cwd);
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayAuthority {
@@ -480,9 +497,8 @@ impl EngineRpc {
                 harness_session_harness: None, space_id: None, last_seen_at: None, room_gen: Some(2),
                 parent_chat_id: None, crew: None,
             });
-            chat.device_id = host.clone();
+            bind_scaffold_workspace(&mut chat, &host, sandbox_id, result.handoff_cwd);
             chat.room_gen = Some(2);
-            chat.cwd.get_or_insert_with(|| "/workspace/ashler-platform".into());
             if update_config && let Some(route) = &metadata.agent_route {
                 let config = chat.config.get_or_insert_with(|| ChatConfig {
                     harness: HarnessId::Omp, model: None, reasoning: None,
@@ -494,7 +510,6 @@ impl EngineRpc {
                 if let Some(account) = &route.account_id { config.model_options.insert("crewAccountId".into(), json!(account)); }
                 else { config.model_options.remove("crewAccountId"); }
             }
-            if let Some(cwd) = result.handoff_cwd { chat.cwd = Some(cwd.clone()); chat.harness_session_cwd = Some(cwd); }
             if let Some(native) = result.handoff_native_session_id { chat.harness_session_id = Some(native); }
             if reset_native {
                 // Empty ID is the durable do-not-resume tombstone; None would fall back to the old journal.
@@ -715,6 +730,44 @@ impl EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaffold_publication_rebinds_local_workspace_and_preserves_remote_worktrees() {
+        let host = crate::scaffold::device_id_for("box", 2);
+        let previous_host = crate::scaffold::device_id_for("box", 1);
+        for (name, device, remote, cwd, handoff, expected) in [
+            ("local project", "controller", false, Some("/Users/czhen"), None, "/workspace/ashler-platform"),
+            ("local project fallback", "controller", false, None, None, "/workspace/ashler-platform"),
+            ("local handoff", "controller", false, Some("/Users/czhen"), Some("/workspace/crew-handoff"), "/workspace/crew-handoff"),
+            ("same host", host.as_str(), true, Some("/workspace/worktree"), None, "/workspace/worktree"),
+            ("new epoch", previous_host.as_str(), true, Some("/workspace/worktree"), None, "/workspace/worktree"),
+            ("verified handoff", host.as_str(), true, Some("/workspace/worktree"), Some("/workspace/crew-handoff"), "/workspace/crew-handoff"),
+        ] {
+            let mut chat: Chat = serde_json::from_value(json!({
+                "id": "session", "deviceId": device, "archived": false,
+                "createdAt": "2026-10-26T00:00:00Z", "cwd": cwd, "spaceId": "project",
+                "config": {"harness": "omp", "model": "openai-codex/gpt-6-astra",
+                    "modelOptions": {}, "sandbox": "workspace-write"},
+                "harnessSessionCwd": if remote { cwd } else { None },
+                "crew": if remote { json!({
+                    "ownerSubject": "owner", "sessionId": "session",
+                    "scope": {"projectId": "project", "deploymentId": "deployment", "sessionId": "session"},
+                    "environment": {
+                        "source": {"kind": "scaffold", "sandbox_id": "box", "lifecycle": "ready", "lifecycle_epoch": 1},
+                        "ownerPrincipal": "owner",
+                        "scope": {"projectId": "project", "deploymentId": "deployment", "sessionId": "session"}
+                    }
+                }) } else { Value::Null }
+            })).unwrap();
+            let config = chat.config.clone();
+            bind_scaffold_workspace(&mut chat, &host, "box", handoff.map(str::to_owned));
+            assert_eq!(chat.device_id, host, "{name}");
+            assert_eq!(chat.cwd.as_deref(), Some(expected), "{name}");
+            assert_eq!(chat.space_id.as_deref(), if remote { Some("project") } else { None }, "{name}");
+            assert_eq!(chat.harness_session_cwd.as_deref(), handoff.or(if remote { cwd } else { None }), "{name}");
+            assert_eq!(chat.config, config, "{name}");
+        }
+    }
 
     #[test]
     fn start_preflight_rejects_untrusted_history_before_control_dispatch() {

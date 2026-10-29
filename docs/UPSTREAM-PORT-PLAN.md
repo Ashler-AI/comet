@@ -343,6 +343,14 @@ was stopped and the conversation was not archived or deleted.
 passed for the Edge correction, including remote typechecks, all Edge tests,
 native-browser contracts and macOS/Linux x64/Linux ARM64 packaging.
 
+MCP sends reuse a configured chat's saved harness and model; only unconfigured
+chats discover the target host's harness catalog. Discovery errors remain fatal
+when a default is needed. Session-scoped host permissions are unchanged.
+Initial publication from a local controller to a verified Scaffold host replaces
+the chat-local working directory and project association with the remote workspace;
+it does not modify the global project. Same-host refreshes, same-sandbox epoch
+changes and verified handoff working directories retain their remote paths.
+
 Stop acceptance also exposed MCP `read_chat` and `get_chat` forcing requests to
 the stopped host despite complete synchronized history. `b9b36ab5` routes both
 read-only consumers through the existing native `transcript` path; live send,
