@@ -798,8 +798,6 @@ impl CodexHarness {
                 "model_providers.crew.wire_api=\"responses\"".to_string(),
                 "model_providers.crew.requires_openai_auth=false".to_string(),
                 "model_providers.crew.supports_websockets=false".to_string(),
-                "model_providers.crew.request_max_retries=0".to_string(),
-                "model_providers.crew.stream_max_retries=0".to_string(),
             ] {
                 cmd.arg("-c").arg(setting);
             }
