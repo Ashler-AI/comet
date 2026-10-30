@@ -133,6 +133,39 @@ Reselecting the chat replaces those watches and requires fresh Preparing evidenc
 Acknowledgements remain tied to the exact pending message; explicit delivery
 failures are not hidden by older transcript rows or unrelated session activity.
 
+## Queued remote attachments
+
+Queued desktop uploads use at most three concurrent 510,000-byte chunks
+(680,000 base64 characters). Progress counts acknowledged bytes; commit waits
+for every chunk ACK. A failed window settles its outstanding calls before
+progress cleanup and retry. Requests for the same `(chat, command)` share one
+escort; different chats remain independent.
+Ownership changes re-deliver bytes before forwarding the command to the new
+host; that destination gets the existing post-transfer relay retry budget.
+
+Durable `pending://` references and committed filenames are unchanged. Fast
+uploads append `-q680000` only to the wire staging ID, preserving its first eight
+characters. Older writers keep their original staging IDs and 45,000-byte
+chunks, so their high-sequence partials cannot contaminate a fast commit.
+Short IDs and IDs without suffix room keep their original ID and chunk layout.
+Receiver authorization, path jails, size limits, and partial-upload TTLs are
+unchanged; no protocol capability or runtime upgrade is required.
+
+Verification on macOS (2026-10-27): all 21 `relay_delivery`, `queued_attachments`,
+and `device_routing` regressions passed. Gated RPC coverage includes reordered
+ACKs, the three-call bound, the final-ACK commit barrier, refusal cleanup,
+old-writer partials across reopen/retry, empty and boundary-sized files, ID
+fallbacks, host moves, and same-ID commands on different chat hosts. The fresh
+Cargo-built engine library binary passed 723 tests (four existing ignored) from
+an isolated temporary working directory; the RPC crate passed 39 (one existing
+ignored). The offline headed demo also attached and sent a synthetic file.
+
+The two-device executable smoke used a local Worker and two real headless
+engines: a queued 5,357,034-byte synthetic file arrived byte-exact with matching
+SHA-256, and its mock run completed on the host and synced to the sender in
+0.406 seconds after queueing. This local result is not a WAN benchmark or a
+deployed-release claim.
+
 ## Provider turn protection
 
 The execution host admits local sends and remotely delivered Run/Steer commands

@@ -1266,10 +1266,7 @@ impl LinkCache {
         // Readiness probe: prove the host answers before caching (an offline host bounces
         // host_offline, which closes the link and fails this call fast).
         let client = link.client();
-        let probe = client.call(
-            crate::methods::LIST_HARNESSES,
-            serde_json::json!({ READINESS_PROBE_PARAM: true }),
-        );
+        let probe = client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({}));
         tokio::time::timeout(self.config.probe_timeout, probe)
             .await
             .map_err(|_| {
