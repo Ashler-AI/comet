@@ -2477,6 +2477,50 @@ async fn antigravity_stdout_sign_in_and_sibling_environment_on_every_spawn() {
     );
 }
 
+// Failure mode: an adapter reached through a PATH symlink starts without its
+// release's local harness beside the target, and every session fails with
+// "Could not find default localharness binary".
+#[tokio::test]
+async fn antigravity_symlinked_adapter_uses_the_harness_beside_its_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let sibling = release.join("localharness_external");
+    std::fs::write(&sibling, "fixture").unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-antigravity-acp.sh");
+    let checks = format!(
+        "[ \"$ANTIGRAVITY_HARNESS_PATH\" = '{}' ] || exit 3\n",
+        std::fs::canonicalize(&sibling).unwrap().display(),
+    );
+    let server = release.join("agy_acp_server.par");
+    std::fs::write(
+        &server,
+        std::fs::read_to_string(fixture)
+            .unwrap()
+            .replacen("#!/bin/sh\n", &format!("#!/bin/sh\n{checks}"), 1),
+    )
+    .unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = bin.join("agy_acp_server");
+    std::os::unix::fs::symlink(&server, &link).unwrap();
+    let harness = AcpHarness::antigravity().with_executable(&link);
+    // Model discovery falls back to a static catalog, so only spawns that
+    // must succeed can tell whether the adapter started with its harness.
+    harness.sign_out().await.unwrap();
+    let (ctl, _steer, _) = controls();
+    let mut req = request("hello");
+    req.model = None;
+    req.cwd = dir.path().display().to_string();
+    assert_eq!(
+        dones(&run_to_end(&harness, req, ctl).await),
+        vec![(DoneStatus::Completed, None)]
+    );
+}
+
 async fn acp_boundary_steer(scenario: &str, trigger_on_done: bool) {
     let adapter = AcpHarness::devin().with_executable(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-robust-acp.py"),

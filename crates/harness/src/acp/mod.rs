@@ -1806,14 +1806,20 @@ impl AcpHarness {
     }
 
     fn configure_adapter_environment(&self, cmd: &mut Command, executable: &Path) {
-        if self.spec.id == HarnessId::Antigravity
-            && let Some(parent) = executable.parent()
-        {
-            let sibling = parent.join("localharness_external");
-            if sibling.is_file() {
-                cmd.env("ANTIGRAVITY_HARNESS_PATH", sibling);
-                cmd.env("PYTHONUNBUFFERED", "1");
-            }
+        if self.spec.id != HarnessId::Antigravity {
+            return;
+        }
+        // A PATH symlink leaves the release's harness beside the link's target.
+        let target = std::fs::canonicalize(executable).ok();
+        let sibling = [Some(executable), target.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(Path::parent)
+            .map(|parent| parent.join("localharness_external"))
+            .find(|sibling| sibling.is_file());
+        if let Some(sibling) = sibling {
+            cmd.env("ANTIGRAVITY_HARNESS_PATH", sibling);
+            cmd.env("PYTHONUNBUFFERED", "1");
         }
     }
 
