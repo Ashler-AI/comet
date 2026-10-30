@@ -2025,7 +2025,14 @@ impl RpcService for EngineRpc {
         // Prefer a positively live host over its asynchronously synced mirror.
         // Unscoped reads still serve retained history when the host is offline
         // or its presence is unknown; explicitly targeted reads never fall back.
-        if method == methods::WATCH_DOC_MESSAGES
+        // A stop is stamped with the queuing doc's latest entry and the host
+        // supersedes stops aimed at past turns, so a lagging mirror's stop would
+        // silently miss the live turn: let the live host stamp it.
+        let prefers_live_host = method == methods::WATCH_DOC_MESSAGES
+            || (method == methods::QUEUE_COMMAND
+                && params.get("command").and_then(|command| command.get("kind"))
+                    .and_then(|kind| kind.as_str()) == Some("interrupt"));
+        if prefers_live_host
             && !self.relay
             && params.get("targetDeviceId").is_none()
             && self.links.is_some()

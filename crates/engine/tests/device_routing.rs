@@ -2309,3 +2309,197 @@ async fn assert_mcp_retained_history(
     assert_eq!(summary["lastMessage"], retained["messages"].as_array().unwrap().last().unwrap().clone());
     offline.shutdown().await;
 }
+
+/// First turn completes; the second reports itself live and then holds until the
+/// host interrupts it, recording that the stop actually reached the harness.
+struct InterruptibleSecondTurn {
+    runs: Arc<AtomicUsize>,
+    blocking: Arc<AtomicUsize>,
+    interrupted: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Harness for InterruptibleSecondTurn {
+    fn id(&self) -> HarnessId {
+        HarnessId::Codex
+    }
+    fn display_name(&self) -> &str {
+        "Interruptible"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let turn = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
+        let started = AgentEvent::SessionStarted {
+            harness: HarnessId::Codex,
+            model: "interruptible-1".into(),
+            tools: vec![],
+            cwd: request.cwd,
+            session_id: "hs-interruptible".into(),
+            assistant_message_id: format!("a-{turn}"),
+        };
+        let done = |status| AgentEvent::Done {
+            status,
+            result: None,
+            error: None,
+            session_id: Some("hs-interruptible".into()),
+        };
+        if turn == 1 {
+            return Ok(futures::stream::iter([
+                Ok(started),
+                Ok(AgentEvent::TextDelta { text: "first reply".into() }),
+                Ok(done(DoneStatus::Completed)),
+            ])
+            .boxed());
+        }
+        let (blocking, interrupted) = (self.blocking.clone(), self.interrupted.clone());
+        let held = futures::stream::once(async move {
+            blocking.fetch_add(1, Ordering::SeqCst);
+            tokio::select! {
+                _ = controls.interrupt.cancelled() => {}
+                _ = controls.turn.stop_requested() => {}
+            }
+            interrupted.fetch_add(1, Ordering::SeqCst);
+            Ok(done(DoneStatus::Interrupted))
+        });
+        Ok(futures::stream::iter([
+            Ok(started),
+            Ok(AgentEvent::TextDelta { text: "still working".into() }),
+        ])
+        .chain(held)
+        .boxed())
+    }
+}
+
+/// A controller's mirror can hold only earlier turns of a chat hosted elsewhere
+/// (session-doc sync is asynchronous). Its stop must still interrupt the host's
+/// live turn instead of being stamped against a past turn and superseded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_interrupt_stops_a_live_remote_turn_despite_a_stale_mirror() {
+    use serde_json::json;
+    use zeron_mcp::{Origin, Tools, Zeron};
+
+    let (relay_url, relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let a = assemble(&dirs.path().join("a"), "device-a");
+    let remote_dir = dirs.path().join("b");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::write(remote_dir.join("device-id"), "device-b").unwrap();
+    let profile = zeron_engine::EngineProfile::development(&remote_dir, "dev-org", "dev-user");
+    let (runs, blocking, interrupted) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let harnesses = HarnessRegistry::new();
+    harnesses.register(Arc::new(InterruptibleSecondTurn {
+        runs: runs.clone(),
+        blocking: blocking.clone(),
+        interrupted: interrupted.clone(),
+    }));
+    let b = EngineCore::assemble_with_profile(profile, Arc::new(harnesses), HarnessId::Codex, None)
+        .unwrap();
+    let mut auth = zeron_engine::AuthConfig::new("http://localhost:27640", &remote_dir);
+    auth.allow_dev_auth = true;
+    b.set_auth(zeron_engine::Auth::new(auth));
+    let registry = zeron_sync::registry::mock_server::MockRegistryServer::start().await;
+    a.workspace.connect_registry_url(&registry.url());
+    b.workspace.connect_registry_url(&registry.url());
+    let host = b.start_host_relay(&relay_url);
+    let mut config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    config.probe_timeout = Duration::from_secs(5);
+    a.set_links(LinkCache::new(config));
+    let tools = Tools::new(Arc::new(Zeron::with_client(
+        zeron_rpc::memory_client(a.rpc_service()),
+        Origin {
+            chat_id: Some("coordinator".into()),
+            device_id: Some("device-a".into()),
+            ..Default::default()
+        },
+    )));
+    a.workspace
+        .create_chat("coordinator", None, Some("device-a"), None, None)
+        .unwrap();
+    let folder = dirs.path().join("remote-project");
+    std::fs::create_dir_all(&folder).unwrap();
+    b.workspace
+        .create_space("remote-project", "device-b", folder.to_str().unwrap(), None, false)
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let project = loop {
+        let projects = tools.call("list_projects", json!({"device":"device-b"})).await;
+        if let Ok(projects) = projects
+            && projects["projects"].as_array().unwrap().len() == 1
+            && tools.call("list_harnesses", json!({"device":"device-b"})).await.is_ok()
+            && a.workspace.peer_liveness("device-b") == zeron_rpc::PeerLiveness::Live
+        {
+            break projects["projects"][0]["id"].as_str().unwrap().to_owned();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "discovery did not converge");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let created = tools
+        .call(
+            "create_chat",
+            json!({
+                "kind":"chat", "device":"device-b", "project":project, "harness":"codex",
+                "title":"Remote stop", "prompt":"first turn", "wait":true, "timeout_secs":30
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created["turn"]["outcome"], "completed", "{created}");
+    let chat_id = created["chatId"].as_str().unwrap().to_owned();
+    // The controller's mirror has synced the first turn, as session-doc sync does.
+    let synced = b.doc_host.open(&chat_id).unwrap().doc().export_snapshot().unwrap();
+    a.doc_host.open(&chat_id).unwrap().doc().doc().import(&synced).unwrap();
+    let mirrored = a.doc_host.open(&chat_id).unwrap().doc().read_entries().unwrap().len();
+
+    tools
+        .call("send_message", json!({"chat":chat_id, "text":"second turn", "wait":false}))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while blocking.load(Ordering::SeqCst) == 0
+        || b.doc_host.open(&chat_id).unwrap().doc().read_entries().unwrap().len() <= mirrored + 1
+    {
+        assert!(tokio::time::Instant::now() < deadline, "second turn never went live on B");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        a.doc_host.open(&chat_id).unwrap().doc().read_entries().unwrap().len(),
+        mirrored,
+        "the controller's mirror must still lag the live turn"
+    );
+
+    tools.call("interrupt_chat", json!({"chat":chat_id})).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while interrupted.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the controller's stop never interrupted the host's live turn"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "only the two requested turns ran");
+
+    a.shutdown().await;
+    b.shutdown().await;
+    drop(host);
+    relay.abort();
+}
