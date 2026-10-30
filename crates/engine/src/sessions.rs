@@ -2406,8 +2406,14 @@ impl Inner {
         self.start_turn(&identity.chat_id, handle)?;
         handle.inference_requests += 1;
         let changed = handle.inference_changed.clone();
+        // OMP also uses this route for background skill-description compression.
+        // Only its native turn events own foreground status; every request still
+        // owns provider protection until its response is consumed or dropped.
+        let inference_drives_turn = handle.runtime_config.harness_id != HarnessId::Omp;
         drop(runs);
-        self.set_run_status(&identity.chat_id, &identity.run_id, SessionStatus::Working, false);
+        if inference_drives_turn {
+            self.set_run_status(&identity.chat_id, &identity.run_id, SessionStatus::Working, false);
+        }
         if let Some(changed) = changed { changed.notify_one(); }
         Ok(Some(InferenceActivity { inner: Arc::downgrade(self), identity: identity.clone() }))
     }
@@ -2611,6 +2617,19 @@ impl Inner {
         // Hold ownership through status publication: a late retired task must
         // never settle or release whichever replacement now owns the chat.
         let runs = lock(&self.runs);
+        self.set_status_with_completion_locked(&runs, chat_id, run_id, status, fresh_start, completed_turn, outcome);
+    }
+
+    fn set_status_with_completion_locked(
+        &self,
+        runs: &MutexGuard<'_, HashMap<String, RunHandle>>,
+        chat_id: &str,
+        run_id: Option<&str>,
+        status: SessionStatus,
+        fresh_start: bool,
+        completed_turn: Option<String>,
+        outcome: Option<DoneStatus>,
+    ) {
         let handle = runs.get(chat_id);
         match run_id {
             Some(run) if !handle.is_some_and(|h| h.run_id == run) => return,
@@ -3848,6 +3867,7 @@ async fn drive_run(
     // Waiting here keeps dispatch and the shared queue-flush watcher responsive.
     // The pending-update marker still orders new subprocesses after installation.
     // Share the lease with the adapter so child cleanup outlives this event loop.
+    let interrupt = controls.interrupt.clone();
     let mut _execution_lease = None;
     let started = match prepared {
         Ok(()) => {
@@ -3891,7 +3911,6 @@ async fn drive_run(
                 match admission {
                     Err(error) => Err(error),
                     Ok(()) => {
-                        let interrupt = controls.interrupt.clone();
                         tokio::select! {
                             biased;
                             _ = interrupt.cancelled() => Ok(futures::stream::once(async {
@@ -4394,15 +4413,6 @@ async fn drive_run(
         if !lock(&inner.runs).get(&chat_id).is_some_and(|h| h.run_id == run_id) {
             break SessionStatus::Idle;
         }
-        // Provider failure is not a user Stop: surface a durable recoverable
-        // error even when the harness closes before the injected Error arrives.
-        if inner.boat_lease.failed(&run_id)
-            && let AgentEvent::Done { status, error, .. } = &mut event
-        {
-            interrupted = true;
-            *status = DoneStatus::Errored;
-            *error = Some(crate::boat_lease::FAILURE.into());
-        }
 
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
@@ -4645,6 +4655,70 @@ async fn drive_run(
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
             }
             continue;
+        }
+        if matches!(event, AgentEvent::TurnStarted) {
+            if idle_since.is_some() && !interrupted {
+                let protection = async {
+                    if interrupt.is_cancelled() { return Ok(false); }
+                    if inner.boat_lease.required() && !inner.boat_lease.active(&run_id) {
+                        tokio::select! {
+                            biased;
+                            result = inner.boat_lease.protect() => result.map_err(EngineError::Other)?,
+                            _ = interrupt.cancelled() => return Ok(false),
+                        }
+                    }
+                    let runs = lock(&inner.runs);
+                    let handle = runs.get(&chat_id).filter(|h| h.run_id == run_id)
+                        .ok_or_else(|| EngineError::Other("Stale Crew native turn".into()))?;
+                    if handle.retiring.load(std::sync::atomic::Ordering::Acquire)
+                        || handle.interrupt_token.is_cancelled() {
+                        return Ok(false);
+                    }
+                    inner.start_turn(&chat_id, handle)?;
+                    // The last auxiliary response may drop concurrently. Keep
+                    // ownership locked until Working is visible, so its Drop
+                    // cannot release this newly admitted foreground turn.
+                    inner.set_status_with_completion_locked(
+                        &runs, &chat_id, Some(&run_id), SessionStatus::Working, true, None, None,
+                    );
+                    Ok::<bool, EngineError>(true)
+                }.await;
+                match protection {
+                    Ok(true) => {
+                        idle_since = None;
+                        self_continued_turn = false;
+                        entry_id = new_id();
+                        segment_started = now_ms();
+                    }
+                    Ok(false) => {
+                        // Cancellation is not a provider denial. Keep its
+                        // provenance instead of inspecting the token after an
+                        // error, since protection failure can cancel it too.
+                        interrupted = true;
+                        interrupt.cancel();
+                        event = AgentEvent::Done {
+                            status: DoneStatus::Interrupted, result: None, error: None, session_id: None,
+                        };
+                    }
+                    Err(error) => {
+                        interrupted = true;
+                        interrupt.cancel();
+                        event = AgentEvent::Done {
+                            status: DoneStatus::Errored, result: None, error: Some(error.to_string()), session_id: None,
+                        };
+                    }
+                }
+            }
+            if matches!(event, AgentEvent::TurnStarted) { continue; }
+        }
+        // Provider failure is not a user Stop: surface a durable recoverable
+        // error even when the harness closes before the injected Error arrives.
+        if inner.boat_lease.failed(&run_id)
+            && let AgentEvent::Done { status, error, .. } = &mut event
+        {
+            interrupted = true;
+            *status = DoneStatus::Errored;
+            *error = Some(crate::boat_lease::FAILURE.into());
         }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
@@ -5826,6 +5900,7 @@ mod tests {
     /// Feed-by-hand harness: the test pushes wire events through a channel
     /// and decides when the stream ends.
     struct FeedHarness {
+        id: HarnessId,
         feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
         steering: Option<mpsc::UnboundedSender<mpsc::Receiver<SteerMessage>>>,
     }
@@ -5833,13 +5908,16 @@ mod tests {
     #[async_trait::async_trait]
     impl Harness for FeedHarness {
         fn id(&self) -> HarnessId {
-            HarnessId::Mock
+            self.id
         }
         fn display_name(&self) -> &str {
             "Feed"
         }
         fn supports_steering(&self) -> bool {
             true
+        }
+        fn deterministic_turn_end(&self) -> bool {
+            self.id == HarnessId::Omp
         }
         fn steering_mode(&self) -> zeron_proto::SteeringMode {
             zeron_proto::SteeringMode::StepBoundary
@@ -5880,7 +5958,7 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let (mailboxes, mut harness_calls) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
+        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
         let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         registry.register(Arc::new(IdleStartupFixture {
             idle_calls: idle_calls.clone(),
@@ -5965,7 +6043,7 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let (mailboxes, mut harness_calls) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
+        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
         let mut sessions = SessionsEngine::new("host".into(),
             Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry));
         Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = BoatLease::new(Ok(None),
@@ -6021,7 +6099,7 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let (mailboxes, mut harness_calls) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
+        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: Some(mailboxes) }));
         let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         registry.register(Arc::new(IdleStartupFixture {
             idle_calls: idle_calls.clone(),
@@ -6189,10 +6267,203 @@ mod tests {
 
 
     #[tokio::test(start_paused = true)]
+    async fn cancelling_native_start_during_protection_is_interrupted_not_errored() {
+        native_start_protection_outcome(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_start_ready_provider_error_takes_precedence_over_cancellation() {
+        native_start_protection_outcome(true).await;
+    }
+
+    async fn native_start_protection_outcome(provider_fails: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (feed, rx) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness {
+            id: HarnessId::Omp, feed: Mutex::new(Some(rx)), steering: None,
+        }));
+        let mut sessions = SessionsEngine::new(
+            "host".into(), Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = Arc::new(tokio::sync::Notify::new());
+        let provider_calls = calls.clone();
+        let provider_called = called.clone();
+        let (failure, failure_rx) = oneshot::channel::<Result<(), String>>();
+        let failure_rx = Arc::new(Mutex::new(Some(failure_rx)));
+        Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = BoatLease::new(
+            Ok(Some("bx_23456789".into())), Arc::new(move |_, cancel| {
+                let call = provider_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                provider_called.notify_one();
+                let failure = (provider_fails && call >= 2).then(|| lock(&failure_rx).take().unwrap());
+                Box::pin(async move {
+                    if call < 2 { return Ok(()); }
+                    if let Some(failure) = failure { return failure.await.unwrap(); }
+                    cancel.cancelled().await;
+                    Err("provider request cancelled".into())
+                })
+            }),
+        );
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap());
+        sessions.set_doc_host(DocHost::new(store, crate::doc_host::DocHostConfig {
+            device_id: "host".into(), default_harness: HarnessId::Omp, edge: None,
+        }));
+        let run = sessions.dispatch("chat", HarnessId::Omp, request(), None).await.unwrap();
+        let interrupt = lock(&sessions.inner.runs)["chat"].interrupt_token.clone();
+        feed.send(AgentEvent::Done {
+            status: DoneStatus::Completed, result: None, error: None, session_id: None,
+        }).unwrap();
+        sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
+            row.chat_id == "chat" && row.status == SessionStatus::Idle)).await.unwrap();
+        // Initial admission and its idle TTL reset finish before the held request.
+        while calls.load(std::sync::atomic::Ordering::Acquire) < 2 { called.notified().await; }
+        feed.send(AgentEvent::TurnStarted).unwrap();
+        while calls.load(std::sync::atomic::Ordering::Acquire) < 3 { called.notified().await; }
+        if provider_fails {
+            // Make both select branches ready before the driver is polled.
+            interrupt.cancel();
+            failure.send(Err("denied".into())).unwrap();
+            sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
+                row.chat_id == "chat" && row.status == SessionStatus::Errored)).await.unwrap();
+        } else {
+            assert!(sessions.terminate("chat").await.unwrap());
+        }
+        assert!(!sessions.is_live("chat", &run));
+        assert_eq!(sessions.session_status("chat").unwrap().status,
+            if provider_fails { SessionStatus::Errored } else { SessionStatus::Idle });
+        let Some((_, AgentEvent::Done { status, error, .. })) = sessions.inner.journal.last_event("chat").unwrap() else {
+            panic!("native admission did not journal its completion");
+        };
+        assert_eq!(status, if provider_fails { DoneStatus::Errored } else { DoneStatus::Interrupted });
+        assert_eq!(error.is_some(), provider_fails);
+        assert!(!sessions.inner.boat_lease.active(&run));
+        let entries = sessions.doc_handle("chat").unwrap().doc().read_entries().unwrap();
+        assert_eq!(entries.iter().flat_map(|entry| &entry.parts).any(|part|
+            matches!(part, MessagePart::Error { .. })), provider_fails);
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_auxiliary_inference_releases_lease_without_reopening_completed_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (feed, rx) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness {
+            id: HarnessId::Omp, feed: Mutex::new(Some(rx)), steering: None,
+        }));
+        let mut sessions = SessionsEngine::new(
+            "host".into(), Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry),
+        );
+        let allow = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let provider_allow = allow.clone();
+        Arc::get_mut(&mut sessions.inner).unwrap().boat_lease = BoatLease::new(
+            Ok(Some("bx_23456789".into())), Arc::new(move |_, _| {
+                let allowed = provider_allow.load(std::sync::atomic::Ordering::Acquire);
+                Box::pin(async move { if allowed { Ok(()) } else { Err("denied".into()) } })
+            }),
+        );
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap());
+        sessions.set_doc_host(DocHost::new(store, crate::doc_host::DocHostConfig {
+            device_id: "host".into(), default_harness: HarnessId::Omp, edge: None,
+        }));
+        let run = sessions.dispatch("chat", HarnessId::Omp, request(), None).await.unwrap();
+        let (_, mut events) = sessions.subscribe("chat", 0).unwrap();
+        let (interrupt, token) = {
+            let runs = lock(&sessions.inner.runs);
+            let handle = &runs["chat"];
+            (handle.interrupt_token.clone(), handle.supervision_token.clone())
+        };
+        let supervision = sessions.retain_supervision("chat", &token).unwrap();
+        feed.send(AgentEvent::TextDelta { text: "complete".into() }).unwrap();
+        feed.send(AgentEvent::Done {
+            status: DoneStatus::Completed, result: None, error: None, session_id: None,
+        }).unwrap();
+        sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
+            row.chat_id == "chat" && row.status == SessionStatus::Idle)).await.unwrap();
+        let completed = sessions.session_status("chat").unwrap().last_completed_turn;
+        assert!(completed.is_some());
+        assert!(!sessions.inner.boat_lease.active(&run));
+
+        // OMP compresses skill descriptions outside the foreground agent loop.
+        // Those requests own protection, but never owe another native Done.
+        let admission = sessions.inner.inference_admission("chat", &run, &interrupt).unwrap();
+        let first = (admission.check)().await.unwrap();
+        let second = (admission.check)().await.unwrap();
+        assert!(sessions.inner.boat_lease.active(&run));
+        assert!(sessions.inner.inference_in_flight("chat", &run));
+        assert_eq!(sessions.session_status("chat").unwrap().status, SessionStatus::Idle);
+        drop(first);
+        assert!(sessions.inner.boat_lease.active(&run), "overlapping auxiliary stream lost protection");
+        drop(second);
+        tokio::task::yield_now().await;
+        let status = sessions.session_status("chat").unwrap();
+        assert_eq!(status.status, SessionStatus::Idle);
+        assert_eq!(status.last_completed_turn, completed);
+        assert!(!sessions.inner.boat_lease.active(&run));
+        assert!(!sessions.inner.inference_in_flight("chat", &run));
+        assert!(sessions.is_live("chat", &run), "supervised warm runtime was retired");
+
+        async fn wait_status(sessions: &SessionsEngine, status: SessionStatus) {
+            sessions.watch_sessions().wait_for(|rows| rows.iter().any(|row|
+                row.chat_id == "chat" && row.status == status)).await.unwrap();
+        }
+        let done = || AgentEvent::Done {
+            status: DoneStatus::Completed, result: None, error: None, session_id: None,
+        };
+        // An autonomous native start must protect work before any model request.
+        feed.send(AgentEvent::TurnStarted).unwrap();
+        wait_status(&sessions, SessionStatus::Working).await;
+        assert!(sessions.inner.boat_lease.active(&run));
+        assert!(!sessions.inner.inference_in_flight("chat", &run));
+        let foreground = (admission.check)().await.unwrap();
+        let auxiliary = (admission.check)().await.unwrap();
+        drop(foreground);
+        drop(auxiliary);
+        assert_eq!(sessions.session_status("chat").unwrap().status, SessionStatus::Working);
+        assert!(sessions.inner.boat_lease.active(&run), "model EOF ended a native foreground turn");
+        let lingering = (admission.check)().await.unwrap();
+        feed.send(done()).unwrap();
+        wait_status(&sessions, SessionStatus::Idle).await;
+        assert!(sessions.inner.boat_lease.active(&run), "native Done released a live response");
+        drop(lingering);
+        assert!(!sessions.inner.boat_lease.active(&run));
+
+        // Exercise the final auxiliary Drop on both sides of native admission.
+        // The runs lock makes protection + Working publication indivisible.
+        for drop_before_start in [true, false] {
+            let auxiliary = (admission.check)().await.unwrap();
+            feed.send(AgentEvent::TurnStarted).unwrap();
+            if drop_before_start {
+                drop(auxiliary);
+                wait_status(&sessions, SessionStatus::Working).await;
+            } else {
+                wait_status(&sessions, SessionStatus::Working).await;
+                drop(auxiliary);
+            }
+            assert!(sessions.inner.boat_lease.active(&run));
+            assert!(!sessions.inner.inference_in_flight("chat", &run));
+            feed.send(done()).unwrap();
+            wait_status(&sessions, SessionStatus::Idle).await;
+            assert!(!sessions.inner.boat_lease.active(&run));
+        }
+        allow.store(false, std::sync::atomic::Ordering::Release);
+        feed.send(AgentEvent::TurnStarted).unwrap();
+        wait_status(&sessions, SessionStatus::Errored).await;
+        assert!(interrupt.is_cancelled(), "unprotected native start was not interrupted");
+        assert!(!sessions.inner.boat_lease.active(&run));
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event.event, AgentEvent::TurnStarted), "native control escaped into the event stream");
+        }
+        drop(supervision);
+        sessions.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn supervision_subscription_retains_exact_run_until_last_drop() {
         async fn park(core: &crate::EngineCore, registry: &HarnessRegistry) -> (mpsc::UnboundedSender<AgentEvent>, String, String) {
             let (feed, rx) = mpsc::unbounded_channel();
-            registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(rx)), steering: None }));
+            registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(rx)), steering: None }));
             let run = core.sessions.dispatch("supervised", HarnessId::Mock, request(), None).await.unwrap();
             feed.send(AgentEvent::Done {
                 status: DoneStatus::Completed, result: None, error: None, session_id: None,
@@ -6265,6 +6536,7 @@ mod tests {
         let (feed, rx) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
         registry.register(Arc::new(FeedHarness {
+            id: HarnessId::Mock,
             feed: Mutex::new(Some(rx)),
             steering: None,
         }));
@@ -6542,7 +6814,7 @@ mod tests {
         workspace.import_chat_row(&chat).unwrap();
         let (feed, events) = mpsc::unbounded_channel();
         let registry = HarnessRegistry::new();
-        registry.register(Arc::new(FeedHarness { feed: Mutex::new(Some(events)), steering: None }));
+        registry.register(Arc::new(FeedHarness { id: HarnessId::Mock, feed: Mutex::new(Some(events)), steering: None }));
         let sessions = SessionsEngine::new("importer".into(),
             Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()), Arc::new(registry));
         sessions.inner.original_epoch_histories.set(

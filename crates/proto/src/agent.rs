@@ -808,6 +808,11 @@ pub enum AgentEvent {
         session_id: String,
         assistant_message_id: String,
     },
+    /// Native foreground activity, including autonomous turns in a parked runtime.
+    /// Unlike a steer, this does not acknowledge a queued user assignment.
+    /// Host-local control only: consumed before journal or wire publication.
+    #[serde(skip)]
+    TurnStarted,
     TextDelta {
         text: String,
     },
@@ -958,6 +963,12 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn native_turn_start_is_not_a_persisted_or_wire_event() {
+        assert!(serde_json::to_string(&AgentEvent::TurnStarted).is_err());
+        assert!(serde_json::from_str::<AgentEvent>(r#"{"type":"turnStarted"}"#).is_err());
     }
 
     /// Drivers spell the key differently; the chip must not care which one

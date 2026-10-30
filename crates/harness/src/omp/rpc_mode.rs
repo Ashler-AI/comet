@@ -966,6 +966,10 @@ pub(crate) async fn run_rpc(
                     "agent_start" => {
                         streaming = true;
                         done_emitted = false;
+                        if events.send(Ok(AgentEvent::TurnStarted)).await.is_err() {
+                            kill_rpc_process(&mut child, process_group, interrupt_grace).await;
+                            return Ok(());
+                        }
                     }
                     "message_start" => {
                         if frame.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
