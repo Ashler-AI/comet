@@ -17,9 +17,26 @@ use zeron_doc::{
     SessionCommandPayload, SessionMessageEntry, TranscriptFrame, apply_transcript_frame,
 };
 use zeron_proto::{
-    Chat, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space, SteeringMode,
+    Chat, Device, DeviceEnvironment, HarnessId, Model, ReasoningLevel, Session, SessionStatus,
+    Space, SteeringMode,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcSubscription, connect_ipc, methods};
+
+/// A failed engine call, shown as `{method}: {error}`. The typed error lets a
+/// caller tell a dial that never reached its host from any later failure.
+#[derive(Debug)]
+struct CallError {
+    method: String,
+    error: RpcError,
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.method, self.error)
+    }
+}
+
+impl std::error::Error for CallError {}
 
 /// First-item wait for a watch snapshot. Localhost; the engine answers
 /// watch attaches in milliseconds unless it is still assembling stores.
@@ -191,17 +208,42 @@ impl Zeron {
     /// restarted underneath a long-lived agent session).
     pub async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let client = self.client().await?;
+        let failed = |error| anyhow::Error::new(CallError { method: method.to_owned(), error });
         match client.call(method, params.clone()).await {
             Err(RpcError::Closed) => {
                 self.forget_client().await;
                 let client = self.client().await?;
-                client
-                    .call(method, params)
-                    .await
-                    .map_err(|e| anyhow!("{method}: {e}"))
+                client.call(method, params).await.map_err(failed)
             }
-            other => other.map_err(|e| anyhow!("{method}: {e}")),
+            other => other.map_err(failed),
         }
+    }
+
+    /// Wake `device_id` when `error` is a dial to it that never reached the
+    /// host and the host is a registered Boat Devbox. Returns whether it woke.
+    /// Only an explicit send or new chat may call this; reads never wake.
+    pub async fn wake_unreached_boat(
+        &self,
+        error: &anyhow::Error,
+        device_id: &str,
+    ) -> anyhow::Result<bool> {
+        let unreached = error.downcast_ref::<CallError>().is_some_and(|call| {
+            zeron_rpc::never_reached_peer(&call.error.to_string(), device_id)
+        });
+        if !unreached
+            || !self.devices().await?.iter().any(|device| {
+                device.id == device_id
+                    && device
+                        .devbox_binding()
+                        .is_some_and(|(provider, _)| provider == DeviceEnvironment::Boat)
+            })
+        {
+            return Ok(false);
+        }
+        self.call(methods::WAKE_DEVICE, json!({ "deviceId": device_id }))
+            .await
+            .with_context(|| format!("waking Boat Devbox {device_id}"))?;
+        Ok(true)
     }
 
     /// Open a watch stream (reconnecting once if the socket is gone).
