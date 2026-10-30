@@ -2012,7 +2012,10 @@ impl Pickers {
                                 list.retain(|descriptor| {
                                     matches!(
                                         descriptor.id,
-                                        HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex
+                                        HarnessId::Omp
+                                            | HarnessId::ClaudeCode
+                                            | HarnessId::Codex
+                                            | HarnessId::Antigravity
                                     )
                                 });
                             }

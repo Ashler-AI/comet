@@ -9610,9 +9610,9 @@ impl Composer {
             }
             if !matches!(
                 resolved.harness,
-                Some(HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex)
+                Some(HarnessId::Omp | HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Antigravity)
             ) {
-                self.show_error("This harness is unavailable in Crew managed mode. Select OMP, Claude Code or Codex; existing history remains readable.", cx);
+                self.show_error("This harness is unavailable in Crew managed mode. Select OMP, Claude Code, Codex or Antigravity; existing history remains readable.", cx);
                 return;
             }
         }
