@@ -1,11 +1,11 @@
 //! Settings → Devices (feature-inventory §1.5): the device registry — name,
 //! platform, last-seen, an Online/Offline badge, a "This device" badge, click-to-copy id,
-//! Rename and explicit wake for registered Namespace and Boat hosts.
+//! Rename, explicit wake for registered Namespace and Boat hosts, and Add devbox.
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, SharedString, Subscription, Task, Window, div,
-    prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, EventEmitter, SharedString, Subscription, Task,
+    Window, div, prelude::*, px,
 };
 use std::time::Duration;
 
@@ -97,6 +97,16 @@ pub fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
     }
 }
 
+/// The new chat draft behind Add devbox. Crew's devbox workflow owns setup;
+/// the agent follows it on this computer while the user signs in and approves.
+pub const DEVBOX_SETUP_REQUEST: &str = "Set up a new personal devbox for me on Boat, following Crew's devbox workflow: skills/devbox in Ashler-AI/comet, read at the source commit of the release you install. Use an xlarge machine, a name that doesn't clash with my existing devboxes, and the same Crew release channel as this computer. Leave sign-ins and approvals to me, and ask before any billing change. It's done when the new machine shows as a Devbox in Settings › Devices.";
+
+/// What the page asks the shell to do.
+pub enum DevicesEvent {
+    /// Open a new chat on this computer that sets up a devbox.
+    AddDevbox,
+}
+
 /// Scope-aware copy: a local registry describes only the active local
 /// workspace and must not imply that account device metadata is already live.
 pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
@@ -127,6 +137,8 @@ pub struct DevicesPage {
     _observe: Subscription,
 }
 
+impl EventEmitter<DevicesEvent> for DevicesPage {}
+
 impl DevicesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
@@ -147,6 +159,10 @@ impl DevicesPage {
     pub(crate) fn on_hidden(&mut self) {
         self.wake_task = None;
         self.waking = None;
+    }
+
+    pub(crate) fn add_devbox(&mut self, cx: &mut Context<Self>) {
+        cx.emit(DevicesEvent::AddDevbox);
     }
 
     fn wake_device(&mut self, device_id: &str, cx: &mut Context<Self>) {
@@ -536,6 +552,30 @@ impl Render for DevicesPage {
             }
             block
         };
+        let others_block = others_block.child(
+            widgets::card_row(&theme, false)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .child(widgets::row_title(&theme, "Devbox"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![div()
+                                .child("An agent on this computer sets up a Boat machine for you")
+                                .into_any_element()],
+                        )),
+                )
+                .child(
+                    widgets::text_action(&theme, widgets::ActionTone::Filled, "Add devbox")
+                        .id("device-add-devbox")
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .aria_label("Add devbox")
+                        .focus_visible(|s| s.border_2().border_color(theme.accent))
+                        .on_click(cx.listener(|this, _, _, cx| this.add_devbox(cx))),
+                ),
+        );
         let card = div()
             .flex()
             .flex_col()

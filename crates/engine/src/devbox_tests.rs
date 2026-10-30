@@ -353,6 +353,45 @@ async fn queued_wake_rpc_rejects_sign_out_revocation_and_scope_change() {
     }
 }
 
+// Failure modes: after a Boat agent restart its exec sessions lack BOAT_ID, so
+// the guarded start helper refuses the machine Boat just routed the exec to;
+// a fallback that overrides Boat's own value hides a copied binding; an ID
+// that is not a valid Boat ID reaches the remote shell.
+#[cfg(unix)]
+#[tokio::test]
+async fn boat_start_supplies_only_a_missing_native_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    for (native, expected) in [(None, BOX), (Some("bx_abcdefgh"), "bx_abcdefgh")] {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join(".local/bin/crew-devbox-autostart");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        let seen = temp.path().join("seen");
+        std::fs::write(&helper, format!(
+            "#!/bin/sh\nprintf '%s %s' \"${{BOAT_ID-unset}}\" \"$1\" > '{}'\n", seen.display(),
+        )).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = native.map_or("-u BOAT_ID".to_owned(), |id| format!("BOAT_ID={id}"));
+        let executable = temp.path().join("boat");
+        std::fs::write(&executable, format!(
+            "#!/bin/sh\nif [ \"$3\" = info ]; then\n  printf '%s' '{{\"sandbox\":{{\"id\":\"{BOX}\",\"state\":\"ready\"}}}}'\nelse\n  shift 6\n  exec env {identity} HOME='{}' /bin/sh -c \"$1\"\nfi\n",
+            temp.path().display(),
+        )).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stop = CancellationToken::new();
+        prepare_host(&executable, DeviceEnvironment::Boat, BOX, &stop, &|| Ok(())).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), format!("{expected} staging"));
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let executable = temp.path().join("boat");
+    let invoked = temp.path().join("invoked");
+    std::fs::write(&executable, format!("#!/bin/sh\ntouch '{}'\n", invoked.display())).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stop = CancellationToken::new();
+    let forged = format!("{BOX}\"; touch pwned; \"");
+    assert!(prepare_host(&executable, DeviceEnvironment::Boat, &forged, &stop, &|| Ok(())).await.is_err());
+    assert!(!invoked.exists(), "an invalid Boat ID must not reach the provider CLI");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn provider_preparation_rechecks_authority_between_commands() {

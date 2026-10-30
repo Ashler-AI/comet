@@ -43,7 +43,7 @@ use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
 use crate::settings::archived::ArchivedPage;
-use crate::settings::devices::DevicesPage;
+use crate::settings::devices::{DEVBOX_SETUP_REQUEST, DevicesEvent, DevicesPage};
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
@@ -2211,6 +2211,7 @@ pub struct Shell {
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
     appearance_settings_sub: Option<Subscription>,
+    devices_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     /// The Copy submenu's hover grace, its painted bounds, and which side
@@ -2770,6 +2771,7 @@ impl Shell {
             notifications_sub: None,
             files_settings_sub: None,
             appearance_settings_sub: None,
+            devices_sub: None,
             chat_menu: popover::Popup::default(),
             chat_copy_intent: Default::default(),
             chat_copy_bounds: None,
@@ -5864,6 +5866,24 @@ impl Shell {
         cx.notify();
     }
 
+    /// Devices › Add devbox: a new chat on this computer, seeded with the setup
+    /// request. The agent follows Crew's devbox workflow with the user there to
+    /// pick it, send, and sign in; a draft already on the canvas is kept.
+    fn add_devbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(local) = self.state.read(cx).local_device_id.clone() else {
+            return;
+        };
+        self.open_new_session(Some(NewSessionTarget::NoProject(local)), cx);
+        let seeded = self.composer.update(cx, |composer, cx| {
+            composer.seed_draft_for(String::new(), DEVBOX_SETUP_REQUEST, cx)
+        });
+        if !seeded {
+            crate::toast::info(cx, "Kept your new chat draft. Clear it to start devbox setup.");
+        }
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
     /// Lazily create the entity for a settings section and return it renderable.
     fn settings_outlet(
         &mut self,
@@ -5875,7 +5895,15 @@ impl Shell {
             SettingsSection::Devices => {
                 if self.devices_page.is_none() {
                     let state = self.state.clone();
-                    self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
+                    let page = cx.new(|cx| DevicesPage::new(state, cx));
+                    self.devices_sub = Some(cx.subscribe_in(
+                        &page,
+                        window,
+                        |this: &mut Shell, _, event: &DevicesEvent, window, cx| match event {
+                            DevicesEvent::AddDevbox => this.add_devbox(window, cx),
+                        },
+                    ));
+                    self.devices_page = Some(page);
                 }
                 match &self.devices_page {
                     Some(page) => page.clone().into_any_element(),
@@ -20009,6 +20037,77 @@ mod settings_modal_regressions {
         shell.read_with(cx, |shell, _| {
             assert_eq!(shell.route, Route::Chat);
             assert_eq!(shell.settings.settings_section, SettingsSection::Devices);
+        });
+    }
+
+    // Failure modes: devbox setup opens on another device or its project, so
+    // the agent provisions from the wrong machine; it overwrites a draft the
+    // user was already writing on the new-chat canvas.
+    #[gpui::test]
+    fn add_devbox_opens_setup_on_this_computer_without_losing_a_draft(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        shell.update(cx, |shell, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.reduced_motion = true;
+            shell.state.update(cx, |state, cx| {
+                state.workspace_scope = Some(WorkspaceScope::Synced);
+                state.local_device_id = Some("local".into());
+                state.devices = ["local", "remote"]
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "name": id, "platform": "linux", "lastSeenAt": null,
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                state.apply_spaces(vec![zeron_proto::Space {
+                    id: "remote-project".into(),
+                    device_id: "remote".into(),
+                    path: "/remote-project".into(),
+                    name: None,
+                    git_detected: false,
+                    git_checked_at: None,
+                    checkout_id: None,
+                    repository_id: None,
+                    github_repo: None,
+                    created_at: Utc::now(),
+                }]);
+                state.select_space(Some("remote-project".into()), cx);
+            });
+            shell.open_settings(SettingsSection::Devices, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let devices = shell.read_with(cx, |shell, _| shell.devices_page.clone().unwrap());
+        devices.update(cx, |page, cx| page.add_devbox(cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.route, Route::Chat);
+            let state = shell.state.read(cx);
+            assert!(state.selected_chat.is_none());
+            assert!(state.selected_space.is_none(), "setup must not run in another device's project");
+            assert_eq!(state.effective_device_id().as_deref(), Some("local"));
+            assert_eq!(
+                shell.composer.read(cx).input.read(cx).text(),
+                crate::settings::devices::DEVBOX_SETUP_REQUEST
+            );
+        });
+
+        shell.update(cx, |shell, cx| {
+            shell.composer.update(cx, |composer, cx| {
+                composer.input.update(cx, |input, cx| input.set_text("keep my words", cx))
+            });
+            shell.open_settings(SettingsSection::Devices, cx);
+        });
+        cx.run_until_parked();
+        devices.update(cx, |page, cx| page.add_devbox(cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.route, Route::Chat);
+            assert_eq!(shell.composer.read(cx).input.read(cx).text(), "keep my words");
         });
     }
 }

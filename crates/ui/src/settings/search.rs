@@ -363,7 +363,9 @@ fn page_terms(section: SettingsSection) -> &'static str {
         }
         SettingsSection::Sandboxes => "scaffold namespace boat environments database hosts",
         SettingsSection::Annotations => "annotations comments accounts review",
-        SettingsSection::Devices => "machines computers remote this device other devices rename",
+        SettingsSection::Devices => {
+            "machines computers remote this device other devices rename wake add devbox boat"
+        }
         SettingsSection::Files => "editor autosave wrap hidden",
         SettingsSection::Appshots => "screenshots capture permissions",
         SettingsSection::Archived => "archive unarchive restore delete sessions threads",

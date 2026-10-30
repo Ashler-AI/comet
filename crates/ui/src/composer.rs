@@ -6785,6 +6785,23 @@ impl Composer {
         self.stage_appshot_for(self.current_key.clone(), appshot, cx);
     }
 
+    /// Put `text` in `key`'s draft unless the user already wrote one there.
+    /// The key may not be current yet: navigation swaps drafts afterwards.
+    pub(crate) fn seed_draft_for(&mut self, key: String, text: &str, cx: &mut Context<Self>) -> bool {
+        if key == self.current_key {
+            if !self.input.read(cx).text().is_empty() {
+                return false;
+            }
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
+        } else if self.drafts.get(&key).is_some_and(|draft| !draft.is_empty()) {
+            return false;
+        } else {
+            self.drafts.insert(key, text.to_owned());
+        }
+        cx.notify();
+        true
+    }
+
     pub fn stage_appshot_for(
         &mut self,
         key: String,
@@ -8968,17 +8985,29 @@ impl Composer {
     fn boat_wake_binding(&self, cx: &App) -> Option<(String, String)> {
         let state = self.state.read(cx);
         let target = state.active_device_id()?;
-        if state.local_device_id.as_deref() == Some(target.as_str())
-            || state.device_online(&target, chrono::Utc::now())
-        {
+        if state.device_online(&target, chrono::Utc::now()) {
             return None;
         }
-        let device = state.devices.iter().find(|device| device.id == target)?;
-        let (provider, boat) = device.devbox_binding()?;
-        if provider != zeron_proto::DeviceEnvironment::Boat {
-            return None;
-        }
+        let device = self.remote_boat_host(&target, cx)?;
+        let (_, boat) = device.devbox_binding()?;
         Some((target, boat.to_owned()))
+    }
+
+    fn remote_boat_host(&self, device_id: &str, cx: &App) -> Option<zeron_proto::Device> {
+        let state = self.state.read(cx);
+        if state.local_device_id.as_deref() == Some(device_id) {
+            return None;
+        }
+        state
+            .devices
+            .iter()
+            .find(|device| {
+                device.id == device_id
+                    && device.devbox_binding().is_some_and(|(provider, _)| {
+                        provider == zeron_proto::DeviceEnvironment::Boat
+                    })
+            })
+            .cloned()
     }
 
     fn cancel_boat_wake(&mut self, cx: &mut Context<Self>) {
@@ -9655,6 +9684,12 @@ impl Composer {
                 .map(|c| c.device_id.clone())
                 .or_else(|| target_device_id.clone())
         };
+        // Presence trails a Boat sleep by up to its online window, so a send
+        // that skipped the wake above can still find the host dark.
+        let dark_boat_host = host_device_id
+            .as_deref()
+            .filter(|_| wake_binding.is_none())
+            .and_then(|host| self.remote_boat_host(host, cx));
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
         let create_side_chat = self.state.update(cx, |state, _| {
@@ -10356,15 +10391,54 @@ impl Composer {
                     }).map_err(|e| e.to_string())?;
                     admission_attempted = true;
                 }
-                let queued = attachments::call_with_timeout(
+                let mut queued = attachments::call_with_timeout(
                     &engine,
                     cx.background_executor(),
                     methods::QUEUE_COMMAND,
-                    params,
+                    params.clone(),
                     std::time::Duration::from_secs(30),
                 )
-                .await
-                .map_err(|e| format!("Send failed: {e}"))?;
+                .await;
+                // Only a dial that never reached the host may wake it and resend
+                // the same command; any later failure could already have run it.
+                if let (Err(error), Some(host)) = (&queued, &dark_boat_host)
+                    && zeron_rpc::never_reached_peer(error, &host.id)
+                {
+                    let (cancel, cancelled) = futures::channel::oneshot::channel();
+                    this.update(cx, |composer, cx| {
+                        composer.boat_wake_cancel = Some((host.id.clone(), cancel));
+                        cx.notify();
+                    }).map_err(|error| error.to_string())?;
+                    let executor = cx.background_executor().clone();
+                    let wake = crate::settings::devices::wake_host(&engine, &executor, host);
+                    futures::pin_mut!(wake);
+                    let woken = match futures::future::select(cancelled, wake).await {
+                        futures::future::Either::Left(_) => return Err("Connection cancelled. Your draft is preserved.".into()),
+                        futures::future::Either::Right((result, _)) => result?,
+                    };
+                    this.update(cx, |composer, cx| {
+                        composer.boat_wake_cancel = None;
+                        composer.state.update(cx, |state, cx| {
+                            let mut devices = state.devices.clone();
+                            let slot = devices.iter_mut()
+                                .find(|row| row.id == host.id && row.devbox_binding() == host.devbox_binding())
+                                .ok_or_else(|| "The selected host binding changed. Nothing was sent.".to_string())?;
+                            *slot = woken;
+                            state.apply_devices(devices);
+                            cx.notify();
+                            Ok::<(), String>(())
+                        })
+                    }).map_err(|error| error.to_string())??;
+                    queued = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::QUEUE_COMMAND,
+                        params,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await;
+                }
+                let queued = queued.map_err(|e| format!("Send failed: {e}"))?;
                 if expects_setup_handoff
                     && let Some(command_id) = queued
                         .get("commandId")
@@ -13911,6 +13985,117 @@ mod tests {
                     }
                 });
             }
+        }
+    }
+
+    // Failure modes: presence still shows a just-slept Boat host online, so
+    // the send dials a dark host and is lost; waking after a failure that may
+    // have reached the host runs the message twice; a failed wake or retry
+    // drops the draft or wakes again.
+    #[gpui::test]
+    fn boat_send_wakes_a_stale_online_host_only_after_an_undelivered_dial(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let dark = "transport: peer boat-host: readiness check failed: connection closed";
+        for outcome in ["retried", "ambiguous", "wake-failed", "retry-failed"] {
+            let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+            let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, _| {
+                state.local_device_id = Some("controller".into());
+                state.devices = vec![serde_json::from_value(serde_json::json!({
+                    "id": "boat-host", "name": "Anything", "platform": "linux", "version": "0.2.113",
+                    "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "lastSeenAt": chrono::Utc::now(),
+                })).unwrap()];
+                state.chats = vec![serde_json::from_value(serde_json::json!({
+                    "id": "boat-chat", "deviceId": "boat-host", "cwd": "/workspace",
+                    "archived": false, "createdAt": chrono::Utc::now(),
+                    "config": { "harness": "codex", "model": "original-model", "sandbox": "workspace-write" },
+                })).unwrap()];
+                state.selected_chat = Some("boat-chat".into());
+                state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
+            });
+            let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+            composer.update(cx, |composer, cx| {
+                composer.input.update(cx, |input, cx| input.set_text("Original immutable message", cx));
+                composer.pickers.update(cx, |pickers, cx| {
+                    pickers.refresh_after_wake("boat-host", Some(HarnessId::Codex), cx)
+                });
+                composer.on_state_changed(cx);
+            });
+            cx.run_until_parked();
+            while requests.try_recv().is_ok() {}
+            composer.update(cx, |composer, cx| composer.on_submit(cx));
+            let mut commands = Vec::new();
+            let mut wakes = Vec::new();
+            for _ in 0..6 {
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+                while let Ok(frame) = requests.try_recv() {
+                    let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                    let reply = match frame.method.as_deref() {
+                        Some(methods::QUEUE_COMMAND) => {
+                            commands.push(frame.params.clone());
+                            if outcome == "retried" && commands.len() == 2 {
+                                Ok(serde_json::json!({ "commandId": "delivered" }))
+                            } else if outcome == "ambiguous" {
+                                Err("transport: no reply from device boat-host for QueueCommand within 30s")
+                            } else {
+                                Err(dark)
+                            }
+                        }
+                        Some(methods::WAKE_DEVICE) => {
+                            wakes.push(frame.params.clone());
+                            if outcome == "wake-failed" {
+                                Err("provider refused wake")
+                            } else {
+                                Ok(serde_json::json!({
+                                    "deviceId": "boat-host", "devboxProvider": "boat", "devboxId": "bx_jdyh7avc", "ready": true,
+                                    "device": { "id": "boat-host", "name": "Woken Boat", "platform": "linux", "version": "0.2.113",
+                                        "lastSeenAt": chrono::Utc::now(), "devboxProvider": "boat", "devboxId": "bx_jdyh7avc" },
+                                }))
+                            }
+                        }
+                        _ => continue,
+                    };
+                    let reply = match reply {
+                        Ok(value) => zeron_rpc::ServerFrame { id: frame.id, ok: Some(value), ..Default::default() },
+                        Err(error) => zeron_rpc::ServerFrame { id: frame.id, err: Some(error.into()), ..Default::default() },
+                    };
+                    replies.try_send(serde_json::to_string(&reply).unwrap()).unwrap();
+                }
+            }
+            let expected_wakes = if outcome == "ambiguous" { 0 } else { 1 };
+            assert_eq!(wakes.len(), expected_wakes, "{outcome}: {wakes:?}");
+            for wake in &wakes {
+                assert_eq!(*wake, serde_json::json!({ "deviceId": "boat-host" }));
+            }
+            let expected_commands = if matches!(outcome, "retried" | "retry-failed") { 2 } else { 1 };
+            assert_eq!(commands.len(), expected_commands, "{outcome}: {commands:?}");
+            assert!(commands.iter().all(|command| *command == commands[0]), "a retry must resend the same immutable command");
+            assert_eq!(commands[0]["targetDeviceId"], "boat-host");
+            composer.read_with(cx, |composer, cx| {
+                assert!(!composer.sending, "{outcome}");
+                assert!(composer.boat_wake_cancel.is_none(), "{outcome}");
+                if outcome == "retried" {
+                    assert!(composer.failure.is_none(), "{outcome}: {:?}", composer.failure);
+                    assert_eq!(composer.input.read(cx).text(), "");
+                } else {
+                    assert_eq!(composer.input.read(cx).text(), "Original immutable message", "{outcome}");
+                    let failure = composer.failure.as_deref().unwrap_or_default().to_string();
+                    let cause = match outcome {
+                        "ambiguous" => "no reply from device",
+                        "wake-failed" => "provider refused wake",
+                        _ => "readiness check failed",
+                    };
+                    assert!(failure.contains(cause), "{outcome}: {failure}");
+                }
+            });
         }
     }
 
