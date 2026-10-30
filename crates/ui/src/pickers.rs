@@ -185,9 +185,37 @@ pub fn default_model(models: &[Model]) -> Option<&Model> {
 /// An explicit selection never silently becomes a different model after refresh.
 fn selected_catalog_model<'a>(models: &'a [Model], selected: Option<&str>) -> Option<&'a Model> {
     match selected {
-        Some(id) => models.iter().find(|model| model.id == id),
+        Some(id) => models.iter().find(|model| model.id == id).or_else(|| {
+            let (family, effort) = zeron_proto::google_model_variant(id)?;
+            models.iter().find(|model| {
+                zeron_proto::google_model_variant(&model.id)
+                    .is_some_and(|(candidate, _)| candidate == family)
+                    && model.reasoning_levels.contains(&effort)
+            })
+        }),
         None => default_model(models),
     }
+}
+
+/// Catalog rows group Google effort variants, but persisted run/Scaffold
+/// intent continues to name the exact provider model.
+fn google_execution_model(harness: HarnessId, model: &Model, effort: Option<ReasoningLevel>) -> String {
+    let managed_google = harness == HarnessId::Antigravity
+        || (harness == HarnessId::Omp && model.id.starts_with("google-antigravity/"));
+    if managed_google
+        && let Some((family, _)) = zeron_proto::google_model_variant(&model.id)
+        && let Some(effort) = effort.filter(|level| model.reasoning_levels.contains(level))
+    {
+        let suffix = match effort {
+            ReasoningLevel::Low => "low",
+            ReasoningLevel::Medium => "medium",
+            ReasoningLevel::High => "high",
+            ReasoningLevel::XHigh => "xhigh",
+            _ => return model.id.clone(),
+        };
+        return format!("{family}-{suffix}");
+    }
+    model.id.clone()
 }
 
 /// A model's default reasoning: X-High when the ladder offers it (zeron
@@ -1441,15 +1469,35 @@ impl Pickers {
     fn explicit_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
         self.config.reasoning.or_else(|| {
             match self.state.read(cx).selected_chat_row() {
-                Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
+                Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning)
+                    .or_else(|| self.google_selected_effort(cx)),
                 // New chat: the level last used with this model, else the
                 // last-used level overall.
                 None => self
                     .effective_harness(cx)
-                    .and_then(|h| self.defaults.reasoning_for(h, self.effective_model_id(cx)))
+                    .and_then(|h| self.defaults.reasoning_by_model.get(&h))
+                    .and_then(|levels| levels.get(self.effective_model_id(cx)?).copied())
+                    .or_else(|| self.google_selected_effort(cx))
                     .or(self.defaults.reasoning),
             }
         })
+    }
+
+    fn google_selected_effort(&self, cx: &App) -> Option<ReasoningLevel> {
+        // A freshly picked family follows the normal effort default. Only
+        // stored variant IDs encode an older explicit effort selection.
+        if self.config.model.is_some() { return None; }
+        let harness = self.effective_harness(cx)?;
+        let id = self.effective_model_id(cx)?;
+        if harness != HarnessId::Antigravity
+            && !(harness == HarnessId::Omp && id.starts_with("google-antigravity/"))
+        {
+            return None;
+        }
+        let (_, effort) = zeron_proto::google_model_variant(id)?;
+        self.selected_model(cx)
+            .filter(|model| model.reasoning_levels.contains(&effort))
+            .map(|_| effort)
     }
 
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
@@ -1601,7 +1649,7 @@ impl Pickers {
             harness,
             model: self
                 .selected_model(cx)
-                .map(|m| m.id.clone())
+                .map(|m| google_execution_model(harness.expect("selected model has a harness"), m, self.effective_reasoning(cx)))
                 // Catalog not loaded (offline): still send the id we know.
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
@@ -2490,7 +2538,7 @@ impl Pickers {
             let mut ladder = config
                 .model
                 .as_deref()
-                .and_then(|id| models.iter().find(|m| m.id == id))
+                .and_then(|id| selected_catalog_model(models, Some(id)))
                 .map(|m| m.reasoning_levels.clone())
                 .unwrap_or_default();
             if ladder.is_empty()
@@ -2509,10 +2557,11 @@ impl Pickers {
             if let Some(model) = config
                 .model
                 .as_deref()
-                .and_then(|id| models.iter().find(|m| m.id == id))
+                .and_then(|id| selected_catalog_model(models, Some(id)))
             {
                 config.model_options =
                     offered_options(model, std::mem::take(&mut config.model_options));
+                config.model = Some(google_execution_model(config.harness, model, config.reasoning));
             }
         }
         self.state.update(cx, |state, cx| {
@@ -2644,7 +2693,7 @@ impl Pickers {
                 .models
                 .get(&harness)
                 .and_then(Loadable::ready)
-                .is_some_and(|models| !models.iter().any(|m| m.id == id))
+                .is_some_and(|models| selected_catalog_model(models, Some(id)).is_none())
             && let Some(descriptor) = descriptors.iter().find(|d| d.id == harness)
         {
             let label = self
@@ -2684,8 +2733,8 @@ impl Pickers {
     /// contain it — then 0), 0 while the list is loading.
     fn selected_model_index(&self, cx: &App) -> usize {
         let selected = self
-            .effective_model_id(cx)
-            .or_else(|| self.selected_model(cx).map(|m| m.id.as_str()));
+            .selected_model(cx).map(|m| m.id.as_str())
+            .or_else(|| self.effective_model_id(cx));
         let effective = self.effective_harness(cx);
         self.model_rows(cx)
             .iter()
@@ -5073,8 +5122,8 @@ impl Pickers {
         let effective = self.effective_harness(cx);
         let is_selected = Some(row.harness) == effective
             && self
-                .effective_model_id(cx)
-                .or_else(|| self.selected_model(cx).map(|m| m.id.as_str()))
+                .selected_model(cx).map(|m| m.id.as_str())
+                .or_else(|| self.effective_model_id(cx))
                 == Some(row.model.id.as_str());
         let is_active = ix == self.active;
         let is_fav = self.defaults.is_favorite(row.harness, &row.model.id);
@@ -5504,8 +5553,8 @@ impl Pickers {
     fn row_is_selected(&self, row: &ModelRowData, cx: &App) -> bool {
         Some(row.harness) == self.effective_harness(cx)
             && self
-                .effective_model_id(cx)
-                .or_else(|| self.selected_model(cx).map(|m| m.id.as_str()))
+                .selected_model(cx).map(|m| m.id.as_str())
+                .or_else(|| self.effective_model_id(cx))
                 == Some(row.model.id.as_str())
     }
 
@@ -6350,6 +6399,7 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
 /// already-clean lists. The send path recomposes the advertised id from the
 /// base + trait (`pick_model_value`), so a folded pick still runs.
 pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
+    let models = zeron_proto::google_model_picker_rows(harness, models);
     fn strip_1m(id: &str) -> Option<&str> {
         id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
     }
@@ -6988,6 +7038,72 @@ mod tests {
                 );
             });
         }
+    }
+
+    // Failure modes: legacy effort rows must not become stale duplicates, global
+    // defaults must not change their effort, and slider changes must reach the
+    // exact provider model in both RunRequest and Scaffold's resolved config.
+    #[gpui::test]
+    fn google_effort_saved_selection_and_slider_resolve_provider_variant(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        for (harness, prefix) in [(HarnessId::Antigravity, ""), (HarnessId::Omp, "google-antigravity/")] {
+            let legacy = format!("{prefix}gemini-4-argon-low");
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.chats.push(serde_json::from_value(serde_json::json!({
+                    "id":"google-chat", "deviceId":"device", "archived":false, "createdAt":"2026-09-01T00:00:00Z",
+                    "config":{"harness":harness, "model":legacy, "sandbox":"workspace-write"}
+                })).unwrap());
+                state.selected_chat = Some("google-chat".into());
+                state
+            });
+            let pickers = cx.new(|cx| Pickers::new(state, cx));
+            pickers.update(cx, |pickers, cx| {
+                pickers.defaults = ComposerDefaults::default();
+                pickers.defaults.reasoning = Some(ReasoningLevel::High);
+                pickers.harnesses = Loadable::Ready(vec![descriptor(harness, "Google")]);
+                let provider = if harness == HarnessId::Omp { " (Google)" } else { "" };
+                let raw_models = [("medium", "Medium"), ("high", "High"), ("low", "Low")]
+                    .into_iter()
+                    .map(|(effort, label)| bare_model(
+                        &format!("{prefix}gemini-4-argon-{effort}"),
+                        &format!("Gemini 4 Argon ({label}){provider}"),
+                    ))
+                    .collect();
+                pickers.apply_model_catalog(harness, Loadable::Ready(normalize_model_rows(harness, raw_models)), cx);
+                assert_eq!(pickers.model_rows(cx).len(), 1);
+                assert_eq!(pickers.model_rows(cx)[0].model.label, format!("Gemini 4 Argon{provider}"));
+                assert!(!pickers.model_rows(cx)[0].selected_only);
+                assert_eq!(pickers.compact_effort(cx).unwrap().selected, 0);
+                assert_eq!(pickers.resolved(cx).model.as_deref(), Some(legacy.as_str()));
+                assert_eq!(pickers.resolved(cx).reasoning, Some(ReasoningLevel::Low));
+                pickers.pick_reasoning(ReasoningLevel::High, cx);
+                let resolved = pickers.resolved(cx);
+                assert_eq!(resolved.model, Some(format!("{prefix}gemini-4-argon-high")));
+                assert_eq!(resolved.reasoning, Some(ReasoningLevel::High));
+                assert_eq!(pickers.model_rows(cx).len(), 1);
+                assert_eq!(pickers.compact_effort(cx).unwrap().selected, 2);
+                let route = zeron_proto::AgentRoute::from_harness_model(harness, resolved.model.as_deref().unwrap()).unwrap();
+                assert_eq!(route.model, "gemini-4-argon-high");
+            });
+        }
+    }
+
+    #[test]
+    fn google_effort_alias_does_not_substitute_unavailable_or_foreign_models() {
+        let mut model = bare_model("google-antigravity/gemini-4-argon-medium", "Gemini 4 Argon");
+        model.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::Medium];
+        let models = vec![model];
+        assert!(selected_catalog_model(&models, Some("google-antigravity/gemini-4-argon-high")).is_none());
+        assert!(selected_catalog_model(&models, Some("other/gemini-4-argon-low")).is_none());
+        assert!(selected_catalog_model(&models, Some("google-antigravity/gemini-4-carbon-low")).is_none());
+        let selected = selected_catalog_model(&models, Some("google-antigravity/gemini-4-argon-low")).unwrap();
+        assert_eq!(selected.id, "google-antigravity/gemini-4-argon-medium");
+        assert_eq!(google_execution_model(HarnessId::Codex, selected, Some(ReasoningLevel::Low)), selected.id);
+        let plain = bare_model("gemini-4-argon-medium", "Gemini 4 Argon");
+        assert_eq!(google_execution_model(HarnessId::Antigravity, &plain, Some(ReasoningLevel::Low)), plain.id);
     }
 
     #[test]
