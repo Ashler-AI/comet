@@ -101,10 +101,7 @@ grids when the main window loses focus.
 
 ## Verification
 
-[Windows CI](../../.github/workflows/windows.yml) builds the release application
-and tests application startup, agent discovery/protocols, process cleanup,
-ConPTY, locking, UI behavior, and shader layouts. Shared Rust regressions run
-on Linux and macOS. To run the engine and harness checks locally:
+There is no Windows CI workflow. Run the engine and harness checks locally:
 
 ```powershell
 cargo test --locked -p zeron-engine -p zeron-harness --lib
