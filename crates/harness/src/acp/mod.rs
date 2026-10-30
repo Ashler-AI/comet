@@ -1366,6 +1366,7 @@ impl AcpHarness {
                 &[],
                 None,
                 &Default::default(),
+                Some(context),
             )
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
@@ -1407,7 +1408,7 @@ impl AcpHarness {
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
         let (_scratch, mut child, _stderr, sign_in_prompted) = self
-            .spawn_agent(home.as_deref(), false, &[], None, &Default::default())
+            .spawn_agent(home.as_deref(), false, &[], None, &Default::default(), None)
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
@@ -1818,6 +1819,7 @@ impl AcpHarness {
         extra_args: &[String],
         _mcp: Option<&zeron_proto::McpServer>,
         run_env: &std::collections::BTreeMap<String, String>,
+        context: Option<&crate::RunContext>,
     ) -> Result<
         (
             Option<ScratchDir>,
@@ -1827,6 +1829,14 @@ impl AcpHarness {
         ),
         HarnessError,
     > {
+        let managed_antigravity = self.spec.id == HarnessId::Antigravity
+            && context.and_then(|value| value.inference.as_ref()).is_some();
+        if managed_antigravity {
+            check_managed_gateway_policy(&antigravity_admin_settings_path())?;
+            if !self.installed() {
+                install_harness(HarnessId::Antigravity).await?;
+            }
+        }
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
@@ -1850,11 +1860,26 @@ impl AcpHarness {
                 }
             }
         }
-        let scratch = self.adapter_scratch()?;
+        let scratch = if managed_antigravity {
+            Some(ScratchDir::new("antigravity-managed")?)
+        } else {
+            self.adapter_scratch()?
+        };
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
         }
         crate::apply_run_env(&mut cmd, run_env);
+        if managed_antigravity {
+            let home = scratch
+                .as_ref()
+                .expect("managed Antigravity scratch")
+                .path()
+                .join("gemini");
+            std::fs::create_dir_all(home.join("antigravity-acp"))?;
+            cmd.env("GEMINI_HOME", home);
+        }
+        // Managed identity and credentials outrank host environment overlays.
+        crate::apply_run_context(&mut cmd, context);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1904,6 +1929,7 @@ impl AcpHarness {
                 &[],
                 None,
                 &Default::default(),
+                None,
             )
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
@@ -1977,7 +2003,7 @@ impl AcpHarness {
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (_scratch, mut child, stderr_tail, sign_in_prompted) = self
-            .spawn_agent(None, false, &[], None, &Default::default())
+            .spawn_agent(None, false, &[], None, &Default::default(), None)
             .await?;
         let (client, incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
@@ -2516,6 +2542,7 @@ impl Harness for AcpHarness {
                 &[],
                 request.mcp.as_ref(),
                 &request.env,
+                controls.context.as_ref(),
             )
             .await?;
         let stdin = child
@@ -2675,6 +2702,40 @@ struct ConfigRules {
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     /// Fixed for the agent's life (see `reconfigures_in_place`).
     access: AccessMode,
+}
+
+fn antigravity_admin_settings_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/Antigravity/admin_settings.json")
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("PROGRAMDATA").filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("Antigravity")
+            .join("admin_settings.json")
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        PathBuf::from("/etc/antigravity/admin_settings.json")
+    }
+}
+
+fn check_managed_gateway_policy(path: &Path) -> Result<(), HarnessError> {
+    // Official MDM settings outrank client gateway metadata. Never override
+    // that policy or risk forwarding the Crew capability to its endpoint.
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(HarnessError::Io(error)),
+        Ok(_) => Err(HarnessError::Protocol(
+            "Crew-managed Antigravity is unavailable while system admin_settings.json is present"
+                .into(),
+        )),
+    }
 }
 
 fn managed_initialize_params(harness: HarnessId, gateway: bool) -> Value {
@@ -4289,7 +4350,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn: turn_control,
-        context: _,
+        context,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
     let rules = ConfigRules {
@@ -4300,10 +4361,32 @@ async fn run_session(session: Session) {
     };
 
     // ---- handshake + session (interruptible) ------------------------------
+    let gateway_route = context
+        .as_ref()
+        .and_then(|value| value.inference.as_ref())
+        .filter(|_| harness == HarnessId::Antigravity);
+    if let Some(route) = gateway_route {
+        // Use the owned account's exact model/effort variant from the relay.
+        request.model = Some(route.model.clone());
+    }
     let setup = async {
         let init = client
-            .request("initialize", initialize_params(harness))
+            .request(
+                "initialize",
+                managed_initialize_params(harness, gateway_route.is_some()),
+            )
             .await?;
+        if let Some(route) = gateway_route {
+            // Provider OAuth stays in Agent Auth; this is an opaque loopback token.
+            request_draining(
+                &client,
+                &mut incoming,
+                access,
+                "authenticate",
+                gateway_auth_params(route),
+            )
+            .await?;
+        }
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
         let inline_images =
@@ -5714,6 +5797,21 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_gateway_rejects_system_admin_overrides_without_reading_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin_settings.json");
+        assert!(check_managed_gateway_policy(&path).is_ok());
+        std::fs::write(
+            &path,
+            r#"{"gateway":{"url":"https://another-gateway.invalid"}}"#,
+        )
+        .unwrap();
+        assert!(check_managed_gateway_policy(&path).is_err());
+        std::fs::write(&path, "invalid admin configuration").unwrap();
+        assert!(check_managed_gateway_policy(&path).is_err());
+    }
 
     #[test]
     fn unix_browser_suppression_falls_back_to_zerons_noop_mode() {
