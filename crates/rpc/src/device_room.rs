@@ -887,6 +887,18 @@ pub enum PeerLiveness {
 
 pub type PeerLivenessProbe = Arc<dyn Fn(&str) -> PeerLiveness + Send + Sync>;
 
+/// A dial failure. [`LinkCache::client`] returns these before it sends any
+/// call, so the call that needed the link never reached the peer.
+fn unreachable(device_id: &str, reason: impl std::fmt::Display) -> RpcError {
+    RpcError::Transport(format!("peer {device_id}: {reason}"))
+}
+
+/// Whether `error`, as any transport renders it, is a dial failure for
+/// `device_id`. The call never reached that peer, so it may be retried.
+pub fn never_reached_peer(error: &str, device_id: &str) -> bool {
+    error.starts_with(&unreachable(device_id, "").to_string())
+}
+
 pub struct LinkCacheConfig {
     pub edge_url: String,
     pub token: Arc<dyn TokenSource>,
@@ -1115,9 +1127,7 @@ impl LinkCache {
         if let Some(probe) = &self.config.liveness
             && probe(device_id) == PeerLiveness::Dark
         {
-            return Err(RpcError::Transport(format!(
-                "peer {device_id}: device is offline (no recent presence)"
-            )));
+            return Err(unreachable(device_id, "device is offline (no recent presence)"));
         }
         let dial_lock = {
             let mut locks = lock(&self.dial_locks);
@@ -1133,8 +1143,8 @@ impl LinkCache {
         if let Some(link) = self.cached(device_id) {
             return Ok(link.client());
         }
-        if let Some(message) = self.cooling(device_id) {
-            return Err(RpcError::Transport(message));
+        if let Some(reason) = self.cooling(device_id) {
+            return Err(unreachable(device_id, reason));
         }
         let mut last_err = None;
         for attempt in 0..DIAL_ATTEMPTS {
@@ -1209,7 +1219,7 @@ impl LinkCache {
             return None;
         }
         Some(format!(
-            "peer {device_id}: unreachable (backing off after {} failed dials; retrying in ~{}s)",
+            "unreachable (backing off after {} failed dials; retrying in ~{}s)",
             entry.failures,
             (until - now).as_secs().max(1)
         ))
@@ -1261,23 +1271,16 @@ impl LinkCache {
             DeviceLink::connect(&url, self.config.token.clone(), token.generation),
         )
         .await
-        .map_err(|_| RpcError::Transport(format!("peer {device_id}: connect timed out")))?;
+        .map_err(|_| unreachable(device_id, "connect timed out"))?;
         let link = Arc::new(link?);
         // Readiness probe: prove the host answers before caching (an offline host bounces
         // host_offline, which closes the link and fails this call fast).
         let client = link.client();
-        let probe = client.call(
-            crate::methods::LIST_HARNESSES,
-            serde_json::json!({ READINESS_PROBE_PARAM: true }),
-        );
+        let probe = client.call(crate::methods::LOCAL_DEVICE, serde_json::json!({}));
         tokio::time::timeout(self.config.probe_timeout, probe)
             .await
-            .map_err(|_| {
-                RpcError::Transport(format!("peer {device_id}: readiness check timed out"))
-            })?
-            .map_err(|e| {
-                RpcError::Transport(format!("peer {device_id}: readiness check failed: {e}"))
-            })?;
+            .map_err(|_| unreachable(device_id, "readiness check timed out"))?
+            .map_err(|e| unreachable(device_id, format_args!("readiness check failed: {e}")))?;
         Ok(link)
     }
 
@@ -1375,6 +1378,63 @@ mod tests {
             .expect("dropping the link leaked the socket")
             .unwrap();
         assert!(!received.is_empty());
+    }
+
+    // Failure modes: a dial failure stops being recognized once it crosses
+    // IPC, so a sleeping host is never woken; another peer's dial failure, or
+    // a failure after the call may have reached the peer, is recognized, so a
+    // retry wakes the wrong machine or runs the call twice.
+    #[tokio::test]
+    async fn only_dial_failures_prove_a_call_never_reached_its_peer() {
+        use futures::SinkExt;
+        struct Fails(Mutex<Vec<RpcError>>);
+        #[async_trait::async_trait]
+        impl crate::RpcService for Fails {
+            async fn handle(&self, _: &str, _: serde_json::Value) -> Result<crate::RpcReply, RpcError> {
+                Err(lock(&self.0).remove(0))
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let edge = format!("http://{}", listener.local_addr().unwrap());
+        // A room without a host bounces every join, as for a slept Devbox.
+        let relay = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
+                    let bounce = encode_device_frame(
+                        &DeviceFrameHeader::new(RELAY_KIND, RELAY_KIND),
+                        br#"{"error":"host_offline"}"#,
+                    ).unwrap();
+                    let _ = ws.send(tokio_tungstenite::tungstenite::Message::Binary(bounce.into())).await;
+                    let _ = ws.close(None).await;
+                });
+            }
+        });
+        let mut config = LinkCacheConfig::new(edge, Arc::new(StaticToken("test".into())));
+        config.probe_timeout = Duration::from_secs(5);
+        let cache = LinkCache::new(config);
+        let bounced = cache.client("boat-host").await.err().expect("a hostless room refuses the dial");
+        let cooling = cache.client("boat-host").await.err().expect("a failed dial backs off");
+        let mut dark = LinkCacheConfig::new("http://127.0.0.1:9", Arc::new(StaticToken("test".into())));
+        dark.liveness = Some(Arc::new(|_| PeerLiveness::Dark));
+        let dark = LinkCache::new(dark).client("boat-host").await.err().expect("a dark peer is not dialed");
+        let undelivered = vec![bounced, cooling, dark];
+        let count = undelivered.len();
+        let delivered = [
+            RpcError::Closed,
+            RpcError::Transport("no reply from device boat-host for QueueCommand within 30s".into()),
+            RpcError::Failed("peer boat-host: refused".into()),
+        ];
+        // Each error crosses the same text wire as the local engine's IPC.
+        let client = crate::memory_client(Arc::new(Fails(Mutex::new(
+            undelivered.into_iter().chain(delivered).collect(),
+        ))));
+        for index in 0..count + 3 {
+            let error = client.call("Any", serde_json::json!({})).await.unwrap_err().to_string();
+            assert_eq!(never_reached_peer(&error, "boat-host"), index < count, "{error}");
+            assert!(!never_reached_peer(&error, "other-host"), "{error}");
+        }
+        relay.abort();
     }
 
     use super::*;

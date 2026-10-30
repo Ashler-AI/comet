@@ -334,6 +334,9 @@ async fn prepare_host(
             Err(provider_failure(&out, &err))
         };
     }
+    if !DeviceEnvironment::Boat.valid_devbox_id(id) {
+        return Err("Invalid Boat sandbox ID".into());
+    }
     let (status, out, err) = run_cli(
         executable,
         &["--no-update", "--json", "info", id],
@@ -358,9 +361,12 @@ async fn prepare_host(
         }
     }
     authorize()?;
+    // A restarted Boat agent can drop BOAT_ID from exec sessions. Boat routed
+    // this exec to `id`, so supply only that missing value; Boat's own wins.
+    let start = format!("export BOAT_ID=\"${{BOAT_ID:-{id}}}\"; {START_HELPER}");
     let (status, out, err) = run_cli(
         executable,
-        &["--no-update", "--json", "exec", id, "--timeout", "180", START_HELPER],
+        &["--no-update", "--json", "exec", id, "--timeout", "180", &start],
         START_TIMEOUT,
         cancel,
     )

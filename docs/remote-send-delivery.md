@@ -133,6 +133,39 @@ Reselecting the chat replaces those watches and requires fresh Preparing evidenc
 Acknowledgements remain tied to the exact pending message; explicit delivery
 failures are not hidden by older transcript rows or unrelated session activity.
 
+## Queued remote attachments
+
+Queued desktop uploads use at most three concurrent 510,000-byte chunks
+(680,000 base64 characters). Progress counts acknowledged bytes; commit waits
+for every chunk ACK. A failed window settles its outstanding calls before
+progress cleanup and retry. Requests for the same `(chat, command)` share one
+escort; different chats remain independent.
+Ownership changes re-deliver bytes before forwarding the command to the new
+host; that destination gets the existing post-transfer relay retry budget.
+
+Durable `pending://` references and committed filenames are unchanged. Fast
+uploads append `-q680000` only to the wire staging ID, preserving its first eight
+characters. Older writers keep their original staging IDs and 45,000-byte
+chunks, so their high-sequence partials cannot contaminate a fast commit.
+Short IDs and IDs without suffix room keep their original ID and chunk layout.
+Receiver authorization, path jails, size limits, and partial-upload TTLs are
+unchanged; no protocol capability or runtime upgrade is required.
+
+Verification on macOS (2026-10-27): all 21 `relay_delivery`, `queued_attachments`,
+and `device_routing` regressions passed. Gated RPC coverage includes reordered
+ACKs, the three-call bound, the final-ACK commit barrier, refusal cleanup,
+old-writer partials across reopen/retry, empty and boundary-sized files, ID
+fallbacks, host moves, and same-ID commands on different chat hosts. The fresh
+Cargo-built engine library binary passed 723 tests (four existing ignored) from
+an isolated temporary working directory; the RPC crate passed 39 (one existing
+ignored). The offline headed demo also attached and sent a synthetic file.
+
+The two-device executable smoke used a local Worker and two real headless
+engines: a queued 5,357,034-byte synthetic file arrived byte-exact with matching
+SHA-256, and its mock run completed on the host and synced to the sender in
+0.406 seconds after queueing. This local result is not a WAN benchmark or a
+deployed-release claim.
+
 ## Provider turn protection
 
 The execution host admits local sends and remotely delivered Run/Steer commands
@@ -148,6 +181,16 @@ from a parked harness reacquires provider protection before any request body is
 forwarded, retains it through response completion/drop, and blocks idle reaping
 while active. Model discovery does not acquire protection. Retired run tokens
 cannot rebind to a replacement run, even for the same chat and provider.
+
+OMP foreground activity follows native `agent_start` and terminal `agent_end`,
+not every inference request. Background skill-description compression can use
+the same route after a completed turn: it retains provider protection while its
+response is live without reopening the foreground or requiring another Done.
+An autonomous native start reacquires protection before becoming Working; that
+claim and status publication share the run-ownership lock so the final auxiliary
+response cannot release the new turn. Model EOF does not settle a foreground
+turn still running tools. Native starts are host-local control signals, never
+new journal/wire events; stored profile and wire compatibility remain unchanged.
 
 Focused engine regressions cover Boat admission, Namespace markers, terminal
 mailbox races, and relay denial/cancellation/stale-token fencing. These changes

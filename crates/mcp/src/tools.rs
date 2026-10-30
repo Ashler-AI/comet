@@ -1034,7 +1034,7 @@ impl Tools {
             .zeron
             .resolve_target(args.project.as_deref(), args.device.as_deref())
             .await?;
-        let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
+        let harnesses = self.host_harnesses(&device_id).await?;
         let harness = match args.harness.as_deref() {
             // Cloud runs its own agents, with your Cloud accounts.
             Some(raw) if args.cloud => {
@@ -1280,6 +1280,17 @@ impl Tools {
         }))
     }
 
+    /// The catalog of a host about to receive a send or a new chat. These are
+    /// explicit actions, so a slept Boat Devbox is woken once and asked again.
+    async fn host_harnesses(&self, device_id: &str) -> anyhow::Result<Vec<HarnessInfo>> {
+        match self.zeron.harnesses_on(Some(device_id)).await {
+            Err(error) if self.zeron.wake_unreached_boat(&error, device_id).await? => {
+                self.zeron.harnesses_on(Some(device_id)).await
+            }
+            result => result,
+        }
+    }
+
     async fn send_message(&self, args: SendArgs) -> anyhow::Result<Value> {
         let text = args.text.trim();
         if text.is_empty() {
@@ -1295,7 +1306,7 @@ impl Tools {
         let (spaces, sessions, harnesses) = tokio::try_join!(
             self.zeron.spaces(),
             self.zeron.sessions(),
-            self.zeron.harnesses_on(Some(&chat.device_id))
+            self.host_harnesses(&chat.device_id)
         )?;
         let space = chat
             .space_id
@@ -1745,6 +1756,11 @@ mod tests {
         extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
+        /// Registers dev-remote as a Boat Devbox.
+        remote_boat: bool,
+        /// Every call routed to dev-remote fails to dial until a wake.
+        remote_asleep: std::sync::atomic::AtomicBool,
+        wakes: Mutex<Vec<Value>>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1754,6 +1770,17 @@ mod tests {
     #[async_trait]
     impl RpcService for World {
         async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if method == methods::WAKE_DEVICE {
+                self.wakes.lock().unwrap().push(params);
+                self.remote_asleep.store(false, SeqCst);
+                return Ok(RpcReply::Value(json!({ "deviceId": "dev-remote", "ready": true })));
+            }
+            if params["targetDeviceId"] == "dev-remote" && self.remote_asleep.load(SeqCst) {
+                return Err(RpcError::Transport(
+                    "peer dev-remote: readiness check failed: connection closed".into(),
+                ));
+            }
             if matches!(
                 method,
                 methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_AGENT_ACCOUNTS
@@ -1772,10 +1799,17 @@ mod tests {
                 methods::ENGINE_INFO => RpcReply::Value(json!({
                     "deviceId": "dev-local", "workspaceScope": "local"
                 })),
-                methods::WATCH_DEVICES => stream(json!([{
-                    "id": "dev-local", "name": "Laptop", "platform": "linux",
-                    "lastSeenAt": null
-                }, {"id": "dev-remote", "name": "Worker", "platform": "linux", "lastSeenAt": null}])),
+                methods::WATCH_DEVICES => {
+                    let mut remote = json!({"id": "dev-remote", "name": "Worker", "platform": "linux", "lastSeenAt": null});
+                    if self.remote_boat {
+                        remote["devboxProvider"] = json!("boat");
+                        remote["devboxId"] = json!("bx_jdyh7avc");
+                    }
+                    stream(json!([{
+                        "id": "dev-local", "name": "Laptop", "platform": "linux",
+                        "lastSeenAt": null
+                    }, remote]))
+                }
                 methods::WATCH_SPACES => stream(json!([{
                     "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
                     "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
@@ -2865,6 +2899,61 @@ mod tests {
             world.writes.lock().unwrap().last().unwrap().1["command"]["request"]["harness"],
             "codex"
         );
+    }
+
+    // Failure modes: an agent's send or new chat aimed at a slept Boat Devbox
+    // fails instead of waking it; a passive read, an unbound host, or a failure
+    // other than a dial starts a machine; one send wakes or delivers twice.
+    #[tokio::test]
+    async fn sends_and_new_chats_wake_a_dark_boat_devbox_once() {
+        let asleep = |boat: bool| {
+            Arc::new(World {
+                beta_remote: true,
+                remote_boat: boat,
+                remote_asleep: true.into(),
+                ..Default::default()
+            })
+        };
+        let world = asleep(true);
+        let agent = tools(world.clone(), Origin::default());
+        assert!(agent.call("list_harnesses", json!({"device": "Worker"})).await.is_err());
+        assert!(agent.call("list_models", json!({"device": "Worker", "harness": "codex"})).await.is_err());
+        assert!(world.wakes.lock().unwrap().is_empty(), "reads must not wake a machine");
+        agent
+            .call("send_message", json!({"chat": "Beta", "text": "go"}))
+            .await
+            .unwrap();
+        assert_eq!(*world.wakes.lock().unwrap(), vec![json!({"deviceId": "dev-remote"})]);
+        let sends: Vec<_> = world.writes.lock().unwrap().iter()
+            .filter(|(method, _)| matches!(method.as_str(), methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE))
+            .cloned().collect();
+        assert_eq!(sends.len(), 1, "{sends:?}");
+
+        let world = asleep(true);
+        tools(world.clone(), Origin::default())
+            .call("create_chat", json!({"kind": "chat", "device": "Worker"}))
+            .await
+            .unwrap();
+        assert_eq!(world.wakes.lock().unwrap().len(), 1);
+
+        let world = asleep(false);
+        assert!(tools(world.clone(), Origin::default())
+            .call("send_message", json!({"chat": "Beta", "text": "go"}))
+            .await
+            .is_err());
+        assert!(world.wakes.lock().unwrap().is_empty(), "an unbound host has nothing to wake");
+
+        let world = Arc::new(World {
+            beta_remote: true,
+            remote_boat: true,
+            catalog_error: Some(methods::LIST_HARNESSES),
+            ..Default::default()
+        });
+        assert!(tools(world.clone(), Origin::default())
+            .call("send_message", json!({"chat": "Beta", "text": "go"}))
+            .await
+            .is_err());
+        assert!(world.wakes.lock().unwrap().is_empty(), "only a failed dial may wake");
     }
 
     #[tokio::test]

@@ -106,7 +106,7 @@ The shared workflow and canonical launchers live in `skills/devbox/`. Select the
 
 Namespace retains its native task directory, private access, `tmux` autostart and verified-release workflow. Boat uses matching live `BOAT_ID`, the authenticated official CLI and channel-qualified guarded `crew-devbox-{staging,production}.service` units. Configuration neither signs in nor starts an engine. On wake, the guard verifies the pinned executable and existing native profile; running-service ownership proves the kernel image's SHA-256, size, owner and executable mode plus a PID-owned LISTEN socket inode. It hashes with at most a 1 MiB buffer and never trusts a pathname prefix: cold restore can relocate the executable's backing image. Rollback preserves profiles and binaries. A previously enabled `ashler-localdev.service` may be started after Crew readiness; absent or disabled units remain untouched.
 
-Boat restores saved files, not running processes or Docker writable layers. App/Tilt readiness must be rechecked separately after wake; Crew never resets, reseeds, replaces or creates a machine to repair it. Ordinary stopped snapshots expire after 14 days; saved snapshots create a new sandbox when started and require a fresh immutable binding and sign-in, not cloned Crew identity. Keep authoritative work backed up elsewhere.
+Boat may reclaim the retained machine during its warm-resume window; only a cold resume restores saved files and starts new processes. Follow the cold-proof procedure in `skills/devbox/references/boat.md`, and recheck app/Tilt readiness separately from Crew. Crew never resets, reseeds, replaces or creates a machine to repair it. Ordinary stopped snapshots expire after 14 days; saved snapshots create a new sandbox when started and require a fresh immutable binding and sign-in, not cloned Crew identity. Keep authoritative work backed up elsewhere.
 
 Namespace task markers and finite Boat TTL renewal belong to executing turns and in-flight inference, not parked harnesses. Admission fails before work if protection cannot be established; Boat renewal failure interrupts the exact active run recoverably. Namespace cleanup removes only owned markers and sweeps only provably abandoned process identities. Independent foreground jobs use `crew-devbox-keepalive`; focused regressions live alongside the canonical scripts and run with `python3 -m unittest discover -s skills/devbox/scripts -p 'test_*.py'`.
 
@@ -281,6 +281,14 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
   OMP's persistent RPC loop tracks todo/goal `get_state` refreshes by request ID
   without blocking frame consumption. Refresh deadlines leave steering, stop,
   and connection teardown responsive even when the native peer never replies.
+  On Linux, exact-journal ownership uses a short-lived native helper and a kernel
+  read lease: existing writers block resume, while readers and unreadable unrelated
+  processes do not. The helper closes inherited descriptors, confines lease-break
+  signals to itself, and releases the lease before returning. After two seconds
+  the parent kills and reaps a timed-out helper. Unsupported or incomplete probes
+  remain unknown and fail closed;
+  no ptrace, mount, or filesystem permissions are relaxed. macOS keeps its native
+  `lsof` probe. Linux needs read-lease support and `close_range` (kernel 5.9+).
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches zeron, avoids libgit2 edge
   cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff

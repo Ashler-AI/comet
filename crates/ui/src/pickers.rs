@@ -1367,10 +1367,10 @@ impl Pickers {
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
         let mut offered = offered_harnesses(list);
         if self.managed_models_only || self.config.scaffold_database.is_some() {
-            offered.retain(|d| d.id == HarnessId::Omp);
+            offered.retain(|d| matches!(d.id, HarnessId::Omp | HarnessId::Antigravity));
             return offered;
         }
-        if self.title.is_some() {
+        if self.title.is_some() && !self.managed_models_only {
             offered.retain(|d| zeron_harness::supports_titles(d.id) && d.id != HarnessId::Mock);
         }
         offered
@@ -1397,9 +1397,7 @@ impl Pickers {
 
     /// Effective harness: picked, or the chat's config, or the first listed.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
-        if self.managed_models_only || self.config.scaffold_database.is_some() {
-            return Some(HarnessId::Omp);
-        }
+        if self.config.scaffold_database.is_some() { return Some(self.config.harness.filter(|harness| matches!(harness, HarnessId::Omp | HarnessId::Antigravity)).unwrap_or(HarnessId::Omp)); }
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -2131,12 +2129,8 @@ impl Pickers {
                         // (`default` alias rows, orphan `[1m]` variants,
                         // version-less alias labels).
                         Ok(mut models) => {
-                            if pickers.managed_models_only
-                                || pickers.config.scaffold_database.is_some()
-                            {
-                                models.retain(|model| {
-                                    zeron_proto::AgentRoute::from_omp_model(&model.id).is_some()
-                                });
+                            if pickers.managed_models_only || pickers.config.scaffold_database.is_some() {
+                                models.retain(|model| zeron_proto::AgentRoute::from_harness_model(harness, &model.id).is_some());
                             }
                             Loadable::Ready(normalize_model_rows(harness, models))
                         }

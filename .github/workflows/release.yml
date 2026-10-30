@@ -163,6 +163,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Package
         run: scripts/package-linux.sh
+      - name: Verify packaged OMP writer probe
+        run: |
+          for archive in target/package/comet-*-linux-*.tar.gz; do
+            unpacked="$(mktemp -d)"
+            tar -xzf "$archive" -C "$unpacked"
+            package="$unpacked/$(basename "$archive" .tar.gz)"
+            scripts/verify-linux-omp-writer-probe.sh "$package/comet" "$package/zeron-engine"
+            rm -rf "$unpacked"
+          done
       - name: Record artifact checksums
         run: |
           cd target/package

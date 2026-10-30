@@ -3,7 +3,7 @@
 One upstream-based implementation produces the native desktop and headless Crew
 runtime. Internal Cargo packages and artwork filenames may remain `zeron`; the
 published compatibility executable is **`comet`**. The workspace release is
-**0.2.131**. This release is staging-only: do not publish production or
+**0.2.134**. This release is staging-only: do not publish production or
 repin production Scaffold. The authoritative lifecycle is
 [`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md).
 
@@ -148,8 +148,8 @@ packages. The workflow installs these on Ubuntu 24.04 x86_64 and arm64 runners.
 ## Immutable candidate and publication
 
 `release.yml` is **workflow_dispatch only**. Merges, pushes and version tags cannot
-publish desktop/Linux releases. Regression tests live in `release-contracts.yml`
-and existing platform workflows, separate from packaging/publication. The 0.2.116
+publish desktop/Linux releases. The repository has no CI test workflows: run the
+relevant regression checks locally before release. The 0.2.116
 cutover uses two phases. First build both signed macOS identities and Linux, then
 publish the verified immutable candidate without advancing channels:
 
@@ -290,11 +290,9 @@ profile conversion, channel promotion, Edge activation or production changes.
 node --test scripts/package-macos.test.mjs scripts/verify-macos-release.test.mjs \
   scripts/release-workflow.test.mjs scripts/scaffold-runtime-release-guard.test.mjs
 bash scripts/test-linux-desktop-entry.sh
-gh workflow run release-contracts.yml --repo Ashler-AI/comet --ref main
 ```
 
-Run the complete installer harness on Linux with GNU utilities, as the Linux CI
-job does. Its build preflight models Linux explicitly and stops at a fake Cargo
+Run the complete installer harness on Linux with GNU utilities. Its build preflight models Linux explicitly and stops at a fake Cargo
 boundary; the subsequent installation checks exercise the real Linux utility
 contracts rather than substituting macOS equivalents.
 

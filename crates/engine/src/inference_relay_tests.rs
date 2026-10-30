@@ -434,6 +434,10 @@ mod tests {
         let tail = Arc::new(Semaphore::new(0));
         let (origin, mut connections, shutdown, server) =
             streaming_control_plane_with_status(tx, StatusCode::UNAUTHORIZED, Some(tail.clone())).await;
+        // Ambient listener discovery must not consume or break an API fixture.
+        let discovery = reqwest::Client::new().head(&origin).send().await.unwrap();
+        assert_eq!(discovery.status(), StatusCode::NOT_FOUND);
+        assert!(rx.try_recv().is_err());
         let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", Arc::new(StaticToken)).unwrap()).unwrap();
         let prepared = relay.prepare("stalled", HarnessId::Codex, None, None).await.unwrap().unwrap();
         let lease = relay.inner.authority.lock().await.lease.clone().unwrap();
@@ -688,9 +692,18 @@ mod tests {
                         let streaming = serving_stream.clone();
                         let tail_gate = tail_gate.clone();
                         async move {
+                            let method = request.method().clone();
+                            let root_probe = request.uri().path_and_query().is_some_and(|target| target.as_str() == "/");
                             let path = request.uri().path().to_string();
                             let headers = request.headers().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            if method == Method::HEAD && root_probe && bytes.is_empty()
+                                && !headers.contains_key(AUTHORIZATION) && !headers.contains_key("x-api-key") {
+                                return Ok::<_, Infallible>(Response::builder().status(StatusCode::NOT_FOUND)
+                                    .header(CONNECTION, "close")
+                                    .body(BodyExt::boxed(Full::new(Bytes::new()))).unwrap());
+                            }
+                            assert_eq!(method, Method::POST, "unexpected fixture request: {method} {path}");
                             if path == "/api/agent-auth/v2/responses" {
                                 streaming.store(true, Ordering::Release);
                                 captured

@@ -241,6 +241,144 @@ async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mux::{BoxIo, Connector};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+    use tokio_tungstenite::tungstenite::{
+        handshake::server::{Request, Response},
+        protocol::{CloseFrame, frame::coding::CloseCode},
+    };
+
+    struct Tokens {
+        generation: AtomicU64,
+        invalidated: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for Tokens {
+        async fn token(&self) -> anyhow::Result<AccessToken> {
+            let generation = self.generation.load(Ordering::SeqCst);
+            Ok(AccessToken { value: format!("lease-{generation}"), generation })
+        }
+
+        fn invalidate(&self, generation: u64) {
+            assert_eq!(self.invalidated.swap(generation, Ordering::SeqCst), 0);
+            let _ = self.generation.compare_exchange(
+                generation, generation + 1, Ordering::SeqCst, Ordering::SeqCst,
+            );
+        }
+    }
+
+    struct NoServices;
+
+    #[async_trait::async_trait]
+    impl Connector for NoServices {
+        async fn connect(&self, _: &str) -> anyhow::Result<BoxIo> {
+            panic!("signaling must not open application traffic");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Outcome {
+        Http(u16),
+        Close(u16),
+        Timeout,
+    }
+
+    #[tokio::test]
+    async fn only_explicit_auth_rejections_invalidate_the_dialed_generation() {
+        for outcome in [
+            Outcome::Http(401),
+            Outcome::Http(403),
+            Outcome::Http(429),
+            Outcome::Http(503),
+            Outcome::Close(4401),
+            Outcome::Close(4403),
+            Outcome::Close(1013),
+            Outcome::Close(1000),
+            Outcome::Timeout,
+        ] {
+            let tokens = Arc::new(Tokens {
+                generation: AtomicU64::new(7),
+                invalidated: AtomicU64::new(0),
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_tokens = tokens.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                if matches!(outcome, Outcome::Timeout) {
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        headers.push(socket.read_u8().await.unwrap());
+                    }
+                    assert!(String::from_utf8(headers).unwrap().to_lowercase()
+                        .contains("authorization: bearer lease-7\r\n"));
+                    server_tokens.generation.store(8, Ordering::SeqCst);
+                    // Keep the handshake unanswered until the client times out.
+                    socket.read_to_end(&mut Vec::new()).await.unwrap();
+                    return;
+                }
+                let handshake = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    move |request: &Request, response: Response| {
+                        assert_eq!(request.headers()["authorization"], "Bearer lease-7");
+                        // Simulate another transport refreshing before this response.
+                        server_tokens.generation.store(8, Ordering::SeqCst);
+                        if let Outcome::Http(status) = outcome {
+                            let mut rejection = response.map(|_| Some(String::new()));
+                            *rejection.status_mut() = status.try_into().unwrap();
+                            return Err(rejection);
+                        }
+                        Ok(response)
+                    },
+                ).await;
+                if let Outcome::Close(code) = outcome {
+                    let mut socket = handshake.unwrap();
+                    assert!(socket.next().await.unwrap().unwrap().is_text());
+                    socket.send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::from(code),
+                        reason: "test outcome".into(),
+                    }))).await.unwrap();
+                    // Leave the TCP connection open until the client reads the close.
+                    while let Some(Ok(message)) = socket.next().await {
+                        if message.is_close() { break; }
+                    }
+                } else {
+                    assert!(handshake.is_err());
+                }
+            });
+            let temp = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(
+                temp.path().join("catalog.json"), "device".into(), "Device".into(),
+            ).unwrap();
+            let stop = CancellationToken::new();
+            let (peers, mut outgoing) = Peers::new(
+                "device".into(), Arc::new(NoServices), stop.clone(),
+            );
+            let config = Config {
+                edge_url: format!("http://{address}"),
+                org_id: "org".into(),
+                tokens: tokens.clone(),
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(15),
+                connect(&config, &catalog, &peers, &mut outgoing, &Notify::new(), false),
+            ).await.expect("signaling did not finish").unwrap_err();
+            if matches!(outcome, Outcome::Timeout) {
+                assert!(error.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+            }
+            server.await.unwrap();
+            let expected = if matches!(outcome, Outcome::Http(401) | Outcome::Close(4401)) {
+                7
+            } else {
+                0
+            };
+            assert_eq!(tokens.invalidated.load(Ordering::SeqCst), expected, "{outcome:?}");
+            assert_eq!(tokens.generation.load(Ordering::SeqCst), 8, "{outcome:?}");
+            stop.cancel();
+        }
+    }
 
     struct NoToken;
     #[async_trait::async_trait]
