@@ -9,9 +9,9 @@ Use this path for this repository's single upstream-based implementation. Intern
 
 ## 1. Verify the reviewed source
 
-Run the narrow checks required by the change and the separate credential-free `release-contracts.yml` workflow. Existing native UI, Linux, Windows, voice and release-profile workflows remain independent of release publication. Exercise the actual changed behavior in an isolated native instance; never run an unimported legacy profile against the new engine. Profile migration is offline, copy-first, explicitly verified and single-writer.
+Run the narrow checks required by the change locally; the repository has no CI test workflows. Exercise the actual changed behavior in an isolated native instance; never run an unimported legacy profile against the new engine. Profile migration is offline, copy-first, explicitly verified and single-writer.
 
-Packaging uses the checked-in Rust toolchain, locked dependencies and `cargo build -p zeron --bin zeron`. Build/test execution requires the current task's authorization. Do not treat release packaging as a substitute for regression CI.
+Packaging uses the checked-in Rust toolchain, locked dependencies and `cargo build -p zeron --bin zeron`. Build/test execution requires the current task's authorization. Do not treat release packaging as a substitute for regression checks.
 
 ## 2. Land reviewed source
 
