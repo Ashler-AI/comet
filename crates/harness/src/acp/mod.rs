@@ -1840,12 +1840,13 @@ impl AcpHarness {
         ),
         HarnessError,
     > {
-        let managed = context.and_then(|value| value.inference.as_ref()).is_some();
-        if managed && self.spec.id == HarnessId::Antigravity {
+        let managed_antigravity = self.spec.id == HarnessId::Antigravity
+            && context.and_then(|value| value.inference.as_ref()).is_some();
+        if managed_antigravity {
             check_managed_gateway_policy(&antigravity_admin_settings_path())?;
-        }
-        if managed && self.spec.id == HarnessId::Antigravity && !self.installed() {
-            install_harness(HarnessId::Antigravity).await?;
+            if !self.installed() {
+                install_harness(HarnessId::Antigravity).await?;
+            }
         }
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
@@ -1870,18 +1871,25 @@ impl AcpHarness {
                 }
             }
         }
-        let scratch = if managed && self.spec.id == HarnessId::Antigravity {
+        let scratch = if managed_antigravity {
             Some(ScratchDir::new("antigravity-managed")?)
-        } else { self.adapter_scratch()? };
+        } else {
+            self.adapter_scratch()?
+        };
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
-            if managed && self.spec.id == HarnessId::Antigravity {
-                let home = dir.path().join("gemini");
-                std::fs::create_dir_all(home.join("antigravity-acp"))?;
-                cmd.env("GEMINI_HOME", home);
-            }
         }
         crate::apply_run_env(&mut cmd, run_env);
+        if managed_antigravity {
+            let home = scratch
+                .as_ref()
+                .expect("managed Antigravity scratch")
+                .path()
+                .join("gemini");
+            std::fs::create_dir_all(home.join("antigravity-acp"))?;
+            cmd.env("GEMINI_HOME", home);
+        }
+        // Managed identity and credentials outrank host environment overlays.
         crate::apply_run_context(&mut cmd, context);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4352,25 +4360,38 @@ async fn run_session(session: Session) {
         access,
     };
 
-    // Read before the setup future borrows `request` to pin a gateway model.
+    // Read before the setup future borrows `request`.
     let setup_budget = if request.resume.is_some() {
         handshake_timeout + session_load_timeout
     } else {
         handshake_timeout
     };
     // ---- handshake + session (interruptible) ------------------------------
+    let gateway_route = context
+        .as_ref()
+        .and_then(|value| value.inference.as_ref())
+        .filter(|_| harness == HarnessId::Antigravity);
+    if let Some(route) = gateway_route {
+        // Use the owned account's exact model/effort variant from the relay.
+        request.model = Some(route.model.clone());
+    }
     let setup = async {
-        let gateway_route = context.as_ref().and_then(|value| value.inference.as_ref())
-            .filter(|_| harness == HarnessId::Antigravity);
         let init = client
-            .request("initialize", managed_initialize_params(harness, gateway_route.is_some()))
+            .request(
+                "initialize",
+                managed_initialize_params(harness, gateway_route.is_some()),
+            )
             .await?;
         if let Some(route) = gateway_route {
-            // The relay has resolved the owned account's current catalog and
-            // selected exact effort variant, including an explicit default.
-            request.model = Some(route.model.clone());
-            // This is an opaque Crew relay token; provider OAuth stays in Agent Auth.
-            request_draining(&client, &mut incoming, access, "authenticate", gateway_auth_params(route)).await?;
+            // Provider OAuth stays in Agent Auth; this is an opaque loopback token.
+            request_draining(
+                &client,
+                &mut incoming,
+                access,
+                "authenticate",
+                gateway_auth_params(route),
+            )
+            .await?;
         }
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
@@ -5783,7 +5804,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("admin_settings.json");
         assert!(check_managed_gateway_policy(&path).is_ok());
-        std::fs::write(&path, r#"{"gateway":{"url":"https://another-gateway.invalid"}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"gateway":{"url":"https://another-gateway.invalid"}}"#,
+        )
+        .unwrap();
         assert!(check_managed_gateway_policy(&path).is_err());
         std::fs::write(&path, "invalid admin configuration").unwrap();
         assert!(check_managed_gateway_policy(&path).is_err());

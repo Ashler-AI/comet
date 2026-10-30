@@ -2017,6 +2017,15 @@ async fn antigravity_managed_gateway_authenticates_without_local_google_credenti
     });
     let mut req = request("hi");
     req.model = Some("default".into());
+    // Host credential overlays must not override a managed Google route.
+    req.env
+        .insert("GEMINI_API_KEY".into(), "must-not-reach-provider".into());
+    req.env.insert(
+        "GOOGLE_APPLICATION_CREDENTIALS".into(),
+        "/unowned/credentials.json".into(),
+    );
+    req.env
+        .insert("GEMINI_HOME".into(), "/unowned/google-home".into());
     let events = run_to_end(&harness, req, controls).await;
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
     assert!(events.contains(&AgentEvent::TextDelta { text: "gateway-authorized".into() }));
