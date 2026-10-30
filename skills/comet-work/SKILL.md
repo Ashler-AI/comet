@@ -13,6 +13,14 @@ Run the narrow checks required by the change locally; the repository has no CI t
 
 Packaging uses the checked-in Rust toolchain, locked dependencies and `cargo build -p zeron --bin zeron`. Build/test execution requires the current task's authorization. Do not treat release packaging as a substitute for regression checks.
 
+Before landing a port of upstream changes, audit it against `main`:
+
+```sh
+python3 scripts/audit-upstream-port.py --main <main before the port> --upstream <ported upstream commit> --result <port head>
+```
+
+It lists the lines `main` added since it diverged from upstream that the port no longer contains, grouped by the commit that added them; formatting and code moved between files are ignored. Restore each group, or state in the PR why upstream supersedes it. The 0.2.130 merge (#152) silently dropped #145, #146 and #148 this way.
+
 ## 2. Land reviewed source
 
 Use the repository's reviewed merge controls. Record the exact merged commit and the successful verification run. Do not invent a direct-push policy. Production promotion requires the release source to be reachable from `origin/main`; a push, merge or version tag never publishes a release automatically.

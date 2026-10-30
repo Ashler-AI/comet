@@ -18,6 +18,39 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-omp.sh")
 }
 
+// Linux ownership checks exec the native helper, so run these consumer tests
+// in the existing native fixture rather than a libtest executable.
+#[cfg(any(not(target_os = "linux"), feature = "native-fixture"))]
+async fn ownership_stop(executable: &std::path::Path, dir: &std::path::Path, selector: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_harness-native-fixture"))
+            .arg("--ownership-stop").arg(executable).arg(dir).arg(selector).output().await.unwrap();
+        if output.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&output.stderr).into_owned()) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    OmpHarness::new().with_executable(executable).with_session_dir(dir)
+        .stop_session(selector).await.map_err(|error| error.to_string())
+}
+
+#[cfg(any(not(target_os = "linux"), feature = "native-fixture"))]
+fn ownership_state(path: &std::path::Path) -> zeron_harness::omp::SessionWriterState {
+    #[cfg(target_os = "linux")]
+    {
+        use zeron_harness::omp::SessionWriterState;
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_harness-native-fixture"))
+            .arg("--ownership-states").arg(path).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        match output.stdout.as_slice() {
+            b"A\nA\n" => SessionWriterState::Active,
+            b"I\nI\n" => SessionWriterState::Inactive,
+            _ => SessionWriterState::Unknown,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    zeron_harness::omp::session_writer_state(path)
+}
+
 #[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } == 0 {
@@ -261,39 +294,30 @@ async fn native_retry_continuation_finishes_without_an_error_card() {
     }
 }
 
+#[cfg(any(not(target_os = "linux"), feature = "native-fixture"))]
 #[tokio::test]
 async fn inactive_takeover_is_idempotent_and_invalid_or_ambiguous_journals_fail() {
     let temp = tempfile::tempdir().unwrap();
     let journal = write_omp_session(temp.path(), "inactive-session");
-    let harness = OmpHarness::new()
-        .with_executable("/missing/omp")
-        .with_session_dir(temp.path());
-    harness
-        .stop_session(journal.to_str().unwrap())
-        .await
-        .unwrap();
-    harness.stop_session("inactive-session").await.unwrap();
+    let executable = std::path::Path::new("/missing/omp");
+    ownership_stop(executable, temp.path(), journal.to_str().unwrap()).await.unwrap();
+    ownership_stop(executable, temp.path(), "inactive-session").await.unwrap();
     let unrelated_writer = std::fs::OpenOptions::new()
         .append(true)
         .open(&journal)
         .unwrap();
-    assert!(harness.stop_session("inactive-session").await.is_err());
+    assert!(ownership_stop(executable, temp.path(), "inactive-session").await.is_err());
     assert!(
         unrelated_writer.metadata().is_ok(),
         "unrelated holder must remain untouched"
     );
     drop(unrelated_writer);
-    harness.stop_session("inactive-session").await.unwrap();
+    ownership_stop(executable, temp.path(), "inactive-session").await.unwrap();
     let invalid = temp.path().join("invalid.jsonl");
     std::fs::write(&invalid, "{}\n").unwrap();
-    assert!(
-        harness
-            .stop_session(invalid.to_str().unwrap())
-            .await
-            .is_err()
-    );
+    assert!(ownership_stop(executable, temp.path(), invalid.to_str().unwrap()).await.is_err());
     std::fs::copy(&journal, temp.path().join("duplicate.jsonl")).unwrap();
-    assert!(harness.stop_session("inactive-session").await.is_err());
+    assert!(ownership_stop(executable, temp.path(), "inactive-session").await.is_err());
 }
 
 #[tokio::test]
@@ -618,6 +642,7 @@ async fn missing_writer_probe_fails_closed_before_spawning_omp() {
         "OMP must not start when the ownership probe is unavailable"
     );
 }
+#[cfg(any(not(target_os = "linux"), feature = "native-fixture"))]
 #[cfg(unix)]
 #[tokio::test]
 async fn verified_takeover_stops_exact_writer_and_releases_journal() {
@@ -649,15 +674,11 @@ async fn verified_takeover_stops_exact_writer_and_releases_journal() {
     }
     assert!(ready.exists(), "writer helper did not start");
     assert_eq!(
-        zeron_harness::omp::session_writer_state(&journal),
+        ownership_state(&journal),
         zeron_harness::omp::SessionWriterState::Active
     );
 
-    let result = OmpHarness::new()
-        .with_executable(&executable)
-        .with_session_dir(&session_dir)
-        .stop_session("takeover-session")
-        .await;
+    let result = ownership_stop(&executable, &session_dir, "takeover-session").await;
     if let Err(error) = result {
         let _ = child.kill();
         panic!("verified takeover failed: {error}");
@@ -671,7 +692,7 @@ async fn verified_takeover_stops_exact_writer_and_releases_journal() {
         "writer process survived takeover"
     );
     assert_eq!(
-        zeron_harness::omp::session_writer_state(&journal),
+        ownership_state(&journal),
         zeron_harness::omp::SessionWriterState::Inactive
     );
 }
