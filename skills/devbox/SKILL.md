@@ -34,7 +34,7 @@ gh api "repos/Ashler-AI/comet/tarball/$COMMIT" > "comet-$COMMIT.tar.gz"
 shasum -a 256 "comet-$COMMIT.tar.gz"
 ```
 
-Read the selected workflow and its provider reference, and fetch `skills/devbox/scripts/{build-crew.sh,configure-host.sh,configure-host.py,autostart.sh,keepalive.py}` through the same `?ref=$COMMIT` route. Copy the scripts into one private directory on the host and the tarball into `~/.cache/crew-build/`, then build with the provider environment `configure-host.sh` uses:
+Read the selected workflow and its provider reference, and fetch `skills/devbox/scripts/{build-crew.sh,configure-host.sh,configure-host.py,autostart.sh,keepalive.py,register-project.sh}` through the same `?ref=$COMMIT` route. Copy the scripts into one private directory on the host and the tarball into `~/.cache/crew-build/`, then build with the provider environment `configure-host.sh` uses:
 
 ```bash
 COMET_DEVBOX_PROVIDER="$PROVIDER" COMET_DEVBOX_ID="$DEVBOX_ID" \
@@ -70,7 +70,7 @@ If Chromium cannot reach its CDN, use the exact pinned installer URL on an autho
 Keep staging and production data directories separate. Do not copy `session.json`, device IDs, or credentials across environments. On a reused machine, inspect active turns before any restart; stop only the selected owned engine after work is idle. Never run competing channels or supervisors against one data directory.
 This native runtime uses production `~/.crew` / IPC `27958`, or staging `~/.crew-staging` / IPC `27957`; callbacks remain `27654` / `27656`. The Linux build has a production identity; staging supplies explicit CLI/runtime coordinates, not a private Canary build. Owner labeling uses the actual native `ZERON_DEVICE_NAME`; callback configuration uses `ZERON_CALLBACK_PORT`. Staging Edge/control plane/project/deployment are `comet-staging.internal.ashler.com`, `scaffold-staging.internal.ashler.com`, `ashler-staging`, `ashler-staging`. Production retains its ordinary project and omits deployment unless supplied by its validated release contract.
 
-The guard requires a physical, owner-owned, non-shared-writable executable outside either profile's moving `app` tree and refuses different existing configuration or helper files. Existing native profiles require explicit `CREW_EXISTING_DEVICE_ID` adoption with matching saved coordinates; no credentials or identities are copied. Legacy profiles are retained, never adopted by renaming their directory. Add the actual checkout path through Crew's project picker; there is no invented native default-folder flag.
+The guard requires a physical, owner-owned, non-shared-writable executable outside either profile's moving `app` tree and refuses different existing configuration or helper files. Existing native profiles require explicit `CREW_EXISTING_DEVICE_ID` adoption with matching saved coordinates; no credentials or identities are copied. Legacy profiles are retained, never adopted by renaming their directory.
 
 
 ## Private setup forwarding and sign-in
@@ -89,6 +89,8 @@ Use the selected provider's forwarding commands for all four mappings. Keep the 
 Run `~/.local/bin/crew-devbox-$CHANNEL login` on the host; open its actual printed authorization URL locally and let the fixed forwarded callback complete login. For gcloud, use `~/.local/bin/crew-devbox-gcloud-login` and the `8085` forward. Do not use remote bootstrap, `--no-browser`, or copied credentials. Inspect a pending login before retrying; duplicate flows can select `8086` and strand the callback. Infisical keeps its supported interactive login; GitHub uses the owner credential below instead of another browser approval.
 
 Start the host with `~/.local/bin/crew-devbox-autostart "$CHANNEL"`. Namespace retains its dedicated self-respawning tmux server and declared `.bashrc` boot hook. Boat uses one guarded, channel-qualified `crew-devbox-$CHANNEL.service` running the native `headless` command with explicit coordinates and linger; do not run native `daemon install` over another channel's service. The immutable binary digest is rechecked before every service start. An occupied IPC port is accepted only for the expected owned process: its kernel executable image must match pinned SHA-256, size, owner and mode, and that PID must own the LISTEN socket inode. Cold-restore relocation is permitted; a matching pathname is never authority. Boat imports current verified `BOAT_ID` into the service manager, never a snapshotted unit file. If native identity is unavailable at OS boot, startup fails closed until an explicit trusted Crew wake supplies it. Already-active owned engines are not restarted. Only an already-enabled existing `ashler-localdev.service` is resumed; this does not prove app/Tilt readiness.
+
+After the engine is running and the checkout is cloned, register the checkout as a Crew project on the host with `bash register-project.sh "$CHANNEL" "$CHECKOUT"` from the uploaded script directory. The composer's device picker lists only devices with a project for the selected project, so a signed-in, online devbox without one never appears there. The script uses the host engine's own device ID and IPC bearer and the same `createSpace` mutation as the folder picker; rerunning it for the same path is a no-op. There is no native default-folder flag.
 
 ## GitHub from Infisical
 
@@ -146,7 +148,7 @@ Seed only the confirmed host-local database. After stop/resume, verify app and T
 
 Record actual owner, provider ID, CPU/memory/disk, Crew version/channel, and these observations:
 
-1. Both Mac and host visible, owner-qualified Devbox label, same stopped device retained in Devices/folder picker.
+1. Both Mac and host visible, `devbox-<provider ID>` label, the devbox listed with its checkout path in the Mac's composer device picker for that project, and the same stopped device retained in Devices/folder picker.
 2. Mac-initiated real selected-model turn returns `hostname`/`pwd` through Crew Agent Auth.
 3. Active turn remains protected, including a turn exceeding one hour; overlapping completion/cancellation preserves other work; idle sleep follows final completion.
 4. Headless Chromium renders a page; private app/Tilt endpoints and pod-to-web callback reachability work before and after resume. Forwarded health alone does not prove document generation/search/research callbacks.
