@@ -120,7 +120,7 @@ Verify `gh api --hostname github.com user` and an authenticated `git ls-remote` 
 
 ## Disk budget
 
-Every Boat resume restores the whole disk except `~/.cache`. `xlarge`, the largest type, holds 251.5 GiB, and a box whose data outgrows it can never resume: one devbox stopped at 259.1 GiB is unrecoverable. Restore time follows file count as much as bytes. A 180 GiB, two-million-file devbox answered a Crew wake in 144 seconds but took about 30 minutes to finish restoring, most of it in the last 2%.
+Every Boat resume restores the whole disk except `~/.cache`. `xlarge`, the largest type, holds 251.5 GiB, and a box whose data outgrows it can never resume: one devbox stopped at 259.1 GiB is unrecoverable. Restore time follows file count as much as bytes. A 180 GiB, two-million-file devbox answered a Crew wake in 144 seconds but took about 30 minutes to finish restoring. Trimmed to 87 GiB, three cold cycles answered in 111–223 seconds and finished restoring in 10–31 minutes, mostly in the Docker-volume phase; pauses took 1 to 22 minutes.
 
 - Keep build output and package caches in `~/.cache`. `build-crew.sh` builds there; also run `npm config set cache ~/.cache/npm`, and point `CARGO_HOME` and `CARGO_TARGET_DIR` there for any other Rust work. One leftover Crew `target` directory in the home was 83 GiB.
 - Check `df -h /` before long work and keep the box under about 150 GiB. The local cluster's unpacked images are most of a restore's files; prune images and volumes nothing uses.
