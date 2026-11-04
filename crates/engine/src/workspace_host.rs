@@ -722,8 +722,8 @@ impl WorkspaceHost {
         self.read(|doc| doc.acknowledged_rows_after(zeron_doc::registry::KIND_CHATS, after, 64))
     }
 
-    pub(crate) fn directory_reconciliation_required(&self) -> bool {
-        self.read(|doc| doc.directory_reconciliation_required())
+    pub(crate) fn directory_fence(&self, seq: u64) -> Option<u64> {
+        self.read(|doc| doc.directory_fence(seq))
     }
 
     /// Includes server ACKs even when the optimistic sidebar did not change.

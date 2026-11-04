@@ -1,5 +1,6 @@
 //! Read-only transcript projection into the owner-scoped Scaffold directory.
-//! Registry sequence numbers fence acknowledged fields; Loro VV fences links.
+//! Registry sequence numbers fence acknowledged fields (moved up per observed
+//! registry server reset, see `RegistryDoc::directory_fence`); Loro VV fences links.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,14 +153,16 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
 async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
     id: &str, required_sources: &mut BTreeMap<String, Version>) -> Result<bool, PublishError> {
     if !zeron_proto::is_cloud_session_id(id) { return Ok(true); }
-    if workspace.directory_reconciliation_required() {
-        return Err(failure("registry server reset observed; directory reconciliation required").into());
-    }
     let Some(row) = workspace.acknowledged_chat(id) else {
         // Absence is not a deletion; optimistic creations await their server ACK.
         return Err(failure("directory awaits acknowledged registry row").into());
     };
     if row.seq == 0 { return Err(failure("directory awaits server registry sequence").into()); }
+    // After a registry server reset, a row kept across it is cited only once
+    // the wiped server acknowledges it again (see RegistryDoc::directory_fence).
+    let Some(fence) = workspace.directory_fence(row.seq) else {
+        return Err(failure("directory awaits the reset registry's acknowledgement").into());
+    };
     let expected = services.session_metadata(id)?;
     let deployment = expected.scope.deployment_id.as_deref()
         .ok_or_else(|| failure("directory requires exact deployment"))?;
@@ -199,7 +202,7 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         None => return Ok(false),
     };
     if row.deleted { links.clear(); }
-    version.insert(REGISTRY_VERSION.into(), row.seq);
+    version.insert(REGISTRY_VERSION.into(), fence);
     require_observed(&version, &Version::new())?;
     if require_observed(&version, &evidence.source_version).is_err()
         || required_sources.get(id).is_some_and(|required| require_observed(&version, required).is_err()) {
@@ -227,10 +230,10 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         Some(previous["revision"].as_u64().filter(|revision| *revision > 0)
             .ok_or_else(|| failure("invalid directory server revision"))?)
     } else { None };
-    // Do not send a projection captured before a registry ACK arriving during
-    // HTTP lookup. Concurrent later writers still meet expectedRevision at SQL.
-    if workspace.directory_reconciliation_required() {
-        return Err(failure("registry server reset observed; directory reconciliation required").into());
+    // Do not send a projection captured before a registry reset or ACK arriving
+    // during HTTP lookup. Concurrent later writers still meet expectedRevision at SQL.
+    if workspace.directory_fence(row.seq) != Some(fence) {
+        return Err(failure("registry reset during directory projection").into());
     }
     if workspace.acknowledged_chat(id).as_ref() != Some(&row) {
         return Err(failure("directory registry changed during projection").into());
@@ -398,6 +401,106 @@ fn extract_links(text: &str, links: &mut BTreeSet<String>) -> Result<(), EngineE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::VecDeque, convert::Infallible};
+    use parking_lot::Mutex;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::{Request, Response, body::Incoming, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use crate::{auth::AuthConfig, scaffold::{ScaffoldClient, ScaffoldRuntime,
+        UnavailableDeviceJoinGrantProvider}, workspace_host::WorkspaceHostConfig};
+    use zeron_doc::{RegistryDoc, REGISTRY_DOC_ID, registry::{RegistryRow, KIND_CHATS}};
+    use zeron_sync::scaffold_auth::{save_session, ScaffoldConfig, ScaffoldIdentity,
+        ScaffoldSession, DEFAULT_OAUTH_SCOPES};
+
+    type Replies = Arc<Mutex<VecDeque<(u16, Value)>>>;
+    type Recorded = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// A Scaffold double for alice: it records directory requests and answers
+    /// them from `replies` in order (500 once they run out).
+    async fn fake_scaffold(replies: Replies, requests: Recorded) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn({
+            let origin = origin.clone();
+            async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let origin = origin.clone();
+                    let replies = replies.clone();
+                    let requests = requests.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let origin = origin.clone();
+                            let replies = replies.clone();
+                            let requests = requests.clone();
+                            async move {
+                                let path = request.uri().path().to_owned();
+                                let body = request.into_body().collect().await.unwrap().to_bytes();
+                                let (status, response) = match path.as_str() {
+                                    "/auth/session" => (200, json!({"userId":"alice", "email":"alice@example.com",
+                                        "projectScope":"project-a", "deploymentId":"deployment-a",
+                                        "credential":"scaffold", "capabilities":["session.read"]})),
+                                    "/api/code-sandboxes/auth/session" => (200, json!({"ok":true,
+                                        "resource":origin, "actor":{"sub":"alice", "auth":"iap"},
+                                        "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})),
+                                    "/api/crew-directory/get" | "/api/crew-directory/upsert" => {
+                                        requests.lock().push((path, serde_json::from_slice(&body).unwrap()));
+                                        replies.lock().pop_front().unwrap_or((500, json!({})))
+                                    }
+                                    _ => panic!("unexpected request: {path}"),
+                                };
+                                Ok::<_, Infallible>(Response::builder().status(status)
+                                    .header("content-type", "application/json").header("connection", "close")
+                                    .body(Full::new(Bytes::from(response.to_string()))).unwrap())
+                            }
+                        });
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service).await.unwrap();
+                    });
+                }
+            }
+        });
+        (origin, server)
+    }
+
+    /// Crew services signed in as alice (project-a, deployment-a), and their store.
+    async fn signed_in_services(dir: &std::path::Path, origin: &str) -> (CrewServices, Arc<DocsStore>) {
+        save_session(&dir.join("scaffold-session.json"), &ScaffoldSession {
+            access_token: "sc_rc_test".into(), resource: origin.into(), edge_origin: origin.into(), device: None,
+            identity: ScaffoldIdentity { user_id: "alice".into(), email: "alice@example.com".into(), name: None,
+                project_scope: "project-a".into(), deployment_id: Some("deployment-a".into()),
+                capabilities: vec!["session.read".into()] },
+        }).unwrap();
+        let mut config = AuthConfig::new(origin, dir);
+        config.scaffold = Some(ScaffoldConfig::new(origin, origin, "project-a"));
+        let auth = Auth::detect(config).await;
+        let runtime = ScaffoldRuntime::new(
+            ScaffoldClient::new(origin, "project-a", auth.for_profile_tokens()).unwrap(),
+            origin, Arc::new(UnavailableDeviceJoinGrantProvider),
+        ).with_deployment_id("deployment-a".into());
+        let store = Arc::new(DocsStore::open(&dir.join("store")).unwrap());
+        (CrewServices::new(auth, runtime, store.clone()).unwrap(), store)
+    }
+
+    fn open_workspace(store: &Arc<DocsStore>) -> WorkspaceHost {
+        WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
+            device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
+            org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
+            owner_registry: true,
+        }).unwrap()
+    }
+
+    /// The acknowledged registry row of a chat this device hosts, at `seq`.
+    fn chat_row(services: &CrewServices, id: &str, seq: u64) -> RegistryRow {
+        RegistryRow {
+            kind: KIND_CHATS.into(), id: id.into(), seq, deleted: false, del_hlc: None,
+            fields: BTreeMap::from([("id".into(), json!(id)), ("deviceId".into(), json!("test-device")),
+                ("crew".into(), serde_json::to_value(services.session_metadata(id).unwrap()).unwrap())]),
+            clocks: BTreeMap::new(),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn signal_storm_cannot_shorten_or_extend_worker_cooldown() {
         for delay in [RETRY_DELAY, Duration::from_secs(125)] {
@@ -437,18 +540,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registry_only_jobs_wait_for_snapshot_and_preserve_publication_fences() {
-        use std::{collections::VecDeque, convert::Infallible};
-        use parking_lot::Mutex;
-        use bytes::Bytes;
-        use http_body_util::{BodyExt, Full};
-        use hyper::{Request, Response, body::Incoming, service::service_fn};
-        use hyper_util::rt::TokioIo;
-        use crate::{auth::AuthConfig, scaffold::{ScaffoldClient, ScaffoldRuntime,
-            UnavailableDeviceJoinGrantProvider}, workspace_host::WorkspaceHostConfig};
-        use zeron_doc::{RegistryDoc, REGISTRY_DOC_ID, registry::{RegistryRow, KIND_CHATS}};
-        use zeron_sync::scaffold_auth::{save_session, ScaffoldConfig, ScaffoldIdentity,
-            ScaffoldSession, DEFAULT_OAUTH_SCOPES};
-
         let id = "9dd173da-fb53-48df-9581-026009c783e2";
         let doc = loro::LoroDoc::new();
         doc.set_peer_id(42).unwrap();
@@ -474,80 +565,14 @@ mod tests {
             (200, remote.clone()), (503, json!({})), // Nor after a failed upsert.
             (200, remote), (200, json!({"revision":8})),
         ])));
-        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn({
-            let origin = origin.clone();
-            let responses = responses.clone();
-            let requests = requests.clone();
-            async move {
-                loop {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let origin = origin.clone();
-                    let responses = responses.clone();
-                    let requests = requests.clone();
-                    tokio::spawn(async move {
-                        let service = service_fn(move |request: Request<Incoming>| {
-                            let origin = origin.clone();
-                            let responses = responses.clone();
-                            let requests = requests.clone();
-                            async move {
-                                let path = request.uri().path().to_owned();
-                                let body = request.into_body().collect().await.unwrap().to_bytes();
-                                let (status, response) = match path.as_str() {
-                                    "/auth/session" => (200, json!({"userId":"alice", "email":"alice@example.com",
-                                        "projectScope":"project-a", "deploymentId":"deployment-a",
-                                        "credential":"scaffold", "capabilities":["session.read"]})),
-                                    "/api/code-sandboxes/auth/session" => (200, json!({"ok":true,
-                                        "resource":origin, "actor":{"sub":"alice", "auth":"iap"},
-                                        "scopes":DEFAULT_OAUTH_SCOPES.split_whitespace().collect::<Vec<_>>()})),
-                                    "/api/crew-directory/get" | "/api/crew-directory/upsert" => {
-                                        requests.lock().push((path, serde_json::from_slice(&body).unwrap()));
-                                        responses.lock().pop_front().unwrap_or((500, json!({})))
-                                    }
-                                    _ => panic!("unexpected request: {path}"),
-                                };
-                                Ok::<_, Infallible>(Response::builder().status(status)
-                                    .header("content-type", "application/json").header("connection", "close")
-                                    .body(Full::new(Bytes::from(response.to_string()))).unwrap())
-                            }
-                        });
-                        hyper::server::conn::http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service).await.unwrap();
-                    });
-                }
-            }
-        });
+        let requests = Recorded::default();
+        let (origin, server) = fake_scaffold(responses.clone(), requests.clone()).await;
         let dir = tempfile::tempdir().unwrap();
-        save_session(&dir.path().join("scaffold-session.json"), &ScaffoldSession {
-            access_token: "sc_rc_test".into(), resource: origin.clone(), edge_origin: origin.clone(), device: None,
-            identity: ScaffoldIdentity { user_id: "alice".into(), email: "alice@example.com".into(), name: None,
-                project_scope: "project-a".into(), deployment_id: Some("deployment-a".into()),
-                capabilities: vec!["session.read".into()] },
-        }).unwrap();
-        let mut config = AuthConfig::new(&origin, dir.path());
-        config.scaffold = Some(ScaffoldConfig::new(&origin, &origin, "project-a"));
-        let auth = Auth::detect(config).await;
-        let runtime = ScaffoldRuntime::new(
-            ScaffoldClient::new(&origin, "project-a", auth.for_profile_tokens()).unwrap(),
-            &origin, Arc::new(UnavailableDeviceJoinGrantProvider),
-        ).with_deployment_id("deployment-a".into());
-        let store = Arc::new(DocsStore::open(&dir.path().join("store")).unwrap());
-        let services = CrewServices::new(auth, runtime, store.clone()).unwrap();
+        let (services, store) = signed_in_services(dir.path(), &origin).await;
         let mut registry = RegistryDoc::new("test-device");
-        let _ = registry.apply_state(9, true, 0, vec![RegistryRow {
-            kind: KIND_CHATS.into(), id: id.into(), seq: 9, deleted: false, del_hlc: None,
-            fields: BTreeMap::from([("id".into(), json!(id)), ("deviceId".into(), json!("test-device")),
-                ("crew".into(), serde_json::to_value(services.session_metadata(id).unwrap()).unwrap())]),
-            clocks: BTreeMap::new(),
-        }]);
+        let _ = registry.apply_state(9, true, 0, vec![chat_row(&services, id, 9)]);
         store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
-        let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
-            device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
-            org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
-            owner_registry: true,
-        }).unwrap();
+        let workspace = open_workspace(&store);
         let local_id = "local-chat-0123456789abcdef";
         workspace.create_chat(local_id, None, Some("test-device"), Some(zeron_proto::ChatConfig {
             harness: zeron_proto::HarnessId::Omp, model: Some("original-model".into()),
@@ -657,11 +682,7 @@ mod tests {
         let _ = registry.apply_state(10, true, 0, vec![tombstone]);
         store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
         store.delete_snapshot(id).unwrap();
-        let workspace = WorkspaceHost::open(store.clone(), WorkspaceHostConfig {
-            device_id: "test-device".into(), device_name: "Test".into(), platform: "linux".into(),
-            org_id: "project-a".into(), user_id: "alice".into(), edge: None, local_only: false,
-            owner_registry: true,
-        }).unwrap();
+        let workspace = open_workspace(&store);
         responses.lock().extend([
             (200, json!({"session":{"revision":8, "sourceVersion":version, "deleted":false}})),
             (200, json!({"revision":9})),
@@ -681,6 +702,74 @@ mod tests {
             assert_eq!(deleted.1["expectedRevision"], 8);
             assert_eq!(deleted.1["deleted"], true);
             assert_eq!(deleted.1["links"], json!([]));
+        }
+        workspace.shutdown();
+        server.abort();
+    }
+
+    // Failure modes: after a registry server reset, directory publication never
+    // resumes; a row kept across the reset is published under its pre-reset
+    // sequence, which outranks its re-acknowledgement and wedges the entry
+    // again; the post-reset upsert cites a registry counter below the one
+    // published before the reset, which the directory store refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_resumes_after_a_registry_reset_once_rows_are_reacknowledged() {
+        let id = "5b0f3c3e-2d6a-4f3e-9c1d-7e8a9b0c1d2e";
+        let doc = loro::LoroDoc::new();
+        doc.set_peer_id(42).unwrap();
+        let row = doc.get_list("messages").push_container(loro::LoroMap::new()).unwrap();
+        row.insert("role", "user").unwrap();
+        let parts = row.insert_container("parts", loro::LoroList::new()).unwrap();
+        let part = parts.push_container(loro::LoroMap::new()).unwrap();
+        part.insert("kind", "text").unwrap();
+        part.insert_container("text", loro::LoroText::new()).unwrap()
+            .insert(0, "See https://acme.slack.com/archives/C123/p1234567890123456").unwrap();
+        doc.commit();
+        let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+        let (mut published, _) = project(&snapshot).unwrap();
+        // Published before the reset, when the server acknowledged the chat at 9.
+        published.insert(REGISTRY_VERSION.into(), 9);
+        let replies = Replies::new(Mutex::new(VecDeque::from([
+            (200, json!({"session":{"revision":7, "sourceVersion":published, "deleted":false}})),
+            (200, json!({"revision":8})),
+        ])));
+        let requests = Recorded::default();
+        let (origin, server) = fake_scaffold(replies.clone(), requests.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (services, store) = signed_in_services(dir.path(), &origin).await;
+        let mut registry = RegistryDoc::new("test-device");
+        let _ = registry.apply_state(9, true, 0, vec![chat_row(&services, id, 9)]);
+        // The server is wiped: this replica keeps the chat at 9 and re-seeds it.
+        let _ = registry.apply_state(2, true, 0, Vec::new());
+        store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+        store.save_snapshot(id, &snapshot).unwrap();
+        let workspace = open_workspace(&store);
+        let mut required = BTreeMap::new();
+        for _ in 0..2 {
+            enqueue_registry(&store, &workspace).await.unwrap();
+            drain(&store, &services, &workspace, &mut required).await.unwrap();
+            assert!(requests.lock().is_empty(), "a kept row's pre-reset sequence is never cited");
+            assert!(store.sync_job_version(id, JOB).unwrap().is_some());
+        }
+        workspace.shutdown();
+
+        // The wiped server acknowledges the re-seed under its own, lower sequence.
+        assert!(registry.apply_rows(3, vec![chat_row(&services, id, 3)]));
+        store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+        let workspace = open_workspace(&store);
+        enqueue_registry(&store, &workspace).await.unwrap();
+        drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert!(store.sync_job_version(id, JOB).unwrap().is_none(), "publication resumed");
+        assert!(replies.lock().is_empty());
+        {
+            let requests = requests.lock();
+            assert_eq!(requests.len(), 2);
+            let (path, upsert) = &requests[1];
+            assert_eq!(path, "/api/crew-directory/upsert");
+            assert_eq!(upsert["expectedRevision"], 7);
+            let fence = upsert["sourceVersion"][REGISTRY_VERSION].as_u64().unwrap();
+            assert!(fence > 9, "the directory store refuses counters below the pre-reset one");
+            assert_eq!(Some(fence), registry.directory_fence(3));
         }
         workspace.shutdown();
         server.abort();

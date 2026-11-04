@@ -99,7 +99,15 @@ identity and version fences. Acknowledged deletions can still use retained local
 source-version evidence after their transcript snapshot has been removed.
 
 The projection uses the acknowledged chat row's real `seq` as `r:registry1`,
-alongside the saved SessionDoc oplog version vector (`s:<peer>`). Pending overlay
+alongside the saved SessionDoc oplog version vector (`s:<peer>`). After a
+registry server reset (operator wipe or rollback) the wiped server numbers rows
+from 1 again, and the directory store refuses any counter below one it holds.
+So each reset a replica observes moves `r:registry1` up by 2^40
+(`RegistryDoc::directory_fence`): post-reset fences outrank pre-reset ones, and
+replicas that observed the same reset cite the same fence. A row kept across a
+reset still carries its pre-reset `seq`, ahead of the cursor, until the wiped
+server acknowledges its re-seed; it is not published until then, because that
+fence would outrank the re-acknowledgement. Pending overlay
 fields are never published under an older acknowledged sequence. New same-owner
 registry chats without Crew metadata use `CrewServices::adopt_chat` and wait for
 its registry acknowledgement. The existing title lifecycle remains responsible
@@ -186,7 +194,8 @@ The legacy snapshot is retained for rollback.
 - Per-device push attribution (`pushOutcomes`) is on `/registry/:orgId/stats` from day one —
   the only per-device surface that made the 2026-08-05 incident debuggable.
 - Nightly R2 backup of the row table (seq-monotonic guard), `/registry/:orgId/rows` repair
-  read, `POST /registry/:orgId/reset` operator wipe (fleet re-seeds automatically).
+  read, `POST /registry/:orgId/reset` operator wipe (fleet re-seeds automatically, and
+  Crew directory publication resumes once the wiped server acknowledges each row).
 - Legacy `/workspace/*` routes remain for older engine builds; nothing new joins them.
 
 ## Sidebar sections

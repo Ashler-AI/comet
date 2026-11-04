@@ -2325,14 +2325,51 @@ fn directory_projection_never_labels_pending_rename_with_acknowledged_sequence()
     assert!(doc.acknowledged_rows_after(KIND_CHATS, "", 64)[0].deleted);
 }
 
+// Failure modes: after a server reset, directory fences are refused forever, so
+// directory publication never resumes; a row kept across the reset still holds
+// its pre-reset sequence, and citing it outranks the row's re-acknowledgement;
+// post-reset fences do not outrank pre-reset ones, which the directory store
+// requires; replicas that observed the same reset cite incomparable fences; a
+// restart or an older binary forgets the reset and reuses pre-reset fences.
 #[test]
-fn directory_sequence_reset_requires_reconciliation_even_after_reseed_and_restart() {
+fn directory_fences_after_a_registry_reset_outrank_earlier_ones_once_rows_are_reacknowledged() {
+    let row = |seq| RegistryRow {
+        kind: KIND_CHATS.into(), id: "chat-1".into(), seq, deleted: false, del_hlc: None,
+        fields: BTreeMap::new(), clocks: BTreeMap::new(),
+    };
     let mut doc = RegistryDoc::new("dev-a");
-    doc.apply_state(40, true, 0, Vec::new());
-    assert!(!doc.directory_reconciliation_required());
+    doc.apply_state(40, true, 0, vec![row(40)]);
+    assert_eq!(doc.directory_fence(40), Some(40), "without a reset the sequence is the fence");
+    // The server is wiped: this replica keeps chat-1 at seq 40 and re-seeds it.
     doc.apply_state(2, true, 0, Vec::new());
-    assert!(doc.directory_reconciliation_required());
-    doc.apply_state(80, true, 0, Vec::new());
-    let restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
-    assert!(restored.directory_reconciliation_required());
+    assert_eq!(doc.directory_fence(40), None, "a kept row's pre-reset sequence is not a fence");
+    // The wiped server acknowledges the re-seed under its own, lower sequence.
+    assert!(doc.apply_rows(3, vec![row(3)]));
+    let fence = doc.directory_fence(3).expect("re-acknowledged rows are citable again");
+    assert!(fence > 40, "post-reset fences outrank every pre-reset fence");
+    assert!(fence < 9_007_199_254_740_992, "fences stay within the directory's wire bound");
+    assert!(doc.apply_rows(4, vec![row(4)]));
+    assert!(doc.directory_fence(4).unwrap() > fence, "within a reset the server orders fences");
+
+    // A replica that observed the same reset from another cursor agrees.
+    let mut other = RegistryDoc::new("dev-b");
+    other.apply_state(30, true, 0, Vec::new());
+    other.apply_state(3, true, 0, vec![row(3)]);
+    assert_eq!(other.directory_fence(3), Some(fence));
+
+    // The reset survives a restart, and older binaries still see it.
+    let bytes = doc.to_bytes().unwrap();
+    assert_eq!(RegistryDoc::from_bytes(&bytes, "dev-a").unwrap().directory_fence(3), Some(fence));
+    let mut persisted: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(persisted["sequenceReset"], json!(true), "older binaries keep refusing old fences");
+    // Snapshots written before resets were counted load as one observed reset.
+    persisted.as_object_mut().unwrap().retain(|key, _| key != "registryResets");
+    let legacy = RegistryDoc::from_bytes(&serde_json::to_vec(&persisted).unwrap(), "dev-a").unwrap();
+    assert_eq!(legacy.directory_fence(3), Some(fence));
+
+    // A second reset outranks the first, and a sequence that would spill into
+    // the next reset's range is never cited.
+    doc.apply_state(1, true, 0, vec![row(1)]);
+    assert!(doc.directory_fence(1).unwrap() > fence);
+    assert_eq!(RegistryDoc::new("dev-c").directory_fence(1 << 40), None);
 }

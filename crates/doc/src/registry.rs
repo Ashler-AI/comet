@@ -436,6 +436,13 @@ pub enum StateOutcome {
 /// cursor-jump healing (ack/gap fixes below).
 const CURRENT_RESYNC_EPOCH: u32 = 1;
 
+/// Registry sequences per observed server reset in a directory fence (see
+/// [`RegistryDoc::directory_fence`]): far beyond any one registry's sequence,
+/// with 8,192 resets inside the directory's wire bound.
+pub const DIRECTORY_FENCE_SPAN: u64 = 1 << 40;
+/// Directory counters are JSON numbers: at most 2^53 - 1.
+const DIRECTORY_FENCE_MAX: u64 = (1 << 53) - 1;
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedState {
@@ -454,8 +461,13 @@ struct PersistedState {
     /// to `false`.
     #[serde(default)]
     local_writes: bool,
+    /// Written for older binaries, which refuse every directory fence once set.
     #[serde(default)]
     sequence_reset: bool,
+    /// See [`RegistryDoc::directory_fence`]. Snapshots from before resets
+    /// were counted carry only `sequence_reset`, read as one reset.
+    #[serde(default)]
+    registry_resets: u64,
     rows: Vec<RegistryRow>,
     pending: Vec<PendingBatch>,
 }
@@ -479,9 +491,10 @@ pub struct RegistryDoc {
     /// an edge ever attaches to this replica, every row re-seeds once (see
     /// [`Self::set_local_only`]). Persisted.
     local_writes: bool,
-    /// Directory fences cannot be reused after server rollback, even if the
-    /// generic registry successfully re-seeds its rows with historical HLCs.
-    sequence_reset: bool,
+    /// Server rollbacks (sequence regressions) this replica has observed.
+    /// Directory fences cannot be reused across one, even when the generic
+    /// registry re-seeds its rows with historical HLCs. Persisted.
+    registry_resets: u64,
     /// Bumped on every mutation (local or applied) — the engine host converts
     /// this into watch-channel publishes and snapshot debounces.
     generation: u64,
@@ -498,7 +511,7 @@ impl RegistryDoc {
             pending: Vec::new(),
             local_only: false,
             local_writes: false,
-            sequence_reset: false,
+            registry_resets: 0,
             generation: 0,
         }
     }
@@ -512,8 +525,28 @@ impl RegistryDoc {
         self.server_seq
     }
 
-    pub fn directory_reconciliation_required(&self) -> bool {
-        self.sequence_reset
+    /// The directory fence citing an acknowledged row at `seq`.
+    ///
+    /// Without a server reset it is the sequence itself. A wiped server
+    /// numbers rows from 1 again, and the directory store refuses any counter
+    /// below one it already holds, so each observed reset moves fences up one
+    /// [`DIRECTORY_FENCE_SPAN`]. They then outrank every fence published
+    /// before the reset, and every replica that observed it cites the same
+    /// fence for the same acknowledgement. A replica that missed it keeps
+    /// citing lower fences, which the directory refuses.
+    ///
+    /// `None` while the row still carries its sequence from before the latest
+    /// reset (it is ahead of the cursor until the wiped server acknowledges
+    /// the re-seed): citing it would outrank that acknowledgement and wedge
+    /// the row's directory entry again. Also `None` when unrepresentable.
+    pub fn directory_fence(&self, seq: u64) -> Option<u64> {
+        if self.registry_resets > 0 && seq > self.server_seq || seq >= DIRECTORY_FENCE_SPAN {
+            return None;
+        }
+        self.registry_resets
+            .checked_mul(DIRECTORY_FENCE_SPAN)
+            .and_then(|base| base.checked_add(seq))
+            .filter(|fence| *fence <= DIRECTORY_FENCE_MAX)
     }
 
     /// Server-acknowledged state only. Pending local fields must never acquire
@@ -618,7 +651,8 @@ impl RegistryDoc {
             gc_floor: self.gc_floor,
             clock: self.clock.clone(),
             local_writes: self.local_writes,
-            sequence_reset: self.sequence_reset,
+            sequence_reset: self.registry_resets > 0,
+            registry_resets: self.registry_resets,
             rows,
             pending: self.pending.clone(),
         };
@@ -648,7 +682,7 @@ impl RegistryDoc {
         doc.gc_floor = state.gc_floor;
         doc.clock = state.clock;
         doc.local_writes = state.local_writes;
-        doc.sequence_reset = state.sequence_reset;
+        doc.registry_resets = state.registry_resets.max(u64::from(state.sequence_reset));
         doc.pending = state.pending;
         for row in state.rows {
             doc.authoritative
@@ -689,7 +723,9 @@ impl RegistryDoc {
         rows: Vec<RegistryRow>,
     ) -> StateOutcome {
         self.generation += 1;
-        self.sequence_reset |= seq < self.server_seq;
+        if seq < self.server_seq {
+            self.registry_resets = self.registry_resets.saturating_add(1);
+        }
         // Remote frames cannot create or overwrite a profile-local history.
         let rows = rows.into_iter().filter(|row| !zeron_proto::is_local_history_chat(&row.id));
         if !full {
