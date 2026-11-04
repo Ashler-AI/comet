@@ -722,8 +722,19 @@ impl WorkspaceHost {
         self.read(|doc| doc.acknowledged_rows_after(zeron_doc::registry::KIND_CHATS, after, 64))
     }
 
-    pub(crate) fn directory_fence(&self, seq: u64) -> Option<u64> {
-        self.read(|doc| doc.directory_fence(seq))
+    pub(crate) fn directory_reconciliation_required(&self) -> bool {
+        self.read(|doc| doc.directory_reconciliation_required())
+    }
+
+    /// See [`RegistryDoc::clear_directory_reconciliation`]; saves the registry
+    /// when the flag clears. `sent` is the registry fence this device sent the
+    /// directory for a chat.
+    pub(crate) fn clear_directory_reconciliation(&self, sent: impl Fn(&str) -> Option<u64>) -> bool {
+        let cleared = lock(&self.inner.reg).clear_directory_reconciliation(sent);
+        if cleared {
+            self.inner.bump_changed();
+        }
+        cleared
     }
 
     /// Includes server ACKs even when the optimistic sidebar did not change.

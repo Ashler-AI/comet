@@ -99,16 +99,30 @@ identity and version fences. Acknowledged deletions can still use retained local
 source-version evidence after their transcript snapshot has been removed.
 
 The projection uses the acknowledged chat row's real `seq` as `r:registry1`,
-alongside the saved SessionDoc oplog version vector (`s:<peer>`). After a
-registry server reset (operator wipe or rollback) the wiped server numbers rows
-from 1 again, and the directory store refuses any counter below one it holds.
-So each reset a replica observes moves `r:registry1` up by 2^40
-(`RegistryDoc::directory_fence`): post-reset fences outrank pre-reset ones, and
-replicas that observed the same reset cite the same fence. A row kept across a
-reset still carries its pre-reset `seq`, ahead of the cursor, until the wiped
-server acknowledges its re-seed; it is not published until then, because that
-fence would outrank the re-acknowledgement. Pending overlay
-fields are never published under an older acknowledged sequence. New same-owner
+alongside the saved SessionDoc oplog version vector (`s:<peer>`). Pending overlay
+fields are never published under an older acknowledged sequence.
+
+A server reset renumbers every row, so a replica that observes one stops
+publishing (`directory_reconciliation_required`): renumbered rows would reuse
+fences it already sent. Only an answer below the cursor its own request carried
+counts. The pull and the socket apply answers concurrently, so an answer whose
+cursor has moved since (`RegistryDoc::apply_answer`) is dropped, as is a late
+duplicate `state`. Older builds applied those as resets. An answer below the
+cursor its request carried always applies, so a reset is never missed. The
+directory worker clears the flag once three things hold
+(`RegistryDoc::clear_directory_reconciliation`):
+
+- no chat's acknowledged `seq` is below the fence this device sent for it;
+- no chat row is ahead of the cursor: a row kept across a reset keeps its old
+  `seq` until the wiped server acknowledges it again;
+- no chat write awaits the server.
+
+A false alarm clears at once. After a real reset the flag stays until the new
+sequence passes this device's own fences, or clears once its re-seed is merged
+if it sent none. From then on its fences never fall below or collide with its
+own. The directory still refuses them below another device's pre-reset fence,
+and accepts them above, the same exposure a fresh device has. While the flag
+stays, the worker keeps its jobs and doesn't attempt to publish. New same-owner
 registry chats without Crew metadata use `CrewServices::adopt_chat` and wait for
 its registry acknowledgement. The existing title lifecycle remains responsible
 for generated titles; directory publishing performs no inference.
@@ -194,8 +208,7 @@ The legacy snapshot is retained for rollback.
 - Per-device push attribution (`pushOutcomes`) is on `/registry/:orgId/stats` from day one —
   the only per-device surface that made the 2026-08-05 incident debuggable.
 - Nightly R2 backup of the row table (seq-monotonic guard), `/registry/:orgId/rows` repair
-  read, `POST /registry/:orgId/reset` operator wipe (fleet re-seeds automatically, and
-  Crew directory publication resumes once the wiped server acknowledges each row).
+  read, `POST /registry/:orgId/reset` operator wipe (fleet re-seeds automatically).
 - Legacy `/workspace/*` routes remain for older engine builds; nothing new joins them.
 
 ## Sidebar sections

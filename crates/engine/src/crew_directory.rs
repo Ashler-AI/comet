@@ -1,8 +1,8 @@
 //! Read-only transcript projection into the owner-scoped Scaffold directory.
-//! Registry sequence numbers fence acknowledged fields (moved up per observed
-//! registry server reset, see `RegistryDoc::directory_fence`); Loro VV fences links.
+//! Registry sequence numbers fence acknowledged fields; Loro VV fences links.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use loro::{Container, LoroValue, ValueOrContainer};
@@ -121,8 +121,47 @@ async fn enqueue_registry(store: &DocsStore, workspace: &WorkspaceHost) -> Resul
     }
 }
 
+/// Older builds also raised the registry reset flag from stale answers. Clear
+/// it once the fences this device sent show nothing was renumbered (see
+/// `RegistryDoc::clear_directory_reconciliation`); after a real reset it stays.
+fn disprove_registry_reset(store: &DocsStore, workspace: &WorkspaceHost) -> Result<(), EngineError> {
+    let mut sent = BTreeMap::new();
+    let mut after = String::new();
+    loop {
+        let rows = workspace.acknowledged_chats_after(&after);
+        if rows.is_empty() { break; }
+        for row in rows {
+            after = row.id;
+            let Some(saved) = store.directory_state(&after)? else { continue };
+            // Evidence that cannot be read cannot show what was sent: keep the flag.
+            let Ok(evidence) = serde_json::from_str::<Evidence>(&saved) else { return Ok(()) };
+            if let Some(fence) = evidence.source_version.get(REGISTRY_VERSION) {
+                sent.insert(after.clone(), *fence);
+            }
+        }
+    }
+    if workspace.clear_directory_reconciliation(|id| sent.get(id).copied()) {
+        PAUSE_REPORTED.store(false, Ordering::Relaxed);
+        tracing::info!(chats = sent.len(), "crew directory: registry reset flag cleared; publication resumes");
+    }
+    Ok(())
+}
+
+/// Whether this process has reported that publication is paused by the flag.
+static PAUSE_REPORTED: AtomicBool = AtomicBool::new(false);
+
 async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
     required_sources: &mut BTreeMap<String, Version>) -> Result<Option<Duration>, EngineError> {
+    if workspace.directory_reconciliation_required() {
+        disprove_registry_reset(store, workspace)?;
+        if workspace.directory_reconciliation_required() {
+            // Every publish would refuse, each with a warning; keep the jobs instead.
+            if !PAUSE_REPORTED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("crew directory: publication paused until the registry reset flag clears");
+            }
+            return Ok(None);
+        }
+    }
     let mut after = String::new();
     loop {
         let ids = store.pending_sync_jobs(JOB, &after, 64)?;
@@ -153,16 +192,14 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
 async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
     id: &str, required_sources: &mut BTreeMap<String, Version>) -> Result<bool, PublishError> {
     if !zeron_proto::is_cloud_session_id(id) { return Ok(true); }
+    if workspace.directory_reconciliation_required() {
+        return Err(failure("registry server reset observed; directory reconciliation required").into());
+    }
     let Some(row) = workspace.acknowledged_chat(id) else {
         // Absence is not a deletion; optimistic creations await their server ACK.
         return Err(failure("directory awaits acknowledged registry row").into());
     };
     if row.seq == 0 { return Err(failure("directory awaits server registry sequence").into()); }
-    // After a registry server reset, a row kept across it is cited only once
-    // the wiped server acknowledges it again (see RegistryDoc::directory_fence).
-    let Some(fence) = workspace.directory_fence(row.seq) else {
-        return Err(failure("directory awaits the reset registry's acknowledgement").into());
-    };
     let expected = services.session_metadata(id)?;
     let deployment = expected.scope.deployment_id.as_deref()
         .ok_or_else(|| failure("directory requires exact deployment"))?;
@@ -202,7 +239,7 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         None => return Ok(false),
     };
     if row.deleted { links.clear(); }
-    version.insert(REGISTRY_VERSION.into(), fence);
+    version.insert(REGISTRY_VERSION.into(), row.seq);
     require_observed(&version, &Version::new())?;
     if require_observed(&version, &evidence.source_version).is_err()
         || required_sources.get(id).is_some_and(|required| require_observed(&version, required).is_err()) {
@@ -230,10 +267,10 @@ async fn publish(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Wo
         Some(previous["revision"].as_u64().filter(|revision| *revision > 0)
             .ok_or_else(|| failure("invalid directory server revision"))?)
     } else { None };
-    // Do not send a projection captured before a registry reset or ACK arriving
-    // during HTTP lookup. Concurrent later writers still meet expectedRevision at SQL.
-    if workspace.directory_fence(row.seq) != Some(fence) {
-        return Err(failure("registry reset during directory projection").into());
+    // Do not send a projection captured before a registry ACK arriving during
+    // HTTP lookup. Concurrent later writers still meet expectedRevision at SQL.
+    if workspace.directory_reconciliation_required() {
+        return Err(failure("registry server reset observed; directory reconciliation required").into());
     }
     if workspace.acknowledged_chat(id).as_ref() != Some(&row) {
         return Err(failure("directory registry changed during projection").into());
@@ -707,13 +744,13 @@ mod tests {
         server.abort();
     }
 
-    // Failure modes: after a registry server reset, directory publication never
-    // resumes; a row kept across the reset is published under its pre-reset
-    // sequence, which outranks its re-acknowledgement and wedges the entry
-    // again; the post-reset upsert cites a registry counter below the one
-    // published before the reset, which the directory store refuses.
+    // Failure modes: a registry reset flag raised from a stale answer (as older
+    // builds did) blocks directory publication forever; after a real server
+    // reset the flag clears anyway, and rows renumbered below fences this
+    // device already sent get published under colliding fences; the cleared
+    // flag returns after a restart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn publication_resumes_after_a_registry_reset_once_rows_are_reacknowledged() {
+    async fn publication_resumes_once_sent_fences_disprove_a_registry_reset() {
         let id = "5b0f3c3e-2d6a-4f3e-9c1d-7e8a9b0c1d2e";
         let doc = loro::LoroDoc::new();
         doc.set_peer_id(42).unwrap();
@@ -726,39 +763,60 @@ mod tests {
             .insert(0, "See https://acme.slack.com/archives/C123/p1234567890123456").unwrap();
         doc.commit();
         let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
-        let (mut published, _) = project(&snapshot).unwrap();
-        // Published before the reset, when the server acknowledged the chat at 9.
-        published.insert(REGISTRY_VERSION.into(), 9);
+        let (projected, _) = project(&snapshot).unwrap();
+        let fenced = |seq: u64| {
+            let mut version = projected.clone();
+            version.insert(REGISTRY_VERSION.into(), seq);
+            version
+        };
+        // This device sent, and the directory confirmed, the chat at registry seq 9.
+        let sent = serde_json::to_string(&Evidence { source_version: fenced(9), confirmed: true,
+            ..Evidence::default() }).unwrap();
         let replies = Replies::new(Mutex::new(VecDeque::from([
-            (200, json!({"session":{"revision":7, "sourceVersion":published, "deleted":false}})),
+            (200, json!({"session":{"revision":7, "sourceVersion":fenced(9), "deleted":false}})),
             (200, json!({"revision":8})),
         ])));
         let requests = Recorded::default();
         let (origin, server) = fake_scaffold(replies.clone(), requests.clone()).await;
+        let mut required = BTreeMap::new();
+
+        // A real reset re-acknowledges the chat at 3, below the sent fence: publication stays blocked.
         let dir = tempfile::tempdir().unwrap();
         let (services, store) = signed_in_services(dir.path(), &origin).await;
+        store.save_directory_state(id, &sent).unwrap();
         let mut registry = RegistryDoc::new("test-device");
         let _ = registry.apply_state(9, true, 0, vec![chat_row(&services, id, 9)]);
-        // The server is wiped: this replica keeps the chat at 9 and re-seeds it.
         let _ = registry.apply_state(2, true, 0, Vec::new());
+        for batch in registry.take_pushable() {
+            assert!(registry.ack_batch(&batch.batch, 3));
+        }
+        assert!(registry.apply_rows(3, vec![chat_row(&services, id, 3)]));
         store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
         store.save_snapshot(id, &snapshot).unwrap();
         let workspace = open_workspace(&store);
-        let mut required = BTreeMap::new();
-        for _ in 0..2 {
-            enqueue_registry(&store, &workspace).await.unwrap();
-            drain(&store, &services, &workspace, &mut required).await.unwrap();
-            assert!(requests.lock().is_empty(), "a kept row's pre-reset sequence is never cited");
-            assert!(store.sync_job_version(id, JOB).unwrap().is_some());
-        }
+        enqueue_registry(&store, &workspace).await.unwrap();
+        drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert!(workspace.directory_reconciliation_required());
+        assert!(requests.lock().is_empty(), "renumbered rows are never published");
+        assert!(store.sync_job_version(id, JOB).unwrap().is_some());
         workspace.shutdown();
 
-        // The wiped server acknowledges the re-seed under its own, lower sequence.
-        assert!(registry.apply_rows(3, vec![chat_row(&services, id, 3)]));
+        // A stale answer raised the flag, as older builds did: nothing was renumbered.
+        let dir = tempfile::tempdir().unwrap();
+        let (services, store) = signed_in_services(dir.path(), &origin).await;
+        store.save_directory_state(id, &sent).unwrap();
+        let mut registry = RegistryDoc::new("test-device");
+        let _ = registry.apply_state(9, true, 0, vec![chat_row(&services, id, 9)]);
+        let _ = registry.apply_state(8, false, 0, Vec::new());
+        assert!(registry.directory_reconciliation_required());
+        // The chat changes afterwards, so there is something new to publish.
+        let _ = registry.apply_state(10, false, 0, vec![chat_row(&services, id, 10)]);
         store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+        store.save_snapshot(id, &snapshot).unwrap();
         let workspace = open_workspace(&store);
         enqueue_registry(&store, &workspace).await.unwrap();
         drain(&store, &services, &workspace, &mut required).await.unwrap();
+        assert!(!workspace.directory_reconciliation_required(), "the sent fence disproves the reset");
         assert!(store.sync_job_version(id, JOB).unwrap().is_none(), "publication resumed");
         assert!(replies.lock().is_empty());
         {
@@ -767,11 +825,11 @@ mod tests {
             let (path, upsert) = &requests[1];
             assert_eq!(path, "/api/crew-directory/upsert");
             assert_eq!(upsert["expectedRevision"], 7);
-            let fence = upsert["sourceVersion"][REGISTRY_VERSION].as_u64().unwrap();
-            assert!(fence > 9, "the directory store refuses counters below the pre-reset one");
-            assert_eq!(Some(fence), registry.directory_fence(3));
+            assert_eq!(upsert["sourceVersion"], json!(fenced(10)));
         }
         workspace.shutdown();
+        let saved = store.load_snapshot(REGISTRY_DOC_ID).unwrap().unwrap();
+        assert!(!RegistryDoc::from_bytes(&saved, "test-device").unwrap().directory_reconciliation_required());
         server.abort();
     }
 
