@@ -11,6 +11,8 @@ pub struct Defaults {
     pub ipc_port: u16,
     pub launchd_label: &'static str,
     pub systemd_unit: &'static str,
+    /// Product name and registered URL scheme (copied links, menus).
+    pub branding: zeron_ui::branding::Branding,
 }
 
 #[cfg(any(comet_default_environment = "canary", test))]
@@ -25,6 +27,7 @@ const CANARY: Defaults = Defaults {
     ipc_port: 27954,
     launchd_label: "ai.ashler.crew.upstream-canary",
     systemd_unit: "crew-upstream-canary.service",
+    branding: zeron_ui::branding::Branding { app_name: "Crew Canary", link_scheme: "crew-upstream-canary" },
 };
 
 #[cfg(any(comet_default_environment = "staging", test))]
@@ -39,6 +42,7 @@ const STAGING: Defaults = Defaults {
     ipc_port: 27957,
     launchd_label: "ai.ashler.crew.staging",
     systemd_unit: "crew-staging.service",
+    branding: zeron_ui::branding::Branding { app_name: "Crew Staging", link_scheme: "comet-staging" },
 };
 
 #[cfg(any(comet_default_environment = "production", test))]
@@ -54,6 +58,7 @@ const PRODUCTION: Defaults = Defaults {
     ipc_port: 27958,
     launchd_label: "ai.ashler.crew.production",
     systemd_unit: "crew-production.service",
+    branding: zeron_ui::branding::Branding::PRODUCTION,
 };
 
 #[cfg(comet_default_environment = "canary")]
@@ -81,6 +86,7 @@ mod tests {
                 assert_ne!(flavor.ipc_port, other.ipc_port);
                 assert_ne!(flavor.launchd_label, other.launchd_label);
                 assert_ne!(flavor.systemd_unit, other.systemd_unit);
+                assert_ne!(flavor.branding, other.branding);
             }
         }
     }

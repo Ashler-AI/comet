@@ -169,7 +169,7 @@ pub fn app_menus() -> Vec<Menu> {
     // what we pass, but gpui still wants a name.
     let mut app_items = vec![
         // The native AppKit about panel; no equivalent elsewhere yet.
-        MenuItem::action("About Crew Canary", About).disabled(!macos),
+        MenuItem::action(format!("About {}", crate::branding::app_name()), About).disabled(!macos),
         // Sparkle's placement: directly under About. Other platforms reach
         // the same check from the account menu.
         MenuItem::action("Check for Updates…", CheckForUpdates),
@@ -181,16 +181,16 @@ pub fn app_menus() -> Vec<Menu> {
         app_items.extend([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Crew Canary", Hide),
+            MenuItem::action(format!("Hide {}", crate::branding::app_name()), Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
         ]);
     }
-    app_items.push(MenuItem::action("Quit Crew Canary", Quit));
+    app_items.push(MenuItem::action(format!("Quit {}", crate::branding::app_name()), Quit));
 
     let mut menus = vec![
-        Menu::new("Crew Canary").items(app_items),
+        Menu::new(crate::branding::app_name()).items(app_items),
         // Standard clipboard verbs tied to the composer's existing actions via
         // their native selectors (`OsAction` → cut:/copy:/paste:/selectAll:),
         // so the OS Edit menu routes through the responder chain to the focused
@@ -246,11 +246,11 @@ mod tests {
     #[test]
     fn app_menu_ends_with_quit() {
         let menus = app_menus();
-        assert_eq!(menus[0].name.as_ref(), "Crew Canary");
+        assert_eq!(menus[0].name.as_ref(), "Crew");
         let Some(MenuItem::Action { name, action, .. }) = menus[0].items.last() else {
             panic!("last app-menu item must be an action");
         };
-        assert_eq!(name.as_ref(), "Quit Crew Canary");
+        assert_eq!(name.as_ref(), "Quit Crew");
         assert_eq!(action.name(), Quit.name());
     }
 
@@ -397,7 +397,7 @@ mod about_panel {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
-        let name = NSString::from_str("Crew Canary");
+        let name = NSString::from_str(crate::branding::app_name());
         let version = NSString::from_str(env!("CARGO_PKG_VERSION"));
         // Empty build version: CFBundleVersion equals the marketing version, and
         // AppKit would otherwise render "Version 0.2.61 (0.2.61)".

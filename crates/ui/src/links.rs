@@ -14,9 +14,9 @@ pub struct HarnessConversationLink {
     pub label: &'static str,
     pub url: String,
 }
-/// Legacy routes remain readable; registering the canary must not take over their handlers.
+/// Every flavor's scheme stays readable, so links copied from another flavor still route.
 pub fn crew_link_scope(url: &str) -> Option<zeron_proto::CollaborationScope> {
-    for scheme in ["comet", "comet-staging", "crew-upstream-canary"] {
+    for scheme in crate::branding::ACCEPTED_LINK_SCHEMES {
         if let Some(link) = zeron_proto::CrewSessionLink::parse_deep_link(url, scheme) {
             return Some(zeron_proto::CollaborationScope {
                 project_id: link.project_id,
@@ -65,7 +65,8 @@ pub fn crew_session_link(chat: &Chat) -> Option<String> {
 pub fn crew_scope_link(scope: &zeron_proto::CollaborationScope) -> Option<String> {
     let id = uuid::Uuid::parse_str(scope.session_id.as_deref()?).ok()?;
     let mut link = format!(
-        "crew-upstream-canary://session/{}/{}",
+        "{}://session/{}/{}",
+        crate::branding::current().link_scheme,
         encode_component(&scope.project_id),
         id
     );
@@ -78,16 +79,18 @@ pub fn crew_scope_link(scope: &zeron_proto::CollaborationScope) -> Option<String
 
 pub fn zeron_conversation_link(chat_id: &str, workspace: &str) -> String {
     format!(
-        "crew-upstream-canary://open/chat/{}?workspace={}",
+        "{}://open/chat/{}?workspace={}",
+        crate::branding::current().link_scheme,
         encode_component(chat_id),
         encode_component(workspace)
     )
 }
 
 pub fn parse_zeron_conversation_link(url: &str) -> Result<ConversationDeepLink, &'static str> {
-    let rest = url
-        .strip_prefix("crew-upstream-canary://open/chat/")
-        .or_else(|| url.strip_prefix("zeron://open/chat/"))
+    let rest = crate::branding::ACCEPTED_LINK_SCHEMES
+        .iter()
+        .chain(&["zeron"])
+        .find_map(|scheme| url.strip_prefix(scheme)?.strip_prefix("://open/chat/"))
         .ok_or("not a Crew conversation link")?;
     let (chat_id, query) = rest.split_once('?').ok_or("missing workspace locator")?;
     if chat_id.is_empty() || chat_id.contains('/') {
@@ -286,8 +289,18 @@ mod tests {
                 .is_none()
             );
         }
+        // Copied links use the running flavor's own scheme (production when unset).
         let link = zeron_conversation_link("same-session", "scope");
-        assert!(link.starts_with("crew-upstream-canary://"));
+        assert!(link.starts_with("comet://"), "{link}");
         assert!(parse_zeron_conversation_link(&format!("{link}&token=secret")).is_err());
+        for scheme in crate::branding::ACCEPTED_LINK_SCHEMES.iter().chain(&["zeron"]) {
+            let parsed = parse_zeron_conversation_link(&format!("{scheme}://open/chat/c1?workspace=w")).unwrap();
+            assert_eq!((parsed.chat_id.as_str(), parsed.workspace.as_str()), ("c1", "w"));
+        }
+        let scope = zeron_proto::CollaborationScope {
+            project_id: "project".into(), deployment_id: None, session_id: Some(session.into()),
+            unknown: Default::default(),
+        };
+        assert!(crew_scope_link(&scope).unwrap().starts_with("comet://session/project/"));
     }
 }

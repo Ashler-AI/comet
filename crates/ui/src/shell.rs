@@ -10077,7 +10077,7 @@ impl Shell {
             match update.prompt()? {
                 Prompt::Checking => (
                     "Checking for updates…".into(),
-                    format!("You're on Crew Canary {current}.").into(),
+                    format!("You're on {} {current}.", crate::branding::app_name()).into(),
                     vec![UpdatePromptButton::Close("Cancel")],
                 ),
                 Prompt::CheckFailed(message) => (
@@ -10090,13 +10090,13 @@ impl Shell {
                 ),
                 Prompt::Result => match update.available() {
                     None => (
-                        "Crew Canary is up to date".into(),
+                        format!("{} is up to date", crate::branding::app_name()).into(),
                         format!("Version {current} is the newest release.").into(),
                         vec![UpdatePromptButton::Close("OK")],
                     ),
                     Some(latest) => {
                         let title: SharedString =
-                            format!("Crew Canary {latest} is available").into();
+                            format!("{} {latest} is available", crate::branding::app_name()).into();
                         if let Some(blocker) = update.blocker() {
                             (
                                 title,
@@ -10120,8 +10120,8 @@ impl Shell {
                                     vec![UpdatePromptButton::Close("Hide")],
                                 ),
                                 Flow::Ready { version, .. } => (
-                                    format!("Crew Canary {version} is ready").into(),
-                                    "Restart to finish updating. If you don't, it installs the next time you quit Crew Canary."
+                                    format!("{} {version} is ready", crate::branding::app_name()).into(),
+                                    format!("Restart to finish updating. If you don't, it installs the next time you quit {}.", crate::branding::app_name())
                                         .into(),
                                     vec![
                                         UpdatePromptButton::Close("Later"),
@@ -10590,11 +10590,11 @@ impl Shell {
             .engine()
             .is_some_and(|engine| matches!(engine.mode(), EngineMode::Remote { .. }));
         let runtime_change_label = if self.runtime_change_task.is_some() {
-            "Stopping engine…"
+            "Stopping engine…".to_owned()
         } else if remote_engine {
-            "Stop daemon and quit"
+            "Stop daemon and quit".to_owned()
         } else {
-            "Quit Crew Canary"
+            format!("Quit {}", crate::branding::app_name())
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
@@ -10890,7 +10890,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, runtime_change_label)
+                            popover::btn_primary(&theme, &runtime_change_label)
                                 .id("sync-restart-quit")
                                 .when(self.runtime_change_task.is_some(), |button| {
                                     button.opacity(0.6)

@@ -20,6 +20,7 @@ pub mod appshots;
 mod asset_http;
 pub mod attachments;
 pub mod badges;
+pub mod branding;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
@@ -117,6 +118,8 @@ pub struct UiConfig {
     pub default_harness: HarnessId,
     /// Conversation URL passed by the OS on a cold launch.
     pub initial_url: Option<String>,
+    /// Product name and URL scheme of the compiled flavor.
+    pub branding: branding::Branding,
 }
 
 impl UiConfig {
@@ -148,6 +151,7 @@ impl gpui::Global for ReopenState {}
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
+    branding::set(config.branding);
     // Retain ownership for the whole application lifetime. The bridge's
     // default runtime has only two workers, insufficient for a desktop engine.
     let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
@@ -458,7 +462,7 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Crew Canary".into()),
+                    title: cfg!(target_os = "windows").then(|| branding::app_name().into()),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

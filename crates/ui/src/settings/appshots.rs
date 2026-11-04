@@ -8,7 +8,8 @@ use crate::settings::widgets;
 fn process_diagnostics() -> &'static str {
     static DETAILS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         format!(
-            "Permissions apply only to Crew Canary desktop (PID {}), not an agent or headless daemon. Executable: {}. macOS may require quitting and reopening this app after a change.",
+            "Permissions apply only to {} desktop (PID {}), not an agent or headless daemon. Executable: {}. macOS may require quitting and reopening this app after a change.",
+            crate::branding::app_name(),
             std::process::id(),
             std::env::current_exe()
                 .map(|path| path.display().to_string())

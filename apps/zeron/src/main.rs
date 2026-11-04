@@ -377,6 +377,7 @@ fn main() -> anyhow::Result<()> {
                 initial_url: cli.open_url,
                 scaffold: config.scaffold,
                 managed_inference: config.managed_inference,
+                branding: crate::environment::DEFAULTS.branding,
             });
             Ok(())
         }
