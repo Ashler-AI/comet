@@ -26,6 +26,12 @@ const WITHOUT_CHANGE_REQUEST_TTL: Duration = Duration::from_secs(45);
 const FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(20);
 const FAILURE_MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 const CONTEXT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// How long an inspection is reused while its [`GitStamp`] still matches.
+/// Bounds how long a change the stamp can't see goes unnoticed.
+const FULL_INSPECTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// A stamp is a handful of `stat` calls. One that takes longer is on a
+/// wedged mount and just reads as unknown.
+const STAMP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChangeRequestCacheKey {
@@ -42,6 +48,7 @@ struct Timing {
     failure_initial_backoff: Duration,
     failure_max_backoff: Duration,
     context_poll_interval: Duration,
+    full_inspection_interval: Duration,
 }
 
 impl Default for Timing {
@@ -52,6 +59,7 @@ impl Default for Timing {
             failure_initial_backoff: FAILURE_INITIAL_BACKOFF,
             failure_max_backoff: FAILURE_MAX_BACKOFF,
             context_poll_interval: CONTEXT_POLL_INTERVAL,
+            full_inspection_interval: FULL_INSPECTION_INTERVAL,
         }
     }
 }
@@ -75,8 +83,110 @@ type InspectionRun = Shared<BoxFuture<'static, Result<CheckoutSourceContext, Cha
 /// interval instead of once per chat. Any waiter can drive the shared run,
 /// so a subscription that stops being polled mid-inspection blocks no one.
 struct Inspection {
+    /// When this run's Git processes started.
     started: Instant,
+    /// When this run started or a matching stamp last confirmed it.
+    checked: Instant,
+    /// The checkout's Git metadata, read before this run started. `None`
+    /// when it could not be read; such a run is never reused by stamp.
+    stamp: Option<GitStamp>,
     run: InspectionRun,
+}
+
+/// The Git metadata [`CheckoutChangeRequestLookup::inspect_checkout`] reads,
+/// as file stamps: the checkout and its `.git` entry, the worktree's `HEAD`,
+/// `commondir` and `config.worktree`, the repository's `config` and
+/// `packed-refs`, and the user's global config. While every stamp matches,
+/// Git would answer the inspection the same way, so a watch reuses it instead
+/// of running 6 to 8 Git processes every poll. Not covered: `include.path`
+/// files, system config, and the remote-tracking ref `@{upstream}` needs;
+/// [`FULL_INSPECTION_INTERVAL`] bounds how long a change there goes unseen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitStamp(Vec<Option<FileStamp>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: u64,
+}
+
+impl FileStamp {
+    /// A directory stamps only its identity: Git creates a file in `.git`
+    /// (`index.lock`) on most commands, which moves the directory's mtime.
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+        #[cfg(not(unix))]
+        let inode = 0;
+        if metadata.is_dir() {
+            return Some(Self {
+                len: 0,
+                modified: None,
+                inode,
+            });
+        }
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            inode,
+        })
+    }
+}
+
+impl GitStamp {
+    /// `None` when `git_dir` has no readable `HEAD` (every Git directory has
+    /// one), so a layout this doesn't understand always runs Git.
+    fn read(checkout: &Path, git_dir: &Path) -> Option<Self> {
+        let head = FileStamp::read(&git_dir.join("HEAD"))?;
+        // A linked worktree names the repository's shared directory in
+        // `commondir`, relative to its own Git directory.
+        let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+            Ok(path) => git_dir.join(path.trim_end_matches(['\r', '\n'])),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.to_owned(),
+            Err(_) => return None,
+        };
+        let files = [
+            checkout.to_owned(),
+            checkout.join(".git"),
+            git_dir.join("commondir"),
+            git_dir.join("config.worktree"),
+            common_dir.join("config"),
+            common_dir.join("packed-refs"),
+        ];
+        let stamps = std::iter::once(Some(head))
+            .chain(files.iter().map(|path| FileStamp::read(path)))
+            .chain(global_git_configs().iter().map(|path| FileStamp::read(path)))
+            .collect();
+        Some(Self(stamps))
+    }
+}
+
+/// The user's global Git config files, as Git finds them.
+fn global_git_configs() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+        return vec![PathBuf::from(path)];
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    config_home
+        .map(|dir| dir.join("git").join("config"))
+        .into_iter()
+        .chain(home.map(|home| home.join(".gitconfig")))
+        .collect()
+}
+
+/// Off the runtime: the checkout may sit on a slow or wedged mount.
+async fn read_git_stamp(checkout: &Path, git_dir: &Path) -> Option<GitStamp> {
+    let (checkout, git_dir) = (checkout.to_owned(), git_dir.to_owned());
+    let read = tokio::task::spawn_blocking(move || GitStamp::read(&checkout, &git_dir));
+    tokio::time::timeout(STAMP_TIMEOUT, read).await.ok()?.ok()?
 }
 
 struct Inner {
@@ -180,7 +290,11 @@ impl CheckoutChangeRequests {
                 if state.service.inner.shutdown.is_cancelled() {
                     return None;
                 }
-                let mut source = match state.service.inspect(&state.cwd).await {
+                let mut source = match state
+                    .service
+                    .inspect(&state.cwd, &state.identity.git_dir)
+                    .await
+                {
                     Ok(source) => source,
                     Err(error) => {
                         tracing::debug!(%error, "change request checkout inspection unavailable");
@@ -226,21 +340,67 @@ impl CheckoutChangeRequests {
         .boxed()
     }
 
-    /// Inspect `cwd`, joining an inspection started less than a poll
-    /// interval ago. Concurrent callers for one path share one run instead of
-    /// each starting their own Git processes.
-    async fn inspect(&self, cwd: &Path) -> Result<CheckoutSourceContext, ChangeRequestError> {
-        let max_age = self.inner.timing.context_poll_interval;
-        let run = {
-            let mut inspections = self
-                .inner
-                .inspections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+    /// Inspect `cwd`, joining an inspection started or confirmed less than a
+    /// poll interval ago. Concurrent callers for one path share one run
+    /// instead of each starting their own Git processes. After that, a
+    /// successful run is reused for up to [`Timing::full_inspection_interval`]
+    /// while the checkout's [`GitStamp`] (read from `git_dir`) still matches.
+    async fn inspect(
+        &self,
+        cwd: &Path,
+        git_dir: &Path,
+    ) -> Result<CheckoutSourceContext, ChangeRequestError> {
+        enum Cached {
+            /// Started or confirmed this poll interval: share it.
+            Fresh(InspectionRun),
+            /// A finished run and the stamp read before it started.
+            Stamped(GitStamp, CheckoutSourceContext),
+            Stale,
+        }
+        let timing = self.inner.timing;
+        let cached = {
+            let mut inspections = self.inspections();
             // Forget paths no subscription has inspected for two intervals.
-            inspections.retain(|_, inspection| inspection.started.elapsed() < max_age * 2);
+            inspections.retain(|_, inspection| {
+                inspection.checked.elapsed() < timing.context_poll_interval * 2
+            });
             match inspections.get(cwd) {
-                Some(inspection) if inspection.started.elapsed() < max_age => {
+                Some(inspection) if inspection.checked.elapsed() < timing.context_poll_interval => {
+                    Cached::Fresh(inspection.run.clone())
+                }
+                Some(inspection)
+                    if inspection.started.elapsed() < timing.full_inspection_interval =>
+                {
+                    match (&inspection.stamp, inspection.run.peek()) {
+                        (Some(stamp), Some(Ok(source))) => {
+                            Cached::Stamped(stamp.clone(), source.clone())
+                        }
+                        _ => Cached::Stale,
+                    }
+                }
+                _ => Cached::Stale,
+            }
+        };
+        let stamp = match cached {
+            Cached::Fresh(run) => return run.await,
+            Cached::Stamped(previous, source) => {
+                let stamp = read_git_stamp(cwd, git_dir).await;
+                if stamp.as_ref() == Some(&previous) {
+                    // Nothing that run read has changed since.
+                    if let Some(inspection) = self.inspections().get_mut(cwd) {
+                        inspection.checked = Instant::now();
+                    }
+                    return Ok(source);
+                }
+                stamp
+            }
+            Cached::Stale => read_git_stamp(cwd, git_dir).await,
+        };
+        let run = {
+            let mut inspections = self.inspections();
+            match inspections.get(cwd) {
+                // Another subscription started a run while the stamp was read.
+                Some(inspection) if inspection.started.elapsed() < timing.context_poll_interval => {
                     inspection.run.clone()
                 }
                 _ => {
@@ -249,10 +409,13 @@ impl CheckoutChangeRequests {
                     let run = async move { lookup.inspect_checkout(&path).await }
                         .boxed()
                         .shared();
+                    let now = Instant::now();
                     inspections.insert(
                         cwd.to_owned(),
                         Inspection {
-                            started: Instant::now(),
+                            started: now,
+                            checked: now,
+                            stamp,
                             run: run.clone(),
                         },
                     );
@@ -261,6 +424,13 @@ impl CheckoutChangeRequests {
             }
         };
         run.await
+    }
+
+    fn inspections(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Inspection>> {
+        self.inner
+            .inspections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn acquire(&self, key: ChangeRequestCacheKey) -> DemandLease {
@@ -570,7 +740,123 @@ mod tests {
             failure_initial_backoff: Duration::from_secs(1),
             failure_max_backoff: Duration::from_secs(2),
             context_poll_interval: Duration::from_millis(5),
+            full_inspection_interval: Duration::from_secs(60),
         }
+    }
+
+    /// A checkout's Git files, without Git: stamps read files only.
+    fn git_layout() -> (tempfile::TempDir, CheckoutIdentity) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature/status\n").unwrap();
+        std::fs::write(git_dir.join("config"), "[core]\n").unwrap();
+        let identity = CheckoutIdentity {
+            id: "checkout-1".into(),
+            root,
+            git_dir,
+        };
+        (temp, identity)
+    }
+
+    fn stamp_timing(full_inspection_interval: Duration) -> Timing {
+        Timing {
+            with_change_request_ttl: Duration::from_secs(60),
+            without_change_request_ttl: Duration::from_secs(60),
+            failure_initial_backoff: Duration::from_secs(1),
+            failure_max_backoff: Duration::from_secs(2),
+            context_poll_interval: Duration::from_millis(5),
+            full_inspection_interval,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_checkout_runs_git_again_only_once_its_metadata_moves() {
+        let (_temp, identity) = git_layout();
+        let lookup = FakeLookup::new(
+            source("feature/status"),
+            [Ok(Some(pull_request(90))), Ok(Some(pull_request(91)))],
+        );
+        let service = service(lookup.clone(), stamp_timing(Duration::from_secs(60)));
+        let mut stream = service.watch_checkout(identity.root.clone(), identity.clone());
+        stream.next().await.unwrap();
+
+        // Many poll intervals, nothing Git reads has changed: no Git runs.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), stream.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(lookup.inspect_count(), 1);
+
+        // A branch switch rewrites HEAD.
+        lookup.set_source(source("feature/other-branch"));
+        std::fs::write(
+            identity.git_dir.join("HEAD"),
+            "ref: refs/heads/feature/other-branch\n",
+        )
+        .unwrap();
+        let switched = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("the HEAD change is inspected")
+            .unwrap();
+
+        assert_eq!(switched.branch, "feature/other-branch");
+        assert_eq!(switched.change_request.unwrap().number, 91);
+        assert_eq!(lookup.inspect_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_checkout_is_still_inspected_every_full_interval() {
+        let (_temp, identity) = git_layout();
+        let lookup = FakeLookup::new(source("feature/status"), [Ok(Some(pull_request(90)))]);
+        let service = service(lookup.clone(), stamp_timing(Duration::from_millis(40)));
+        let mut stream = service.watch_checkout(identity.root.clone(), identity.clone());
+        stream.next().await.unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_millis(250), stream.next()).await;
+
+        // Every poll (5 ms) would be ~50 runs; the stamp holds them to one
+        // per full interval (40 ms).
+        let runs = lookup.inspect_count();
+        assert!((2..=8).contains(&runs), "{runs} inspections");
+    }
+
+    #[test]
+    fn git_stamp_follows_a_linked_worktree_to_the_shared_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let common = temp.path().join("repo").join(".git");
+        let git_dir = common.join("worktrees").join("feature");
+        let checkout = temp.path().join("feature");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(common.join("config"), "[core]\n").unwrap();
+        let stamp = GitStamp::read(&checkout, &git_dir).unwrap();
+
+        // Git's scratch files and the index are not what an inspection reads.
+        std::fs::write(common.join("index.lock"), "").unwrap();
+        std::fs::write(git_dir.join("index"), "changed").unwrap();
+        assert_eq!(GitStamp::read(&checkout, &git_dir).as_ref(), Some(&stamp));
+
+        // `git push -u` records the upstream in the shared config.
+        std::fs::write(
+            common.join("config"),
+            "[core]\n[branch \"feature\"]\n\tremote = origin\n",
+        )
+        .unwrap();
+        assert_ne!(GitStamp::read(&checkout, &git_dir).as_ref(), Some(&stamp));
+
+        // Without a HEAD the layout isn't understood, so there is no stamp.
+        std::fs::remove_file(git_dir.join("HEAD")).unwrap();
+        assert_eq!(GitStamp::read(&checkout, &git_dir), None);
     }
 
     #[tokio::test]
@@ -746,6 +1032,7 @@ mod tests {
             failure_initial_backoff: Duration::from_millis(1),
             failure_max_backoff: Duration::from_millis(1),
             context_poll_interval: Duration::from_millis(1),
+            full_inspection_interval: Duration::from_millis(1),
         };
         let service = service(lookup.clone(), timing);
         let key = cache_key("checkout-1", &source);
