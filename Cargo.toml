@@ -187,7 +187,7 @@ fff-search = "=0.11.0"
 # on CI runners, on every platform; release turnaround wins over its modest
 # size/speed gain. Strip debug symbols.
 lto = false
-strip = "symbols"
+strip = "none"
 
 [profile.dev]
 # gpui is slow unoptimized; match zed's approach for deps
