@@ -145,7 +145,7 @@ fn model(
 /// `claudeOptionsFor` ladders: full ladder (through ultracode/ultrathink) on
 /// Fable 5, `max`-topped ladders on Opus/Sonnet, no efforts but a thinking
 /// toggle on Haiku; context-window select on the long-context families and
-/// fast mode on Opus 4.5+.
+/// fast mode on Opus 4.5+ and Fable 5.2.
 ///
 /// `pub`: besides the discovery-side enrichment here, the UI's display-side
 /// normalization borrows these labels so alias rows served by older engines
@@ -328,16 +328,23 @@ fn snapshot_base(id: &str) -> Option<&str> {
 pub fn static_models() -> Vec<Model> {
     vec![
         model(
+            "claude-fable-5-2",
+            "Fable 5.2",
+            "Most intelligent model for building agents",
+            FULL_LADDER,
+            vec![context_window(), toggle("fastMode", "Fast Mode")],
+        ),
+        model(
             "claude-fable-5-1",
             "Fable 5.1",
-            "Most intelligent model for building agents",
+            "Previous generation Fable",
             FULL_LADDER,
             vec![context_window()],
         ),
         model(
             "claude-fable-5",
             "Fable 5",
-            "Previous generation Fable",
+            "Older generation Fable",
             FULL_LADDER,
             vec![context_window()],
         ),
@@ -422,9 +429,46 @@ mod tests {
     }
 
     #[test]
+    fn fable_5_2_leads_the_managed_catalog() {
+        // Managed Crew serves this list verbatim (no CLI discovery), and its
+        // first row is the default for new Claude Code chats.
+        let models = static_models();
+        let fable = &models[0];
+        assert_eq!(
+            (fable.id.as_str(), fable.label.as_str()),
+            ("claude-fable-5-2", "Fable 5.2")
+        );
+        assert_eq!(fable.reasoning_levels, FULL_LADDER);
+        // Claude Code 2.1.321 reports fast mode for Fable 5.2, unlike 5.1.
+        assert_eq!(
+            fable
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["contextWindow", "fastMode"]
+        );
+        let description = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .and_then(|model| model.description.clone())
+        };
+        assert_eq!(
+            description("claude-fable-5-1").as_deref(),
+            Some("Previous generation Fable")
+        );
+        assert_eq!(
+            description("claude-fable-5").as_deref(),
+            Some("Older generation Fable")
+        );
+    }
+
+    #[test]
     fn xhigh_family_matching() {
         assert!(supports_xhigh("claude-fable-5"));
         assert!(supports_xhigh("claude-fable-5-1"));
+        assert!(supports_xhigh("claude-fable-5-2"));
         assert!(supports_xhigh("claude-opus-5"));
         assert!(supports_xhigh("claude-opus-5-5"));
         assert!(supports_xhigh("claude-opus-5-5[1m]"));
