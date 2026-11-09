@@ -1459,13 +1459,26 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
 
 /// Render-time continuation join at the entry level (`joinContinuations` in TS):
 /// concatenate continuation entries' parts onto their root, in list order.
+///
+/// An id appears once. Id-idempotent writers check only their own replica,
+/// so two peers can insert the same entry before they sync and the merged
+/// list keeps both. The first copy wins, matching the by-id writers
+/// (`set_message_status`, `append_error_part`) that update the first match.
 pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<SessionMessageEntry> {
-    if !entries.iter().any(|e| e.continuation_of.is_some()) {
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(entries.len());
+    let repeated = entries.iter().any(|e| !seen.insert(e.id.as_str()));
+    if !repeated && !entries.iter().any(|e| e.continuation_of.is_some()) {
         return entries;
     }
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(entries.len());
     let mut out: Vec<SessionMessageEntry> = Vec::with_capacity(entries.len());
     let mut root_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for entry in entries {
+        if !seen.insert(entry.id.clone()) {
+            continue;
+        }
         match &entry.continuation_of {
             Some(root_id) => {
                 if let Some(&at) = root_index.get(root_id) {
@@ -2369,6 +2382,43 @@ mod tests {
         let eb = b.read_entries().unwrap();
         assert_eq!(ea, eb);
         assert_eq!(ea.len(), 2); // one insert from each peer, converged in the same order
+    }
+
+    #[test]
+    fn same_id_inserted_on_two_peers_renders_once() {
+        // Id-idempotent writers (`write_user_message`) only see their own
+        // replica, so two peers can each insert the same entry before they
+        // sync. The list keeps both; the transcript must show one, or a
+        // reader takes the copy for a second user turn (a Scaffold run that
+        // finished in 20 minutes then waited out its 3h deadline).
+        let a = SessionDoc::init("chat-1").unwrap();
+        let b = SessionDoc::from_doc({
+            let d = LoroDoc::new();
+            d.import(&a.export_snapshot().unwrap()).unwrap();
+            d
+        });
+        a.push_message(&user_entry("scaffold:run", "Work")).unwrap();
+        b.push_message(&user_entry("scaffold:run", "Work")).unwrap();
+        let a_update = a
+            .doc()
+            .export(ExportMode::updates(&b.doc().oplog_vv()))
+            .unwrap();
+        let b_update = b
+            .doc()
+            .export(ExportMode::updates(&a.doc().oplog_vv()))
+            .unwrap();
+        b.doc().import(&a_update).unwrap();
+        a.doc().import(&b_update).unwrap();
+        let mut reply = user_entry("reply", "Done");
+        reply.role = MessageRole::Assistant;
+        a.push_message(&reply).unwrap();
+
+        assert_eq!(a.read_entries().unwrap().len(), 3);
+        let ids: Vec<String> = join_continuation_entries(a.read_entries().unwrap())
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ids, ["scaffold:run", "reply"]);
     }
 
     #[test]
