@@ -128,7 +128,14 @@ pub mod methods {
     /// list): current set first, then a fresh snapshot per landed chunk —
     /// the sending thumbnail's percent-ring feed. No params; IPC-only.
     pub const WATCH_TRANSFERS: &str = "WatchTransfers";
+    /// Chat rows. Like `WatchSessions` / `WatchDevices`: whole lists per change,
+    /// or with `{listDelta: true}` a reset then changed rows only
+    /// (`zeron_proto::list_delta`). `{includeArchived: false}` drops archived rows.
     pub const WATCH_CHATS: &str = "WatchChats";
+    /// `{key}` → the chats `key` could name (`Chat::matches_reference`): what a
+    /// lookup by id, id prefix or title needs, without the whole `WatchChats`
+    /// list. IPC-only.
+    pub const FIND_CHATS: &str = "FindChats";
     pub const WATCH_SIDEBAR_PREFERENCES: &str = "WatchSidebarPreferences";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";

@@ -918,7 +918,7 @@ impl Tools {
 
     async fn list_chats(&self, args: ListChatsArgs) -> anyhow::Result<Value> {
         let (mut chats, spaces, sessions) = tokio::try_join!(
-            self.zeron.chats(),
+            self.zeron.chats_filtered(args.include_archived),
             self.zeron.spaces(),
             self.zeron.sessions()
         )?;

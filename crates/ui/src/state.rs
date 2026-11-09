@@ -3058,23 +3058,34 @@ impl AppState {
             watch_tasks.push(task);
         }
         watch_tasks.extend([
-            spawn_watch(
+            spawn_list_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_SESSIONS,
+                |session: &Session| session.chat_id.as_str(),
                 AppState::apply_sessions,
             ),
-            spawn_chats_watch(cx, handle.clone()),
+            // Boot selection is the shell's job (it lands on the first restored
+            // open tab, device-local state this entity can't see); this task
+            // only pumps frames.
+            spawn_list_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_CHATS,
+                |chat: &Chat| chat.id.as_str(),
+                AppState::apply_chats,
+            ),
             spawn_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_SIDEBAR_PREFERENCES,
                 AppState::apply_sidebar_preferences,
             ),
-            spawn_watch(
+            spawn_list_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_DEVICES,
+                |device: &Device| device.id.as_str(),
                 AppState::apply_devices,
             ),
             spawn_watch(
@@ -3712,10 +3723,19 @@ fn spawn_deferred_engine_watch(
     }))
 }
 
-/// Chats watch. Boot selection is the shell's job (it lands on the first
-/// restored open tab, device-local state this entity can't see); this task
-/// only pumps frames.
-fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+/// A keyed list watch (Chats / Sessions / Devices) over `listDelta` frames:
+/// the mirror rebuilds the whole list, so `apply` sees exactly what a
+/// whole-list frame carried — one call per engine wake-up, which presence
+/// expiry relies on. Engines without `listDelta` keep sending arrays, which
+/// the mirror takes as resets. A frame the mirror can't apply leaves it
+/// unusable: resubscribe for a fresh reset.
+fn spawn_list_watch<T: DeserializeOwned + Clone + 'static>(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    method: &'static str,
+    key: fn(&T) -> &str,
+    apply: fn(&mut AppState, Vec<T>) -> bool,
+) -> Task<()> {
     cx.spawn(async move |this, cx| {
         // Resubscribe loop (same contract as the transcript watch): a daemon
         // restart or RPC drop ends the stream, and a bare return here froze
@@ -3725,12 +3745,15 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
         loop {
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
+                .subscribe(
+                    method,
+                    serde_json::json!({ zeron_proto::list_delta::LIST_DELTA_PARAM: true }),
+                )
                 .await
             {
                 Ok(rx) => rx,
                 Err(err) => {
-                    tracing::debug!(error = %err, "chats watch unavailable; retrying");
+                    tracing::debug!(method, error = %err, "watch unavailable; retrying");
                     if this.update(cx, |_, _| {}).is_err() {
                         return;
                     }
@@ -3738,20 +3761,21 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                     continue;
                 }
             };
+            let mut mirror = zeron_proto::list_delta::ListMirror::new(key);
             while let Some(value) = rx.recv().await {
-                let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                    Ok(parsed) => parsed,
+                let rows = match mirror.ingest(value) {
+                    Ok(rows) => rows.to_vec(),
                     Err(err) => {
-                        tracing::warn!(error = %err, "dropping malformed chats frame");
-                        continue;
+                        tracing::warn!(method, error = %err, "list watch frame unusable; resubscribing");
+                        break;
                     }
                 };
                 let alive = this.update(cx, |state, cx| {
-                    // Identical re-published lists skip the re-sort fan-out:
-                    // watch reconciliation and a whole-shell re-render.
-                    let changed = state.apply_chats(parsed);
+                    // Identical lists skip the re-sort fan-out: watch
+                    // reconciliation and a whole-shell re-render.
+                    let changed = apply(state, rows);
                     let linked = state.apply_pending_deep_link(cx);
-                    if changed {
+                    if changed && matches!(method, methods::WATCH_CHATS | methods::WATCH_DEVICES) {
                         state.reconcile_change_request_watches(cx);
                     }
                     if changed || linked {
@@ -3762,7 +3786,8 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                     return;
                 }
             }
-            tracing::debug!("chats stream ended; resubscribing");
+            drop(rx);
+            tracing::debug!(method, "list watch ended; resubscribing");
             if this.update(cx, |_, _| {}).is_err() {
                 return;
             }
