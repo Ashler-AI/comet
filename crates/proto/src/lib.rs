@@ -15,6 +15,7 @@ pub mod device_paths;
 pub mod entities;
 pub mod file_mentions;
 pub mod invocation;
+pub mod list_delta;
 mod google_models;
 pub use google_models::{google_model_picker_rows, google_model_variant};
 pub mod motion;

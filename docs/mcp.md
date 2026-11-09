@@ -149,7 +149,9 @@ native execution state. `statusStale` distinguishes expired live reports, and
 can return `interrupted`; a lost host is never interpreted as successful
 completion. See [agent and terminal status](program-status.md).
 
-Chats are referenced by full id, a unique id prefix, or an exact title.
+Chats are referenced by full id, a unique id prefix, or an exact title —
+resolved among the candidates `FindChats {key}` returns, not the whole chat
+list (engines without `FindChats` still serve the `WatchChats` snapshot).
 Projects by id, path, display name, or unique path suffix. Devices by id or
 name (default: the local engine's device).
 
@@ -160,7 +162,7 @@ name (default: the local engine's device).
 | `list_projects`    | `WatchSpaces` snapshot                                    |
 | `list_harnesses`   | `ListHarnesses` + `ListAgentAccounts` (`targetDeviceId?`) |
 | `list_models`      | `ListModels {harness, targetDeviceId?}`                                    |
-| `list_chats`       | `WatchChats` + `WatchSessions` snapshots (status merged)  |
+| `list_chats`       | `WatchChats {includeArchived}` + `WatchSessions` snapshots (status merged) |
 | `get_chat`         | above + `WatchDocMessages` opening frame (pending input)  |
 | `create_chat`      | `Mutate createChat` (+ `renameChat`; optional first send) |
 | `create_chats`     | Concurrent `create_chat` requests with per-request results |

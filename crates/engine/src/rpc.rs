@@ -1866,6 +1866,62 @@ where
     .boxed()
 }
 
+/// A keyed list watch (`WatchChats` / `WatchSessions` / `WatchDevices`): whole
+/// lists per wake-up by default; with `{"listDelta": true}` a reset, then one
+/// `zeron_proto::list_delta` frame per wake-up carrying only changed rows.
+/// `keep` narrows the list before either encoding.
+fn list_watch<T>(
+    params: &serde_json::Value,
+    rx: watch::Receiver<Vec<T>>,
+    key: fn(&T) -> &str,
+    keep: Option<fn(&T) -> bool>,
+) -> BoxStream<'static, serde_json::Value>
+where
+    T: serde::Serialize + Clone + PartialEq + Send + Sync + 'static,
+{
+    use zeron_proto::list_delta::{LIST_DELTA_PARAM, ListFrame, diff};
+    let delta = params
+        .get(LIST_DELTA_PARAM)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !delta && keep.is_none() {
+        return watch_stream(rx);
+    }
+    let read = move |rx: &mut watch::Receiver<Vec<T>>| -> Vec<T> {
+        let rows = rx.borrow_and_update();
+        match keep {
+            Some(keep) => rows.iter().filter(|row| keep(row)).cloned().collect(),
+            None => rows.clone(),
+        }
+    };
+    futures::stream::unfold((rx, None::<Vec<T>>), move |(mut rx, sent)| async move {
+        if sent.is_some() {
+            rx.changed().await.ok()?;
+        }
+        let rows = read(&mut rx);
+        let value = match (&sent, delta) {
+            (_, false) => serde_json::to_value(&rows),
+            (None, true) => serde_json::to_value(ListFrame::Reset { rows: rows.clone() }),
+            (Some(sent), true) => serde_json::to_value(diff(sent, &rows, key)),
+        }
+        .ok()?;
+        Some((value, (rx, Some(rows))))
+    })
+    .boxed()
+}
+
+fn chat_key(chat: &zeron_proto::Chat) -> &str {
+    &chat.id
+}
+
+fn session_key(session: &zeron_proto::Session) -> &str {
+    &session.chat_id
+}
+
+fn device_key(device: &zeron_proto::Device) -> &str {
+    &device.id
+}
+
 /// The transcript watch as delta frames (`zeron_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
@@ -2880,13 +2936,47 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(Box::pin(stream)))
             }
             methods::WATCH_CHATS => {
-                Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
+                let include_archived = params
+                    .get("includeArchived")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                let keep: Option<fn(&zeron_proto::Chat) -> bool> =
+                    (!include_archived).then_some(|chat| !chat.archived);
+                Ok(RpcReply::Stream(list_watch(
+                    &params,
+                    self.workspace.watch_chats(),
+                    chat_key,
+                    keep,
+                )))
+            }
+            methods::FIND_CHATS => {
+                #[derive(Deserialize)]
+                struct Input {
+                    key: String,
+                }
+                let Input { key } = parse_params(params)?;
+                let key = key.trim();
+                if key.is_empty() {
+                    return Err(RpcError::BadParams("key is required".into()));
+                }
+                let candidates: Vec<zeron_proto::Chat> = self
+                    .workspace
+                    .watch_chats()
+                    .borrow()
+                    .iter()
+                    .filter(|chat| chat.matches_reference(key))
+                    .cloned()
+                    .collect();
+                RpcReply::value(&candidates)
             }
             methods::WATCH_SIDEBAR_PREFERENCES => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_sidebar_preferences(),
             ))),
-            methods::WATCH_DEVICES => Ok(RpcReply::Stream(watch_stream(
+            methods::WATCH_DEVICES => Ok(RpcReply::Stream(list_watch(
+                &params,
                 self.workspace.watch_devices(),
+                device_key,
+                None,
             ))),
             methods::WATCH_SPACES => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_spaces(),
@@ -2896,7 +2986,7 @@ impl RpcService for EngineRpc {
                 let merged = self
                     .workspace
                     .merged_sessions_watch(self.sessions.watch_sessions());
-                Ok(RpcReply::Stream(watch_stream(merged)))
+                Ok(RpcReply::Stream(list_watch(&params, merged, session_key, None)))
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
@@ -4370,6 +4460,59 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn list_watches_send_changed_rows_once_per_wake_up() {
+        use futures::StreamExt;
+        use serde_json::json;
+        let chat = |id: &str, archived: bool, title: &str| -> zeron_proto::Chat {
+            serde_json::from_value(json!({
+                "id": id, "deviceId": "dev", "archived": archived, "title": title,
+                "createdAt": "2026-11-09T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let rows: Vec<_> = (0..300).map(|i| chat(&format!("c{i:03}"), i % 2 == 0, "t")).collect();
+        let (tx, rx) = watch::channel(rows.clone());
+        async fn next(stream: &mut BoxStream<'static, serde_json::Value>) -> serde_json::Value {
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        let mut whole = list_watch(&json!({}), rx.clone(), chat_key, None);
+        let mut delta = list_watch(&json!({ "listDelta": true }), rx.clone(), chat_key, None);
+        let mut live = list_watch(
+            &json!({ "listDelta": true, "includeArchived": false }),
+            rx,
+            chat_key,
+            Some(|chat: &zeron_proto::Chat| !chat.archived),
+        );
+        assert_eq!(next(&mut whole).await.as_array().unwrap().len(), 300);
+        let reset = next(&mut delta).await;
+        assert_eq!(reset["kind"], "reset");
+        assert_eq!(reset["rows"].as_array().unwrap().len(), 300);
+        assert_eq!(next(&mut live).await["rows"].as_array().unwrap().len(), 150);
+
+        // One row changes: the delta subscriber gets just that row.
+        tx.send_modify(|rows| rows[1].title = Some("renamed".into()));
+        assert_eq!(next(&mut whole).await.as_array().unwrap().len(), 300);
+        let frame = next(&mut delta).await;
+        assert_eq!(frame["kind"], "delta");
+        assert_eq!(frame["upsert"].as_array().unwrap().len(), 1);
+        assert_eq!(frame["upsert"][0]["title"], "renamed");
+        assert_eq!(next(&mut live).await["upsert"][0]["id"], "c001");
+
+        // An unchanged wake-up (the presence tick) still sends a frame.
+        tx.send_modify(|_| {});
+        assert_eq!(next(&mut delta).await, json!({ "kind": "delta" }));
+        assert_eq!(next(&mut live).await, json!({ "kind": "delta" }));
+        // Archiving leaves the live-only list.
+        tx.send_modify(|rows| rows[1].archived = true);
+        assert_eq!(next(&mut delta).await["upsert"][0]["archived"], true);
+        assert_eq!(next(&mut live).await, json!({ "kind": "delta", "remove": ["c001"] }));
+    }
 
     #[tokio::test]
     async fn wake_never_runs_for_local_profiles_or_relay_calls() {

@@ -311,6 +311,17 @@ impl Zeron {
         self.snapshot_as(methods::WATCH_CHATS, json!({})).await
     }
 
+    /// Without archived chats when `include_archived` is false — the engine
+    /// filters, sparing the bulk of the list. Engines that predate the filter
+    /// ignore it and send everything; callers filter again.
+    pub async fn chats_filtered(&self, include_archived: bool) -> anyhow::Result<Vec<Chat>> {
+        self.snapshot_as(
+            methods::WATCH_CHATS,
+            json!({ "includeArchived": include_archived }),
+        )
+        .await
+    }
+
     pub async fn sessions(&self) -> anyhow::Result<Vec<Session>> {
         self.snapshot_as(methods::WATCH_SESSIONS, json!({})).await
     }
@@ -468,13 +479,28 @@ impl Zeron {
     // ---- resolution --------------------------------------------------------
 
     /// Full id, unique id prefix, or exact (case-insensitive) title.
+    ///
+    /// Asks the engine for just the candidates (`FindChats`) rather than the
+    /// whole chat list; engines from before it (an app update restarts the
+    /// engine only once it is idle) still get the list.
     pub async fn resolve_chat(&self, key: &str) -> anyhow::Result<Chat> {
         let key = key.trim();
         if key.is_empty() {
             bail!("chat is required");
         }
-        let chats = self.chats().await?;
-        resolve_chat_in(&chats, key)
+        let candidates: Vec<Chat> = match self.call(methods::FIND_CHATS, json!({ "key": key })).await {
+            Ok(value) => serde_json::from_value(value)
+                .with_context(|| format!("{}: unexpected shape", methods::FIND_CHATS))?,
+            Err(error)
+                if error.downcast_ref::<CallError>().is_some_and(|call| {
+                    matches!(call.error, RpcError::UnknownMethod(_))
+                }) =>
+            {
+                self.chats().await?
+            }
+            Err(error) => return Err(error),
+        };
+        resolve_chat_in(&candidates, key)
     }
 
     /// Space id, exact path, display name, or unique path suffix.
@@ -902,6 +928,58 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
         }
+    }
+
+    #[tokio::test]
+    async fn chat_references_resolve_from_candidates_like_from_the_whole_list() {
+        struct Service {
+            find_chats: bool,
+            chats: Vec<Chat>,
+        }
+        #[async_trait::async_trait]
+        impl zeron_rpc::RpcService for Service {
+            async fn handle(
+                &self,
+                method: &str,
+                params: Value,
+            ) -> Result<zeron_rpc::RpcReply, RpcError> {
+                match method {
+                    methods::FIND_CHATS if self.find_chats => {
+                        let key = params["key"].as_str().unwrap();
+                        let found: Vec<&Chat> =
+                            self.chats.iter().filter(|c| c.matches_reference(key)).collect();
+                        zeron_rpc::RpcReply::value(&found)
+                    }
+                    methods::WATCH_CHATS if !self.find_chats => Ok(zeron_rpc::RpcReply::Stream(
+                        futures::stream::once(std::future::ready(json!(self.chats))).boxed(),
+                    )),
+                    other => Err(RpcError::UnknownMethod(other.into())),
+                }
+            }
+        }
+        use futures::StreamExt;
+        let chats = vec![
+            chat("aaaa1111-1", Some("Fix login")),
+            chat("aaaa2222-2", Some("Fix Login")),
+            chat("bbbb3333-3", Some(" Docs ")),
+            chat("cccc4444-4", Some("aaaa")),
+        ];
+        let resolve = |find_chats| {
+            let rpc = zeron_rpc::memory_client(Arc::new(Service { find_chats, chats: chats.clone() }));
+            Zeron::with_client(rpc, Origin::default())
+        };
+        let (current, legacy) = (resolve(true), resolve(false));
+        for key in [
+            "bbbb3333-3", "bbbb", " docs ", "aaaa", "aaaa1", "fix login", "cccc4444-4", "zzzz", "",
+        ] {
+            let outcome = |result: anyhow::Result<Chat>| result.map(|c| c.id).map_err(|e| e.to_string());
+            assert_eq!(
+                outcome(current.resolve_chat(key).await),
+                outcome(legacy.resolve_chat(key).await),
+                "{key:?}"
+            );
+        }
+        assert_eq!(current.resolve_chat("docs").await.unwrap().id, "bbbb3333-3");
     }
 
     #[test]

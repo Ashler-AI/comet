@@ -392,6 +392,17 @@ impl Chat {
     pub fn on_chat2(&self) -> bool {
         self.room_gen.unwrap_or(1) >= 2
     }
+
+    /// Whether `key` (already trimmed) could name this chat: its full id, an id
+    /// prefix, or its exact title ignoring ASCII case. The Zeron MCP resolves
+    /// references among exactly these candidates (`FindChats`).
+    pub fn matches_reference(&self, key: &str) -> bool {
+        self.id.starts_with(key)
+            || self
+                .title
+                .as_deref()
+                .is_some_and(|title| title.trim().eq_ignore_ascii_case(key))
+    }
 }
 
 impl Chat {

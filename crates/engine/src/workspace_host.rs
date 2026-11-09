@@ -852,6 +852,12 @@ impl WorkspaceHost {
 
     /// WatchSessions source: remote devices' rows from the registry merged with
     /// this engine's live status watch (the local view is fresher for our own runs).
+    ///
+    /// Publishes only when the merged list differs. Every local status write is
+    /// mirrored into the registry ([`Self::record_session`]), and the merge
+    /// ignores this device's registry rows — so that echo re-merges to the same
+    /// list, and resending it put a byte-identical full list on the wire to
+    /// every subscriber for each heartbeat of every running session.
     pub fn merged_sessions_watch(
         &self,
         local: watch::Receiver<Vec<Session>>,
@@ -866,14 +872,15 @@ impl WorkspaceHost {
                     changed = rows.changed() => if changed.is_err() { break },
                     changed = local.changed() => if changed.is_err() { break },
                 }
+                if tx.is_closed() {
+                    break; // no receivers left
+                }
                 let merged = merge_sessions(
                     &device_id,
                     &rows.borrow_and_update(),
                     &local.borrow_and_update(),
                 );
-                if tx.send(merged).is_err() {
-                    break; // no receivers left
-                }
+                publish_if_changed(&tx, merged);
             }
         });
         rx
@@ -2137,6 +2144,67 @@ mod tests {
             host.watch_spaces().borrow()[0].name.as_deref(),
             Some("Renamed")
         );
+    }
+
+    #[tokio::test]
+    async fn merged_sessions_ignore_the_registry_echo_of_a_local_status() {
+        use super::*;
+        use std::time::Duration;
+        use zeron_proto::SessionStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test device".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+                local_only: false,
+                owner_registry: true,
+            },
+        )
+        .unwrap();
+        let session = |chat_id: &str, device_id: &str| Session {
+            last_turn_outcome: None,
+            terminal_activity: None,
+            last_completed_turn: None,
+            chat_id: chat_id.into(),
+            device_id: device_id.into(),
+            status: SessionStatus::Working,
+            started_at: None,
+            updated_at: Utc::now(),
+            running_subagents: 0,
+        };
+        let (local_tx, local_rx) = watch::channel(Vec::<Session>::new());
+        let mut merged = host.merged_sessions_watch(local_rx);
+        let next = |merged: &mut watch::Receiver<Vec<Session>>| {
+            let mut merged = merged.clone();
+            async move { tokio::time::timeout(Duration::from_millis(200), merged.changed()).await }
+        };
+
+        // A heartbeat of our own run: published once…
+        let local = session("local-chat", "test-device");
+        local_tx.send_replace(vec![local.clone()]);
+        next(&mut merged).await.expect("a local change wakes readers").unwrap();
+        assert_eq!(*merged.borrow_and_update(), vec![local.clone()]);
+
+        // …and its registry mirror re-merges to the same list: nothing to resend.
+        host.record_session(&local);
+        host.inner.publish();
+        assert!(
+            next(&mut merged).await.is_err(),
+            "the registry echo must not republish an identical list"
+        );
+
+        // A remote device's row is a real change.
+        host.record_session(&session("remote-chat", "remote-device"));
+        host.inner.publish();
+        next(&mut merged).await.expect("a remote change wakes readers").unwrap();
+        let chats: Vec<_> = merged.borrow().iter().map(|s| s.chat_id.clone()).collect();
+        assert_eq!(chats, ["local-chat", "remote-chat"]);
     }
 
     #[tokio::test]
