@@ -345,7 +345,8 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
-        // claude-code (mock shares it), as Claude Code 2.1.307 reports them.
+        // claude-code (mock shares it), as Claude Code 2.1.307 reports them,
+        // with Fable 5.2 (and its fast mode) from Claude Code 2.1.321.
         _ => vec![
             model(
                 "claude-opus-5-5",
@@ -355,11 +356,11 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![context_window("200k"), toggle("fastMode", "Fast Mode")],
             ),
             model(
-                "claude-fable-5-1",
-                "Fable 5.1",
+                "claude-fable-5-2",
+                "Fable 5.2",
                 "Most intelligent model for building agents",
                 FULL_LADDER,
-                vec![context_window("200k")],
+                vec![context_window("200k"), toggle("fastMode", "Fast Mode")],
             ),
             model(
                 "claude-sonnet-5-5",
@@ -376,9 +377,16 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
             model(
+                "claude-fable-5-1",
+                "Fable 5.1",
+                "Previous generation Fable",
+                FULL_LADDER,
+                vec![context_window("200k")],
+            ),
+            model(
                 "claude-fable-5",
                 "Fable 5",
-                "Previous generation Fable",
+                "Older generation Fable",
                 FULL_LADDER,
                 vec![context_window("200k")],
             ),
