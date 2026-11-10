@@ -194,10 +194,10 @@ fn default_effort_values(
         ReasoningLevel::Low => vec!["low", "minimal"],
         ReasoningLevel::Medium => vec!["medium"],
         ReasoningLevel::High => vec!["high"],
-        ReasoningLevel::XHigh => vec!["xhigh", "x-high", "high"],
-        ReasoningLevel::Max => vec!["max", "xhigh", "high"],
+        ReasoningLevel::XHigh => vec!["xhigh", "extra_high", "x-high", "high"],
+        ReasoningLevel::Max => vec!["max", "xhigh", "extra_high", "x-high", "high"],
         ReasoningLevel::Ultra | ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink => {
-            vec!["ultra", "max", "high"]
+            vec!["ultra", "max", "xhigh", "extra_high", "high"]
         }
     }
 }
@@ -2056,7 +2056,7 @@ impl AcpHarness {
                 }
             }
             if self.spec.effort_in_model_id {
-                models = group_effort_variants(models);
+                models = group_session_effort_variants(&session, models);
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
@@ -2091,7 +2091,7 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
         "low" => Some(ReasoningLevel::Low),
         "medium" => Some(ReasoningLevel::Medium),
         "high" => Some(ReasoningLevel::High),
-        "xhigh" => Some(ReasoningLevel::XHigh),
+        "xhigh" | "extrahigh" => Some(ReasoningLevel::XHigh),
         "max" => Some(ReasoningLevel::Max),
         "ultra" => Some(ReasoningLevel::Ultra),
         "ultracode" => Some(ReasoningLevel::Ultracode),
@@ -3819,11 +3819,51 @@ fn is_auth_required(error: &HarnessError) -> bool {
     matches!(error, HarnessError::Protocol(message) if message.contains("(code -32000)"))
 }
 
-const EFFORT_SUFFIXES: [(&str, &str, ReasoningLevel); 3] = [
-    ("-low", " (Low)", ReasoningLevel::Low),
-    ("-medium", " (Medium)", ReasoningLevel::Medium),
-    ("-high", " (High)", ReasoningLevel::High),
+const EFFORT_ID_SUFFIXES: [&str; 7] = [
+    "-low",
+    "-medium",
+    "-high",
+    "-xhigh",
+    "-extra_high",
+    "-x-high",
+    "-max",
 ];
+
+fn strip_effort_label(name: &str) -> Option<(&str, ReasoningLevel)> {
+    const LABEL_SUFFIXES: &[(&str, ReasoningLevel)] = &[
+        (" (low)", ReasoningLevel::Low),
+        (" (low thinking)", ReasoningLevel::Low),
+        (" (medium)", ReasoningLevel::Medium),
+        (" (medium thinking)", ReasoningLevel::Medium),
+        (" (high)", ReasoningLevel::High),
+        (" (high thinking)", ReasoningLevel::High),
+        (" (xhigh)", ReasoningLevel::XHigh),
+        (" (x-high)", ReasoningLevel::XHigh),
+        (" (extra)", ReasoningLevel::XHigh),
+        (" (extra high)", ReasoningLevel::XHigh),
+        (" (extra_high)", ReasoningLevel::XHigh),
+        (" (xhigh thinking)", ReasoningLevel::XHigh),
+        (" (x-high thinking)", ReasoningLevel::XHigh),
+        (" (extra thinking)", ReasoningLevel::XHigh),
+        (" (extra high thinking)", ReasoningLevel::XHigh),
+        (" (extra_high thinking)", ReasoningLevel::XHigh),
+        (" (max)", ReasoningLevel::Max),
+        (" (max thinking)", ReasoningLevel::Max),
+    ];
+    let lower = name.to_ascii_lowercase();
+    LABEL_SUFFIXES.iter().find_map(|(suffix, level)| {
+        (name.len() > suffix.len() && lower.ends_with(suffix))
+            .then(|| (&name[..name.len() - suffix.len()], *level))
+    })
+}
+
+fn strip_effort_id_suffix(id: &str) -> Option<&str> {
+    let trimmed = id.strip_suffix("-effort").unwrap_or(id);
+    EFFORT_ID_SUFFIXES
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
+        .filter(|base| !base.is_empty())
+}
 
 /// one picker row: either a single advertised model, or the effort variants
 /// of one model with the id the agent advertises for each level.
@@ -3834,9 +3874,9 @@ struct EffortGroup<'a> {
 }
 
 /// group advertised `(id, name)` choices by their display name. antigravity
-/// names every effort variant "<model> (Low|Medium|High)", but its ids don't
-/// always follow (a signed-in account pairs `gemini-3.1-pro-low` with
-/// `gemini-pro-agent` for High), so the name is the only reliable key. A
+/// names every effort variant "<model> (Low|Medium|High|Extra|Max)", while its
+/// ids don't always follow (a signed-in account pairs `gemini-3.1-pro-low`
+/// with `gemini-pro-agent` for High), so the name is the only reliable key. A
 /// group's id is a variant id minus its level suffix, falling back to the
 /// first variant's id; ids come from the wire alone, so discovery and run
 /// time derive the same one.
@@ -3845,10 +3885,7 @@ fn effort_groups<'a>(
 ) -> Vec<EffortGroup<'a>> {
     let mut groups: Vec<EffortGroup<'a>> = Vec::new();
     for (id, name) in choices {
-        let variant = EFFORT_SUFFIXES.iter().find_map(|(_, label_suffix, level)| {
-            name.strip_suffix(label_suffix).map(|base| (base, *level))
-        });
-        let Some((base, level)) = variant else {
+        let Some((base, level)) = strip_effort_label(name) else {
             groups.push(EffortGroup {
                 id: id.to_owned(),
                 label: name,
@@ -3872,14 +3909,11 @@ fn effort_groups<'a>(
         group.id = group
             .variants
             .iter()
-            .find_map(|(_, id)| {
-                EFFORT_SUFFIXES
-                    .iter()
-                    .find_map(|(id_suffix, _, _)| id.strip_suffix(id_suffix))
-            })
+            .find_map(|(_, id)| strip_effort_id_suffix(id))
             .unwrap_or(group.variants[0].1)
             .to_owned();
         group.variants.sort_by_key(|(level, _)| *level);
+        group.variants.dedup_by_key(|(level, _)| *level);
     }
     groups
 }
@@ -3907,15 +3941,44 @@ fn group_effort_variants(models: Vec<Model>) -> Vec<Model> {
         .collect()
 }
 
-/// the advertised variant id for a grouped model: the picked level when the
-/// model offers it, else its strongest level. Ids the agent already
-/// advertises (chats saved with a full variant id) pass through untouched.
-fn effort_variant_id(
-    session_response: &Value,
-    model: &str,
-    reasoning: Option<ReasoningLevel>,
-) -> String {
-    let choices: Vec<(&str, &str)> = session_response
+fn session_available_effort_groups(session_response: &Value) -> Vec<EffortGroup<'_>> {
+    let available = session_response
+        .get("models")
+        .and_then(|models| models.get("availableModels"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    effort_groups(available.iter().filter_map(|model| {
+        let id = model.get("modelId").and_then(Value::as_str)?;
+        let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
+        Some((id, name))
+    }))
+}
+
+/// Fold flat `configOptions.model` variant lists (agy_acp_server <= 1.1.1), and
+/// when `models.availableModels` is also present alongside pre-grouped family
+/// options (agy_acp_server >= 1.4.4), attach each family's own variant ladder
+/// instead of sharing the active model's `thought_level` or static fallback.
+fn group_session_effort_variants(session_response: &Value, models: Vec<Model>) -> Vec<Model> {
+    let mut models = group_effort_variants(models);
+    let available_groups = session_available_effort_groups(session_response);
+    if available_groups.is_empty() {
+        return models;
+    }
+    for model in &mut models {
+        if let Some(group) = available_groups.iter().find(|group| group.id == model.id) {
+            if group.variants.len() >= 2 {
+                model.reasoning_levels = group.variants.iter().map(|(level, _)| *level).collect();
+            } else {
+                model.reasoning_levels.clear();
+            }
+        }
+    }
+    models
+}
+
+fn model_config_choices(session_response: &Value) -> Vec<(&str, &str)> {
+    session_response
         .get("configOptions")
         .and_then(Value::as_array)
         .and_then(|options| {
@@ -3933,7 +3996,18 @@ fn effort_variant_id(
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// the advertised variant id for a grouped model: the picked level when the
+/// model offers it, else the nearest offered fallback. Ids the agent already
+/// advertises (chats saved with a full variant id) pass through untouched.
+fn effort_variant_id(
+    session_response: &Value,
+    model: &str,
+    reasoning: Option<ReasoningLevel>,
+) -> String {
+    let choices = model_config_choices(session_response);
     if choices.iter().any(|(id, _)| *id == model) {
         return model.to_owned();
     }
@@ -3948,18 +4022,51 @@ fn effort_variant_id(
             .find(|(variant_level, _)| *variant_level == level)
             .map(|(_, id)| (*id).to_owned())
     };
+    let fallback: &[ReasoningLevel] = if reasoning.is_some_and(|level| level > ReasoningLevel::High)
+    {
+        &[
+            ReasoningLevel::Max,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::High,
+            ReasoningLevel::Medium,
+            ReasoningLevel::Low,
+        ]
+    } else {
+        &[
+            ReasoningLevel::High,
+            ReasoningLevel::Medium,
+            ReasoningLevel::Low,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ]
+    };
     reasoning
         .and_then(offered)
-        .or_else(|| {
-            [
-                ReasoningLevel::High,
-                ReasoningLevel::Medium,
-                ReasoningLevel::Low,
-            ]
-            .into_iter()
-            .find_map(offered)
-        })
+        .or_else(|| fallback.iter().copied().find_map(offered))
         .unwrap_or_else(|| model.to_owned())
+}
+
+/// Resolve a requested model + reasoning against either flat variant choices
+/// (1.1.1) or grouped family choices + `models.availableModels` (1.4.4+).
+fn resolve_session_effort_model(
+    session_response: &Value,
+    model: &str,
+    reasoning: Option<ReasoningLevel>,
+) -> (String, Option<ReasoningLevel>) {
+    let choices = model_config_choices(session_response);
+    if !choices.iter().any(|(id, _)| *id == model) {
+        for group in session_available_effort_groups(session_response) {
+            if choices.iter().any(|(id, _)| *id == group.id)
+                && let Some((level, _)) = group
+                    .variants
+                    .iter()
+                    .find(|(_, variant_id)| *variant_id == model)
+            {
+                return (group.id, Some(*level));
+            }
+        }
+    }
+    (effort_variant_id(session_response, model, reasoning), reasoning)
 }
 
 /// Await a setup request while draining incoming messages, so a `session/load`
@@ -4181,14 +4288,15 @@ async fn select_session_config(
     // ACP clients follow the same split. Unlike the best-effort auxiliary options,
     // an explicit model switch is strict: prompting with a different
     // model than the picker shows is worse than surfacing the RPC error.
-    let requested_model: Option<String> = match request.model.as_deref() {
-        Some(model) if rules.effort_in_model_id => Some(effort_variant_id(
-            &session_response,
-            model,
-            request.reasoning,
-        )),
-        model => model.map(str::to_owned),
+    let (requested_model, effective_reasoning) = match request.model.as_deref() {
+        Some(model) if rules.effort_in_model_id => {
+            let (resolved, reasoning) =
+                resolve_session_effort_model(&session_response, model, request.reasoning);
+            (Some(resolved), reasoning)
+        }
+        model => (model.map(str::to_owned), request.reasoning),
     };
+    request.reasoning = effective_reasoning;
     if rules.harness == HarnessId::Antigravity {
         validate_config_model_selection(
             &session_response,
@@ -4229,14 +4337,21 @@ async fn select_session_config(
         &request.model_options,
         rules.access,
     );
-    // Devin's effort and speed choices depend on the selected model:
-    // switch the model first, then choose them from what it offers.
-    let deferred = rules.harness == HarnessId::Devin
-        && sets
-            .iter()
-            .any(|(id, _)| is_model_config_option(&options_snapshot, id));
-    if deferred {
+    // Devin's effort/speed choices and Antigravity 1.4+'s `thought_level`
+    // choices depend on the selected model: switch the model first, then
+    // choose from what the updated `configOptions` offers. Antigravity keeps
+    // `mode` in pass 0 so a supervised run leaves `yolo` before any refresh.
+    let model_changing = sets
+        .iter()
+        .any(|(id, _)| is_model_config_option(&options_snapshot, id));
+    let defer_all_non_model = rules.harness == HarnessId::Devin && model_changing;
+    let defer_thought_level =
+        rules.harness == HarnessId::Antigravity && model_changing && !efforts.is_empty();
+    let deferred = defer_all_non_model || defer_thought_level;
+    if defer_all_non_model {
         sets.retain(|(id, _)| is_model_config_option(&options_snapshot, id));
+    } else if defer_thought_level {
+        sets.retain(|(id, _)| config_option_category(&options_snapshot, id) != Some("thought_level"));
     }
     let mut pass = 0;
     loop {
@@ -4311,7 +4426,13 @@ async fn select_session_config(
             &request.model_options,
             rules.access,
         );
-        sets.retain(|(id, _)| !is_model_config_option(&options_snapshot, id));
+        if defer_thought_level {
+            sets.retain(|(id, _)| {
+                config_option_category(&options_snapshot, id) == Some("thought_level")
+            });
+        } else {
+            sets.retain(|(id, _)| !is_model_config_option(&options_snapshot, id));
+        }
     }
     Ok(options_snapshot)
 }
@@ -7194,6 +7315,173 @@ mod tests {
             "gemini-legacy"
         );
         assert_eq!(id("unknown-model", None), "unknown-model");
+    }
+
+    #[test]
+    fn antigravity_supports_xhigh_extra_high_and_max_across_flat_and_grouped_wire_shapes() {
+        let flat = json!({
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "options": [
+                    {"value": "gemini-4-argon-max", "name": "Gemini 4 Argon (Max)"},
+                    {"value": "gemini-4-argon-xhigh", "name": "Gemini 4 Argon (Extra)"},
+                    {"value": "gemini-4-argon-high", "name": "Gemini 4 Argon (High)"},
+                    {"value": "gemini-4-argon-medium", "name": "Gemini 4 Argon (Medium)"},
+                    {"value": "gemini-4-argon-low", "name": "Gemini 4 Argon (Low)"},
+                    {"value": "gemini-4-carbon-extra_high", "name": "Gemini 4 Carbon (Extra High)"},
+                    {"value": "gemini-4-carbon-high", "name": "Gemini 4 Carbon (High)"}
+                ]
+            }]
+        });
+        let flat_rows: Vec<(String, String, Vec<ReasoningLevel>)> =
+            group_session_effort_variants(&flat, models_from_session(&flat, &[]))
+                .into_iter()
+                .map(|m| (m.id, m.label, m.reasoning_levels))
+                .collect();
+        assert_eq!(
+            flat_rows,
+            vec![
+                (
+                    "gemini-4-argon".into(),
+                    "Gemini 4 Argon".into(),
+                    vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                        ReasoningLevel::Max,
+                    ],
+                ),
+                (
+                    "gemini-4-carbon".into(),
+                    "Gemini 4 Carbon".into(),
+                    vec![ReasoningLevel::High, ReasoningLevel::XHigh],
+                ),
+            ]
+        );
+        assert_eq!(
+            effort_variant_id(&flat, "gemini-4-argon", Some(ReasoningLevel::XHigh)),
+            "gemini-4-argon-xhigh"
+        );
+        assert_eq!(
+            effort_variant_id(&flat, "gemini-4-argon", Some(ReasoningLevel::Max)),
+            "gemini-4-argon-max"
+        );
+        // Requesting Max on a model topping out at XHigh clamps to XHigh, while
+        // an unset reasoning still defaults to High.
+        assert_eq!(
+            effort_variant_id(&flat, "gemini-4-carbon", Some(ReasoningLevel::Max)),
+            "gemini-4-carbon-extra_high"
+        );
+        assert_eq!(
+            effort_variant_id(&flat, "gemini-4-argon", None),
+            "gemini-4-argon-high"
+        );
+
+        // agy_acp_server 1.4.4+ shape: grouped `configOptions.model` + active
+        // family `thinking_level` + full `models.availableModels`.
+        let grouped = json!({
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gemini-3.8-flash",
+                    "options": [
+                        {"value": "gemini-4-argon", "name": "Gemini 4 Argon"},
+                        {"value": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
+                        {"value": "gemini-3.7-flash", "name": "Gemini 3.7 Flash"},
+                        {"value": "gemini-legacy", "name": "Gemini Legacy"}
+                    ]
+                },
+                {
+                    "id": "thinking_level",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "high",
+                    "options": [
+                        {"value": "low", "name": "Low"},
+                        {"value": "medium", "name": "Medium"},
+                        {"value": "high", "name": "High"}
+                    ]
+                }
+            ],
+            "models": {
+                "currentModelId": "gemini-3.8-flash-high",
+                "availableModels": [
+                    {"modelId": "gemini-4-argon-max", "name": "Gemini 4 Argon (Max)"},
+                    {"modelId": "gemini-4-argon-xhigh", "name": "Gemini 4 Argon (Extra)"},
+                    {"modelId": "gemini-4-argon-high", "name": "Gemini 4 Argon (High)"},
+                    {"modelId": "gemini-4-argon-medium", "name": "Gemini 4 Argon (Medium)"},
+                    {"modelId": "gemini-4-argon-low", "name": "Gemini 4 Argon (Low)"},
+                    {"modelId": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"},
+                    {"modelId": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)"},
+                    {"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)"},
+                    {"modelId": "gemini-3.7-flash-extra_high", "name": "Gemini 3.7 Flash (Extra High)"},
+                    {"modelId": "gemini-3.7-flash-high", "name": "Gemini 3.7 Flash (High)"},
+                    {"modelId": "gemini-legacy", "name": "Gemini Legacy"}
+                ]
+            }
+        });
+        let grouped_rows: Vec<(String, Vec<ReasoningLevel>)> = group_session_effort_variants(
+            &grouped,
+            models_from_session(&grouped, &(antigravity_spec().models)()),
+        )
+        .into_iter()
+        .map(|m| (m.id, m.reasoning_levels))
+        .collect();
+        assert_eq!(
+            grouped_rows,
+            vec![
+                (
+                    "gemini-4-argon".into(),
+                    vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                        ReasoningLevel::Max,
+                    ],
+                ),
+                (
+                    "gemini-3.8-flash".into(),
+                    vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                    ],
+                ),
+                (
+                    "gemini-3.7-flash".into(),
+                    vec![ReasoningLevel::High, ReasoningLevel::XHigh],
+                ),
+                ("gemini-legacy".into(), vec![]),
+            ]
+        );
+        assert_eq!(
+            resolve_session_effort_model(
+                &grouped,
+                "gemini-4-argon-max",
+                Some(ReasoningLevel::High),
+            ),
+            ("gemini-4-argon".into(), Some(ReasoningLevel::Max))
+        );
+        assert!(
+            validate_config_model_selection(
+                &grouped,
+                Some("gemini-4-argon-unavailable"),
+                &serde_json::Map::new(),
+            )
+            .is_err()
+        );
+        assert_eq!(reasoning_from_value("extra_high"), Some(ReasoningLevel::XHigh));
+        assert!(default_effort_values(Some(ReasoningLevel::XHigh), None).contains(&"extra_high"));
+        assert_eq!(
+            default_effort_values(Some(ReasoningLevel::Max), None).first(),
+            Some(&"max")
+        );
     }
 
     #[test]

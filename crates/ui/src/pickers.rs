@@ -211,6 +211,7 @@ fn google_execution_model(harness: HarnessId, model: &Model, effort: Option<Reas
             ReasoningLevel::Medium => "medium",
             ReasoningLevel::High => "high",
             ReasoningLevel::XHigh => "xhigh",
+            ReasoningLevel::Max => "max",
             _ => return model.id.clone(),
         };
         return format!("{family}-{suffix}");
@@ -7061,7 +7062,13 @@ mod tests {
                 pickers.defaults.reasoning = Some(ReasoningLevel::High);
                 pickers.harnesses = Loadable::Ready(vec![descriptor(harness, "Google")]);
                 let provider = if harness == HarnessId::Omp { " (Google)" } else { "" };
-                let raw_models = [("medium", "Medium"), ("high", "High"), ("low", "Low")]
+                let raw_models = [
+                    ("medium", "Medium"),
+                    ("high", "High"),
+                    ("low", "Low"),
+                    ("xhigh", "Extra"),
+                    ("max", "Max"),
+                ]
                     .into_iter()
                     .map(|(effort, label)| bare_model(
                         &format!("{prefix}gemini-4-argon-{effort}"),
@@ -7075,14 +7082,24 @@ mod tests {
                 assert_eq!(pickers.compact_effort(cx).unwrap().selected, 0);
                 assert_eq!(pickers.resolved(cx).model.as_deref(), Some(legacy.as_str()));
                 assert_eq!(pickers.resolved(cx).reasoning, Some(ReasoningLevel::Low));
-                pickers.pick_reasoning(ReasoningLevel::High, cx);
-                let resolved = pickers.resolved(cx);
-                assert_eq!(resolved.model, Some(format!("{prefix}gemini-4-argon-high")));
-                assert_eq!(resolved.reasoning, Some(ReasoningLevel::High));
-                assert_eq!(pickers.model_rows(cx).len(), 1);
-                assert_eq!(pickers.compact_effort(cx).unwrap().selected, 2);
-                let route = zeron_proto::AgentRoute::from_harness_model(harness, resolved.model.as_deref().unwrap()).unwrap();
-                assert_eq!(route.model, "gemini-4-argon-high");
+                for (index, level, suffix) in [
+                    (2, ReasoningLevel::High, "high"),
+                    (3, ReasoningLevel::XHigh, "xhigh"),
+                    (4, ReasoningLevel::Max, "max"),
+                ] {
+                    pickers.pick_reasoning(level, cx);
+                    let resolved = pickers.resolved(cx);
+                    assert_eq!(resolved.model, Some(format!("{prefix}gemini-4-argon-{suffix}")));
+                    assert_eq!(resolved.reasoning, Some(level));
+                    assert_eq!(pickers.model_rows(cx).len(), 1);
+                    assert_eq!(pickers.compact_effort(cx).unwrap().selected, index);
+                    let route = zeron_proto::AgentRoute::from_harness_model(
+                        harness,
+                        resolved.model.as_deref().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(route.model, format!("gemini-4-argon-{suffix}"));
+                }
             });
         }
     }
@@ -7093,6 +7110,8 @@ mod tests {
         model.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::Medium];
         let models = vec![model];
         assert!(selected_catalog_model(&models, Some("google-antigravity/gemini-4-argon-high")).is_none());
+        assert!(selected_catalog_model(&models, Some("google-antigravity/gemini-4-argon-xhigh")).is_none());
+        assert!(selected_catalog_model(&models, Some("google-antigravity/gemini-4-argon-max")).is_none());
         assert!(selected_catalog_model(&models, Some("other/gemini-4-argon-low")).is_none());
         assert!(selected_catalog_model(&models, Some("google-antigravity/gemini-4-carbon-low")).is_none());
         let selected = selected_catalog_model(&models, Some("google-antigravity/gemini-4-argon-low")).unwrap();

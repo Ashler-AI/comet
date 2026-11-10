@@ -18,9 +18,34 @@ pub fn google_model_variant(id: &str) -> Option<(&str, ReasoningLevel)> {
         "medium" => ReasoningLevel::Medium,
         "high" => ReasoningLevel::High,
         "xhigh" => ReasoningLevel::XHigh,
+        "max" => ReasoningLevel::Max,
         _ => return None,
     };
     Some((base, effort))
+}
+
+fn effort_label_annotations(effort: ReasoningLevel) -> &'static [&'static str] {
+    match effort {
+        ReasoningLevel::Low => &[" (low)", " (low thinking)"],
+        ReasoningLevel::Medium => &[" (medium)", " (medium thinking)"],
+        ReasoningLevel::High => &[" (high)", " (high thinking)"],
+        // CCPA/Hub labels `xhigh` as "(Extra)", agy_acp_server SDK metadata as
+        // "(Extra High)", and Zeron as "(X-High)".
+        ReasoningLevel::XHigh => &[
+            " (xhigh)",
+            " (x-high)",
+            " (extra)",
+            " (extra high)",
+            " (extra_high)",
+            " (xhigh thinking)",
+            " (x-high thinking)",
+            " (extra thinking)",
+            " (extra high thinking)",
+            " (extra_high thinking)",
+        ],
+        ReasoningLevel::Max => &[" (max)", " (max thinking)"],
+        _ => &[],
+    }
 }
 
 #[cfg(test)]
@@ -38,11 +63,20 @@ mod tests {
             google_model_variant("gemini-3.8-flash-high"),
             Some(("gemini-3.8-flash", ReasoningLevel::High))
         );
+        assert_eq!(
+            google_model_variant("gemini-4-argon-xhigh"),
+            Some(("gemini-4-argon", ReasoningLevel::XHigh))
+        );
+        assert_eq!(
+            google_model_variant("google-antigravity/gemini-4-argon-max"),
+            Some(("google-antigravity/gemini-4-argon", ReasoningLevel::Max))
+        );
         for id in [
             "openai/gemini-4-argon-high",
             "claude-high",
             "gemini-carbon-preview",
             "gemini-high",
+            "gemini-max",
         ] {
             assert_eq!(google_model_variant(id), None, "{id}");
         }
@@ -76,8 +110,6 @@ pub fn google_model_picker_rows(harness: HarnessId, models: Vec<Model>) -> Vec<M
         }
         let mut row = model.clone();
         // Remove only a matching effort annotation, never a model qualifier.
-        let suffix = model.id.rsplit('-').next().unwrap_or_default();
-        let annotation = format!(" ({suffix})");
         let provider_suffix = if harness == HarnessId::Omp {
             " (Google)"
         } else {
@@ -87,7 +119,13 @@ pub fn google_model_picker_rows(harness: HarnessId, models: Vec<Model>) -> Vec<M
             .label
             .strip_suffix(provider_suffix)
             .unwrap_or(&row.label);
-        if label.to_ascii_lowercase().ends_with(&annotation) {
+        let lower_label = label.to_ascii_lowercase();
+        if let Some(annotation) = effort_label_annotations(effort)
+            .iter()
+            .copied()
+            .find(|annotation| lower_label.ends_with(annotation))
+            .filter(|annotation| label.len() > annotation.len())
+        {
             row.label = format!(
                 "{}{provider_suffix}",
                 &label[..label.len() - annotation.len()]
@@ -103,7 +141,7 @@ pub fn google_model_picker_rows(harness: HarnessId, models: Vec<Model>) -> Vec<M
 #[cfg(test)]
 mod picker_tests {
     use super::*;
-    use crate::ReasoningLevel::{High, Low, Medium};
+    use crate::ReasoningLevel::{High, Low, Max, Medium, XHigh};
 
     fn catalog() -> Vec<Model> {
         [
@@ -136,5 +174,67 @@ mod picker_tests {
         assert_eq!(models[1].reasoning_levels, vec![High]);
         assert_eq!(models[2].id, "gemini-carbon-preview");
         assert!(models[2].reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn google_picker_groups_xhigh_and_max_variants_and_strips_ccpa_labels() {
+        let raw = [
+            (
+                "google-antigravity/gemini-4-argon-xhigh",
+                "Gemini 4 Argon (Extra) (Google)",
+            ),
+            (
+                "google-antigravity/gemini-4-argon-max",
+                "Gemini 4 Argon (Max) (Google)",
+            ),
+            (
+                "google-antigravity/gemini-4-argon-high",
+                "Gemini 4 Argon (High) (Google)",
+            ),
+            (
+                "google-antigravity/gemini-4-argon-medium",
+                "Gemini 4 Argon (Medium) (Google)",
+            ),
+            (
+                "google-antigravity/gemini-4-argon-low",
+                "Gemini 4 Argon (Low) (Google)",
+            ),
+            (
+                "google-antigravity/gemini-4-carbon-max",
+                "Gemini 4 Carbon (Preview) (Google)",
+            ),
+            (
+                "google-antigravity/gemini-4-carbon-xhigh",
+                "Gemini 4 Carbon (Extra High) (Google)",
+            ),
+            (
+                "google-antigravity/gemini-3.8-flash-xhigh",
+                "Gemini 3.8 Flash (Extra High) (Google)",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, label)| Model {
+            id: id.into(),
+            label: label.into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![],
+        })
+        .collect();
+
+        let models = google_model_picker_rows(HarnessId::Omp, raw);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "google-antigravity/gemini-4-argon-xhigh");
+        assert_eq!(models[0].label, "Gemini 4 Argon (Google)");
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![Low, Medium, High, XHigh, Max]
+        );
+        assert_eq!(models[1].id, "google-antigravity/gemini-4-carbon-max");
+        assert_eq!(models[1].label, "Gemini 4 Carbon (Preview) (Google)");
+        assert_eq!(models[1].reasoning_levels, vec![XHigh, Max]);
+        assert_eq!(models[2].id, "google-antigravity/gemini-3.8-flash-xhigh");
+        assert_eq!(models[2].label, "Gemini 3.8 Flash (Google)");
+        assert_eq!(models[2].reasoning_levels, vec![XHigh]);
     }
 }
