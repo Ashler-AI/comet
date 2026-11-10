@@ -386,7 +386,11 @@ fn run_omp_supervisor(_args: impl Iterator<Item = OsString>) -> Result<(), Harne
 // tier as its thinking level so the account-bound route cannot drift.
 fn managed_google_model(model: &str) -> (&str, Option<&str>) {
     match model.rsplit_once('-') {
-        Some((logical, tier @ ("low" | "medium" | "high" | "xhigh"))) => (logical, Some(tier)),
+        Some((logical, tier @ ("low" | "medium" | "high" | "xhigh" | "max")))
+            if logical.starts_with("gemini-") =>
+        {
+            (logical, Some(tier))
+        }
         _ => (model, None),
     }
 }
@@ -2740,5 +2744,18 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o077, 0);
         }
+    }
+
+    #[test]
+    fn managed_google_model_pins_effort_tiers_through_max() {
+        for tier in ["low", "medium", "high", "xhigh", "max"] {
+            let model = format!("gemini-4-argon-{tier}");
+            assert_eq!(managed_google_model(&model), ("gemini-4-argon", Some(tier)));
+        }
+        assert_eq!(
+            managed_google_model("gemini-carbon-preview"),
+            ("gemini-carbon-preview", None)
+        );
+        assert_eq!(managed_google_model("gemini-max"), ("gemini-max", None));
     }
 }
