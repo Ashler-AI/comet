@@ -87,6 +87,118 @@ mod provisioning_tests {
         assert_eq!(attached_session(&outcome), Some(("session", "sandbox-host")));
         assert!(attachment_after_create(&outcome).is_none());
     }
+
+    #[test]
+    fn sandbox_route_supports_omp_claude_code_codex_and_antigravity_catalogs() {
+        let model = |id: &str| zeron_proto::Model {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![],
+        };
+        let mut catalogs = std::collections::HashMap::new();
+        catalogs.insert(zeron_proto::HarnessId::Omp, vec![model("openai-codex/gpt-5.4")]);
+        catalogs.insert(zeron_proto::HarnessId::ClaudeCode, vec![model("claude-sonnet-4-6")]);
+        catalogs.insert(zeron_proto::HarnessId::Codex, vec![model("gpt-5.4")]);
+        catalogs.insert(zeron_proto::HarnessId::Antigravity, vec![model("gemini-3-pro")]);
+        let accounts = vec![
+            SharedAccount {
+                id: "acct_anthropic".into(),
+                provider: "anthropic".into(),
+                email: None,
+                display_name: None,
+                plan_label: None,
+                status: "active".into(),
+                usage_windows: vec![],
+            },
+            SharedAccount {
+                id: "acct_openai".into(),
+                provider: "openai".into(),
+                email: None,
+                display_name: None,
+                plan_label: None,
+                status: "ready".into(),
+                usage_windows: vec![],
+            },
+        ];
+
+        let claude = build_sandbox_agent_route(
+            Some((zeron_proto::HarnessId::ClaudeCode, "claude-sonnet-4-6")),
+            &catalogs,
+            &accounts,
+            Some("acct_anthropic"),
+        )
+        .unwrap();
+        assert_eq!(claude.harness(), zeron_proto::HarnessId::ClaudeCode);
+        assert_eq!(claude.provider, AgentProvider::Anthropic);
+        assert_eq!(claude.execution_model(), "claude-sonnet-4-6");
+        assert_eq!(claude.account_id.as_deref(), Some("acct_anthropic"));
+
+        let codex = build_sandbox_agent_route(
+            Some((zeron_proto::HarnessId::Codex, "gpt-5.4")),
+            &catalogs,
+            &accounts,
+            None,
+        )
+        .unwrap();
+        assert_eq!(codex.harness(), zeron_proto::HarnessId::Codex);
+        assert_eq!(codex.provider, AgentProvider::OpenAi);
+        assert_eq!(codex.execution_model(), "gpt-5.4");
+
+        assert!(build_sandbox_agent_route(
+            Some((zeron_proto::HarnessId::ClaudeCode, "claude-opus-4-6")),
+            &catalogs,
+            &accounts,
+            None,
+        )
+        .is_none());
+        assert!(build_sandbox_agent_route(
+            Some((zeron_proto::HarnessId::ClaudeCode, "claude-sonnet-4-6")),
+            &catalogs,
+            &accounts,
+            Some("acct_openai"),
+        )
+        .is_none());
+    }
+}
+
+fn build_sandbox_agent_route(
+    selected: Option<(zeron_proto::HarnessId, &str)>,
+    catalogs: &std::collections::HashMap<zeron_proto::HarnessId, Vec<zeron_proto::Model>>,
+    accounts: &[SharedAccount],
+    account: Option<&str>,
+) -> Option<AgentRoute> {
+    let (harness, model) = selected?;
+    if !matches!(
+        harness,
+        zeron_proto::HarnessId::Omp
+            | zeron_proto::HarnessId::ClaudeCode
+            | zeron_proto::HarnessId::Codex
+            | zeron_proto::HarnessId::Antigravity
+    ) {
+        return None;
+    }
+    catalogs.get(&harness)?.iter().any(|m| m.id == model).then_some(())?;
+    let mut route = AgentRoute::from_harness_model(harness, model)?;
+    if let Some(account) = account {
+        let provider = match route.provider {
+            AgentProvider::Anthropic => "anthropic",
+            AgentProvider::OpenAi => "openai",
+            AgentProvider::Antigravity => "antigravity",
+        };
+        if !accounts.iter().any(|candidate| {
+            candidate.id == account
+                && candidate.provider.eq_ignore_ascii_case(provider)
+                && matches!(candidate.status.as_str(), "active" | "connected" | "ready")
+        }) {
+            return None;
+        }
+        route.routing_mode = zeron_proto::AgentRoutingMode::Pinned;
+        route.account_id = Some(account.to_owned());
+    }
+    route.validate().ok()?;
+    Some(route)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,9 +221,8 @@ pub struct CrewAccounts {
     confirmation: Option<(&'static str, Value, String)>,
     model_picker: Entity<crate::pickers::Pickers>,
     _model_picked: Subscription,
-    model: Option<String>,
-    models: Vec<zeron_proto::Model>,
-    native_models: Vec<zeron_proto::Model>,
+    selected: Option<(zeron_proto::HarnessId, String)>,
+    catalog_models: std::collections::HashMap<zeron_proto::HarnessId, Vec<zeron_proto::Model>>,
     account: Option<String>,
     account_select: widgets::SelectState,
     database: ScaffoldDatabaseEnvironment,
@@ -126,7 +237,7 @@ impl CrewAccounts {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let model_picker = cx.new(|cx| crate::pickers::Pickers::new_for_sandboxes(state.clone(), cx));
         let model_picked = cx.subscribe(&model_picker, |page: &mut Self, _, event: &crate::pickers::TitleModelPicked, cx| {
-            page.model = event.0.model.as_ref().map(|model| if event.0.harness == Some(zeron_proto::HarnessId::Antigravity) { format!("antigravity/{model}") } else { model.clone() });
+            page.selected = event.0.harness.zip(event.0.model.clone());
             page.account = None;
             cx.notify();
         });
@@ -135,7 +246,7 @@ impl CrewAccounts {
             state, view: CrewView::Accounts, status: None, accounts: vec![], environments: vec![], outcome: None,
             busy: false, error: None, notice: None, confirmation: None,
             model_picker, _model_picked: model_picked,
-            model: None, models: vec![], native_models: vec![],
+            selected: None, catalog_models: Default::default(),
             account: None, account_select: widgets::SelectState::default(),
             database: ScaffoldDatabaseEnvironment::Local,
             database_select: widgets::SelectState::default(),
@@ -164,23 +275,45 @@ impl CrewAccounts {
                     Some(engine.client().call("scaffold.refresh", json!(status.scope)).await.map_err(|e| e.to_string())
                         .and_then(|value| serde_json::from_value::<ScaffoldEnvironmentSnapshot>(value).map_err(|e| e.to_string())))
                 } else { None };
-                let models = if refresh_environments {
-                    Some(engine.client().call(zeron_rpc::methods::LIST_MODELS, json!({"harness": zeron_proto::HarnessId::Omp})).await.map_err(|error| error.to_string())
-                        .and_then(|value| serde_json::from_value::<Vec<zeron_proto::Model>>(value).map_err(|error| error.to_string())))
-                } else { None };
-                let native_models = if refresh_environments {
-                    Some(if accounts.as_ref().is_ok_and(|snapshot| snapshot.accounts.iter().any(|account|
-                        account.provider == "antigravity" && matches!(account.status.as_str(), "active" | "connected" | "ready"))) {
-                        engine.client().call(zeron_rpc::methods::LIST_MODELS, json!({"harness": zeron_proto::HarnessId::Antigravity})).await.map_err(|error| error.to_string())
-                            .and_then(|value| serde_json::from_value::<Vec<zeron_proto::Model>>(value).map_err(|error| error.to_string()))
-                    } else { Ok(Vec::new()) })
-                } else { None };
-                Ok::<_, String>((status, accounts, environments, models, native_models))
+                let catalogs = if refresh_environments {
+                    let has_google = accounts.as_ref().is_ok_and(|snapshot| {
+                        snapshot.accounts.iter().any(|account| {
+                            account.provider == "antigravity"
+                                && matches!(account.status.as_str(), "active" | "connected" | "ready")
+                        })
+                    });
+                    let mut loaded = Vec::new();
+                    for harness in [
+                        zeron_proto::HarnessId::Omp,
+                        zeron_proto::HarnessId::ClaudeCode,
+                        zeron_proto::HarnessId::Codex,
+                        zeron_proto::HarnessId::Antigravity,
+                    ] {
+                        if harness == zeron_proto::HarnessId::Antigravity && !has_google {
+                            loaded.push((harness, Ok(Vec::new())));
+                            continue;
+                        }
+                        let models = engine
+                            .client()
+                            .call(zeron_rpc::methods::LIST_MODELS, json!({"harness": harness}))
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|value| {
+                                serde_json::from_value::<Vec<zeron_proto::Model>>(value)
+                                    .map_err(|error| error.to_string())
+                            });
+                        loaded.push((harness, models));
+                    }
+                    Some(loaded)
+                } else {
+                    None
+                };
+                Ok::<_, String>((status, accounts, environments, catalogs))
             }.await;
             this.update(cx, |page, cx| {
                 page.busy = false;
                 match result {
-                    Ok((status, accounts, environments, models, native_models)) => {
+                    Ok((status, accounts, environments, catalogs)) => {
                         let recovery_key = json!([status.principal_id, status.scope]).to_string();
                         if page.outcome.is_none() {
                             if let Some(id) = super::current(cx).crew_recovery_commands.get(&recovery_key).cloned() {
@@ -193,13 +326,26 @@ impl CrewAccounts {
                         if let Some(environments) = environments {
                             match environments { Ok(snapshot) => page.environments = snapshot.environments, Err(error) => errors.push(format!("Sandboxes: {error}")) }
                         }
-                        if let Some(models) = models {
-                            match models { Ok(models) => page.models = models.into_iter().filter(|model| AgentRoute::from_omp_model(&model.id).is_some()).collect(), Err(error) => errors.push(format!("Models: {error}")) }
-                        }
-                        if let Some(models) = native_models {
-                            match models {
-                                Ok(models) => page.native_models = models,
-                                Err(error) => { page.native_models.clear(); errors.push(format!("Google models: {error}")); }
+                        if let Some(catalogs) = catalogs {
+                            for (harness, models) in catalogs {
+                                match models {
+                                    Ok(mut models) => {
+                                        models.retain(|model| {
+                                            AgentRoute::from_harness_model(harness, &model.id).is_some()
+                                        });
+                                        let normalized = crate::pickers::normalize_model_rows(harness, models.clone());
+                                        for row in normalized {
+                                            if !models.iter().any(|existing| existing.id == row.id) {
+                                                models.push(row);
+                                            }
+                                        }
+                                        page.catalog_models.insert(harness, models);
+                                    }
+                                    Err(error) => {
+                                        page.catalog_models.remove(&harness);
+                                        errors.push(format!("{} models: {error}", harness.as_str()));
+                                    }
+                                }
                             }
                         }
                         page.error = (!errors.is_empty()).then(|| errors.join("\n"));
@@ -304,7 +450,7 @@ impl CrewAccounts {
         };
         let mut scope = status.scope.clone();
         scope.session_id = Some(uuid::Uuid::new_v4().to_string());
-        let description = format!("Create a new Scaffold sandbox using {} and the {} database? Source and region use deployment defaults.", route.omp_model(), self.database.as_str());
+        let description = format!("Create a new Scaffold sandbox using {} and the {} database? Source and region use deployment defaults.", route.execution_model(), self.database.as_str());
         let control = ScaffoldEnvironmentControl::Create {
             scope, name: None, source_ref: None,
             region: None, database_environment: self.database,
@@ -334,24 +480,14 @@ impl CrewAccounts {
     }
 
     fn agent_route(&self) -> Option<AgentRoute> {
-        let selected = self.model.as_deref()?;
-        let mut route = if let Some(native) = selected.strip_prefix("antigravity/") {
-            if !self.native_models.iter().any(|model| model.id == native) { return None; }
-            AgentRoute::from_harness_model(zeron_proto::HarnessId::Antigravity, native)?
-        } else {
-            if !self.models.iter().any(|model| model.id == selected) { return None; }
-            AgentRoute::from_omp_model(selected)?
-        };
-        Some(match &self.account {
-            Some(account) => {
-                let provider = match route.provider { AgentProvider::Anthropic => "anthropic", AgentProvider::OpenAi => "openai", AgentProvider::Antigravity => "antigravity" };
-                if !self.accounts.iter().any(|candidate| candidate.id == *account && candidate.provider.eq_ignore_ascii_case(provider) && matches!(candidate.status.as_str(), "active" | "connected" | "ready")) { return None; }
-                route.routing_mode = zeron_proto::AgentRoutingMode::Pinned;
-                route.account_id = Some(account.clone());
-                route
-            }
-            None => route,
-        })
+        build_sandbox_agent_route(
+            self.selected
+                .as_ref()
+                .map(|(harness, model)| (*harness, model.as_str())),
+            &self.catalog_models,
+            &self.accounts,
+            self.account.as_deref(),
+        )
     }
 
 

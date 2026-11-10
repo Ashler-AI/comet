@@ -16,9 +16,13 @@ final class ScaffoldDestinationTests: XCTestCase {
     func testOnlyManagedRoutesRunInASandbox() {
         XCTAssertTrue(crewManagedModel(harness: "omp", model: "openai-codex/gpt-5.5"))
         XCTAssertTrue(crewManagedModel(harness: "omp", model: "anthropic/claude-opus-5"))
+        XCTAssertTrue(crewManagedModel(harness: "claude-code", model: "claude-sonnet-4-6"))
+        XCTAssertTrue(crewManagedModel(harness: "codex", model: "gpt-5.4"))
         XCTAssertTrue(crewManagedModel(harness: "antigravity", model: "gemini-3-pro"))
         XCTAssertFalse(crewManagedModel(harness: "omp", model: "gpt-5.5"), "provider-qualified only")
         XCTAssertFalse(crewManagedModel(harness: "claude-code", model: "anthropic/claude-opus-5"))
+        XCTAssertFalse(crewManagedModel(harness: "codex", model: "openai-codex/gpt-5.4"))
+        XCTAssertFalse(crewManagedModel(harness: "cursor", model: "claude-sonnet-4-6"))
         XCTAssertFalse(crewManagedModel(harness: "not-a-harness", model: "openai/gpt-5.5"))
     }
 

@@ -372,8 +372,13 @@ impl HarnessRegistry {
 
     fn route_allowed(&self, id: HarnessId) -> bool {
         !self.managed_inference
-            || matches!(id, HarnessId::Omp | HarnessId::Antigravity)
-            || (!self.scaffold_host && matches!(id, HarnessId::ClaudeCode | HarnessId::Codex))
+            || matches!(
+                id,
+                HarnessId::Omp
+                    | HarnessId::Antigravity
+                    | HarnessId::ClaudeCode
+                    | HarnessId::Codex
+            )
     }
 
     fn gate(&self, id: HarnessId) -> Arc<tokio::sync::RwLock<()>> {
@@ -1600,13 +1605,32 @@ mod gate_tests {
                 harness.release.notify_one();
                 registry.register(harness);
                 let result = registry.discover_commands(id, Path::new("/catalog-checkout")).await;
-                if id == HarnessId::Omp || (!scaffold && id == HarnessId::Codex) {
+                if matches!(id, HarnessId::Omp | HarnessId::Codex) {
                     result.unwrap();
                 } else {
                     assert!(matches!(result, Err(HarnessError::Protocol(_))));
                 }
                 assert!(matches!(registry.discover_models(id).await, Err(HarnessError::Protocol(_))));
             }
+        }
+
+        let scaffold_registry = default_registry().with_execution_policy(true, true);
+        for allowed in [
+            HarnessId::Omp,
+            HarnessId::Antigravity,
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+        ] {
+            assert!(scaffold_registry.resolve(allowed).is_ok(), "{allowed:?} must resolve on scaffold_host");
+        }
+        for denied in [
+            HarnessId::Cursor,
+            HarnessId::Opencode,
+            HarnessId::Pi,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+        ] {
+            assert!(scaffold_registry.resolve(denied).is_err(), "{denied:?} must be denied on scaffold_host");
         }
     }
 

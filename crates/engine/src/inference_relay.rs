@@ -767,7 +767,7 @@ impl InferenceRelay {
             .inner
             .client
             .proxy_agent_inference(AgentInferenceProxyRequest {
-                harness: Some(if route.request.harness == HarnessId::Omp { "omp" } else { "antigravity" }),
+                harness: Some(route.request.harness.as_str()),
                 bound_model: Some(&route.request.model),
                 endpoint,
                 query,
