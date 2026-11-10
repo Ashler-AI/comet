@@ -40,7 +40,74 @@ use tokio::sync::watch;
 pub mod windows;
 
 #[cfg(target_os = "macos")]
+mod macos_install;
+#[cfg(target_os = "macos")]
 mod macos_verification;
+
+/// When the desktop app installs a staged update ([`InstallKind::apply_desktop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopInstall {
+    /// "Restart to update": the user is waiting for the update. Anything
+    /// changed since staging is verified again first, however long that
+    /// takes, and the new version starts once this process exits.
+    Restart,
+    /// Quitting with an update staged: the user is waiting for the app to
+    /// close. Only an update untouched since staging installs, which is a
+    /// quick swap. Anything else stays staged for the next launch to verify.
+    Quit,
+}
+
+/// A downloaded, verified update, ready for [`InstallKind::apply_desktop`].
+#[derive(Clone)]
+pub struct StagedUpdate {
+    path: PathBuf,
+    /// macOS: the copy verified beside the installed app, with its seals.
+    #[cfg(target_os = "macos")]
+    mac: Option<Arc<macos_install::Prepared>>,
+}
+
+impl StagedUpdate {
+    fn at(path: PathBuf) -> Self {
+        Self {
+            path,
+            #[cfg(target_os = "macos")]
+            mac: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mac(prepared: macos_install::Prepared) -> Self {
+        Self {
+            path: prepared.path().to_path_buf(),
+            mac: Some(Arc::new(prepared)),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_mac_app(&self) -> anyhow::Result<&macos_install::Prepared> {
+        self.mac
+            .as_deref()
+            .context("this macOS update was not prepared for installation")
+    }
+}
+
+impl std::fmt::Debug for StagedUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StagedUpdate").field(&self.path).finish()
+    }
+}
+
+impl PartialEq for StagedUpdate {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for StagedUpdate {}
 
 fn staging_mac_app() -> bool {
     cfg!(target_os = "macos")
@@ -48,6 +115,7 @@ fn staging_mac_app() -> bool {
             .or(option_env!("COMET_DEFAULT_ENVIRONMENT")) != Some("production")
 }
 
+#[cfg(target_os = "macos")]
 fn mac_app_name() -> &'static str {
     if staging_mac_app() { "Crew Staging.app" } else { "Crew.app" }
 }
@@ -423,40 +491,84 @@ impl InstallKind {
         access_token: Option<&str>,
         manifest: &Manifest,
         data_dir: &Path,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<StagedUpdate> {
         require_update_delivery()?;
         match self {
-            Self::MacApp { .. } => stage_mac_app(edge_url, access_token, manifest, data_dir).await,
+            Self::MacApp { bundle } => {
+                stage_mac_app(edge_url, access_token, manifest, data_dir, bundle).await
+            }
             Self::Managed { app_root } if self.supports_desktop_update() => {
-                stage_headless(edge_url, access_token, manifest, app_root).await
+                stage_headless(edge_url, access_token, manifest, app_root)
+                    .await
+                    .map(StagedUpdate::at)
             }
             #[cfg(windows)]
             Self::WindowsPortable { directory } => {
-                windows::stage(edge_url, access_token, manifest, directory).await
+                windows::stage(edge_url, access_token, manifest, directory)
+                    .await
+                    .map(StagedUpdate::at)
             }
             _ => bail!("this installation does not support desktop updates"),
         }
     }
 
-    /// Install a staged update. With `relaunch`, the new version starts once
-    /// this process exits ("Restart to update"); without it the update takes
-    /// effect at the next launch ("install on quit"). Either way the caller
-    /// must quit after this succeeds.
-    pub fn apply_desktop(&self, staged: &Path, relaunch: bool) -> anyhow::Result<()> {
+    /// Install a staged update. On [`DesktopInstall::Restart`] the new version
+    /// starts once this process exits; on [`DesktopInstall::Quit`] it takes
+    /// effect at the next launch. Either way the caller must quit after this
+    /// succeeds.
+    ///
+    /// On macOS the slow verification (`codesign --deep` and Gatekeeper, which
+    /// took minutes on a busy Mac) already happened while staging, so this is
+    /// normally a sub-second swap. It still runs on a blocking thread: a
+    /// restart re-verifies a bundle changed since staging, and a UI caller
+    /// must never freeze its event loop on that.
+    pub async fn apply_desktop(
+        &self,
+        staged: &StagedUpdate,
+        install: DesktopInstall,
+    ) -> anyhow::Result<()> {
+        let kind = self.clone();
+        let staged = staged.clone();
+        tokio::task::spawn_blocking(move || kind.apply_desktop_blocking(&staged, install))
+            .await
+            .context("the update install thread stopped")?
+    }
+
+    fn apply_desktop_blocking(
+        &self,
+        staged: &StagedUpdate,
+        install: DesktopInstall,
+    ) -> anyhow::Result<()> {
         require_update_delivery()?;
+        let relaunch = install == DesktopInstall::Restart;
         match self {
             Self::MacApp { bundle } => {
-                let installed = apply_mac_app(staged, bundle)?;
-                // The swap copied the staged bundle; the cache is spent.
-                if let Some(version_dir) = staged.parent() {
-                    let _ = std::fs::remove_dir_all(version_dir);
+                require_mac_app_update_platform()?;
+                #[cfg(target_os = "macos")]
+                {
+                    let prepared = staged.prepared_mac_app()?;
+                    anyhow::ensure!(
+                        prepared.bundle() == bundle.as_path(),
+                        "this update was prepared for {}",
+                        prepared.bundle().display()
+                    );
+                    let installed = prepared.commit(match install {
+                        DesktopInstall::Restart => macos_install::Changed::Reverify,
+                        DesktopInstall::Quit => macos_install::Changed::Refuse,
+                    })?;
+                    if relaunch {
+                        relaunch_after_exit(Path::new("/usr/bin/open"), &installed);
+                    }
+                    Ok(())
                 }
-                if relaunch {
-                    relaunch_after_exit(Path::new("/usr/bin/open"), &installed);
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (bundle, relaunch);
+                    bail!("macOS app updates are not supported on this platform")
                 }
-                Ok(())
             }
             Self::Managed { app_root } if self.supports_desktop_update() => {
+                let staged = staged.path();
                 let version = staged
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -469,7 +581,9 @@ impl InstallKind {
                 Ok(())
             }
             #[cfg(windows)]
-            Self::WindowsPortable { directory } => windows::apply(staged, directory, relaunch),
+            Self::WindowsPortable { directory } => {
+                windows::apply(staged.path(), directory, relaunch)
+            }
             _ => bail!("this installation does not support desktop updates"),
         }
     }
@@ -924,16 +1038,19 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/<app-name>`
-/// (idempotent). The bundle is unpacked beside its final name and renamed in
-/// only after its binary answers with the expected version, so an interrupted
-/// unpack can never be mistaken for a staged update. Returns the staged bundle.
+/// Download the app tarball and prepare it for a fast install: it is unpacked
+/// into a hidden directory beside `bundle` and fully verified there (Developer
+/// ID, pinned team, Gatekeeper, and its `--version`), with every bundle the
+/// swap would move. That verification takes minutes, so it happens here, in
+/// the background, rather than when the user restarts. A copy prepared by an
+/// earlier run is reused only after it passes the same verification.
 pub async fn stage_mac_app(
     edge_url: &str,
     access_token: Option<&str>,
     manifest: &Manifest,
     data_dir: &Path,
-) -> anyhow::Result<PathBuf> {
+    bundle: &Path,
+) -> anyhow::Result<StagedUpdate> {
     // Reject unsupported targets before creating a stage or making a request.
     require_mac_app_update_platform()?;
     let version = &manifest.version;
@@ -941,156 +1058,55 @@ pub async fn stage_mac_app(
         parse_version(version).is_some(),
         "invalid release version {version:?}"
     );
-    let updates = data_dir.join("updates");
-    let dir = updates.join(version);
-    let staged = dir.join(mac_app_name());
-    let staged_binary = staged.join("Contents/MacOS/comet");
-    if staged_binary.exists() {
-        #[cfg(target_os = "macos")]
-        macos_verification::Policy::pinned()?.verify_distribution(&staged)?;
-        verify_staged_binary(&staged_binary, version).await?;
-        return Ok(staged);
-    }
-    prune_stale_stages(&updates, version);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let file = mac_app_artifact(version);
-    let tarball = dir.join(&file);
-    download_release_file(edge_url, access_token, manifest, &file, &tarball).await?;
-    let unpack = dir.join(".unpack");
-    std::fs::create_dir_all(&unpack)?;
-    let unpacked = run(
-        "tar",
-        &[
-            "-xzf",
-            &tarball.to_string_lossy(),
-            "-C",
-            &unpack.to_string_lossy(),
-        ],
-    )
-    .map(|()| unpack.join(mac_app_name()));
-    std::fs::remove_file(&tarball).ok();
-    let unpacked = unpacked?;
-    let unpacked_binary = unpacked.join("Contents/MacOS/comet");
-    if !unpacked_binary.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
-        bail!("app tarball {file} did not contain {}", mac_app_name());
-    }
     #[cfg(target_os = "macos")]
-    macos_verification::Policy::pinned()?.verify_distribution(&unpacked)?;
-    if let Err(err) = verify_staged_binary(&unpacked_binary, version).await {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(err);
+    {
+        macos_install::stage(edge_url, access_token, manifest, data_dir, bundle)
+            .await
+            .map(StagedUpdate::mac)
     }
-    std::fs::rename(&unpacked, &staged)
-        .with_context(|| format!("moving {} into place", staged.display()))?;
-    let _ = std::fs::remove_dir_all(&unpack);
-    Ok(staged)
-}
-
-/// Staged bundles of other versions are dead weight (each is a whole app):
-/// drop them whenever a new version stages.
-fn prune_stale_stages(updates: &Path, keep: &str) {
-    let Ok(entries) = std::fs::read_dir(updates) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name() != keep {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (edge_url, access_token, data_dir, bundle);
+        bail!("macOS app updates are not supported on this platform")
     }
 }
 
-/// Install the staged bundle next to the current app, preserving metadata and
-/// migrating renamed installs to `Crew.app` or `Crew Staging.app` as appropriate.
-/// Incoming, copied, and installed macOS bundles are authenticated before any
-/// installed bundle is moved. Legacy ad-hoc migration requires the updater itself
-/// to run from an already trusted distribution; it never re-signs an old app.
-/// Any existing target bundle is restored if the replacement fails.
+/// Swap in an update [`stage_mac_app`] prepared, returning the installed
+/// bundle. A bundle changed since staging is verified again first. Blocking.
+pub fn install_mac_app(staged: &StagedUpdate) -> anyhow::Result<PathBuf> {
+    require_mac_app_update_platform()?;
+    #[cfg(target_os = "macos")]
+    {
+        staged
+            .prepared_mac_app()?
+            .commit(macos_install::Changed::Reverify)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = staged;
+        bail!("macOS app updates are not supported on this platform")
+    }
+}
+
+/// Install the unpacked app at `staged` over `bundle` in one step, migrating
+/// renamed installs to `Crew.app` or `Crew Staging.app` as appropriate.
+/// Only the copy placed beside `bundle` is verified (and so authenticated), and
+/// every installed bundle the swap would move is authenticated before any of
+/// them is moved. Legacy ad-hoc migration requires the updater itself to run
+/// from an already trusted distribution; it never re-signs an old app. Any
+/// existing target bundle is restored if the replacement fails. Blocking and
+/// slow: the desktop flow uses [`stage_mac_app`] and [`InstallKind::apply_desktop`].
 pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<PathBuf> {
     require_mac_app_update_platform()?;
     #[cfg(target_os = "macos")]
-    let policy = macos_verification::Policy::pinned()?;
-    #[cfg(target_os = "macos")]
-    policy.verify_distribution(staged)?;
-    let parent = bundle
-        .parent()
-        .context("app bundle has no parent directory")?;
-    #[cfg(target_os = "macos")]
-    let target_name = std::ffi::OsStr::new(mac_app_name());
-    #[cfg(not(target_os = "macos"))]
-    let target_name = staged
-        .file_name()
-        .context("staged app bundle has no name")?;
-    let target = parent.join(target_name);
-    let current_name = bundle
-        .file_name()
-        .context("app bundle has no name")?
-        .to_string_lossy();
-    let target_name = target_name.to_string_lossy();
-    let pid = std::process::id();
-    // Keep the .app suffix: stapler validates bundles by their file type.
-    let fresh = parent.join(format!(".{target_name}.new-{pid}.app"));
-    let old = parent.join(format!(".{current_name}.old-{pid}"));
-    let displaced_target = (target.as_path() != bundle && target.exists())
-        .then(|| parent.join(format!(".{target_name}.old-{pid}")));
-    // Do not discard an interrupted update's backups or follow a stale symlink.
-    for path in [&fresh, &old].into_iter().chain(displaced_target.iter()) {
-        if path.symlink_metadata().is_ok() {
-            bail!("update work path already exists: {}", path.display());
-        }
-    }
-    if let Err(error) = run(
-        if cfg!(target_os = "macos") {
-            "/usr/bin/ditto"
-        } else {
-            "ditto"
-        },
-        &[&staged.to_string_lossy(), &fresh.to_string_lossy()],
-    ) {
-        let _ = std::fs::remove_dir_all(&fresh);
-        return Err(error).context("copying the verified Crew update");
-    }
-    #[cfg(target_os = "macos")]
     {
-        // Verify the actual copy, then every installed bundle we would move.
-        // All trust checks precede the first rename or removal of installed data.
-        let verified = (|| -> anyhow::Result<()> {
-            policy.verify_distribution(&fresh)?;
-            policy.verify_installed(bundle)?;
-            if displaced_target.is_some() {
-                policy.verify_installed(&target)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = verified {
-            let _ = std::fs::remove_dir_all(&fresh);
-            return Err(error).context("Crew update refused before replacing the installed app");
-        }
+        macos_install::prepare_copy(staged, bundle)?.commit(macos_install::Changed::Reverify)
     }
-    if let Some(displaced) = displaced_target.as_ref() {
-        std::fs::rename(&target, displaced).context("moving the existing target app aside")?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (staged, bundle);
+        bail!("macOS app updates are not supported on this platform")
     }
-    if let Err(err) = std::fs::rename(bundle, &old) {
-        if let Some(displaced) = displaced_target.as_ref() {
-            let _ = std::fs::rename(displaced, &target);
-        }
-        let _ = std::fs::remove_dir_all(&fresh);
-        return Err(err).context("moving the current app aside");
-    }
-    if let Err(err) = std::fs::rename(&fresh, &target) {
-        let _ = std::fs::rename(&old, bundle);
-        if let Some(displaced) = displaced_target.as_ref() {
-            let _ = std::fs::rename(displaced, &target);
-        }
-        let _ = std::fs::remove_dir_all(&fresh);
-        return Err(err).context("installing the new app bundle");
-    }
-    let _ = std::fs::remove_dir_all(&old);
-    if let Some(displaced) = displaced_target {
-        let _ = std::fs::remove_dir_all(displaced);
-    }
-    Ok(target)
 }
 
 /// Detached relauncher: waits for THIS process to exit, then runs `program`
@@ -1883,9 +1899,15 @@ mod tests {
         assert!(managed_err.to_string().contains("not supported on windows"));
         assert!(!app_root.exists(), "managed staging must not touch disk");
 
-        let mac_err = stage_mac_app("http://127.0.0.1:1", None, &manifest, &data_dir)
-            .await
-            .unwrap_err();
+        let mac_err = stage_mac_app(
+            "http://127.0.0.1:1",
+            None,
+            &manifest,
+            &data_dir,
+            &data_dir.join("Installed.app"),
+        )
+        .await
+        .unwrap_err();
         assert!(mac_err.to_string().contains("not supported on windows"));
         assert!(!data_dir.exists(), "macOS staging must not touch disk");
 

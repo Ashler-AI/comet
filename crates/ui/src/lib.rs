@@ -276,7 +276,9 @@ pub fn run_app(config: UiConfig) {
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
-            app_update::install_on_quit(cx);
+            // No update install here: this hook runs on the UI thread, after
+            // the quit is committed. `app_menus::quit_after_save` installs a
+            // staged update beforehand, off that thread.
             // The background engine outlives this app: banners resume at
             // once rather than after the last focus report goes stale.
             let unfocus = quit_state.read(cx).viewport_closing();

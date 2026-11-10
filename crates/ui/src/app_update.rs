@@ -16,12 +16,14 @@
 //! installed when the app quits — so nobody stays on a stale version just
 //! because they never clicked. `COMET_AUTO_UPDATE=0` keeps it report-only.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use gpui_tokio::Tokio;
-use zeron_update::{InstallKind, UpdateBlocker, UpdateStatus, Updater};
+use zeron_update::{
+    DesktopInstall, InstallKind, StagedUpdate, UpdateBlocker, UpdateStatus, Updater,
+};
 
 /// Download/install lifecycle of the newest release in this process.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,11 +35,16 @@ pub enum Flow {
     /// Staged and verified: "restart to apply", or installed on quit.
     Ready {
         version: String,
-        staged: PathBuf,
+        staged: StagedUpdate,
     },
     Failed {
         version: String,
         message: SharedString,
+    },
+    /// Swapping in the staged update off the UI thread (verified again
+    /// first if it changed since staging); the app quits when it finishes.
+    Installing {
+        version: String,
     },
     /// Swapped in; this process is on its way out.
     Installed,
@@ -78,6 +85,9 @@ pub struct AppUpdate {
     _status_watch: Task<()>,
     download: Option<Task<()>>,
     user_check: Option<Task<()>>,
+    install_task: Option<Task<()>>,
+    /// A quit was requested while installing: quit even if the install fails.
+    quit_after_install: bool,
 }
 
 struct GlobalAppUpdate(Entity<AppUpdate>);
@@ -144,6 +154,8 @@ impl AppUpdate {
             _status_watch: status_watch,
             download: None,
             user_check: None,
+            install_task: None,
+            quit_after_install: false,
         }
     }
 
@@ -210,7 +222,7 @@ impl AppUpdate {
             return;
         };
         let current = match &self.flow {
-            Flow::Downloading { .. } | Flow::Installed => return,
+            Flow::Downloading { .. } | Flow::Installing { .. } | Flow::Installed => return,
             Flow::Ready { version, .. } => Some(version),
             Flow::Idle | Flow::Failed { .. } => None,
         };
@@ -221,7 +233,12 @@ impl AppUpdate {
     }
 
     pub fn start_download(&mut self, cx: &mut Context<Self>) {
-        if !self.self_updating() || matches!(self.flow, Flow::Downloading { .. }) {
+        if !self.self_updating()
+            || matches!(
+                self.flow,
+                Flow::Downloading { .. } | Flow::Installing { .. } | Flow::Installed
+            )
+        {
             return;
         }
         let Some(version) = self.available().map(str::to_owned) else {
@@ -257,7 +274,7 @@ impl AppUpdate {
             this.update(cx, |this, cx| {
                 this.flow = match outcome {
                     Ok((version, staged)) => {
-                        tracing::info!(%version, staged = %staged.display(), "update staged");
+                        tracing::info!(%version, staged = %staged.path().display(), "update staged");
                         Flow::Ready { version, staged }
                     }
                     Err(message) => {
@@ -329,48 +346,79 @@ impl AppUpdate {
     /// The staged update "Restart to update" would install.
     pub fn staged(&self) -> Option<PathBuf> {
         match &self.flow {
-            Flow::Ready { staged, .. } => Some(staged.clone()),
+            Flow::Ready { staged, .. } => Some(staged.path().to_path_buf()),
             _ => None,
         }
     }
 
-    /// Install `staged` and arrange the relaunch. The caller quits on success.
-    pub fn install_for_restart(
-        &mut self,
-        staged: &Path,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
-        let result = self.install.apply_desktop(staged, true);
-        self.flow = match &result {
-            Ok(()) => Flow::Installed,
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                Flow::Failed {
-                    version: self.available().unwrap_or_default().to_owned(),
-                    message: format!("{err:#}").into(),
-                }
-            }
+    /// Install the staged update in the background, then quit.
+    ///
+    /// Staging already verified the update, so this is normally a sub-second
+    /// swap. It never runs on the UI thread: run there, the old verification
+    /// at restart (minutes of `codesign --deep` and Gatekeeper on a busy Mac)
+    /// froze the app until it was killed mid-update. While it runs the strip
+    /// shows "Installing…" and the app stays responsive.
+    ///
+    /// On [`DesktopInstall::Restart`] a failure keeps the app open on the
+    /// error. On [`DesktopInstall::Quit`] the app quits whatever the outcome.
+    /// Either way the quit goes through the usual unsaved-file checks, since
+    /// the app stayed usable meanwhile. Returns whether the quit now waits for
+    /// an install.
+    pub fn install_then_quit(&mut self, install: DesktopInstall, cx: &mut Context<Self>) -> bool {
+        if matches!(self.flow, Flow::Installing { .. }) {
+            // The running install quits when it ends; a quit request makes
+            // that unconditional.
+            self.quit_after_install |= install == DesktopInstall::Quit;
+            return true;
+        }
+        if install == DesktopInstall::Quit && !self.automatic {
+            return false;
+        }
+        let Flow::Ready { version, staged } = self.flow.clone() else {
+            return false;
         };
+        self.quit_after_install = install == DesktopInstall::Quit;
+        self.flow = Flow::Installing {
+            version: version.clone(),
+        };
+        let kind = self.install.clone();
+        let apply = Tokio::spawn(
+            cx,
+            async move { kind.apply_desktop(&staged, install).await },
+        );
+        self.install_task = Some(cx.spawn(async move |this, cx| {
+            let result = match apply.await {
+                Ok(result) => result,
+                Err(join) => Err(anyhow::anyhow!(join)),
+            };
+            let quit = this
+                .update(cx, |this, cx| {
+                    let quit = match result {
+                        Ok(()) => {
+                            tracing::info!(%version, ?install, "installed staged update");
+                            this.flow = Flow::Installed;
+                            true
+                        }
+                        Err(err) => {
+                            tracing::error!(%version, ?install, error = %format!("{err:#}"), "update install failed");
+                            this.flow = Flow::Failed {
+                                version,
+                                message: format!("{err:#}").into(),
+                            };
+                            this.quit_after_install
+                        }
+                    };
+                    cx.notify();
+                    quit
+                })
+                .unwrap_or(false);
+            if quit {
+                // The flow is settled now, so the quit gate lets this through.
+                let _ = cx.update(crate::app_menus::request_quit);
+            }
+        }));
         cx.notify();
-        result
-    }
-
-    /// Quit hook: a staged update the user never restarted for installs now,
-    /// so the next launch is current. Runs synchronously inside the quit.
-    fn install_on_quit(&mut self) {
-        if !self.automatic {
-            return;
-        }
-        let Flow::Ready { version, staged } = &self.flow else {
-            return;
-        };
-        match self.install.apply_desktop(staged, false) {
-            Ok(()) => {
-                tracing::info!(%version, "installed staged update on quit");
-                self.flow = Flow::Installed;
-            }
-            Err(err) => tracing::warn!(error = %err, "installing the staged update on quit failed"),
-        }
+        true
     }
 
     /// The sidebar strip for the current state: `None` while nothing is newer.
@@ -418,6 +466,9 @@ pub fn strip_for(
                 format!("Update failed: {message}").into(),
                 StripAction::Download,
             ),
+            Flow::Installing { version } => {
+                (format!("Installing v{version}…").into(), StripAction::None)
+            }
             Flow::Installed => ("Restarting…".into(), StripAction::None),
         };
     }
@@ -442,9 +493,32 @@ pub fn check_for_updates(cx: &mut App) {
     }
 }
 
-/// See [`AppUpdate::install_on_quit`].
-pub fn install_on_quit(cx: &mut App) {
-    if let Some(update) = AppUpdate::global(cx) {
-        update.update(cx, |update, _| update.install_on_quit());
+/// Quit gate: a staged update the user never restarted for installs before
+/// the app quits, so the next launch is current. Returns whether the quit is
+/// deferred to that install ([`AppUpdate::install_then_quit`]).
+pub fn install_before_quit(cx: &mut App) -> bool {
+    AppUpdate::global(cx).is_some_and(|update| {
+        update.update(cx, |update, cx| {
+            update.install_then_quit(DesktopInstall::Quit, cx)
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installing_strip_reports_progress_and_takes_no_click() {
+        let install = InstallKind::MacApp {
+            bundle: PathBuf::from("/Applications/Crew Staging.app"),
+        };
+        let installing = Flow::Installing {
+            version: "0.2.142".into(),
+        };
+        let (label, action) = strip_for(&install, false, &installing, "0.2.142");
+        assert_eq!(label.as_ref(), "Installing v0.2.142…");
+        // A second restart click must not start a second install.
+        assert_eq!(action, StripAction::None);
     }
 }
