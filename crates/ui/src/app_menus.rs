@@ -98,6 +98,11 @@ fn prepare_quit(cx: &mut App) {
 }
 
 pub(crate) fn quit_after_save(cx: &mut App) {
+    // A staged update installs first, off the UI thread, and requests the
+    // quit again when done.
+    if crate::app_update::install_before_quit(cx) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     native_quit::allow();
     cx.quit();

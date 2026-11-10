@@ -10045,20 +10045,18 @@ impl Shell {
 
     /// Swap the staged update over the installed one, arm the detached
     /// relauncher, and quit — the relauncher starts the new version once this
-    /// process (and its engine lock / IPC port) is gone.
+    /// process (and its engine lock / IPC port) is gone. The install runs in
+    /// the background; the app quits when it succeeds.
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
+        if !self.prepare_exit(PendingExit::InstallUpdate(staged), cx) {
             return;
         }
         let Some(update) = crate::app_update::AppUpdate::global(cx) else {
             return;
         };
-        if update
-            .update(cx, |update, cx| update.install_for_restart(&staged, cx))
-            .is_ok()
-        {
-            crate::app_menus::quit_after_save(cx);
-        }
+        update.update(cx, |update, cx| {
+            update.install_then_quit(zeron_update::DesktopInstall::Restart, cx)
+        });
     }
 
     /// The "Check for Updates…" dialog: checking, then the outcome, which
@@ -10112,6 +10110,12 @@ impl Shell {
                                         UpdatePromptButton::Close("Later"),
                                         UpdatePromptButton::Download,
                                     ],
+                                ),
+                                Flow::Installing { version } => (
+                                    format!("Installing {version}…").into(),
+                                    "Installing the update — Crew closes when it finishes."
+                                        .into(),
+                                    vec![UpdatePromptButton::Close("Hide")],
                                 ),
                                 Flow::Downloading { .. } | Flow::Installed => (
                                     title,

@@ -89,8 +89,15 @@ pub async fn update(config: &EngineConfig, check_only: bool) -> anyhow::Result<(
                 zeron_update::mac_app_artifact(&manifest.version)
             );
             let access_token = access_tokens().await?;
-            let staged = zeron_update::stage_mac_app(edge_url, Some(&access_token), &manifest, &config.data_dir).await?;
-            let installed = zeron_update::apply_mac_app(&staged, &bundle)?;
+            let staged = zeron_update::stage_mac_app(
+                edge_url,
+                Some(&access_token),
+                &manifest,
+                &config.data_dir,
+                &bundle,
+            )
+            .await?;
+            let installed = zeron_update::install_mac_app(&staged)?;
             println!("updated {} — relaunch Crew to finish.", installed.display());
             Ok(())
         }
