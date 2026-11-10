@@ -1366,11 +1366,10 @@ impl Pickers {
     /// The harnesses this picker offers: runnable ones for the composer,
     /// narrowed to title-capable agents when bound to thread naming.
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
-        let mut offered = offered_harnesses(list);
         if self.managed_models_only || self.config.scaffold_database.is_some() {
-            offered.retain(|d| matches!(d.id, HarnessId::Omp | HarnessId::Antigravity));
-            return offered;
+            return scaffold_offered_harnesses(list);
         }
+        let mut offered = offered_harnesses(list);
         if self.title.is_some() && !self.managed_models_only {
             offered.retain(|d| zeron_harness::supports_titles(d.id) && d.id != HarnessId::Mock);
         }
@@ -1398,7 +1397,7 @@ impl Pickers {
 
     /// Effective harness: picked, or the chat's config, or the first listed.
     fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
-        if self.config.scaffold_database.is_some() { return Some(self.config.harness.filter(|harness| matches!(harness, HarnessId::Omp | HarnessId::Antigravity)).unwrap_or(HarnessId::Omp)); }
+        if self.config.scaffold_database.is_some() { return Some(self.config.harness.filter(|harness| is_scaffold_harness(*harness)).unwrap_or(HarnessId::Omp)); }
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -3199,10 +3198,24 @@ impl Pickers {
             } => self.pick_space(space.id, cx),
             DeviceTarget::Device { device_id, .. } => self.pick_device(device_id, cx),
             DeviceTarget::Scaffold(database) => {
+                let harness = self
+                    .config
+                    .harness
+                    .filter(|harness| is_scaffold_harness(*harness))
+                    .unwrap_or(HarnessId::Omp);
                 self.config.scaffold_database = Some(database);
-                self.config.harness = Some(HarnessId::Omp);
-                self.config.model = None;
-                self.ensure_models(HarnessId::Omp, true, cx);
+                self.config.harness = Some(harness);
+                if self
+                    .config
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| {
+                        zeron_proto::AgentRoute::from_harness_model(harness, model).is_none()
+                    })
+                {
+                    self.config.model = None;
+                }
+                self.ensure_models(harness, true, cx);
                 self.close(cx);
             }
         }
@@ -6536,6 +6549,27 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 /// both enabled and installed offers nothing, and the composer surfaces the
 /// no-agents empty state + blocks new sends — resurrecting descriptors that
 /// can only fail with NotInstalled is the #128 bug.
+fn is_scaffold_harness(id: HarnessId) -> bool {
+    matches!(
+        id,
+        HarnessId::Omp
+            | HarnessId::ClaudeCode
+            | HarnessId::Codex
+            | HarnessId::Antigravity
+    )
+}
+
+pub fn scaffold_offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
+    scaffold_offered_harnesses_impl(list, mock_harness_enabled())
+}
+
+fn scaffold_offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
+    visible_harnesses_impl(list, allow_mock)
+        .into_iter()
+        .filter(|d| is_scaffold_harness(d.id))
+        .collect()
+}
+
 pub fn offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
     offered_harnesses_impl(list, mock_harness_enabled())
 }
@@ -10701,6 +10735,42 @@ mod tests {
         ];
         let offered = offered_harnesses_impl(&catalog, false);
         assert!(offered.is_empty());
+    }
+
+    #[test]
+    fn scaffold_harnesses_offer_omp_claude_code_codex_and_antigravity_without_local_clis() {
+        let descriptor =
+            |id: HarnessId, name: &str, enabled: Option<bool>, installed: bool| HarnessDescriptor {
+                id,
+                name: name.into(),
+                supports_steering: true,
+                steering_mode: zeron_proto::SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+                installed,
+                can_install: false,
+                enabled,
+            };
+        // A desktop controller without local `omp`, `claude`, `codex`, or `agy_acp_server`
+        // binaries still offers all four Scaffold harnesses when targeting a remote sandbox,
+        // while keeping non-Scaffold local harnesses out of the sandbox rail.
+        let catalog = vec![
+            descriptor(HarnessId::Omp, "Oh My Pi", Some(false), false),
+            descriptor(HarnessId::Mock, "Mock", Some(true), true),
+            descriptor(HarnessId::ClaudeCode, "Claude Code", Some(false), false),
+            descriptor(HarnessId::Codex, "Codex", Some(false), false),
+            descriptor(HarnessId::Cursor, "Cursor", Some(true), true),
+            descriptor(HarnessId::Antigravity, "Antigravity", Some(false), false),
+        ];
+        let offered = scaffold_offered_harnesses_impl(&catalog, false);
+        assert_eq!(
+            offered.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![
+                HarnessId::Omp,
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Antigravity,
+            ]
+        );
     }
 }
 

@@ -22,7 +22,13 @@ impl RuntimeProfile {
     pub fn allows_harness(self, harness: HarnessId) -> bool {
         match self {
             Self::LocalController => harness != HarnessId::Mock,
-            Self::ScaffoldHost => harness == HarnessId::Omp,
+            Self::ScaffoldHost => matches!(
+                harness,
+                HarnessId::Omp
+                    | HarnessId::Antigravity
+                    | HarnessId::ClaudeCode
+                    | HarnessId::Codex
+            ),
             Self::Mock => harness == HarnessId::Mock,
         }
     }
@@ -45,10 +51,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scaffold_host_allows_only_omp_and_no_recursive_controller_features() {
+    fn scaffold_host_allows_scaffold_harnesses_and_no_recursive_controller_features() {
         assert!(RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::Omp));
-        assert!(!RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::ClaudeCode));
-        assert!(!RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::Codex));
+        assert!(RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::Antigravity));
+        assert!(RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::ClaudeCode));
+        assert!(RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::Codex));
+        assert!(!RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::Cursor));
         assert!(!RuntimeProfile::ScaffoldHost.allows_harness(HarnessId::Mock));
         assert!(!RuntimeProfile::ScaffoldHost.allows_scaffold_control());
         assert!(!RuntimeProfile::ScaffoldHost.allows_session_import());
@@ -70,8 +78,15 @@ mod tests {
             HarnessId::Antigravity,
         ] {
             assert!(RuntimeProfile::LocalController.allows_harness(harness));
-            assert!(
-                !RuntimeProfile::ScaffoldHost.allows_harness(harness) || harness == HarnessId::Omp
+            assert_eq!(
+                RuntimeProfile::ScaffoldHost.allows_harness(harness),
+                matches!(
+                    harness,
+                    HarnessId::Omp
+                        | HarnessId::Antigravity
+                        | HarnessId::ClaudeCode
+                        | HarnessId::Codex
+                )
             );
         }
         assert!(!RuntimeProfile::LocalController.allows_harness(HarnessId::Mock));

@@ -617,15 +617,48 @@ impl AgentRoute {
     }
 
     pub fn execution_model(&self) -> String {
-        if self.harness() == crate::HarnessId::Antigravity { self.model.clone() } else { self.omp_model() }
+        if matches!(
+            self.harness(),
+            crate::HarnessId::Antigravity
+                | crate::HarnessId::ClaudeCode
+                | crate::HarnessId::Codex
+        ) {
+            self.model.clone()
+        } else {
+            self.omp_model()
+        }
     }
 
     pub fn from_harness_model(harness: crate::HarnessId, model: &str) -> Option<Self> {
-        if harness == crate::HarnessId::Antigravity {
-            let model = model.strip_prefix("antigravity/").unwrap_or(model).trim();
-            return (!model.is_empty() && !model.contains('/')).then(|| Self::automatic(AgentProvider::Antigravity, model));
+        match harness {
+            crate::HarnessId::Antigravity => {
+                let model = model.strip_prefix("antigravity/").unwrap_or(model).trim();
+                (!model.is_empty() && !model.contains('/'))
+                    .then(|| Self::automatic(AgentProvider::Antigravity, model))
+            }
+            crate::HarnessId::ClaudeCode => {
+                let model = model.trim();
+                (!model.is_empty()
+                    && !model.contains('/')
+                    && model.to_ascii_lowercase().starts_with("claude-"))
+                .then(|| Self {
+                    harness: Some(crate::HarnessId::ClaudeCode),
+                    ..Self::automatic(AgentProvider::Anthropic, model)
+                })
+            }
+            crate::HarnessId::Codex => {
+                let model = model.trim();
+                (!model.is_empty()
+                    && !model.contains('/')
+                    && model.to_ascii_lowercase().starts_with("gpt-"))
+                .then(|| Self {
+                    harness: Some(crate::HarnessId::Codex),
+                    ..Self::automatic(AgentProvider::OpenAi, model)
+                })
+            }
+            crate::HarnessId::Omp => Self::from_omp_model(model),
+            _ => None,
         }
-        Self::from_omp_model(model).filter(|route| harness == crate::HarnessId::Omp || route.provider != AgentProvider::Antigravity)
     }
 
     pub fn automatic(provider: AgentProvider, model: impl Into<String>) -> Self {
@@ -655,11 +688,21 @@ impl AgentRoute {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.harness.is_some_and(|harness| harness != crate::HarnessId::Omp || self.provider != AgentProvider::Antigravity) {
-            return Err("only OMP may override the provider default harness");
+        let valid_harness = match (self.harness, self.provider) {
+            (None, _) => true,
+            (Some(crate::HarnessId::Omp), AgentProvider::Antigravity) => true,
+            (Some(crate::HarnessId::ClaudeCode), AgentProvider::Anthropic) => true,
+            (Some(crate::HarnessId::Codex), AgentProvider::OpenAi) => true,
+            _ => false,
+        };
+        if !valid_harness {
+            return Err("agent route harness does not match provider");
         }
         if self.model.trim().is_empty() {
             return Err("agent route model is required");
+        }
+        if self.harness() != crate::HarnessId::Omp && self.model.contains('/') {
+            return Err("native agent route model must not be provider-qualified");
         }
         match (self.routing_mode, self.account_id.as_deref()) {
             (AgentRoutingMode::Automatic, None) => Ok(()),
@@ -1372,6 +1415,71 @@ mod tests {
         let native = AgentRoute::from_harness_model(crate::HarnessId::Antigravity, "gemini-4-argon-medium").unwrap();
         assert_eq!(native.harness(), crate::HarnessId::Antigravity);
         assert_eq!(native.execution_model(), "gemini-4-argon-medium");
+    }
+
+    #[test]
+    fn claude_code_and_codex_routes_preserve_explicit_harnesses_and_reject_mismatches() {
+        let claude = AgentRoute::from_harness_model(crate::HarnessId::ClaudeCode, "claude-sonnet-4-6").unwrap();
+        assert_eq!(claude.provider, AgentProvider::Anthropic);
+        assert_eq!(claude.harness, Some(crate::HarnessId::ClaudeCode));
+        assert_eq!(claude.harness(), crate::HarnessId::ClaudeCode);
+        assert_eq!(claude.model, "claude-sonnet-4-6");
+        assert_eq!(claude.execution_model(), "claude-sonnet-4-6");
+        assert!(claude.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&claude).unwrap(),
+            serde_json::json!({
+                "harness": "claude-code",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "fallback": "disabled",
+                "routingMode": "automatic",
+            })
+        );
+
+        let codex = AgentRoute::from_harness_model(crate::HarnessId::Codex, "gpt-5.4").unwrap();
+        assert_eq!(codex.provider, AgentProvider::OpenAi);
+        assert_eq!(codex.harness, Some(crate::HarnessId::Codex));
+        assert_eq!(codex.harness(), crate::HarnessId::Codex);
+        assert_eq!(codex.model, "gpt-5.4");
+        assert_eq!(codex.execution_model(), "gpt-5.4");
+        assert!(codex.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&codex).unwrap(),
+            serde_json::json!({
+                "harness": "codex",
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "fallback": "disabled",
+                "routingMode": "automatic",
+            })
+        );
+
+        for (harness, bad_model) in [
+            (crate::HarnessId::ClaudeCode, "anthropic/claude-sonnet-4-6"),
+            (crate::HarnessId::ClaudeCode, "gpt-5.4"),
+            (crate::HarnessId::Codex, "openai-codex/gpt-5.4"),
+            (crate::HarnessId::Codex, "claude-sonnet-4-6"),
+            (crate::HarnessId::Cursor, "claude-sonnet-4-6"),
+            (crate::HarnessId::Omp, "claude-sonnet-4-6"),
+        ] {
+            assert!(
+                AgentRoute::from_harness_model(harness, bad_model).is_none(),
+                "unexpectedly accepted ({harness:?}, {bad_model})"
+            );
+        }
+
+        let mut wrong_provider = claude.clone();
+        wrong_provider.provider = AgentProvider::OpenAi;
+        assert!(wrong_provider.validate().is_err());
+
+        let mut qualified_native = codex.clone();
+        qualified_native.model = "openai/gpt-5.4".into();
+        assert!(qualified_native.validate().is_err());
+
+        let mut explicit_omp_openai = AgentRoute::automatic(AgentProvider::OpenAi, "gpt-5.4");
+        explicit_omp_openai.harness = Some(crate::HarnessId::Omp);
+        assert!(explicit_omp_openai.validate().is_err());
     }
 
     #[test]

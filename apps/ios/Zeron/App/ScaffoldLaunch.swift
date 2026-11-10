@@ -96,12 +96,12 @@ extension AppModel {
     }
 
     /// The managed models a sandbox runs, from the controller's own catalog
-    /// (OMP and Antigravity routes, the desktop's filter).
+    /// (OMP, Claude Code, Codex, and Antigravity routes — the desktop's filter).
     @MainActor
     func scaffoldModels() async -> [ModelChoice] {
         guard let client, let controller = await scaffoldControllerId() else { return [] }
         var out: [ModelChoice] = []
-        for h in await client.listHarnesses(deviceId: controller) where h.offered && ["omp", "antigravity"].contains(h.id) {
+        for h in await client.listHarnesses(deviceId: controller) where ["omp", "claude-code", "codex", "antigravity"].contains(h.id) {
             let models = await client.listModels(deviceId: controller, harness: h.id)
             out += models.filter { crewManagedModel(harness: h.id, model: $0.id) }.map {
                 ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels, detail: $0.description)

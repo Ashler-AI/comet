@@ -52,11 +52,16 @@ pub fn database_label(database: ScaffoldDatabaseEnvironment) -> &'static str {
     }
 }
 
-/// A model a Scaffold sandbox can run: managed OMP/Antigravity routes only,
+/// A model a Scaffold sandbox can run: managed Scaffold harness routes only,
 /// the same filter the desktop applies to its Scaffold destinations.
 pub fn is_managed_model(harness: HarnessId, model: &str) -> bool {
-    matches!(harness, HarnessId::Omp | HarnessId::Antigravity)
-        && AgentRoute::from_harness_model(harness, model).is_some()
+    matches!(
+        harness,
+        HarnessId::Omp
+            | HarnessId::ClaudeCode
+            | HarnessId::Codex
+            | HarnessId::Antigravity
+    ) && AgentRoute::from_harness_model(harness, model).is_some()
 }
 
 /// The credential-free route for a picked harness/model, pinned to an Agent
@@ -848,8 +853,20 @@ mod tests {
             launch_route(&none),
             Err(ClientError::InvalidArgument(_))
         ));
+        assert_eq!(
+            launch_route(&config(HarnessId::Codex, "gpt-5.5"))
+                .unwrap()
+                .harness(),
+            HarnessId::Codex
+        );
+        assert_eq!(
+            launch_route(&config(HarnessId::ClaudeCode, "claude-opus-5"))
+                .unwrap()
+                .harness(),
+            HarnessId::ClaudeCode
+        );
         assert!(matches!(
-            launch_route(&config(HarnessId::Codex, "gpt-5.5")),
+            launch_route(&config(HarnessId::Cursor, "gpt-5.5")),
             Err(ClientError::InvalidArgument(_))
         ));
     }
@@ -1606,19 +1623,47 @@ mod tests {
     async fn an_unmanaged_model_never_reaches_a_controller() {
         let dir = tempfile::tempdir().unwrap();
         let fake = Fake::new(dir.path(), |_, kind, _| panic!("no {kind} expected"));
-        let mut unmanaged = launch(ScaffoldDatabaseEnvironment::Local);
-        unmanaged.config = config(HarnessId::ClaudeCode, "claude-opus-5");
-        let (_, phase) = phases();
-        let error = run(
-            &fake,
-            &Journal::at(dir.path()),
-            &base_scope(),
-            unmanaged,
-            &phase,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ClientError::InvalidArgument(_)), "{error}");
+        for (harness, bad_model) in [
+            (HarnessId::Cursor, "claude-opus-5"),
+            (HarnessId::ClaudeCode, "anthropic/claude-opus-5"),
+            (HarnessId::Codex, "openai-codex/gpt-5.4"),
+        ] {
+            let mut unmanaged = launch(ScaffoldDatabaseEnvironment::Local);
+            unmanaged.config = config(harness, bad_model);
+            let (_, phase) = phases();
+            let error = run(
+                &fake,
+                &Journal::at(dir.path()),
+                &base_scope(),
+                unmanaged,
+                &phase,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, ClientError::InvalidArgument(_)), "{error}");
+        }
         assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn claude_code_and_codex_managed_routes_pass_launch_validation() {
+        assert!(is_managed_model(HarnessId::ClaudeCode, "claude-sonnet-4-6"));
+        assert!(is_managed_model(HarnessId::Codex, "gpt-5.4"));
+
+        let claude_route = launch_route(&config(HarnessId::ClaudeCode, "claude-sonnet-4-6")).unwrap();
+        assert_eq!(claude_route.provider, zeron_proto::AgentProvider::Anthropic);
+        assert_eq!(claude_route.harness(), HarnessId::ClaudeCode);
+        assert_eq!(claude_route.execution_model(), "claude-sonnet-4-6");
+
+        let mut pinned_codex = config(HarnessId::Codex, "gpt-5.4");
+        pinned_codex
+            .model_options
+            .insert("crewAccountId".into(), "acct_openai_1".into());
+        let codex_route = launch_route(&pinned_codex).unwrap();
+        assert_eq!(codex_route.provider, zeron_proto::AgentProvider::OpenAi);
+        assert_eq!(codex_route.harness(), HarnessId::Codex);
+        assert_eq!(codex_route.execution_model(), "gpt-5.4");
+        assert_eq!(codex_route.routing_mode, zeron_proto::AgentRoutingMode::Pinned);
+        assert_eq!(codex_route.account_id.as_deref(), Some("acct_openai_1"));
     }
 }

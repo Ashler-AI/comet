@@ -180,7 +180,7 @@ impl CrewServices {
         self.identity().map_err(|error| EngineError::Other(error.to_string()))?;
         if self.auth.device_mode() {
             let (_, scope) = self.identity().map_err(|error| EngineError::Other(error.to_string()))?;
-            if scope.session_id.as_deref() != Some(session_id) || !matches!(harness, HarnessId::Omp | HarnessId::Antigravity) {
+            if !sandbox_device_inference_allowed(&scope, session_id, harness) {
                 return Err(EngineError::Other("Sandbox inference is bound to its managed session".into()));
             }
         }
@@ -878,6 +878,21 @@ fn terminal_control_error(error: &ScaffoldError) -> bool {
         || matches!(error, ScaffoldError::Api(api) if (400..500).contains(&api.0.status) && api.0.status != 408 && api.0.status != 429)
 }
 
+fn sandbox_device_inference_allowed(
+    scope: &CollaborationScope,
+    session_id: &str,
+    harness: HarnessId,
+) -> bool {
+    scope.session_id.as_deref() == Some(session_id)
+        && matches!(
+            harness,
+            HarnessId::Omp
+                | HarnessId::Antigravity
+                | HarnessId::ClaudeCode
+                | HarnessId::Codex
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,5 +1092,31 @@ mod tests {
         assert!(validate_transition(&previous,&environment).is_err());
         environment.owner_principal="other@example.com".into();
         assert!(validate_transition(&previous,&environment).is_err());
+    }
+
+    #[test]
+    fn sandbox_device_inference_admits_all_scaffold_harnesses_for_bound_session_only() {
+        let scope = CollaborationScope {
+            project_id: "p".into(),
+            deployment_id: Some("d".into()),
+            session_id: Some("session-1".into()),
+            unknown: Default::default(),
+        };
+        for allowed in [
+            HarnessId::Omp,
+            HarnessId::Antigravity,
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+        ] {
+            assert!(
+                sandbox_device_inference_allowed(&scope, "session-1", allowed),
+                "{allowed:?} must be allowed for bound sandbox session"
+            );
+            assert!(
+                !sandbox_device_inference_allowed(&scope, "other-session", allowed),
+                "{allowed:?} must be denied for unbound session"
+            );
+        }
+        assert!(!sandbox_device_inference_allowed(&scope, "session-1", HarnessId::Cursor));
     }
 }
