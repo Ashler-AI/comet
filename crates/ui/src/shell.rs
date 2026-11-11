@@ -1840,6 +1840,7 @@ async fn stop_synced_runtime(
     ipc_port: u16,
     data_dir: &std::path::Path,
 ) -> Result<(), String> {
+    engine.cancel_reconnect();
     let stop_error = if matches!(engine.mode(), EngineMode::Remote { .. }) {
         engine
             .client()
@@ -6760,6 +6761,7 @@ impl Shell {
         };
         self.sync_flow = SyncFlow::SigningOut;
         self.runtime_change_error = None;
+        self.state.update(cx, |state, _| state.expect_engine_exit());
         let ipc_port = self.boot.ipc_port;
         let data_dir = self.data_dir.clone();
         let shutdown_dir = data_dir.clone();
@@ -6909,6 +6911,7 @@ impl Shell {
         self.sync_flow = SyncFlow::Switching { import };
         self.runtime_change_error = None;
         self.import_current = None;
+        self.state.update(cx, |state, _| state.expect_engine_exit());
         let ipc_port = self.boot.ipc_port;
         let data_dir = self.data_dir.clone();
         let transition = Tokio::spawn(cx, async move {
@@ -7112,9 +7115,11 @@ impl Shell {
         }
 
         self.runtime_change_error = None;
+        self.state.update(cx, |state, _| state.expect_engine_exit());
         let ipc_port = self.boot.ipc_port;
         let data_dir = self.data_dir.clone();
         let shutdown = Tokio::spawn(cx, async move {
+            engine.cancel_reconnect();
             engine
                 .client()
                 .call(methods::STOP_ENGINE, serde_json::json!({}))
