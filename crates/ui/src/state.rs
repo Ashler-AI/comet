@@ -49,6 +49,38 @@ pub fn launch_background_engine() {
     LAUNCH_BACKGROUND_ENGINE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// After a background engine goes away unasked, the app starts it again —
+/// first at once-ish, then backing off so a crashing engine can't spin. One
+/// that keeps dying is a bug to see, not hide: past the last delay the app
+/// stops and shows the failure (with Retry). Embedding wouldn't help — an
+/// engine bug crashes an in-process engine too, taking the window with it.
+const ENGINE_RESPAWN_BACKOFF: [std::time::Duration; 4] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+];
+const ENGINE_LOSS_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Record an unasked engine loss: how long to wait before starting it
+/// again, or `None` once losses come too often to keep trying.
+fn record_engine_loss(
+    losses: &mut Vec<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    record_engine_loss_with_backoff(losses, now, &ENGINE_RESPAWN_BACKOFF)
+}
+
+fn record_engine_loss_with_backoff(
+    losses: &mut Vec<std::time::Instant>,
+    now: std::time::Instant,
+    backoff: &[std::time::Duration],
+) -> Option<std::time::Duration> {
+    losses.retain(|at| now.saturating_duration_since(*at) < ENGINE_LOSS_WINDOW);
+    losses.push(now);
+    backoff.get(losses.len() - 1).copied()
+}
+
 // Recently viewed transcripts stay renderable while a fresh watch opens. Move
 // ownership on navigation; never clone whale payloads or retain live watches.
 const TRANSCRIPT_CACHE_CAP: usize = 12;
@@ -289,12 +321,23 @@ impl EngineBackend for RemoteEngine {
     }
 }
 
+#[derive(Clone)]
+struct ManagedRespawn {
+    config: Arc<EngineConfig>,
+    losses: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    #[cfg(test)]
+    backoff: Option<Vec<std::time::Duration>>,
+    #[cfg(test)]
+    launcher: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
 /// Cheaply clonable handle to whichever backend won the probe.
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
     engine_info: EngineInfo,
     deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
+    respawn: Option<ManagedRespawn>,
     replacement: Arc<tokio::sync::OnceCell<EngineHandle>>,
     stopped: tokio_util::sync::CancellationToken,
 }
@@ -302,6 +345,11 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub(crate) fn same_connection(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn bootstrap_gate() -> &'static tokio::sync::Mutex<()> {
+        static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        &BOOTSTRAP_GATE
     }
 
     /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
@@ -312,14 +360,8 @@ impl EngineHandle {
         // a time. The winner binds the deferred IPC listener before releasing
         // the gate, so a concurrent viewport's probe finds it and attaches as
         // Remote instead of racing it for the data dir.
-        static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _gate = BOOTSTRAP_GATE.lock().await;
-
-        if let Some(handle) = Self::attach_to_daemon(config.ipc_port, &config.data_dir).await {
-            return Ok(handle);
-        }
-
-        tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
+        let _gate = Self::bootstrap_gate().lock().await;
+        let launching = LAUNCH_BACKGROUND_ENGINE.load(std::sync::atomic::Ordering::SeqCst);
         let engine_config = EngineConfig {
             data_dir: config.data_dir,
             edge_url: config.edge_url,
@@ -333,12 +375,30 @@ impl EngineHandle {
             device_bootstrap_file: None,
             managed_inference: config.managed_inference,
         };
-        let launching = LAUNCH_BACKGROUND_ENGINE.load(std::sync::atomic::Ordering::SeqCst);
-        if Self::should_launch_background(launching, engine_config.ipc_port).await
-            && let Some(handle) = Self::launch_background(&engine_config).await
+        let respawn = (launching && engine_config.ipc_port != 0).then(|| ManagedRespawn {
+            config: Arc::new(engine_config.clone()),
+            losses: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            backoff: None,
+            #[cfg(test)]
+            launcher: None,
+        });
+
+        if let Some(mut handle) =
+            Self::attach_to_daemon(engine_config.ipc_port, &engine_config.data_dir).await
         {
+            handle.respawn = respawn;
             return Ok(handle);
         }
+
+        if Self::should_launch_background(launching, engine_config.ipc_port).await
+            && let Some(mut handle) = Self::launch_background(&engine_config, None).await
+        {
+            handle.respawn = respawn;
+            return Ok(handle);
+        }
+
+        tracing::info!(data_dir = %engine_config.data_dir.display(), "no daemon on port; embedding engine");
 
         // Own the data dir before opening anything under it or binding IPC —
         // the lock, not the port bind, is the ownership decision. A failed
@@ -355,10 +415,11 @@ impl EngineHandle {
                         return Err(err.into());
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    if let Some(handle) =
+                    if let Some(mut handle) =
                         Self::attach_to_daemon(engine_config.ipc_port, &engine_config.data_dir)
                             .await
                     {
+                        handle.respawn = respawn;
                         return Ok(handle);
                     }
                 }
@@ -476,6 +537,7 @@ impl EngineHandle {
             }),
             engine_info,
             deferred_state: Some(state_rx.clone()),
+            respawn: None,
             replacement: Arc::new(tokio::sync::OnceCell::new()),
             stopped: tokio_util::sync::CancellationToken::new(),
         };
@@ -509,10 +571,22 @@ impl EngineHandle {
         !taken
     }
 
-    async fn launch_background(config: &EngineConfig) -> Option<EngineHandle> {
+    async fn launch_background(
+        config: &EngineConfig,
+        expected: Option<&EngineInfo>,
+    ) -> Option<EngineHandle> {
+        struct ReapGuard(Option<std::process::Child>);
+        impl Drop for ReapGuard {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.take() {
+                    zeron_engine::managed::reap(child);
+                }
+            }
+        }
+
         const STARTUP: std::time::Duration = std::time::Duration::from_secs(20);
         let app = std::env::current_exe().ok()?;
-        let mut child = match zeron_engine::managed::launch(config, &app) {
+        let child = match zeron_engine::managed::launch(config, &app) {
             Ok(child) => child,
             Err(err) => {
                 tracing::warn!(error = %err, "couldn't start the background engine; embedding one");
@@ -520,30 +594,72 @@ impl EngineHandle {
             }
         };
         tracing::info!(pid = child.id(), "background engine started");
+        let mut child = ReapGuard(Some(child));
         let deadline = std::time::Instant::now() + STARTUP;
         loop {
-            if let Some(handle) = Self::attach_to_daemon(config.ipc_port, &config.data_dir).await {
-                zeron_engine::managed::reap(child);
+            if let Some(handle) =
+                Self::attach_to_daemon_expected(config.ipc_port, &config.data_dir, expected).await
+            {
                 return Some(handle);
             }
-            if let Ok(Some(status)) = child.try_wait() {
+            if let Ok(Some(status)) = child.0.as_mut().unwrap().try_wait() {
+                child.0.take();
                 tracing::warn!(%status, "background engine exited during startup; embedding one");
                 return None;
             }
             if std::time::Instant::now() >= deadline {
                 tracing::warn!("background engine didn't come up in time; embedding one");
-                let _ = child.kill();
-                let _ = child.wait();
+                if let Some(mut child) = child.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
                 return None;
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
     }
 
+    async fn respawn_background(
+        respawn: &ManagedRespawn,
+        expected: Option<&EngineInfo>,
+    ) -> Option<EngineHandle> {
+        #[cfg(test)]
+        if let Some(launcher) = &respawn.launcher {
+            if !launcher() {
+                return None;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some(handle) = Self::attach_to_daemon_expected(
+                    respawn.config.ipc_port,
+                    &respawn.config.data_dir,
+                    expected,
+                )
+                .await
+                {
+                    return Some(handle);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+        Self::launch_background(&respawn.config, expected).await
+    }
+
     /// Probe the IPC port and, if a live engine answers, attach as a remote
     /// viewport. `None` means embed: nothing listening, a non-engine listener,
     /// or a listener without an identity.
     async fn attach_to_daemon(ipc_port: u16, data_dir: &Path) -> Option<EngineHandle> {
+        Self::attach_to_daemon_expected(ipc_port, data_dir, None).await
+    }
+
+    async fn attach_to_daemon_expected(
+        ipc_port: u16,
+        data_dir: &Path,
+        expected: Option<&EngineInfo>,
+    ) -> Option<EngineHandle> {
         let url = format!("ws://127.0.0.1:{ipc_port}");
         let probe = tokio::time::timeout(
             std::time::Duration::from_millis(750),
@@ -553,7 +669,7 @@ impl EngineHandle {
         if !matches!(probe, Ok(Ok(_))) {
             return None;
         }
-        match Self::connect_daemon(url, ipc_port, data_dir.to_path_buf(), None).await {
+        match Self::connect_daemon(url, ipc_port, data_dir.to_path_buf(), expected).await {
             Ok(handle) => Some(handle),
             Err(err) => {
                 tracing::warn!(error = %err, "not an engine; embedding instead");
@@ -605,13 +721,15 @@ impl EngineHandle {
             }),
             engine_info,
             deferred_state: Some(state_rx),
+            respawn: None,
             replacement: Arc::new(tokio::sync::OnceCell::new()),
             stopped: tokio_util::sync::CancellationToken::new(),
         })
     }
 
     /// All viewports sharing this connection adopt one replacement. Never
-    /// bootstrap here: an unavailable daemon must not open another profile.
+    /// embed here: an unavailable daemon must not open another in-process
+    /// profile, though a managed background engine is respawned with backoff.
     async fn reconnect(&self) -> Result<Self, RpcError> {
         let EngineMode::Remote { url } = self.mode() else {
             return Err(RpcError::Closed);
@@ -623,6 +741,75 @@ impl EngineHandle {
             biased;
             _ = self.stopped.cancelled() => Err(RpcError::Closed),
             replacement = self.replacement.get_or_try_init(|| async {
+                if let Some(respawn) = &self.respawn {
+                    loop {
+                        let delay = {
+                            let mut losses = respawn.losses.lock().unwrap();
+                            let now = std::time::Instant::now();
+                            #[cfg(test)]
+                            let delay = if let Some(backoff) = respawn.backoff.as_deref() {
+                                record_engine_loss_with_backoff(&mut losses, now, backoff)
+                            } else {
+                                record_engine_loss(&mut losses, now)
+                            };
+                            #[cfg(not(test))]
+                            let delay = record_engine_loss(&mut losses, now);
+                            delay
+                        };
+                        let Some(delay) = delay else {
+                            let reason = self.client().close_reason();
+                            let log = respawn.config.data_dir.join("logs").join("zeron-engine.log");
+                            let losses = respawn.losses.lock().unwrap().len();
+                            tracing::error!(
+                                losses,
+                                reason = reason.as_deref().unwrap_or("the engine went away"),
+                                "the engine connection keeps dropping; giving up until Retry"
+                            );
+                            let message = match reason {
+                                Some(reason) => format!(
+                                    "Crew keeps losing its connection to the engine: {reason}. \
+                                     Details are in {}.",
+                                    log.display()
+                                ),
+                                None => format!(
+                                    "Crew's engine keeps stopping unexpectedly. Details are in {}.",
+                                    log.display()
+                                ),
+                            };
+                            return Err(RpcError::Failed(message));
+                        };
+                        tracing::warn!(
+                            ?delay,
+                            reason = ?self.client().close_reason(),
+                            "lost the engine connection; reconnecting"
+                        );
+                        tokio::time::sleep(delay).await;
+                        let _gate = Self::bootstrap_gate().lock().await;
+                        let attempt = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            Self::connect_daemon(
+                                url.clone(),
+                                ipc_port,
+                                data_dir.clone(),
+                                Some(&self.engine_info),
+                            ),
+                        )
+                        .await;
+                        if let Ok(Ok(mut handle)) = attempt {
+                            handle.respawn = Some(respawn.clone());
+                            handle.stopped = self.stopped.clone();
+                            return Ok(handle);
+                        }
+                        if Self::should_launch_background(true, ipc_port).await
+                            && let Some(mut handle) =
+                                Self::respawn_background(respawn, Some(&self.engine_info)).await
+                        {
+                            handle.respawn = Some(respawn.clone());
+                            handle.stopped = self.stopped.clone();
+                            return Ok(handle);
+                        }
+                    }
+                }
                 loop {
                     let attempt = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
@@ -662,6 +849,7 @@ impl EngineHandle {
                 devbox_id: None,
             },
             deferred_state: None,
+            respawn: None,
             replacement: Arc::new(tokio::sync::OnceCell::new()),
             stopped: tokio_util::sync::CancellationToken::new(),
         }
@@ -691,6 +879,12 @@ impl EngineHandle {
 
     fn deferred_state(&self) -> Option<tokio::sync::watch::Receiver<DeferredEngineState>> {
         self.deferred_state.clone()
+    }
+
+    /// Cancel reconnect watches sharing this handle before an intentional
+    /// `StopEngine` call so no viewport respawns the engine while it drains.
+    pub fn cancel_reconnect(&self) {
+        self.stopped.cancel();
     }
 
     pub async fn shutdown(&self) {
@@ -1046,6 +1240,7 @@ pub struct AppState {
     /// Notifies at clock-driven transitions (see [`Self::watch_clock_transitions`]).
     clock: ClockTransitions,
     engine: Option<EngineHandle>,
+    engine_exit_expected: bool,
     watch_tasks: Vec<Task<()>>,
     /// This window's identity and focus report for engine-owned desktop
     /// notifications.
@@ -1168,6 +1363,7 @@ impl AppState {
             data_dir: None,
             clock: ClockTransitions::default(),
             engine: None,
+            engine_exit_expected: false,
             watch_tasks: Vec::new(),
             viewport_id: uuid::Uuid::new_v4().to_string(),
             viewport_focused: false,
@@ -2713,6 +2909,7 @@ impl AppState {
             handle.stopped.cancel();
         }
         self.engine = None;
+        self.engine_exit_expected = false;
         self.watch_tasks.clear();
         self.focus_task = None;
         self.transcript_task = None;
@@ -2935,6 +3132,7 @@ impl AppState {
             if let Some(handle) = &s.engine {
                 handle.stopped.cancel();
             }
+            s.engine_exit_expected = false;
             s.connection = ConnectionStatus::Connecting;
             s.workspace_scope = None;
             s.auth = None;
@@ -2965,6 +3163,12 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// The next engine exit is the shell's doing (it stops the engine to
+    /// replace the runtime): don't reconnect on it.
+    pub fn expect_engine_exit(&mut self) {
+        self.engine_exit_expected = true;
     }
 
     pub fn set_viewport_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
@@ -3046,6 +3250,7 @@ impl AppState {
             self.harness_updates.clear();
         }
         self.engine = Some(handle.clone());
+        self.engine_exit_expected = false;
         self.report_focus(cx);
         if let Some(update) = crate::app_update::AppUpdate::global(cx) {
             update.update(cx, |update, _| update.set_engine(Some(handle.clone())));
@@ -3631,10 +3836,14 @@ fn spawn_reconnect_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Op
         }
         if !this
             .update(cx, |state, cx| {
-                if !state
-                    .engine
-                    .as_ref()
-                    .is_some_and(|current| current.same_connection(&handle))
+                let signed_out_synced = state.workspace_scope == Some(WorkspaceScope::Synced)
+                    && matches!(state.auth, Some(AuthState::SignedOut));
+                if state.engine_exit_expected
+                    || signed_out_synced
+                    || !state
+                        .engine
+                        .as_ref()
+                        .is_some_and(|current| current.same_connection(&handle))
                 {
                     return false;
                 }
@@ -3658,18 +3867,46 @@ fn spawn_reconnect_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Op
                 result = previous.reconnect() => result,
             }
         });
-        if let Ok(Ok(replacement)) = reconnect.await {
-            this.update(cx, |state, cx| {
-                if !handle.stopped.is_cancelled()
-                    && state
-                        .engine
-                        .as_ref()
-                        .is_some_and(|current| current.same_connection(&handle))
-                {
-                    state.attach_engine(replacement, cx);
-                }
-            })
-            .ok();
+        match reconnect.await {
+            Ok(Ok(replacement)) => {
+                this.update(cx, |state, cx| {
+                    if !handle.stopped.is_cancelled()
+                        && !state.engine_exit_expected
+                        && state
+                            .engine
+                            .as_ref()
+                            .is_some_and(|current| current.same_connection(&handle))
+                    {
+                        state.attach_engine(replacement, cx);
+                    }
+                })
+                .ok();
+            }
+            Ok(Err(RpcError::Failed(message))) => {
+                this.update(cx, |state, cx| {
+                    if !handle.stopped.is_cancelled()
+                        && !state.engine_exit_expected
+                        && state
+                            .engine
+                            .as_ref()
+                            .is_some_and(|current| current.same_connection(&handle))
+                    {
+                        if let Some(update) = crate::app_update::AppUpdate::global(cx) {
+                            update.update(cx, |update, _| update.set_engine(None));
+                        }
+                        state.engine = None;
+                        state.watch_tasks.clear();
+                        state.transcript_task = None;
+                        state.queue_task = None;
+                        state.change_request_tasks.clear();
+                        state.focus_task = None;
+                        state.connection = ConnectionStatus::Failed(message);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            _ => {}
         }
     }))
 }
@@ -4610,6 +4847,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_background_engine_starts_only_on_a_free_real_port() {
+        let free = free_port().await;
+        assert!(EngineHandle::should_launch_background(true, free).await);
+        assert!(!EngineHandle::should_launch_background(false, free).await);
+        // Port 0 has no address a background engine could be found at.
+        assert!(!EngineHandle::should_launch_background(true, 0).await);
+        // A stranger on the port would keep it from ever serving.
+        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        assert!(!EngineHandle::should_launch_background(true, taken).await);
+    }
+
+    #[test]
+    fn a_lost_engine_respawns_with_backoff_then_stops_to_show_the_failure() {
+        use std::time::Duration;
+        let start = std::time::Instant::now();
+        let mut losses = Vec::new();
+        assert_eq!(
+            record_engine_loss(&mut losses, start),
+            Some(Duration::from_secs(1))
+        );
+        // Spread out, losses age away: an update restart now and then
+        // always gets the short delay.
+        assert_eq!(
+            record_engine_loss(
+                &mut losses,
+                start + ENGINE_LOSS_WINDOW + Duration::from_secs(1)
+            ),
+            Some(Duration::from_secs(1))
+        );
+        let burst = start + Duration::from_secs(3600);
+        let delays: Vec<_> = (0..5)
+            .map(|n| record_engine_loss(&mut losses, burst + Duration::from_secs(n)))
+            .collect();
+        assert_eq!(
+            delays,
+            vec![
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(5)),
+                Some(Duration::from_secs(15)),
+                None,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
         // The port probe only proves *something* is listening. A process that
         // accepts TCP and never speaks WebSocket used to hang the dial forever;
@@ -5151,6 +5437,261 @@ mod tests {
             assert!(state.sub_watch_tasks.is_empty());
         });
         drop(server);
+    }
+
+    #[gpui::test]
+    fn managed_background_engine_respawns_after_update_exit_and_surfaces_repeated_crashes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use futures::StreamExt;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct Daemon {
+            generation: u32,
+        }
+        #[async_trait]
+        impl RpcService for Daemon {
+            async fn handle(
+                &self,
+                method: &str,
+                params: serde_json::Value,
+            ) -> Result<RpcReply, RpcError> {
+                let frame = match method {
+                    methods::ENGINE_INFO => {
+                        return RpcReply::value(&EngineInfo {
+                            device_id: "dev".into(),
+                            workspace_scope: WorkspaceScope::Local,
+                            cursor_sdk_version: None,
+                            capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+                            devbox_provider: None,
+                            devbox_id: None,
+                        });
+                    }
+                    methods::ENGINE_READY => return RpcReply::value(&true),
+                    methods::WATCH_CHATS => {
+                        serde_json::to_value(vec![chat("selected", 0, None)]).unwrap()
+                    }
+                    methods::WATCH_DOC_MESSAGES => {
+                        let id = params["chatId"].as_str().unwrap();
+                        serde_json::to_value(zeron_doc::TranscriptUpdate {
+                            frame: TranscriptFrame::reset(&[user_entry(&format!(
+                                "{id}-{}",
+                                self.generation
+                            ))]),
+                            context_usage: None,
+                            replay_baseline: None,
+                            command_delivery: HashMap::new(),
+                        })
+                        .unwrap()
+                    }
+                    other => return Err(RpcError::UnknownMethod(other.into())),
+                };
+                Ok(RpcReply::Stream(
+                    futures::stream::once(async move { frame })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                ))
+            }
+        }
+
+        struct ServerGuard {
+            stop: Option<tokio::sync::oneshot::Sender<()>>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                if let Some(stop) = self.stop.take() {
+                    let _ = stop.send(());
+                }
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        fn serve(port: u16, generation: u32, token: &str) -> (ServerGuard, u16) {
+            let token = token.to_owned();
+            let (port_tx, port_rx) = std::sync::mpsc::channel();
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                        .await
+                        .unwrap();
+                    let bound_port = listener.local_addr().unwrap().port();
+                    let task = tokio::spawn(zeron_rpc::serve_ws_listener(
+                        listener,
+                        Arc::new(Daemon { generation }),
+                        token,
+                    ));
+                    port_tx.send(bound_port).unwrap();
+                    let _ = stop_rx.await;
+                    task.abort();
+                });
+            });
+            let bound_port = port_rx.recv().unwrap();
+            (
+                ServerGuard {
+                    stop: Some(stop_tx),
+                    thread: Some(thread),
+                },
+                bound_port,
+            )
+        }
+
+        fn drive_until(
+            cx: &mut gpui::TestAppContext,
+            runtime: &tokio::runtime::Runtime,
+            mut ready: impl FnMut(&mut gpui::TestAppContext) -> bool,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                runtime.block_on(async {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                });
+                cx.run_until_parked();
+                if ready(cx) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "managed respawn observation did not arrive"
+                );
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        cx.update(|cx| gpui_tokio::init_from_handle(cx, runtime.handle().clone()));
+        let ipc_dir = tempfile::tempdir().unwrap();
+        let ipc_token = zeron_rpc::ipc_auth::issue_token(ipc_dir.path()).unwrap();
+        let (server_1, port) = serve(0, 1, &ipc_token);
+
+        let allow_respawn = Arc::new(AtomicBool::new(true));
+        let launch_calls = Arc::new(AtomicUsize::new(0));
+        let spawned_server: Arc<Mutex<Option<ServerGuard>>> = Arc::new(Mutex::new(None));
+        let respawn = ManagedRespawn {
+            config: Arc::new(EngineConfig {
+                data_dir: ipc_dir.path().to_path_buf(),
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                ipc_port: port,
+                default_harness: HarnessId::Mock,
+                org_id: None,
+                workos_client_id: None,
+                scaffold: None,
+                device: None,
+                device_bootstrap_file: None,
+                managed_inference: false,
+            }),
+            losses: Arc::new(Mutex::new(Vec::new())),
+            backoff: Some(vec![
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            ]),
+            launcher: Some({
+                let allow_respawn = allow_respawn.clone();
+                let launch_calls = launch_calls.clone();
+                let spawned_server = spawned_server.clone();
+                let ipc_token = ipc_token.clone();
+                Arc::new(move || {
+                    let call = launch_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if !allow_respawn.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    let (next, _) = serve(port, (call + 1) as u32, &ipc_token);
+                    *spawned_server.lock().unwrap() = Some(next);
+                    true
+                })
+            }),
+        };
+
+        let mut original = runtime
+            .block_on(EngineHandle::attach_to_daemon(port, ipc_dir.path()))
+            .unwrap();
+        original.respawn = Some(respawn.clone());
+
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.attach_engine(original.clone(), cx);
+            state.select_chat(Some("selected".into()), cx);
+        });
+        drive_until(cx, &runtime, |cx| {
+            state.read_with(cx, |state, _| {
+                state
+                    .transcript
+                    .first()
+                    .is_some_and(|row| row.id == "selected-1")
+            })
+        });
+
+        // Simulate macOS managed engine exiting for an update ("the app starts
+        // the new engine"): nothing restarts it until the app's reconnect watch
+        // launches the new background engine.
+        drop(server_1);
+        drive_until(cx, &runtime, |cx| {
+            state.read_with(cx, |state, _| {
+                state
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| !engine.same_connection(&original))
+                    && state
+                        .transcript
+                        .first()
+                        .is_some_and(|row| row.id == "selected-2")
+            })
+        });
+        assert_eq!(launch_calls.load(Ordering::SeqCst), 1);
+
+        // Now simulate repeated startup crashes exhausting the backoff window:
+        // the app stops spinning and surfaces ConnectionStatus::Failed with the
+        // engine log path so Retry can recover.
+        allow_respawn.store(false, Ordering::SeqCst);
+        let server_2 = spawned_server.lock().unwrap().take();
+        drop(server_2);
+        drive_until(cx, &runtime, |cx| {
+            state.read_with(cx, |state, _| {
+                matches!(&state.connection, ConnectionStatus::Failed(msg) if msg.contains("zeron-engine.log"))
+                    && state.engine.is_none()
+            })
+        });
+        assert_eq!(launch_calls.load(Ordering::SeqCst), 3);
+
+        // Deliberate shell shutdowns (`expect_engine_exit`) must not respawn.
+        allow_respawn.store(true, Ordering::SeqCst);
+        let (server_3, _) = serve(port, 10, &ipc_token);
+        let mut intentional = runtime
+            .block_on(EngineHandle::attach_to_daemon(port, ipc_dir.path()))
+            .unwrap();
+        intentional.respawn = Some(ManagedRespawn {
+            losses: Arc::new(Mutex::new(Vec::new())),
+            ..respawn
+        });
+        state.update(cx, |state, cx| {
+            state.attach_engine(intentional.clone(), cx);
+            state.expect_engine_exit();
+        });
+        let before = launch_calls.load(Ordering::SeqCst);
+        drop(server_3);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), intentional.client().closed())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            launch_calls.load(Ordering::SeqCst),
+            before,
+            "expected engine exit must not respawn the background engine"
+        );
     }
 
     fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {
