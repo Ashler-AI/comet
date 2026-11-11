@@ -512,6 +512,18 @@ impl WorkspaceSearch {
     fn acquire(&self, root: &Path, warm: bool) -> Result<SharedFilePicker, WorkspaceSearchError> {
         self.start_reaper();
         let now = (self.inner.clock)();
+        {
+            let mut entries = lock(&self.inner.entries);
+            if let Some(entry) = entries.get_mut(root) {
+                entry.last_used = now;
+                entry.warmed |= warm;
+                return Ok(entry.picker.clone());
+            }
+        }
+        // Match DiffSync and WorkspaceFiles: a recursive watcher on a checkout
+        // with huge dependency trees (node_modules, target/) registers tens of
+        // thousands of FSEvents/inotify watches across up to MAX_LIVE worktrees.
+        let watch = self.inner.watch && !crate::workspace_files::exceeds_watch_budget(root);
         let mut evicted = None;
         let picker = {
             let mut entries = lock(&self.inner.entries);
@@ -522,7 +534,7 @@ impl WorkspaceSearch {
             } else {
                 // Create first: a root fff refuses (a filesystem root, a
                 // vanished folder) must not cost a healthy index its place.
-                let picker = create_picker(root, self.inner.watch)?;
+                let picker = create_picker(root, watch)?;
                 if entries.len() >= MAX_LIVE {
                     evicted = lru_victim(&entries)
                         .and_then(|victim| entries.remove(&victim).map(|entry| (victim, entry)));
@@ -625,7 +637,7 @@ fn create_picker(root: &Path, watch: bool) -> Result<SharedFilePicker, Workspace
         },
     )
     .map_err(unavailable)?;
-    tracing::info!(root = %root.display(), "workspace search index created");
+    tracing::info!(root = %root.display(), watch, "workspace search index created");
     let logged = picker.clone();
     let root_for_log = root.to_path_buf();
     let _ = std::thread::Builder::new()
@@ -894,6 +906,21 @@ mod tests {
             assert!(Instant::now() < deadline, "watcher never indexed beta.rs");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn over_budget_roots_index_without_starting_a_watcher() {
+        let (_dir, root) = folder(&[("alpha.rs", b"")]);
+        for i in 0..=crate::workspace_files::MAX_WATCH_DIRS {
+            std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+        }
+        let search = WorkspaceSearch::new();
+        let picker = ready(&search, &root);
+        assert!(names(&search, &root, "alpha").contains(&"alpha.rs".to_owned()));
+        assert!(
+            !picker.wait_for_watcher(Duration::from_millis(100)),
+            "over-budget roots must not register a recursive fff watcher"
+        );
     }
 
     #[test]

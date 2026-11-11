@@ -68,7 +68,7 @@ pub fn init_logging(data_dir: Option<&std::path::Path>, mode: &str, stderr_only:
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
     let default_filter = if data_dir.is_some() {
-        "info,loro_internal=warn,loro=warn"
+        "info,loro_internal=warn,loro=warn,fff_search=warn,fff=warn"
     } else {
         "warn"
     };

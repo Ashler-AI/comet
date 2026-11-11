@@ -1071,7 +1071,7 @@ fn is_internal_temp_wire_path(path: &str) -> bool {
         .is_some_and(|name| name.starts_with(".zeron-save-") && name.ends_with(".tmp"))
 }
 
-fn exceeds_watch_budget(root: &Path) -> bool {
+pub(crate) fn exceeds_watch_budget(root: &Path) -> bool {
     let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
     let mut seen = 0usize;
     while let Some(directory) = queue.pop_front() {

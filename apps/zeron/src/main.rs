@@ -215,7 +215,7 @@ fn main() -> anyhow::Result<()> {
     // overrides the whole filter).
     let long_running = matches!(&cli.command, None | Some(Command::Headless(_)));
     let default_filter = if long_running {
-        "info,loro_internal=warn,loro=warn"
+        "info,loro_internal=warn,loro=warn,fff_search=warn,fff=warn"
     } else {
         "warn"
     };
