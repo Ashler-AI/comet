@@ -282,6 +282,10 @@ impl Repos {
             // Let Git handle long native paths without persisting user config.
             cmd.args(["-c", "core.longpaths=true"]);
         }
+        // Automated engine operations must not kick off detached `git gc --auto`
+        // or `git maintenance run --auto` repacks (especially catastrophic on
+        // blobless partial clones with thousands of `.promisor` packs).
+        cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"]);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -320,6 +324,7 @@ impl Repos {
             use std::os::windows::process::CommandExt;
             cmd.as_std_mut().creation_flags(0x08000000);
         }
+        cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"]);
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
