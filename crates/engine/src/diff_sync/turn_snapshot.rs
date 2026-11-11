@@ -372,6 +372,7 @@ async fn snapshot_git(
         use std::os::windows::process::CommandExt;
         cmd.as_std_mut().creation_flags(0x08000000);
     }
+    cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"]);
     cmd.arg("-C").arg(root).args(args);
     cmd.env("GIT_INDEX_FILE", index);
     store.apply_to(&mut cmd);
