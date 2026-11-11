@@ -1461,13 +1461,28 @@ mod tests {
     fn cached_activity_loaders_keep_renewing_under_system_reduced_motion(
         cx: &mut gpui::TestAppContext,
     ) {
-        use gpui::{AppContext as _, Context, ParentElement as _, Render};
+        use gpui::{AppContext as _, Context, Entity, ParentElement as _, Render, Styled as _};
+        use std::cell::Cell;
+        use std::rc::Rc;
 
-        struct Loaders;
+        struct CachedSibling {
+            renders: Rc<Cell<usize>>,
+        }
+        impl Render for CachedSibling {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                gpui::div()
+            }
+        }
+
+        struct Loaders {
+            sibling: Entity<CachedSibling>,
+        }
         impl Render for Loaders {
             fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let theme = crate::theme::Theme::dark();
                 gpui::div()
+                    .child(self.sibling.clone().cached(gpui::StyleRefinement::default()))
                     .child(crate::loaders::gradient_spinner(
                         "working",
                         &theme,
@@ -1494,23 +1509,41 @@ mod tests {
             });
             apply(cx);
         });
-        let window = cx.add_window(|_, _| Loaders);
+        let sibling_renders = Rc::new(Cell::new(0));
+        let sibling_renders_for_view = sibling_renders.clone();
+        let window = cx.add_window(|_, cx| Loaders {
+            sibling: cx.new(|_| CachedSibling {
+                renders: sibling_renders_for_view,
+            }),
+        });
+        let parent_id = window.entity(cx).unwrap().entity_id();
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         cx.run_until_parked();
+        let baseline_renders = sibling_renders.get();
+        assert_eq!(baseline_renders, 1);
         for _ in 0..20 {
             cx.background_executor.advance_clock(PULSE_TICK);
             cx.run_until_parked();
             cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
                 .unwrap();
         }
+        assert_eq!(
+            sibling_renders.get(),
+            baseline_renders,
+            "cached sibling panes must stay cached across pulse ticks"
+        );
         cx.update(|cx| {
             let clock = cx.global::<PulseClock>();
             assert!(clock.tick >= 20);
             assert_eq!(
                 clock.leases.len(),
                 2,
-                "transcript and cached sidebar loader"
+                "cached transcript and sidebar loaders"
+            );
+            assert!(
+                !clock.leases.contains_key(&parent_id),
+                "parent container must not hold a pulse lease"
             );
             assert!(
                 clock.leases.values().all(|lease| lease.stride == 2),
@@ -1521,7 +1554,20 @@ mod tests {
 
     #[gpui::test]
     fn system_reduced_motion_keeps_activity_loaders_ticking(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext as _;
+        use gpui::{AppContext as _, Context, ParentElement as _, Render};
+
+        struct Host;
+        impl Render for Host {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                gpui::div().child(crate::loaders::gradient_spinner(
+                    "working",
+                    &crate::theme::Theme::dark(),
+                    2.5,
+                    cx.entity_id(),
+                    cx,
+                ))
+            }
+        }
 
         cx.update(|cx| {
             cx.set_global(MotionState {
@@ -1532,19 +1578,17 @@ mod tests {
             });
             apply(cx);
             assert!(reduced_motion(cx));
-
-            let view = cx.new(|_| ());
-            drop(crate::loaders::gradient_spinner(
-                "working",
-                &crate::theme::Theme::dark(),
-                2.5,
-                view.entity_id(),
-                cx,
-            ));
+        });
+        let window = cx.add_window(|_, _| Host);
+        let host_id = window.entity(cx).unwrap().entity_id();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.update(|cx| {
             assert!(
-                cx.try_global::<PulseClock>()
-                    .is_some_and(|clock| clock.leases.contains_key(&view.entity_id())),
-                "a working indicator must keep receiving ticks with system reduced motion"
+                cx.try_global::<PulseClock>().is_some_and(|clock| {
+                    clock.leases.len() == 1 && !clock.leases.contains_key(&host_id)
+                }),
+                "a working indicator must keep receiving ticks on its cached leaf view with system reduced motion"
             );
         });
     }

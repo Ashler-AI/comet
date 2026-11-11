@@ -71,39 +71,89 @@ pub fn zeron_mark_loader(
 /// The zeron wave loader: a row of cells pulsing opacity 0.08→1 / scale 0.9→1
 /// over 2.4s with a 0.15s stagger per cell.
 ///
-/// `id` scopes the per-cell animation state — give each loader instance a
-/// distinct id.
+/// `id` scopes the cached leaf view — give each loader instance within a parent
+/// view a distinct id.
 pub fn zeron_loader(
-    _id: &'static str,
+    id: &'static str,
     theme: &Theme,
     cell_px: f32,
-    view: EntityId,
-    cx: &mut App,
+    _view: EntityId,
+    _cx: &mut App,
 ) -> impl IntoElement {
-    let color = theme.text;
-    let slot = cell_px;
-    let delta = motion::pulse_delta(&ZERON_PULSE, view, cx);
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(slot / 2.0))
-        .children((0..ZERON_CELLS).map(move |i| {
-            // Fixed slot; the animated cell breathes inside it.
-            div()
-                .size(px(slot))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child({
-                    let phase = motion::staggered_phase(delta, i, PULSE_STAGGER);
-                    div()
-                        .rounded(px(slot / 4.0))
-                        .bg(color)
-                        .opacity(motion::pulse_opacity(phase))
-                        .size(px(slot * motion::pulse_scale(phase)))
-                })
-        }))
+    ZeronLoader {
+        key: SharedString::new_static(id),
+        color: theme.text,
+        cell_px,
+    }
+}
+
+#[derive(IntoElement)]
+struct ZeronLoader {
+    key: SharedString,
+    color: gpui::Hsla,
+    cell_px: f32,
+}
+
+impl RenderOnce for ZeronLoader {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (color, cell_px) = (self.color, self.cell_px);
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<ZeronLoaderView>>, _| {
+                let view =
+                    previous.unwrap_or_else(|| cx.new(|_| ZeronLoaderView { color, cell_px }));
+                view.update(cx, |view, cx| {
+                    if view.color != color || view.cell_px != cell_px {
+                        view.color = color;
+                        view.cell_px = cell_px;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        let width =
+            cell_px * ZERON_CELLS as f32 + (cell_px / 2.0) * ZERON_CELLS.saturating_sub(1) as f32;
+        view.cached(
+            gpui::StyleRefinement::default()
+                .w(px(width))
+                .h(px(cell_px))
+                .flex_none(),
+        )
+    }
+}
+
+struct ZeronLoaderView {
+    color: gpui::Hsla,
+    cell_px: f32,
+}
+
+impl Render for ZeronLoaderView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let color = self.color;
+        let slot = self.cell_px;
+        let delta = motion::pulse_delta(&ZERON_PULSE, cx.entity_id(), cx);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(slot / 2.0))
+            .children((0..ZERON_CELLS).map(move |i| {
+                // Fixed slot; the animated cell breathes inside it.
+                div()
+                    .size(px(slot))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child({
+                        let phase = motion::staggered_phase(delta, i, PULSE_STAGGER);
+                        div()
+                            .rounded(px(slot / 4.0))
+                            .bg(color)
+                            .opacity(motion::pulse_opacity(phase))
+                            .size(px(slot * motion::pulse_scale(phase)))
+                    })
+            }))
+    }
 }
 
 pub use zeron_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
@@ -113,14 +163,61 @@ pub use zeron_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 /// sunrise gradient. Each cell pulses opacity once per 750ms period; the
 /// per-cell phase follows the "arrow-up" pattern (the pulse enters at the
 /// bottom edge and converges toward the top-center cell), so the wave reads
-/// as travelling upward.
+/// as travelling upward. Repaints from its own cached leaf view so enclosing
+/// containers (`TranscriptView`, `Shell`, `Changes`) stay cached while working.
 pub fn gradient_spinner(
-    _id: &'static str,
+    id: &'static str,
     _theme: &Theme,
     cell_px: f32,
-    view: EntityId,
-    cx: &mut App,
+    _view: EntityId,
+    _cx: &mut App,
 ) -> impl IntoElement {
+    GradientSpinner {
+        key: SharedString::new_static(id),
+        cell_px,
+    }
+}
+
+#[derive(IntoElement)]
+struct GradientSpinner {
+    key: SharedString,
+    cell_px: f32,
+}
+
+impl RenderOnce for GradientSpinner {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let cell_px = self.cell_px;
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<GradientSpinnerView>>, _| {
+                let view =
+                    previous.unwrap_or_else(|| cx.new(|_| GradientSpinnerView { cell_px }));
+                view.update(cx, |view, cx| {
+                    if view.cell_px != cell_px {
+                        view.cell_px = cell_px;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        let side = px(
+            cell_px * MATRIX_SIDE as f32 + (cell_px / 2.0) * MATRIX_SIDE.saturating_sub(1) as f32,
+        );
+        view.cached(gpui::StyleRefinement::default().size(side).flex_none())
+    }
+}
+
+struct GradientSpinnerView {
+    cell_px: f32,
+}
+
+impl Render for GradientSpinnerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        gradient_spinner_cells(self.cell_px, cx.entity_id(), cx)
+    }
+}
+
+fn gradient_spinner_cells(cell_px: f32, view: EntityId, cx: &mut App) -> impl IntoElement {
     let center = (MATRIX_SIDE as f32 - 1.0) / 2.0;
     let max = MATRIX_SIDE as f32 - 1.0 + center;
     let pulse = motion::activity_pulse_slow(view, cx);
