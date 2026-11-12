@@ -17,11 +17,13 @@
  */
 import type { Verified } from "./auth";
 
-export const DEFAULT_SESSION_FRESH_MS = 60_000;
-export const DEFAULT_SESSION_GRACE_MS = 15 * 60_000;
+// Internal-tool trade-off: revocation/downgrade lands within the fresh window
+// while Scaffold answers; grace only applies while it cannot answer at all.
+export const DEFAULT_SESSION_FRESH_MS = 10 * 60_000;
+export const DEFAULT_SESSION_GRACE_MS = 24 * 60 * 60_000;
 const MIN_SESSION_FRESH_MS = 100;
-const MAX_SESSION_FRESH_MS = 5 * 60_000;
-const MAX_SESSION_GRACE_MS = 60 * 60_000;
+const MAX_SESSION_FRESH_MS = 60 * 60_000;
+const MAX_SESSION_GRACE_MS = 7 * 24 * 60 * 60_000;
 /** Coordinator and isolate clocks differ slightly; bounds are re-anchored to local time anyway. */
 const MAX_CLOCK_SKEW_MS = 30_000;
 

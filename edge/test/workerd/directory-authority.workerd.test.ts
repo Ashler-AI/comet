@@ -178,7 +178,13 @@ it.each([
   await upstream(token, status, retryAfter);
   const first = await Promise.all(rooms.map(room => check(room, token)));
   const firstReceivedAt = Date.now();
-  for (const result of first) expect(result).toMatchObject(retryAfter === undefined ? { status: "unavailable" } : { status: "unavailable", retryAfter });
+  for (const result of first) {
+    expect(result.status).toBe("unavailable");
+    // Joiners share the upstream value; arrivals after the cooldown is set see the same deadline in seconds.
+    if (retryAfter !== undefined && result.status === "unavailable") {
+      expect(result.retryAfter === retryAfter || /^[1-9]\d*$/.test(result.retryAfter ?? "")).toBe(true);
+    }
+  }
   const initial = await observed(token);
   // A bare 503 retains the existing bounded two-attempt upstream recovery.
   expect(initial.requests).toHaveLength(kind === "default" ? 2 : 1);

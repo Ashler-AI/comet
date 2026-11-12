@@ -134,7 +134,7 @@ describe("Scaffold slow or unavailable", () => {
     const bearer = token("owner");
     const { socket, close } = await socketFor(env, bearer);
     set(bearer, { status: 503 });
-    for (const offset of [FRESH + 1, 5 * 60_000, GRACE - 1]) {
+    for (const offset of [FRESH + 1, FRESH + 60 * 60_000, GRACE - 1]) {
       at(offset);
       resetIsolateScaffoldSessions(); // every request on a cold isolate: the coordinator record answers
       expect((await check(env, bearer)).status, `t+${offset}`).toBe("authenticated");
@@ -353,7 +353,7 @@ describe("tenancy and bounds", () => {
   it("clamps operator policy to safe bounds", () => {
     expect(sessionPolicy({})).toEqual({ freshMs: FRESH, graceMs: GRACE });
     expect(sessionPolicy({ SCAFFOLD_SESSION_FRESH_MS: "5", SCAFFOLD_SESSION_GRACE_MS: "1" })).toEqual({ freshMs: 100, graceMs: 100 });
-    expect(sessionPolicy({ SCAFFOLD_SESSION_FRESH_MS: "99999999", SCAFFOLD_SESSION_GRACE_MS: "999999999" })).toEqual({ freshMs: 300_000, graceMs: 3_600_000 });
+    expect(sessionPolicy({ SCAFFOLD_SESSION_FRESH_MS: "99999999", SCAFFOLD_SESSION_GRACE_MS: "999999999" })).toEqual({ freshMs: 3_600_000, graceMs: 604_800_000 });
     expect(sessionPolicy({ SCAFFOLD_SESSION_FRESH_MS: "-1", SCAFFOLD_SESSION_GRACE_MS: "1e9" })).toEqual({ freshMs: FRESH, graceMs: GRACE });
   });
 
