@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import worker from "./index";
 import { AUTH_USER_HEADER, type Env } from "./env";
 import { requestAuthority } from "./authority";
-import { AuthGrant } from "./auth-routes";
+import { AuthGrant, resetIsolateScaffoldSessions } from "./auth-routes";
 
 const session = "01956000-0000-7000-8000-000000000001";
 const authorityEnv = (): Env => {
@@ -30,7 +30,7 @@ const authorityEnv = (): Env => {
   } as unknown as DurableObjectNamespace;
   return env;
 };
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); resetIsolateScaffoldSessions(); });
 
 it("reads existing chat2 ownership, strips forged claims, and fails closed", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({

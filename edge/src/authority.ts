@@ -93,7 +93,10 @@ export const requestAuthority = (request: Request): SocketAuthority | undefined 
   return value ? JSON.parse(value) as SocketAuthority : undefined;
 };
 
-/** Revalidate before receiving AND delivering data: silent revoked readers receive no further rows. */
+/** Revalidate before receiving AND delivering data: silent revoked readers receive no further rows.
+ * Scaffold sessions revalidate through bounded reuse (scaffold-session.ts): a revoked or
+ * narrowed session closes within one fresh period; an unreachable authority closes 1013
+ * only after the grace bound of the last successful verification. */
 export const socketAuthorized = async (env: Env, ws: WebSocket): Promise<boolean> => {
   const state = ws.deserializeAttachment() as { authority?: SocketAuthority } | null;
   if (!state?.authority) {
@@ -122,8 +125,8 @@ export const socketAuthorized = async (env: Env, ws: WebSocket): Promise<boolean
 
 type SocketData = string | ArrayBuffer | Uint8Array;
 const sends = new WeakMap<WebSocket, SocketData[]>();
-/** A backfill batch shares one fresh check, then sends synchronously in wire order.
- * No positive authority cache survives the batch: revoked silent readers cannot receive later updates. */
+/** A backfill batch shares one check, then sends synchronously in wire order.
+ * Every batch is checked: revoked silent readers receive nothing after the reuse bound. */
 export const sendAuthorized = (env: Env, ctx: DurableObjectState, ws: WebSocket, data: SocketData): void => {
   const pending = sends.get(ws);
   if (pending) { pending.push(data); return; }

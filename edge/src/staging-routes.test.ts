@@ -3,7 +3,7 @@ import worker from "./index";
 import type { Env } from "./env";
 import { authorizeRoute } from "./authority";
 import { fetchReleaseObject } from "./release-feed";
-import { AuthGrant } from "./auth-routes";
+import { AuthGrant, resetIsolateScaffoldSessions } from "./auth-routes";
 
 vi.mock("./release-feed", () => ({ fetchReleaseObject: vi.fn(async () => new Response("private artifact")) }));
 const env = {
@@ -36,7 +36,7 @@ const request = (path: string, method = "GET", token = "sc_rc_existing-stage-cli
   new Request(`https://comet-staging.internal.ashler.com${path}`, {
     method, headers: token ? { authorization: `Bearer ${token}` } : {},
   });
-afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); resetIsolateScaffoldSessions(); });
 
 it("keeps existing staging bearer manifest, archive, signature and installer access behind authentication", async () => {
   authority();

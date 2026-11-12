@@ -7,6 +7,9 @@ export interface Env {
   SCAFFOLD_PROJECT_SCOPE: string;
   SCAFFOLD_DEPLOYMENT_ID: string;
   SCAFFOLD_REQUIRED_CAPABILITIES: string;
+  /** Optional reuse bounds for a verified Scaffold session (ms, clamped; see scaffold-session.ts). */
+  SCAFFOLD_SESSION_FRESH_MS?: string;
+  SCAFFOLD_SESSION_GRACE_MS?: string;
   SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
   PREVIEW_ROOMS: DurableObjectNamespace;

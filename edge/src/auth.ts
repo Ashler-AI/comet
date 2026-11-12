@@ -1,9 +1,10 @@
 /**
  * Authenticates Scaffold control-plane bearers without handling Google/IAP
  * assertions in Comet. Scaffold's IAP-protected OAuth authorize route binds a
- * bearer to an internal principal. HTTP and socket authorization rendezvous in
- * an AUTH_GRANTS coordinator before fresh `/api/code-sandboxes/auth/session`
- * checks, sharing pending work across isolates but never completed authorization.
+ * bearer to an internal principal. HTTP and socket authorization share one
+ * AUTH_GRANTS coordinator per token and configuration. It reuses Scaffold's
+ * last positive `/api/code-sandboxes/auth/session` answer only within the
+ * bounds in scaffold-session.ts. Rejection purges reuse immediately.
  */
 import type { Env } from "./env";
 import { authenticateDeviceToken, verifyScaffoldThroughCoordinator } from "./auth-routes";
@@ -19,6 +20,8 @@ export type ScaffoldAuthEnv = Omit<
     | "SCAFFOLD_REQUIRED_CAPABILITIES"
     | "AUTH_GRANTS"
     | "SCAFFOLD_DEPLOYMENT_ID"
+    | "SCAFFOLD_SESSION_FRESH_MS"
+    | "SCAFFOLD_SESSION_GRACE_MS"
   >,
   "SCAFFOLD_REQUIRED_CAPABILITIES"
 > & {
@@ -45,6 +48,15 @@ export type ScaffoldAuthenticationResult =
   | { status: "authenticated"; identity: Verified }
   | { status: "invalid" }
   | { status: "unavailable"; retryAfter?: string };
+
+/**
+ * Coordinator-internal outcome. `denied` is a definitive authority answer: a
+ * 2xx response that fails the resource, actor or required-capability checks,
+ * or Scaffold's remote-code off switch.
+ * Public callers still see it as `unavailable`, unchanged, but unlike an
+ * unreachable authority it purges reuse instead of falling back to it.
+ */
+export type ScaffoldVerification = ScaffoldAuthenticationResult | { status: "denied" };
 
 interface ScaffoldSession {
   readonly ok?: unknown;
@@ -122,6 +134,18 @@ export const bearerFromRequest = (request: Request): string | undefined => {
 // ponytail: retain the measured 2,918 ms attempt budget; the shared 8-second
 // envelope also bounds coordinator dispatch, queueing and response decoding.
 const SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS = 2_918;
+
+/** Scaffold answers `404 {"error":"remote_code_sandboxes_disabled"}` while remote code is
+ * switched off (`SCAFFOLD_REMOTE_CODE_ROLLOUT_MODE`). Any other 404 (routing, bridge) is an outage. */
+const remoteCodeDisabled = async (response: Response, signal: AbortSignal): Promise<boolean> => {
+  try {
+    const body = await boundedAuthJson<{ error?: unknown } | null>(response, signal);
+    return body?.error === "remote_code_sandboxes_disabled";
+  } catch {
+    return false;
+  }
+};
+
 const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string, signal?: AbortSignal): Promise<ScaffoldAuthenticationResult> => {
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   return verifyScaffoldThroughCoordinator(env, token, signal);
@@ -130,7 +154,7 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string, si
 /** Called only by the internal grant coordinator with its own trusted bindings. */
 export const verifyScaffoldSessionResult = async (
   env: ScaffoldAuthEnv, token: string, signal: AbortSignal
-): Promise<ScaffoldAuthenticationResult> => {
+): Promise<ScaffoldVerification> => {
   if (!scaffoldTokenFits(token)) return { status: "unavailable", retryAfter: "1" };
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
@@ -156,7 +180,8 @@ export const verifyScaffoldSessionResult = async (
         controller.signal.throwIfAborted();
       }
       if (!response.ok) {
-        await response.body?.cancel();
+        const disabled = response.status === 404 && await remoteCodeDisabled(response, controller.signal);
+        if (response.status !== 404) await response.body?.cancel();
         const cfRay = response.headers.get("cf-ray");
         const retryAfter = response.headers.get("retry-after");
         // Fixed fields keep each event below 256 bytes; upstream strings are untrusted.
@@ -169,6 +194,9 @@ export const verifyScaffoldSessionResult = async (
         // Only explicit credential rejection revokes state. Preserve authority
         // Retry-After exactly, and never amplify throttling with another attempt.
         if (response.status === 401 || response.status === 403) return { status: "invalid" };
+        // Scaffold's off switch is a decision, not an outage: end reuse like a revocation,
+        // but keep the public 503 so sessions recover once it is switched back on.
+        if (disabled) return { status: "denied" };
         if (retryAfter !== null) {
           if (retryAfter.length > SCAFFOLD_JSON_BYTES || new TextEncoder().encode(retryAfter).byteLength > SCAFFOLD_JSON_BYTES) {
             return { status: "unavailable", retryAfter: "1" };
@@ -192,7 +220,8 @@ export const verifyScaffoldSessionResult = async (
       signal.removeEventListener("abort", abort);
     }
   }
-  if (!session || typeof session !== "object") return { status: "unavailable" };
+  // An undecodable body is a failed exchange; a decoded answer is definitive.
+  if (!session || typeof session !== "object" || Array.isArray(session)) return { status: "unavailable" };
   const subject = typeof session.actor?.sub === "string" ? session.actor.sub.trim().toLowerCase() : "";
   const scopes = Array.isArray(session.scopes)
     ? [...new Set(session.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0))]
@@ -205,7 +234,7 @@ export const verifyScaffoldSessionResult = async (
     normalizedOrigin(typeof session.resource === "string" ? session.resource : "") !== resource ||
     !required.every((capability) => capabilities.includes(capability))
   ) {
-    return { status: "unavailable" };
+    return { status: "denied" };
   }
   return {
     status: "authenticated",

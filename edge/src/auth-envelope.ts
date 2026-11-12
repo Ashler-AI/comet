@@ -1,5 +1,3 @@
-import type { ScaffoldAuthenticationResult } from "./auth";
-
 // One isolate-wide budget, shared by dispatchers and every AuthGrant instance.
 // Nested same-isolate dispatch consumes two slots, never a second budget.
 // Dispatch uses at most half, leaving headroom for its same-isolate coordinators.
@@ -47,12 +45,15 @@ export async function boundedAuthJson<T>(message: Request | Response, signal: Ab
   }
 }
 
+export interface AdmissionUnavailable { status: "unavailable"; retryAfter: "1" }
+
 /** Return promptly on abort, but charge the slot until ALL retained work settles. */
-export async function scaffoldAdmission(
+export async function scaffoldAdmission<T>(
   kind: "dispatch" | "coordinator",
   signal: AbortSignal | undefined,
-  operation: (signal: AbortSignal) => Promise<ScaffoldAuthenticationResult>
-): Promise<ScaffoldAuthenticationResult> {
+  operation: (signal: AbortSignal) => Promise<T>,
+  deadlineMs: number = SCAFFOLD_DEADLINE_MS
+): Promise<T | AdmissionUnavailable> {
   if (signal?.aborted || admitted >= SCAFFOLD_ADMISSIONS || (kind === "dispatch" && dispatched >= SCAFFOLD_ADMISSIONS / 2)) {
     return { status: "unavailable", retryAfter: "1" };
   }
@@ -60,14 +61,14 @@ export async function scaffoldAdmission(
   if (kind === "dispatch") dispatched++;
   const controller = new AbortController();
   const abort = () => { controller.abort(); };
-  const timer = setTimeout(abort, SCAFFOLD_DEADLINE_MS);
+  const timer = setTimeout(abort, Math.min(deadlineMs, SCAFFOLD_DEADLINE_MS));
   signal?.addEventListener("abort", abort, { once: true });
   let onAbort!: () => void;
-  const cancelled = new Promise<ScaffoldAuthenticationResult>(resolve => {
+  const cancelled = new Promise<AdmissionUnavailable>(resolve => {
     onAbort = () => { resolve({ status: "unavailable", retryAfter: "1" }); };
     controller.signal.addEventListener("abort", onAbort, { once: true });
   });
-  const work = (async (): Promise<ScaffoldAuthenticationResult> => {
+  const work = (async (): Promise<T | AdmissionUnavailable> => {
     try {
       return await operation(controller.signal);
     } catch {

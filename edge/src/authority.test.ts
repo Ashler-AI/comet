@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticateResult, verifyScaffoldSessionResult, type Verified } from "./auth";
-import { AuthGrant, authenticateDeviceToken, handleAuthenticatedAuthRoute, handlePublicAuthRoute, scaffoldVerificationName, verifyScaffoldThroughCoordinator } from "./auth-routes";
+import { AuthGrant, authenticateDeviceToken, handleAuthenticatedAuthRoute, handlePublicAuthRoute, resetIsolateScaffoldSessions, scaffoldVerificationName, verifyScaffoldThroughCoordinator } from "./auth-routes";
 import { boundedAuthJson, scaffoldAdmission, SCAFFOLD_JSON_BYTES, SCAFFOLD_TOKEN_BYTES } from "./auth-envelope";
+import { DEFAULT_SESSION_FRESH_MS } from "./scaffold-session";
 import { authorizeRoute, requestAuthority, scopedRpcAllowed, socketAuthorized, sendAuthorized, stampRpcAuthority, trustedRequest } from "./authority";
 import type { Env } from "./env";
 
@@ -29,7 +30,7 @@ const authorityEnv = (overrides: Partial<Env> = {}): Env => {
   return env;
 };
 let config: Env;
-beforeEach(() => { config = authorityEnv(); });
+beforeEach(() => { config = authorityEnv(); resetIsolateScaffoldSessions(); });
 const req = (path: string, method = "GET") => new Request(`https://edge.example${path}`, { method });
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -134,7 +135,7 @@ describe("scoped transport authority", () => {
     expect(result.status === "authenticated" && result.identity.userId).toBe(identity.userId);
     expect(fetcher.mock.calls[0][1].redirect).toBe("manual");
   });
-  it("shares only in-flight equivalent verification through decoding and rechecks revocation", async () => {
+  it("shares in-flight equivalent verification through decoding and rechecks revocation after the fresh bound", async () => {
     const session = { ok: true, actor: { sub: identity.userId, auth: "iap" }, resource: config.SCAFFOLD_CONTROL_PLANE_URL, scopes: ["remote_code:read"] };
     let release!: () => void, decodingStarted!: () => void;
     const bodyReady = new Promise<void>(resolve => { release = resolve; });
@@ -174,8 +175,16 @@ describe("scoped transport authority", () => {
     expect(capabilities).toEqual({ status: "unavailable" });
     expect(fetcher).toHaveBeenCalledTimes(2);
     fetcher.mockResolvedValue(new Response("", { status: 401 }));
+    // Within the fresh bound the verified session is reused without Scaffold.
+    expect((await authenticateResult(config as Env, request())).status).toBe("authenticated");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + DEFAULT_SESSION_FRESH_MS + 1);
     expect(await authenticateResult(config as Env, request())).toEqual({ status: "invalid" });
     expect(fetcher).toHaveBeenCalledTimes(3);
+    // A just-rejected token is held briefly, then checked fresh again; never reused.
+    expect(await authenticateResult(config as Env, request())).toEqual({ status: "invalid" });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    clock.mockReturnValue(Date.now() + 2_001);
     expect(await authenticateResult(config as Env, request())).toEqual({ status: "invalid" });
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
@@ -189,7 +198,9 @@ describe("scoped transport authority", () => {
     vi.stubGlobal("fetch", fetcher);
     const request = (token = "sc_rc_test") => new Request("https://edge.example/auth/session", { headers: { authorization: `Bearer ${token}` } });
     const results = await Promise.all(Array.from({ length: 12 }, () => authenticateResult({ ...config }, request())));
-    expect(results).toEqual(Array.from({ length: 12 }, () => ({ status: "unavailable", retryAfter })));
+    // Joiners share the upstream value; arrivals after it settled see the same deadline in seconds.
+    expect(results[0]).toEqual({ status: "unavailable", retryAfter });
+    for (const result of results) expect([retryAfter, "2"]).toContain(result.status === "unavailable" ? result.retryAfter : undefined);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect((await authenticateResult(config, request("sc_rc_other"))).status).toBe("authenticated");
     clock.mockReturnValue(start + 1999);
@@ -291,9 +302,12 @@ describe("scoped transport authority", () => {
     const result = await authenticateResult(config as Env, request);
     expect(result.status === "authenticated" && result.identity.userId).toBe(identity.userId);
     expect(fetcher).toHaveBeenCalledTimes(2);
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start + DEFAULT_SESSION_FRESH_MS + 1);
+    // A definitive answer without the required scope keeps the public 503 but is never reused.
     expect(await authenticateResult(config as Env, request)).toEqual({ status: "unavailable" });
     expect(fetcher).toHaveBeenCalledTimes(3);
-    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 1001);
+    clock.mockReturnValue(start + DEFAULT_SESSION_FRESH_MS + 2_002);
     expect(await authenticateResult(config as Env, request)).toEqual({ status: "unavailable" });
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
@@ -321,6 +335,7 @@ describe("scoped transport authority", () => {
     expect(send.mock.calls).toEqual([["first"], ["second"]]);
     expect(fetcher).toHaveBeenCalledTimes(1);
     fetcher.mockImplementation(async () => new Response("", { status: 401 }));
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + DEFAULT_SESSION_FRESH_MS + 1);
     sendAuthorized(config as Env, ctx, socket, "revoked");
     await Promise.all(work);
     expect(send).toHaveBeenCalledTimes(2);
@@ -581,8 +596,11 @@ describe("Scaffold coordinator resource envelope", () => {
     const name = await scaffoldVerificationName(config, "sc_rc_cancel");
     const coordinator = config.AUTH_GRANTS.get(config.AUTH_GRANTS.idFromName(name));
     const call = (signal: AbortSignal) => coordinator.fetch("https://grant.internal/verify-scaffold", { method: "POST", body: JSON.stringify({ token: "sc_rc_cancel" }), signal });
-    const one = call(first.signal), two = call(second.signal);
+    const one = call(first.signal);
     await ready;
+    const two = call(second.signal);
+    // Let the second caller join the in-flight check before the first leaves.
+    await new Promise(resolve => setTimeout(resolve, 20));
     first.abort();
     expect(await (await one).json()).toEqual({ status: "unavailable", retryAfter: "1" });
     expect(authoritySignal.aborted).toBe(false);
@@ -620,9 +638,14 @@ describe("Scaffold coordinator resource envelope", () => {
     release(new Response(null, { status: 401 }));
     expect(await Promise.all(pending.map(async response => (await response).json()))).toEqual(Array.from({ length: 32 }, () => ({ status: "invalid" })));
     fetcher.mockImplementation(async () => new Response(null, { status: 403 }));
-    expect(await (await coordinator.fetch("https://grant.internal/verify-scaffold", {
+    const verify = async () => (await coordinator.fetch("https://grant.internal/verify-scaffold", {
       method: "POST", body: JSON.stringify({ token })
-    })).json()).toEqual({ status: "invalid" });
+    })).json();
+    // The rejection hold answers an immediate re-check; afterwards Scaffold decides again.
+    expect(await verify()).toEqual({ status: "invalid" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_001);
+    expect(await verify()).toEqual({ status: "invalid" });
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
