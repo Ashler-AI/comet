@@ -225,6 +225,13 @@ primary Scaffold can be built from those exact bytes before `production-deployed
 is acknowledged. Both production targets refuse any other bucket. Staging
 publication never authorizes a production action.
 
+`scaffold_runtime_deployment=desktop-ahead-of-scaffold` with
+`release_surface=desktop` releases the desktop app across a runtime-contract change
+while Scaffold keeps its deployed contract. Only desktop channels move. The guard
+rejects that acknowledgement for `desktop-and-scaffold`, so it can never publish a
+Scaffold runtime. Desktop launches on a mismatched Scaffold fail with
+`scaffold_runtime_contract_mismatch` until Scaffold is deployed.
+
 The compatibility baseline is the moving `scaffold-manifest.json`, not the last
 versioned candidate or the checked-in runtime marker. A moving v1 channel still
 requires `staging-deployed` before promotion of verified v2 support.

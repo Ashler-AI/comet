@@ -518,6 +518,54 @@ describe("release channel publication", () => {
     assert.equal(readFileSync(path.join(releases, "desktop-latest.txt"), "utf8"), "0.1.156");
   });
 
+  it("releases the desktop app ahead of Scaffold without moving any Scaffold channel", async (t) => {
+    const workflow = await read(".github/workflows/release.yml");
+    const script = shellStep(workflow, "publish-production", "publish");
+    const { dir, bucket, env } = publicationFixture(t);
+    const releases = path.join(bucket, "releases");
+    const desktopManifest = path.join(dir, "candidate/desktop-manifest.json");
+    writeFileSync(desktopManifest, JSON.stringify({
+      ...JSON.parse(readFileSync(desktopManifest, "utf8")), scaffoldRuntimeVersion: "scaffold.comet-runtime.v2",
+    }));
+    mkdirSync(releases);
+    const current = JSON.stringify({ schemaVersion: 2, version: "0.1.50", scaffoldRuntimeVersion: "scaffold.comet-runtime.v1", files: {} });
+    writeFileSync(path.join(releases, "scaffold-manifest.json"), current);
+    writeFileSync(path.join(releases, "manifest.json"), current);
+    for (const pointer of ["desktop-latest.txt", "scaffold-latest.txt", "latest.txt"]) writeFileSync(path.join(releases, pointer), "0.1.50");
+    // The hosted runner's `dpkg --compare-versions A gt B`, for numeric dotted versions.
+    writeFileSync(path.join(dir, "bin/dpkg"), `#!${process.execPath}
+const [flag, a, op, b] = process.argv.slice(2);
+if (flag !== "--compare-versions" || op !== "gt") process.exit(2);
+const [x, y] = [a, b].map(v => v.split(".").map(Number));
+for (let i = 0; i < Math.max(x.length, y.length); i++) {
+  if ((x[i] ?? 0) !== (y[i] ?? 0)) process.exit((x[i] ?? 0) > (y[i] ?? 0) ? 0 : 1);
+}
+process.exit(1);
+`, { mode: 0o755 });
+    const production = {
+      ...env, PROMOTION_TARGET: "production", COMET_RELEASES_GCS_BUCKET: "ashler-comet-releases-production",
+      SCAFFOLD_RUNTIME_DEPLOYMENT: "desktop-ahead-of-scaffold",
+    };
+
+    // The acknowledgement never carries the Scaffold runtime with it.
+    const both = command(dir, "bash", ["-c", script], { ...production, RELEASE_SURFACE: "desktop-and-scaffold" });
+    assert.notEqual(both.status, 0);
+    assert.equal(readFileSync(path.join(releases, "desktop-latest.txt"), "utf8"), "0.1.50");
+
+    const desktop = command(dir, "bash", ["-c", script], { ...production, RELEASE_SURFACE: "desktop" });
+    assert.equal(desktop.status, 0, desktop.stderr);
+    assert.match(desktop.stdout, /desktop scaffold\.comet-runtime\.v2 ahead of Scaffold scaffold\.comet-runtime\.v1/);
+    assert.equal(readFileSync(path.join(releases, "desktop-latest.txt"), "utf8"), VERSION);
+    assert.deepEqual(readFileSync(path.join(releases, "desktop-manifest.json")), readFileSync(desktopManifest));
+    assert.equal(readFileSync(path.join(releases, "scaffold-manifest.json"), "utf8"), current);
+    assert.equal(readFileSync(path.join(releases, "manifest.json"), "utf8"), current);
+    for (const pointer of ["scaffold-latest.txt", "latest.txt"]) {
+      assert.equal(readFileSync(path.join(releases, pointer), "utf8"), "0.1.50");
+    }
+    const readback = shellStep(workflow, "publish-production", "readback-production");
+    assert.equal(command(dir, "bash", ["-c", readback], { ...production, RELEASE_SURFACE: "desktop" }).status, 0);
+  });
+
   it("does not move either desktop channel when staging would move backwards", async (t) => {
     const { dir, bucket, env } = publicationFixture(t);
     const releases = path.join(bucket, "releases");

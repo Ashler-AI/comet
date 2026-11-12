@@ -84,3 +84,23 @@ Each production step needs point-of-execution approval. Both `comet-production`
 Everything up to step 4 is additive and invisible to existing users. Step 5 moves
 production channels, and they never move backward, so recovering after step 5 means a
 newer forward release.
+
+## 2026-11-12 attempt: Scaffold rolled back, desktop shipped ahead
+
+Steps 1–3 completed. Step 4 rolled every primary Scaffold service, the sandbox
+provider and the template forward from `master` (lock `f2118967eb`). From 21:42Z to
+22:31Z, no new session of any runtime profile became ready:
+
+- The provider's readiness writes and ingress releases to the control plane timed out.
+- Control-plane session Durable Objects carried 3–4× their normal requests, with p99
+  wall time up to 6 s.
+
+This is a regression in `master`'s Scaffold services, not native Crew: non-Crew sessions
+failed too. ashler-platform #13360 restored the previous lock, and the control-plane
+Worker was rolled back to its legacy-config version. #13368 reverts the primary chat2
+config until a retry.
+
+The desktop app ships ahead of Scaffold instead: `release_surface=desktop`,
+`scaffold_runtime_deployment=desktop-ahead-of-scaffold`, reusing the staging candidate
+run. Production Scaffold stays on the v1 runtime. Retrying step 4 needs that regression
+reproduced and fixed in staging with the exact `master` images first.
