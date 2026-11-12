@@ -88,9 +88,12 @@ holds the dispatcher and coordinator. `edge/src/auth.ts` classifies outcomes.
 - **Unavailable** (transport, timeout, 408/429/5xx, admission, coordinator unreachable from a
   warm isolate): serve the last verification until `verifiedAt + 24 h`, never extended by
   serving. The isolate then waits 5 s before asking again.
-- **Definitive:** 401/403 → purge plus `invalid` (401). A decoded 2xx that fails the resource,
-  actor or required-capability checks is the new internal `denied`. It purges, keeps the public
-  503 (unchanged contract), and is never served stale. Both hold for 2 s to collapse bursts.
+- **Definitive:** 401/403 → purge plus `invalid` (401). The new internal `denied` covers two
+  cases: a decoded 2xx that fails the resource, actor or required-capability checks, and
+  Scaffold's remote-code off switch (`404 {"error":"remote_code_sandboxes_disabled"}`, the only
+  non-ok body the edge reads). `denied` purges, keeps the public 503 (unchanged contract, so
+  engines keep their sign-in and recover when the switch is back on) and is never served stale.
+  Any other 404 (routing, bridge) stays an outage. Both outcomes hold for 2 s to collapse bursts.
 - **Durability:** the coordinator persists its one record (`scaffold-session` key) with an alarm
   at the grace bound. Restarts keep the bound; rejection deletes it.
 - **Mid-deploy:** a positive reply without bounds (old coordinator) authorizes that request only.
@@ -140,11 +143,11 @@ separately, because the engine amplified the outage:
 1. Fresh 10 min / grace 24 h (relaxed from 60 s / 15 min for an internal tool). Grace bounds
    how long a revoked token keeps working during an outage, including one an attacker pushes into
    429 at Scaffold. The token's last real verification still anchors it.
-2. Kill switches. With a long grace, making Scaffold's `/auth/session` *unavailable* no longer cuts
-   edge access promptly. That covers turning off remote code (Scaffold returns 404
-   `remote_code_sandboxes_disabled`, classified as unavailable) or taking the bridge down.
-   Revoking the token (403) still does, within fresh. If an "off" switch must be immediate, map that
-   specific 404 to `denied`.
+2. Kill switches (resolved). Turning off remote code in Scaffold (`SCAFFOLD_REMOTE_CODE_ROLLOUT_MODE`)
+   and revoking a token (403) both end edge access at the next check, within the 10 min fresh
+   window. Neither is instant: an instant cut needs Scaffold to notify the edge, or a shorter fresh
+   window. Taking the bridge down is an outage by definition, so it no longer cuts access within
+   grace.
 3. Whether `denied` should become a public 403 instead of today's 503 (client-visible change).
 4. Cold isolates still need the coordinator hop. If that hop is what degraded (the 8 s here was
    at the dispatcher while the DO's own wall time stayed short), only option B removes it.

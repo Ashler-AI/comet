@@ -16,8 +16,8 @@ const baseConfig = {
 const FRESH = DEFAULT_SESSION_FRESH_MS;
 const GRACE = DEFAULT_SESSION_GRACE_MS;
 
-/** Scaffold `/auth/session`, per bearer. `hang` holds replies until released. */
-interface Upstream { status: number; scopes: string[]; hang: boolean }
+/** Scaffold `/auth/session`, per bearer. `hang` holds replies until released; `body` is a non-200 reply body. */
+interface Upstream { status: number; scopes: string[]; hang: boolean; body?: string }
 let upstream: Map<string, Upstream>;
 let held: Array<() => void>;
 const scaffold = vi.fn(async (url: string, init: RequestInit) => {
@@ -30,7 +30,7 @@ const scaffold = vi.fn(async (url: string, init: RequestInit) => {
       init.signal?.addEventListener("abort", () => { reject(new Error("aborted")); }, { once: true });
     });
   }
-  if (state.status !== 200) return new Response("", { status: state.status });
+  if (state.status !== 200) return new Response(state.body ?? "", { status: state.status });
   return Response.json({ ok: true, resource: new URL(url).origin, actor: { sub: `${token.slice(6)}@example.com`, auth: "iap" }, scopes: state.scopes });
 });
 const token = (user: string, scopes = ["remote_code:read"]) => {
@@ -264,6 +264,43 @@ describe("revocation and capability changes", () => {
     expect(await check(env, bearer)).toEqual({ status: "invalid" });
     // Isolate A's entry is also past fresh, so it consults the coordinator's rejection.
     expect(await check(env, bearer)).toEqual({ status: "invalid" });
+  });
+
+  it("treats Scaffold's remote-code off switch as definitive: access ends at the next refresh and returns once on", async () => {
+    const { env, record } = coordinators();
+    const bearer = token("owner");
+    const { socket, close } = await socketFor(env, bearer);
+    set(bearer, { status: 404, body: JSON.stringify({ error: "remote_code_sandboxes_disabled" }) });
+    at(FRESH - 1);
+    expect((await check(env, bearer)).status).toBe("authenticated"); // the same bound as revocation
+    at(FRESH + 1);
+    expect(await check(env, bearer)).toEqual({ status: "unavailable" }); // public 503, unchanged
+    expect(await record(bearer)).toBeUndefined();
+    // Retryable close: engines keep their sign-in and reconnect once the switch is back on.
+    expect(await socketAuthorized(env, socket)).toBe(false);
+    expect(close).toHaveBeenCalledWith(1013, "authority unavailable");
+    set(bearer, { status: 503, body: undefined });
+    at(FRESH + 10_000);
+    resetIsolateScaffoldSessions();
+    expect(await check(env, bearer)).toMatchObject({ status: "unavailable" }); // a later outage revives nothing
+    set(bearer, { status: 200 });
+    at(FRESH + 20_000);
+    expect((await check(env, bearer)).status).toBe("authenticated");
+  });
+
+  it("keeps any other 404 (routing, bridge) an outage that reuse rides through", async () => {
+    const { env, record } = coordinators();
+    const bearer = token("owner");
+    await check(env, bearer);
+    const bodies = ["", "<html>not found</html>", JSON.stringify({ error: "not_found" }), JSON.stringify(["remote_code_sandboxes_disabled"])];
+    for (const [index, body] of bodies.entries()) {
+      set(bearer, { status: 404, body });
+      at(FRESH + 1 + index * (ISOLATE_RECHECK_MS + 1_000));
+      const calls = scaffoldCalls();
+      expect((await check(env, bearer)).status, body).toBe("authenticated");
+      expect(scaffoldCalls(), body).toBe(calls + 1);
+    }
+    expect(await record(bearer)).toMatchObject({ verifiedAt: start });
   });
 
   it("applies a narrower capability set at the next refresh and closes sockets bound to the wider one", async () => {

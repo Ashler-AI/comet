@@ -51,7 +51,8 @@ export type ScaffoldAuthenticationResult =
 
 /**
  * Coordinator-internal outcome. `denied` is a definitive authority answer: a
- * 2xx response that fails the resource, actor or required-capability checks.
+ * 2xx response that fails the resource, actor or required-capability checks,
+ * or Scaffold's remote-code off switch.
  * Public callers still see it as `unavailable`, unchanged, but unlike an
  * unreachable authority it purges reuse instead of falling back to it.
  */
@@ -133,6 +134,18 @@ export const bearerFromRequest = (request: Request): string | undefined => {
 // ponytail: retain the measured 2,918 ms attempt budget; the shared 8-second
 // envelope also bounds coordinator dispatch, queueing and response decoding.
 const SCAFFOLD_AUTH_ATTEMPT_TIMEOUT_MS = 2_918;
+
+/** Scaffold answers `404 {"error":"remote_code_sandboxes_disabled"}` while remote code is
+ * switched off (`SCAFFOLD_REMOTE_CODE_ROLLOUT_MODE`). Any other 404 (routing, bridge) is an outage. */
+const remoteCodeDisabled = async (response: Response, signal: AbortSignal): Promise<boolean> => {
+  try {
+    const body = await boundedAuthJson<{ error?: unknown } | null>(response, signal);
+    return body?.error === "remote_code_sandboxes_disabled";
+  } catch {
+    return false;
+  }
+};
+
 const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string, signal?: AbortSignal): Promise<ScaffoldAuthenticationResult> => {
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   return verifyScaffoldThroughCoordinator(env, token, signal);
@@ -167,7 +180,8 @@ export const verifyScaffoldSessionResult = async (
         controller.signal.throwIfAborted();
       }
       if (!response.ok) {
-        await response.body?.cancel();
+        const disabled = response.status === 404 && await remoteCodeDisabled(response, controller.signal);
+        if (response.status !== 404) await response.body?.cancel();
         const cfRay = response.headers.get("cf-ray");
         const retryAfter = response.headers.get("retry-after");
         // Fixed fields keep each event below 256 bytes; upstream strings are untrusted.
@@ -180,6 +194,9 @@ export const verifyScaffoldSessionResult = async (
         // Only explicit credential rejection revokes state. Preserve authority
         // Retry-After exactly, and never amplify throttling with another attempt.
         if (response.status === 401 || response.status === 403) return { status: "invalid" };
+        // Scaffold's off switch is a decision, not an outage: end reuse like a revocation,
+        // but keep the public 503 so sessions recover once it is switched back on.
+        if (disabled) return { status: "denied" };
         if (retryAfter !== null) {
           if (retryAfter.length > SCAFFOLD_JSON_BYTES || new TextEncoder().encode(retryAfter).byteLength > SCAFFOLD_JSON_BYTES) {
             return { status: "unavailable", retryAfter: "1" };
