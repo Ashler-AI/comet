@@ -3,9 +3,10 @@
 One upstream-based implementation produces the native desktop and headless Crew
 runtime. Internal Cargo packages and artwork filenames may remain `zeron`; the
 published compatibility executable is **`comet`**. The workspace release is
-**0.2.147**. This release is staging-only: do not publish production or
-repin production Scaffold. The authoritative lifecycle is
-[`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md).
+**0.2.147**. Production still runs legacy 0.1.156. Moving production to native
+follows [`docs/production-native-cutover.md`](../docs/production-native-cutover.md),
+and every production step needs explicit operator approval. The authoritative
+lifecycle is [`skills/comet-work/SKILL.md`](../skills/comet-work/SKILL.md).
 
 ## Brand artwork
 
@@ -217,8 +218,12 @@ release routes and pinned signed identities. Production promotion is a separate
 explicit dispatch, approval environment and bucket; it excludes standalone staging
 assets. Reuse `candidate_run_id` to promote the exact successful prior candidate,
 without rebuilding or re-signing. Provenance, source ancestry, checksums and both
-signed macOS variants must pass verification again. No production action is
-authorized by this staging cutover.
+signed macOS variants must pass verification again. `production-candidate`
+writes only `releases/<version>/*` to `ashler-comet-releases-production`. It moves
+no channel, alias or Scaffold manifest and does not consult the runtime guard, so
+primary Scaffold can be built from those exact bytes before `production-deployed`
+is acknowledged. Both production targets refuse any other bucket. Staging
+publication never authorizes a production action.
 
 The compatibility baseline is the moving `scaffold-manifest.json`, not the last
 versioned candidate or the checked-in runtime marker. A moving v1 channel still

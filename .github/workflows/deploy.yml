@@ -1,8 +1,11 @@
 name: deploy
 
-# Canonical staging candidates only. Deployment uses the comet-staging environment
-# and retains existing release-reader secrets in place. Retained legacy state and
-# rollback are sealed with the native candidate; production has no path here.
+# Native Edge candidates. Staging replaces the canonical staging Worker in place,
+# retaining its legacy state, release-reader secrets and sealed rollback.
+# Production deploys the SEPARATE native Worker `ashler-crew-edge-production`
+# (crew.internal.ashler.com) behind the reviewer-gated comet-production
+# environment. The legacy production Worker (comet.internal.ashler.com) keeps
+# serving legacy Scaffold sessions and is never deployed by this workflow.
 on:
   workflow_dispatch:
     inputs:
@@ -11,17 +14,17 @@ on:
         required: true
         type: string
       target:
-        description: "Build a candidate only, or deploy that exact candidate to native staging"
+        description: "Build candidates only, or deploy the exact candidate to native staging or native production"
         required: true
         default: candidate
         type: choice
-        options: [candidate, staging]
+        options: [candidate, staging, production]
 
 permissions:
   contents: read
 
 concurrency:
-  group: comet-edge-native-staging
+  group: comet-edge-native
   cancel-in-progress: false
 
 defaults:
@@ -29,32 +32,33 @@ defaults:
     shell: bash
 
 jobs:
-  # Refuse unauthorized targets before checkout, tooling or protected secrets.
-  staging-scope:
+  # Refuse unknown targets before checkout, tooling or protected secrets.
+  target-scope:
     if: github.repository_owner == 'Ashler-AI'
     runs-on: ubuntu-24.04
     steps:
       - id: target
-        name: Reject targets outside this staging-only authorization
+        name: Reject targets outside the reviewed native deployments
         env:
           REQUESTED_TARGET: ${{ inputs.target }}
         run: |
           case "$REQUESTED_TARGET" in
-            candidate|staging) ;;
-            *) echo "::error::This native/retained-rollback candidate is staging-only. Production requires independent qualification and authorization."; exit 1 ;;
+            candidate|staging|production) ;;
+            *) echo "::error::Unsupported deployment target. Native candidates deploy only to staging or the separate native production Worker."; exit 1 ;;
           esac
 
   candidate:
     if: github.repository_owner == 'Ashler-AI'
-    needs: staging-scope
+    needs: target-scope
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}
       digest: ${{ steps.candidate.outputs.digest }}
       rollback_digest: ${{ steps.candidate.outputs.rollback_digest }}
+      production_digest: ${{ steps.candidate.outputs.production_digest }}
     steps:
       - id: source_request
-        name: Require reviewed immutable source and staging-only target
+        name: Require reviewed immutable source and a supported target
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           TARGET: ${{ inputs.target }}
@@ -62,7 +66,7 @@ jobs:
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::source_sha must be a full lowercase 40-character commit SHA'; exit 1; }
           [[ "$SOURCE_SHA" = "$GITHUB_SHA" ]] || { echo '::error::source_sha must match the dispatched ref; select that reviewed source with --ref'; exit 1; }
-          case "$TARGET" in candidate|staging) ;; *) echo '::error::unsupported deployment target'; exit 1 ;; esac
+          case "$TARGET" in candidate|staging|production) ;; *) echo '::error::unsupported deployment target'; exit 1 ;; esac
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
@@ -86,8 +90,11 @@ jobs:
         run: npm run types
       - name: Build canonical candidate and forward-retained rollback once
         run: node edge/scripts/staging-artifacts.mjs build "$RUNNER_TEMP/comet-edge-pair"
+      - name: Build the separate native production Worker once
+        working-directory: edge
+        run: npx wrangler deploy --env production --dry-run --outdir "$RUNNER_TEMP/comet-edge-production"
       - id: candidate
-        name: Seal candidate and forward-retained rollback digests
+        name: Seal candidate, forward-retained rollback and production digests
         env:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
@@ -97,13 +104,20 @@ jobs:
               -czf "comet-edge-$kind.tar.gz" -C "$RUNNER_TEMP/comet-edge-pair/$kind" .
             sha256sum "comet-edge-$kind.tar.gz" > "comet-edge-$kind.tar.gz.sha256"
           done
+          test -f "$RUNNER_TEMP/comet-edge-production/production.js"
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -czf comet-edge-production.tar.gz -C "$RUNNER_TEMP/comet-edge-production" .
+          sha256sum comet-edge-production.tar.gz > comet-edge-production.tar.gz.sha256
           digest="$(sha256sum comet-edge-candidate.tar.gz | cut -d' ' -f1)"
           rollback_digest="$(sha256sum comet-edge-rollback.tar.gz | cut -d' ' -f1)"
-          jq -n --arg digest "$digest" --arg rollbackDigest "$rollback_digest" --arg commit "$SOURCE_SHA" \
+          production_digest="$(sha256sum comet-edge-production.tar.gz | cut -d' ' -f1)"
+          jq -n --arg digest "$digest" --arg rollbackDigest "$rollback_digest" --arg productionDigest "$production_digest" \
+            --arg commit "$SOURCE_SHA" \
             --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{schemaVersion:2,sha256:$digest,rollbackSha256:$rollbackDigest,sourceCommit:$commit,workflowRun:$workflowRun,proof:"staging-proof.json"}' \
+            '{schemaVersion:2,sha256:$digest,rollbackSha256:$rollbackDigest,productionSha256:$productionDigest,sourceCommit:$commit,workflowRun:$workflowRun,proof:"staging-proof.json"}' \
             > comet-edge-candidate.provenance.json
           echo "rollback_digest=$rollback_digest" >> "$GITHUB_OUTPUT"
+          echo "production_digest=$production_digest" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -114,6 +128,8 @@ jobs:
             comet-edge-candidate.provenance.json
             comet-edge-rollback.tar.gz
             comet-edge-rollback.tar.gz.sha256
+            comet-edge-production.tar.gz
+            comet-edge-production.tar.gz.sha256
           if-no-files-found: error
 
   staging:
@@ -177,3 +193,73 @@ jobs:
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$CLOUDFLARE_ACCOUNT_ID"
           npx wrangler deploy "$CANDIDATE_ENTRY" --no-bundle --config wrangler.jsonc --env staging
+
+  # The separate native production Worker. comet-production requires reviewer
+  # approval; its Cloudflare credentials are environment secrets of their own.
+  production:
+    if: inputs.target == 'production'
+    needs: candidate
+    runs-on: ubuntu-24.04
+    environment: comet-production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - name: Install locked deploy tooling
+        working-directory: edge
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: comet-edge-candidate-${{ needs.candidate.outputs.sha }}
+      - id: verify
+        name: Verify the exact production candidate against reviewed source
+        env:
+          SOURCE_SHA: ${{ needs.candidate.outputs.sha }}
+          EXPECTED_PRODUCTION_DIGEST: ${{ needs.candidate.outputs.production_digest }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          sha256sum --check comet-edge-production.tar.gz.sha256
+          actual="$(sha256sum comet-edge-production.tar.gz | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_PRODUCTION_DIGEST"
+          jq -e --arg digest "$actual" --arg commit "$SOURCE_SHA" \
+            --arg workflowRun "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '.schemaVersion == 2 and .productionSha256 == $digest and .sourceCommit == $commit and .workflowRun == $workflowRun' \
+            comet-edge-candidate.provenance.json > /dev/null
+          mkdir -p "$RUNNER_TEMP/verified-edge/production"
+          tar -xzf comet-edge-production.tar.gz -C "$RUNNER_TEMP/verified-edge/production"
+          test -f "$RUNNER_TEMP/verified-edge/production/production.js"
+          echo "entry=$RUNNER_TEMP/verified-edge/production/production.js" >> "$GITHUB_OUTPUT"
+      - name: Deploy exact candidate to the separate native production Worker
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CANDIDATE_ENTRY: ${{ steps.verify.outputs.entry }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
+            echo "::error::comet-production needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID environment secrets"
+            exit 1
+          fi
+          npx wrangler deploy "$CANDIDATE_ENTRY" --no-bundle --config wrangler.jsonc --env production
+      - name: Verify the native production origin answers as production
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if body="$(curl -fsS --max-time 10 https://crew.internal.ashler.com/health)" &&
+               jq -e '.ok == true and .auth == "scaffold" and .environment == "production"' <<<"$body" > /dev/null; then
+              echo "Native production Edge is serving: $body"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::crew.internal.ashler.com did not report the native production Edge"
+          exit 1

@@ -1,7 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   // Root deployment stays disabled. Canonical staging retains the captured
-  // account/domain/bucket and original v1/v2 DO lineage; production is absent.
+  // account/domain/bucket and original v1/v2 DO lineage. Native production is a
+  // separate Worker and origin; the legacy production Worker is not managed here.
   "name": "ashler-comet-edge-local-only",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
@@ -71,6 +72,43 @@
         "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
         "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
         "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.chat session.control session.annotate session.invite session.files session.environment"
+      }
+    },
+    // Native production. Legacy `ashler-comet-edge-production` keeps
+    // comet.internal.ashler.com, its Durable Objects and its secrets for legacy
+    // Scaffold sessions; it is only reached here through LEGACY_EDGE release reads.
+    // No APNs key is bound yet, so session notifications are logged, not sent.
+    "production": {
+      "name": "ashler-crew-edge-production",
+      "account_id": "dd15bb23eb5c14365fe2621acc049e01",
+      "main": "src/production.ts",
+      "compatibility_date": "2026-08-04",
+      "compatibility_flags": ["nodejs_compat"],
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [{ "pattern": "crew.internal.ashler.com", "custom_domain": true }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "AUTH_GRANTS", "class_name": "NativeAuthGrant" },
+          { "name": "DEVICE_ROOMS", "class_name": "NativeDeviceRoom" },
+          { "name": "PREVIEW_ROOMS", "class_name": "NativePreviewRoom" },
+          { "name": "REGISTRY_ROOMS", "class_name": "NativeRegistryRoom" },
+          { "name": "CHAT_ROOMS", "class_name": "NativeChatRoom" }
+        ]
+      },
+      "migrations": [
+        { "tag": "native-v1", "new_sqlite_classes": ["NativeAuthGrant", "NativeDeviceRoom", "NativePreviewRoom", "NativeRegistryRoom", "NativeChatRoom"] }
+      ],
+      // Shared with legacy, which writes only att/ and backup/; native is fenced to native-v2/.
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "ashler-comet-production-blobs" }],
+      "services": [{ "binding": "LEGACY_EDGE", "service": "ashler-comet-edge-production" }],
+      "vars": {
+        "AUTH_MODE": "scaffold",
+        "ENVIRONMENT": "production",
+        "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold.internal.ashler.com",
+        "SCAFFOLD_PROJECT_SCOPE": "ashler-production",
+        "SCAFFOLD_DEPLOYMENT_ID": "ashler-production",
+        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.sync.write session.chat session.control session.annotate session.files session.environment"
       }
     }
   },

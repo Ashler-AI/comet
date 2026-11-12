@@ -46,7 +46,9 @@ const PRODUCTION: Defaults = Defaults {
     data_dir: ".crew",
     #[cfg(windows)]
     windows_data_dir: "Crew",
-    edge_url: "https://comet.internal.ashler.com",
+    // Native production Edge. The legacy origin, comet.internal.ashler.com,
+    // keeps serving legacy Scaffold sessions and is never dialed by this build.
+    edge_url: "https://crew.internal.ashler.com",
     scaffold_url: Some("https://scaffold.internal.ashler.com"),
     project_scope: Some("ashler-production"),
     // Canonical main leaves deployment selection to validated device bootstrap.
@@ -83,5 +85,13 @@ mod tests {
                 assert_ne!(flavor.systemd_unit, other.systemd_unit);
             }
         }
+    }
+
+    #[test]
+    fn production_dials_the_native_edge_not_the_legacy_origin() {
+        // comet.internal.ashler.com is the legacy Worker serving legacy Scaffold
+        // sessions; edge/wrangler.jsonc env.production owns the native origin.
+        assert_eq!(PRODUCTION.edge_url, "https://crew.internal.ashler.com");
+        assert_ne!(PRODUCTION.edge_url, "https://comet.internal.ashler.com");
     }
 }
