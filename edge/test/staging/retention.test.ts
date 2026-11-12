@@ -327,7 +327,7 @@ it("admits the published v1 authority profile for archive-v2 native grant issuan
     const rejected = await http("/auth/device-grants", { ...post(request), headers: auth });
     expect(rejected.status).toBe(403);
     expect(await rejected.json()).toEqual({ error: "grant_target_forbidden" });
-    // Authentication may create only its storage-free coordinator, never a device grant or epoch fence.
+    // Authentication may create only its verification coordinator (one bounded session record), never a device grant or epoch fence.
     expect((await mf.listDurableObjectIds("NativeAuthGrant")).map(id => id.toString())).toEqual([
       nativeGrants.idFromName(verificationName).toString()
     ]);

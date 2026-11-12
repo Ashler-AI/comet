@@ -19,6 +19,9 @@ it("directory lookup never claims a chat and observes the actual chat2 owner", a
 });
 
 const runtimeEnv = env as unknown as Env;
+// Short real-clock reuse bounds from vitest.workerd.config.ts bindings.
+const FRESH_MS = Number(runtimeEnv.SCAFFOLD_SESSION_FRESH_MS);
+const GRACE_MS = Number(runtimeEnv.SCAFFOLD_SESSION_GRACE_MS);
 const tokens: string[] = [];
 const sockets: Array<{ socket: WebSocket; room: DurableObjectStub }> = [];
 // Integration timing is intentional: workerd DO timers and the Node outbound
@@ -27,8 +30,8 @@ const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 const consumer = () => env.TEST_LOG.get(env.TEST_LOG.idFromName(crypto.randomUUID()));
 const controlUrl = (token: string) => `https://authority-test.internal/?token=${encodeURIComponent(token)}`;
 type UpstreamState = { status: number; retryAfter?: string; requests: Array<{ at: number; url: string }> };
-const upstream = async (token: string, status: number, retryAfter?: string): Promise<UpstreamState> => {
-  const response = await fetch(controlUrl(token), { method: "POST", body: JSON.stringify({ status, retryAfter }) });
+const upstream = async (token: string, status: number, retryAfter?: string, scopes?: string[]): Promise<UpstreamState> => {
+  const response = await fetch(controlUrl(token), { method: "POST", body: JSON.stringify({ status, retryAfter, scopes }) });
   expect(response.status).toBe(200);
   return response.json<UpstreamState>();
 };
@@ -65,7 +68,7 @@ afterEach(async () => {
   }));
 });
 
-it("bounds continuous cross-DO verification waves and freshly verifies sequential batches", async () => {
+it("reuses one verification across DO waves within the fresh bound and rechecks revocation after it", async () => {
   const token = await newToken();
   const rooms = Array.from({ length: 4 }, consumer);
   await Promise.all(rooms.map(async (room, index) => {
@@ -82,17 +85,19 @@ it("bounds continuous cross-DO verification waves and freshly verifies sequentia
     }
   }));
   const completed = await observed(token);
-  expect(completed.requests.length).toBeGreaterThanOrEqual(3);
-  expect(completed.requests.length).toBeLessThanOrEqual(4);
+  // Twelve checks across four DOs share one Scaffold answer (a slow runner may cross one fresh bound).
+  expect(completed.requests.length).toBeGreaterThanOrEqual(1);
+  expect(completed.requests.length).toBeLessThanOrEqual(2);
   expect(completed.requests.every(request => request.url === "https://authority.example/api/code-sandboxes/auth/session")).toBe(true);
 
-  // Completed successes (and explicit rejections) are not a positive or negative TTL.
+  // Reuse ends at the fresh bound: the next check asks Scaffold and sees the revocation.
   await upstream(token, 401);
-  for (let wave = 1; wave <= 2; wave++) {
-    expect(await check(rooms[wave], token)).toEqual({ status: "invalid" });
-    const state = await observed(token);
-    expect(state.requests).toHaveLength(completed.requests.length + wave);
-  }
+  await pause(FRESH_MS + 50);
+  expect(await check(rooms[1], token)).toEqual({ status: "invalid" });
+  expect((await observed(token)).requests).toHaveLength(completed.requests.length + 1);
+  // An immediate re-check is answered by the short rejection hold, never by reuse.
+  expect(await check(rooms[2], token)).toEqual({ status: "invalid" });
+  expect((await observed(token)).requests).toHaveLength(completed.requests.length + 1);
 
   const name = await scaffoldVerificationName(runtimeEnv, token);
   const coordinator = env.AUTH_GRANTS.get(env.AUTH_GRANTS.idFromName(name));
@@ -110,11 +115,16 @@ it("keeps same-isolate dispatch bursts live through the real coordinator binding
   expect(first.slice(16)).toEqual(Array.from({ length: 48 }, () => ({ status: "unavailable", retryAfter: "1" })));
   const completed = (await observed(token)).requests.length;
   expect(completed).toBeGreaterThanOrEqual(1);
+  // Past fresh, the whole burst shares this isolate's single coordinator consultation.
   await upstream(token, 401);
-  const recovered = await burst();
-  expect(recovered.slice(0, 16)).toEqual(Array.from({ length: 16 }, () => ({ status: "invalid" })));
-  expect(recovered.slice(16)).toEqual(Array.from({ length: 48 }, () => ({ status: "unavailable", retryAfter: "1" })));
-  expect((await observed(token)).requests.length).toBeGreaterThan(completed);
+  await pause(FRESH_MS + 50);
+  expect(await burst()).toEqual(Array.from({ length: 64 }, () => ({ status: "invalid" })));
+  expect((await observed(token)).requests.length).toBe(completed + 1);
+  // Capacity recovered: a cold token is admitted within the same dispatch budget.
+  const other = await newToken();
+  const cold = await Promise.all(Array.from({ length: 64 }, () => verifyScaffoldThroughCoordinator(runtimeEnv, other)));
+  expect(cold.slice(0, 16).every(result => result.status === "authenticated")).toBe(true);
+  expect(cold.slice(16)).toEqual(Array.from({ length: 48 }, () => ({ status: "unavailable", retryAfter: "1" })));
 }, 10_000);
 
 it("shares HTTP, inbound socket, and outbound batch checks without delivering to revoked silent readers", async () => {
@@ -142,9 +152,11 @@ it("shares HTTP, inbound socket, and outbound batch checks without delivering to
   await expect.poll(() => readers.map(reader => reader.frames)).toEqual(Array.from({ length: 3 }, () => ["first", "second"]));
   await expect.poll(() => runInDurableObject(rooms[0], (_instance, state) => state.storage.get("authorizedMessage"))).toBe("accepted");
   const accepted = await observed(token);
-  expect(accepted.requests).toHaveLength(2);
+  // Connects, frames and batches within the fresh bound reuse the one verification.
+  expect(accepted.requests.length).toBeLessThanOrEqual(2);
 
   await upstream(token, 401);
+  await pause(FRESH_MS + 50);
   readers[0].socket.send("forbidden");
   const revokedHttp = check(rooms[3], token);
   // Readers 1 and 2 never send anything, including after revocation.
@@ -153,7 +165,7 @@ it("shares HTTP, inbound socket, and outbound batch checks without delivering to
   await expect.poll(() => readers.map(reader => reader.closed)).toEqual([[4401], [4401], [4401]]);
   expect(readers.map(reader => reader.frames)).toEqual(Array.from({ length: 3 }, () => ["first", "second"]));
   expect(await runInDurableObject(rooms[0], (_instance, state) => state.storage.get("authorizedMessage"))).toBe("accepted");
-  expect((await observed(token)).requests).toHaveLength(3);
+  expect((await observed(token)).requests).toHaveLength(accepted.requests.length + 1);
 }, 10_000);
 
 it.each([
@@ -208,8 +220,9 @@ it.each([
   expect(recovered.requests).toHaveLength(latest.requests.length + 1);
   expect(recovered.requests[recovered.requests.length - 1].at).toBeGreaterThanOrEqual(deadline);
 
-  // A completed recovery is not cached, even if no boundary request recovered.
+  // A recovery is reused only within the fresh bound; afterwards revocation is seen at once.
   await upstream(token, 401);
+  await pause(FRESH_MS + 50);
   expect(await check(consumer(), token)).toEqual({ status: "invalid" });
   const revoked = await observed(token);
   expect(revoked.requests).toHaveLength(recovered.requests.length + 1);
@@ -265,6 +278,61 @@ it("enforces coordinator JSON and UTF-8 token ceilings on the real binding", asy
   expect((await observed(token)).requests).toHaveLength(0);
   expect(await (await call(exact)).json()).toMatchObject({ status: "authenticated" });
   await upstream(token, 401);
+  await pause(FRESH_MS + 50);
   expect(await (await call(exact)).json()).toEqual({ status: "invalid" });
   expect((await observed(token)).requests).toHaveLength(2);
 });
+
+const openSocket = async (room: DurableObjectStub, token: string) => {
+  const response = await room.fetch("https://consumer.internal/authority/ws", {
+    headers: { authorization: `Bearer ${token}`, upgrade: "websocket" }
+  });
+  expect(response.status).toBe(101);
+  const socket = response.webSocket!;
+  socket.accept();
+  sockets.push({ socket, room });
+  const frames: string[] = [];
+  const closed: number[] = [];
+  socket.addEventListener("message", event => { frames.push(String(event.data)); });
+  socket.addEventListener("close", event => { closed.push(event.code); });
+  return { socket, frames, closed };
+};
+
+it("keeps a verified session and its sockets working through an upstream outage until the grace bound", async () => {
+  const token = await newToken();
+  const room = consumer();
+  const reader = await openSocket(room, token);
+  await upstream(token, 503);
+  await pause(FRESH_MS + 50);
+  // Past fresh with Scaffold failing: HTTP, inbound frames and delivery all continue.
+  expect((await check(consumer(), token)).status).toBe("authenticated");
+  reader.socket.send("during-outage");
+  await expect.poll(() => runInDurableObject(room, (_instance, state) => state.storage.get("authorizedMessage"))).toBe("during-outage");
+  await send(room, ["delivered-during-outage"]);
+  await expect.poll(() => reader.frames).toEqual(["delivered-during-outage"]);
+  expect(reader.closed).toEqual([]);
+
+  // At the grace bound the edge fails closed, retryably: 503 and a 1013 close, never 4401.
+  await pause(GRACE_MS);
+  expect((await check(consumer(), token)).status).toBe("unavailable");
+  await send(room, ["after-grace"]);
+  await expect.poll(() => reader.closed).toEqual([1013]);
+  expect(reader.frames).toEqual(["delivered-during-outage"]);
+}, 10_000);
+
+it("applies a capability downgrade at the next refresh and closes sockets bound to the wider grant", async () => {
+  const token = `sc_rc_${crypto.randomUUID()}`;
+  tokens.push(token);
+  await upstream(token, 200, undefined, ["remote_code:read", "remote_code:write"]);
+  const room = consumer();
+  const wide = await check(room, token);
+  expect(wide.status === "authenticated" && wide.identity.capabilities).toEqual(["session.read", "session.chat", "session.annotate", "session.files"]);
+  const reader = await openSocket(room, token);
+  await upstream(token, 200, undefined, ["remote_code:read"]);
+  await pause(FRESH_MS + 50);
+  const narrow = await check(consumer(), token);
+  expect(narrow.status === "authenticated" && narrow.identity.capabilities).toEqual(["session.read"]);
+  reader.socket.send("after-downgrade");
+  await expect.poll(() => reader.closed).toEqual([4401]);
+  expect(await runInDurableObject(room, (_instance, state) => state.storage.get("authorizedMessage"))).toBeUndefined();
+}, 10_000);

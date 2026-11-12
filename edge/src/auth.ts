@@ -1,9 +1,10 @@
 /**
  * Authenticates Scaffold control-plane bearers without handling Google/IAP
  * assertions in Comet. Scaffold's IAP-protected OAuth authorize route binds a
- * bearer to an internal principal. HTTP and socket authorization rendezvous in
- * an AUTH_GRANTS coordinator before fresh `/api/code-sandboxes/auth/session`
- * checks, sharing pending work across isolates but never completed authorization.
+ * bearer to an internal principal. HTTP and socket authorization share one
+ * AUTH_GRANTS coordinator per token and configuration. It reuses Scaffold's
+ * last positive `/api/code-sandboxes/auth/session` answer only within the
+ * bounds in scaffold-session.ts. Rejection purges reuse immediately.
  */
 import type { Env } from "./env";
 import { authenticateDeviceToken, verifyScaffoldThroughCoordinator } from "./auth-routes";
@@ -19,6 +20,8 @@ export type ScaffoldAuthEnv = Omit<
     | "SCAFFOLD_REQUIRED_CAPABILITIES"
     | "AUTH_GRANTS"
     | "SCAFFOLD_DEPLOYMENT_ID"
+    | "SCAFFOLD_SESSION_FRESH_MS"
+    | "SCAFFOLD_SESSION_GRACE_MS"
   >,
   "SCAFFOLD_REQUIRED_CAPABILITIES"
 > & {
@@ -45,6 +48,14 @@ export type ScaffoldAuthenticationResult =
   | { status: "authenticated"; identity: Verified }
   | { status: "invalid" }
   | { status: "unavailable"; retryAfter?: string };
+
+/**
+ * Coordinator-internal outcome. `denied` is a definitive authority answer: a
+ * 2xx response that fails the resource, actor or required-capability checks.
+ * Public callers still see it as `unavailable`, unchanged, but unlike an
+ * unreachable authority it purges reuse instead of falling back to it.
+ */
+export type ScaffoldVerification = ScaffoldAuthenticationResult | { status: "denied" };
 
 interface ScaffoldSession {
   readonly ok?: unknown;
@@ -130,7 +141,7 @@ const verifyScaffoldTokenResult = async (env: ScaffoldAuthEnv, token: string, si
 /** Called only by the internal grant coordinator with its own trusted bindings. */
 export const verifyScaffoldSessionResult = async (
   env: ScaffoldAuthEnv, token: string, signal: AbortSignal
-): Promise<ScaffoldAuthenticationResult> => {
+): Promise<ScaffoldVerification> => {
   if (!scaffoldTokenFits(token)) return { status: "unavailable", retryAfter: "1" };
   if (!token.startsWith("sc_rc_")) return { status: "invalid" };
   const resource = normalizedOrigin(env.SCAFFOLD_CONTROL_PLANE_URL);
@@ -192,7 +203,8 @@ export const verifyScaffoldSessionResult = async (
       signal.removeEventListener("abort", abort);
     }
   }
-  if (!session || typeof session !== "object") return { status: "unavailable" };
+  // An undecodable body is a failed exchange; a decoded answer is definitive.
+  if (!session || typeof session !== "object" || Array.isArray(session)) return { status: "unavailable" };
   const subject = typeof session.actor?.sub === "string" ? session.actor.sub.trim().toLowerCase() : "";
   const scopes = Array.isArray(session.scopes)
     ? [...new Set(session.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0))]
@@ -205,7 +217,7 @@ export const verifyScaffoldSessionResult = async (
     normalizedOrigin(typeof session.resource === "string" ? session.resource : "") !== resource ||
     !required.every((capability) => capabilities.includes(capability))
   ) {
-    return { status: "unavailable" };
+    return { status: "denied" };
   }
   return {
     status: "authenticated",
