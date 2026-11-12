@@ -16,7 +16,7 @@ on:
           - desktop
           - desktop-and-scaffold
       promotion_target:
-        description: "Choose where to promote the exact candidate"
+        description: "Choose where to promote the exact candidate (*-candidate publishes immutable versioned objects only)"
         required: true
         default: none
         type: choice
@@ -24,6 +24,7 @@ on:
           - none
           - staging-candidate
           - staging
+          - production-candidate
           - production
       scaffold_runtime_deployment:
         description: "When scaffold-runtime-version.txt changes, confirm compatible Scaffold is already deployed"
@@ -96,7 +97,7 @@ jobs:
               ;;
           esac
           case "$promotion_target" in
-            none|staging-candidate|staging|production) ;;
+            none|staging-candidate|staging|production-candidate|production) ;;
             *)
               echo "::error::unsupported promotion target: $promotion_target"
               exit 1
@@ -117,8 +118,8 @@ jobs:
               echo "::error::candidate_run_id must be a positive GitHub Actions run id"
               exit 1
             fi
-            if [[ "$promotion_target" != "staging" && "$promotion_target" != "production" ]]; then
-              echo "::error::candidate_run_id is only supported for staging or production promotion"
+            if [[ "$promotion_target" != "staging" && "$promotion_target" != "production-candidate" && "$promotion_target" != "production" ]]; then
+              echo "::error::candidate_run_id is only supported for staging, production-candidate or production promotion"
               exit 1
             fi
           fi
@@ -621,7 +622,7 @@ jobs:
       needs.version.result == 'success' &&
       needs.candidate.result == 'success' &&
       needs['verify-macos-candidate'].result == 'success' &&
-      (needs.version.outputs.promotion_target == 'staging-candidate' || needs.version.outputs.promotion_target == 'staging' || needs.version.outputs.promotion_target == 'production')
+      (needs.version.outputs.promotion_target == 'staging-candidate' || needs.version.outputs.promotion_target == 'staging' || needs.version.outputs.promotion_target == 'production-candidate' || needs.version.outputs.promotion_target == 'production')
     needs: [version, candidate, verify-macos-candidate]
     runs-on: ubuntu-24.04
     environment: comet-release-staging
@@ -722,7 +723,7 @@ jobs:
             name="$(basename "$file")"
             publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
           done
-          if [[ "$PROMOTION_TARGET" == "staging-candidate" ]]; then
+          if [[ "$PROMOTION_TARGET" == "staging-candidate" || "$PROMOTION_TARGET" == "production-candidate" ]]; then
             echo "Published immutable private staging candidate $VERSION without moving release channels."
             exit 0
           fi
@@ -771,7 +772,7 @@ jobs:
           fi
       - id: readback
         name: Verify published staging channels
-        if: ${{ needs.version.outputs.promotion_target != 'staging-candidate' }}
+        if: ${{ needs.version.outputs.promotion_target != 'staging-candidate' && needs.version.outputs.promotion_target != 'production-candidate' }}
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -822,7 +823,7 @@ jobs:
       needs['verify-macos-candidate'].result == 'success' &&
       needs['publish-staging'].result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      needs.version.outputs.promotion_target == 'production'
+      (needs.version.outputs.promotion_target == 'production-candidate' || needs.version.outputs.promotion_target == 'production')
     needs: [version, candidate, verify-macos-candidate, publish-staging]
     runs-on: ubuntu-24.04
     environment: comet-release-production
@@ -830,6 +831,7 @@ jobs:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       COMET_RELEASES_GCS_BUCKET: ${{ secrets.COMET_RELEASES_GCS_BUCKET }}
       RELEASE_SURFACE: ${{ needs.version.outputs.release_surface }}
+      PROMOTION_TARGET: ${{ needs.version.outputs.promotion_target }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -884,6 +886,11 @@ jobs:
           SCAFFOLD_RUNTIME_DEPLOYMENT: ${{ inputs.scaffold_runtime_deployment || 'unchanged' }}
         run: |
           set -euo pipefail
+          # Primary Scaffold pins and the legacy release reader both use this bucket.
+          if [[ "${COMET_RELEASES_GCS_BUCKET:-}" != "ashler-comet-releases-production" ]]; then
+            echo "::error::production release bucket configuration is invalid"
+            exit 1
+          fi
           publish_immutable() {
             source="$1"
             object="$2"
@@ -912,6 +919,18 @@ jobs:
               return 1
             fi
           }
+          if [[ "${PROMOTION_TARGET:-}" == "production-candidate" ]]; then
+            # Primary Scaffold must be built from these exact bytes before the
+            # runtime guard can be acknowledged: publish only versioned objects,
+            # with no guard, root-level alias, moving manifest or channel pointer.
+            for file in candidate/*; do
+              name="$(basename "$file")"
+              case "$name" in comet-staging-*|desktop-staging-*) continue ;; esac
+              publish_immutable "$file" "gs://$COMET_RELEASES_GCS_BUCKET/releases/$VERSION/$name"
+            done
+            echo "Published immutable private production candidate $VERSION without moving release channels."
+            exit 0
+          fi
           current_scaffold_manifest="$RUNNER_TEMP/current-scaffold-manifest.json"
           if ! gcloud storage cp \
             "gs://$COMET_RELEASES_GCS_BUCKET/releases/scaffold-manifest.json" \
@@ -953,6 +972,7 @@ jobs:
             gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
           fi
       - name: Verify published production channels
+        if: ${{ needs.version.outputs.promotion_target == 'production' }}
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |

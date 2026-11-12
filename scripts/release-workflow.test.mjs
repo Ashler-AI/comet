@@ -234,7 +234,7 @@ describe("executable release gates", () => {
   it("rejects unmerged publication even when its exact source was reviewed", async (t) => {
     const checkout = releaseCheckout(t, false);
     const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
-    for (const target of ["staging-candidate", "staging", "production"]) {
+    for (const target of ["staging-candidate", "staging", "production-candidate", "production"]) {
       const result = runVersion(script, checkout, {
         REQUESTED_PROMOTION_TARGET: target, REQUESTED_CANDIDATE_RUN_ID: "",
         REQUESTED_REVIEWED_SHA: checkout.sha,
@@ -283,10 +283,24 @@ describe("executable release gates", () => {
       { REQUESTED_CANDIDATE_RUN_ID: "not-a-run-id" },
       { REQUESTED_PROMOTION_TARGET: "none" },
       { REQUESTED_PROMOTION_TARGET: "staging-candidate" },
+      { REQUESTED_PROMOTION_TARGET: "production-candidates" },
     ]) {
       const result = runVersion(script, checkout, overrides);
       assert.notEqual(result.status, 0);
       assert.equal(result.output, "");
+    }
+  });
+
+  it("reuses the exact staging candidate for a private production candidate", async (t) => {
+    const checkout = releaseCheckout(t, true);
+    const script = shellStep(await read(".github/workflows/release.yml"), "version", "version");
+    for (const candidateRun of [RUN_ID, ""]) {
+      const result = runVersion(script, checkout, {
+        REQUESTED_PROMOTION_TARGET: "production-candidate", REQUESTED_CANDIDATE_RUN_ID: candidateRun,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.output, /^promotion_target=production-candidate$/m);
+      assert.match(result.output, new RegExp(`^candidate_run_id=${candidateRun}$`, "m"));
     }
   });
 
@@ -408,6 +422,7 @@ describe("release channel publication", () => {
     const workflow = await read(".github/workflows/release.yml");
     for (const target of ["staging", "production"]) {
       const { dir, bucket, env } = publicationFixture(t);
+      env.COMET_RELEASES_GCS_BUCKET = `ashler-comet-releases-${target}`;
       const result = command(dir, "bash", ["-c", shellStep(workflow, `publish-${target}`, "publish")], env);
       assert.equal(result.status, 0, result.stderr);
       const releases = path.join(bucket, "releases");
@@ -439,12 +454,68 @@ describe("release channel publication", () => {
   });
 
   it("keeps private candidates immutable without moving either desktop channel", async (t) => {
-    const { dir, bucket, env } = publicationFixture(t);
     const script = shellStep(await read(".github/workflows/release.yml"), "publish-staging", "publish");
-    const result = command(dir, "bash", ["-c", script], { ...env, PROMOTION_TARGET: "staging-candidate" });
+    for (const promotion of ["staging-candidate", "production-candidate"]) {
+      const { dir, bucket, env } = publicationFixture(t);
+      const result = command(dir, "bash", ["-c", script], { ...env, PROMOTION_TARGET: promotion });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(readdirSync(path.join(bucket, "releases")), [VERSION]);
+      assert.deepEqual(readdirSync(path.join(bucket, "releases", VERSION)).sort(), readdirSync(path.join(dir, "candidate")).sort());
+    }
+  });
+
+  it("rejects non-production buckets before any production storage write", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "publish-production", "publish");
+    for (const promotion of ["production-candidate", "production"]) {
+      for (const configuredBucket of [undefined, "", "ashler-comet-releases-staging", "ashler-comet-releases-production-copy"]) {
+        const { dir, bucket, env } = publicationFixture(t);
+        const result = command(dir, "bash", ["-c", script], {
+          ...env, PROMOTION_TARGET: promotion, COMET_RELEASES_GCS_BUCKET: configuredBucket,
+        });
+        assert.notEqual(result.status, 0);
+        assert.equal(existsSync(env.FIXTURE_WRITES), false);
+        assert.deepEqual(readdirSync(bucket), []);
+      }
+    }
+  });
+
+  it("publishes a production candidate's versioned bytes before Scaffold is deployed, moving nothing", async (t) => {
+    const script = shellStep(await read(".github/workflows/release.yml"), "publish-production", "publish");
+    const { dir, bucket, env } = publicationFixture(t);
+    const releases = path.join(bucket, "releases");
+    // A v2 candidate while the live production channel still serves the v1
+    // runtime: exactly the change the guard refuses without a Scaffold deployment.
+    const desktopManifest = path.join(dir, "candidate/desktop-manifest.json");
+    writeFileSync(desktopManifest, JSON.stringify({
+      ...JSON.parse(readFileSync(desktopManifest, "utf8")), scaffoldRuntimeVersion: "scaffold.comet-runtime.v2",
+    }));
+    mkdirSync(releases);
+    const current = JSON.stringify({ schemaVersion: 2, version: "0.1.156", scaffoldRuntimeVersion: "scaffold.comet-runtime.v1", files: {} });
+    writeFileSync(path.join(releases, "scaffold-manifest.json"), current);
+    for (const channel of ["desktop", "scaffold"]) writeFileSync(path.join(releases, `${channel}-latest.txt`), "0.1.156");
+    const before = readdirSync(releases).sort();
+    const result = command(dir, "bash", ["-c", script], {
+      ...env, PROMOTION_TARGET: "production-candidate", COMET_RELEASES_GCS_BUCKET: "ashler-comet-releases-production",
+      SCAFFOLD_RUNTIME_DEPLOYMENT: "unchanged",
+    });
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(readdirSync(path.join(bucket, "releases")), [VERSION]);
-    assert.deepEqual(readdirSync(path.join(bucket, "releases", VERSION)).sort(), readdirSync(path.join(dir, "candidate")).sort());
+    assert.deepEqual(readdirSync(releases).sort(), [...before, VERSION].sort());
+    const expected = readdirSync(path.join(dir, "candidate")).filter(name => !/^(comet-staging-|desktop-staging-)/.test(name));
+    assert.deepEqual(readdirSync(path.join(releases, VERSION)).sort(), expected.sort());
+    for (const name of expected) {
+      assert.deepEqual(readFileSync(path.join(releases, VERSION, name)), readFileSync(path.join(dir, "candidate", name)));
+    }
+    assert.equal(readFileSync(path.join(releases, "scaffold-manifest.json"), "utf8"), current);
+    for (const channel of ["desktop", "scaffold"]) {
+      assert.equal(readFileSync(path.join(releases, `${channel}-latest.txt`), "utf8"), "0.1.156");
+    }
+    // Full promotion of the same bytes still requires the acknowledged Scaffold deployment.
+    const promoted = command(dir, "bash", ["-c", script], {
+      ...env, PROMOTION_TARGET: "production", COMET_RELEASES_GCS_BUCKET: "ashler-comet-releases-production",
+      SCAFFOLD_RUNTIME_DEPLOYMENT: "unchanged",
+    });
+    assert.notEqual(promoted.status, 0);
+    assert.equal(readFileSync(path.join(releases, "desktop-latest.txt"), "utf8"), "0.1.156");
   });
 
   it("does not move either desktop channel when staging would move backwards", async (t) => {
@@ -481,12 +552,14 @@ describe("release channel publication", () => {
 });
 
 describe("Crew edge deployment", () => {
-  it("rejects production dispatch before candidate or deployment jobs can start", async (t) => {
-    const script = shellStep(await read(".github/workflows/deploy.yml"), "staging-scope", "target");
+  const TARGETS = ["candidate", "staging", "production"];
+
+  it("accepts only candidate, staging and native production before any job can start", async (t) => {
+    const script = shellStep(await read(".github/workflows/deploy.yml"), "target-scope", "target");
     const dir = scratch(t);
-    for (const target of ["candidate", "staging", "production", "", "canary"]) {
+    for (const target of [...TARGETS, "", "canary", "legacy-production", "Production"]) {
       const result = command(dir, "bash", ["-c", script], { REQUESTED_TARGET: target });
-      assert.equal(result.status === 0, ["candidate", "staging"].includes(target), result.stderr);
+      assert.equal(result.status === 0, TARGETS.includes(target), result.stderr);
     }
   });
 
@@ -494,14 +567,74 @@ describe("Crew edge deployment", () => {
     const script = shellStep(await read(".github/workflows/deploy.yml"), "candidate", "source_request");
     const dir = scratch(t);
     for (const source of [RUN_SHA, "c".repeat(40), "", "HEAD", RUN_SHA.toUpperCase()]) {
-      for (const target of ["candidate", "staging", "production", ""]) {
+      for (const target of [...TARGETS, "", "canary"]) {
         const result = command(dir, "bash", ["-c", script], {
           SOURCE_SHA: source, GITHUB_SHA: RUN_SHA, TARGET: target,
         });
         assert.equal(result.status === 0,
-          source === RUN_SHA && ["candidate", "staging"].includes(target), result.stderr);
+          source === RUN_SHA && TARGETS.includes(target), result.stderr);
       }
     }
+  });
+
+  it("deploys native production only behind comet-production, never as staging or the legacy Worker", async () => {
+    const workflow = await read(".github/workflows/deploy.yml");
+    const jobs = workflow.slice(workflow.indexOf("\njobs:\n"));
+    const code = (job) => jobBlock(jobs, job).replace(/^\s*#.*$/gm, "");
+    const production = code("production");
+    const staging = code("staging");
+    assert.match(production, /\n    if: inputs\.target == 'production'\n/);
+    assert.match(production, /\n    environment: comet-production\n/);
+    assert.match(production, /npx wrangler deploy "\$CANDIDATE_ENTRY" --no-bundle --config wrangler\.jsonc --env production\n/);
+    assert.doesNotMatch(production, /--env staging|comet-staging|ashler-comet-edge-production|comet\.internal\.ashler\.com/);
+    assert.match(staging, /\n    environment: comet-staging\n/);
+    assert.doesNotMatch(staging, /--env production|comet-production/);
+    assert.equal((jobs.match(/npx wrangler deploy "\$CANDIDATE_ENTRY"/g) ?? []).length, 2);
+  });
+
+  it("deploys only the sealed production candidate from this run's reviewed source", async (t) => {
+    const script = shellStep(await read(".github/workflows/deploy.yml"), "production", "verify");
+    const dir = scratch(t);
+    fixtureCommand(dir, "git", "init", "-q", "-b", "main", ".");
+    fixtureCommand(dir, "git", "commit", "-q", "--allow-empty", "-m", "reviewed source");
+    const sha = fixtureCommand(dir, "git", "rev-parse", "HEAD");
+    const run = { GITHUB_SERVER_URL: "https://github.com", GITHUB_REPOSITORY: REPOSITORY, GITHUB_RUN_ID: "77" };
+    const workflowRun = `${run.GITHUB_SERVER_URL}/${run.GITHUB_REPOSITORY}/actions/runs/${run.GITHUB_RUN_ID}`;
+    const seal = (entry = "production.js") => {
+      const bundle = mkdtempSync(path.join(dir, "bundle-"));
+      writeFileSync(path.join(bundle, entry), "export default {};\n");
+      fixtureCommand(dir, "tar", "-czf", "comet-edge-production.tar.gz", "-C", bundle, ".");
+      writeFileSync(path.join(dir, "comet-edge-production.tar.gz.sha256"), fixtureCommand(dir, "sha256sum", "comet-edge-production.tar.gz") + "\n");
+      return fixtureCommand(dir, "sha256sum", "comet-edge-production.tar.gz").split(" ")[0];
+    };
+    const verify = (digest, provenance, overrides = {}) => {
+      writeFileSync(path.join(dir, "comet-edge-candidate.provenance.json"), JSON.stringify(provenance));
+      const output = path.join(dir, "output");
+      writeFileSync(output, "");
+      rmSync(path.join(dir, "runner"), { recursive: true, force: true });
+      const result = command(dir, "bash", ["-c", script], {
+        ...run, GITHUB_SHA: sha, SOURCE_SHA: sha, EXPECTED_PRODUCTION_DIGEST: digest,
+        RUNNER_TEMP: path.join(dir, "runner"), GITHUB_OUTPUT: output, ...overrides,
+      });
+      return { result, output: readFileSync(output, "utf8") };
+    };
+    const digest = seal();
+    const provenance = { schemaVersion: 2, productionSha256: digest, sourceCommit: sha, workflowRun };
+    const accepted = verify(digest, provenance);
+    assert.equal(accepted.result.status, 0, accepted.result.stderr);
+    assert.match(accepted.output, /^entry=.*\/verified-edge\/production\/production\.js$/m);
+
+    for (const [expected, record, overrides] of [
+      ["0".repeat(64), provenance, {}],
+      [digest, { ...provenance, productionSha256: "0".repeat(64) }, {}],
+      [digest, { ...provenance, workflowRun: `${workflowRun}0` }, {}],
+      [digest, { ...provenance, sourceCommit: RUN_SHA }, {}],
+      [digest, provenance, { SOURCE_SHA: RUN_SHA }],
+    ]) {
+      assert.notEqual(verify(expected, record, overrides).result.status, 0);
+    }
+    const wrongEntry = seal("staging.js");
+    assert.notEqual(verify(wrongEntry, { ...provenance, productionSha256: wrongEntry }).result.status, 0);
   });
 
   it("requires the three retained release-reader secret_text bindings", () => {
