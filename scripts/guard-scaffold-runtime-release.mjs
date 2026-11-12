@@ -1,7 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
-const acknowledgements = new Set(["unchanged", "staging-deployed", "production-deployed"]);
+// desktop-ahead-of-scaffold releases only the desktop channel while Scaffold keeps
+// its deployed runtime. Desktop reaches Scaffold sandboxes only through their
+// supervisor, and refuses a mismatched one with scaffold_runtime_contract_mismatch.
+const DESKTOP_AHEAD = "desktop-ahead-of-scaffold";
+const acknowledgements = new Set(["unchanged", "staging-deployed", "production-deployed", DESKTOP_AHEAD]);
 const targets = new Set(["staging", "production"]);
 const releaseSurfaces = new Set(["desktop", "desktop-and-scaffold"]);
 
@@ -34,11 +38,22 @@ export function validateRuntimePromotion({
     : runtimeVersion(current, "current Scaffold manifest");
   if (currentVersion === candidateVersion) return { changed: false, candidateVersion, currentVersion };
 
+  if (acknowledgement === DESKTOP_AHEAD) {
+    if (releaseSurface !== "desktop") {
+      throw new Error([
+        `${DESKTOP_AHEAD} publishes only the desktop channel; it cannot publish the ${candidateVersion} Scaffold runtime.`,
+        "Use release_surface=desktop, or deploy compatible ashler-platform support and acknowledge that deployment.",
+      ].join(" "));
+    }
+    return { changed: true, candidateVersion, currentVersion, desktopAheadOfScaffold: true };
+  }
+
   if (releaseSurface !== "desktop-and-scaffold") {
     throw new Error([
       `Scaffold runtime contract changes from ${currentVersion ?? "<unpublished>"} to ${candidateVersion}.`,
       "A breaking contract release must publish desktop and Scaffold runtimes together.",
-      "Rerun release.yml with release_surface=desktop-and-scaffold after deploying compatible ashler-platform support.",
+      "Rerun release.yml with release_surface=desktop-and-scaffold after deploying compatible ashler-platform support,",
+      `or release only the desktop app ahead of Scaffold with scaffold_runtime_deployment=${DESKTOP_AHEAD}.`,
     ].join(" "));
   }
 
@@ -80,7 +95,9 @@ async function main() {
     acknowledgement,
     releaseSurface,
   });
-  if (result.changed) {
+  if (result.desktopAheadOfScaffold) {
+    console.log(`Accepted ${target} desktop ${result.candidateVersion} ahead of Scaffold ${result.currentVersion ?? "<unpublished>"}; the Scaffold channel stays unchanged.`);
+  } else if (result.changed) {
     console.log(`Accepted ${target} Scaffold runtime change to ${result.candidateVersion}.`);
   }
 }

@@ -27,7 +27,7 @@ on:
           - production-candidate
           - production
       scaffold_runtime_deployment:
-        description: "When scaffold-runtime-version.txt changes, confirm compatible Scaffold is already deployed"
+        description: "When scaffold-runtime-version.txt changes, confirm compatible Scaffold is already deployed, or release only the desktop app ahead of Scaffold (desktop surface only)"
         required: true
         default: unchanged
         type: choice
@@ -35,6 +35,7 @@ on:
           - unchanged
           - staging-deployed
           - production-deployed
+          - desktop-ahead-of-scaffold
       candidate_run_id:
         description: "Successful release run whose exact candidate should be reused for staging or production promotion; empty rebuilds"
         required: false
@@ -971,7 +972,8 @@ jobs:
             gcloud storage cp candidate/SHA256SUMS "gs://$COMET_RELEASES_GCS_BUCKET/releases/SHA256SUMS"
             gcloud storage cp scaffold-latest.txt "gs://$COMET_RELEASES_GCS_BUCKET/releases/latest.txt"
           fi
-      - name: Verify published production channels
+      - id: readback-production
+        name: Verify published production channels
         if: ${{ needs.version.outputs.promotion_target == 'production' }}
         env:
           VERSION: ${{ needs.version.outputs.version }}
