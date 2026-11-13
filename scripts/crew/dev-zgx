@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Run this branch's zgx against its own engine, isolated from every other
+# Crew and Zeron on this Mac (docs/crew/zgx-thin-port.md):
+#   - data ~/.crew-zgx-dev, IPC port 27960, the agents' home under it
+#     (zeron_cli::crew and apps/zgx/src/engine/manager.rs decide these);
+#   - no Edge yet (a loopback port nothing serves): signed out, local;
+#   - nothing inherited from the Crew that started this shell (clean-env).
+#
+#   scripts/crew/build-engine            # once, and after engine changes
+#   scripts/crew/dev-zgx [main|gallery|onboarding|intro]   (default: main)
+#
+# Needs Zig 0.16 for zgx's terminals (Ghostty): ZIG=/path/to/zig, or
+# ~/.crew-zgx-dev/zig/zig.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+zig="${ZIG:-$HOME/.crew-zgx-dev/zig/zig}"
+engine="${CREW_ZGX_ENGINE_BIN:-$HOME/.crew-zgx-dev/bin/zeron-engine}"
+target="$(python3 "$root/scripts/local-cargo.py" --print-target-dir)/zgx"
+
+[[ -x "$zig" ]] || { echo "no Zig 0.16 at $zig (set ZIG)" >&2; exit 1; }
+[[ -x "$engine" ]] || { echo "no engine at $engine: run scripts/crew/build-engine" >&2; exit 1; }
+
+cd "$root/apps/zgx"
+exec "$root/scripts/crew/clean-env" \
+  ZIG="$zig" \
+  CARGO_TARGET_DIR="$target" \
+  ZERON_ZGX_ENGINE_BIN="$engine" \
+  ZERON_ZGX_EDGE="${CREW_ZGX_EDGE:-http://127.0.0.1:9}" \
+  ZERON_DISABLE_NOTIFICATIONS=1 \
+  cargo run -- "${1:-main}"

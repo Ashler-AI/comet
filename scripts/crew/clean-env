@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Run a command with only a small allowlisted environment.
+#
+# Agent shells on a Crew machine inherit the running Crew's environment:
+# its data folder and IPC port (ZERON_DATA_DIR=~/.crew-staging,
+# ZERON_IPC_PORT=27957), ZERON_MANAGED_ENGINE, COMET_*, CREW_*, OMP_* and the
+# agent's own inference credentials (ANTHROPIC_*, CLAUDE_CODE_*). A test
+# engine, zgx or `cargo test` started with those can attach to that Crew,
+# read its IPC token, stop it, or open its store. This wrapper drops all of
+# them; only the variables below survive, plus any NAME=value given first.
+#
+#   scripts/crew/clean-env [NAME=value ...] command [args ...]
+#   scripts/crew/clean-env --print            # show the environment it would use
+set -euo pipefail
+
+keep=(
+  HOME PATH USER LOGNAME SHELL TMPDIR LANG TERM
+  SSH_AUTH_SOCK __CF_USER_TEXT_ENCODING
+  # Team rule: no local TypeScript typechecks, including from Git hooks.
+  ASHLER_INCREMENTAL_TSC_CHECKS
+)
+
+args=()
+for name in "${keep[@]}"; do
+  if [[ -n "${!name+x}" ]]; then
+    args+=("$name=${!name}")
+  fi
+done
+for name in $(compgen -e); do
+  [[ "$name" == LC_* ]] && args+=("$name=${!name}")
+done
+
+if [[ "${1:-}" == "--print" ]]; then
+  exec env -i "${args[@]}" env
+fi
+
+while [[ $# -gt 0 && "$1" == *=* && "$1" != -* ]]; do
+  args+=("$1")
+  shift
+done
+if [[ $# -eq 0 ]]; then
+  echo "usage: scripts/crew/clean-env [NAME=value ...] command [args ...]" >&2
+  exit 2
+fi
+
+exec env -i "${args[@]}" "$@"

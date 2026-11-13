@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Build this branch's engine (`zeron-engine`, without the old gpui app) through
+# the local cargo policy, and copy it out of the shared target: another
+# worktree's build replaces `target/debug/zeron-engine` there at any time.
+#
+#   scripts/crew/build-engine            # -> ~/.crew-zgx-dev/bin/zeron-engine
+#   CREW_ZGX_ENGINE_BIN=/path scripts/crew/build-engine
+set -euo pipefail
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+out="${CREW_ZGX_ENGINE_BIN:-$HOME/.crew-zgx-dev/bin/zeron-engine}"
+mkdir -p "$(dirname "$out")"
+exec "$root/scripts/crew/clean-env" python3 "$root/scripts/local-cargo.py" \
+  build -p zeron --bin zeron-engine --no-default-features \
+  --copy-binary debug/zeron-engine "$out"

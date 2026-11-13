@@ -14,15 +14,23 @@ path = "src/lib.rs"
 [[bin]]
 name = "zeron"
 path = "src/main.rs"
+required-features = ["ui"]
 
 [[bin]]
 name = "zeron-engine"
 path = "src/bin/zeron-engine.rs"
 
+[features]
+default = ["ui"]
+# The headed gpui app (`zeron`). `zeron-engine` doesn't need it:
+# `cargo build -p zeron --bin zeron-engine --no-default-features` builds the
+# engine without compiling gpui.
+ui = ["dep:zeron-ui"]
+
 [dependencies]
 zeron-engine.workspace = true
 zeron-rpc.workspace = true
-zeron-ui.workspace = true
+zeron-ui = { workspace = true, optional = true }
 zeron-update.workspace = true
 zeron-cli.workspace = true
 zeron-mcp.workspace = true
