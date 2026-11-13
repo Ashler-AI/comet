@@ -8,6 +8,7 @@
 pub mod allocator;
 pub mod auth_cli;
 pub mod background;
+pub mod crew_runtime;
 pub mod engine_commands;
 pub mod ipc_cli;
 pub mod plugin_cli;
@@ -39,7 +40,7 @@ pub fn engine_config_from_env() -> zeron_engine::EngineConfig {
     // Crew: never another install's store or engine, whatever the
     // environment says (zeron_cli::crew).
     zeron_cli::crew::exit_if_refused(&data_dir, ipc_port);
-    zeron_engine::EngineConfig {
+    let mut config = zeron_engine::EngineConfig {
         data_dir,
         edge_url: edge_url_from_env(),
         ipc_port,
@@ -53,7 +54,14 @@ pub fn engine_config_from_env() -> zeron_engine::EngineConfig {
         edge_token,
         scaffold: None,
         device: None,
+    };
+    // Crew: the Scaffold authority the data dir names, if it names one
+    // (crew_runtime.rs); a file it can't use stops it, as a refusal does.
+    if let Err(why) = crew_runtime::apply(&mut config) {
+        eprintln!("refusing to start: {why} (docs/crew/zgx-thin-port.md)");
+        std::process::exit(78);
     }
+    config
 }
 
 /// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
