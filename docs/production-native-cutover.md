@@ -72,7 +72,16 @@ Each production step needs point-of-execution approval. Both `comet-production`
    - Set `SCAFFOLD_CREW_SYNC_GENERATION=chat2` for new sessions.
    - Build the `chat2` template from the step 3 tuple (version, production bucket,
      Linux SHA-256) while existing legacy sandboxes keep resuming.
-   - Verify a fresh native session and a legacy resume.
+   - The provider must hand sandboxes Scaffold's public https origin
+     (ashler-platform #13388). Primary's own control-plane URL is cluster-private, and
+     native Crew refuses it.
+   - Flip the template and the Worker back to back, at a quiet time. Each provider pod
+     runs one template generation. Until the `chat2` Worker is deployed, new Crew
+     sessions are refused with `crew_session_migration_required`. Prebuild the images
+     and template, materialize the lock, and deploy the Worker as soon as the new
+     provider pods take traffic.
+   - Verify a fresh native session and a legacy resume. If a native session stays
+     `starting`, read `/workspace/.scaffold/logs/comet.log` in its sandbox.
 5. **Promote production.** Run `release.yml` with `promotion_target=production`,
    `scaffold_runtime_deployment=production-deployed` and the same `candidate_run_id`.
 6. **Verify.** Check production desktop login and `update --check` against
@@ -88,19 +97,32 @@ newer forward release.
 ## 2026-11-12 attempt: Scaffold rolled back, desktop shipped ahead
 
 Steps 1–3 completed. Step 4 rolled every primary Scaffold service, the sandbox
-provider and the template forward from `master` (lock `f2118967eb`). From 21:42Z to
-22:31Z, no new session of any runtime profile became ready:
+provider and the template forward from `master`. From 21:40Z to 22:31Z, no new Crew
+(`comet_remote`) session became ready. There were two causes:
 
-- The provider's readiness writes and ingress releases to the control plane timed out.
-- Control-plane session Durable Objects carried 3–4× their normal requests, with p99
-  wall time up to 6 s.
+- **Skew, 21:40–21:49Z.** The first run's lock (`f2118967eb`) rolled the `chat2`
+  provider and the native-only template but kept the legacy Worker. Every new Crew
+  session was created as `session` and refused with `crew_session_migration_required`.
+  This lasted until the second run deployed the `chat2` Worker.
+- **Native Crew could not authenticate, from 21:49Z.** The provider passed its own
+  cluster-private URL (`http://scaffold-control-plane.scaffold.svc.cluster.local`)
+  into sandboxes as `SCAFFOLD_CONTROL_PLANE_URL`. The supervisor gives that URL to the
+  engine as `--scaffold-url`, and the engine accepts only an https origin. It logged
+  `Scaffold auth is not configured correctly` and exited, so crew-web stayed at 503
+  and startup health never passed. Staging's control-plane URL is already public,
+  which is why staging never showed this. ashler-platform #13388 fixes it.
 
-This is a regression in `master`'s Scaffold services, not native Crew: non-Crew sessions
-failed too. ashler-platform #13360 restored the previous lock, and the control-plane
-Worker was rolled back to its legacy-config version. #13368 reverts the primary chat2
-config until a retry.
+The coordinator was not overloaded. SessionCoordinator Durable Objects stayed near 2×
+baseline, with p99 around 100 ms, while sessions were already failing. A `remote_code`
+canary became ready at 22:16Z. Separately, from 22:06 to 22:15Z, client traffic to the
+Worker and the provider dropped about 75%, and the Worker threw exceptions. That dip
+is still unexplained, so watch for it on the retry.
+
+ashler-platform #13360 restored the previous lock, and the control-plane Worker was
+rolled back to its legacy-config version. #13368 reverts the primary `chat2` config
+until a retry.
 
 The desktop app ships ahead of Scaffold instead: `release_surface=desktop`,
 `scaffold_runtime_deployment=desktop-ahead-of-scaffold`, reusing the staging candidate
-run. Production Scaffold stays on the v1 runtime. Retrying step 4 needs that regression
-reproduced and fixed in staging with the exact `master` images first.
+run. Production Scaffold stays on the v1 runtime. A retry of step 4 needs #13388 merged
+first, and the back-to-back flip described above.
