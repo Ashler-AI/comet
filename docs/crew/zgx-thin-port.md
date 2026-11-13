@@ -94,6 +94,29 @@ Deferred:
 
   Org creation and selection refuse in Scaffold mode.
 - **`rpc.rs`:** refuse `AccessToken` in Scaffold mode. The `sc_rc_` bearer lasts until revoked and carries exec and lifecycle scopes. zgx's direct Edge calls (`/username`, `/onboarding`, `/auth/orgs`, `/cards`) are answered locally instead.
+- **As built (slice 2):**
+  - Crew logic sits in `crates/engine/src/crew_auth.rs` and `crew_profile.rs`, child modules of
+    `auth` and `profile`; upstream's structs gain one `crew` field each.
+  - `scaffold_auth.rs` is Crew's file except for one thing: it defines its own `AccessToken`,
+    because upstream's `zeron_proto` has none. `zeron-sync` gains `base64` and `chrono`;
+    `percent-encoding` isn't needed, and `tempfile` stays a dev-dependency.
+  - The authority comes only from `<data_dir>/crew-runtime.json` (`edgeUrl`, `scaffoldUrl`,
+    `projectScope`, optional `deploymentId`), read in `apps/zeron/src/crew_runtime.rs`.
+    No environment variable names it. Its `edgeUrl` replaces `ZERON_EDGE_URL`, and an unusable
+    file stops the engine (exit 78). Without the file, the engine is unchanged.
+  - Signed in, `AuthStatus` is `{state: signedIn, user: {id, email, name}, orgId: <projectScope>}`.
+    The credential is `<data_dir>/scaffold-session.json` (0600).
+  - Sign-in uses a loopback callback on an ephemeral port (`http://127.0.0.1:<port>/callback`),
+    both headed and headless. `SignIn` ignores its hints. `CompleteSignIn` takes the callback URL
+    or `state.code`.
+  - In Scaffold mode, `AccessToken`, `StepUp`, `DeleteAccount`, `CreateOrg` and `SelectOrg`
+    answer `RpcError::Capability("crew.scaffold_unsupported")`. `ListOrgs` answers `[]`.
+    Cloud, vault, runner and plugin keys are off.
+  - Dev mode only with an explicit `ZERON_EDGE_TOKEN`, never because the WorkOS client id is
+    missing or empty, and never from the Edge's `/health`. The one exception is the dev identity
+    of an `EngineCore` that never had auth attached (tests and embeds); it is set explicitly.
+  - `crates/ui/src/state.rs` (the old gpui app) gets `scaffold: None, device: None` in its
+    `EngineConfig` literal, and no Crew mode.
 - **Edge protocol** that v0.3.4 expects and Crew's edge lacks:
   - `/chat2/:id/checkpoint-part` and its staged commit;
   - the attachment blob route;
@@ -163,7 +186,24 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
 
 - [x] 0. Baseline
 - [ ] 1. Isolation and flavour
-- [ ] 2. Crew sign-in
+- [ ] 2. Crew sign-in: code in place (see "As built" under Seam notes), not yet verified.
+  - Passing: Crew's 15 `scaffold_auth` unit tests in `zeron-sync`
+    (`cargo test -p zeron-sync --lib scaffold_auth`).
+  - Not yet built (builds paused for disk space):
+    - `cargo check -p zeron-engine` and `cargo check -p zeron --bin zeron-engine --no-default-features`;
+    - `crates/engine/tests/scaffold_auth.rs`, which includes the exit gate
+      `the_engine_signs_in_with_scaffold_and_reports_the_project_as_its_organization`;
+    - the changed tests in `crates/engine/tests/{auth,local_first}.rs`;
+    - `apps/zeron` (`crew_runtime::tests`).
+  - Deferred:
+    - Crew's rejection fence, `AccessToken { generation }` through `TokenSource::invalidate`.
+      Until it lands, an Edge 401 doesn't send the engine back to Scaffold, and a revoked
+      `sc_rc_` credential is only noticed at the next engine start. Crew's tests that drive
+      the fence are left out.
+    - Crew's `crew_guard`.
+    - Sandbox (device) hosts: their auth and profile are ported, but not their runtime (owner
+      registry, the `--device-bootstrap-file`, original-epoch evidence, the Scaffold client).
+      That is slice 6.
 - [ ] 3. Edge
 - [ ] 4. zgx Crew mode
 - [ ] 5. Agent Auth
