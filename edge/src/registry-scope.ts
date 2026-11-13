@@ -41,11 +41,11 @@ export function visibleRow(row: Row, a: SocketAuthority): boolean {
 
 // The actual RegistryDoc columns, not a generic row/table permission. Null is
 // upstream's field-clear encoding; identity columns are checked separately.
-const columns: Record<string, Record<string, string>> = {
+export const registryColumns: Record<string, Record<string, string>> = {
   devices: { id: "string", name: "string", platform: "string", devboxProvider: "devboxProvider", devboxId: "string", lastSeenAt: "number", createdAt: "number", version: "string", cursorSdkVersion: "string", cursorSdkEngineVersion: "string", capabilities: "strings" },
-  spaces: { id: "string", deviceId: "string", path: "string", name: "string", gitDetected: "boolean", gitCheckedAt: "number", checkoutId: "string", repositoryId: "string", createdAt: "number" },
-  chats: { id: "string", deviceId: "string", title: "string", archived: "boolean", cwd: "string", branch: "string", checkoutId: "string", sourceContext: "object", config: "object", crew: "object", lastMessagePreview: "string", lastMessageAt: "number", createdAt: "number", harnessSessionId: "string", harnessSessionCwd: "string", spaceId: "string", parentChatId: "string", lastSeenAt: "number", roomGen: "number" },
-  sessions: { chatId: "string", deviceId: "string", status: "status", lastCompletedTurn: "string", startedAt: "number", updatedAt: "number", runningSubagents: "number" },
+  spaces: { id: "string", deviceId: "string", path: "string", name: "string", gitDetected: "boolean", gitCheckedAt: "number", checkoutId: "string", repositoryId: "string", createdAt: "number", githubRepo: "string" },
+  chats: { id: "string", deviceId: "string", title: "string", archived: "boolean", cwd: "string", branch: "string", checkoutId: "string", sourceContext: "object", config: "object", crew: "object", lastMessagePreview: "string", lastMessageAt: "number", createdAt: "number", harnessSessionId: "string", harnessSessionCwd: "string", harnessSessionHarness: "string", spaceId: "string", parentChatId: "string", lastSeenAt: "number", roomGen: "number" },
+  sessions: { chatId: "string", deviceId: "string", status: "status", lastCompletedTurn: "string", lastTurnOutcome: "object", terminalActivity: "object", startedAt: "number", updatedAt: "number", runningSubagents: "number" },
 };
 function validValue(value: FieldValue, type?: string): boolean {
   if (!type) return false;
@@ -63,14 +63,14 @@ export function scopedOps(ops: Op[], a: SocketAuthority, load: (kind: string, id
   const projected = new Map<string, Row>();
   const get = (kind: string, id: string) => projected.get(`${kind}/${id}`) ?? load(kind, id);
   for (const op of ops) {
-    if (!Object.hasOwn(columns, op.kind) || op.op === "delete" || !op.set) return undefined;
+    if (!Object.hasOwn(registryColumns, op.kind) || op.op === "delete" || !op.set) return undefined;
     if ((op.kind === "chats" || op.kind === "sessions") && op.id !== a.sessionId ||
         op.kind === "devices" && op.id !== a.deviceId) return undefined;
     const before = get(op.kind, op.id);
     if (before?.deleted || before?.fields.deviceId != null && before.fields.deviceId !== a.deviceId) return undefined;
     const set = { ...op.set };
     for (const [key, value] of Object.entries(set)) {
-      if (!Object.hasOwn(columns[op.kind], key) || !validValue(value, columns[op.kind][key])) return undefined;
+      if (!Object.hasOwn(registryColumns[op.kind], key) || !validValue(value, registryColumns[op.kind][key])) return undefined;
       if ((key === "id" && value !== op.id) || (key === "chatId" && value !== a.sessionId) ||
           (key === "deviceId" && value !== a.deviceId) ||
           (key === "parentChatId" && value !== null && value !== before?.fields.parentChatId)) return undefined;
