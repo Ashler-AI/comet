@@ -1,16 +1,31 @@
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+// The engine refuses a local IPC handshake without its bearer
+// (crates/rpc/src/ipc_auth.rs). Resolve it in the engine clients' order at every
+// dial: each engine start mints a new token.
+function ipcToken(env) {
+  if (env.ZERON_IPC_TOKEN?.trim()) return env.ZERON_IPC_TOKEN.trim();
+  const path = env.ZERON_IPC_TOKEN_FILE?.trim() || (env.COMET_DATA_DIR ? join(env.COMET_DATA_DIR, 'ipc-token') : '');
+  let token = '';
+  try { token = path ? readFileSync(path, 'utf8').trim() : ''; } catch {}
+  if (!token) throw new Error('Crew engine unavailable: no IPC token yet');
+  return token;
+}
 
 export class CrewRpc extends EventEmitter {
-  constructor(port) {
+  constructor(port, { env = process.env } = {}) {
     super();
     this.url = `ws://127.0.0.1:${port}`;
+    this.env = env;
     this.pending = new Map();
     this.nextId = 0;
   }
 
   async connect() {
     if (this.socket) throw new Error('RPC already connected');
-    const socket = new WebSocket(this.url);
+    const socket = new WebSocket(this.url, { headers: { authorization: `Bearer ${ipcToken(this.env)}` } });
     this.socket = socket;
     await new Promise((resolve, reject) => {
       const disconnect = error => {
