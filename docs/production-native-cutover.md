@@ -77,6 +77,10 @@ Each production step needs point-of-execution approval. Both `comet-production`
      native Crew refuses it.
    - The Crew release must include #215: crew-web must present the engine's IPC
      token, or every native sandbox stalls with crew-web at 503.
+   - The Worker must publish each `chat2` session's registry chat row
+     (ashler-platform #13616), and the native Edge must admit the host's registry
+     columns (#218). Otherwise sandboxes from agents, the web UI and other non-native
+     creators never become ready.
    - Set the pins in both places. The primary build job runs in the `staging` GitHub
      environment, and its `SCAFFOLD_ASHLER_COMET_VERSION` and
      `SCAFFOLD_ASHLER_COMET_LINUX_SHA256` override the repository variables.
@@ -85,8 +89,9 @@ Each production step needs point-of-execution approval. Both `comet-production`
      sessions are refused with `crew_session_migration_required`. Prebuild the images
      and template, materialize the lock, and deploy the Worker as soon as the new
      provider pods take traffic.
-   - Verify a fresh native session and a legacy resume. If a native session stays
-     `starting`, read `/workspace/.scaffold/logs/comet.log` in its sandbox.
+   - Verify a fresh session from the Scaffold web UI or an agent, not only from the
+     native app, and a legacy resume. If a native session stays `starting`, read
+     `/workspace/.scaffold/logs/comet.log` in its sandbox.
 5. **Promote production.** Run `release.yml` with `promotion_target=production`,
    `scaffold_runtime_deployment=production-deployed` and the same `candidate_run_id`.
 6. **Verify.** Check production desktop login and `update --check` against
@@ -177,6 +182,26 @@ Recovery:
 - A new legacy session was ready at 21:53Z.
 - One user session created in the window stalled.
 
-**Before any retry, decide how sessions from non-native creators get a registry row.**
-For example, the Worker could create the chat server-side on the native Edge, or those
-sessions could stay on the legacy generation, which needs both templates.
+### The fix: Scaffold publishes the row
+
+ashler-platform #13616 (merged 2026-11-13) has the Worker publish the chat row
+itself. It writes with the owner's Scaffold credential, to the owner's registry room
+on the Edge that minted the device grant, during every `chat2` device bootstrap:
+
+- **Every bootstrap** writes the row a native controller would, at the oldest registry
+  clock. That clock never beats an existing write, so the row lands only where none
+  exists. It never overrides a native client or the host, and never revives a deleted
+  chat.
+- **Chats whose id Scaffold minted** have no native controller. No client sent a
+  runtime profile, so the session records `crewChatController: "scaffold"`. Every
+  bootstrap, including resumes, rebinds the chat's device and Crew environment, and
+  the host's status row, to the epoch that just started.
+- **A refused write fails the bootstrap** and revokes its grant.
+
+Staging masked the gap a second way: a running native desktop publishes rows for all
+of its owner's sandboxes on its 30 s `scaffold.refresh`. So test with a session whose
+owner runs no desktop, or check that the row the host received is Scaffold's.
+
+Before the retry, deploy #218 to the native production Edge
+(`deploy.yml target=production`). Its native host batches carry columns the current
+production Edge refuses. #218 has been on the staging Edge since 2026-11-13.
