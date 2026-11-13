@@ -103,6 +103,65 @@ Deferred:
 
   Relay frames stay off until the authority checks cover them.
 
+### zgx Crew mode
+
+- Every development build of this branch is Crew's (`apps/zgx/src/crew.rs`,
+  `crew::MODE`; the `beta` feature stays upstream's and is not built here).
+- **Endpoint:** no WorkOS client, sign-in callback port `0`, and the Edge named
+  by `crew-runtime.json` in the engine's data dir, else the loopback default.
+  `ZERON_ZGX_ENV`, `ZERON_ZGX_EDGE`, `ZERON_ZGX_WORKOS_CLIENT` and
+  `ZERON_ZGX_CALLBACK_PORT` do nothing. Upstream's staging and production
+  tables stay in `src/auth.rs`, unreachable.
+- **Engine start:** `ZERON_EDGE_URL` and `ZERON_WORKOS_CLIENT_ID` are removed,
+  never set. `ZERON_CALLBACK_PORT=0` is passed.
+- **Session:** a launch counts `session.json` or `scaffold-session.json` as kept.
+- **Account calls:** `crew::install` runs after `auth::install` and
+  `settings::install` in `main.rs` and replaces their actions:
+  - `username` and `card` answer nil;
+  - `orgs` answers the session's `orgId` (else `projectScope`) with role `member`;
+  - `choose_org` accepts only that project and never calls `SelectOrg`;
+  - `me` comes from the session;
+  - setup's pages are kept in `crew-onboarding.json` in zgx's app data dir;
+  - username claims, org creation, invites and profile edits answer `refused`.
+- **Fail-closed seam:** any other Edge call (members, photos) is refused in
+  `Auth::bearer` before `AccessToken` or a request.
+- **Scripts:** the host publishes `crew` (`ui/account/crew.luau`) and
+  `account.provider = "scaffold"`.
+  - Signed-in setup takes `ui/screens/onboarding/crew.luau`'s path from
+    `state.luau`'s `way()`.
+  - Settings swaps Profile for `settings/crew_account.luau` (same id) and
+    drops Members, from the index too.
+  - Window titles and About read "Crew (zgx dev)".
+- `scripts/crew/dev-zgx` still passes `ZERON_ZGX_EDGE`. Crew mode ignores it,
+  so the line can go. Point the engine at an Edge with `crew-runtime.json`.
+- `scripts/crew/dev-zgx` runs zgx through `clean-env`, so `ZERON_ZGX_PRIVATE_SIGNIN`
+  never reaches it: sign-in opens the default browser.
+
+**Headed check** (slice 4's exit gate), once slices 2 and 3 are on this branch:
+
+1. Run `scripts/crew/build-engine`.
+2. Write `~/.crew-zgx-dev/crew-runtime.json` with `edgeUrl` (the local `wrangler dev`
+   Edge), `scaffoldUrl` (the authority: decision 1), `projectScope` and `deploymentId`.
+3. Run `scripts/crew/dev-zgx onboarding`. With no argument it opens the main
+   window and skips setup.
+   - stderr says `zeron-zgx: account: crew (<edgeUrl>, callback port 0)`.
+   - The window title is "Crew (zgx dev)".
+4. Sign in. Setup should go Sign in → Make it yours → agents → "<project> is
+   ready" (Member) → main window.
+5. Check Settings:
+   - Account shows the email and "In <project>.", with no photo, name, title,
+     username or delete.
+   - There is no Members page.
+   - About says "Crew (zgx dev)".
+6. Check the engine's environment. Get its pid from
+   `lsof -nP -iTCP:27960 -sTCP:LISTEN`, then run `ps eww -p <pid>`.
+   - It shows `ZERON_CALLBACK_PORT=0`.
+   - It shows no `ZERON_EDGE_URL` and no `ZERON_WORKOS_CLIENT_ID`.
+7. Run a local Claude Code turn. Its login lives in `~/.crew-zgx-dev/home`.
+8. Quit and relaunch `scripts/crew/dev-zgx`. The main window comes back signed
+   in, and it never shows signed out while the engine starts: the engine's
+   `scaffold-session.json` counts as a kept session.
+
 ### Agent Auth
 
 - Use `RunEnvironment::prepare(harness, chat_id, &mut RunRequest)` (`crates/engine/src/registry.rs`).
@@ -165,7 +224,13 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
 - [ ] 1. Isolation and flavour
 - [ ] 2. Crew sign-in
 - [ ] 3. Edge
-- [ ] 4. zgx Crew mode
+- [ ] 4. zgx Crew mode: implemented and unit-tested on 2026-11-13.
+  - `cargo test --bin zeron-zgx` in `apps/zgx`: 693 passed, 0 failed, 33 ignored.
+    That includes the `crew::`, `auth::` and `engine::manager` tests. The one new
+    ignore is upstream's staging-default test, which is unreachable here.
+  - Not run: the integration tests (`design_lint`, `leftovers`, `reload`,
+    `onboarding_continue_ink`), stopped for disk space.
+  - Open: the headed exit gate (above), which needs slices 2 and 3.
 - [ ] 5. Agent Auth
 - [ ] 6. Scaffold
 - [ ] 7. Packaging
