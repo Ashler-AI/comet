@@ -56,7 +56,9 @@
 //! one. Every build refuses any other Crew's or Zeron's engine and store
 //! (`zeron_cli::crew::refusal`), with no variable to allow it, and starts its
 //! engine without the coordinates or credentials it inherited
-//! (`zeron_launch::crew`).
+//! (`zeron_launch::crew`). In Crew mode (src/crew.rs) the engine it starts
+//! gets no edge or WorkOS client either (it reads its own
+//! `crew-runtime.json`), and the sign-in callback's port 0.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -376,11 +378,16 @@ fn spawn(config: &Config, bin: &Path) -> std::io::Result<()> {
     let mut command = std::process::Command::new(bin);
     // Crew: nothing of another install's coordinates or credentials.
     zeron_launch::crew::scrub_inherited(&mut command);
+    if crate::crew::MODE {
+        // Crew: the engine reads its Edge and sign-in from its own
+        // crew-runtime.json (src/crew.rs); this app names neither.
+        command.env_remove("ZERON_EDGE_URL").env_remove("ZERON_WORKOS_CLIENT_ID");
+    } else {
+        command.env("ZERON_EDGE_URL", &config.edge).env("ZERON_WORKOS_CLIENT_ID", &config.client);
+    }
     command
         .env("ZERON_DATA_DIR", &config.data_dir)
         .env("ZERON_IPC_PORT", config.port.to_string())
-        .env("ZERON_EDGE_URL", &config.edge)
-        .env("ZERON_WORKOS_CLIENT_ID", &config.client)
         .env("ZERON_CALLBACK_PORT", config.callback_port.to_string())
         // Not the shipping app's: no app to open from a banner.
         .env_remove("ZERON_APP")
@@ -564,6 +571,52 @@ mod tests {
         assert!(!spawner.start_if_due(&config), "held: nothing started");
         lock.unlock().unwrap();
         assert!(spawner.start_if_due(&config), "let go: started at once");
+    }
+
+    /// Crew: the engine this app starts reads its Edge and sign-in from its
+    /// own runtime configuration. It's given its data dir, its port and the
+    /// sign-in callback's port 0, and no edge or WorkOS client, whatever the
+    /// config holds. (A stand-in that writes down what it was started with.)
+    #[cfg(all(unix, not(feature = "beta")))]
+    #[test]
+    fn a_crew_engine_is_started_with_no_edge_or_workos_client() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("engine");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = --build-id ] && exit 0\nenv > \"$ZERON_DATA_DIR/env.part\" && mv \"$ZERON_DATA_DIR/env.part\" \"$ZERON_DATA_DIR/env.txt\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let crew = crate::crew::endpoint_at(None);
+        let config = Config {
+            port: 27961,
+            data_dir: dir.path().join("data"),
+            bin: Some(bin),
+            home: Some(dir.path().join("home")),
+            spawn: true,
+            // (Upstream's, had they been passed on.)
+            edge: "https://edge.zeron.sh".into(),
+            client: "client_01KWD0EAKZKD50YCQJNYSRE4BY".into(),
+            callback_port: crew.port,
+            managed: false,
+        };
+        assert!(Spawner::new().start_if_due(&config), "started");
+        let written = config.data_dir.join("env.txt");
+        let until = Instant::now() + Duration::from_secs(20);
+        while !written.is_file() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let env = std::fs::read_to_string(&written).expect("the stand-in wrote down its environment");
+        let var = |name: &str| env.lines().find_map(|line| line.strip_prefix(&format!("{name}=")).map(str::to_owned));
+        assert_eq!(var("ZERON_EDGE_URL"), None);
+        assert_eq!(var("ZERON_WORKOS_CLIENT_ID"), None);
+        assert_eq!(var("ZERON_CALLBACK_PORT").as_deref(), Some("0"));
+        assert_eq!(var("ZERON_IPC_PORT").as_deref(), Some("27961"));
+        assert_eq!(var("ZERON_DATA_DIR").map(PathBuf::from), Some(config.data_dir.clone()));
+        assert_eq!(var("HOME").map(PathBuf::from), Some(dir.path().join("home")));
+        assert!(env.lines().all(|line| !line.contains("zeron.sh")), "nothing of Zeron's servers:\n{env}");
     }
 
     #[test]

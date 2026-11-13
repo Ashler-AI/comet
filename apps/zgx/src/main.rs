@@ -37,6 +37,7 @@ mod auth;
 mod carried_settings;
 mod chat;
 mod cloud;
+mod crew;
 mod dev;
 mod dictation;
 mod completion;
@@ -849,6 +850,10 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         links::install(&host);
         // Your imported VS Code themes (src/themes.rs).
         themes::install(cx, &host);
+        // Crew (src/crew.rs): the `crew` flag, and the account's calls
+        // answered with no Edge (after auth's and settings', which these
+        // replace).
+        crew::install(&host);
     }
     host
 }
@@ -1227,7 +1232,7 @@ fn run_menu_command(host: &ScriptHost, id: &str) {
 
 fn intro_window() -> WindowOptions {
     WindowOptions {
-        title: "Zeron".into(),
+        title: crew::TITLE.into(),
         transparent: true,
         decorations: false,
         resizable: false,
@@ -1255,7 +1260,7 @@ fn zeron_glass() -> Glass {
 /// blur, which the theme's `background` tints (the shipping app's glass).
 fn zeron_window(width: f64, height: f64) -> WindowOptions {
     WindowOptions {
-        title: "Zeron".into(),
+        title: crew::TITLE.into(),
         width,
         height,
         decorations: cfg!(target_os = "macos"),

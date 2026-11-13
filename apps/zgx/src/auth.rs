@@ -28,6 +28,10 @@
 //! accepts, shared with Zeron.app). It has no staging built in, and the
 //! variables below do nothing in it.
 //!
+//! Crew: this branch's development builds are Crew's (src/crew.rs): Scaffold
+//! through the engine, no WorkOS, no Edge calls from here, and none of the
+//! variables below. Upstream's builds:
+//!
 //! Development builds are staging's by default, production one variable
 //! away:
 //!   ZERON_ZGX_ENV=production       edge.zeron.sh, its client, port 27641
@@ -140,6 +144,11 @@ fn endpoint_with(_var: impl Fn(&str) -> Option<String>) -> Endpoint {
 /// A development build's: staging's by default, or as the variables say.
 #[cfg(not(feature = "beta"))]
 fn endpoint_with(var: impl Fn(&str) -> Option<String>) -> Endpoint {
+    // Crew: Crew's alone, whatever the variables say; nothing below is
+    // reachable from a Crew build.
+    if crate::crew::MODE {
+        return crate::crew::endpoint();
+    }
     let base = match var("ZERON_ZGX_ENV").as_deref() {
         Some("production" | "prod") => &PRODUCTION,
         _ => &STAGING,
@@ -196,12 +205,28 @@ mod endpoint_tests {
 
     #[cfg(not(feature = "beta"))]
     #[test]
+    #[ignore = "Crew: upstream's staging default is unreachable from a Crew build (a_crew_build_is_crew_s_whatever_it_is_told)"]
     fn a_development_build_is_staging_unless_told() {
         let at = endpoint_with(|_| None);
         assert_eq!((at.name, at.edge.as_str(), at.port), ("staging", STAGING.edge, STAGING.port));
         let at = endpoint_with(|key| (key == "ZERON_ZGX_ENV").then(|| "production".into()));
         assert_eq!((at.name, at.edge.as_str(), at.port), ("production", PRODUCTION.edge, PRODUCTION.port));
         assert_eq!(endpoint_with(staging_vars).name, "custom");
+    }
+
+    /// Crew: a development build signs in with Scaffold through its engine,
+    /// whatever the variables say: no WorkOS client, the engine's own
+    /// callback port (0), and never staging's or production's edge.
+    #[cfg(not(feature = "beta"))]
+    #[test]
+    fn a_crew_build_is_crew_s_whatever_it_is_told() {
+        let production = |key: &str| (key == "ZERON_ZGX_ENV").then(|| "production".to_string());
+        for vars in [staging_vars as fn(&str) -> Option<String>, |_: &str| None, production] {
+            let at = endpoint_with(vars);
+            assert_eq!((at.name, at.client.as_str(), at.port), (crate::crew::ENV, "", 0));
+            assert!(at.edge != STAGING.edge && at.edge != PRODUCTION.edge, "{}", at.edge);
+        }
+        assert_eq!(endpoint().name, crate::crew::ENV);
     }
 }
 
@@ -414,6 +439,20 @@ pub(crate) fn signed_in() -> Option<(String, Option<String>)> {
     })
 }
 
+/// The signed-in account as the engine said it: what Crew answers the
+/// account's calls from (src/crew.rs).
+pub(crate) fn signed_in_account() -> Option<crate::crew::Account> {
+    AUTH.with(|a| match &*a.session.borrow() {
+        Session::SignedIn { user, org } => Some(crate::crew::Account {
+            id: user.id.clone(),
+            email: user.email.clone(),
+            first_name: user.first_name.clone(),
+            org: org.clone(),
+        }),
+        _ => None,
+    })
+}
+
 pub(crate) async fn edge(method: &'static str, path: String, body: Option<Json>) -> Result<(u16, Json), Outcome> {
     let auth = AUTH.with(Rc::clone);
     auth.authed(method, path, body).await
@@ -435,7 +474,13 @@ pub(crate) fn encode_path(value: &str) -> String {
 pub fn session_exists() -> bool {
     let account = endpoint();
     engine::manager::Config::from_env(&account.edge, &account.client, account.port)
-        .is_ok_and(|config| config.data_dir.join("session.json").is_file())
+        .is_ok_and(|config| session_kept(&config.data_dir))
+}
+
+/// Whether an engine keeps a session in `data_dir`: `session.json`, or
+/// (Crew) the Scaffold one beside it (src/crew.rs).
+pub(crate) fn session_kept(data_dir: &std::path::Path) -> bool {
+    data_dir.join("session.json").is_file() || crate::crew::scaffold_session_kept(data_dir)
 }
 
 /// Whether a launch still without the engine's answer shows signed out.
@@ -487,6 +532,8 @@ impl Auth {
             ("user", user),
             ("failure", self.failure.get().map_or(Value::Nil, Value::from)),
             ("env", Value::from(self.endpoint.name)),
+            // Who it signs in with (Crew: "scaffold"; upstream's say none).
+            ("provider", crate::crew::provider()),
             // The organization the session works in (Settings' own).
             (
                 "organization_id",
@@ -676,6 +723,12 @@ impl Auth {
 
     /// The engine's bearer, kept until it nears its end.
     async fn bearer(&self) -> Result<String, Outcome> {
+        // Crew: the engine keeps its Scaffold bearer to itself (it refuses
+        // `AccessToken`), so nothing here asks for one, and no call reaches
+        // the Edge (src/crew.rs answers the account's calls).
+        if crate::crew::MODE {
+            return Err(crate::crew::NO_EDGE);
+        }
         if let Some(access) = &*self.access.borrow()
             && access.expires - now() > TOKEN_SLACK
         {
@@ -921,6 +974,10 @@ impl Auth {
 
     /// Anyone's card: public, no account needed.
     async fn card(&self, name: String) -> Result<Value, Outcome> {
+        // Crew: no cards, and no call to the Edge for one.
+        if crate::crew::MODE {
+            return Ok(Value::Nil);
+        }
         let url = format!("{}/cards/{}", self.endpoint.edge, encode(&name));
         match off_thread(move || request("GET", &url, None, None))
             .await
