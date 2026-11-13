@@ -75,6 +75,11 @@ Each production step needs point-of-execution approval. Both `comet-production`
    - The provider must hand sandboxes Scaffold's public https origin
      (ashler-platform #13388). Primary's own control-plane URL is cluster-private, and
      native Crew refuses it.
+   - The Crew release must include #215: crew-web must present the engine's IPC
+     token, or every native sandbox stalls with crew-web at 503.
+   - Set the pins in both places. The primary build job runs in the `staging` GitHub
+     environment, and its `SCAFFOLD_ASHLER_COMET_VERSION` and
+     `SCAFFOLD_ASHLER_COMET_LINUX_SHA256` override the repository variables.
    - Flip the template and the Worker back to back, at a quiet time. Each provider pod
      runs one template generation. Until the `chat2` Worker is deployed, new Crew
      sessions are refused with `crew_session_migration_required`. Prebuild the images
@@ -124,5 +129,24 @@ until a retry.
 
 The desktop app ships ahead of Scaffold instead: `release_surface=desktop`,
 `scaffold_runtime_deployment=desktop-ahead-of-scaffold`, reusing the staging candidate
-run. Production Scaffold stays on the v1 runtime. A retry of step 4 needs #13388 merged
-first, and the back-to-back flip described above.
+run. Production Scaffold stays on the v1 runtime.
+
+## 2026-11-13 retry: rolled back, third cause found
+
+The retry shipped #13388 with Crew 0.2.148. The template flipped at 19:08Z, and the
+Worker flipped at 19:14Z after a 5-minute skew window. #13388 worked: the engine started
+with `--scaffold-url https://scaffold.internal.ashler.com` and stayed up. But a fresh
+native session still never became ready. The 0.2.148 engine refused crew-web's IPC
+connections ("rejecting IPC handshake without the engine's bearer token", 401). Since
+`454c93e72` the engine requires `Authorization: Bearer <{data_dir}/ipc-token>`, and
+crew-web's `CrewRpc` never sent it. The supervisor's engine probe and agent bridge import
+the same client. #215 fixes that.
+
+Recovery:
+
+- The Worker was rolled back to `f4925073` at 19:25Z. ashler-platform #13524 restored the
+  pre-flip lock and reverted the `chat2` config.
+- A new Crew session was ready 28 s after launch on the legacy stack (19:42Z).
+- No user session was affected; only the test session was created in the window.
+
+The next retry needs a Crew release that includes #215.
