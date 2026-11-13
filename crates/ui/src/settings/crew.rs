@@ -21,6 +21,8 @@ pub(crate) struct CrewStatus {
 struct SharedAccount {
     id: String,
     provider: String,
+    #[serde(default)]
+    provider_account_id: Option<String>,
     email: Option<String>,
     display_name: Option<String>,
     plan_label: Option<String>,
@@ -31,6 +33,57 @@ struct SharedAccount {
 
 #[derive(Deserialize)]
 struct Accounts { accounts: Vec<SharedAccount> }
+
+fn is_healthy(account: &SharedAccount) -> bool {
+    matches!(account.status.as_str(), "connected" | "active" | "ready")
+}
+
+/// One shared login and its other saved copies. Older sign-in paths saved some ChatGPT
+/// logins twice (by workspace, or by user and workspace) or under an earlier owner key.
+/// Newer servers merge them; this keeps an older server's copies off the list.
+struct SharedLogin<'a> {
+    account: &'a SharedAccount,
+    copies: Vec<&'a SharedAccount>,
+}
+
+fn login_key(account: &SharedAccount) -> String {
+    let provider = account.provider.to_ascii_lowercase();
+    let identity = account.provider_account_id.as_deref().unwrap_or(&account.id);
+    match account.email.as_deref().map(str::trim).filter(|email| !email.is_empty()) {
+        // A ChatGPT login is one person (email) in one workspace; seats of a Team stay apart.
+        Some(email) if provider == "openai" => {
+            let workspace = identity.split_once("::").map_or(identity, |(_, workspace)| workspace);
+            format!("openai\u{1f}{workspace}\u{1f}{}", email.to_lowercase())
+        }
+        _ => format!("{provider}\u{1f}{identity}"),
+    }
+}
+
+/// Logins in server order, each shown through a working copy when it has one.
+fn shared_logins(accounts: &[SharedAccount]) -> Vec<SharedLogin<'_>> {
+    let mut logins: Vec<(String, Vec<&SharedAccount>)> = Vec::new();
+    for account in accounts {
+        let key = login_key(account);
+        match logins.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, copies)) => copies.push(account),
+            None => logins.push((key, vec![account])),
+        }
+    }
+    logins.into_iter().map(|(_, mut copies)| {
+        copies.sort_by_key(|account| (
+            !is_healthy(account),
+            !account.provider_account_id.as_deref().is_some_and(|id| id.contains("::")),
+        ));
+        let account = copies.remove(0);
+        SharedLogin { account, copies }
+    }).collect()
+}
+
+/// An operation waiting for the user's confirmation.
+enum PendingAction {
+    Request { method: &'static str, params: Value },
+    RemoveAccounts(Vec<String>),
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +159,7 @@ mod provisioning_tests {
             SharedAccount {
                 id: "acct_anthropic".into(),
                 provider: "anthropic".into(),
+                provider_account_id: None,
                 email: None,
                 display_name: None,
                 plan_label: None,
@@ -115,6 +169,7 @@ mod provisioning_tests {
             SharedAccount {
                 id: "acct_openai".into(),
                 provider: "openai".into(),
+                provider_account_id: None,
                 email: None,
                 display_name: None,
                 plan_label: None,
@@ -218,7 +273,7 @@ pub struct CrewAccounts {
     busy: bool,
     error: Option<String>,
     notice: Option<String>,
-    confirmation: Option<(&'static str, Value, String)>,
+    confirmation: Option<(PendingAction, String)>,
     model_picker: Entity<crate::pickers::Pickers>,
     _model_picked: Subscription,
     selected: Option<(zeron_proto::HarnessId, String)>,
@@ -456,8 +511,46 @@ impl CrewAccounts {
             region: None, database_environment: self.database,
             agent_route: route,
         };
-        self.confirmation = Some(("scaffold.control", json!({"commandId": format!("{}:create", uuid::Uuid::new_v4()), "control": control}),
-            description));
+        self.confirmation = Some((PendingAction::Request {
+            method: "scaffold.control",
+            params: json!({"commandId": format!("{}:create", uuid::Uuid::new_v4()), "control": control}),
+        }, description));
+        cx.notify();
+    }
+
+    fn confirm_removal(&mut self, ids: Vec<String>, description: String, cx: &mut Context<Self>) {
+        self.confirmation = Some((PendingAction::RemoveAccounts(ids), description));
+        cx.notify();
+    }
+
+    /// Revokes shared accounts one at a time and keeps whatever was removed before a failure.
+    fn remove_accounts(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        if self.busy { return; }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some("Engine unavailable. No account was removed.".into()); cx.notify(); return;
+        };
+        self.busy = true; self.error = None; self.notice = None;
+        cx.spawn(async move |this, cx| {
+            let mut removed = Vec::new();
+            let mut failure = None;
+            for id in &ids {
+                match engine.client().call("crew.accounts.revoke", json!({"accountId": id})).await {
+                    Ok(_) => removed.push(id.clone()),
+                    Err(error) => { failure = Some(error.to_string()); break; }
+                }
+            }
+            this.update(cx, |page, cx| {
+                page.busy = false;
+                page.accounts.retain(|account| !removed.contains(&account.id));
+                if let Some(error) = failure {
+                    page.error = Some(format!("Removed {} of {} accounts: {error}", removed.len(), ids.len()));
+                } else {
+                    page.notice = Some(if removed.len() == 1 { "Account removed.".into() } else { format!("{} accounts removed.", removed.len()) });
+                    page.refresh(cx);
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
         cx.notify();
     }
 
@@ -518,7 +611,7 @@ impl Render for CrewAccounts {
         };
         let mut body = div().flex().flex_col().gap(px(16.0))
             .child(div().flex().items_center().justify_between().gap(px(12.0))
-                .child(widgets::page_header(&theme, title, (self.view == CrewView::Accounts).then_some(self.accounts.len())))
+                .child(widgets::page_header(&theme, title, (self.view == CrewView::Accounts).then(|| shared_logins(&self.accounts).len())))
                 .when(self.view != CrewView::Annotations, |el| el.child(Self::action(&theme, "crew-refresh", if self.busy { "Refreshing…" } else { "Refresh" })
                     .on_click(cx.listener(|page, _, _, cx| page.refresh(cx))))));
         if !matches!(self.state.read(cx).auth, Some(zeron_proto::AuthState::SignedIn { .. })) {
@@ -529,7 +622,7 @@ impl Render for CrewAccounts {
         }
         if let Some(error) = &self.error { body = body.child(widgets::error_strip(&theme, error.clone())); }
         if let Some(notice) = &self.notice { body = body.child(widgets::page_subtitle(&theme, notice.clone())); }
-        if let Some((_, _, description)) = &self.confirmation {
+        if let Some((_, description)) = &self.confirmation {
             let card = crate::popover::dialog_card(&theme).id("crew-confirmation-card")
                 .role(gpui::Role::Dialog).aria_label("Confirm operation")
                 .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
@@ -538,12 +631,15 @@ impl Render for CrewAccounts {
                 .child(widgets::row_title(&theme, "Confirm operation"))
                 .child(widgets::page_subtitle(&theme, description.clone()))
                 .child(Self::action(&theme, "crew-confirm", "Confirm")
+                    .debug_selector(|| "crew-confirm".into())
                     .tab_index(if self.busy { -1 } else { 0 })
                     .when(self.busy, |el| el.opacity(0.5).aria_description("Unavailable while a request is pending"))
                     .on_click(cx.listener(|page, _, _, cx| {
                         if page.busy { return; }
-                        if let Some((method, params, _)) = page.confirmation.take() {
-                            page.request(method, params, cx);
+                        match page.confirmation.take() {
+                            Some((PendingAction::Request { method, params }, _)) => page.request(method, params, cx),
+                            Some((PendingAction::RemoveAccounts(ids), _)) => page.remove_accounts(ids, cx),
+                            None => {}
                         }
                     })))
                 .child(Self::action(&theme, "crew-cancel", "Cancel").on_click(cx.listener(|page, _, _, cx| { page.confirmation = None; cx.notify(); })));
@@ -552,8 +648,10 @@ impl Render for CrewAccounts {
         let Some(status) = self.status.clone() else { return body.into_any_element(); };
         if self.view == CrewView::Accounts {
             let now = chrono::Utc::now();
+            let logins = shared_logins(&self.accounts);
+            let controller = status.role == "local_controller";
             for (provider, title, harness) in [("anthropic", "Anthropic", zeron_proto::HarnessId::ClaudeCode), ("openai", "OpenAI", zeron_proto::HarnessId::Codex), ("antigravity", "Antigravity", zeron_proto::HarnessId::Antigravity)] {
-                let mut accounts = self.accounts.iter().filter(|account| account.provider.eq_ignore_ascii_case(provider)).peekable();
+                let mut provider_logins = logins.iter().filter(|login| login.account.provider.eq_ignore_ascii_case(provider)).peekable();
                 let header = div().flex().items_center().justify_between().gap(px(12.0))
                     .child(div().flex().items_center().gap(px(8.0))
                         .child(crate::icons::icon(match harness { zeron_proto::HarnessId::Codex => crate::icons::OPENAI_MARK, zeron_proto::HarnessId::Antigravity => crate::icons::ANTIGRAVITY_MARK, _ => crate::icons::CLAUDE_MARK }).size(px(20.0)).text_color(theme.text_muted))
@@ -561,12 +659,20 @@ impl Render for CrewAccounts {
                     .when(status.role == "local_controller", |el| el.child(Self::action(&theme, format!("crew-add-{provider}"), "Add account")
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddAccount(harness))))));
                 let mut card = widgets::section_card(&theme).flex().flex_col();
-                if accounts.peek().is_none() {
+                if provider_logins.peek().is_none() {
                     card = card.child(div().p(px(16.0)).child(widgets::page_subtitle(&theme, "No accounts yet.")));
                 }
-                for account in accounts {
+                for login in provider_logins {
+                    let account = login.account;
                     let label = account.email.clone().or(account.display_name.clone()).unwrap_or_else(|| "Shared account".into());
-                    let healthy = matches!(account.status.as_str(), "connected" | "active" | "ready");
+                    let healthy = is_healthy(account);
+                    let copy_ids: Vec<String> = login.copies.iter().map(|copy| copy.id.clone()).collect();
+                    let copies = copy_ids.len();
+                    let copy_noun = if copies == 1 { "copy" } else { "copies" };
+                    let all_ids: Vec<String> = std::iter::once(account.id.clone()).chain(copy_ids.iter().cloned()).collect();
+                    let remove_description = format!("Remove {label} from shared accounts?\nSandboxes stop using it. You can add it again later.{}",
+                        if copies > 0 { format!("\nIts {copies} other saved {copy_noun} will be removed too.") } else { String::new() });
+                    let copies_description = format!("Remove {copies} duplicate {copy_noun} of {label}?\nThe account itself is kept.");
                     let row = div().flex().items_center().gap(px(12.0)).p(px(16.0)).border_b_1().border_color(theme.border)
                         .child(div().flex_none().size(px(32.0)).rounded_full().bg(theme.wash(0.09)).flex().items_center().justify_center()
                             .child(label.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into())))
@@ -581,7 +687,18 @@ impl Render for CrewAccounts {
                                         .child(super::accounts::render_usage_meter_width(usage, &theme, 230.0))
                                         .when_some(super::accounts::format_reset(usage.resets_at, now), |el, reset| el.child(widgets::page_subtitle(&theme, reset)))
                                 }))
-                                .when(account.usage_windows.is_empty(), |el| el.child(widgets::page_subtitle(&theme, "Usage unavailable")))));
+                                .when(account.usage_windows.is_empty(), |el| el.child(widgets::page_subtitle(&theme, "Usage unavailable"))))
+                            .when(copies > 0, |el| el.child(widgets::page_subtitle(&theme,
+                                format!("Also saved {copies} more {}", if copies == 1 { "time" } else { "times" }))))
+                            .when(controller, |el| el.child(div().flex().flex_wrap().gap(px(8.0))
+                                .child(Self::action(&theme, format!("crew-remove-{}", account.id), "Remove…")
+                                    .debug_selector(|| format!("crew-remove-{}", account.id))
+                                    .aria_description("Remove this account from the shared pool")
+                                    .on_click(cx.listener(move |page, _, _, cx| page.confirm_removal(all_ids.clone(), remove_description.clone(), cx))))
+                                .when(copies > 0, |el| el.child(Self::action(&theme, format!("crew-remove-copies-{}", account.id), "Remove copies…")
+                                    .debug_selector(|| format!("crew-remove-copies-{}", account.id))
+                                    .aria_description("Remove duplicate saved copies of this account")
+                                    .on_click(cx.listener(move |page, _, _, cx| page.confirm_removal(copy_ids.clone(), copies_description.clone(), cx))))))));
                     card = card.child(row);
                 }
                 body = body.child(div().flex().flex_col().gap(px(10.0)).child(header).child(card));
@@ -612,7 +729,7 @@ impl Render for CrewAccounts {
                         .on_click(cx.listener(|page, _, _, cx| { page.sandbox_options = !page.sandbox_options; cx.notify(); }))))
                 .when(self.sandbox_options, |el| {
                     let provider = self.agent_route().map(|route| route.provider);
-                    let candidates: Vec<_> = self.accounts.iter().filter(|account| matches!(account.status.as_str(), "active" | "connected" | "ready") && match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), Some(AgentProvider::Antigravity) => account.provider.eq_ignore_ascii_case("antigravity"), None => false }).collect();
+                    let candidates: Vec<_> = shared_logins(&self.accounts).into_iter().map(|login| login.account).filter(|account| is_healthy(account) && match provider { Some(AgentProvider::Anthropic) => account.provider.eq_ignore_ascii_case("anthropic"), Some(AgentProvider::OpenAi) => account.provider.eq_ignore_ascii_case("openai"), Some(AgentProvider::Antigravity) => account.provider.eq_ignore_ascii_case("antigravity"), None => false }).collect();
                     let selected = candidates.iter().position(|account| Some(&account.id) == self.account.as_ref()).map_or(0, |ix| ix + 1);
                     let ids: Vec<_> = candidates.iter().map(|account| account.id.clone()).collect();
                     let options = std::iter::once(widgets::SelectOption::new("Automatic · shared pool")).chain(candidates.iter().map(|account| widgets::SelectOption::new(account.email.clone().or(account.display_name.clone()).unwrap_or_else(|| "Shared account".into())))).collect::<Vec<_>>();
@@ -674,7 +791,7 @@ impl Render for CrewAccounts {
                     if operation == "Inspect" { page.control(control, cx); }
                     else {
                         let warning = if operation == "Stop sandbox…" { "Stop permanently ends this host epoch. The same logical session may later explicitly start a fresh epoch; its old native process is never resumed. This is NOT the composer Stop button." } else if operation == "Start new epoch…" { "Start a fresh verified host epoch for this same session. Original history and its receipt stay immutable; only a new user request may begin a new native conversation. This does not resume the destroyed native process." } else if operation == "Use sandbox…" { "Attach to this same sandbox; if paused, it will resume. This does not create another sandbox." } else { "Apply this operation to the selected sandbox?" };
-                        page.confirmation = Some(("scaffold.control", json!({"commandId": uuid::Uuid::new_v4().to_string(), "control": control}), format!("{operation} {label}\n{warning}"))); cx.notify();
+                        page.confirmation = Some((PendingAction::Request { method: "scaffold.control", params: json!({"commandId": uuid::Uuid::new_v4().to_string(), "control": control}) }, format!("{operation} {label}\n{warning}"))); cx.notify();
                     }
                 })));
             }
@@ -698,3 +815,141 @@ pub(crate) fn lifecycle_label(lifecycle: zeron_proto::ScaffoldLifecycle) -> &'st
     match lifecycle { Creating => "Creating", RestoringSnapshot => "Restoring snapshot", Starting => "Starting", Ready => "Ready", AgentRunning => "Agent running", Paused => "Paused", Resuming => "Resuming", Stopped => "Stopped", Failed => "Needs attention" }
 }
 
+
+#[cfg(test)]
+mod shared_login_tests {
+    use super::*;
+
+    fn account(id: &str, provider: &str, provider_account_id: &str, email: &str, status: &str) -> SharedAccount {
+        SharedAccount {
+            id: id.into(),
+            provider: provider.into(),
+            provider_account_id: Some(provider_account_id.into()),
+            email: Some(email.into()),
+            display_name: None,
+            plan_label: None,
+            status: status.into(),
+            usage_windows: vec![],
+        }
+    }
+
+    fn shown(accounts: &[SharedAccount]) -> Vec<(&str, Vec<&str>)> {
+        shared_logins(accounts)
+            .into_iter()
+            .map(|login| (login.account.id.as_str(), login.copies.iter().map(|copy| copy.id.as_str()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn saved_copies_of_one_chatgpt_login_show_as_one_working_account() {
+        let accounts = [
+            account("earlier", "openai", "workspace-1", "Person@Example.com", "attention_required"),
+            account("other", "openai", "workspace-2", "other@example.com", "connected"),
+            account("workspace-only", "openai", "workspace-1", "person@example.com", "connected"),
+            account("crew", "openai", "user-1::workspace-1", "person@example.com", "connected"),
+        ];
+        assert_eq!(shown(&accounts), vec![("crew", vec!["workspace-only", "earlier"]), ("other", vec![])]);
+    }
+
+    #[test]
+    fn seats_of_one_team_workspace_stay_separate_accounts() {
+        let accounts = [
+            account("a", "openai", "user-a::team", "a@example.com", "connected"),
+            account("b", "openai", "user-b::team", "b@example.com", "connected"),
+            account("c", "openai", "team", "c@example.com", "connected"),
+        ];
+        assert_eq!(shown(&accounts), vec![("a", vec![]), ("b", vec![]), ("c", vec![])]);
+    }
+
+    #[test]
+    fn other_providers_merge_only_identical_account_ids() {
+        let accounts = [
+            account("claude-1", "anthropic", "uuid-1", "person@example.com", "connected"),
+            account("claude-2", "anthropic", "uuid-2", "person@example.com", "connected"),
+            account("claude-1-earlier-key", "anthropic", "uuid-1", "person@example.com", "connected"),
+            account("chatgpt", "openai", "uuid-1", "person@example.com", "connected"),
+        ];
+        assert_eq!(
+            shown(&accounts),
+            vec![("claude-1", vec!["claude-1-earlier-key"]), ("claude-2", vec![]), ("chatgpt", vec![])],
+        );
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+    use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+    use std::sync::{Arc, Mutex};
+
+    fn listed(revoked: &[String]) -> Value {
+        let accounts = [
+            json!({"id": "dead", "provider": "openai", "providerAccountId": "workspace-1",
+                "email": "person@example.com", "status": "attention_required"}),
+            json!({"id": "crew", "provider": "openai", "providerAccountId": "user-1::workspace-1",
+                "email": "person@example.com", "planLabel": "ChatGPT Pro", "status": "connected"}),
+            json!({"id": "other", "provider": "openai", "providerAccountId": "user-2::workspace-2",
+                "email": "other@example.com", "status": "connected"}),
+        ];
+        json!({"accounts": accounts.into_iter()
+            .filter(|account| !revoked.iter().any(|id| account["id"] == id.as_str()))
+            .collect::<Vec<_>>()})
+    }
+
+    #[gpui::test]
+    fn removing_copies_revokes_only_the_duplicate_and_keeps_the_account(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let revoked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rpc = ScriptedRpc::new({
+            let revoked = revoked.clone();
+            move |method, params| {
+                let revoked = revoked.clone();
+                async move {
+                    match method.as_str() {
+                        "crew.status" => zeron_rpc::RpcReply::value(&json!({
+                            "scope": {"projectId": "project"}, "principalId": "owner", "role": "local_controller",
+                        })),
+                        "crew.accounts.list" => zeron_rpc::RpcReply::value(&listed(&revoked.lock().unwrap())),
+                        "crew.accounts.revoke" => {
+                            revoked.lock().unwrap().push(params["accountId"].as_str().unwrap().into());
+                            zeron_rpc::RpcReply::value(&json!({}))
+                        }
+                        other => panic!("unexpected RPC {other}"),
+                    }
+                }
+            }
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = fixture::state(cx, Some(rpc.client()));
+            state.update(cx, |state, _| {
+                state.auth = Some(zeron_proto::AuthState::SignedIn {
+                    user: zeron_proto::UserProfile { id: "owner".into(), email: "owner@example.com".into(), name: None },
+                    org_id: None,
+                });
+            });
+            let mut page = CrewAccounts::new(state, cx);
+            page.refresh(cx);
+            page
+        });
+        rpc.settle(cx, &runtime, |cx| page.read_with(cx, |page, _| !page.busy && page.status.is_some()));
+
+        // The dead copy is folded into the working login rather than listed.
+        assert!(cx.debug_bounds("crew-remove-crew").is_some());
+        assert!(cx.debug_bounds("crew-remove-dead").is_none());
+        assert!(cx.debug_bounds("crew-remove-copies-other").is_none());
+        let remove_copies = cx.debug_bounds("crew-remove-copies-crew").unwrap();
+        cx.simulate_click(remove_copies.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let confirm = cx.debug_bounds("crew-confirm").unwrap();
+        cx.simulate_click(confirm.center(), gpui::Modifiers::default());
+        rpc.settle(cx, &runtime, |cx| page.read_with(cx, |page, _| !page.busy && page.notice.is_some()));
+
+        assert_eq!(*revoked.lock().unwrap(), ["dead"]);
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.accounts.iter().map(|account| account.id.as_str()).collect::<Vec<_>>(), ["crew", "other"]);
+            assert_eq!(page.error, None);
+        });
+    }
+}
