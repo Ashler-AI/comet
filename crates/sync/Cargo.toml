@@ -21,6 +21,9 @@ rusqlite.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# Crew's Scaffold sign-in (scaffold_auth.rs): PKCE challenges and Retry-After dates.
+base64 = "0.22"
+chrono.workspace = true
 
 # NWPathMonitor bridge (net_path.rs) — the update handler is an ObjC block.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -32,9 +35,7 @@ block2 = "0.6"
 mock-server = []
 
 [dev-dependencies]
-chrono.workspace = true
 zeron-proto.workspace = true
 tempfile.workspace = true
-base64 = "0.22"
 # `start_paused` virtual-clock tests (the 2026-07-30 sync-stall regressions).
 tokio = { workspace = true, features = ["test-util"] }
