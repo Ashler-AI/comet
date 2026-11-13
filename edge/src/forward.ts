@@ -6,6 +6,7 @@
  */
 import type { Verified } from "./auth";
 import { AUTH_USER_HEADER, CALLER_DEVICE_HEADER, ROOM_KIND_HEADER, RUNNER_ACCOUNT_HEADER, RUNNER_DEVICE_HEADER } from "./env";
+import { crewForwardHeaders } from "./crew/authority";
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -37,6 +38,8 @@ export const forward = (
   headers.delete(RUNNER_ACCOUNT_HEADER);
   // And the calling device: only a dial the Worker verified (device-link.ts).
   headers.delete(CALLER_DEVICE_HEADER);
+  // And Crew's x-crew-* headers: only the authority the Worker verified.
+  crewForwardHeaders(request, headers);
   headers.set(AUTH_USER_HEADER, auth.userId);
   if (callerDevice) headers.set(CALLER_DEVICE_HEADER, callerDevice);
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);

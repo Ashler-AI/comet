@@ -22,6 +22,12 @@
  * act as their device, not the user: every row delivery to them is filtered
  * and every op they push must be on a row they host (registry-runner.ts).
  *
+ * Crew (docs/crew/zgx-thin-port.md): sockets keep the Worker's verified
+ * authority (crew/authority.ts), revalidated before each frame in and out.
+ * A Scaffold sandbox host's device credential sees and writes only its own
+ * session, device and space, typed by crew/registry-scope.ts and bound to
+ * its lifecycle epoch; `/peer-target` answers the typed peer relay.
+ *
  * Hibernation discipline: ZERO wall-clock timers; ping/pong rides the
  * auto-response pair; the one alarm does the bookkeeping flush and, daily,
  * tombstone GC + the R2 backup.
@@ -29,6 +35,8 @@
 import { applyOp, validateOp, type Op, type Row } from "./registry-core";
 import { chatHost, parentOf, runnerCanSee, runnerOpRefusal, type RunnerScope } from "./registry-runner";
 import { AUTH_USER_HEADER, RUNNER_ACCOUNT_HEADER, RUNNER_DEVICE_HEADER, apnsConfig, type Env } from "./env";
+import { requestAuthority, socketAuthorized, sendAuthorized, type SocketAuthority } from "./crew/authority";
+import { bindingMatches, registryHost, scopedOps, visibleRow } from "./crew/registry-scope";
 import { isDeadToken, sendApns, type ApnsEnvironment } from "./apns";
 import { WriteMeter } from "./write-meter";
 import {
@@ -56,6 +64,8 @@ const MAX_FRAME_BYTES = 1_000_000;
 const BOOKKEEPING_FLUSH_MS = 5 * 60_000;
 
 interface SocketState {
+  /** Crew: the Worker's verified authority, revalidated per frame. */
+  authority?: SocketAuthority;
   userId: string;
   device: string;
   /** Set once a valid hello established the session. */
@@ -124,6 +134,20 @@ export class RegistryRoom implements DurableObject {
    * alarm it arms is durable, so evicting this field loses no flush. */
   private flushAt?: number;
 
+  /** Every frame out goes past its socket's authority (crew/authority.ts); a
+   * sandbox host's frames carry only its own rows and presence. */
+  private send(ws: WebSocket, frame: Record<string, unknown>): void {
+    const authority = (ws.deserializeAttachment() as SocketState | null)?.authority;
+    if (authority?.credential === "device") {
+      if (!this.hostAuthorized(authority)) { ws.close(4403, "registry binding changed"); return; }
+      if (frame.t === "presence" && frame.device !== authority.deviceId) return;
+      frame = { ...frame };
+      if (Array.isArray(frame.rows)) frame.rows = this.filterRows(frame.rows as Row[], authority);
+      if (frame.presence) frame.presence = this.visiblePresence(authority);
+    }
+    sendAuthorized(this.env, this.ctx, ws, JSON.stringify(frame));
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.env = env;
@@ -174,6 +198,32 @@ export class RegistryRoom implements DurableObject {
 
   private gcFloor(): number {
     return Number(this.getMeta("gcFloor") ?? "0");
+  }
+
+  // ── Crew: a sandbox host's view (crew/registry-scope.ts) ─────────────────
+
+  /** A device credential is this deployment's typed host for its session, and
+   * no newer lifecycle epoch has written that session since. */
+  private hostAuthorized(authority: SocketAuthority): boolean {
+    if (!registryHost(authority) || authority.projectId !== this.env.SCAFFOLD_PROJECT_SCOPE ||
+        authority.deploymentId !== this.env.SCAFFOLD_DEPLOYMENT_ID ||
+        !bindingMatches(this.loadRow("chats", authority.sessionId!), authority)) return false;
+    const stored = this.getMeta(`hostBinding/${authority.sessionId}`);
+    if (!stored) return true;
+    const binding = JSON.parse(stored) as { device: string; epoch: number };
+    return authority.lifecycleEpoch! > binding.epoch ||
+      authority.lifecycleEpoch === binding.epoch && authority.deviceId === binding.device;
+  }
+
+  private filterRows(rows: Row[], authority?: SocketAuthority): Row[] {
+    if (authority?.credential !== "device") return rows;
+    return rows.filter(row => visibleRow(row, authority));
+  }
+
+  private visiblePresence(authority?: SocketAuthority): Record<string, number> {
+    if (authority?.credential !== "device") return Object.fromEntries(this.presence);
+    const at = this.presence.get(authority.deviceId!);
+    return at === undefined ? {} : { [authority.deviceId!]: at };
   }
 
   // ── row storage ───────────────────────────────────────────────────────────
@@ -298,15 +348,47 @@ export class RegistryRoom implements DurableObject {
     if (runner !== undefined && !["/ws", "/rows", "/push"].includes(url.pathname)) {
       return json({ error: "forbidden" }, 403);
     }
+    const authority = requestAuthority(request);
+    // Crew: internal only (crew/peer-route.ts). The device hosting another of
+    // this owner's Crew sessions in this deployment, never the registry itself.
+    if (url.pathname === "/peer-target" && request.method === "GET") {
+      const sessionId = url.searchParams.get("sessionId") ?? "";
+      if (!authority || authority.userId !== userId || !authority.capabilities.includes("session.chat") ||
+          authority.projectId !== this.env.SCAFFOLD_PROJECT_SCOPE ||
+          authority.deploymentId !== this.env.SCAFFOLD_DEPLOYMENT_ID) return json({ error: "forbidden" }, 403);
+      const row = this.loadRow("chats", sessionId);
+      const crew = row?.fields.crew;
+      if (!row || row.deleted || !crew || typeof crew !== "object" || Array.isArray(crew)) return json({ error: "not_found" }, 404);
+      const scope = crew.scope;
+      if (crew.ownerSubject !== userId || crew.sessionId !== sessionId ||
+          !scope || typeof scope !== "object" || Array.isArray(scope) ||
+          scope.projectId !== authority.projectId || scope.deploymentId !== authority.deploymentId || scope.sessionId !== sessionId ||
+          typeof row.fields.deviceId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(row.fields.deviceId)) {
+        return json({ error: "not_found" }, 404);
+      }
+      return json({ deviceId: row.fields.deviceId });
+    }
+    // Crew: a sandbox host syncs its own rows and nothing else, as itself.
+    if (authority?.credential === "device") {
+      if (authority.userId !== userId || !this.hostAuthorized(authority) ||
+          !((request.method === "GET" && ["/ws", "/rows"].includes(url.pathname)) ||
+            (request.method === "POST" && url.pathname === "/push")) ||
+          (url.searchParams.has("device") && url.searchParams.get("device") !== authority.deviceId)) {
+        return json({ error: "forbidden" }, 403);
+      }
+    }
+    const crewDevice = authority?.credential === "device" ? authority.deviceId : undefined;
 
     if (url.pathname === "/ws") {
-      // A runner's device identity is the verified one, never self-declared.
-      const device = runner ?? url.searchParams.get("device") ?? "";
+      // A runner's (or sandbox host's) device identity is the verified one,
+      // never self-declared.
+      const device = crewDevice ?? runner ?? url.searchParams.get("device") ?? "";
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
       const state: SocketState = {
         userId,
         device,
+        ...(authority ? { authority } : {}),
         ...(runner ? { runner } : {}),
         ...(runnerAccount ? { runnerAccount } : {})
       };
@@ -381,14 +463,14 @@ export class RegistryRoom implements DurableObject {
       const sinceRaw = url.searchParams.get("since");
       const sinceNum = sinceRaw === null ? NaN : Number(sinceRaw);
       const cursor = Number.isInteger(sinceNum) && sinceNum >= 0 ? sinceNum : null;
-      const device = runner ?? url.searchParams.get("device") ?? "";
+      const device = crewDevice ?? runner ?? url.searchParams.get("device") ?? "";
       if (device !== "" && url.searchParams.get("beat") === "1") {
         const at = Date.now();
         this.presence.set(device, at);
         for (const socket of this.ctx.getWebSockets()) {
           const socketState = socket.deserializeAttachment() as SocketState | null;
           if (!socketState?.ready) continue;
-          send(socket, { t: "presence", device, at });
+          this.send(socket, { t: "presence", device, at });
         }
       }
       const seq = this.seq();
@@ -398,8 +480,8 @@ export class RegistryRoom implements DurableObject {
         seq,
         full,
         gcFloor,
-        rows: this.visible(full ? this.rowsSince(0) : this.rowsSince(cursor), runner, runnerAccount),
-        presence: Object.fromEntries(this.presence)
+        rows: this.filterRows(this.visible(full ? this.rowsSince(0) : this.rowsSince(cursor), runner, runnerAccount), authority),
+        presence: this.visiblePresence(authority)
       });
     }
 
@@ -432,7 +514,7 @@ export class RegistryRoom implements DurableObject {
       // apply, same rows broadcast to live sockets; the ack is the response
       // body. LWW clocks make replayed batches apply zero ops, so
       // at-least-once delivery (including 0-RTT/early-data replays) is safe.
-      const device = runner ?? url.searchParams.get("device") ?? "";
+      const device = crewDevice ?? runner ?? url.searchParams.get("device") ?? "";
       // Pre-read cap (the WS path gets this for free from MAX_FRAME_BYTES):
       // a legitimate batch is bounded well under this by MAX_BATCH_OPS ×
       // MAX_OP_BYTES; anything larger only burns this room's own CPU.
@@ -444,7 +526,7 @@ export class RegistryRoom implements DurableObject {
       } catch {
         return json({ error: "bad_push", message: "malformed body" }, 400);
       }
-      const outcome = this.applyPushBatch(device, frame, runner);
+      const outcome = this.applyPushBatch(device, frame, runner, authority);
       if (!outcome.ok) return json({ error: outcome.code, message: outcome.message }, 400);
       return json({
         batch: outcome.batch,
@@ -479,6 +561,7 @@ export class RegistryRoom implements DurableObject {
   // ── WebSocket protocol ────────────────────────────────────────────────────
 
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (!(await socketAuthorized(this.env, ws))) return;
     if (typeof message !== "string") {
       ws.close(1003, "text frames only");
       return;
@@ -494,7 +577,13 @@ export class RegistryRoom implements DurableObject {
       ws.close(1002, "bad json");
       return;
     }
+    if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+      ws.close(1002, "bad frame"); return;
+    }
     const state = ws.deserializeAttachment() as SocketState;
+    if (state.authority?.credential === "device" && !this.hostAuthorized(state.authority)) {
+      ws.close(4403, "registry binding changed"); return;
+    }
     switch (frame.t) {
       case "hello":
         this.handleHello(ws, state, frame);
@@ -506,10 +595,10 @@ export class RegistryRoom implements DurableObject {
         this.handlePresence(ws, state, frame);
         return;
       case "probe":
-        send(ws, { t: "probe-ok", seq: this.seq() });
+        this.send(ws, { t: "probe-ok", seq: this.seq() });
         return;
       default:
-        send(ws, { t: "error", code: "bad_frame", message: `unknown frame: ${String(frame.t)}` });
+        this.send(ws, { t: "error", code: "bad_frame", message: `unknown frame: ${String(frame.t)}` });
     }
   }
 
@@ -523,7 +612,13 @@ export class RegistryRoom implements DurableObject {
 
   private handleHello(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {
     const cursor = typeof frame.cursor === "number" && frame.cursor >= 0 ? frame.cursor : null;
-    if (state.runner === undefined && typeof frame.device === "string" && frame.device.length > 0) {
+    if (state.authority?.credential === "device") {
+      // Crew: a sandbox host is its credential's device, never another.
+      if (frame.device !== undefined && frame.device !== state.authority.deviceId) {
+        ws.close(4403, "device mismatch"); return;
+      }
+      state.device = state.authority.deviceId!;
+    } else if (state.runner === undefined && typeof frame.device === "string" && frame.device.length > 0) {
       state.device = frame.device;
     }
     state.ready = true;
@@ -536,7 +631,7 @@ export class RegistryRoom implements DurableObject {
     // (former) or re-seeding the server (latter; see registry.rs).
     const full = cursor === null || cursor < gcFloor || cursor > seq;
     const rows = this.visible(full ? this.rowsSince(0) : this.rowsSince(cursor), state.runner, state.runnerAccount);
-    send(ws, {
+    this.send(ws, {
       t: "state",
       seq,
       full,
@@ -549,20 +644,20 @@ export class RegistryRoom implements DurableObject {
   private handlePush(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {
     if (!state.ready) {
       this.recordPush(state.device, false);
-      send(ws, { t: "error", code: "bad_push", message: "hello first / malformed push" });
+      this.send(ws, { t: "error", code: "bad_push", message: "hello first / malformed push" });
       return;
     }
-    const outcome = this.applyPushBatch(state.device, frame, state.runner);
+    const outcome = this.applyPushBatch(state.device, frame, state.runner, state.authority);
     if (!outcome.ok) {
-      send(ws, { t: "error", code: outcome.code, message: outcome.message });
+      this.send(ws, { t: "error", code: outcome.code, message: outcome.message });
       return;
     }
     // Skipped runner ops are reported like invalid ones (error frames the
     // client logs and counts); the ack still retires the batch.
     for (const rejected of outcome.rejected.slice(0, 20)) {
-      send(ws, { t: "error", code: "not_owner", message: `${rejected.kind}/${rejected.id}: ${rejected.error}` });
+      this.send(ws, { t: "error", code: "not_owner", message: `${rejected.kind}/${rejected.id}: ${rejected.error}` });
     }
-    send(ws, {
+    this.send(ws, {
       t: "ack",
       batch: outcome.batch,
       seq: outcome.seq,
@@ -575,25 +670,34 @@ export class RegistryRoom implements DurableObject {
    * every ready socket -- shared by the WS push and the HTTP `POST /push`
    * fallback. The caller delivers the ack/error on its own transport.
    * `runner` (a Cloud device) may only touch rows it hosts: its other ops
-   * are skipped and reported in `rejected`, the rest of the batch applies. */
+   * are skipped and reported in `rejected`, the rest of the batch applies.
+   * A Crew sandbox host's batch (`authority`, a device credential) is typed
+   * by crew/registry-scope.ts and applies whole or not at all. */
   private applyPushBatch(
     device: string,
     frame: Record<string, unknown>,
-    runner?: string
+    runner?: string,
+    authority?: SocketAuthority
   ):
     | { ok: false; code: string; message: string }
     | { ok: true; batch: string; seq: number; applied: number; rejected: RejectedOp[] } {
+    if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
+      return { ok: false, code: "bad_push", message: "malformed push" };
+    }
     const batch = typeof frame.batch === "string" ? frame.batch : "";
     if (batch === "" || !Array.isArray(frame.ops)) {
       this.recordPush(device, false);
       return { ok: false, code: "bad_push", message: "malformed push" };
     }
-    const ops = frame.ops as WireOp[];
+    let ops = frame.ops as WireOp[];
     if (ops.length === 0 || ops.length > MAX_BATCH_OPS) {
       this.recordPush(device, false);
       return { ok: false, code: "bad_push", message: `batch of ${ops.length} ops` };
     }
     for (const op of ops) {
+      if (!op || typeof op !== "object" || op.set === null || op.clocks === null) {
+        return { ok: false, code: "invalid_op", message: "malformed op" };
+      }
       const invalid = validateOp(op);
       if (invalid) {
         // Reject the WHOLE batch: batches are transactional (cascade deletes)
@@ -602,6 +706,15 @@ export class RegistryRoom implements DurableObject {
         this.recordPush(device, false);
         return { ok: false, code: "invalid_op", message: `${op.kind}/${op.id}: ${invalid}` };
       }
+    }
+    if (authority?.credential === "device") {
+      if (!this.hostAuthorized(authority)) return { ok: false, code: "forbidden", message: "registry binding changed" };
+      const allowed = scopedOps(ops, authority, (kind, id) => this.loadRow(kind, id));
+      if (!allowed) return { ok: false, code: "forbidden", message: "outside typed host registry scope" };
+      ops = allowed;
+      this.setMeta(`hostBinding/${authority.sessionId}`, JSON.stringify({
+        device: authority.deviceId, epoch: authority.lifecycleEpoch,
+      }));
     }
 
     // Apply atomically: DO events are single-threaded and SQLite writes in an
@@ -657,7 +770,7 @@ export class RegistryRoom implements DurableObject {
         if (!socketState?.ready) continue;
         // A runner still gets the frame (possibly empty) so its cursor
         // advances with the room's seq.
-        send(socket, { t: "rows", seq, rows: this.visible(rows, socketState.runner, socketState.runnerAccount) });
+        this.send(socket, { t: "rows", seq, rows: this.visible(rows, socketState.runner, socketState.runnerAccount) });
       }
       this.notifySessions(sessionsBefore, touched);
     }
@@ -739,13 +852,17 @@ export class RegistryRoom implements DurableObject {
 
   private handlePresence(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {
     if (!state.ready || state.device === "") return;
-    const at = typeof frame.at === "number" ? frame.at : Date.now();
+    // Crew: a sandbox host beats as itself, on the room's clock.
+    if (state.authority?.credential === "device" && frame.device !== undefined && frame.device !== state.authority.deviceId) {
+      ws.close(4403, "device mismatch"); return;
+    }
+    const at = state.authority?.credential === "device" ? Date.now() : typeof frame.at === "number" ? frame.at : Date.now();
     this.presence.set(state.device, at);
     for (const socket of this.ctx.getWebSockets()) {
       if (socket === ws) continue;
       const socketState = socket.deserializeAttachment() as SocketState | null;
       if (!socketState?.ready) continue;
-      send(socket, { t: "presence", device: state.device, at });
+      this.send(socket, { t: "presence", device: state.device, at });
     }
   }
 
@@ -869,14 +986,6 @@ export class RegistryRoom implements DurableObject {
     this.sql.exec("DELETE FROM meta WHERE key = 'backupDue'");
   }
 }
-
-const send = (ws: WebSocket, frame: Record<string, unknown>): void => {
-  try {
-    ws.send(JSON.stringify(frame));
-  } catch {
-    /* socket already gone; hibernation API cleans it up */
-  }
-};
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {

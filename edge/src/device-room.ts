@@ -16,11 +16,20 @@
  * Also holds small "sidecar" JSON slots the host publishes (repos/branches
  * snapshot for instant new-chat pickers §8.1; capability metadata) so pickers
  * render last-known state while the live RPC happens at confirm time.
+ *
+ * Crew (docs/crew/zgx-thin-port.md): sockets keep the Worker's verified
+ * authority (crew/authority.ts), revalidated before each frame in and out.
+ * Every client RPC reaches the host with the relay's own `__crewAuthority`
+ * envelope (callers' copies are dropped); a session-scoped credential may send
+ * only its session's typed commands (scopedRpcAllowed), and the typed peer
+ * relay (crew/peer-route.ts) only `DeliverPeerMessage` between Crew sessions.
  */
 import { ensureNudges, enqueueNudge, pendingNudges, acknowledgeNudge, NUDGE_PAGE } from "./device-nudges";
 import { BytesReader, BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_USER_HEADER, CALLER_DEVICE_HEADER, type Env } from "./env";
+import { requestAuthority, socketAuthorized, sendAuthorized, scopedRpcAllowed, stampRpcAuthority, type SocketAuthority } from "./crew/authority";
+import { peerMessageAuthority, peerSessionDevice, type PeerAuthority } from "./crew/peer-route";
 
 export interface DeviceFrameHeader {
   /** Stream id, unique per (connId, logical stream). */
@@ -53,6 +62,8 @@ export const decodeDeviceFrame = (
 };
 
 interface SocketState {
+  /** Crew: the Worker's verified authority, revalidated per frame. */
+  authority?: SocketAuthority;
   userId: string;
   role: "host" | "client";
   connId: string;
@@ -62,6 +73,8 @@ interface SocketState {
   joinedAt?: number;
   nudgeAck?: boolean;
   nudgeInflight?: string[];
+  /** Crew: a typed peer link (crew/peer-route.ts), and the session it targets. */
+  peer?: Pick<PeerAuthority, "targetSessionId" | "targetDeviceId"> & { reply: boolean };
 }
 
 const HOST_TAG = "host";
@@ -101,10 +114,11 @@ const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 export class DeviceRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
   private readonly blobs: BlobStore;
+  private readonly env: Env;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
-    void env;
+    this.env = env;
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -183,16 +197,29 @@ export class DeviceRoom implements DurableObject {
         this.ctx.acceptWebSocket(pair[1], [clientTag(connId)]);
       }
       const callerDevice = role === "client" ? request.headers.get(CALLER_DEVICE_HEADER) ?? undefined : undefined;
+      const authority = requestAuthority(request);
       const state: SocketState = {
         userId,
         role,
         connId,
+        ...(authority ? { authority } : {}),
         ...(callerDevice ? { callerDevice } : {}),
         joinedAt: Date.now(),
         nudgeAck: url.searchParams.get("nudgeAck") === "1",
         nudgeInflight: []
       };
+      // Crew: only crew/peer-route.ts builds these queries (the Worker's
+      // ordinary dial replaces the caller's whole query).
+      if (role === "client" && ["peer", "peer-reply"].includes(url.searchParams.get("purpose") ?? "")) {
+        state.peer = { targetSessionId: url.searchParams.get("peerSessionId") ?? "",
+          targetDeviceId: url.searchParams.get("targetDeviceId") ?? "", reply: url.searchParams.get("purpose") === "peer-reply" };
+      }
       pair[1].serializeAttachment(state);
+      if (role === "host" && authority?.credential === "device") {
+        // Crew: auto-pongs never wake this object; the alarm revalidates a
+        // sandbox host's grant while it stays connected.
+        await this.ctx.storage.setAlarm(Date.now() + 15_000);
+      }
       if (role === "host") this.replayNudges(pair[1]);
       // Tells the dialer its device was stamped (device-link.ts).
       const headers = callerDevice ? { [CALLER_DEVICE_HEADER]: callerDevice } : undefined;
@@ -258,6 +285,8 @@ export class DeviceRoom implements DurableObject {
     const inflight = new Set(state.nudgeInflight ?? []);
     let sent = 0;
     for (const row of pendingNudges(this.ctx.storage.sql)) {
+      // Crew: a session-scoped host hears only its own session's nudges.
+      if (state.authority?.sessionId && row.chat_id !== state.authority.sessionId) continue;
       if (state.nudgeAck && inflight.has(row.token)) continue;
       if (state.nudgeAck ? inflight.size >= NUDGE_PAGE : sent >= NUDGE_PAGE) break;
       if (row.chat_id === "*" && !state.nudgeAck) continue;
@@ -276,12 +305,18 @@ export class DeviceRoom implements DurableObject {
     const host = this.liveHost();
     if (!host) return; // Next join replays durable receipts.
     const state = host.deserializeAttachment() as SocketState;
+    if (state.authority?.credential === "device") {
+      // Crew: auto-pongs do not wake this object; renew only while the bound host is live.
+      await this.ctx.storage.setAlarm(Date.now() + 15_000);
+      if (!(await socketAuthorized(this.env, host))) return;
+    }
     state.nudgeInflight = [];
     host.serializeAttachment(state);
     this.replayNudges(host);
   }
 
-  webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): void {
+  async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (!(await socketAuthorized(this.env, ws))) return;
     if (typeof message === "string") return; // ping/pong auto-response
     const state = ws.deserializeAttachment() as SocketState;
     let frame: { header: DeviceFrameHeader; payload: Uint8Array };
@@ -292,12 +327,71 @@ export class DeviceRoom implements DurableObject {
       return;
     }
     if (state.role === "client") {
+      // Upstream probes the complete host path before admitting an RPC link.
+      const echo = frame.header.k === "echo" && frame.header.s === "echo" && frame.payload.length === 0;
+      if (state.peer) {
+        // Crew: a typed peer link carries DeliverPeerMessage (or the dial's
+        // LocalDevice probe and echoes) between two live Crew sessions only.
+        try {
+          const authority = state.authority;
+          const value = frame.header.k === "rpc" ? JSON.parse(new TextDecoder().decode(frame.payload)) : undefined;
+          const localDevice = value?.method === "LocalDevice" && (!value.params || Object.keys(value.params).length === 0);
+          const peer = frame.header.k === "rpc" && authority ? peerMessageAuthority(frame.payload, authority, state.peer, state.peer.reply) : undefined;
+          if (!authority || !authority.capabilities.includes("session.chat") || (!localDevice && !peer && !echo) ||
+              await peerSessionDevice(this.env, authority, state.peer.targetSessionId) !== state.peer.targetDeviceId ||
+              (peer && await peerSessionDevice(this.env, authority, peer.sourceSessionId) !== peer.sourceDeviceId)) {
+            this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("session_scope_denied"));
+            return;
+          }
+          const host = this.liveHost();
+          if (!host) {
+            this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
+            return;
+          }
+          const target = (host.deserializeAttachment() as SocketState).authority;
+          if (target && (target.userId !== authority.userId || target.projectId !== authority.projectId ||
+              target.deploymentId !== authority.deploymentId || (target.sessionId &&
+                (target.sessionId !== state.peer.targetSessionId || target.deviceId !== state.peer.targetDeviceId)))) {
+            this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("session_scope_denied"));
+            return;
+          }
+          const envelope = peer ?? (authority.sessionId && authority.deviceId ? {
+            sourceSessionId: authority.sessionId, sourceDeviceId: authority.deviceId,
+            targetSessionId: state.peer.targetSessionId, targetDeviceId: state.peer.targetDeviceId
+          } : undefined);
+          const payload = echo ? frame.payload : stampRpcAuthority(frame.payload, authority, envelope);
+          if (payload) this.deliver(host, { s: frame.header.s, k: frame.header.k, from: state.connId }, payload);
+        } catch {
+          this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("peer_authority_unavailable"));
+        }
+        return;
+      }
+      // Crew: RPC, terminal and empty echo frames only, within the caller's scope.
+      if ((!echo && !["rpc", "term"].includes(frame.header.k)) ||
+          !scopedRpcAllowed(frame.header.k, frame.payload, state.authority)) {
+        this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("session_scope_denied"));
+        return;
+      }
       const host = this.liveHost();
       if (!host) {
         // Host offline: bounce a relay-level error so the client can surface
         // "device is asleep" instead of hanging.
         this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("host_offline"));
         return;
+      }
+      // Crew: a session-scoped host takes only its session's typed commands.
+      const hostState = host.deserializeAttachment() as SocketState;
+      if (!scopedRpcAllowed(frame.header.k, frame.payload, hostState.authority)) {
+        this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("session_scope_denied"));
+        return;
+      }
+      if (frame.header.k === "rpc") {
+        const payload = stampRpcAuthority(frame.payload, state.authority);
+        if (!payload) {
+          this.deliver(ws, { s: frame.header.s, k: RELAY_KIND }, encodeRelayError("invalid_rpc"));
+          return;
+        }
+        frame.payload = payload;
       }
       this.deliver(
         host,
@@ -357,9 +451,10 @@ export class DeviceRoom implements DurableObject {
     this.webSocketClose(ws);
   }
 
+  /** Every frame out goes past its socket's authority (crew/authority.ts). */
   private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): void {
     try {
-      ws.send(encodeDeviceFrame(header, payload));
+      sendAuthorized(this.env, this.ctx, ws, encodeDeviceFrame(header, payload));
     } catch {
       /* stale socket */
     }

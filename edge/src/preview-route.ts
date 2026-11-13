@@ -1,6 +1,7 @@
 import type { Verified } from "./auth";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { PREVIEW_PUBLISHER_HEADER, PREVIEW_SIGN_IN_HEADER } from "./preview-room";
+import { crewForwardHeaders } from "./crew/authority";
 /** Route identity comes exclusively from verified JWT claims. */
 export function previewRoute(request: Request, env: Pick<Env, "PREVIEW_ROOMS">, auth: Verified): Promise<Response> | Response | undefined {
   const url = new URL(request.url);
@@ -20,6 +21,8 @@ export function previewRoute(request: Request, env: Pick<Env, "PREVIEW_ROOMS">, 
   const headers = new Headers(request.headers);
   headers.set(AUTH_USER_HEADER, auth.userId); headers.delete(ROOM_KIND_HEADER);
   headers.delete(PREVIEW_PUBLISHER_HEADER); headers.delete(PREVIEW_SIGN_IN_HEADER);
+  // Crew's x-crew-* headers: only the authority the Worker verified.
+  crewForwardHeaders(request, headers);
   if (runner) headers.set(PREVIEW_PUBLISHER_HEADER, "1");
   if (signIn) headers.set(PREVIEW_SIGN_IN_HEADER, "1");
   return room.fetch(new Request(url, { method: request.method, headers }));

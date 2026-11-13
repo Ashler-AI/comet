@@ -1,4 +1,5 @@
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, RUNNER_ACCOUNT_HEADER, RUNNER_DEVICE_HEADER, type Env } from "./env";
+import { crewForwardHeaders } from "./crew/authority";
 
 /** Canonical chat identity comes from the authenticated route, never a
  * sender-supplied query. Also used by the workerd routing fixture. */
@@ -33,6 +34,8 @@ export function chatRoute(request: Request, env: Pick<Env, "CHAT_ROOMS">, userId
   // Worker-controlled runner identity: never passed through from a caller.
   headers.delete(RUNNER_DEVICE_HEADER);
   headers.delete(RUNNER_ACCOUNT_HEADER);
+  // Crew's x-crew-* headers: only the authority the Worker verified.
+  crewForwardHeaders(request, headers);
   headers.set(AUTH_USER_HEADER, userId);
   headers.delete(AUTH_ORG_HEADER);
   if (orgId) headers.set(AUTH_ORG_HEADER, orgId);

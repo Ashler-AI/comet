@@ -70,7 +70,10 @@ const relayed = async (bearer: string, target: string, query: string, h: Awaited
   expect(res.status).toBe(101);
   const ws = res.webSocket!;
   ws.accept();
-  ws.send(encodeDeviceFrame({ s: `s-${connId}`, k: "rpc", from: "someone-else", fromDevice: "forged" } as DeviceFrameHeader, new Uint8Array([1])));
+  // Crew: the relay stamps its own authority into every RPC frame, so a frame
+  // is a JSON-RPC request, as the engine's are (src/crew/authority.ts).
+  const rpc = new TextEncoder().encode(JSON.stringify({ id: 1, method: "LocalDevice", params: {}, cancel: false }));
+  ws.send(encodeDeviceFrame({ s: `s-${connId}`, k: "rpc", from: "someone-else", fromDevice: "forged" } as DeviceFrameHeader, rpc));
   await expect.poll(() => h.seen.find((f) => f.s === `s-${connId}`)).toBeDefined();
   ws.close();
   return { header: h.seen.find((f) => f.s === `s-${connId}`)!, stamped: res.headers.get("x-zeron-caller-device") };

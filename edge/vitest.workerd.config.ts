@@ -67,6 +67,10 @@ export default defineConfig({
         r2Buckets: ["BLOBS", "RELEASES", "CARD_IMAGES"],
         bindings: {
           AUTH_MODE: "dev",
+          // Crew: rooms admit a socket without the Worker's verified authority
+          // (these fixtures dial rooms directly) only in local dev auth
+          // (src/crew/authority.ts socketAuthorized).
+          ENVIRONMENT: "local",
           WORKOS_CLIENT_ID: "test-only",
           BOAT_API_KEY: "test-boat-key",
           BOAT_API_BASE: "https://boat.test/api/v1",
