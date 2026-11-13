@@ -12,6 +12,8 @@
     "test": "npm run test:unit && npm run test:workerd",
     "test:unit": "vitest run",
     "test:workerd": "vitest run -c vitest.workerd.config.ts",
+    "test:crew-workerd": "vitest run -c vitest.crew-workerd.config.ts",
+    "dev:crew-zgx": "CLOUDFLARE_CF_FETCH_ENABLED=false WRANGLER_SEND_METRICS=false WRANGLER_SEND_ERROR_REPORTS=false wrangler dev --env crew-zgx-local --ip 127.0.0.1 --port 27961",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

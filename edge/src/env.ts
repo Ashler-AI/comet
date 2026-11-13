@@ -147,6 +147,32 @@ export interface Env {
   /** Browser Run, which draws a card's picture from its player page. Unset ⇒
    * pictures not yet in CARD_IMAGES answer 404. */
   BROWSER?: Fetcher;
+
+  // ── Crew (docs/crew/zgx-thin-port.md): Scaffold identities and scoped
+  //    device grants in place of WorkOS (src/crew). AUTH_MODE is "scaffold",
+  //    or "dev" with ENVIRONMENT "local" (bearer `user[@projectScope]`).
+  /** Device grants, and one Scaffold verification coordinator per token and
+   * configuration (crew/auth-routes.ts AuthGrant). */
+  AUTH_GRANTS: DurableObjectNamespace;
+  /** The grant epoch fence (crew/native-grant-epoch.ts): the AuthGrant
+   * namespace again. Declared but unbound ⇒ grant routes answer 503. */
+  NATIVE_GRANT_EPOCHS?: DurableObjectNamespace;
+  /** Names this deployment in Scaffold verification keys; "local" admits dev auth. */
+  ENVIRONMENT: string;
+  /** The Scaffold origin whose `/api/code-sandboxes/auth/session` decides `sc_rc_` bearers. */
+  SCAFFOLD_CONTROL_PLANE_URL: string;
+  /** Every identity's project (its `orgId`, and the registry's `{orgId}`). */
+  SCAFFOLD_PROJECT_SCOPE: string;
+  SCAFFOLD_DEPLOYMENT_ID: string;
+  /** Space-separated capabilities a Scaffold bearer must carry (crew/auth.ts). */
+  SCAFFOLD_REQUIRED_CAPABILITIES: string;
+  /** Optional reuse bounds for a verified Scaffold session (ms, clamped; see crew/scaffold-session.ts). */
+  SCAFFOLD_SESSION_FRESH_MS?: string;
+  SCAFFOLD_SESSION_GRACE_MS?: string;
+  /** Crew's private release bucket (crew/release-feed.ts), read only with this reader credential. */
+  COMET_RELEASES_GCS_BUCKET?: string;
+  GCP_RELEASE_SERVICE_ACCOUNT_EMAIL?: string;
+  GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY?: string;
 }
 
 /** APNs settings, when push is set up for this deployment. */

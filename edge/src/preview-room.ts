@@ -1,4 +1,5 @@
 import { AUTH_USER_HEADER, type Env } from "./env";
+import { requestAuthority, socketAuthorized, sendAuthorized, type SocketAuthority } from "./crew/authority";
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.localhost$/;
@@ -14,6 +15,8 @@ type Attachment = {
   publisher?: boolean;
   /** Publisher only: the devices that signaled it (the only ones it may answer). */
   peers?: string[];
+  /** Crew: the Worker's verified authority, revalidated per message in and out. */
+  authority?: SocketAuthority;
 };
 
 /** Set by the Worker for runner bearers (stripped from every request first). */
@@ -68,7 +71,7 @@ export function previewSignal(value: unknown): object | undefined {
 /** One authenticated user's devices in one organization. Only presence, service
  * metadata and SDP/ICE coordination live here; binary preview frames are rejected. */
 export class PreviewRoom {
-  constructor(private state: DurableObjectState, _env: Env) {
+  constructor(private state: DurableObjectState, private env: Env) {
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS preview_catalog (device TEXT PRIMARY KEY, services TEXT NOT NULL)");
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -87,6 +90,7 @@ export class PreviewRoom {
     this.state.acceptWebSocket(server);
     const now = Date.now();
     const publisher = request.headers.get(PREVIEW_PUBLISHER_HEADER) === "1";
+    const authority = requestAuthority(request);
     server.serializeAttachment({
       device,
       connection: crypto.randomUUID(),
@@ -94,7 +98,8 @@ export class PreviewRoom {
       lastSeen: now,
       budgetAt: now,
       messages: 0,
-      ...(publisher ? { publisher, peers: [] } : {})
+      ...(publisher ? { publisher, peers: [] } : {}),
+      ...(authority ? { authority } : {})
     } satisfies Attachment);
     this.broadcast({ type: "catalog", device, services: [] }, server);
     // A publisher never receives the other devices' services.
@@ -106,6 +111,7 @@ export class PreviewRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (!(await socketAuthorized(this.env, ws))) return;
     const info = this.info(ws);
     if (!info.device) return;
     if (typeof message !== "string" || new TextEncoder().encode(message).byteLength > MAX_MESSAGE) { ws.close(1008, "Signaling messages only"); return; }
@@ -162,7 +168,7 @@ export class PreviewRoom {
   }
   private sockets(): WebSocket[] { return this.state.getWebSockets().filter(ws => this.info(ws)?.device); }
   private info(ws: WebSocket): Attachment { return ws.deserializeAttachment() as Attachment; }
-  private send(ws: WebSocket, value: object): void { try { ws.send(JSON.stringify(value)); } catch { ws.close(1011, "Signaling disconnected"); } }
+  private send(ws: WebSocket, value: object): void { try { sendAuthorized(this.env, this.state, ws, JSON.stringify(value)); } catch { ws.close(1011, "Signaling disconnected"); } }
   /** To every device but `except`, never to a publisher (it sees no one's services or presence). */
   private broadcast(value: object, except: WebSocket): void {
     for (const ws of this.sockets()) if (ws !== except && !this.info(ws).publisher) this.send(ws, value);
