@@ -15,6 +15,8 @@ async fn the_restart_hook_reaches_the_live_engine_and_holds_none_after() {
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: Some("client_test".into()),
+        scaffold: None,
+        device: None,
     };
     let auth = Engine::build_auth(&config).await;
     let scope = Engine::initial_workspace_scope(&auth);

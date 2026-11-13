@@ -90,8 +90,11 @@ mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{
-    Auth, AuthConfig, AuthState, AuthUser, OrgMembership, ScreenHint, SignInOptions,
+    Auth, AuthConfig, AuthState, AuthUser, DeviceGrantAuthority, OrgMembership, ProfileTokens,
+    ScreenHint, SignInOptions,
 };
+/// Crew: Scaffold sign-in's configuration and credential types.
+pub use zeron_sync::scaffold_auth;
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TreeSnapshot, TurnSnapshot,
@@ -168,8 +171,14 @@ pub struct EngineConfig {
     /// Workspace-doc org (`ws/{orgId}` room). `None` = `$ZERON_ORG_ID` or the dev default.
     /// In WorkOS mode the signed-in session's org wins.
     pub org_id: Option<String>,
-    /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
+    /// WorkOS client id — enables real auth; `None` = dev mode (bearer =
+    /// `edge_token`) when that's set (Crew), signed out otherwise.
     pub workos_client_id: Option<String>,
+    /// Crew: the Scaffold authority (`<data_dir>/crew-runtime.json`), which
+    /// replaces WorkOS and dev mode.
+    pub scaffold: Option<scaffold_auth::ScaffoldConfig>,
+    /// Crew: a sandbox host's one-use device grant (never a user credential).
+    pub device: Option<scaffold_auth::DeviceConfig>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -274,7 +283,11 @@ impl EngineCore {
         std::fs::create_dir_all(data_dir)?;
         update_trial::refuse_mid_update(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
-        let device_id = load_or_create_device_id(data_dir)?;
+        // Crew: a sandbox host is the device its grant names.
+        let device_id = match profile.device_id_override() {
+            Some(device) => device.to_owned(),
+            None => load_or_create_device_id(data_dir)?,
+        };
         // This device's harness enablement (Settings → Providers) rides the
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
@@ -341,7 +354,11 @@ impl EngineCore {
         }
         // A Cloud machine's token isn't admitted there (edge/src/runner-policy.ts):
         // it would ask, get a 403, and ask again every 30 s for as long as it's up.
-        if let Some(edge) = edge.as_ref().filter(|_| !runner::is_cloud_platform()) {
+        // Crew: nor a Scaffold profile's (no plugin keys on Crew's Edge).
+        if let Some(edge) = edge
+            .as_ref()
+            .filter(|_| !runner::is_cloud_platform() && !profile.managed_scaffold())
+        {
             plugins.set_directory(Arc::new(plugins::keys::EdgeDirectory::new(
                 &edge.url,
                 edge.token.clone(),
@@ -398,7 +415,9 @@ impl EngineCore {
         // A recorded local→synced import grants this account the local
         // profile's uploads root read-only — transcripts imported earlier
         // embed absolute paths under it (same shape as the legacy adoption).
+        // (Crew: a Scaffold profile imports nothing implicitly.)
         if profile.scope() != WorkspaceScope::Local
+            && !profile.managed_scaffold()
             && let Some(root) =
                 local_import::marker_grants_read_root(data_dir, profile.org_id(), profile.user_id())
         {
@@ -415,7 +434,7 @@ impl EngineCore {
             agent_accounts_config.codex_home.clone()
         };
         sessions.set_generated_images(uploads.clone(), codex_home.join("generated_images"));
-        let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
+        let local_import = (profile.scope() == WorkspaceScope::Synced && !profile.managed_scaffold()).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
                 &device_id,
@@ -549,6 +568,9 @@ impl EngineCore {
                 .unwrap_or_else(|| "dev-user".into());
             let mut config = AuthConfig::new("http://localhost:27640", std::env::temp_dir());
             config.dev_user_id = dev_user;
+            // Crew: dev auth is only ever explicit — as here, for an embed
+            // that attached none (no authority, no Edge).
+            config.allow_dev_auth = true;
             Auth::new(config)
         })
         .clone()
@@ -614,8 +636,9 @@ impl EngineCore {
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
     pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
         let auth = self.auth();
+        // Crew: pinned to the runtime's verified profile, as its rooms are.
         let mut config =
-            zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+            zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), auth.for_profile_tokens());
         if runner::is_cloud_platform() {
             // One host per device room, so nothing to decorrelate from, and a
             // message is usually waiting on this very dial.
@@ -913,9 +936,14 @@ impl Engine {
     /// modes. A clean WorkOS boot deliberately avoids probing Edge: signed-out
     /// installations must be able to start locally without network access.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
+        // Crew: a Scaffold authority is this engine's; no Cloud runner then.
+        let crew = config.scaffold.is_some() || config.device.is_some();
         // A Cloud runner authenticates with its enrolled key; runner.json
         // wins over every other mode (and never touches session.json).
         match runner::RunnerIdentity::load(&config.data_dir) {
+            Ok(Some(_)) if crew => {
+                tracing::warn!("a Scaffold authority is configured; ignoring runner.json");
+            }
             Ok(Some(identity)) => {
                 let auth_config = AuthConfig::new(identity.edge_url(), config.data_dir.clone());
                 return Auth::new_runner(auth_config, Arc::new(identity));
@@ -925,21 +953,36 @@ impl Engine {
         }
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
+        auth_config.scaffold = config.scaffold.clone();
+        auth_config.device = config.device.clone();
+        // Crew: dev mode only with an explicit development bearer.
+        auth_config.allow_dev_auth = config
+            .edge_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
         if let Ok(base) = std::env::var("ZERON_WORKOS_API_BASE")
             && !base.trim().is_empty()
         {
             auth_config.workos_api_base = base;
         }
-        auth_config.callback_port = Some(
+        // Crew: Scaffold registers each sign-in's exact loopback redirect,
+        // on a port of the moment's choosing.
+        auth_config.callback_port = Some(if crew {
+            0
+        } else {
             std::env::var("ZERON_CALLBACK_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or(27641),
-        );
+                .unwrap_or(27641)
+        });
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
         }
-        Auth::new(auth_config)
+        let auth = Auth::new(auth_config);
+        // Crew: a retained Scaffold credential is verified before a profile
+        // is chosen (no network otherwise).
+        auth.verify_retained_scaffold().await;
+        auth
     }
 
     /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
@@ -947,8 +990,24 @@ impl Engine {
         if auth.is_runner() {
             // A Cloud runner is always synced for its enrolled {org, user}.
             WorkspaceScope::Synced
+        } else if auth.scaffold_enabled() {
+            // Crew: a retained (or just verified) Scaffold credential, or a
+            // device host, is synced; else local until a sign-in and restart.
+            if auth.device_mode()
+                || auth.loaded_scaffold_session()
+                || auth.verified_scaffold_session().is_some()
+            {
+                WorkspaceScope::Synced
+            } else {
+                WorkspaceScope::Local
+            }
         } else if !auth.workos_enabled() {
-            WorkspaceScope::Development
+            // Crew: development only where dev auth is explicitly allowed.
+            if auth.dev_enabled() {
+                WorkspaceScope::Development
+            } else {
+                WorkspaceScope::Local
+            }
         } else if auth.loaded_workos_session() {
             WorkspaceScope::Synced
         } else {
@@ -986,6 +1045,14 @@ impl Engine {
                 )))
             }
             WorkspaceScope::Synced => {
+                // Crew: only a verified Scaffold identity opens its profile;
+                // a retained one still being verified (an outage) waits.
+                if auth.scaffold_enabled() {
+                    if auth.pending_scaffold_verification() {
+                        return Ok(None);
+                    }
+                    return EngineProfile::scaffold(&config.data_dir, auth).map(Some);
+                }
                 let state = auth.state();
                 let Some(user) = state.user() else {
                     return Err(EngineError::Other(
@@ -1055,6 +1122,12 @@ impl Engine {
         profile: EngineProfile,
         lock: Option<InstanceLock>,
     ) -> anyhow::Result<EngineRuntime> {
+        // Crew: a Scaffold profile opens only as the identity it was resolved
+        // for, and its network credentials stay pinned to that identity.
+        if profile.scaffold_profile_key() != auth.verified_profile_key().as_deref() {
+            anyhow::bail!("Crew profile authority changed during initialization");
+        }
+        let tokens = auth.for_profile_tokens();
         let edge_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
             WorkspaceScope::Synced => {
@@ -1086,9 +1159,12 @@ impl Engine {
             // burning attempts. No-op on platforms without a monitor.
             zeron_sync::net_path::spawn_path_monitor();
         }
-        let device_id = load_or_create_device_id(profile.device_root())?;
+        let device_id = match profile.device_id_override() {
+            Some(device) => device.to_owned(),
+            None => load_or_create_device_id(profile.device_root())?,
+        };
         let edge = edge_enabled.then(|| {
-            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
+            EdgeConfig::new(config.edge_url.clone(), tokens.clone()).with_device(device_id)
         });
 
         let preview_org = profile.org_id().to_string();
@@ -1230,7 +1306,7 @@ impl Engine {
         let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
             edge_url: config.edge_url.clone(),
             org_id: preview_org,
-            tokens: Arc::new(auth.clone()),
+            tokens: tokens.clone(),
         });
         core.previews.start(projects, preview_signaling).await;
         // Release checker: polls {edge}/releases hourly (wall clock); headless
@@ -1299,7 +1375,7 @@ impl Engine {
 
         let host_relay = edge.as_ref().map(|edge| {
             let mut link_config =
-                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
+                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), tokens.clone());
             // Registry-dark dial gate: devices with no recent presence fail
             // fast with zero dials; presence returning un-parks them (the
             // peer-alive hook below clears any cooldown at the same moment).
@@ -1346,7 +1422,13 @@ impl Engine {
         update_trial::boot(&config.data_dir)?;
         // Cloud runner: runner.json wins; else ZERON_RUNNER_ENROLL enrolls
         // first (retrying network failures; a rejected code is fatal).
-        if let Some(identity) = runner::bootstrap(&config.data_dir, &config.edge_url).await? {
+        // Crew: never with a Scaffold authority.
+        let runner_identity = if config.scaffold.is_some() || config.device.is_some() {
+            None
+        } else {
+            runner::bootstrap(&config.data_dir, &config.edge_url).await?
+        };
+        if let Some(identity) = runner_identity {
             wake_trace::enable(&config.data_dir);
             if identity.edge_url() != config.edge_url.trim_end_matches('/') {
                 tracing::info!(edge = %identity.edge_url(), "runner: using the edge this device enrolled with");
@@ -1369,6 +1451,27 @@ impl Engine {
         let workspace_scope = Self::initial_workspace_scope(&auth);
         let mut profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
         let _refresh_loop = auth.spawn_refresh_loop();
+        // Kept across verification and assembly, so a stop meanwhile is heard.
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+
+        // Crew: a retained Scaffold credential is workspace intent, not
+        // authorization. While an outage holds up its verification, the
+        // refresh loop retries it; a daemon neither prompts nor opens the
+        // local workspace meanwhile.
+        while profile.is_none() && auth.pending_scaffold_verification() {
+            tokio::select! {
+                changed = auth_state.changed() => {
+                    changed.map_err(|_| EngineError::Other("authentication state closed before managed verification".into()))?;
+                }
+                result = &mut shutdown => {
+                    result?;
+                    _refresh_loop.abort();
+                    return Ok(());
+                }
+            }
+            profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
+        }
 
         // A captured cloud session without an organization must finish onboarding
         // before its profile can open. A clean signed-out install is local and never
@@ -1414,7 +1517,7 @@ impl Engine {
         );
 
         tokio::select! {
-            result = shutdown_signal() => {
+            result = &mut shutdown => {
                 // Stopped from outside mid-trial (a sleep, a restart): not the
                 // release's fault, and the record should say so.
                 zeron_update::transaction::note_trial_interrupted();
@@ -1552,10 +1655,15 @@ pub async fn serve_ipc(
 /// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
 /// errors immediately — a daemon under systemd/launchd must load the session that
 /// `zeron login` persisted, never wait on a prompt nobody can see.
+///
+/// Crew: with a Scaffold authority the browser comes back to this engine's
+/// loopback, so nothing is pasted and stdin is never read (a blocking read
+/// would keep the runtime from ending after sign-in).
 pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal();
     let mut state_rx = auth.watch_state();
+    let mut sign_in_started = false;
     let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
     let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
     loop {
@@ -1589,26 +1697,31 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                         "not signed in — run `zeron login` on this machine first".into(),
                     ));
                 }
-                if stdin_reader.is_none() {
-                    let url = auth.start_headless_sign_in();
+                if !sign_in_started {
+                    let url = auth.start_headless_sign_in().await?;
+                    sign_in_started = true;
                     println!("Sign in to Zeron:\n\n  {url}\n");
-                    println!("Then paste the code shown in the browser here and press enter.");
-                    let auth = auth.clone();
-                    stdin_reader = Some(tokio::spawn(async move {
-                        loop {
-                            let Some(line) = read_stdin_line().await else {
-                                return;
-                            };
-                            let pasted = line.trim();
-                            if pasted.is_empty() {
-                                continue;
+                    if auth.scaffold_enabled() {
+                        println!("Finish signing in in your browser; this continues on its own.");
+                    } else {
+                        println!("Then paste the code shown in the browser here and press enter.");
+                        let auth = auth.clone();
+                        stdin_reader = Some(tokio::spawn(async move {
+                            loop {
+                                let Some(line) = read_stdin_line().await else {
+                                    return;
+                                };
+                                let pasted = line.trim();
+                                if pasted.is_empty() {
+                                    continue;
+                                }
+                                match auth.complete_sign_in(pasted).await {
+                                    Ok(()) => return,
+                                    Err(err) => println!("Sign-in failed: {err}"),
+                                }
                             }
-                            match auth.complete_sign_in(pasted).await {
-                                Ok(()) => return,
-                                Err(err) => println!("Sign-in failed: {err}"),
-                            }
-                        }
-                    }));
+                        }));
+                    }
                 }
             }
         }

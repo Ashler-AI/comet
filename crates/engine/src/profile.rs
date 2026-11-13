@@ -3,6 +3,9 @@
 //! Stores, journals, and uploads are profile-scoped. Repositories, worktrees,
 //! agent credentials, UI settings, and the device id remain device-scoped under
 //! the engine data directory.
+//!
+//! Crew adds the Scaffold profile (`crew_profile.rs`): its store is named by
+//! the verified identity, under `profiles/scaffold`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,6 +15,11 @@ use uuid::Uuid;
 use zeron_proto::WorkspaceScope;
 
 use crate::EngineError;
+
+// Crew: the Scaffold profile, a child module so it builds this one's struct.
+#[path = "crew_profile.rs"]
+mod crew;
+pub use crew::scaffold_profile_directory;
 
 const LOCAL_PROFILE_FILE: &str = "local-profile.json";
 const LOCAL_ORG_ID: &str = "local";
@@ -27,6 +35,8 @@ pub struct EngineProfile {
     uploads_root: PathBuf,
     org_id: String,
     user_id: String,
+    /// Crew: what only a Scaffold profile has.
+    crew: crew::CrewProfile,
 }
 
 impl EngineProfile {
@@ -41,6 +51,7 @@ impl EngineProfile {
             store_root,
             org_id: LOCAL_ORG_ID.to_string(),
             user_id: profile_id,
+            crew: crew::CrewProfile::default(),
         })
     }
 
@@ -66,6 +77,7 @@ impl EngineProfile {
             store_root,
             org_id: org_id.to_string(),
             user_id: user_id.to_string(),
+            crew: crew::CrewProfile::default(),
         }
     }
 
@@ -101,7 +113,8 @@ impl EngineProfile {
     /// fallback. New writes always use [`Self::uploads_root`], and other accounts
     /// never receive the fallback root.
     pub(crate) fn claim_legacy_uploads_root(&self) -> Result<Option<PathBuf>, EngineError> {
-        if self.scope == WorkspaceScope::Local {
+        // Crew: a Scaffold profile imports explicitly; it never claims unscoped old data.
+        if self.scope == WorkspaceScope::Local || self.managed_scaffold() {
             return Ok(None);
         }
 

@@ -307,6 +307,8 @@ async fn dev_mode_is_signed_in_with_configured_bearer() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = AuthConfig::new("http://127.0.0.1:1", dir.path());
     config.dev_user_id = "wing-dev".into();
+    // Crew: dev mode is only ever explicit.
+    config.allow_dev_auth = true;
     let auth = Auth::new(config);
     assert!(!auth.workos_enabled());
     assert!(!auth.loaded_workos_session());
@@ -317,6 +319,30 @@ async fn dev_mode_is_signed_in_with_configured_bearer() {
     auth.complete_sign_in("whatever")
         .await
         .expect("dev complete is a no-op");
+}
+
+/// Crew: no WorkOS client id (missing, or the empty string that means dev
+/// mode upstream) signs nobody in unless dev auth is explicitly allowed.
+#[tokio::test]
+async fn no_client_id_without_dev_auth_is_signed_out_with_nothing_to_sign_in_to() {
+    for client_id in [None, Some(""), Some("  ")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = AuthConfig::new("http://127.0.0.1:1", dir.path());
+        config.dev_user_id = "wing-dev".into();
+        config.workos_client_id = client_id.map(str::to_string);
+        let auth = Auth::detect(config).await;
+        assert!(!auth.workos_enabled());
+        assert!(!auth.dev_enabled());
+        assert!(!auth.is_authenticated_mode());
+        assert_eq!(auth.state(), AuthState::SignedOut, "{client_id:?}");
+        assert_eq!(auth.user_id(), None);
+        assert_eq!(auth.access_token().await, Err(TokenError::SignedOut));
+        assert_eq!(TokenSource::token(&auth).await, Err(TokenError::SignedOut));
+        assert!(auth.start_sign_in().await.is_err());
+        assert!(auth.start_headless_sign_in().await.is_err());
+        assert!(auth.complete_sign_in("state.code").await.is_err());
+        assert_eq!(auth.state(), AuthState::SignedOut);
+    }
 }
 
 /// The app restarts the engine as soon as a sign-in is announced, and the
@@ -337,7 +363,7 @@ async fn a_fresh_ticket_is_used_before_the_sign_in_is_announced() {
             record.lock().unwrap().push((user, probe.state(), probe.step_up(), bearer));
         })
     }));
-    let url = auth.start_headless_sign_in();
+    let url = auth.start_headless_sign_in().await.expect("authorize url");
     let state = query_param(&url, "state").expect("state param");
     auth.complete_sign_in(&format!("{state}.code123")).await.expect("sign-in");
     let seen = seen.lock().unwrap().clone();
@@ -368,7 +394,7 @@ async fn a_local_engine_registers_its_signing_key_with_the_sign_ins_ticket() {
     .expect("a local engine");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
     core.set_auth(auth.clone());
-    let url = auth.start_headless_sign_in();
+    let url = auth.start_headless_sign_in().await.expect("authorize url");
     let state = query_param(&url, "state").expect("state param");
     auth.complete_sign_in(&format!("{state}.code123")).await.expect("sign-in");
     // By the time the sign-in is announced (and the app would restart the
@@ -396,7 +422,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
         "signed out: no token"
     );
 
-    let url = auth.start_headless_sign_in();
+    let url = auth.start_headless_sign_in().await.expect("authorize url");
     assert!(url.starts_with("https://authkit.example/user_management/authorize?"));
     assert_eq!(
         query_param(&url, "client_id").as_deref(),
@@ -483,7 +509,7 @@ async fn creating_a_second_org_continues_in_the_first() {
     let edge = StubEdge::start().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
-    let url = auth.start_headless_sign_in();
+    let url = auth.start_headless_sign_in().await.expect("authorize url");
     let state = query_param(&url, "state").expect("state");
     auth.complete_sign_in(&format!("{state}.codeX"))
         .await
@@ -520,7 +546,7 @@ async fn short_lived_tokens_refresh_on_demand() {
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
-    let url = auth.start_headless_sign_in();
+    let url = auth.start_headless_sign_in().await.expect("authorize url");
     let state = query_param(&url, "state").expect("state");
     auth.complete_sign_in(&format!("{state}.codeX"))
         .await
@@ -823,7 +849,7 @@ async fn an_old_refresh_cannot_report_signed_out_after_a_new_sign_in() {
         .unwrap();
 
         auth.sign_out();
-        let url = auth.start_headless_sign_in();
+        let url = auth.start_headless_sign_in().await.expect("authorize url");
         let state = query_param(&url, "state").unwrap();
         auth.complete_sign_in(&format!("{state}.new-code"))
             .await
@@ -1041,8 +1067,38 @@ async fn detect_probes_edge_dev_mode() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = workos_config(&format!("http://127.0.0.1:{port}"), dir.path());
     config.dev_user_id = "dev-w".into();
+    // Crew: only where dev auth is explicitly allowed.
+    config.allow_dev_auth = true;
     let auth = Auth::detect(config).await;
     assert!(!auth.workos_enabled(), "edge dev mode wins");
     assert_eq!(auth.access_token().await.as_deref(), Ok("dev-w"));
+    task.abort();
+}
+
+/// Crew: untrusted health metadata cannot turn configured auth into a dev bearer.
+#[tokio::test]
+async fn detect_never_downgrades_configured_auth_to_dev() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let probes = Arc::new(AtomicUsize::new(0));
+    let seen = probes.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            if read_request(&mut stream).await.is_some() {
+                seen.fetch_add(1, Ordering::SeqCst);
+                respond(&mut stream, "200 OK", r#"{"ok":true,"auth":"dev"}"#).await;
+            }
+        }
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = workos_config(&format!("http://127.0.0.1:{port}"), dir.path());
+    config.dev_user_id = "dev-w".into();
+    let auth = Auth::detect(config).await;
+    assert!(auth.workos_enabled(), "configured authority must not be downgraded");
+    assert_eq!(auth.access_token().await, Err(TokenError::SignedOut));
+    assert_eq!(probes.load(Ordering::SeqCst), 0, "nothing asked the edge");
     task.abort();
 }
