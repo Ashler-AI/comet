@@ -4,6 +4,15 @@
  * Durable Objects. Also serves content-addressed R2 attachments (§1.2) and
  * the absorbed WorkOS auth routes (formerly apps/server).
  *
+ * Crew build (docs/crew/zgx-thin-port.md): crew/router.ts answers first, with
+ * Scaffold identities and scoped device grants in place of WorkOS, and hands
+ * on only authorized, trusted requests. Of the routes below, this build keeps
+ * /preview, /chat2, /registry, /device and /blob. WorkOS and /auth/*, the
+ * user directory, usernames, cards, onboarding, plugin keys, the vault,
+ * Cloud, runners, /admin, billing, the hosted model list, the public
+ * install surface and caller-device proof (device-link.ts) stay in the tree
+ * unrouted; the legacy session and workspace lanes answer 410.
+ *
  * Routes:
  *   GET  /health
  *   POST /auth/exchange               — WorkOS code → tokens
@@ -71,18 +80,13 @@
  *     (every public card route goes through publicCardGate: per-IP limit, one plain 503)
  *   GET|POST /username, GET /username/check — user bearer (claim, availability)
  */
-import { authenticate } from "./auth";
+import { crewRoute } from "./crew/router";
+import { AuthGrant } from "./crew/auth-routes";
 import { chatRoute } from "./chat-route";
-import { dialDeviceRoom } from "./device-link";
 import { deviceParam, forward } from "./forward";
-import { handleAuthRoute } from "./auth-routes";
-import { handlePublicCardRoute, handleUsernameRoute } from "./card-routes";
-import { publicCardGate } from "./card-gate";
 import type { Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { previewRoute } from "./preview-route";
-import { modelListRoute } from "./model-list";
-import { releaseRoute } from "./releases";
 import { PreviewRoom } from "./preview-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
@@ -90,25 +94,12 @@ import { ChatRoom } from "./chat-room";
 import { CloudAccount } from "./cloud/cloud-account";
 import { CloudIndex } from "./cloud/cloud-index";
 import { DeleteWorkflow, ProvisionWorkflow, SleepWorkflow, WakeWorkflow } from "./cloud/workflows";
-import {
-  autoWakeCloudDevice,
-  handleBillingPublicRoute,
-  handleCloudRoute,
-  handleRunnerPublicRoute
-} from "./cloud/routes";
-import { handleAdminRoute, runCloudCron } from "./cloud/billing";
-import { sandboxProvider } from "./cloud/providers";
-import { FakeProvider } from "./cloud/providers/fake";
+import { runCloudCron } from "./cloud/billing";
 import { handleAttachmentBlob } from "./attachment-blobs";
 import { runnerChatGate, runnerDeviceGate } from "./runner-access";
-import { runnerRefusal } from "./runner-policy";
-import { handleOnboardingRoute } from "./onboarding-routes";
-import { handlePluginKeyRoute } from "./plugin-keys";
-import { handleVaultRoute } from "./vault-routes";
-import { handleUserDirectoryRoute, UserDirectory } from "./user-directory";
-import installSh from "./install.sh";
+import { UserDirectory } from "./user-directory";
 
-export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom, CloudAccount, CloudIndex, UserDirectory };
+export { AuthGrant, SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom, CloudAccount, CloudIndex, UserDirectory };
 export { ProvisionWorkflow, WakeWorkflow, SleepWorkflow, DeleteWorkflow };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -133,116 +124,20 @@ const json = (value: unknown, status = 200): Response =>
   });
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Crew: authenticate, authorize and answer Crew's own routes; only a
+    // trusted request for the room routing below comes back.
+    const crew = await crewRoute(request, env);
+    if (crew instanceof Response) return crew;
+    const { auth } = crew;
+    request = crew.request;
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
-
-    if (url.pathname === "/health") {
-      return json({ ok: true, auth: env.AUTH_MODE === "dev" ? "dev" : "workos" });
-    }
-
-    // ── public install surface (also routed from zeron.sh): the
-    //    `curl | sh` installer and the release artifacts it downloads ───────
-    if (url.pathname === "/install.sh" && (request.method === "GET" || request.method === "HEAD")) {
-      return new Response(request.method === "HEAD" ? null : installSh, {
-        headers: {
-          "content-type": "application/x-sh",
-          "cache-control": "public, max-age=0, must-revalidate"
-        }
-      });
-    }
-    const release = await releaseRoute(request, env, url);
-    if (release) return release;
-    const modelList = await modelListRoute(request, env, url);
-    if (modelList) return modelList;
-
-    // ── WorkOS auth routes (pre-bearer: exchange/refresh/callback have no
-    //    access token yet; the org routes verify the bearer themselves) ─────
-    const authRouted = await handleAuthRoute(request, env, url);
-    if (authRouted) return authRouted;
-
-    // ── operator usage export (ADMIN_TOKEN, not a JWT) and the Cloud
-    //    engine's identity routes (pre-bearer: it is proving possession of
-    //    its enrollment code / key in order to GET a bearer) ─────────────────
-    const adminRouted = await handleAdminRoute(request, env, url);
-    if (adminRouted) return adminRouted;
-    const billingRouted = await handleBillingPublicRoute(request, env, url);
-    if (billingRouted) return billingRouted;
-    const runnerRouted = await handleRunnerPublicRoute(request, env, url);
-    if (runnerRouted) return runnerRouted;
-    const usersRouted = await handleUserDirectoryRoute(request, env, url);
-    if (usersRouted) return usersRouted;
-    const cardRouted = await publicCardGate(request, env, url, () => handlePublicCardRoute(request, env, ctx, url));
-    if (cardRouted) return cardRouted;
-
-    const auth = await authenticate(env, request);
-    if (!auth) return json({ error: "unauthenticated" }, 401);
-
-    // Runner bearers (the Cloud device) act as their DEVICE, not the user:
-    // no account management, no vault beyond their own grants, no other
-    // device's room but its liveness, no legacy rooms (runner-policy.ts);
-    // chat2/blobs only for chats they host (runner-access.ts); registry rows
-    // filtered and ownership-checked in RegistryRoom (registry-runner.ts).
-    const refused = runnerRefusal(auth, request.method, url);
-    if (refused) return json({ error: "forbidden", message: refused }, 403);
-
-    // Local e2e seam: the fake provider's machines (with the enrollment env a
-    // real sandbox would get), so scripts/cloud-e2e.sh can start a real
-    // runner engine. Dev auth + fake provider only; 404 everywhere else.
-    if (url.pathname === "/dev/cloud/fake-sandboxes" && request.method === "GET") {
-      const fake = env.AUTH_MODE === "dev" ? sandboxProvider(env, "fake") : undefined;
-      return fake instanceof FakeProvider ? json({ sandboxes: fake.snapshot() }) : json({ error: "not_found" }, 404);
-    }
-
-    const usernameRouted = await handleUsernameRoute(request, env, auth, url);
-    if (usernameRouted) return usernameRouted;
-    const onboardingRouted = await handleOnboardingRoute(request, env, auth, url);
-    if (onboardingRouted) return onboardingRouted;
-    const pluginKeysRouted = await handlePluginKeyRoute(request, env, auth, url);
-    if (pluginKeysRouted) return pluginKeysRouted;
-
-    const cloudRouted = await handleCloudRoute(request, env, auth, url);
-    if (cloudRouted) return cloudRouted;
-    const vaultRouted = await handleVaultRoute(request, env, auth, url);
-    if (vaultRouted) return vaultRouted;
 
     const preview = previewRoute(request, env, auth);
     if (preview) return preview;
 
-    // ── session rooms ───────────────────────────────────────────────────────
-    if (parts[0] === "session" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "ws") {
-      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-        return json({ error: "expected websocket" }, 426);
-      }
-      // `s2/` = the WorkOS staging→production identity break: rooms are
-      // claim-on-first-join per user id, and prod issued a fresh id for
-      // everyone — a new namespace lets prod identities claim fresh rooms
-      // while hosts re-upload doc state from their local snapshots (same
-      // playbook as `ws3` below). Frame-level room ids stay the bare chatId.
-      return forward(
-        env.SESSION_ROOMS,
-        `s2/${parts[1]}`,
-        request,
-        auth,
-        "/ws",
-        `?chatId=${parts[1]}${deviceParam(url)}`
-      );
-    }
-    if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/tail", "");
-    }
-    if (parts[0] === "stats" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/stats", "");
-    }
-    if (parts[0] === "diff" && parts[1] && ID_RE.test(parts[1])) {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/diff", "");
-    }
-    if (parts[0] === "snapshot" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/snapshot", "");
-    }
-    if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
-      return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth, "/append", "");
-    }
+    // ── session rooms: the legacy Loro lanes, retired (crew/router.ts: 410) ──
 
     // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
     //    Claim-on-first-join ownership enforced in the DO (chat ids are
@@ -254,70 +149,12 @@ export default {
       const notHost = await runnerChatGate(env, auth, parts[1]);
       if (notHost) return notHost;
     }
-    const chatResponse = chatRoute(request, env, auth.userId, auth.orgId);
+    // Crew: no org header, so a chat room never asks the registry who hosts
+    // it (`/chat-host`); only the relay layer, off in this build, would.
+    const chatResponse = chatRoute(request, env, auth.userId);
     if (chatResponse) return chatResponse;
 
-    // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;
-    //    the caller's WorkOS org claim (`org_id`) must equal the URL's orgId,
-    //    and the room itself is derived from the caller's OWN user id — the
-    //    workspace doc (spaces, chats index, devices) is per-user; teammates
-    //    in the same org can never address each other's rooms. ──────────────
-    if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
-      const orgId = parts[1];
-      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      // `ws4` = the 2026-08-04 incident break: the ws3 instance's storage was
-      // left with causally-broken update rows by the abort-thrash loop (acks
-      // outran the debounced flush) and could not be trusted again even after
-      // /reset-log; a name bump allocates a virgin DO. (`ws3` was the per-user
-      // privacy break, `ws2` the spaces overhaul.) Legacy rooms are orphaned
-      // (hibernated, ~zero cost). URL path stays `/workspace/:orgId/*`; the
-      // name is worker-internal — clients echo their own roomId strings.
-      const room = `ws4/${orgId}/${auth.userId}`;
-      if (parts[2] === "ws") {
-        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-          return json({ error: "expected websocket" }, 426);
-        }
-        return forward(
-          env.SESSION_ROOMS,
-          room,
-          request,
-          auth,
-          "/ws",
-          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
-          "workspace"
-        );
-      }
-      if (parts[2] === "tail" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth, "/tail", "", "workspace");
-      }
-      // Observability: log/snapshot sizes for the per-user workspace room, so a
-      // human can see whether the compaction budget is holding (org-membership
-      // was already checked above; the DO bypasses the owner gate for
-      // workspace kind).
-      if (parts[2] === "stats" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth, "/stats", "", "workspace");
-      }
-      // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
-      // behind the shallow-locked rebuild converges by replacing its local
-      // workspace doc with this — see the incident repair recipe).
-      if (parts[2] === "snapshot" && request.method === "GET") {
-        return forward(env.SESSION_ROOMS, room, request, auth, "/snapshot", "", "workspace");
-      }
-      // Operator wedge-break: clear a workspace room whose update log grew big
-      // enough to CPU-reset the DO on every cold start (org-membership already
-      // checked; state re-uploads from each device's local doc on rejoin).
-      if (parts[2] === "reset-log" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth, "/reset-log", "", "workspace");
-      }
-      // Merge-safe repair write (the chat rooms' /append, for the workspace
-      // doc): lets an operator seed a reset room with ONE compact
-      // locally-exported history blob instead of waiting for every device to
-      // re-upload its whole doc — the N-way redundant re-seed is what kept
-      // ballooning the update log after the 2026-08-05 wedge breaks.
-      if (parts[2] === "append" && request.method === "POST") {
-        return forward(env.SESSION_ROOMS, room, request, auth, "/append", "", "workspace");
-      }
-    }
+    // ── workspace rooms: the legacy Loro workspace doc, retired (crew/router.ts: 410)
 
     // ── registry rooms (docs/registry-sync.md): the row-table replacement for
     //    the Loro workspace doc. Same trust shape as /workspace: org claim
@@ -325,7 +162,8 @@ export default {
     //    trusts the stamped header. `reg1` = first registry generation. ─────
     if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
-      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      // Crew: the org is the Scaffold project (a device credential carries no org claim).
+      if ((auth.credential === "device" ? auth.projectScope : auth.orgId) !== orgId) return json({ error: "forbidden" }, 403);
       const room = `reg1/${orgId}/${auth.userId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -381,10 +219,18 @@ export default {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);
         }
-        // Dials never wake a sleeping Cloud session (viewing a chat must not
-        // start a billed machine): the dial sees host_offline. Sends do —
-        // through the nudge below.
-        return dialDeviceRoom(env, auth, request, url, deviceId);
+        // Crew: dialDeviceRoom's caller-device proof needs plugin keys, which
+        // stay unrouted here, so no client dial is stamped (`fromDevice`).
+        const role = url.searchParams.get("role") === "host" ? "host" : "client";
+        const connId = url.searchParams.get("connId") ?? crypto.randomUUID();
+        return forward(
+          env.DEVICE_ROOMS,
+          `d2/${deviceId}`,
+          request,
+          auth,
+          "/ws",
+          `?role=${role}&connId=${encodeURIComponent(connId)}`
+        );
       }
       if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {
         return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, `/sidecar/${parts[3]}`, "");
@@ -396,9 +242,7 @@ export default {
       // doc". Delivered live if the host is connected, else queued in the DO
       // and replayed on the host's next join.
       if (parts[2] === "nudge" && request.method === "POST") {
-        // A send to a sleeping Cloud session wakes its machine; the nudge
-        // queues in the DeviceRoom and replays once its engine reconnects.
-        autoWakeCloudDevice(env, ctx, auth, deviceId, env.CLOUD_EDGE_URL ?? url.origin);
+        // (Crew: no Cloud machines to wake; the nudge queues as for any host.)
         return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth, "/nudge", "");
       }
     }
@@ -452,11 +296,8 @@ export default {
       }
     }
 
-    // ── retired attachment mirror (clients ≤0.1.62): acknowledge and discard
-    //    so old outboxes drain once instead of retrying the PUT forever ──────
-    if (parts[0] === "attachments" && parts[1] && request.method === "PUT") {
-      return json({ ok: true });
-    }
+    // ── retired attachment mirror (clients ≤0.1.62): crew/router.ts answers
+    //    410, never acknowledging bytes it discards ──────────────────────────
 
     return json({ error: "not_found" }, 404);
   },
