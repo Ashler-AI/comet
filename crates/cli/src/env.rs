@@ -1,8 +1,8 @@
 //! The edge and sign-in client `zeron` resolves from its environment.
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
-/// `ZERON_EDGE_URL` overrides (local dev / self-hosting).
-pub const DEFAULT_EDGE_URL: &str = "https://edge.zeron.sh";
+/// The edge when nothing names one. Crew: none yet, and never Zeron's
+/// (crate::crew::DEFAULT_EDGE_URL). `ZERON_EDGE_URL` overrides.
+pub const DEFAULT_EDGE_URL: &str = crate::crew::DEFAULT_EDGE_URL;
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
 /// authorize URL), so baking it in is safe. Overridden by `ZERON_WORKOS_CLIENT_ID`;
@@ -30,7 +30,7 @@ pub fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> 
     }
 }
 
-/// The engine's IPC port: `ZERON_IPC_PORT`, else 27654.
+/// The engine's IPC port: `ZERON_IPC_PORT`, else [`DEFAULT_IPC_PORT`].
 pub fn ipc_port_from_env() -> u16 {
     ipc_port_from(std::env::var("ZERON_IPC_PORT").ok().as_deref())
 }
@@ -40,5 +40,6 @@ pub fn ipc_port_from(value: Option<&str>) -> u16 {
     value.and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_IPC_PORT)
 }
 
-/// The production engine's IPC port.
-pub const DEFAULT_IPC_PORT: u16 = 27654;
+/// The engine's IPC port when nothing names one. Crew: this flavour's
+/// (crate::crew), never Zeron's 27654.
+pub const DEFAULT_IPC_PORT: u16 = crate::crew::DEFAULT_IPC_PORT;

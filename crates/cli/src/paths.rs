@@ -31,16 +31,10 @@ pub fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBu
     }
     #[cfg(not(windows))]
     {
+        // Crew: its own folder (crate::crew), never Zeron's `~/.zeron`, and
+        // no adopting `~/.comet-native` (another install's, kept as it is).
         let home = PathBuf::from(env("HOME").expect("HOME not set"));
-        let dir = home.join(".zeron");
-        // One-shot 0.2.0 migration: adopt the pre-rename data dir.
-        if !dir.exists() {
-            let old = home.join(".comet-native");
-            if old.exists() && std::fs::rename(&old, &dir).is_ok() {
-                eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
-            }
-        }
-        dir
+        home.join(crate::crew::DATA_DIR_NAME)
     }
 }
 

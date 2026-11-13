@@ -22,11 +22,14 @@ fn main() -> anyhow::Result<()> {
         }
         Launch::Window { open_url, .. } => {
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
+            let (data_dir, ipc_port) = (paths::data_dir(), zeron_cli::ipc_port_from_env());
+            // Crew: never another install's engine or store (zeron_cli::crew).
+            zeron_cli::crew::exit_if_refused(&data_dir, ipc_port);
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
-                data_dir: paths::data_dir(),
-                ipc_port: zeron_cli::ipc_port_from_env(),
+                data_dir,
+                ipc_port,
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,

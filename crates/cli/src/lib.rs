@@ -15,6 +15,7 @@
 //!     helper beside it ([`Engines::Helper`]: `Contents/MacOS/Zeron Engine`
 //!     in a macOS bundle), which replaces this process and runs it there.
 
+pub mod crew;
 pub mod daemon;
 mod env;
 pub mod logging;

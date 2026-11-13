@@ -35,10 +35,14 @@ static ALLOC: allocator::Allocator = allocator::Allocator;
 pub fn engine_config_from_env() -> zeron_engine::EngineConfig {
     // Dev-mode bearer (no WorkOS): an explicit token enables sync.
     let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
+    let (data_dir, ipc_port) = (paths::data_dir(), zeron_cli::ipc_port_from_env());
+    // Crew: never another install's store or engine, whatever the
+    // environment says (zeron_cli::crew).
+    zeron_cli::crew::exit_if_refused(&data_dir, ipc_port);
     zeron_engine::EngineConfig {
-        data_dir: paths::data_dir(),
+        data_dir,
         edge_url: edge_url_from_env(),
-        ipc_port: zeron_cli::ipc_port_from_env(),
+        ipc_port,
         default_harness: harness_from_env(),
         // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
         // default "dev-org") scopes the workspace room otherwise.

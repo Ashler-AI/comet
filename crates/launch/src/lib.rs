@@ -5,6 +5,8 @@
 //! (`zeron headless` and the other engine subcommands, run in the helper) and
 //! the zgx app all start it through here, without linking the engine.
 
+pub mod crew;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -102,6 +104,8 @@ pub struct LaunchConfig {
 /// exiting (or its terminal closing) leaves it running.
 pub fn launch(config: &LaunchConfig, app_exe: &Path) -> std::io::Result<Child> {
     let mut command = engine_command(app_exe);
+    // Crew: nothing of another install's coordinates or credentials (crew).
+    crew::scrub_inherited(&mut command);
     command
         .env(MANAGED_ENV, "1")
         .env(APP_ENV, app_path(app_exe))

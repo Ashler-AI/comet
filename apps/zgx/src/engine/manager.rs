@@ -49,6 +49,14 @@
 //! session is signed in while its workspace is still local, it is stopped
 //! and started again ([`needs_restart`]); a synced engine stops by itself on
 //! sign-out and is started again, signed out.
+//!
+//! **Crew** (docs/crew/zgx-thin-port.md): a development build's engine is
+//! this flavour's own (`zeron_cli::crew`: `~/.crew-zgx-dev`, port 27960), with
+//! a home of its own under its data dir unless `ZERON_ZGX_ENGINE_HOME` names
+//! one. Every build refuses any other Crew's or Zeron's engine and store
+//! (`zeron_cli::crew::refusal`), with no variable to allow it, and starts its
+//! engine without the coordinates or credentials it inherited
+//! (`zeron_launch::crew`).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -58,8 +66,9 @@ use std::time::{Duration, Instant};
 const PRODUCTION_DATA: &[&str] = &[".zeron", ".comet-native"];
 
 /// The ports the production engine serves: Zeron's, and the one Zeron v3's
-/// Windows install serves beside it.
-const PRODUCTION_PORTS: &[u16] = &[zeron_cli::DEFAULT_IPC_PORT, 27655];
+/// Windows install serves beside it. (Crew: not `zeron_cli::DEFAULT_IPC_PORT`,
+/// which is this flavour's own.)
+const PRODUCTION_PORTS: &[u16] = &[27654, 27655];
 
 /// The production engine's data dirs: [`PRODUCTION_DATA`] under home, and on
 /// Windows where zeron_cli puts it there (%LOCALAPPDATA%\Zeron, which no
@@ -187,6 +196,9 @@ impl Config {
         if same_dir(&data_dir, &home.join(STAGING_DATA)) {
             return Err(format!("~/{STAGING_DATA} is the staging engine's"));
         }
+        if let Some(why) = zeron_cli::crew::refusal(&data_dir, port) {
+            return Err(why);
+        }
         Ok(Self {
             port,
             data_dir,
@@ -213,11 +225,15 @@ impl Config {
                 .trim()
                 .parse()
                 .map_err(|_| format!("ZERON_ZGX_ENGINE_PORT `{raw}` isn't a port"))?,
-            None => STAGING_PORT,
+            // Crew: this flavour's engine, not Zeron staging's.
+            None => zeron_cli::crew::DEFAULT_IPC_PORT,
         };
         let data_dir = var("ZERON_ZGX_ENGINE_DATA")
             .map(|dir| expand(&dir, home))
-            .unwrap_or_else(|| home.join(STAGING_DATA));
+            .unwrap_or_else(|| home.join(zeron_cli::crew::DATA_DIR_NAME));
+        if let Some(why) = zeron_cli::crew::refusal(&data_dir, port) {
+            return Err(why);
+        }
         if var("ZERON_ZGX_ENGINE_PRODUCTION").as_deref() != Some("1") {
             if PRODUCTION_PORTS.contains(&port) {
                 return Err(format!("port {port} is the production engine's (ZERON_ZGX_ENGINE_PRODUCTION=1 to use it anyway)"));
@@ -231,11 +247,16 @@ impl Config {
             let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/zeron-engine");
             built.exists().then_some(built)
         });
+        // Crew: the agents' logins, worktrees and caches are the engine's own
+        // unless a home is named, never this Mac's or another Crew's.
+        let engine_home = var("ZERON_ZGX_ENGINE_HOME")
+            .map(|dir| expand(&dir, home))
+            .unwrap_or_else(|| data_dir.join("home"));
         Ok(Self {
             port,
             data_dir,
             bin,
-            home: var("ZERON_ZGX_ENGINE_HOME").map(|dir| expand(&dir, home)),
+            home: Some(engine_home),
             spawn: var("ZERON_ZGX_ENGINE_SPAWN").as_deref() != Some("0"),
             edge: edge.into(),
             client: client.into(),
@@ -353,6 +374,8 @@ fn spawn(config: &Config, bin: &Path) -> std::io::Result<()> {
     let started = config.data_dir.join(STARTED);
     let _ = std::fs::remove_file(&started);
     let mut command = std::process::Command::new(bin);
+    // Crew: nothing of another install's coordinates or credentials.
+    zeron_launch::crew::scrub_inherited(&mut command);
     command
         .env("ZERON_DATA_DIR", &config.data_dir)
         .env("ZERON_IPC_PORT", config.port.to_string())
@@ -444,9 +467,8 @@ mod tests {
         assert!(config_of(&[("ZERON_ZGX_ENGINE_DATA", "~/.zeron")], home, None, edge).is_err());
         assert!(config_of(&[("ZERON_ZGX_ENGINE_DATA", "~/.comet-native")], home, None, edge).is_err());
         assert!(config_of(&[("ZERON_ZGX_ENGINE_PORT", "27655")], home, None, edge).is_err());
-        // Asked for by name, it's allowed.
-        let production = config_of(&[("ZERON_ZGX_ENGINE_PORT", "27655"), ("ZERON_ZGX_ENGINE_DATA", "~/.zeron"), ("ZERON_ZGX_ENGINE_PRODUCTION", "1")], home, None, edge).unwrap();
-        assert_eq!((production.port, production.data_dir.clone()), (27655, home.join(".zeron")));
+        // Crew: not even asked for by name.
+        assert!(config_of(&[("ZERON_ZGX_ENGINE_PORT", "27655"), ("ZERON_ZGX_ENGINE_DATA", "~/.zeron"), ("ZERON_ZGX_ENGINE_PRODUCTION", "1")], home, None, edge).is_err());
         // Windows' own place for it, which no HOME moves.
         if cfg!(windows) {
             let local = [("LOCALAPPDATA", r"C:\Users\someone\AppData\Local"), ("ZERON_ZGX_ENGINE_DATA", r"C:\Users\someone\AppData\Local\Zeron")];
@@ -454,9 +476,33 @@ mod tests {
             let profile = [("USERPROFILE", r"C:\Users\someone"), ("ZERON_ZGX_ENGINE_DATA", r"C:\Users\someone\AppData\Local\Zeron")];
             assert!(config_of(&profile, home, None, edge).is_err());
         }
-        let staging = config_of(&[], home, None, edge).unwrap();
-        assert_eq!((staging.port, staging.data_dir.clone()), (STAGING_PORT, home.join(STAGING_DATA)));
-        assert!(!staging.follows_bundle());
+        let own = config_of(&[], home, None, edge).unwrap();
+        let data = home.join(zeron_cli::crew::DATA_DIR_NAME);
+        assert_eq!((own.port, own.data_dir.clone()), (zeron_cli::crew::DEFAULT_IPC_PORT, data.clone()));
+        assert_eq!(own.home, Some(data.join("home")), "the engine's own home by default");
+        assert!(!own.follows_bundle());
+    }
+
+    /// Crew: no other Crew's engine or store, however it's named, and no
+    /// variable that allows one.
+    #[cfg(not(feature = "beta"))]
+    #[test]
+    fn a_development_build_refuses_every_other_crew() {
+        let home = Path::new("/Users/someone");
+        let edge = "https://staging.zeron.sh";
+        for data in ["~/.crew-staging", "~/.crew", "~/.crew-upstream-canary", "~/.crew-staging/profiles/x", "~/.zeron-staging", "/Users/someone/.crew-zgx-dev/../.crew-staging"] {
+            for production in [None, Some("1")] {
+                let mut vars = vec![("ZERON_ZGX_ENGINE_DATA", data)];
+                vars.extend(production.map(|one| ("ZERON_ZGX_ENGINE_PRODUCTION", one)));
+                assert!(config_of(&vars, home, None, edge).is_err(), "{data} {production:?}");
+            }
+        }
+        for port in ["27954", "27957", "27958", "27871"] {
+            assert!(config_of(&[("ZERON_ZGX_ENGINE_PORT", port)], home, None, edge).is_err(), "{port}");
+        }
+        // Somewhere of its own is fine, and its home can be named.
+        let elsewhere = config_of(&[("ZERON_ZGX_ENGINE_DATA", "/tmp/crew-zgx-test"), ("ZERON_ZGX_ENGINE_PORT", "27961"), ("ZERON_ZGX_ENGINE_HOME", "/tmp/crew-zgx-home")], home, None, edge).unwrap();
+        assert_eq!((elsewhere.port, elsewhere.home.clone()), (27961, Some(PathBuf::from("/tmp/crew-zgx-home"))));
     }
 
     /// The beta manages Zeron.app's own engine: its port and data, the
@@ -473,7 +519,8 @@ mod tests {
         let home = Path::new("/Users/someone");
         let prod = crate::auth::production();
         let beta = config_of(&[], home, Some(&exe), &prod.edge).unwrap();
-        assert_eq!((beta.port, beta.data_dir.clone()), (27654, home.join(".zeron")));
+        // Crew: this flavour's port and data dir, not Zeron.app's.
+        assert_eq!((beta.port, beta.data_dir.clone()), (zeron_cli::crew::DEFAULT_IPC_PORT, home.join(zeron_cli::crew::DATA_DIR_NAME)));
         assert_eq!(beta.startable(), Some(macos.join("Zeron Engine").as_path()));
         assert_eq!((beta.edge.as_str(), beta.client.as_str(), beta.callback_port), (prod.edge.as_str(), prod.client.as_str(), 27641));
         assert!(beta.follows_bundle());
