@@ -1,0 +1,4 @@
+# Crew's local Edge (wrangler.jsonc "crew-zgx-local") serves no static files.
+# An environment can't drop the top level's "assets" (upstream's member-card
+# pages, unrouted in this build), so it points here instead: nothing to serve.
+*

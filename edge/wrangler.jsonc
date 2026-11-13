@@ -292,6 +292,56 @@
         "STRIPE_PRICE_MAX": "price_1URyT5Ld6XnizwPILYWMVbKZ",
         "STRIPE_PRICE_CREDITS": "price_1URyT5Ld6XnizwPI2nNPHhkH"
       }
+    },
+    // Crew's thin port (docs/crew/zgx-thin-port.md): the local Edge for the zgx
+    // test build, run with `npm run dev:crew-zgx` (wrangler dev on
+    // 127.0.0.1:27961) and nothing else. No routes, no workers.dev or preview
+    // URL, no crons; Durable Objects and R2 are local. Scaffold identities and
+    // scoped device grants (src/crew) replace WorkOS. Never deploy it: it
+    // inherits the top level's account id, which is upstream Zeron's.
+    //
+    // The Scaffold authority below is a loopback port nothing serves (discard),
+    // so every `sc_rc_` bearer answers 503 until an uncommitted
+    // .dev.vars.crew-zgx-local names the one the owner chose (the plan's
+    // decision 1) and the project scope the engine signs in to. See the plan's
+    // "Local Edge" section for the variables; none is a secret unless Crew's
+    // private release feed is wanted (without it /releases/* answers 503).
+    "crew-zgx-local": {
+      "name": "crew-zgx-edge-local",
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [],
+      "triggers": { "crons": [] },
+      // An environment can't drop the top level's "assets" (the member-card
+      // pages, unrouted here): an empty folder, and the Worker answers first.
+      "assets": { "directory": "crew-no-assets", "run_worker_first": true },
+      "durable_objects": {
+        "bindings": [
+          { "name": "AUTH_GRANTS", "class_name": "AuthGrant" },
+          // The grant epoch fence shares the namespace, as on Crew's staging Edge.
+          { "name": "NATIVE_GRANT_EPOCHS", "class_name": "AuthGrant" },
+          { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+          { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
+          { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
+          { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
+        ]
+      },
+      "migrations": [
+        { "tag": "crew-zgx-local-v1", "new_sqlite_classes": ["AuthGrant", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom"] }
+      ],
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "crew-zgx-local-blobs" }],
+      // Not inherited from the top level: CHAT_RELAY_LAYER stays unset (and
+      // chat-room.ts keeps the relay layer off for any Crew deployment).
+      "vars": {
+        "AUTH_MODE": "scaffold",
+        "ENVIRONMENT": "crew-zgx-local",
+        "SCAFFOLD_CONTROL_PLANE_URL": "http://127.0.0.1:9",
+        "SCAFFOLD_PROJECT_SCOPE": "crew-zgx-local",
+        "SCAFFOLD_DEPLOYMENT_ID": "crew-zgx-local",
+        "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.sync.write session.chat session.control session.annotate session.files session.environment"
+      },
+      // Bearers can ride WebSocket query strings: no request logging.
+      "observability": { "enabled": false }
     }
   },
   "observability": {
