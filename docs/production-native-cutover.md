@@ -150,3 +150,33 @@ Recovery:
 - No user session was affected; only the test session was created in the window.
 
 The next retry needs a Crew release that includes #215.
+
+## 2026-11-13 0.2.149 attempt: rolled back, cutover blocked on a design gap
+
+0.2.149 (#215, #216) flipped at 21:31Z, and #215 worked: the engine came up and
+crew-web reached it over IPC. But no new native session became ready. The engine logged
+"directory update awaits synchronization or reconciliation … directory awaits
+acknowledged registry row", and `WatchChats` returned no rows. crew-web never found its
+session context, so it stayed at 503.
+
+A `chat2` sandbox only hosts a chat that already has a row in the native Edge's org
+registry. Only a native Crew client creates that row: it creates the chat, then calls
+`POST /api/code-sandboxes` with that chat id. Production sandboxes mostly come from other
+creators, none of which create the row:
+
+- agents through the Scaffold MCP (`/mcp/code-sandboxes`; the origin defaults to `ui`);
+- legacy clients;
+- the Scaffold web UI's "Launch sandbox".
+
+Staging never showed this, because every staging native session came from the native
+Crew app.
+
+Recovery:
+
+- The Worker was rolled back at 21:36Z, and ashler-platform #13594 restored the lock.
+- A new legacy session was ready at 21:53Z.
+- One user session created in the window stalled.
+
+**Before any retry, decide how sessions from non-native creators get a registry row.**
+For example, the Worker could create the chat server-side on the native Edge, or those
+sessions could stay on the legacy generation, which needs both templates.
