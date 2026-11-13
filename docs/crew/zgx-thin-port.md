@@ -103,6 +103,47 @@ Deferred:
 
   Relay frames stay off until the authority checks cover them.
 
+### Local Edge (slice 3)
+
+- **Layout.** Crew's auth stack is in `edge/src/crew/`. `crew/router.ts` answers
+  first through one call in `index.ts`: it authenticates, authorizes the route,
+  answers Crew's own routes and hands upstream's room routing a trusted request.
+  The rooms (`chat-room`, `registry-room`, `device-room`, `preview-room`) carry
+  marked `Crew:` grafts.
+- **Unrouted:** WorkOS and upstream's `/auth/*`, the user directory, usernames,
+  cards, onboarding, plugin keys, step-up, the vault, Cloud, runners, `/admin`,
+  billing, `/models/v1.json` and the public `install.sh`. These answer 401
+  without a bearer and 404 with one. The legacy session and workspace lanes
+  answer 410. The relay layer is off in any Crew deployment, whatever
+  `CHAT_RELAY_LAYER` says.
+- **Upstream's newer lanes:**
+  - `checkpoint-part` and the staged commit need a writable authority.
+  - Attachment blobs follow the session's blob rule. A sandbox host may also
+    DELETE an attachment it collects.
+  - Registry `/chat-host` is never reached: chat rooms get no org header.
+  - Caller-device proof is closed: the Worker never stamps `fromDevice`.
+  - `/releases/*` is Crew's authenticated feed: 503 without its bucket. The
+    engine's unauthenticated harness-compatibility fetch gets 401 and keeps its
+    built-in list.
+- **Run:** `scripts/crew/clean-env npm --prefix edge run dev:crew-zgx` serves
+  `http://127.0.0.1:27961` (environment `crew-zgx-local`). Durable Objects and
+  R2 are local, with no routes or crons, and wrangler's telemetry and `cf.json`
+  fetch are off. Point zgx at it with `CREW_ZGX_EDGE=http://127.0.0.1:27961
+  scripts/crew/dev-zgx`, or a bare engine with `ZERON_EDGE_URL`.
+- **Variables:** put these in `edge/.dev.vars.crew-zgx-local`, which is never committed.
+  - `SCAFFOLD_CONTROL_PLANE_URL` is the Scaffold authority (decision 1). The
+    default is a loopback port nothing serves, so `sc_rc_` bearers answer 503.
+  - `SCAFFOLD_PROJECT_SCOPE` must equal the engine's project scope. Default
+    `crew-zgx-local`; for staging Platform sandboxes it is `ashler-staging`.
+  - Optional: `SCAFFOLD_DEPLOYMENT_ID`, and `SCAFFOLD_SESSION_FRESH_MS` and
+    `SCAFFOLD_SESSION_GRACE_MS`.
+  - The only secrets are the optional release feed's: `COMET_RELEASES_GCS_BUCKET`,
+    `GCP_RELEASE_SERVICE_ACCOUNT_EMAIL` and `GCP_RELEASE_SERVICE_ACCOUNT_PRIVATE_KEY`.
+- **Offline:** add `-- --var AUTH_MODE:dev --var ENVIRONMENT:local`. The bearer
+  is then `user@crew-zgx-local`, and nothing is verified.
+- **Tests:** `npm run test:unit`, `npm run test:workerd` (upstream's tier) and
+  `npm run test:crew-workerd` (Crew's), each through `scripts/crew/clean-env`.
+
 ### Agent Auth
 
 - Use `RunEnvironment::prepare(harness, chat_id, &mut RunRequest)` (`crates/engine/src/registry.rs`).
@@ -164,7 +205,8 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
 - [x] 0. Baseline
 - [ ] 1. Isolation and flavour
 - [ ] 2. Crew sign-in
-- [ ] 3. Edge
+- [ ] 3. Edge: built, and tested locally with unit, workerd and `wrangler dev`
+  smoke runs. Its exit gate waits for slice 2's signed-in engine to join.
 - [ ] 4. zgx Crew mode
 - [ ] 5. Agent Auth
 - [ ] 6. Scaffold
