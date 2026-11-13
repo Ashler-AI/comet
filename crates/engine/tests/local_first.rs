@@ -28,6 +28,8 @@ fn config(
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
+        scaffold: None,
+        device: None,
     }
 }
 
@@ -489,8 +491,11 @@ async fn workspace_recovers_from_an_unreachable_edge_without_restarting() {
     runtime.shutdown().await;
 }
 
+/// Crew: upstream made this development (signed in as `dev-user`, offline);
+/// with no WorkOS client id and no explicit bearer this build is signed out
+/// and local instead — no dev identity, no Edge.
 #[tokio::test]
-async fn development_without_an_explicit_bearer_stays_offline() {
+async fn no_client_id_and_no_bearer_is_signed_out_and_local() {
     let dir = tempfile::tempdir().unwrap();
     let (edge_url, requests, edge_task) = rejecting_edge().await;
     let config = config(dir.path(), edge_url, None, None);
@@ -498,21 +503,19 @@ async fn development_without_an_explicit_bearer_stays_offline() {
     let scope = Engine::initial_workspace_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .unwrap()
-        .expect("development profile is ready");
+        .expect("local profile is ready");
 
-    assert_eq!(scope, WorkspaceScope::Development);
-    assert_eq!(auth.access_token().await.as_deref(), Ok("dev-user"));
-    let runtime = Engine::assemble_runtime(&config, auth, profile)
-        .await
-        .unwrap();
-
-    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Development);
-    assert!(
-        runtime.core().links().is_none(),
-        "the synthetic dev identity must not enable Edge"
+    assert_eq!(scope, WorkspaceScope::Local);
+    assert_eq!(profile.scope(), WorkspaceScope::Local);
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert_eq!(auth.user_id(), None);
+    assert_eq!(
+        auth.access_token().await,
+        Err(zeron_rpc::TokenError::SignedOut)
     );
+    assert!(auth.start_sign_in().await.is_err(), "nothing to sign in with");
+    assert!(!dir.path().join("orgs/dev-org/dev-user").exists());
     assert_eq!(requests.load(Ordering::SeqCst), 0);
-    runtime.shutdown().await;
     edge_task.abort();
 }
 

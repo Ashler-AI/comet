@@ -1037,6 +1037,9 @@ impl EngineRpc {
             return CloudClient::unavailable();
         };
         let org_id = match &self.auth {
+            // Crew: no Zeron Cloud or vault with a Scaffold authority (and
+            // never its bearer to those routes).
+            Some(auth) if auth.scaffold_enabled() => return CloudClient::unavailable(),
             Some(auth) if auth.workos_enabled() => match auth.state() {
                 crate::auth::AuthState::SignedIn {
                     org_id: Some(org_id),
@@ -2988,6 +2991,12 @@ impl AuthRpc {
 #[async_trait]
 impl RpcService for AuthRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        // Crew: in Scaffold mode the `sc_rc_` bearer never leaves the engine
+        // (it lasts until revoked, with exec and lifecycle scopes), and the
+        // account has no step-up, deletion or organizations here.
+        if self.auth.refuses_in_scaffold_mode(method) {
+            return Err(RpcError::Capability(crate::auth::SCAFFOLD_UNSUPPORTED.into()));
+        }
         match method {
             methods::AUTH_STATUS => Ok(RpcReply::Stream(watch_stream(self.auth.watch_state()))),
             methods::SIGN_IN => {
@@ -3050,7 +3059,11 @@ impl RpcService for AuthRpc {
                 }
             }
             methods::SIGN_IN_HEADLESS => {
-                let url = self.auth.start_headless_sign_in();
+                let url = self
+                    .auth
+                    .start_headless_sign_in()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "url": url }))
             }
             methods::COMPLETE_SIGN_IN => {

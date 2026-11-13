@@ -21,6 +21,10 @@
 //!   so the device-room relay and room clients always dial with a live `?token=`, even
 //!   on the first redial after a laptop wakes from sleep. Org onboarding: an org-less session is `NeedsOrganization`; `SelectOrg`
 //!   runs an org-scoped refresh and the state follows the returned token's `org_id`.
+//!
+//! Crew adds a fourth, **Scaffold** (`AuthConfig::scaffold`, see `crew_auth.rs`), which
+//! replaces WorkOS and dev mode alike. And dev mode is only ever explicit here
+//! (`AuthConfig::allow_dev_auth`): no WorkOS client id alone signs nobody in.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +39,11 @@ use tokio::sync::watch;
 use crate::EngineError;
 use crate::http_error::describe_http_error;
 use zeron_rpc::TokenError;
+
+// Crew: Scaffold sign-in, a child module so it reaches this one's state.
+#[path = "crew_auth.rs"]
+mod crew;
+pub use crew::{DeviceGrantAuthority, ProfileTokens, SCAFFOLD_UNSUPPORTED, ScaffoldScope};
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 /// Refresh when the cached token has less than this much life left.
@@ -67,6 +76,9 @@ struct RefreshFailure {
     at: tokio::time::Instant,
     wall: std::time::SystemTime,
     delay: Duration,
+    /// The authority said how long to wait (Crew: Scaffold's Retry-After):
+    /// a connectivity hint doesn't cut it short ([`Auth::retry_refresh`]).
+    server_cooldown: bool,
 }
 
 impl RefreshFailure {
@@ -208,7 +220,8 @@ pub struct AuthConfig {
     pub edge_url: String,
     /// Data dir for the persisted session (`session.json`, 0600).
     pub data_dir: PathBuf,
-    /// WorkOS client id; `None` = dev mode.
+    /// WorkOS client id; `None` = dev mode when [`Self::allow_dev_auth`],
+    /// else signed out with no authority (Crew).
     pub workos_client_id: Option<String>,
     /// WorkOS API base (authorize URL host).
     pub workos_api_base: String,
@@ -216,6 +229,14 @@ pub struct AuthConfig {
     pub dev_user_id: String,
     /// Loopback callback port; `None` = ephemeral.
     pub callback_port: Option<u16>,
+    /// Crew: the Scaffold authority. Set, it replaces WorkOS and dev mode;
+    /// invalid, it signs nobody in (never dev mode).
+    pub scaffold: Option<zeron_sync::scaffold_auth::ScaffoldConfig>,
+    /// Crew: a sandbox host's one-use device grant (never a user's credential).
+    pub device: Option<zeron_sync::scaffold_auth::DeviceConfig>,
+    /// Crew: dev mode (always signed in, bearer = user id) only when this
+    /// says so, never because a WorkOS client id is missing or empty.
+    pub allow_dev_auth: bool,
 }
 
 impl AuthConfig {
@@ -227,6 +248,9 @@ impl AuthConfig {
             workos_api_base: "https://api.workos.com".into(),
             dev_user_id: "dev-user".into(),
             callback_port: None,
+            scaffold: None,
+            device: None,
+            allow_dev_auth: false,
         }
     }
 }
@@ -311,7 +335,9 @@ struct AuthInner {
     /// Single-flight refresh: WorkOS refresh tokens are single-use (rotated per
     /// exchange); two concurrent refreshes would race and could revoke the session.
     refresh_gate: tokio::sync::Mutex<()>,
-    refresh_flight: Mutex<Option<RefreshFlight>>,
+    /// The flight in the air, and the sign-in generation it serves: a
+    /// replaced session never shares the old one's (Crew).
+    refresh_flight: Mutex<Option<(u64, RefreshFlight)>>,
     /// Set at shutdown ([`Auth::quiesce_refresh`]): no refresh after.
     refresh_quiesced: std::sync::atomic::AtomicBool,
     /// Failed refreshes are shared across every HTTP/WS token consumer, not
@@ -336,6 +362,8 @@ struct AuthInner {
     step_up_states: Mutex<std::collections::HashSet<String>>,
     /// [`Auth::on_fresh_ticket`].
     fresh_ticket: Mutex<Option<FreshTicketHook>>,
+    /// Crew: the Scaffold authority, its helper and verified credential.
+    crew: crew::CrewAuth,
 }
 
 /// The longest a step-up ticket is kept.
@@ -400,6 +428,8 @@ impl std::fmt::Display for DeleteAccountError {
 struct SignInLifecycle {
     generation: u64,
     pending: HashMap<String, Instant>,
+    /// Crew: the Scaffold credential's lifecycle, fenced by the same lock.
+    crew: crew::Lifecycle,
 }
 
 /// The auth service — cheap to clone by `Arc`.
@@ -409,11 +439,16 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Build from config: dev mode unless a WorkOS client id is configured.
-    pub fn new(config: AuthConfig) -> Self {
+    /// Build from config: WorkOS when a client id is configured; Crew's
+    /// Scaffold authority instead of either when one is; dev mode only when
+    /// [`AuthConfig::allow_dev_auth`] says so; else signed out.
+    pub fn new(mut config: AuthConfig) -> Self {
+        // Crew: signed out until a retained credential is verified.
+        let crew = crew::CrewAuth::load(&mut config);
         let workos = config
             .workos_client_id
             .clone()
+            .filter(|_| !crew.enabled())
             .filter(|s| !s.trim().is_empty());
         let session_file = config.data_dir.join("session.json");
         let stored: Option<StoredSession> = if workos.is_some() {
@@ -424,7 +459,7 @@ impl Auth {
             None
         };
         let initial = match (&workos, &stored) {
-            (None, _) => AuthState::SignedIn {
+            (None, _) if config.allow_dev_auth && !crew.enabled() => AuthState::SignedIn {
                 user: AuthUser {
                     id: config.dev_user_id.clone(),
                     email: config.dev_user_id.clone(),
@@ -432,11 +467,12 @@ impl Auth {
                 },
                 org_id: None,
             },
+            (None, _) => AuthState::SignedOut,
             (Some(_), Some(session)) => state_for(session.user.clone(), session.org_id.clone()),
             (Some(_), None) => AuthState::SignedOut,
         };
         let loaded_workos_session = workos.is_some() && stored.is_some();
-        Self::assemble(config, workos, loaded_workos_session, stored, initial, None)
+        Self::assemble(config, workos, loaded_workos_session, stored, initial, None, crew)
     }
 
     /// Runner mode: a Cloud device authenticating with its enrolled key. The
@@ -451,7 +487,7 @@ impl Auth {
             },
             org_id: Some(identity.org_id().to_string()),
         };
-        Self::assemble(config, None, false, None, initial, Some(identity))
+        Self::assemble(config, None, false, None, initial, Some(identity), crew::CrewAuth::default())
     }
 
     fn assemble(
@@ -461,6 +497,7 @@ impl Auth {
         stored: Option<StoredSession>,
         initial: AuthState,
         runner: Option<Arc<crate::runner::RunnerIdentity>>,
+        crew: crew::CrewAuth,
     ) -> Self {
         let (state_tx, _) = watch::channel(initial);
         let (token_tx, _) = watch::channel(0);
@@ -492,6 +529,7 @@ impl Auth {
                 step_up: Mutex::new(None),
                 step_up_states: Mutex::new(std::collections::HashSet::new()),
                 fresh_ticket: Mutex::new(None),
+                crew,
             }),
         }
     }
@@ -514,9 +552,11 @@ impl Auth {
 
     /// Like [`Auth::new`], but additionally probes `{edge}/health`: an edge running in
     /// dev auth mode forces dev mode even when a client id is configured (matching the
-    /// edge's "bearer = user id" verification).
+    /// edge's "bearer = user id" verification). Crew: only where dev auth is
+    /// explicitly allowed, never in place of a Scaffold authority; and a
+    /// retained Scaffold credential is verified before a profile is chosen.
     pub async fn detect(mut config: AuthConfig) -> Self {
-        if config.workos_client_id.is_some() {
+        if config.workos_client_id.is_some() && config.allow_dev_auth && config.scaffold.is_none() {
             #[derive(Deserialize)]
             struct Health {
                 auth: Option<String>,
@@ -540,7 +580,9 @@ impl Auth {
                 config.workos_client_id = None;
             }
         }
-        Self::new(config)
+        let auth = Self::new(config);
+        auth.verify_retained_scaffold().await;
+        auth
     }
 
     /// The edge this auth signs in against.
@@ -575,7 +617,7 @@ impl Auth {
         if let Some(runner) = &self.inner.runner {
             return Some(runner.user_id().to_string());
         }
-        if self.inner.workos.is_none() {
+        if self.dev_enabled() {
             let dev = &self.inner.config.dev_user_id;
             return Some(dev.split('@').next().unwrap_or(dev).to_string());
         }
@@ -590,8 +632,16 @@ impl Auth {
         if self.inner.runner.is_some() {
             return self.runner_access_token().await;
         }
+        if self.scaffold_enabled() {
+            return self.scaffold_credential().await.map(|(token, _)| token);
+        }
         if self.inner.workos.is_none() {
-            return Ok(self.inner.config.dev_user_id.clone());
+            // Crew: the dev bearer only where dev auth is allowed and signed in.
+            return if self.dev_enabled() && self.state().is_signed_in() {
+                Ok(self.inner.config.dev_user_id.clone())
+            } else {
+                Err(TokenError::SignedOut)
+            };
         }
         if let Some(entry) = &*lock(&self.inner.access)
             && entry.remaining() > TOKEN_SLACK
@@ -620,8 +670,23 @@ impl Auth {
 
     /// Allow one fresh attempt after a connectivity hint or an explicit Retry.
     /// Consumers still serialize on the refresh gate and share its outcome.
+    /// An authority's own Retry-After (Crew: Scaffold's) still stands.
     pub fn retry_refresh(&self) {
+        self.reset_refresh_retry(false);
+    }
+
+    /// [`Self::retry_refresh`]; a sign-in or sign-out (`lifecycle_change`)
+    /// also ends an authority's cooldown, which was the old credential's.
+    fn reset_refresh_retry(&self, lifecycle_change: bool) {
         let mut retry = lock(&self.inner.refresh_retry);
+        if !lifecycle_change
+            && retry
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.server_cooldown && !failure.remaining().is_zero())
+        {
+            return;
+        }
         retry.generation = retry.generation.wrapping_add(1);
         retry.failures = 0;
         retry.failure = None;
@@ -633,6 +698,9 @@ impl Auth {
     pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
         let auth = self.clone();
         tokio::spawn(async move {
+            if auth.scaffold_enabled() {
+                return auth.scaffold_refresh_loop().await;
+            }
             if auth.inner.workos.is_none() && auth.inner.runner.is_none() {
                 return;
             }
@@ -705,8 +773,13 @@ impl Auth {
     /// account or on signing in, and whether it asks afresh rather than
     /// going on as the account the browser is already signed into.
     pub async fn start_sign_in_with(&self, options: SignInOptions) -> Result<String, EngineError> {
+        // Crew: Scaffold's own page; it has no hints.
+        if self.scaffold_enabled() {
+            return self.start_scaffold_sign_in().await;
+        }
         if self.inner.workos.is_none() {
-            return Ok(String::new()); // dev mode: nothing to do (TS parity)
+            // dev mode: nothing to do (TS parity)
+            return self.no_sign_in_authority().map(|()| String::new());
         }
         let port = self.ensure_loopback().await?;
         Ok(self.begin_sign_in(&format!("http://127.0.0.1:{port}/callback"), options))
@@ -724,22 +797,27 @@ impl Auth {
 
     /// Begin a headless sign-in: the redirect is the edge's hosted paste-code page —
     /// nothing ever redirects to this machine, so the browser can be anywhere.
-    pub fn start_headless_sign_in(&self) -> String {
-        if self.inner.workos.is_none() {
-            return String::new();
+    /// Crew: Scaffold redirects to this machine's loopback, as a headed sign-in does.
+    pub async fn start_headless_sign_in(&self) -> Result<String, EngineError> {
+        if self.scaffold_enabled() || self.inner.workos.is_none() {
+            return self.start_sign_in().await;
         }
         let edge = self.inner.config.edge_url.trim_end_matches('/');
-        self.begin_sign_in(
+        Ok(self.begin_sign_in(
             &format!("{edge}/auth/cli/callback"),
             SignInOptions::default(),
-        )
+        ))
     }
 
     /// Finish a headless sign-in with the pasted `state.code` string. The state half
     /// must match a sign-in started HERE (same CSRF discipline as the loopback flow).
+    /// Crew: Scaffold takes that, or the whole callback URL.
     pub async fn complete_sign_in(&self, pasted: &str) -> Result<(), EngineError> {
+        if self.scaffold_enabled() {
+            return self.complete_scaffold_sign_in(pasted).await;
+        }
         if self.inner.workos.is_none() {
-            return Ok(());
+            return self.no_sign_in_authority();
         }
         let trimmed = pasted.trim();
         let (state, code) = trimmed.split_once('.').unwrap_or(("", ""));
@@ -888,11 +966,13 @@ impl Auth {
     fn clear_session(&self, sign_in: &mut SignInLifecycle) {
         sign_in.generation = sign_in.generation.wrapping_add(1);
         sign_in.pending.clear();
+        // Crew: and the Scaffold credential, its verification and its file.
+        self.clear_scaffold_session(sign_in);
         *lock(&self.inner.step_up) = None;
         lock(&self.inner.step_up_states).clear();
         *lock(&self.inner.stored) = None;
         *lock(&self.inner.access) = None;
-        self.retry_refresh();
+        self.reset_refresh_retry(true);
         self.persist::<&StoredSession>(None);
         self.inner.state_tx.send_replace(AuthState::SignedOut);
         self.inner
@@ -921,6 +1001,9 @@ impl Auth {
     /// Each user creates one: if we already did (a double-submit, a retry, or an
     /// earlier session), the edge answers 409 with that org and we continue in it.
     pub async fn create_org(&self, name: &str) -> Result<(), EngineError> {
+        if self.scaffold_enabled() {
+            return Err(EngineError::Other("Scaffold project scope is authority-managed".into()));
+        }
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -961,6 +1044,9 @@ impl Auth {
     /// Scope the session to an org: one refresh with `organizationId`; the state follows
     /// the returned token's `org_id` claim.
     pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
+        if self.scaffold_enabled() {
+            return Err(EngineError::Other("Scaffold project scope is immutable; reopen its profile".into()));
+        }
         if self.inner.workos.is_none() {
             return Ok(());
         }
@@ -1113,7 +1199,7 @@ impl Auth {
         };
         self.persist(Some(&session));
         *lock(&self.inner.stored) = Some(session);
-        self.retry_refresh();
+        self.reset_refresh_retry(true);
         Ok((result.user, org_id))
     }
 
@@ -1143,9 +1229,12 @@ impl Auth {
         if organization_id.is_some() {
             return self.refresh_serialized(organization_id).await;
         }
+        // Crew: a flight serves the sign-in it started under; a sign-in or
+        // sign-out since starts another (they still queue on the gate).
+        let generation = lock(&self.inner.sign_in).generation;
         let flight = {
             let mut active = lock(&self.inner.refresh_flight);
-            if let Some(flight) = active.as_ref() {
+            if let Some((_, flight)) = active.as_ref().filter(|(served, _)| *served == generation) {
                 flight.clone()
             } else {
                 let auth = self.clone();
@@ -1156,7 +1245,10 @@ impl Auth {
                         .refresh_serialized(None)
                         .await
                         .map_err(|e| e.to_string());
-                    *lock(&auth.inner.refresh_flight) = None;
+                    let mut active = lock(&auth.inner.refresh_flight);
+                    if active.as_ref().is_some_and(|(served, _)| *served == generation) {
+                        *active = None;
+                    }
                     result
                 });
                 let flight = async move {
@@ -1165,7 +1257,7 @@ impl Auth {
                 }
                 .boxed()
                 .shared();
-                *active = Some(flight.clone());
+                *active = Some((generation, flight.clone()));
                 flight
             }
         };
@@ -1203,7 +1295,9 @@ impl Auth {
             return Ok(None);
         }
         // Re-check under the gate: the refresh we queued behind may have done the work.
+        // (Crew: a Scaffold bearer isn't cached here; its verification is.)
         if organization_id.is_none()
+            && !self.scaffold_enabled()
             && let Some(entry) = &*lock(&self.inner.access)
             && entry.remaining() > TOKEN_SLACK
         {
@@ -1220,7 +1314,13 @@ impl Auth {
             }
             retry.generation
         };
-        let result = self.refresh_locked(organization_id).await;
+        // Crew: Scaffold verifies (or renews a device grant), and may say how
+        // long to wait before asking again.
+        let (result, retry_after) = if self.scaffold_enabled() {
+            self.scaffold_refresh_locked().await
+        } else {
+            (self.refresh_locked(organization_id).await, None)
+        };
         let mut retry = lock(&self.inner.refresh_retry);
         // A Retry/sign-in/sign-out during the request invalidates its cooldown.
         if retry.generation == generation {
@@ -1235,7 +1335,9 @@ impl Auth {
                     let backoff = base.saturating_mul(1 << (retry.failures - 1).min(8));
                     let jitter =
                         Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]));
-                    let delay = if self.runner_rejected() {
+                    let delay = if let Some(server) = retry_after {
+                        server.max(REFRESH_RETRY_BASE)
+                    } else if self.runner_rejected() {
                         RUNNER_REJECTED_RETRY
                     } else {
                         (backoff + jitter).min(REFRESH_RETRY_CAP)
@@ -1247,6 +1349,7 @@ impl Auth {
                         at: tokio::time::Instant::now(),
                         wall: std::time::SystemTime::now(),
                         delay,
+                        server_cooldown: retry_after.is_some(),
                     });
                 }
                 Ok(_) => {
@@ -1699,6 +1802,10 @@ async fn handle_loopback_conn(
 
     let (status, body) = if path != "/callback" {
         ("404 Not Found", page("Not found."))
+    } else if auth.scaffold_enabled() {
+        // Crew: Scaffold checks the whole callback against its redirect.
+        let callback = format!("http://127.0.0.1:{}{target}", stream.local_addr()?.port());
+        crew::scaffold_callback(&auth, request_line.split_whitespace().next(), &callback).await
     } else {
         let params: HashMap<String, String> = query
             .split('&')

@@ -19,6 +19,8 @@ pub mod dial;
 mod held_sends;
 pub mod net_path;
 pub mod registry;
+/// Crew: Scaffold sign-in (docs/crew/zgx-thin-port.md).
+pub mod scaffold_auth;
 pub mod socket;
 mod store;
 mod store_recovery;

@@ -295,6 +295,9 @@ impl EngineHandle {
             default_harness: config.default_harness,
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
+            // Crew: no Scaffold authority in the old gpui app.
+            scaffold: None,
+            device: None,
         };
         let launching = LAUNCH_BACKGROUND_ENGINE.load(std::sync::atomic::Ordering::SeqCst);
         if Self::should_launch_background(launching, engine_config.ipc_port).await

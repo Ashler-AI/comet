@@ -89,9 +89,13 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    if !auth.workos_enabled() {
-        println!("Auth is in dev mode (no WorkOS client id) — there is nothing to sign in to.");
-        return Ok(());
+    // Crew: Scaffold or WorkOS; dev mode (explicit only) has nothing to sign in to.
+    if !auth.is_authenticated_mode() {
+        if auth.dev_enabled() {
+            println!("Auth is in dev mode (a development bearer) — there is nothing to sign in to.");
+            return Ok(());
+        }
+        anyhow::bail!("no sign-in authority is configured (a Scaffold one is named in crew-runtime.json)");
     }
     if let AuthState::SignedIn { user, org_id } = auth.state() {
         println!(
@@ -140,14 +144,15 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    if !auth.workos_enabled() {
+    if !auth.is_authenticated_mode() {
         // Dev mode has no live session, but clear any stale session.json from a
         // previous WorkOS-mode run so the next real run starts signed out.
         auth.sign_out();
-        println!("Auth is in dev mode — cleared any stale saved session.");
-        println!("The next engine start will remain in development mode.");
+        println!("No sign-in authority is configured — cleared any stale saved session.");
         return Ok(());
     }
+    // Crew: a Scaffold credential has a file of its own.
+    let session_file = if auth.scaffold_enabled() { "scaffold-session.json" } else { "session.json" };
     match auth.state() {
         AuthState::SignedOut => {
             // Also remove malformed or stale files that could not be loaded.
@@ -162,7 +167,7 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
             auth.sign_out();
             println!(
                 "Signed out {email} — removed {}.",
-                config.data_dir.join("session.json").display()
+                config.data_dir.join(session_file).display()
             );
         }
     }
@@ -181,6 +186,9 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
     let account = account_status(scope, &auth.state());
     println!("Data dir: {}", config.data_dir.display());
     println!("Edge:     {}", config.edge_url);
+    if let Some(scaffold) = &config.scaffold {
+        println!("Scaffold: {} (project {})", scaffold.control_origin, scaffold.project_scope);
+    }
     if let Some(runner) = auth.runner_identity() {
         println!(
             "Runner:   Cloud device {} (org {}, user {})",
@@ -255,6 +263,8 @@ mod tests {
             default_harness: HarnessId::Mock,
             org_id: None,
             workos_client_id: Some("client_test".into()),
+            scaffold: None,
+            device: None,
         }
     }
 
