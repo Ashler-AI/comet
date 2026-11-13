@@ -103,7 +103,8 @@ Deferred:
   - The authority comes only from `<data_dir>/crew-runtime.json` (`edgeUrl`, `scaffoldUrl`,
     `projectScope`, optional `deploymentId`), read in `apps/zeron/src/crew_runtime.rs`.
     No environment variable names it. Its `edgeUrl` replaces `ZERON_EDGE_URL`, and an unusable
-    file stops the engine (exit 78). Without the file, the engine is unchanged.
+    file stops the engine (exit 78). So does an `edgeUrl` that is another Crew's Edge (Crew
+    Staging's, Crew's or Crew Canary's local one): rule 5. Without the file, the engine is unchanged.
   - Signed in, `AuthStatus` is `{state: signedIn, user: {id, email, name}, orgId: <projectScope>}`.
     The credential is `<data_dir>/scaffold-session.json` (0600).
   - Sign-in uses a loopback callback on an ephemeral port (`http://127.0.0.1:<port>/callback`),

@@ -17,6 +17,10 @@
 //! Without the file the engine is as it was: signed out and local, no Edge.
 //! A file that can't be used stops the engine (as another install's data dir
 //! does) rather than leave it running without the authority it names.
+//!
+//! Nor may it name another Crew's Edge, whatever else it says (isolation
+//! rule 5): an engine of this build syncing there would be a second writer
+//! in rooms that other Crew versions use ([`OTHER_EDGES`]).
 
 use std::path::Path;
 
@@ -25,6 +29,17 @@ use zeron_engine::scaffold_auth::{ScaffoldConfig, normalized_origin};
 
 /// The file's name in the data dir.
 pub const FILE: &str = "crew-runtime.json";
+
+/// Other Crews' Edges: Crew Staging's, Crew's (native and legacy), and Crew
+/// Canary's local one. Never this build's.
+pub const OTHER_EDGES: &[&str] = &[
+    "https://comet-staging.internal.ashler.com",
+    "https://crew.internal.ashler.com",
+    "https://comet.internal.ashler.com",
+    "http://127.0.0.1:27941",
+    "http://localhost:27941",
+    "http://[::1]:27941",
+];
 
 /// A data dir's Crew runtime: the Scaffold authority and its Edge.
 #[derive(Debug, Clone)]
@@ -64,6 +79,9 @@ pub fn load(data_dir: &Path) -> Result<Option<CrewRuntime>, String> {
         })
     };
     let edge_url = origin("edgeUrl")?;
+    if OTHER_EDGES.contains(&edge_url.as_str()) {
+        return Err(invalid(&format!("{edge_url} is another Crew's Edge")));
+    }
     let mut scaffold = ScaffoldConfig::new(origin("scaffoldUrl")?, &edge_url, required("projectScope")?);
     scaffold.deployment_id = text("deploymentId")?;
     Ok(Some(CrewRuntime { edge_url, scaffold }))
@@ -171,6 +189,12 @@ mod tests {
             ("edgeUrl", serde_json::json!("http://edge.example")),
             ("scaffoldUrl", serde_json::json!("https://scaffold.example/oauth")),
             ("scaffoldUrl", serde_json::json!("https://user@scaffold.example")),
+            // Never another Crew's Edge, however it's spelled.
+            ("edgeUrl", serde_json::json!("https://comet-staging.internal.ashler.com")),
+            ("edgeUrl", serde_json::json!("https://Crew.Internal.Ashler.com:443/")),
+            ("edgeUrl", serde_json::json!("https://comet.internal.ashler.com")),
+            ("edgeUrl", serde_json::json!("http://127.0.0.1:27941")),
+            ("edgeUrl", serde_json::json!("http://localhost:27941/")),
         ] {
             let mut file = good.clone();
             file[field] = value;
