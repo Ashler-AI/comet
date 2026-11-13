@@ -3,6 +3,7 @@
 -- `onboarding.start`) picks where a launch starts.
 
 local api = require("@account/api")
+local crew = require("./crew")
 
 export type Step = "signin" | "appearance" | "username" | "card" | "org" | "invite" | "github" | "providers" | "done"
 export type Path = "signed_in" | "skipped"
@@ -111,6 +112,10 @@ M.last_org = ui.persist("last_org", "")
 -- The way through this run takes.
 local function way(): { Step }
 	local path = M.path:get()
+	-- Crew: signed in, its one way through (./crew.luau), welcome or not.
+	if crew.on and path == "signed_in" then
+		return (crew.PATH :: any) :: { Step }
+	end
 	return if M.welcome and path == "signed_in" then M.WELCOME else M.PATHS[path]
 end
 

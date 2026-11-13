@@ -1,8 +1,9 @@
-//! Crew mode (src/crew.rs): the account's endpoint and kept session, and
-//! the account's calls answered with no Edge, no engine and no bearer.
+//! Crew mode (src/crew.rs): the account's endpoint and kept session, the
+//! account's calls answered with no Edge, no engine and no bearer, and
+//! setup's and Settings' Crew screens on the host's `crew` flag.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -11,6 +12,10 @@ use serde_json::{Value as Json, json};
 use zgx_script::{ScriptHost, Value, testing::TestApp};
 
 use super::{Account, Answers, ENV, MODE, NO_EDGE, PAGES, PROVIDER, Pages, RUNTIME, Runtime, SCAFFOLD_SESSION, TITLE, answer, endpoint_at, provider};
+
+fn ui_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui")
+}
 
 fn ada(org: Option<&str>) -> Account {
     Account { id: "user_ada".into(), email: "ada@example.net".into(), first_name: Some("Ada".into()), org: org.map(Into::into) }
@@ -235,4 +240,118 @@ fn signed_out_the_account_s_calls_say_so() {
     }
     assert_eq!(said(&app, "choose")["account.choose_org"]["word"], "signed_out");
     assert_eq!(got["account.username"], json!({ "ok": true }));
+}
+
+/// Setup on the `crew` flag: signed in, the look, the agents, done
+/// (ui/crew_onboarding_order.luau's cases); and signing in as setup does
+/// works in the project the host answers, as a member.
+#[test]
+fn setup_goes_crew_s_way() {
+    let pages = tempfile::tempdir().unwrap();
+    let crew = answers(Some(ada(Some("proj_1"))), Runtime::default(), Some(pages.path()));
+    let mut app = TestApp::new(|runtime| {
+        let host = ScriptHost::new(runtime, ui_dir().join("crew_onboarding_order.luau"));
+        host.shared("crew", true);
+        answer(&host, crew);
+        host
+    });
+    app.frames(2);
+    assert_eq!(app.error(), None);
+    assert_eq!(app.text("#result"), "ok");
+    assert!(app.host.run_command("crew_test.signed_in"));
+    app.frames(10);
+    assert_eq!(state(&app, "step"), Some(Value::from("appearance")));
+    assert_eq!(state(&app, "path"), Some(Value::from("signed_in")));
+    assert_eq!(state(&app, "org_name"), Some(Value::from("proj_1")));
+    assert_eq!(state(&app, "org_done"), Some(Value::Bool(true)));
+    assert_eq!(state(&app, "org_admin"), Some(Value::Bool(false)));
+}
+
+/// Without the flag, setup is Zeron's as it was (ui/onboarding_order.luau,
+/// which `zgx test ui onboarding` runs too).
+#[test]
+fn setup_without_the_flag_is_zeron_s() {
+    let mut app = TestApp::new(|runtime| ScriptHost::new(runtime, ui_dir().join("onboarding_order.luau")));
+    app.frames(2);
+    assert_eq!(app.error(), None);
+    assert_eq!(app.text("#result"), "ok");
+}
+
+/// The main window's shell (ui/shell_fixture.luau, Settings' calls answered
+/// by ui/settings_stub.luau) signed in, on Settings.
+fn settings(crew: bool) -> TestApp {
+    let app = TestApp::new(|runtime| {
+        let host = ScriptHost::new(runtime, ui_dir().join("shell_fixture.luau"));
+        host.window_size(runtime.signal((1200., 900.)));
+        if crew {
+            host.shared("crew", true);
+        }
+        host
+    });
+    app.ui.scene.borrow_mut().resize(1200., 900.);
+    app.frames(30);
+    assert_eq!(app.error(), None, "the shell failed to load");
+    assert!(app.host.run_command("settings_stub.sign_in"));
+    assert!(app.host.run_command("shell.settings"));
+    app.frames(20);
+    app
+}
+
+/// Whether anything matches `target`: one node or several (`find` says
+/// none for several).
+fn shows(app: &mut TestApp, target: &str) -> bool {
+    match app.target(target) {
+        Ok(_) => true,
+        Err(why) => !why.starts_with("nothing matches"),
+    }
+}
+
+/// Crew's Settings: no Members, and an account page without the profile's
+/// edits (whom you're signed in as and where, devices, signing out); its
+/// About says which app this is.
+#[test]
+fn settings_have_no_members_and_no_profile_edits() {
+    let mut app = settings(true);
+    assert!(shows(&mut app, "#settings-nav >> role:tab \"Account\""), "{}", app.tree());
+    assert!(!shows(&mut app, "#settings-nav >> \"Members\""), "no Members:\n{}", app.tree());
+    app.click("#settings-nav >> role:tab \"Account\"");
+    app.frames(30);
+    assert_eq!(app.error(), None);
+    for gone in ["Photo", "Name", "Title", "Username", "Save changes", "Delete account", "Claim a username"] {
+        assert!(!shows(&mut app, &format!("#settings-page >> \"{gone}\"")), "{gone} shows:\n{}", app.tree());
+    }
+    for kept in ["Signed in as", "ada@example.net", "Signed in on", "Sign out"] {
+        assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
+    }
+    // Where the session works: the project, as the engine says.
+    assert!(app.tree().contains("In org_1."), "{}", app.tree());
+    // Nothing the design lint finds on it.
+    let lint: Vec<String> = app.host.warnings().into_iter().filter(|w| w.contains("design lint")).collect();
+    assert!(lint.is_empty(), "{lint:#?}");
+    app.click("#settings-nav >> role:tab \"About & updates\"");
+    app.frames(30);
+    assert!(shows(&mut app, "#settings-page >> \"Crew (zgx dev)\""), "{}", app.tree());
+    // The search finds no Members page.
+    app.type_text("#settings-nav >> #settings-search", "members");
+    app.frames(10);
+    assert!(!shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());
+}
+
+/// Without the flag, Settings are Zeron's as they were.
+#[test]
+fn settings_without_the_flag_are_zeron_s() {
+    let mut app = settings(false);
+    assert!(shows(&mut app, "#settings-nav >> role:tab \"Members\""), "{}", app.tree());
+    app.click("#settings-nav >> role:tab \"Account\"");
+    app.frames(30);
+    for kept in ["Photo", "Name", "Username", "Save changes", "Delete account"] {
+        assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
+    }
+    app.click("#settings-nav >> role:tab \"About & updates\"");
+    app.frames(30);
+    assert!(shows(&mut app, "#settings-page >> \"Zeron\""), "{}", app.tree());
+    assert!(!app.tree().contains("Crew (zgx dev)"));
+    app.type_text("#settings-nav >> #settings-search", "members");
+    app.frames(10);
+    assert!(shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());
 }

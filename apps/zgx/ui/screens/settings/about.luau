@@ -21,6 +21,7 @@ local ds = require("@ds")
 local host = require("@app/screens/settings/host")
 local search = require("@app/screens/settings/search")
 local locale = require("@ds/locale")
+local crew = require("@account/crew")
 
 local M = {}
 
@@ -281,7 +282,7 @@ function M.view(): Node
 		ds.Settings.Section {
 			ds.Settings.Group {
 				row("version", {
-					label = "Zeron",
+					label = if crew.on then crew.PRODUCT else "Zeron",
 					description = function(): string
 						return M.build(M.now:get().engine_build) or ui.t("settings.about.version.description"):get()
 					end,

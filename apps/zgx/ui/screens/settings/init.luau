@@ -36,6 +36,8 @@ local about = require("@app/screens/settings/about")
 local cloud_page = require("@app/screens/settings/cloud")
 local billing_page = require("@app/screens/settings/billing")
 local cloud = require("@account/cloud")
+-- Crew: no profile to edit and no members to manage (ui/account/crew.luau).
+local crew = require("@account/crew")
 
 type Module = { ID: string, TITLE: string, view: () -> Node }
 
@@ -71,7 +73,8 @@ add(voice, "microphone", "Personal")
 add(files, "folder", "Personal")
 add(shortcuts, "keyboard", "Personal")
 add(appshots, "gallery", "Personal")
-add(profile, "user-rounded", "Personal")
+-- (Crew: its own account page in Profile's place, without the edits.)
+add(if crew.on then require("@app/screens/settings/crew_account") else profile, "user-rounded", "Personal")
 -- The panel's browser, under a heading of its own (room for what it grows:
 -- site data, permissions, downloads).
 add(browser, "global", "Browser")
@@ -79,7 +82,11 @@ add(browser_history, "clock-circle", "Browser")
 add(providers, "widget", "Devices")
 add(devices, "laptop", "Devices")
 add(projects_page, "folder-with-files", "Devices")
-add(members, "users-group-rounded", "Organization")
+if crew.on then
+	search.unindex(members.ID)
+else
+	add(members, "users-group-rounded", "Organization")
+end
 -- Last, under Zeron's own heading (the shipping app's About and its
 -- updates, in its app menu): after everything, Archived too.
 settings.add {
