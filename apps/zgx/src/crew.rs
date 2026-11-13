@@ -96,6 +96,22 @@ pub fn scaffold_session_kept(data_dir: &Path) -> bool {
     data_dir.join(SCAFFOLD_SESSION).is_file()
 }
 
+/// Whether a sign-in page the engine returns may be opened: Scaffold's
+/// authorize page (https), or a loopback test authority's (plain http on
+/// 127.0.0.1, localhost or [::1], which the engine's Scaffold mode returns
+/// for a local authority). Nothing else over plain http.
+pub fn sign_in_url_allowed(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once(':').map_or(authority, |(host, _)| host);
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+}
+
 /// `account.provider`: Scaffold in a Crew build, nothing in upstream's.
 pub fn provider() -> Value {
     if MODE { Value::from(PROVIDER) } else { Value::Nil }

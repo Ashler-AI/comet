@@ -671,7 +671,8 @@ impl Auth {
             })?;
         // Empty: the engine has no sign-in to do (development).
         if let Some(url) = answer["url"].as_str().filter(|url| !url.is_empty()) {
-            if !url.starts_with("https://") {
+            // Crew: a loopback test authority's page is plain http.
+            if !crate::crew::sign_in_url_allowed(url) {
                 return Err("failed");
             }
             if let Err(error) = open_sign_in(url) {

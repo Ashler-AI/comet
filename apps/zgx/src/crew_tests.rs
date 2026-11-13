@@ -11,7 +11,32 @@ use std::{
 use serde_json::{Value as Json, json};
 use zgx_script::{ScriptHost, Value, testing::TestApp};
 
-use super::{Account, Answers, ENV, MODE, NO_EDGE, PAGES, PROVIDER, Pages, RUNTIME, Runtime, SCAFFOLD_SESSION, TITLE, answer, endpoint_at, provider};
+use super::{Account, Answers, ENV, MODE, NO_EDGE, PAGES, PROVIDER, Pages, RUNTIME, Runtime, SCAFFOLD_SESSION, TITLE, answer, endpoint_at, provider, sign_in_url_allowed};
+
+/// Scaffold's https page opens, and a loopback test authority's plain http
+/// one; no other plain http page, however it's dressed up.
+#[test]
+fn only_https_or_a_loopback_authoritys_sign_in_page_opens() {
+    for url in [
+        "https://scaffold-upstream-canary.internal.ashler.com/oauth/authorize?x=1",
+        "http://127.0.0.1:41234/oauth/authorize",
+        "http://localhost:9/authorize",
+        "http://[::1]:8080/authorize",
+    ] {
+        assert!(sign_in_url_allowed(url), "{url}");
+    }
+    for url in [
+        "http://scaffold.example.com/authorize",
+        "http://localhost.example.com/authorize",
+        "http://127.0.0.1@example.com/authorize",
+        "http://127.0.0.2/authorize",
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "",
+    ] {
+        assert!(!sign_in_url_allowed(url), "{url}");
+    }
+}
 
 fn ui_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui")
