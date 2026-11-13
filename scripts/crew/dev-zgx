@@ -3,8 +3,11 @@
 # Crew and Zeron on this Mac (docs/crew/zgx-thin-port.md):
 #   - data ~/.crew-zgx-dev, IPC port 27960, the agents' home under it
 #     (zeron_cli::crew and apps/zgx/src/engine/manager.rs decide these);
-#   - no Edge yet (a loopback port nothing serves): signed out, local;
+#   - the Edge and Scaffold the engine reads from ~/.crew-zgx-dev/crew-runtime.json,
+#     or none (signed out, local) without it;
 #   - nothing inherited from the Crew that started this shell (clean-env).
+#
+# ZERON_ZGX_PRIVATE_SIGNIN=1 signs in in a private Chrome window.
 #
 #   scripts/crew/build-engine            # once, and after engine changes
 #   scripts/crew/dev-zgx [main|gallery|onboarding|intro]   (default: main)
@@ -25,6 +28,6 @@ exec "$root/scripts/crew/clean-env" \
   ZIG="$zig" \
   CARGO_TARGET_DIR="$target" \
   ZERON_ZGX_ENGINE_BIN="$engine" \
-  ZERON_ZGX_EDGE="${CREW_ZGX_EDGE:-http://127.0.0.1:9}" \
+  ZERON_ZGX_PRIVATE_SIGNIN="${ZERON_ZGX_PRIVATE_SIGNIN:-}" \
   ZERON_DISABLE_NOTIFICATIONS=1 \
   cargo run -- "${1:-main}"
