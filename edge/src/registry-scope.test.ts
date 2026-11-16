@@ -60,3 +60,24 @@ it("allows every column the native registry writes", () => {
   const allowed = new Set(Object.values(registryColumns).flatMap(kind => Object.keys(kind)));
   expect([...written].filter(field => !allowed.has(field)).sort()).toEqual([]);
 });
+
+// Failure mode (2026-11-16): a resumed Scaffold host still holds ops its previous
+// epoch never delivered, e.g. `devices/<…-e1>` lastSeenAt. No epoch-3 grant can
+// write them, so the whole batch was refused and retried forever, and nothing
+// the resumed host wrote reached the registry.
+it("drops a resumed host's undelivered previous-epoch ops and admits the rest", () => {
+  const resumed: SocketAuthority = { ...host, deviceId: "comet-scaffold-box-e3", lifecycleEpoch: 3 };
+  const stamp = (device: string) => `1794528000000-000002-${device}`;
+  const staleHeartbeat: Op = { kind: "devices", id: "comet-scaffold-box-e1", op: "update", hlc: stamp("comet-scaffold-box-e1"), set: { lastSeenAt: 1 } };
+  const staleStatus: Op = { kind: "sessions", id: "chat-1", op: "upsert", hlc: stamp("comet-scaffold-box-e2"),
+    set: { chatId: "chat-1", deviceId: "comet-scaffold-box-e2", status: "working" } };
+  const status: Op = { kind: "sessions", id: "chat-1", op: "upsert", hlc: stamp(resumed.deviceId!),
+    set: { chatId: "chat-1", deviceId: resumed.deviceId!, status: "idle" } };
+  expect(scopedOps([staleHeartbeat, staleStatus, status], resumed, () => undefined)).toEqual([{ ...status, clocks: {} }]);
+  // A batch of only undelivered ops is acknowledged empty, so the host retires it.
+  expect(scopedOps([staleHeartbeat], resumed, () => undefined)).toEqual([]);
+  // Only this sandbox's earlier epochs are dropped; anything else keeps the typed checks.
+  for (const author of ["comet-scaffold-box-e4", "comet-scaffold-other-e1", "comet-scaffold-box-e1x", "desktop"]) {
+    expect(scopedOps([{ ...staleHeartbeat, hlc: stamp(author) }], resumed, () => undefined)).toBeUndefined();
+  }
+});
