@@ -56,6 +56,17 @@ function validValue(value: FieldValue, type?: string): boolean {
   if (type === "status") return ["idle", "working", "awaitingInput", "errored"].includes(value as string);
   return typeof value === type && (type !== "number" || Number.isFinite(value));
 }
+/** Whether the op's clock names an earlier lifecycle epoch of this same sandbox. A
+ * resumed host still holds what that epoch never delivered; no later grant may write
+ * it, and refusing it would refuse every batch the resumed host sends. Dropping a
+ * write grants nothing, so a forged author only loses its own op. */
+function previousEpochOp(op: Op, a: SocketAuthority): boolean {
+  const author = op.hlc.slice("0000000000000-000000-".length);
+  const prefix = `comet-scaffold-${a.sandboxId}-e`;
+  const epoch = author.startsWith(prefix) ? author.slice(prefix.length) : "";
+  return /^\d{1,15}$/.test(epoch) && Number(epoch) < a.lifecycleEpoch!;
+}
+
 /** The device is a single-session, epoch-bound Scaffold host, so its space may
  * arrive before its chat in upstream's separate pending batches. */
 export function scopedOps(ops: Op[], a: SocketAuthority, load: (kind: string, id: string) => Row | undefined): Op[] | undefined {
@@ -63,6 +74,7 @@ export function scopedOps(ops: Op[], a: SocketAuthority, load: (kind: string, id
   const projected = new Map<string, Row>();
   const get = (kind: string, id: string) => projected.get(`${kind}/${id}`) ?? load(kind, id);
   for (const op of ops) {
+    if (previousEpochOp(op, a)) continue;
     if (!Object.hasOwn(registryColumns, op.kind) || op.op === "delete" || !op.set) return undefined;
     if ((op.kind === "chats" || op.kind === "sessions") && op.id !== a.sessionId ||
         op.kind === "devices" && op.id !== a.deviceId) return undefined;

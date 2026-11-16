@@ -162,6 +162,28 @@ it("rejects other sessions/devices, raw columns, deletes, admin and stale epochs
   expect((await state(stub)).rows.find(row => row.id === "one")?.fields.title).toBe("new host");
 });
 
+// Failure mode (2026-11-16): after a resume the host's pending queue still holds what
+// its previous epoch never delivered. Refusing that batch refused everything after it.
+it("acknowledges a resumed host's batch without its previous epoch's undelivered ops", async () => {
+  const stub = room();
+  const resumed = { ...host, deviceId: "comet-scaffold-box-e3", lifecycleEpoch: 3 };
+  const resumedCrew = { ...crew, environment: { ...crew.environment, source: { ...crew.environment.source, lifecycle_epoch: 3 } } };
+  expect((await push(stub, [op("chats", "one", { id: "one", deviceId: resumed.deviceId, crew: resumedCrew })])).status).toBe(200);
+  const previous = (tick: number) => `${String(tick).padStart(13, "0")}-000000-${host.deviceId}`;
+  const heartbeat: Op = { kind: "devices", id: host.deviceId!, op: "update", hlc: previous(5), set: { lastSeenAt: 5 } };
+  const before = await state(stub);
+  const onlyPrevious = await push(stub, [heartbeat], resumed);
+  expect(onlyPrevious.status).toBe(200);
+  expect(await onlyPrevious.json()).toMatchObject({ applied: 0 });
+  expect(await state(stub)).toEqual(before);
+  const previousStatus: Op = { ...op("sessions", "one", { chatId: "one", deviceId: host.deviceId!, status: "working" }, 4), hlc: previous(4) };
+  const status = op("sessions", "one", { chatId: "one", deviceId: resumed.deviceId, status: "idle" }, 6);
+  expect((await push(stub, [heartbeat, previousStatus, status], resumed)).status).toBe(200);
+  const rows = (await state(stub)).rows;
+  expect(rows.find(row => row.kind === "sessions")?.fields).toMatchObject({ deviceId: resumed.deviceId, status: "idle" });
+  expect(rows.some(row => row.kind === "devices")).toBe(false);
+});
+
 async function issuedHost(): Promise<SocketAuthority> {
   const grantId = crypto.randomUUID().replaceAll("-", "");
   const secret = "a".repeat(64);
