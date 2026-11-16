@@ -251,5 +251,17 @@ Gaps found:
   The root fix still belongs in the engine: on an epoch change, retire or rewrite the
   ops the old device id authored.
 
-Remaining: promote production (step 5) with `scaffold_runtime_deployment=production-deployed`,
-then retire the legacy Worker (step 7) after the last legacy session stops.
+Promotion (step 5) followed the same day. 0.2.149 could no longer be promoted: the 0.2.150
+staging release had moved the staging channels, and `publish-staging` refuses to move a
+channel backward. So 0.2.150 went to production instead. It is 0.2.149 plus #213 and has
+the same Scaffold runtime contract:
+
+- a production candidate reusing staging run 43938356680 (run 43950630210);
+- the production promotion with `desktop-and-scaffold` and `production-deployed`
+  (run 43951678943), verified at 20:44:38Z.
+
+Production `desktop` and `scaffold` channels moved to 0.2.150 (from 0.2.148 and
+0.1.156). Scaffold's own template pins are still 0.2.149, which is compatible; bump them
+with the next primary build.
+
+Remaining: retire the legacy Worker (step 7) after the last legacy session stops.
