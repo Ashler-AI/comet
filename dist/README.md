@@ -3,7 +3,7 @@
 One upstream-based implementation produces the native desktop and headless Crew
 runtime. Internal Cargo packages and artwork filenames may remain `zeron`; the
 published compatibility executable is **`comet`**. The workspace release is
-**0.2.149**. Production desktop runs native 0.2.148; production Scaffold still runs
+**0.2.150**. Production desktop runs native 0.2.148; production Scaffold still runs
 legacy 0.1.156. Moving Scaffold to native follows
 [`docs/production-native-cutover.md`](../docs/production-native-cutover.md), and
 every production step needs explicit operator approval. The authoritative
