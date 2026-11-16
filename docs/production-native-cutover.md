@@ -205,3 +205,51 @@ owner runs no desktop, or check that the row the host received is Scaffold's.
 Before the retry, deploy #218 to the native production Edge
 (`deploy.yml target=production`). Its native host batches carry columns the current
 production Edge refuses. #218 has been on the staging Edge since 2026-11-13.
+
+## 2026-11-16: production Scaffold is native
+
+The fourth retry succeeded, with Crew 0.2.149, ashler-platform #13616 and the native
+production Edge at `1a78e75b78` (#218 and #220).
+
+Timeline (UTC):
+
+| Time | Step |
+| --- | --- |
+| 18:53:55 | Native production Edge deployed: #218, plus #220, which drops a resumed host's previous-epoch registry ops instead of refusing its batch. |
+| 19:00:45 | ashler-platform #13906 re-landed the `chat2` config. Pins were set to 0.2.149 / `bc4ff78a…` in the repo and in the `staging` environment. |
+| 19:38:54 | Run 1 (43934955469) committed the lock: provider and template `e2b-6532-f0b027aed732`. |
+| 19:41:31 | First new provider pod Ready. The Worker-only Run 2 was dispatched. |
+| 19:42:47 | `chat2` Worker live (`03ef3898`). The skew window was about 76 s, and no user session was created in it. |
+
+Verification:
+
+- **The first web-UI session failed.** It landed on an *old* provider pod that was
+  still serving during the rolling update (`maxSurge 1`, `maxUnavailable 0`). A legacy
+  template sandbox received a `chat2` bootstrap, and its engine exited with
+  `device_join_grant_unavailable`.
+- **After the old pod drained:**
+  - A web-UI session was ready in 36 s, on Crew 0.2.149 with Scaffold's registry row.
+  - A native pause and resume came back ready at the new epoch.
+  - A legacy session resumed.
+  - A `chat2` session stranded by the 11-13 attempt resumed ready, because Scaffold
+    created its row on that start.
+- **The first agent-created sandboxes** (`rcs_`, through the MCP route) were ready in
+  about a minute.
+
+Gaps found:
+
+- **Flip gap.** Flipping the Worker when the *first* new provider pod is Ready still
+  leaves old pods serving until the rollout completes. A `chat2` session that lands on
+  an old pod fails. Next time, wait for the old ReplicaSet to drain before the Worker
+  flip, or make old providers refuse `chat2` requests so the Worker can retry.
+- **E2B resume failures.** These predate the cutover and are not caused by it:
+  - `connect_sandbox` timeouts appeared twice in the 24 h before the flip, and once on a
+    three-day-old legacy pause after it.
+  - A resume issued seconds after a pause can fail with "sandbox files … not found"
+    until E2B finishes the snapshot.
+- **Stale-op root fix.** #220 handles a resumed host's previous-epoch ops at the Edge.
+  The root fix still belongs in the engine: on an epoch change, retire or rewrite the
+  ops the old device id authored.
+
+Remaining: promote production (step 5) with `scaffold_runtime_deployment=production-deployed`,
+then retire the legacy Worker (step 7) after the last legacy session stops.
