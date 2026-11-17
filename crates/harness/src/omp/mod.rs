@@ -2227,7 +2227,14 @@ fn models_from_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
         .map(|model| {
             let max_ladder = matches!(
                 model.selector.rsplit('/').next(),
-                Some("claude-opus-5-5" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna")
+                Some(
+                    "claude-opus-5-5"
+                        | "gpt-6-sol"
+                        | "gpt-6.1-sol"
+                        | "gpt-6.2-sol"
+                        | "gpt-6.2-astra"
+                        | "gpt-6-luna"
+                )
             );
             let size_description = match (model.context_window, model.max_tokens) {
                 (Some(context_window), Some(max_tokens)) => {

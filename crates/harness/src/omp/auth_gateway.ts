@@ -41,6 +41,17 @@ function stripProviderPrefix(model: GatewayModel): string {
   return model.id.startsWith(prefix) ? model.id.slice(prefix.length) : model.id;
 }
 
+// Models whose OpenAI model card gives a 1,050,000-token context and 128,000
+// output tokens, with base per-million-token rates. Above 272K input the
+// provider charges 2x input/cache and 1.5x output.
+const OPENAI_MODEL_CARD_COSTS = new Map([
+  ["gpt-6-sol", { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 }],
+  ["gpt-6.1-sol", { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }],
+  ["gpt-6.2-sol", { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }],
+  ["gpt-6.2-astra", { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 }],
+  ["gpt-6-luna", { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 }],
+]);
+
 function modelConfig(model: GatewayModel) {
   const id = stripProviderPrefix(model);
   if (model.owned_by === "anthropic" && id === "claude-opus-5-5") {
@@ -69,18 +80,14 @@ function modelConfig(model: GatewayModel) {
       },
     };
   }
-  if (model.owned_by === "openai-codex" && (
-    id === "gpt-6-sol" || id === "gpt-6.1-sol" || id === "gpt-6-luna"
-  )) {
+  const openAiCost = model.owned_by === "openai-codex" ? OPENAI_MODEL_CARD_COSTS.get(id) : undefined;
+  if (openAiCost) {
     return {
       id,
       name: id,
       reasoning: true,
       input: ["text", "image"] as Array<"text" | "image">,
-      // Base rates; above 272K input the provider charges 2x input/cache and 1.5x output.
-      cost: id === "gpt-6-luna"
-        ? { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 }
-        : { input: 2, output: 10, cacheRead: id === "gpt-6.1-sol" ? 0.1 : 0.2, cacheWrite: 2.5 },
+      cost: openAiCost,
       contextWindow: 1_050_000,
       maxTokens: 128_000,
     };

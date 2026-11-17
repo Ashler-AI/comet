@@ -286,19 +286,34 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
-        // As Codex 0.163 reports them.
+        // As Codex 0.163 reports them; the GPT-6.2 rows and the two rows they
+        // supersede use the live catalog's wording (2026-11-17).
         "codex" => vec![
+            model(
+                "gpt-6.2-sol",
+                "GPT-6.2-Sol",
+                "Fast, go-to model for coding and everyday work.",
+                CODEX_ULTRA,
+                service_tier(),
+            ),
+            model(
+                "gpt-6.2-astra",
+                "GPT-6.2-Astra",
+                "Our most capable model for complex coding and professional work.",
+                CODEX_ULTRA,
+                service_tier(),
+            ),
             model(
                 "gpt-6.1-sol",
                 "GPT-6.1-Sol",
-                "Latest workhorse model for coding and everyday work.",
+                "Previous generation model for coding and everyday work.",
                 CODEX_ULTRA,
                 service_tier(),
             ),
             model(
                 "gpt-6-astra",
                 "GPT-6-Astra",
-                "Frontier intelligence for the most demanding work.",
+                "Previous generation model for complex coding and professional work.",
                 CODEX_ULTRA,
                 service_tier(),
             ),
@@ -725,7 +740,7 @@ mod tests {
         assert_eq!(cache.harnesses("dev/mac").unwrap().len(), 2);
         assert_eq!(
             cache.models("dev/mac", "codex").unwrap()[0].id,
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
         );
         assert!(cache.models("dev/mac", "grok").is_none());
     }
