@@ -1,7 +1,7 @@
 {
   "source": {
     "repository": "Ashler-AI/ashler-platform",
-    "revision": "11c6555ae3d07fc9057ee6fa4dfee35e2b013532",
+    "revision": "27bb2f8f1efd39f27511ca2b9991664d0e7a5dda",
     "path": "internal/scaffold/control-plane/worker/src/omp-auth-broker.ts"
   },
   "models": [
@@ -13,6 +13,18 @@
         "low",
         "medium",
         "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6.2-astra",
+      "label": "gpt-6.2-astra",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     },
     {
@@ -68,8 +80,8 @@
       ]
     },
     {
-      "id": "openai-codex/gpt-6-luna",
-      "label": "gpt-6-luna",
+      "id": "openai-codex/gpt-6.1-sol",
+      "label": "gpt-6.1-sol",
       "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
       "reasoningLevels": [
         "low",
@@ -80,8 +92,30 @@
       ]
     },
     {
-      "id": "openai-codex/gpt-6.1-sol",
-      "label": "gpt-6.1-sol",
+      "id": "openai-codex/gpt-6.2-sol",
+      "label": "gpt-6.2-sol",
+      "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6.1-terra",
+      "label": "gpt-6.1-terra",
+      "description": "Scaffold model · account access checked when starting a run",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6-luna",
+      "label": "gpt-6-luna",
       "description": "1,050,000 context · 922,000 max input · 128,000 max output · Scaffold model · account access checked when starting a run",
       "reasoningLevels": [
         "low",

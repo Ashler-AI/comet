@@ -133,9 +133,23 @@ fn model(
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
         model(
+            "gpt-6.2-sol",
+            "GPT-6.2-Sol",
+            "Fast, go-to model for coding and everyday work.",
+            ULTRA_LADDER,
+            vec![service_tier()],
+        ),
+        model(
+            "gpt-6.2-astra",
+            "GPT-6.2-Astra",
+            "Our most capable model for complex coding and professional work.",
+            ULTRA_LADDER,
+            vec![service_tier()],
+        ),
+        model(
             "gpt-6-astra",
             "GPT-6-Astra",
-            "Our most capable model for complex, demanding work.",
+            "Previous generation model for complex coding and professional work.",
             ULTRA_LADDER,
             vec![service_tier()],
         ),
@@ -215,10 +229,10 @@ mod tests {
     #[test]
     fn catalog_is_newest_first_with_service_tiers() {
         let models = static_models();
-        assert_eq!(models.len(), 9);
-        assert_eq!(models[0].id, "gpt-6-astra");
+        assert_eq!(models.len(), 11);
+        assert_eq!(models[0].id, "gpt-6.2-sol");
         assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
-        assert!(!models[5].reasoning_levels.contains(&ReasoningLevel::Max));
+        assert!(!models[7].reasoning_levels.contains(&ReasoningLevel::Max));
         for m in &models {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");
             // Daybreak Blue reports no service tiers on the wire.

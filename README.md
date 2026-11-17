@@ -45,10 +45,18 @@ does not update an already-running engine's search behavior.
 ### Managed model choices
 
 Crew's managed Codex picker uses the bundled shared model catalog, including
-`gpt-6.1-sol`, rather than the native CLI's offline fallback. Codex receives the
-bare model ID; Agent Auth still checks account/model access when a run starts.
-Update and restart the running Crew engine to refresh these choices; replacing
-only the frontend or CLI does not update its catalog behavior.
+`gpt-6.2-sol` and `gpt-6.2-astra`, rather than the native CLI's offline fallback.
+Codex receives the bare model ID; Agent Auth still checks account/model access
+when a run starts. Update and restart the running Crew engine to refresh these
+choices; replacing only the frontend or CLI does not update its catalog behavior.
+`node scripts/sync-omp-model-catalog.mjs <Platform commit SHA>` regenerates the
+catalog from Platform's `ompInferenceModelCatalog`.
+
+Managed Codex runs take each model's tools, instructions and context window from
+the installed Codex CLI's bundled catalog, because Agent Auth is a custom
+provider to Codex. A model newer than that catalog still runs, with Codex's
+fallback metadata (it warns "Model metadata for … not found"); Codex 0.169 has
+no GPT-6.2 rows, for example. OMP builds its own requests and is unaffected.
 
 ### Engine and agent update recovery
 
