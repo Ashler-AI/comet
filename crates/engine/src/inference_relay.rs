@@ -4,7 +4,7 @@ use futures::{Stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderMap};
+use hyper::header::{ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -763,6 +763,16 @@ impl InferenceRelay {
         } else {
             (reqwest::Body::wrap_stream(request.into_body().into_data_stream()), content_length)
         };
+        let mut forwarded_headers = sanitize_request_headers(headers);
+        // Antigravity marks a streamed answer with `?alt=sse`, which the Scaffold
+        // path replaces. Proxies on the way keep event streams open but cut other
+        // requests at a deadline, so the stream has to be declared in Accept too.
+        if endpoint == "antigravity/streamGenerateContent"
+            && !forwarded_headers.get(ACCEPT).and_then(|value| value.to_str().ok())
+                .is_some_and(|accept| accept.contains("text/event-stream"))
+        {
+            forwarded_headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        }
         let upstream = self
             .inner
             .client
@@ -775,7 +785,7 @@ impl InferenceRelay {
                 conversation_id: &route.request.logical_session_id,
                 requested_account_id: route.request.requested_account_id.as_deref(),
                 request_id: &request_id,
-                headers: sanitize_request_headers(headers),
+                headers: forwarded_headers,
                 content_length,
                 body,
                 cancellation: &cancellation,
