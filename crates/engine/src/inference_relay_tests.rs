@@ -469,6 +469,7 @@ mod tests {
         conversation_id: String,
         request_id: String,
         account_id: Option<String>,
+        accept: Option<String>,
         body: Value,
     }
 
@@ -556,6 +557,10 @@ mod tests {
                                                 .to_string(),
                                             account_id: headers
                                                 .get("x-agent-auth-account-id")
+                                                .and_then(|value| value.to_str().ok())
+                                                .map(str::to_string),
+                                            accept: headers
+                                                .get("accept")
                                                 .and_then(|value| value.to_str().ok())
                                                 .map(str::to_string),
                                             body: serde_json::from_slice(&bytes).unwrap(),
@@ -723,6 +728,7 @@ mod tests {
                                             .unwrap()
                                             .to_string(),
                                         account_id: None,
+                                        accept: None,
                                         body: serde_json::from_slice(&bytes).unwrap(),
                                     })
                                     .unwrap();
@@ -1316,6 +1322,15 @@ mod tests {
         assert_eq!(captured.authorization, "Bearer remote-agent-auth-authority-1");
         assert_eq!(captured.api_key, None);
         assert_eq!(captured.body, json!({"model":"gemini-3.8-flash-high","request":body}));
+        // `?alt=sse` marked this answer as a stream and the Scaffold path drops it,
+        // so the relay must say so itself or proxies apply their request deadlines.
+        assert_eq!(captured.accept.as_deref(), Some("text/event-stream"));
+        let response = http.post(format!("{}/v1beta/models/gemini-3.8-flash:generateContent", route.base_url))
+            .bearer_auth(&route.token).header("accept", "application/json").json(&body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = rx.recv().await.unwrap();
+        assert_eq!(captured.path, "/api/agent-auth/v2/antigravity/generateContent");
+        assert_eq!(captured.accept.as_deref(), Some("application/json"));
         for path in ["/v1/messages", "/v1beta/models/gemini:countTokens", "/v1beta/models/a/b:generateContent", "/v1beta/models/gemini:streamGenerateContent?key=secret"] {
             let response = http.post(format!("{}{path}", route.base_url)).header("x-goog-api-key", &route.token)
                 .json(&body).send().await.unwrap();
