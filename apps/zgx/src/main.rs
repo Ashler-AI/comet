@@ -157,10 +157,11 @@ use zgx_desktop::{
 };
 use zgx_script::{ScriptHost, Shared, Value};
 
-/// Where `ui.persist` keeps its files: the packaged app's (the beta), apart
-/// from development builds'. Crew: its own, never a Zeron install's
-/// (docs/crew/zgx-thin-port.md).
-const APP_ID: &str = if cfg!(feature = "beta") { "crew-zgx-canary" } else { "crew-zgx-dev" };
+/// Where `ui.persist` keeps its files: the Zeron app's (the beta), apart from
+/// development builds'. Crew: its flavour's own (`zeron_cli::crew::APP_ID`),
+/// as its engine's data dir is, so a packaged canary never reads a
+/// development build's setup or windows (docs/crew/zgx-thin-port.md).
+const APP_ID: &str = if cfg!(feature = "beta") { "zeron" } else { zeron_cli::crew::APP_ID };
 
 /// Setup's window, in points: room for a step and its footer, no more.
 const ONBOARDING_SIZE: (f64, f64) = (680., 500.);

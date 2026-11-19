@@ -36,6 +36,10 @@ pub const DATA_DIR_NAME: &str = if CANARY { ".crew-zgx-canary" } else { ".crew-z
 /// The engine's IPC port when nothing names one.
 pub const DEFAULT_IPC_PORT: u16 = if CANARY { 27959 } else { 27960 };
 
+/// The app's own data (zgx's `app_data_dir`: its setup, windows and
+/// `ui.persist` state), apart for each flavour as the engine's is.
+pub const APP_ID: &str = if CANARY { "crew-zgx-canary" } else { "crew-zgx-dev" };
+
 /// What the packaged canary is called: its bundle (scripts/crew/package-zgx-app),
 /// its windows and Settings → About.
 pub const CANARY_PRODUCT: &str = "Crew zgx Canary";
@@ -205,5 +209,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         assert!(refusal(&home.path().join(DATA_DIR_NAME), DEFAULT_IPC_PORT).is_none());
         assert!(DATA_DIR_NAME.starts_with(OURS));
+        // The app's own data follows the flavour too: its name is the data
+        // dir's, less the dot (`crew-zgx-dev`, `crew-zgx-canary`).
+        assert_eq!(Some(APP_ID), DATA_DIR_NAME.strip_prefix('.'));
     }
 }
