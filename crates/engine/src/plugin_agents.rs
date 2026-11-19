@@ -47,7 +47,10 @@ impl AgentHost for EngineAgentHost {
 
     fn activate(&self, harness: HarnessId, account: String) -> BoxFuture<'static, Result<AgentAccountsSnapshot, String>> {
         let (accounts, voice) = (self.accounts.clone(), self.sessions.voice_manager());
+        // Crew: managed runs never use this device's own logins.
+        let refused = self.registry.refuse_own_logins();
         Box::pin(async move {
+            refused?;
             voice.retire();
             accounts.activate(harness, &account).await.map_err(|e| e.to_string())
         })
@@ -56,6 +59,10 @@ impl AgentHost for EngineAgentHost {
     fn models(&self, harness: HarnessId) -> BoxFuture<'static, Result<Vec<Model>, String>> {
         let (registry, data_dir) = (self.registry.clone(), self.data_dir.clone());
         Box::pin(async move {
+            // Crew: the managed catalog, as `ListModels` lists it.
+            if let Some(crew) = registry.crew_inference() {
+                return crew.models(harness).await;
+            }
             let lease = Arc::new(registry.execution_lease(harness).await);
             let resolved = registry.resolve(harness).map_err(|e| e.to_string())?;
             crate::model_catalogs::list_with_lease(&data_dir, resolved, false, Some(lease))
@@ -123,6 +130,8 @@ impl AgentHost for EngineAgentHost {
     }
 
     fn pin_mechanism(&self, account: &AgentAccount) -> Option<&'static str> {
+        // Crew: no local login can be pinned while runs are managed.
+        self.registry.refuse_own_logins().ok()?;
         self.accounts.pin_mechanism(account)
     }
 
@@ -135,6 +144,8 @@ impl AgentHost for EngineAgentHost {
     }
 
     fn set_pin(&self, harness: HarnessId, chat: &str, account: Option<&str>) -> Result<(), String> {
+        // Crew: managed runs never use this device's own logins.
+        self.registry.refuse_own_logins()?;
         self.accounts.set_pin(harness, chat, account);
         Ok(())
     }

@@ -223,6 +223,9 @@ pub struct HarnessRegistry {
     account_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
     /// Credits Zeron in agents' commits ([`crate::commit_credit`]).
     commit_credit: std::sync::OnceLock<Arc<crate::commit_credit::CommitCredit>>,
+    /// Crew: managed inference, the only run environment once set
+    /// ([`crate::crew_inference`]).
+    pub(crate) crew: std::sync::OnceLock<Arc<crate::crew_inference::CrewInference>>,
 }
 
 impl Default for HarnessRegistry {
@@ -247,6 +250,10 @@ impl HarnessRegistry {
         id: HarnessId,
         lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<Vec<zeron_proto::Model>, HarnessError> {
+        // Crew: the managed catalog; no CLI is probed.
+        if let Some(crew) = self.crew.get() {
+            return crew.models(id).await.map_err(HarnessError::Protocol);
+        }
         let harness = self.resolve(id)?;
         tokio::spawn(async move {
             // An RPC cancellation must not drop the gate before the probe's
@@ -309,6 +316,7 @@ impl HarnessRegistry {
             run_environment_ready: tokio::sync::watch::channel(true).0,
             account_environment: Mutex::new(None),
             commit_credit: std::sync::OnceLock::new(),
+            crew: std::sync::OnceLock::new(),
         }
     }
 
@@ -339,6 +347,10 @@ impl HarnessRegistry {
     }
 
     fn environments(&self) -> Vec<Arc<dyn RunEnvironment>> {
+        // Crew: managed inference is the only one (no pins, no own logins).
+        if let Some(crew) = self.crew.get() {
+            return vec![crew.clone() as Arc<dyn RunEnvironment>];
+        }
         [&self.run_environment, &self.account_environment]
             .into_iter()
             .filter_map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner).clone())
