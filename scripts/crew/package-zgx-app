@@ -57,6 +57,10 @@ interface="$target/zgx/$profile/zeron-zgx"
 [[ -x "$engine" && -x "$interface" ]] || die "the build left no $engine or $interface"
 
 version="$(grep -m1 '^version' "$root/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
+# What it was built from (the engine's own build id can name an older commit:
+# crates/engine/build.rs reads git only when it changes).
+commit="$(git -C "$root" rev-parse HEAD)"
+git -C "$root" diff --quiet HEAD -- || commit="$commit-dirty"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 install -m 755 "$interface" "$app/Contents/MacOS/zeron"
@@ -73,6 +77,7 @@ plutil -replace NSMicrophoneUsageDescription -string \
   "$APP_NAME uses your microphone for on-device dictation and for voice sessions you start." "$plist"
 # Ghostty's floor, as upstream's bundle.
 plutil -replace LSMinimumSystemVersion -string "13.0" "$plist"
+plutil -replace CrewSourceCommit -string "$commit" "$plist"
 plutil -convert xml1 "$plist"
 plutil -lint "$plist" >/dev/null
 
@@ -97,5 +102,5 @@ codesign --force --entitlements "$entitlements" --sign - --identifier "$BUNDLE_I
 codesign --force --entitlements "$entitlements" --sign - "$app"
 codesign --verify --strict --verbose=2 "$app"
 
-echo "packaged: $app ($profile, $(du -sh "$app" | cut -f1))"
+echo "packaged: $app ($profile, $(du -sh "$app" | cut -f1), from $commit)"
 echo "install:  ditto \"$app\" \"/Applications/$APP_NAME.app\""
